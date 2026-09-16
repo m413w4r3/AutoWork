@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import date
 from uuid import UUID
 
@@ -9,6 +10,8 @@ from pydantic import Field, field_validator
 
 from cti_app.application.jobs import JobParameters
 from cti_app.domain.classification import TLP
+
+SOURCE_PROFILE_PATTERN = re.compile(r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$")
 
 
 class DiscoverEditionParameters(JobParameters):
@@ -19,7 +22,11 @@ class DiscoverEditionParameters(JobParameters):
     period_end: date
     as_of_date: date = Field(default_factory=date.today)
     languages: list[str] = Field(min_length=1, max_length=10)
-    source_profile: str = Field(min_length=1, max_length=128)
+    source_profile: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=SOURCE_PROFILE_PATTERN.pattern,
+    )
     keywords: list[str] = Field(default_factory=list, max_length=100)
     exclusions: list[str] = Field(default_factory=list, max_length=100)
     complementary_axis: str = Field(default="initial", min_length=1, max_length=500)

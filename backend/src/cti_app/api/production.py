@@ -906,9 +906,7 @@ async def _dispatch_handed_off_production_run(
 
 # A refused retry is an operational instruction, not a stack trace.  The code
 # stays the machine identity the frontend switches on; the message is what the
-# Review console renders when it has nothing better to say.  Leaving it out is
-# what made every conflict surface as the generic "la revue de publication n'a
-# pas pu être mise à jour".
+# Review console renders when it has nothing better to say.
 _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
     "production_run_cancelled": (
         "Cette production a été arrêtée. Utilisez « Reprendre la production »."
@@ -917,8 +915,8 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
         "Une tentative est déjà en cours pour cet article. Attendez qu'elle se termine."
     ),
     "retry_stage_not_in_pipeline": "Cette étape ne fait pas partie du pipeline de production.",
-    "edition_frozen_for_publication": (
-        "L'édition est gelée pour publication : plus aucune production ne peut être relancée."
+    "edition_archived": (
+        "L'édition est archivée : plus aucune production ne peut être modifiée."
     ),
     "edition_not_found": "L'édition de cet article est introuvable.",
     "production_run_edition_changed": (
@@ -2432,6 +2430,6 @@ async def cancel_edition_batch(
         "action": "cancel",
         "batch_id": str(cancellation.batch.id),
         "status": cancellation.batch.status.value,
-        "edition_status": cancellation.edition.status.value,
+        "edition_state": cancellation.edition.state.value,
         "edition_version": cancellation.edition.version,
     }

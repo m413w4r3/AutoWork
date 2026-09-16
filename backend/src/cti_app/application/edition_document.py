@@ -47,10 +47,10 @@ def edition_metadata_projection(edition: Edition) -> dict[str, Any]:
         "period_end": edition.period_end.isoformat(),
         "tlp": edition.tlp.value,
         "languages": list(edition.languages),
-        "previous_edition_id": (
-            str(edition.previous_edition_id) if edition.previous_edition_id else None
-        ),
-        "source_profile": edition.source_profile,
+        "state": edition.state.value,
+        "version": edition.version,
+        "created_at": edition.created_at.isoformat(),
+        "updated_at": edition.updated_at.isoformat(),
     }
 
 

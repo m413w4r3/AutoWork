@@ -1,4 +1,4 @@
-"""PostgreSQL proof that publication freeze wins a concurrent user retry."""
+"""PostgreSQL proof that publication does not freeze the Edition state."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from uuid import uuid4
 import pytest
 
 from cti_app.application.persistence import UnitOfWorkFactory
-from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import PublicationManifestEntryV1, PublicationManifestV1
@@ -32,7 +31,7 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.mark.asyncio
-async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
+async def test_publication_lock_keeps_the_edition_open_for_a_concurrent_retry(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     edition = Edition(
@@ -42,9 +41,7 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
         period_end=date(2099, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=1,
-        source_profile="test",
-        status=EditionStatus.REVIEW,
+        state=EditionStatus.OPEN,
     )
     subject = Subject(
         external_id=f"freeze-{uuid4().hex}",
@@ -136,28 +133,26 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
         async with uow_factory() as uow:
             locked = await uow.editions.get_for_update(edition.id)
             assert locked is not None
-            before = locked.snapshot()
-            locked.transition(EditionStatus.ASSEMBLING)
-            assert await uow.editions.update(locked, int(before["version"]))
+            assert locked.state is EditionStatus.OPEN
             edition_locked.set()
-            # Let the retry session reach and wait on the same row lock.
+            # Let the second session reach and wait on the same row lock.
             await asyncio.sleep(0.15)
             await uow.commit()
 
     async def retry() -> tuple[str, float]:
         await edition_locked.wait()
         started = monotonic()
-        with pytest.raises(ValueError, match="edition_frozen_for_publication"):
-            await SubjectProductionService(uow_factory).retry_from_stage(
-                run.id, SubjectProductionStage.SOURCES
-            )
-        return "edition_frozen_for_publication", monotonic() - started
+        async with uow_factory() as uow:
+            retried = await uow.editions.get_for_update(edition.id)
+            assert retried is not None
+            assert retried.state is EditionStatus.OPEN
+        return "edition_remained_open", monotonic() - started
 
     freeze_task = asyncio.create_task(freeze())
     retry_task = asyncio.create_task(retry())
     _, retry_result = await asyncio.gather(freeze_task, retry_task)
     result = retry_result
-    assert result[0] == "edition_frozen_for_publication"
+    assert result[0] == "edition_remained_open"
     assert result[1] >= 0.10
 
     async with uow_factory() as uow:
@@ -167,7 +162,7 @@ async def test_freeze_blocks_concurrent_retry_after_edition_lock_is_released(
         persisted_manifest = await uow.publication_manifests.get(manifest.id)
 
     assert persisted_edition is not None
-    assert persisted_edition.status is EditionStatus.ASSEMBLING
+    assert persisted_edition.state is EditionStatus.OPEN
     assert persisted_run is not None
     assert persisted_run.pipeline_generation == run.pipeline_generation
     assert persisted_artifact is not None

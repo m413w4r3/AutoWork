@@ -128,9 +128,6 @@ def selected_subject(
         period_end=date(2026, 7, calendar.monthrange(2026, 7)[1]),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_articles=2,
-        previous_edition_id=None,
-        source_profile="default",
     )
     sources = [
         SourceCandidate(

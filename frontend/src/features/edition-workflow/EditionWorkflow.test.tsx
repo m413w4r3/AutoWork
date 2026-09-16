@@ -22,13 +22,8 @@ const edition: Edition = {
   period_end: "2026-08-31",
   tlp: "AMBER",
   languages: ["fr"],
-  target_articles: 5,
-  previous_edition_id: null,
-  source_profile: "default",
-  status: "selection",
+  state: "open",
   version: 3,
-  progress_percent: 30,
-  allowed_transitions: ["production", "archived"],
   created_at: "2026-08-29T10:00:00Z",
   updated_at: "2026-08-29T10:00:00Z",
 };
@@ -65,7 +60,6 @@ const board = {
   selected_articles: 1,
   ignored: 0,
   undecided: 0,
-  target_articles: 5,
   automatic_selection: false as const,
 };
 
@@ -116,7 +110,7 @@ const review = {
 
 const release = {
   edition_id: edition.id,
-  edition_status: "assembling" as const,
+  edition_state: "open" as const,
   manifest_id: "manifest-1",
   manifest_sha256: "a".repeat(64),
   release_id: null,
@@ -145,14 +139,14 @@ const emptyDiscovery = {
   warning: "",
 };
 
-function editionWith(
-  status: Edition["status"],
-  allowed_transitions: Edition["allowed_transitions"] = [],
-): Edition {
-  return { ...edition, status, allowed_transitions };
+function editionWith(state: Edition["state"]): Edition {
+  return { ...edition, state };
 }
 
-function renderWorkflow(value: Edition) {
+function renderWorkflow(value: Edition, phase?: string) {
+  if (phase) {
+    window.history.replaceState({}, "", `/editions/${value.id}?phase=${phase}`);
+  }
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -183,6 +177,7 @@ it("exige de cocher le sujet éligible avant de lancer, puis invalide Edition ap
   });
   const invalidate = vi.spyOn(client, "invalidateQueries");
   const user = userEvent.setup();
+  window.history.replaceState({}, "", "/editions/edition-1?phase=selection");
 
   render(
     <QueryClientProvider client={client}>
@@ -218,48 +213,30 @@ it("exige de cocher le sujet éligible avant de lancer, puis invalide Edition ap
 });
 
 describe("rendu strict des états Edition", () => {
-  it("DRAFT affiche seulement l’introduction et la transition vers DISCOVERY", async () => {
-    const updated = editionWith("discovery", ["selection"]);
+  it("DRAFT affiche directement l’outil de découverte sans transition Edition", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = urlOf(input);
       if (url.includes("/discovery/candidates")) {
         return Promise.resolve(Response.json(emptyDiscovery));
       }
-      if (init?.method === "POST")
-        return Promise.resolve(Response.json(updated));
+      if (init?.method === "POST") {
+        throw new Error(`Unexpected workflow mutation ${url}`);
+      }
       throw new Error(`Unexpected GET ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
-    const user = userEvent.setup();
-    const client = new QueryClient({
-      defaultOptions: { queries: { retry: false } },
-    });
-    render(
-      <QueryClientProvider client={client}>
-        <EditionWorkflow edition={editionWith("draft", ["discovery"])} />
-      </QueryClientProvider>,
-    );
+    renderWorkflow(editionWith("open"));
 
-    expect(screen.getByText("Préparer la découverte")).toBeInTheDocument();
+    expect(await screen.findByText("Sujets candidats")).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Démarrer la découverte" }),
-    ).toBeInTheDocument();
-    expect(screen.queryByText("Sujets candidats")).not.toBeInTheDocument();
+      screen.queryByRole("button", { name: "Démarrer la découverte" }),
+    ).not.toBeInTheDocument();
     expect(
-      fetchMock.mock.calls.some(([input]) =>
-        urlOf(input).includes("/discovery/candidates"),
-      ),
+      fetchMock.mock.calls.some(([, callInit]) => callInit?.method === "POST"),
     ).toBe(false);
-
-    await user.click(
-      screen.getByRole("button", { name: "Démarrer la découverte" }),
-    );
-    await waitFor(() =>
-      expect(client.getQueryData(["edition", edition.id])).toEqual(updated),
-    );
   });
 
-  it("DISCOVERY désactive la sélection pendant un job puis la réactive à sa fin", async () => {
+  it("DISCOVERY rend l’outil directement sans action de transition", async () => {
     const activeJobId = "job-discovery";
     window.localStorage.setItem(
       discoveryJobStorageKey(edition.id),
@@ -289,7 +266,10 @@ describe("rendu strict des états Edition", () => {
       created_at: "2026-08-29T10:00:00Z",
       updated_at: "2026-08-29T10:01:00Z",
     };
-    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === "POST") {
+        throw new Error(`Unexpected workflow mutation ${urlOf(input)}`);
+      }
       const url = urlOf(input);
       if (url.includes("/discovery/candidates"))
         return Promise.resolve(Response.json(emptyDiscovery));
@@ -298,18 +278,20 @@ describe("rendu strict des états Edition", () => {
       throw new Error(`Unexpected GET ${url}`);
     });
     vi.stubGlobal("fetch", fetchMock);
-    renderWorkflow(editionWith("discovery", ["selection"]));
+    renderWorkflow(editionWith("open"));
 
-    const openSelection = await screen.findByRole("button", {
-      name: "Ouvrir la sélection",
-    });
-    expect(openSelection).toBeDisabled();
+    expect(await screen.findByText("Sujets candidats")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Ouvrir la sélection" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByText(
         "La recherche en cours doit se terminer avant la sélection.",
       ),
     ).toBeInTheDocument();
-    await waitFor(() => expect(openSelection).toBeEnabled());
+    expect(
+      fetchMock.mock.calls.some(([, callInit]) => callInit?.method === "POST"),
+    ).toBe(false);
   });
 
   it("SELECTION affiche le board et un seul sélecteur de lot de production, non pré-armé", async () => {
@@ -324,7 +306,7 @@ describe("rendu strict des états Edition", () => {
         throw new Error(`Unexpected GET ${url}`);
       }),
     );
-    renderWorkflow(editionWith("selection", ["production"]));
+    renderWorkflow(editionWith("open"), "selection");
     expect(
       await screen.findByRole("heading", { name: "1 article éligible" }),
     ).toBeInTheDocument();
@@ -338,7 +320,7 @@ describe("rendu strict des états Edition", () => {
 
   it("PRODUCTION affiche uniquement la console métier", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(batch)));
-    renderWorkflow(editionWith("production"));
+    renderWorkflow(editionWith("open"), "production");
     expect(
       await screen.findByRole("heading", { name: "0 / 1 articles traités" }),
     ).toBeInTheDocument();
@@ -348,7 +330,7 @@ describe("rendu strict des états Edition", () => {
 
   it("REVIEW affiche la console de revue sans découverte ni sélection", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(review)));
-    renderWorkflow(editionWith("review"));
+    renderWorkflow(editionWith("open"), "review");
     expect(
       await screen.findByRole("heading", { name: "Revue de publication" }),
     ).toBeInTheDocument();
@@ -365,7 +347,7 @@ describe("rendu strict des états Edition", () => {
 
   it("ASSEMBLING charge le release et affiche l’état d’assemblage", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
-    renderWorkflow(editionWith("assembling"));
+    renderWorkflow(editionWith("open"), "publication");
     expect(
       await screen.findByRole("heading", { name: "Manifest figé" }),
     ).toBeInTheDocument();
@@ -380,12 +362,13 @@ describe("rendu strict des états Edition", () => {
       vi.fn().mockResolvedValue(
         Response.json({
           ...release,
-          edition_status: "published",
+          edition_state: "open",
+          release_id: "release-1",
           assembly_status: "succeeded",
         }),
       ),
     );
-    renderWorkflow(editionWith("published"));
+    renderWorkflow(editionWith("open"), "publication");
     expect(
       await screen.findByRole("heading", { name: "Bulletin publié" }),
     ).toBeInTheDocument();
@@ -394,7 +377,7 @@ describe("rendu strict des états Edition", () => {
 
   it("ARCHIVED affiche son état en lecture seule", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
-    renderWorkflow(editionWith("archived"));
+    renderWorkflow(editionWith("archived"), "publication");
     expect(
       await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();
@@ -409,6 +392,8 @@ describe("navigation historique du workflow", () => {
       if (init?.method === "POST") {
         throw new Error(`Unexpected workflow mutation ${url}`);
       }
+      if (url.endsWith("/discovery/candidates"))
+        return Response.json(emptyDiscovery);
       if (url.endsWith("/release")) return Response.json(release);
       if (url.endsWith("/editorial-groups")) return Response.json(board);
       if (url.endsWith("/production")) return Response.json(batch);
@@ -424,10 +409,8 @@ describe("navigation historique du workflow", () => {
 
     renderWorkflow(editionWith("archived"));
 
-    expect(
-      await screen.findByRole("heading", { name: "Édition archivée" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Publication" })).toHaveAttribute(
+    expect(await screen.findByText("Sujets candidats")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Découverte" })).toHaveAttribute(
       "aria-current",
       "step",
     );
@@ -478,7 +461,7 @@ describe("navigation historique du workflow", () => {
     ).toBe(false);
   });
 
-  it("ouvre la phase demandée par URL et retombe sur la phase courante si elle est invalide", async () => {
+  it("ouvre la phase demandée par URL et retombe sur la découverte si elle est invalide", async () => {
     const fetchMock = historyFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState({}, "", "/editions/edition-1?phase=production");
@@ -492,10 +475,8 @@ describe("navigation historique du workflow", () => {
 
     window.history.replaceState({}, "", "/editions/edition-1?phase=unknown");
     renderWorkflow(editionWith("archived"));
-    expect(
-      await screen.findByRole("heading", { name: "Édition archivée" }),
-    ).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Publication" })).toHaveAttribute(
+    expect(await screen.findByText("Sujets candidats")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Découverte" })).toHaveAttribute(
       "aria-current",
       "step",
     );
@@ -504,12 +485,12 @@ describe("navigation historique du workflow", () => {
     ).toBe(false);
   });
 
-  it("conserve les contrôles de la phase courante pour une édition active", async () => {
+  it("laisse les outils actifs accessibles pour une édition ouverte", async () => {
     const fetchMock = historyFetchMock();
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
 
-    renderWorkflow(editionWith("production"));
+    renderWorkflow(editionWith("open"), "production");
     expect(
       await screen.findByRole("heading", { name: "0 / 1 articles traités" }),
     ).toBeInTheDocument();
@@ -524,8 +505,8 @@ describe("navigation historique du workflow", () => {
       await screen.findByRole("heading", { name: "Sélection des sujets" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Tout sélectionner" }),
-    ).not.toBeInTheDocument();
+      screen.getByRole("button", { name: "Tout sélectionner" }),
+    ).toBeInTheDocument();
     expect(
       fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
     ).toBe(false);
@@ -583,7 +564,6 @@ describe("sélecteur du lot de production", () => {
       selected_articles: groups.length,
       ignored: 0,
       undecided: 0,
-      target_articles: groups.length,
       automatic_selection: false as const,
     };
   }
@@ -601,7 +581,7 @@ describe("sélecteur du lot de production", () => {
       "fetch",
       vi.fn().mockResolvedValue(Response.json(boardOf(groups))),
     );
-    renderWorkflow(editionWith("selection"));
+    renderWorkflow(editionWith("open"), "selection");
 
     expect(
       await screen.findByRole("heading", { name: "22 articles éligibles" }),
@@ -624,7 +604,7 @@ describe("sélecteur du lot de production", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
     const user = userEvent.setup();
-    renderWorkflow(editionWith("selection"));
+    renderWorkflow(editionWith("open"), "selection");
 
     await screen.findByRole("heading", { name: "3 articles éligibles" });
     const checkboxB = screen.getByRole("checkbox", { name: "Article B" });
@@ -664,7 +644,7 @@ describe("sélecteur du lot de production", () => {
   it("désélectionner B ramène le compteur à 1", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(boardABC)));
     const user = userEvent.setup();
-    renderWorkflow(editionWith("selection"));
+    renderWorkflow(editionWith("open"), "selection");
 
     await screen.findByRole("heading", { name: "3 articles éligibles" });
     await user.click(screen.getByRole("checkbox", { name: "Article A" }));
@@ -681,7 +661,7 @@ describe("sélecteur du lot de production", () => {
   it("un article devenu non éligible est retiré automatiquement de la sélection", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(boardABC)));
     const user = userEvent.setup();
-    const client = renderWorkflow(editionWith("selection"));
+    const client = renderWorkflow(editionWith("open"), "selection");
 
     await screen.findByRole("heading", { name: "3 articles éligibles" });
     await user.click(screen.getByRole("checkbox", { name: "Article A" }));

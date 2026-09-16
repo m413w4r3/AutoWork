@@ -15,7 +15,7 @@ const emptyEditionPage = {
   page_size: 20,
 };
 
-const draftEdition: Edition = {
+const openEdition: Edition = {
   id: "edition-1",
   country: "France",
   country_code: "FR",
@@ -23,13 +23,8 @@ const draftEdition: Edition = {
   period_end: "2026-08-31",
   tlp: "GREEN",
   languages: ["fr"],
-  target_articles: 3,
-  previous_edition_id: null,
-  source_profile: "default",
-  status: "draft",
+  state: "open",
   version: 1,
-  progress_percent: 0,
-  allowed_transitions: ["discovery"],
   created_at: "2026-08-29T10:00:00Z",
   updated_at: "2026-08-29T10:00:00Z",
 };
@@ -87,7 +82,7 @@ describe("EditionListPage URL filters", () => {
     window.history.replaceState(
       null,
       "",
-      "/editions?country_code=fr&period=2026-08&status=production",
+      "/editions?country_code=fr&period=2026-08&state=open",
     );
     const fetchMock = stubFetch(() => Response.json(emptyEditionPage));
 
@@ -95,10 +90,10 @@ describe("EditionListPage URL filters", () => {
 
     expect(screen.getByLabelText("Code pays")).toHaveValue("FR");
     expect(screen.getByLabelText("Période")).toHaveValue("2026-08");
-    expect(screen.getByLabelText("Statut")).toHaveValue("production");
+    expect(screen.getByLabelText("État")).toHaveValue("open");
     await screen.findByRole("heading", { name: "Aucune édition" });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/editions?country_code=FR&period=2026-08&status=production",
+      "/api/editions?country_code=FR&period=2026-08&state=open",
       undefined,
     );
   });
@@ -107,7 +102,7 @@ describe("EditionListPage URL filters", () => {
     window.history.replaceState(
       null,
       "",
-      "/editions?country_code=france&period=2026-13&status=unknown",
+      "/editions?country_code=france&period=2026-13&state=unknown",
     );
     const fetchMock = stubFetch(() => Response.json(emptyEditionPage));
 
@@ -115,7 +110,7 @@ describe("EditionListPage URL filters", () => {
 
     expect(screen.getByLabelText("Code pays")).toHaveValue("");
     expect(screen.getByLabelText("Période")).toHaveValue("");
-    expect(screen.getByLabelText("Statut")).toHaveValue("");
+    expect(screen.getByLabelText("État")).toHaveValue("");
     await screen.findByRole("heading", { name: "Aucune édition" });
     expect(fetchMock).toHaveBeenCalledWith("/api/editions?", undefined);
   });
@@ -124,7 +119,7 @@ describe("EditionListPage URL filters", () => {
     window.history.replaceState(
       null,
       "",
-      "/editions?country_code=FR&period=2026-08&status=production&source=test",
+      "/editions?country_code=FR&period=2026-08&state=open&source=test",
     );
     const fetchMock = stubFetch(() => Response.json(emptyEditionPage));
     const replaceState = vi.spyOn(window.history, "replaceState");
@@ -136,14 +131,14 @@ describe("EditionListPage URL filters", () => {
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/editions?period=2026-08&status=production",
+        "/api/editions?period=2026-08&state=open",
         undefined,
       ),
     );
     expect(replaceState).toHaveBeenCalledWith(
       window.history.state,
       "",
-      "/editions?period=2026-08&status=production&source=test",
+      "/editions?period=2026-08&state=open&source=test",
     );
     expect(
       screen.getByRole("heading", { name: "Éditions" }),
@@ -154,7 +149,7 @@ describe("EditionListPage URL filters", () => {
     window.history.replaceState(
       null,
       "",
-      "/editions?country_code=FR&period=2026-08&status=production",
+      "/editions?country_code=FR&period=2026-08&state=open",
     );
     const fetchMock = stubFetch(() => Response.json(emptyEditionPage));
 
@@ -163,18 +158,18 @@ describe("EditionListPage URL filters", () => {
     window.history.pushState(
       null,
       "",
-      "/editions?country_code=DE&period=2027-02&status=review",
+      "/editions?country_code=DE&period=2027-02&state=archived",
     );
     window.dispatchEvent(new PopStateEvent("popstate"));
 
     await waitFor(() => {
       expect(screen.getByLabelText("Code pays")).toHaveValue("DE");
       expect(screen.getByLabelText("Période")).toHaveValue("2027-02");
-      expect(screen.getByLabelText("Statut")).toHaveValue("review");
+      expect(screen.getByLabelText("État")).toHaveValue("archived");
     });
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/editions?country_code=DE&period=2027-02&status=review",
+        "/api/editions?country_code=DE&period=2027-02&state=archived",
         undefined,
       ),
     );
@@ -184,18 +179,18 @@ describe("EditionListPage URL filters", () => {
     window.history.replaceState(
       null,
       "",
-      "/editions?country_code=fr&period=2026-08&status=draft",
+      "/editions?country_code=fr&period=2026-08&state=open",
     );
     stubFetch((url) => {
-      if (url === "/api/editions?country_code=FR&period=2026-08&status=draft") {
+      if (url === "/api/editions?country_code=FR&period=2026-08&state=open") {
         return Response.json({
-          items: [draftEdition],
+          items: [openEdition],
           total: 1,
           page: 1,
           page_size: 20,
         });
       }
-      return Response.json(draftEdition);
+      return Response.json(openEdition);
     });
 
     const user = userEvent.setup();
@@ -207,11 +202,11 @@ describe("EditionListPage URL filters", () => {
     await waitFor(() => {
       expect(window.location.pathname).toBe("/editions");
       expect(window.location.search).toBe(
-        "?country_code=fr&period=2026-08&status=draft",
+        "?country_code=fr&period=2026-08&state=open",
       );
       expect(screen.getByLabelText("Code pays")).toHaveValue("FR");
       expect(screen.getByLabelText("Période")).toHaveValue("2026-08");
-      expect(screen.getByLabelText("Statut")).toHaveValue("draft");
+      expect(screen.getByLabelText("État")).toHaveValue("open");
     });
   });
 });

@@ -10,13 +10,10 @@ test("Article : sélection, production, revue et publication DOCX", async ({
   const artifactId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
   const manifestId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const hash = "a".repeat(64);
-  let productionStarted = false;
-  let productionTerminal = false;
   let batchReads = 0;
   let publicationAccepted = false;
   let releasePublished = false;
   let releaseReads = 0;
-  let editionReads = 0;
   const seenPaths: string[] = [];
 
   const edition = () => ({
@@ -27,21 +24,8 @@ test("Article : sélection, production, revue et publication DOCX", async ({
     period_end: "2026-08-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_articles: 1,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: releasePublished
-      ? "published"
-      : publicationAccepted
-        ? "assembling"
-        : productionTerminal && editionReads >= 4
-          ? "review"
-          : productionStarted
-            ? "production"
-            : "selection",
-    version: publicationAccepted ? 5 : productionStarted ? 3 : 2,
-    progress_percent: releasePublished ? 100 : publicationAccepted ? 90 : 40,
-    allowed_transitions: releasePublished ? ["archived"] : ["archived"],
+    state: "open",
+    version: 2,
     created_at: "2026-08-29T00:00:00Z",
     updated_at: "2026-08-29T00:00:00Z",
   });
@@ -78,7 +62,6 @@ test("Article : sélection, production, revue et publication DOCX", async ({
     selected_articles: 1,
     ignored: 0,
     undecided: 0,
-    target_articles: 1,
     automatic_selection: false,
   };
 
@@ -152,7 +135,7 @@ test("Article : sélection, production, revue et publication DOCX", async ({
 
   const release = () => ({
     edition_id: editionId,
-    edition_status: releasePublished ? "published" : "assembling",
+    edition_state: "open",
     manifest_id: manifestId,
     manifest_sha256: hash,
     release_id: releasePublished ? "release-1" : null,
@@ -174,7 +157,6 @@ test("Article : sélection, production, revue et publication DOCX", async ({
     seenPaths.push(`${request.method()} ${path}`);
 
     if (path === `/api/editions/${editionId}`) {
-      editionReads += 1;
       await route.fulfill({ json: edition() });
       return;
     }
@@ -186,13 +168,11 @@ test("Article : sélection, production, revue et publication DOCX", async ({
       path === `/api/editions/${editionId}/production` &&
       request.method() === "POST"
     ) {
-      productionStarted = true;
       await route.fulfill({ status: 202, json: runningBatch });
       return;
     }
     if (path === `/api/editions/${editionId}/production`) {
       batchReads += 1;
-      if (batchReads > 1) productionTerminal = true;
       await route.fulfill({ json: batchReads === 1 ? runningBatch : batch });
       return;
     }
@@ -206,7 +186,7 @@ test("Article : sélection, production, revue et publication DOCX", async ({
         status: 202,
         json: {
           edition_id: editionId,
-          edition_status: "assembling",
+          edition_state: "open",
           manifest_id: manifestId,
           manifest_sha256: hash,
           edition_version: 4,
@@ -268,6 +248,7 @@ test("Article : sélection, production, revue et publication DOCX", async ({
   ).toBeVisible();
   await expect(page.getByText("1 prêts")).toBeVisible();
   await page.reload();
+  await page.getByRole("link", { name: "Publication" }).click();
 
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),

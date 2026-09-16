@@ -449,9 +449,7 @@ class ProductionScenario:
             period_end=date(2026, 8, 31),
             tlp=TLP.AMBER,
             languages=("fr",),
-            target_articles=1,
-            source_profile="business-test",
-            status=EditionStatus.SELECTION,
+            state=EditionStatus.OPEN,
         )
         self.subject = Subject(
             external_id=f"BUSINESS-{uuid4().hex}",

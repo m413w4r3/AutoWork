@@ -323,7 +323,7 @@ class _Orchestrator:
         return {"stage": expected_stage.value, "status": "success"}
 
 
-def _edition(status: EditionStatus = EditionStatus.PRODUCTION) -> Edition:
+def _edition(state: EditionStatus = EditionStatus.OPEN) -> Edition:
     return Edition(
         country="France",
         country_code="FR",
@@ -331,9 +331,7 @@ def _edition(status: EditionStatus = EditionStatus.PRODUCTION) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
-        status=status,
+        state=state,
     )
 
 
@@ -360,12 +358,12 @@ class _World:
         produced: Sequence[ProductionArtifactStage] = (),
         progress: dict[str, Any] | None = None,
         archived_sources: int = len(SOURCE_IDS),
-        edition_status: EditionStatus = EditionStatus.PRODUCTION,
+        edition_state: EditionStatus = EditionStatus.OPEN,
         batch_status: ProductionBatchStatus = ProductionBatchStatus.RUNNING,
         batch_phase: ProductionBatchPhase = ProductionBatchPhase.INITIAL,
         with_sibling: bool = False,
     ) -> None:
-        self.edition = _edition(edition_status)
+        self.edition = _edition(edition_state)
         self.uow = _Uow(self.edition, archived_sources=archived_sources)
         self.batch = self.uow.edition_production_batches.add(
             EditionProductionBatch(
@@ -687,12 +685,12 @@ async def test_resume_keeps_one_run_one_edition_entry_and_no_orphan_artifact(
 async def test_a_cancelled_article_of_an_edition_resumes_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Case 4: one article of a finished batch, resumed from the Review."""
+    """Case 4: one article of a finished batch, resumed from batch Review."""
     world = _World(
         stage=SubjectProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         progress=_progress(*SOURCE_IDS),
-        edition_status=EditionStatus.REVIEW,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
         batch_phase=ProductionBatchPhase.REVIEW,
         with_sibling=True,
@@ -710,8 +708,9 @@ async def test_a_cancelled_article_of_an_edition_resumes_alone(
     # The neighbour is untouched: resuming is an article-local gesture.
     assert world.sibling.status is SubjectProductionStatus.READY
     assert world.sibling.pipeline_generation == sibling_generation
-    # Review-time recovery never reopens the whole edition in production.
-    assert world.uow.editions.edition.status is EditionStatus.REVIEW
+    # Review-time recovery never changes the edition state or version.
+    assert world.uow.editions.edition.state is EditionStatus.OPEN
+    assert world.uow.editions.edition.version == 1
 
 
 async def test_resume_is_refused_when_a_sibling_is_still_running() -> None:
@@ -740,11 +739,11 @@ async def test_resume_is_refused_on_a_cancelled_batch() -> None:
     assert world.run.status is SubjectProductionStatus.CANCELLED
 
 
-async def test_resume_is_refused_once_the_edition_left_production() -> None:
-    world = _World(stage=SubjectProductionStage.SYNTHESIS, edition_status=EditionStatus.ASSEMBLING)
+async def test_resume_is_refused_once_the_edition_is_archived() -> None:
+    world = _World(stage=SubjectProductionStage.SYNTHESIS, edition_state=EditionStatus.ARCHIVED)
     await world.service().cancel_run_with_result(world.run.id)
 
-    with pytest.raises(ValueError, match="edition_frozen_for_publication"):
+    with pytest.raises(ValueError, match="edition_archived"):
         await world.service().resume_cancelled_run(world.run.id)
 
 

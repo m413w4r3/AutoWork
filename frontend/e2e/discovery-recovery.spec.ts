@@ -36,13 +36,8 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
           period_end: "2026-08-31",
           tlp: "AMBER",
           languages: ["fr", "en", "fa"],
-          target_articles: 8,
-          previous_edition_id: null,
-          source_profile: "iran-default",
-          status: "discovery",
+          state: "open",
           version: 1,
-          progress_percent: 10,
-          allowed_transitions: ["selection", "archived"],
           created_at: "2026-08-13T10:00:00Z",
           updated_at: "2026-08-13T10:00:00Z",
         },
@@ -60,7 +55,6 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
           selected_articles: 0,
           ignored: 0,
           undecided: 0,
-          target_articles: 8,
           automatic_selection: false,
         },
       });
@@ -106,6 +100,9 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
     }
     if (path.endsWith("/manual/preview")) {
       calls.manual += 1;
+      expect(request.postDataJSON()).toMatchObject({
+        source_profile: "iran-default",
+      });
       return route.fulfill({ json: preview });
     }
     if (path.endsWith("/complete")) {

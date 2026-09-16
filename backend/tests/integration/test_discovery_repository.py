@@ -37,8 +37,6 @@ async def test_discovery_batch_round_trip_and_source_status(
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_articles=8,
-        source_profile="iran-default",
     )
     research_run = _run("research", "a")
     source = SourceCandidate(
@@ -198,8 +196,6 @@ async def test_discovery_batch_contributions_metadata_preserved(
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_articles=8,
-        source_profile="iran-default",
     )
     research_run = _run("research", "a")
     source = SourceCandidate(

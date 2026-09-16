@@ -53,7 +53,7 @@ class InMemoryEditionRepository:
         country_code: str | None,
         period_start: date | None,
         period_end: date | None,
-        status: EditionStatus | None,
+        state: EditionStatus | None,
     ) -> tuple[Sequence[Edition], int]:
         matches = [
             deepcopy(edition)
@@ -61,7 +61,7 @@ class InMemoryEditionRepository:
             if (country_code is None or edition.country_code == country_code)
             and (period_start is None or edition.period_start >= period_start)
             and (period_end is None or edition.period_end <= period_end)
-            and (status is None or edition.status is status)
+            and (state is None or edition.state is state)
         ]
         matches.sort(key=lambda item: (item.period_start, item.country_code), reverse=True)
         return matches[offset : offset + limit], len(matches)

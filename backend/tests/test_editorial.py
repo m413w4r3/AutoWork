@@ -27,9 +27,6 @@ def _edition() -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_articles=6,
-        previous_edition_id=None,
-        source_profile="iran-default",
     )
 
 
@@ -139,10 +136,9 @@ async def test_active_snapshot_creates_one_group_per_durable_subject() -> None:
 
 
 @pytest.mark.asyncio
-async def test_ioc_signal_auto_selects_article_even_above_target_and_audits_once() -> None:
+async def test_ioc_signal_auto_selects_article_without_edition_quota() -> None:
     uow = InMemoryEditorialUnitOfWorkFactory()
     edition = _edition()
-    edition.target_articles = 0
     uow.editions[edition.id] = edition
     candidate = _candidate("IOC campaign", "https://example.test/ioc")
     candidate.iocs = ("203.0.113.10",)

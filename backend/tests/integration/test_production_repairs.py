@@ -12,7 +12,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_repairs import repair_key_for_rejection
 from cti_app.domain.classification import TLP
-from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -43,9 +43,6 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         period_end=date(2098, 1, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=1,
-        source_profile="test",
-        status=EditionStatus.REVIEW,
     )
     subject = Subject(
         external_id=f"repair-{uuid4().hex}",

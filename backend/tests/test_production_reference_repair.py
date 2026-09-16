@@ -146,7 +146,7 @@ class _Uow:
         self.committed = False
 
     async def _edition(self) -> SimpleNamespace:
-        return SimpleNamespace(status=EditionStatus.REVIEW)
+        return SimpleNamespace(state=EditionStatus.OPEN)
 
     async def _list_collections(self, _subject_id: UUID) -> list[object]:
         return self.collections

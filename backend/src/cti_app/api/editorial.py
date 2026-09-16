@@ -117,7 +117,6 @@ class EditorialBoardView(BaseModel):
     selected_articles: int
     ignored: int
     undecided: int
-    target_articles: int
     automatic_selection: bool = False
 
 
@@ -299,7 +298,6 @@ def _board_view(board: EditorialBoard) -> EditorialBoardView:
         selected_articles=board.selected_articles,
         ignored=board.ignored,
         undecided=board.undecided,
-        target_articles=board.target_articles,
     )
 
 

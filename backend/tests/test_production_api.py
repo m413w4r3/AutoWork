@@ -108,25 +108,14 @@ class _Groups:
 class _Edition:
     def __init__(self, edition_id: UUID) -> None:
         self.id = edition_id
-        self.status = EditionStatus.SELECTION
+        self.state = EditionStatus.OPEN
         self.version = 1
         today = datetime.now(UTC).date()
         self.period_start = today
         self.period_end = today
 
     def snapshot(self) -> dict[str, Any]:
-        return {"id": str(self.id), "status": self.status.value, "version": self.version}
-
-    def transition(self, status: EditionStatus, *, now: datetime) -> None:
-        del now
-        self.status = status
-        self.version += 1
-
-    def return_to_selection_after_production_cancellation(self, *, now: datetime) -> None:
-        del now
-        assert self.status is EditionStatus.PRODUCTION
-        self.status = EditionStatus.SELECTION
-        self.version += 1
+        return {"id": str(self.id), "state": self.state.value, "version": self.version}
 
 
 class _Editions:
@@ -772,7 +761,25 @@ async def test_start_edition_produces_every_selected_article(api: AsyncClient, u
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 3
-    assert (await uow.editions.get(edition_id)).status is EditionStatus.PRODUCTION
+    edition = await uow.editions.get(edition_id)
+    assert edition.state is EditionStatus.OPEN
+    assert edition.version == 1
+
+
+async def test_start_edition_rejects_an_archived_edition(api: AsyncClient, uow: _Uow) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    edition = await uow.editions.get(edition_id)
+    edition.state = EditionStatus.ARCHIVED
+    version = edition.version
+
+    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+
+    assert response.status_code == 400
+    assert not uow.edition_production_batches.items
+    assert edition.state is EditionStatus.ARCHIVED
+    assert edition.version == version
 
 
 async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _Uow) -> None:
@@ -807,7 +814,7 @@ async def test_start_edition_rejects_explicit_empty_subject_selection(
 
     assert response.status_code == 400
     assert not uow.edition_production_batches.items
-    assert (await uow.editions.get(edition_id)).status is EditionStatus.SELECTION
+    assert (await uow.editions.get(edition_id)).state is EditionStatus.OPEN
 
 
 async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chosen_subset(
@@ -1537,7 +1544,7 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     else:
         run.mark_needs_review(code="extraction_review", message="review")
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(edition_id)).status = EditionStatus.PRODUCTION
+    (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
 
@@ -1585,7 +1592,7 @@ async def test_retry_stage_rejects_queued_or_running_run(
     if status is SubjectProductionStatus.RUNNING:
         run.start_running()
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(run.edition_id)).status = EditionStatus.PRODUCTION
+    (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
 
     response = await api.post(
         f"/api/subjects/{run.subject_id}/production/retry", json={"stage": "extraction"}
@@ -1628,7 +1635,7 @@ async def test_retry_by_run_changes_only_the_requested_run(
     second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
     await uow.subject_production_runs.add(first)
     await uow.subject_production_runs.add(second)
-    (await uow.editions.get(first.edition_id)).status = EditionStatus.PRODUCTION
+    (await uow.editions.get(first.edition_id)).state = EditionStatus.OPEN
     await uow.production_artifacts.append(_artifact(first, ProductionArtifactStage.REFERENCES))
 
     response = await api.post(
@@ -1659,7 +1666,7 @@ async def test_a_refused_retry_names_the_stage_that_would_run(
     subject_id = uuid4()
     run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(run.edition_id)).status = EditionStatus.REVIEW
+    (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
     # Everything downstream of EXTRACTION was invalidated by the repair.
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
@@ -1686,7 +1693,7 @@ async def test_the_named_retry_stage_is_the_one_that_succeeds(
     subject_id = uuid4()
     run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(run.edition_id)).status = EditionStatus.REVIEW
+    (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
 
@@ -1726,11 +1733,12 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert response.status_code == 200, response.text
     assert repeated.status_code == 200, repeated.text
     assert batch.status == "cancelled"
-    assert (await uow.editions.get(edition_id)).status is EditionStatus.SELECTION
-    assert [event.action for event in uow.edition_audit.events] == [
-        "edition.transitioned",
-        "edition.production_cancelled",
-    ]
+    assert response.json()["edition_state"] == "open"
+    assert response.json()["edition_version"] == 1
+    edition = await uow.editions.get(edition_id)
+    assert edition.state is EditionStatus.OPEN
+    assert edition.version == 1
+    assert uow.edition_audit.events == []
     assert all(
         run.status is SubjectProductionStatus.CANCELLED
         for run in uow.subject_production_runs.items.values()
@@ -1771,7 +1779,32 @@ async def test_batch_cancel_preserves_terminal_runs(
     assert uow.subject_production_runs.items[items[2].production_run_id].status is (
         SubjectProductionStatus.CANCELLED
     )
-    assert response.json()["edition_status"] == "selection"
+    assert response.json()["edition_state"] == "open"
+    assert "edition_status" not in response.json()
+
+
+async def test_batch_cancel_rejects_an_archived_edition(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+
+    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    assert started.status_code == 200, started.text
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    edition = await uow.editions.get(edition_id)
+    edition.state = EditionStatus.ARCHIVED
+    version = edition.version
+
+    response = await api.post(f"/api/editions/{edition_id}/production/{batch.id}/cancel")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "edition_archived"
+    assert batch.status == ProductionBatchStatus.RUNNING
+    assert edition.state is EditionStatus.ARCHIVED
+    assert edition.version == version
 
 
 async def test_repeated_old_batch_cancel_cannot_affect_newer_batch(
@@ -2135,7 +2168,7 @@ async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
     edition_id, subject_id = uuid4(), uuid4()
     run = _reconciliation_run(edition_id, subject_id)
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
     jobs = production_app.state.job_service
@@ -2259,7 +2292,7 @@ async def test_retry_by_run_is_refused_while_reconciliation_is_pending(
     edition_id, subject_id = uuid4(), uuid4()
     run = _reconciliation_run(edition_id, subject_id)
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
     jobs = production_app.state.job_service
@@ -2285,7 +2318,7 @@ async def test_reconciliation_barrier_does_not_change_the_ordinary_retry_contrac
     run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
     run.current_stage = SubjectProductionStage.EXTRACTION
     await uow.subject_production_runs.add(run)
-    (await uow.editions.get(edition_id)).status = EditionStatus.REVIEW
+    (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
 

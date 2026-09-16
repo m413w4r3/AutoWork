@@ -198,6 +198,7 @@ export interface DiscoveryImportConfirmResult {
 export function launchDiscovery(
   editionId: string,
   complementaryAxis: string,
+  sourceProfile: string,
   confirmNewResearch = false,
 ): Promise<DiscoveryLaunchResult> {
   return request(`/api/editions/${encodeURIComponent(editionId)}/discovery`, {
@@ -205,6 +206,7 @@ export function launchDiscovery(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       complementary_axis: complementaryAxis,
+      source_profile: sourceProfile,
       confirm_new_research: confirmNewResearch,
     }),
   });
@@ -317,6 +319,7 @@ export function confirmManualDiscoveryRecovery(
 export function previewDiscoveryImport(
   editionId: string,
   markdown: string,
+  sourceProfile: string,
   complementaryAxis: string = "manual-import",
   sensitivity: string = "internal",
 ): Promise<DiscoveryRecoveryPreview> {
@@ -327,6 +330,7 @@ export function previewDiscoveryImport(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         markdown,
+        source_profile: sourceProfile,
         complementary_axis: complementaryAxis,
         sensitivity,
         external_llm_allowed: true,
@@ -339,6 +343,7 @@ export function confirmDiscoveryImport(
   editionId: string,
   markdown: string,
   expectedSha256: string,
+  sourceProfile: string,
   complementaryAxis: string = "manual-import",
   sensitivity: string = "internal",
 ): Promise<DiscoveryImportConfirmResult> {
@@ -350,6 +355,7 @@ export function confirmDiscoveryImport(
       body: JSON.stringify({
         markdown,
         expected_sha256: expectedSha256,
+        source_profile: sourceProfile,
         complementary_axis: complementaryAxis,
         sensitivity,
         external_llm_allowed: true,

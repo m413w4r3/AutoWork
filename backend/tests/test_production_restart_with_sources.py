@@ -101,7 +101,7 @@ class _Editions:
             (),
             {
                 "id": edition_id,
-                "status": EditionStatus.PRODUCTION,
+                "state": EditionStatus.OPEN,
                 "period_start": today - timedelta(days=7),
                 "period_end": today,
             },

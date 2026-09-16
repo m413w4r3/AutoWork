@@ -1,7 +1,7 @@
 """Resuming one article from Review, on the batch state that really exists.
 
 A production that ends with issues leaves the batch terminal
-(``completed_with_issues``, phase ``review``) and the edition in ``review``.
+(``completed_with_issues``, phase ``review``) while the edition stays ``open``.
 Every dispatch fence only lets a QUEUED or RUNNING batch move a subject
 forward, so an article corrected from Review used to run its current stage and
 then stop: the chained job for the next stage was fenced out and the run stayed
@@ -290,7 +290,7 @@ class _Orchestrator:
         return {"stage": expected_stage.value, "status": "success"}
 
 
-def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
+def _edition(state: EditionStatus = EditionStatus.OPEN) -> Edition:
     return Edition(
         country="France",
         country_code="FR",
@@ -298,9 +298,7 @@ def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
-        status=status,
+        state=state,
     )
 
 
@@ -310,13 +308,13 @@ class _World:
     def __init__(
         self,
         *,
-        edition_status: EditionStatus = EditionStatus.REVIEW,
+        edition_state: EditionStatus = EditionStatus.OPEN,
         batch_status: ProductionBatchStatus = ProductionBatchStatus.COMPLETED_WITH_ISSUES,
         batch_phase: ProductionBatchPhase = ProductionBatchPhase.REVIEW,
         stage: SubjectProductionStage = SubjectProductionStage.EXTRACTION,
         run_status: SubjectProductionStatus = SubjectProductionStatus.NEEDS_REVIEW,
     ) -> None:
-        self.edition = _edition(edition_status)
+        self.edition = _edition(edition_state)
         self.uow = _Uow(self.edition)
         self.batch = self.uow.edition_production_batches.add(
             EditionProductionBatch(
@@ -442,15 +440,16 @@ async def test_review_retry_reopens_the_finished_batch_and_reaches_assembly(
     # cleanly this time, since every article of the batch is now ready.
     assert world.batch.status is ProductionBatchStatus.COMPLETED
     assert world.batch.phase is ProductionBatchPhase.REVIEW
-    # Review-time recovery never reopens the whole edition in production.
-    assert world.uow.editions.edition.status is EditionStatus.REVIEW
+    # Review-time recovery never changes the edition state or version.
+    assert world.uow.editions.edition.state is EditionStatus.OPEN
+    assert world.uow.editions.edition.version == 1
 
 
 async def test_a_still_running_batch_keeps_its_own_phase_on_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World(
-        edition_status=EditionStatus.PRODUCTION,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.RUNNING,
         batch_phase=ProductionBatchPhase.INITIAL,
     )
@@ -476,26 +475,26 @@ async def test_cancelled_batch_blocks_a_review_retry(monkeypatch: pytest.MonkeyP
     assert world.run.pipeline_generation == 1
 
 
-async def test_publication_freeze_blocks_a_review_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_publication_manifest_does_not_block_an_open_edition_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     world = _World()
     _register(world, monkeypatch)
     world.uow.publication_manifests.frozen = True
 
-    with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+    await _retry(world, SubjectProductionStage.EXTRACTION)
 
-    assert str(error.value) == "edition_frozen_for_publication"
-    assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+    assert world.batch.status is ProductionBatchStatus.RUNNING
 
 
-async def test_assembling_edition_blocks_a_review_retry(monkeypatch: pytest.MonkeyPatch) -> None:
-    world = _World(edition_status=EditionStatus.ASSEMBLING)
+async def test_archived_edition_blocks_a_review_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    world = _World(edition_state=EditionStatus.ARCHIVED)
     _register(world, monkeypatch)
 
     with pytest.raises(ValueError) as error:
         await _retry(world, SubjectProductionStage.EXTRACTION)
 
-    assert str(error.value) == "edition_frozen_for_publication"
+    assert str(error.value) == "edition_archived"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
 
 
@@ -751,7 +750,7 @@ async def test_a_running_sibling_blocks_a_retry_inside_a_running_batch(
 ) -> None:
     """One subject at a time, including during the batch's initial pass."""
     world = _World(
-        edition_status=EditionStatus.PRODUCTION,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.RUNNING,
         batch_phase=ProductionBatchPhase.INITIAL,
     )
@@ -773,7 +772,7 @@ async def test_the_same_retry_succeeds_once_the_sibling_is_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World(
-        edition_status=EditionStatus.PRODUCTION,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.RUNNING,
         batch_phase=ProductionBatchPhase.INITIAL,
     )
@@ -792,7 +791,7 @@ async def test_the_same_retry_succeeds_once_the_sibling_is_terminal(
 
 async def test_a_queued_sibling_never_blocks_a_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     world = _World(
-        edition_status=EditionStatus.PRODUCTION,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.RUNNING,
         batch_phase=ProductionBatchPhase.INITIAL,
     )

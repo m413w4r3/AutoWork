@@ -51,7 +51,7 @@ class _DecisionArguments(TypedDict):
     actor_id: str
 
 
-def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
+def _edition(state: EditionStatus = EditionStatus.OPEN) -> Edition:
     from datetime import date
 
     return Edition(
@@ -62,9 +62,7 @@ def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=1,
-        source_profile="test",
-        status=status,
+        state=state,
     )
 
 
@@ -336,31 +334,34 @@ async def test_stale_generation_does_not_append() -> None:
 
 
 @pytest.mark.asyncio
-async def test_status_without_review_is_rejected() -> None:
+async def test_review_requires_an_existing_edition() -> None:
     row = _row(SubjectProductionStatus.READY)
-    uow = _Uow(_edition(EditionStatus.SELECTION), row)
-    with pytest.raises(ValueError, match="edition_has_no_review"):
+    edition = _edition()
+    edition.id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    uow = _Uow(edition, row)
+    with pytest.raises(ValueError) as error:
         await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
+    assert str(error.value) == str(EDITION_ID)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edition_status",
-    [EditionStatus.PRODUCTION, EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED],
+    "edition_state",
+    [EditionStatus.OPEN, EditionStatus.ARCHIVED],
 )
-async def test_frozen_edition_stays_readable(edition_status: EditionStatus) -> None:
-    """Reading a historical review is not editing it (read/write split)."""
+async def test_review_stays_readable_for_open_and_archived(edition_state: EditionStatus) -> None:
+    """Review data is readable independently of the edition lifecycle state."""
     row = _row(SubjectProductionStatus.READY)
-    uow = _Uow(_edition(edition_status), row)
+    uow = _Uow(_edition(edition_state), row)
     review = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
     assert [item.subject_id for item in review.items] == [SUBJECT_ID]
 
 
 @pytest.mark.asyncio
-async def test_published_edition_still_refuses_a_decision() -> None:
+async def test_archived_edition_still_refuses_a_decision() -> None:
     row = _row(SubjectProductionStatus.READY)
-    uow = _Uow(_edition(EditionStatus.PUBLISHED), row)
-    with pytest.raises(ValueError, match="edition_must_be_in_review"):
+    uow = _Uow(_edition(EditionStatus.ARCHIVED), row)
+    with pytest.raises(ValueError, match="edition_archived"):
         await EditionReviewService(cast(Any, _Factory(uow))).decide(
             EDITION_ID,
             SUBJECT_ID,

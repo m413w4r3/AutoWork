@@ -1,13 +1,12 @@
 import { expect, test } from "@playwright/test";
 
-test("Édition : arrêter la production revient à la sélection", async ({
+test("Édition : arrêter la production conserve l’édition ouverte", async ({
   page,
 }) => {
   const editionId = "12121212-1212-4121-8121-121212121212";
   const subjectId = "a1111111-1111-4111-8111-111111111111";
   const batchId = "e5555555-5555-4555-8555-555555555555";
   const runId = "f6666666-6666-4666-8666-666666666666";
-  let editionStatus: "production" | "selection" = "production";
   let currentBatchStatus: "running" | "cancelled" = "running";
 
   const group = {
@@ -45,14 +44,8 @@ test("Édition : arrêter la production revient à la sélection", async ({
     period_end: "2026-08-31",
     tlp: "GREEN",
     languages: ["fr"],
-    target_articles: 1,
-    previous_edition_id: null,
-    source_profile: "default",
-    status: editionStatus,
-    version: editionStatus === "production" ? 3 : 4,
-    progress_percent: editionStatus === "production" ? 55 : 30,
-    allowed_transitions:
-      editionStatus === "production" ? ["review"] : ["production", "archived"],
+    state: "open",
+    version: 3,
     created_at: "2026-08-29T00:00:00Z",
     updated_at: "2026-08-29T00:00:00Z",
   });
@@ -62,7 +55,6 @@ test("Édition : arrêter la production revient à la sélection", async ({
     selected_articles: 1,
     ignored: 0,
     undecided: 0,
-    target_articles: 1,
     automatic_selection: false,
   };
 
@@ -113,14 +105,13 @@ test("Édition : arrêter la production revient à la sélection", async ({
       path === `/api/editions/${editionId}/production/${batchId}/cancel` &&
       request.method() === "POST"
     ) {
-      editionStatus = "selection";
       currentBatchStatus = "cancelled";
       await route.fulfill({
         json: {
           action: "cancel",
           batch_id: batchId,
           status: "cancelled",
-          edition_status: "selection",
+          edition_state: "open",
           edition_version: 4,
         },
       });
@@ -143,6 +134,8 @@ test("Édition : arrêter la production revient à la sélection", async ({
   await page
     .getByRole("button", { name: "Arrêter et revenir à la sélection" })
     .click();
+
+  await page.getByRole("link", { name: "Sélection" }).click();
 
   await expect(
     page.getByRole("heading", { name: "1 article éligible" }),

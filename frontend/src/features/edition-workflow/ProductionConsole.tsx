@@ -7,7 +7,6 @@ import {
   type BatchItemDetail,
   type BatchStatus,
 } from "../../api/production";
-import type { Edition } from "../../api/editions";
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { Link } from "../../routing";
 import { productionBatchPollingInterval } from "./productionPolling";
@@ -196,20 +195,7 @@ export function ProductionConsole({
         ? cancelProductionBatch(editionId, batch.data.batch_id)
         : Promise.reject(new Error("Aucun lot de production actif.")),
     retry: false,
-    onSuccess: (result) => {
-      const currentEdition = queryClient.getQueryData<Edition>([
-        "edition",
-        editionId,
-      ]);
-      if (currentEdition && result.edition_status === "selection") {
-        queryClient.setQueryData<Edition>(["edition", editionId], {
-          ...currentEdition,
-          status: "selection",
-          version: result.edition_version,
-          progress_percent: 30,
-          allowed_transitions: ["production", "archived"],
-        });
-      }
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
       void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
       void queryClient.invalidateQueries({

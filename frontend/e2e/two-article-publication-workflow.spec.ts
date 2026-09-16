@@ -13,10 +13,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   const artifactB = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef";
   const manifestId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const hash = "a".repeat(64);
-  let productionStarted = false;
-  let batchFinished = false;
   let batchReads = 0;
-  let allowReview = false;
   let publicationAccepted = false;
   let releasePublished = false;
   let releaseReads = 0;
@@ -32,21 +29,8 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
     period_end: "2026-08-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_articles: 2,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: releasePublished
-      ? "published"
-      : publicationAccepted
-        ? "assembling"
-        : batchFinished && allowReview
-          ? "review"
-          : productionStarted
-            ? "production"
-            : "selection",
-    version: publicationAccepted ? 5 : productionStarted ? 3 : 2,
-    progress_percent: releasePublished ? 100 : publicationAccepted ? 90 : 40,
-    allowed_transitions: ["archived"],
+    state: "open",
+    version: 2,
     created_at: "2026-08-29T00:00:00Z",
     updated_at: "2026-08-29T00:00:00Z",
   });
@@ -109,7 +93,6 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
     selected_articles: 2,
     ignored: 0,
     undecided: 0,
-    target_articles: 2,
     automatic_selection: false,
   };
 
@@ -312,7 +295,6 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
       path === `/api/editions/${editionId}/production` &&
       request.method() === "POST"
     ) {
-      productionStarted = true;
       productionPostBody = request.postDataJSON();
       await route.fulfill({
         status: 202,
@@ -331,7 +313,6 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
           json: batchState("ready", "running", 1, "running"),
         });
       } else {
-        batchFinished = true;
         await route.fulfill({
           json: batchState("ready", "ready", 2, "completed"),
         });
@@ -353,7 +334,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
         status: 202,
         json: {
           edition_id: editionId,
-          edition_status: "assembling",
+          edition_state: "open",
           manifest_id: manifestId,
           manifest_sha256: hash,
           edition_version: 4,
@@ -371,7 +352,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
       await route.fulfill({
         json: {
           edition_id: editionId,
-          edition_status: releasePublished ? "published" : "assembling",
+          edition_state: "open",
           manifest_id: manifestId,
           manifest_sha256: hash,
           release_id: releasePublished ? "release-1" : null,
@@ -449,8 +430,8 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   await expect(
     page.getByRole("heading", { name: "2 / 2 articles traités" }),
   ).toBeVisible();
-  allowReview = true;
   await page.reload();
+  await page.getByRole("link", { name: "Publication" }).click();
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),
   ).toBeVisible();

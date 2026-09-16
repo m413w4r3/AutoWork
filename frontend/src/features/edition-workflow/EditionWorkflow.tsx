@@ -3,11 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 
 import { fetchEditorialBoard } from "../../api/editorial";
 import { startEditionProduction } from "../../api/production";
-import {
-  transitionEdition,
-  type Edition,
-  type EditionStatus,
-} from "../../api/editions";
+import type { Edition } from "../../api/editions";
 import { EditorialBoard } from "../../components/EditorialBoard";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { discoveryJobStorageKey } from "../discovery/discoveryStorage";
@@ -32,37 +28,13 @@ const WORKFLOW_STEPS = [
 
 type WorkflowPhase = (typeof WORKFLOW_STEPS)[number][0];
 
-function stepForStatus(status: EditionStatus): WorkflowPhase {
-  if (status === "draft" || status === "discovery") return "discovery";
-  if (status === "selection") return "selection";
-  if (status === "production") return "production";
-  if (status === "review") return "review";
-  return "publication";
-}
-
-function phaseIndex(phase: WorkflowPhase): number {
-  return WORKFLOW_STEPS.findIndex(([step]) => step === phase);
-}
-
-function isTerminalStatus(status: EditionStatus): boolean {
-  return status === "published" || status === "archived";
-}
-
-function isPhaseViewable(status: EditionStatus, phase: WorkflowPhase): boolean {
-  if (isTerminalStatus(status)) return true;
-  return phaseIndex(phase) <= phaseIndex(stepForStatus(status));
-}
-
 function isWorkflowPhase(value: string | null): value is WorkflowPhase {
   return WORKFLOW_STEPS.some(([phase]) => phase === value);
 }
 
-function phaseFromLocation(status: EditionStatus): WorkflowPhase {
+function phaseFromLocation(): WorkflowPhase {
   const requested = new URLSearchParams(window.location.search).get("phase");
-  const fallback = stepForStatus(status);
-  return isWorkflowPhase(requested) && isPhaseViewable(status, requested)
-    ? requested
-    : fallback;
+  return isWorkflowPhase(requested) ? requested : "discovery";
 }
 
 function phaseUrl(phase: WorkflowPhase): string {
@@ -72,7 +44,7 @@ function phaseUrl(phase: WorkflowPhase): string {
   return `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`;
 }
 
-function useViewedPhase(status: EditionStatus): {
+function useViewedPhase(): {
   phase: WorkflowPhase;
   selectPhase: (phase: WorkflowPhase) => void;
 } {
@@ -85,108 +57,45 @@ function useViewedPhase(status: EditionStatus): {
   }, []);
 
   return {
-    phase: phaseFromLocation(status),
-    selectPhase: (phase) => {
-      if (isPhaseViewable(status, phase)) navigate(phaseUrl(phase));
-    },
+    phase: phaseFromLocation(),
+    selectPhase: (phase) => navigate(phaseUrl(phase)),
   };
 }
 
 function WorkflowStepper({
-  status,
   viewedPhase,
   onSelect,
 }: {
-  status: EditionStatus;
   viewedPhase: WorkflowPhase;
   onSelect: (phase: WorkflowPhase) => void;
 }) {
-  const currentPhase = stepForStatus(status);
   return (
     <ol className="workflow-steps" aria-label="Workflow de l’édition">
       {WORKFLOW_STEPS.map(([phase, label]) => {
-        const viewable = isPhaseViewable(status, phase);
         const current = phase === viewedPhase;
         return (
           <li
             key={phase}
             className={
-              [
-                phase === currentPhase ? "is-business-current" : null,
-                current ? "is-viewed" : null,
-                !viewable ? "is-unavailable" : null,
-              ]
-                .filter(Boolean)
-                .join(" ") || undefined
+              [current ? "is-viewed" : null].filter(Boolean).join(" ") ||
+              undefined
             }
             data-phase={phase}
           >
-            {viewable ? (
-              <a
-                href={phaseUrl(phase)}
-                aria-current={current ? "step" : undefined}
-                onClick={(event) => {
-                  event.preventDefault();
-                  onSelect(phase);
-                }}
-              >
-                {label}
-              </a>
-            ) : (
-              <button type="button" disabled>
-                {label}
-              </button>
-            )}
-            {phase === currentPhase ? (
-              <small className="workflow-step-status">
-                {phase === viewedPhase
-                  ? "Phase actuelle"
-                  : "Phase actuelle de l’édition"}
-              </small>
-            ) : null}
+            <a
+              href={phaseUrl(phase)}
+              aria-current={current ? "step" : undefined}
+              onClick={(event) => {
+                event.preventDefault();
+                onSelect(phase);
+              }}
+            >
+              {label}
+            </a>
           </li>
         );
       })}
     </ol>
-  );
-}
-
-function StatusAction({
-  edition,
-  target,
-  disabled = false,
-  children,
-}: {
-  edition: Edition;
-  target: EditionStatus;
-  disabled?: boolean;
-  children: React.ReactNode;
-}) {
-  const queryClient = useQueryClient();
-  const transition = useMutation({
-    mutationFn: () => transitionEdition(edition, target),
-    onSuccess: (updated) => {
-      queryClient.setQueryData(["edition", edition.id], updated);
-      void queryClient.invalidateQueries({ queryKey: ["editions"] });
-    },
-  });
-
-  if (!edition.allowed_transitions.includes(target)) return null;
-  return (
-    <div className="workflow-action">
-      {transition.error ? (
-        <p className="error-message" role="alert">
-          {transition.error.message}
-        </p>
-      ) : null}
-      <button
-        className="button"
-        disabled={transition.isPending || disabled}
-        onClick={() => transition.mutate()}
-      >
-        {transition.isPending ? "Mise à jour…" : children}
-      </button>
-    </div>
   );
 }
 
@@ -201,27 +110,6 @@ function DiscoveryPhase({
     Boolean(window.localStorage.getItem(discoveryJobStorageKey(edition.id))),
   );
 
-  if (edition.status === "draft") {
-    return (
-      <>
-        <section
-          className="workflow-placeholder"
-          aria-labelledby="discovery-intro-heading"
-        >
-          <p className="eyebrow">Découverte</p>
-          <h2 id="discovery-intro-heading">Préparer la découverte</h2>
-          <p>
-            Lancez la phase de découverte pour rechercher et examiner les sujets
-            candidats de cette édition.
-          </p>
-        </section>
-        <StatusAction edition={edition} target="discovery">
-          Démarrer la découverte
-        </StatusAction>
-      </>
-    );
-  }
-
   return (
     <>
       <DiscoveryPanel
@@ -229,15 +117,6 @@ function DiscoveryPhase({
         onRunningChange={setDiscoveryRunning}
         readOnly={readOnly}
       />
-      {!readOnly ? (
-        <StatusAction
-          edition={edition}
-          target="selection"
-          disabled={discoveryRunning}
-        >
-          Ouvrir la sélection
-        </StatusAction>
-      ) : null}
       {!readOnly && discoveryRunning ? (
         <p className="workflow-note" role="status">
           La recherche en cours doit se terminer avant la sélection.
@@ -359,17 +238,12 @@ function SelectionPhase({
 }
 
 export function EditionWorkflow({ edition }: { edition: Edition }) {
-  const { phase, selectPhase } = useViewedPhase(edition.status);
-  const currentPhase = stepForStatus(edition.status);
-  const readOnly = isTerminalStatus(edition.status) || phase !== currentPhase;
+  const { phase, selectPhase } = useViewedPhase();
+  const readOnly = edition.state === "archived";
 
   return (
     <section className="edition-workflow" aria-label="Workflow de l’édition">
-      <WorkflowStepper
-        status={edition.status}
-        viewedPhase={phase}
-        onSelect={selectPhase}
-      />
+      <WorkflowStepper viewedPhase={phase} onSelect={selectPhase} />
       {phase === "discovery" ? (
         <DiscoveryPhase edition={edition} readOnly={readOnly} />
       ) : null}
@@ -383,11 +257,7 @@ export function EditionWorkflow({ edition }: { edition: Edition }) {
         <ReviewConsole editionId={edition.id} readOnly={readOnly} />
       ) : null}
       {phase === "publication" ? (
-        <PublicationConsole
-          editionId={edition.id}
-          editionStatus={edition.status}
-          readOnly={readOnly}
-        />
+        <PublicationConsole editionId={edition.id} readOnly={readOnly} />
       ) : null}
     </section>
   );

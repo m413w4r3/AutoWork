@@ -1,5 +1,4 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef } from "react";
 
 import {
   acceptEditionPublication,
@@ -8,7 +7,7 @@ import {
   getEditionRelease,
   type EditionReleaseResponse,
 } from "../../api/publication";
-import { ApiError, type EditionStatus } from "../../api/editions";
+import { ApiError } from "../../api/editions";
 import { publicationPollingInterval } from "./publicationPolling";
 
 function readableDate(value: string): string {
@@ -78,52 +77,34 @@ function ArchivedPublication({
 
 export function PublicationConsole({
   editionId,
-  editionStatus,
   readOnly = false,
 }: {
   editionId: string;
-  editionStatus: EditionStatus;
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
   const release = useQuery({
     queryKey: ["edition-release", editionId],
     queryFn: () => getEditionRelease(editionId),
-    refetchInterval: (query) =>
-      publicationPollingInterval(editionStatus, query.state.data),
+    refetchInterval: (query) => publicationPollingInterval(query.state.data),
   });
-  const releaseTransitionInvalidated = useRef(false);
   const accept = useMutation({
     mutationFn: () => acceptEditionPublication(editionId),
     retry: false,
     onSuccess: () => invalidatePublication(queryClient, editionId),
   });
 
-  useEffect(() => {
-    if (
-      !releaseTransitionInvalidated.current &&
-      release.data?.edition_status === "published"
-    ) {
-      releaseTransitionInvalidated.current = true;
-      void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
-      void queryClient.invalidateQueries({ queryKey: ["editions"] });
-    }
-  }, [editionId, queryClient, release.data?.edition_status]);
-
   if (release.isPending) {
     return <p role="status">Chargement de la publication…</p>;
   }
-  if (
-    release.isError &&
-    (editionStatus !== "archived" || !isMissingRelease(release.error))
-  ) {
+  if (release.isError && (!readOnly || !isMissingRelease(release.error))) {
     return (
       <p className="error-message" role="alert">
         La publication est inaccessible : {String(release.error)}
       </p>
     );
   }
-  if (editionStatus === "archived") {
+  if (readOnly) {
     return (
       <ArchivedPublication
         editionId={editionId}
@@ -134,7 +115,7 @@ export function PublicationConsole({
   if (!release.data) return null;
 
   const current = release.data;
-  if (editionStatus === "published") {
+  if (current.release_id) {
     return (
       <section
         className="workflow-placeholder publication-console"

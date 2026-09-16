@@ -146,9 +146,7 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[SubjectProductionRun]]:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=len(runs),
-        source_profile="default",
-        status=EditionStatus.PRODUCTION,
+        state=EditionStatus.OPEN,
     )
     return _Uow(batch, runs, items, edition), runs
 
@@ -331,19 +329,21 @@ async def test_recovery_runs_candidates_in_editorial_order_and_finishes_review()
     ) is None
     assert uow.edition_production_batches.item.phase is ProductionBatchPhase.REVIEW
     assert uow.edition_production_batches.item.status == "completed_with_issues"
-    assert uow.editions.edition.status is EditionStatus.REVIEW
-    assert len(uow.edition_audit.events) == 1
+    assert uow.editions.edition.state is EditionStatus.OPEN
+    assert uow.editions.edition.version == 1
+    assert len(uow.edition_audit.events) == 0
 
 
 @pytest.mark.asyncio
-async def test_batch_terminal_handoff_moves_production_edition_to_review() -> None:
+async def test_batch_terminal_handoff_leaves_open_edition_unchanged() -> None:
     uow, runs = _batch_uow(["unknown_code"])
     service = EditionProductionService(lambda: uow)
 
     result = await service.on_subject_terminal(uow.edition_production_batches.item.id, runs[0].id)
 
     assert result is None
-    assert uow.editions.edition.status is EditionStatus.REVIEW
+    assert uow.editions.edition.state is EditionStatus.OPEN
+    assert uow.editions.edition.version == 1
 
 
 @pytest.mark.asyncio

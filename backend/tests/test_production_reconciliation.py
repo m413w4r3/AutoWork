@@ -107,10 +107,10 @@ class _Items:
 
 class _Manifests:
     def __init__(self) -> None:
-        self.frozen = False
+        self.present = False
 
     async def get_latest_for_edition(self, edition_id: UUID):
-        return object() if self.frozen else None
+        return object() if self.present else None
 
 
 class _Uow:
@@ -119,10 +119,10 @@ class _Uow:
         run: SubjectProductionRun,
         model: ModelRun,
         *,
-        edition_status: EditionStatus = EditionStatus.PRODUCTION,
+        edition_state: EditionStatus = EditionStatus.OPEN,
         batch_status: ProductionBatchStatus = ProductionBatchStatus.RUNNING,
     ) -> None:
-        edition = SimpleNamespace(id=run.edition_id, status=edition_status)
+        edition = SimpleNamespace(id=run.edition_id, state=edition_state)
         batch = EditionProductionBatch(
             id=uuid4(),
             edition_id=run.edition_id,
@@ -240,7 +240,7 @@ ReconciliationFixture = tuple[ProductionReconciliationService, _Uow, _Gateway, _
 
 def _build_fixture(
     *,
-    edition_status: EditionStatus = EditionStatus.PRODUCTION,
+    edition_state: EditionStatus = EditionStatus.OPEN,
     batch_status: ProductionBatchStatus = ProductionBatchStatus.RUNNING,
 ) -> ReconciliationFixture:
     edition_id, subject_id = uuid4(), uuid4()
@@ -280,7 +280,7 @@ def _build_fixture(
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
     )
-    uow = _Uow(run, model, edition_status=edition_status, batch_status=batch_status)
+    uow = _Uow(run, model, edition_state=edition_state, batch_status=batch_status)
     gateway = _Gateway(model)
     bridge = _Bridge("bridge-1", "# recovered\n\nanswer")
     jobs = _Jobs()
@@ -303,12 +303,12 @@ def fixture() -> ReconciliationFixture:
 def review_fixture() -> ReconciliationFixture:
     """The state actually reached after a production that finished with issues.
 
-    The batch is terminal, its phase is review, and the edition already moved
-    on to review.  Nothing here is hypothetical: this is what an operator sees
-    when a single article stopped on an ambiguous ChatGPT submission.
+    The batch is terminal and its phase is review.  Nothing here is hypothetical:
+    this is what an operator sees when a single article stopped on an ambiguous
+    ChatGPT submission.
     """
     return _build_fixture(
-        edition_status=EditionStatus.REVIEW,
+        edition_state=EditionStatus.OPEN,
         batch_status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
     )
 
@@ -382,7 +382,7 @@ async def test_abandon_releases_exact_visible_target_without_adopting_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["cancelled", "selection", "frozen", "sibling"])
+@pytest.mark.parametrize("blocked", ["cancelled", "archived", "sibling"])
 async def test_resume_safety_fences_are_typed_conflicts(
     fixture: ReconciliationFixture, blocked: str
 ) -> None:
@@ -390,10 +390,8 @@ async def test_resume_safety_fences_are_typed_conflicts(
     run = next(iter(uow.subject_production_runs.runs.values()))
     if blocked == "cancelled":
         uow.edition_production_batches.batch.status = ProductionBatchStatus.CANCELLED
-    elif blocked == "selection":
-        uow.editions.edition.status = EditionStatus.SELECTION
-    elif blocked == "frozen":
-        uow.publication_manifests.frozen = True
+    elif blocked == "archived":
+        uow.editions.edition.state = EditionStatus.ARCHIVED
     else:
         sibling = SubjectProductionRun(
             subject_id=uuid4(),
@@ -418,8 +416,7 @@ async def test_resume_safety_fences_are_typed_conflicts(
         )
     assert error.value.code in {
         "production_reconciliation_batch_cancelled",
-        "production_reconciliation_edition_selection",
-        "production_reconciliation_publication_frozen",
+        "production_reconciliation_edition_archived",
         "production_reconciliation_active_sibling",
     }
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
@@ -487,45 +484,38 @@ async def test_cancelled_batch_is_never_reopened_by_a_review_recovery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocked", ["frozen", "sibling", "assembling"])
-async def test_terminal_batch_recovery_keeps_every_publication_fence(
-    review_fixture: ReconciliationFixture, blocked: str
+async def test_open_edition_reconciliation_is_allowed_with_publication_manifest(
+    review_fixture: ReconciliationFixture,
+) -> None:
+    service, uow, _, _, jobs = review_fixture
+    run = next(iter(uow.subject_production_runs.runs.values()))
+    uow.publication_manifests.present = True
+
+    await service.adopt_manual(
+        run.id, "manual", hashlib.sha256(b"manual").hexdigest(), actor_id="analyst"
+    )
+
+    assert run.status is SubjectProductionStatus.RUNNING
+    assert uow.edition_production_batches.batch.status is (
+        ProductionBatchStatus.RUNNING
+    )
+    assert jobs.submissions == 1
+
+
+@pytest.mark.asyncio
+async def test_archived_edition_reconciliation_is_refused(
+    review_fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, _, jobs = review_fixture
     run = next(iter(uow.subject_production_runs.runs.values()))
-    if blocked == "frozen":
-        uow.publication_manifests.frozen = True
-    elif blocked == "assembling":
-        uow.editions.edition.status = EditionStatus.ASSEMBLING
-    else:
-        sibling = SubjectProductionRun(
-            subject_id=uuid4(),
-            edition_id=run.edition_id,
-            status=SubjectProductionStatus.RUNNING,
-            current_stage=SubjectProductionStage.SOURCES,
-        )
-        uow.subject_production_runs.runs[sibling.id] = sibling
-        uow.edition_production_batch_items.items.append(
-            EditionProductionBatchItem(
-                batch_id=uow.edition_production_batches.batch.id,
-                subject_id=sibling.subject_id,
-                production_run_id=sibling.id,
-                position=2,
-            )
-        )
+    uow.editions.edition.state = EditionStatus.ARCHIVED
 
     with pytest.raises(ProductionReconciliationError) as error:
         await service.adopt_manual(
             run.id, "manual", hashlib.sha256(b"manual").hexdigest(), actor_id="analyst"
         )
 
-    assert error.value.code in {
-        "production_reconciliation_publication_frozen",
-        "production_reconciliation_active_sibling",
-    }
-    assert uow.edition_production_batches.batch.status is (
-        ProductionBatchStatus.COMPLETED_WITH_ISSUES
-    )
+    assert error.value.code == "production_reconciliation_edition_archived"
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
     assert jobs.submissions == 0
 

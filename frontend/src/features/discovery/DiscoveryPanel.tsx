@@ -95,6 +95,7 @@ export function DiscoveryPanel({
   // and look stuck rather than fail cleanly.
   const [mergeReconciling, setMergeReconciling] = useState(false);
   const [axis, setAxis] = useState("initial");
+  const [sourceProfile, setSourceProfile] = useState("default");
   const [manualMarkdown, setManualMarkdown] = useState("");
   const [showManualRecovery, setShowManualRecovery] = useState(false);
   // L'import autonome d'une réponse ChatGPT est un flux distinct de la
@@ -130,7 +131,8 @@ export function DiscoveryPanel({
         : false,
   });
   const launch = useMutation({
-    mutationFn: () => launchDiscovery(editionId, axis.trim() || "initial"),
+    mutationFn: () =>
+      launchDiscovery(editionId, axis.trim() || "initial", sourceProfile),
     onSuccess: (result) => {
       setJobId(result.job_id);
       setJobStatus(null);
@@ -143,7 +145,7 @@ export function DiscoveryPanel({
   });
   const relaunch = useMutation({
     mutationFn: () =>
-      launchDiscovery(editionId, axis.trim() || "initial", true),
+      launchDiscovery(editionId, axis.trim() || "initial", sourceProfile, true),
     onSuccess: (result) => {
       setJobId(result.job_id);
       setJobStatus(null);
@@ -262,6 +264,7 @@ export function DiscoveryPanel({
       previewDiscoveryImport(
         editionId,
         manualImportMarkdown,
+        sourceProfile,
         axis.trim() || "manual-import",
       ),
     onSuccess: setManualImportPreview,
@@ -275,6 +278,7 @@ export function DiscoveryPanel({
         editionId,
         manualImportMarkdown,
         manualImportPreview.sha256,
+        sourceProfile,
         axis.trim() || "manual-import",
       );
     },
@@ -392,6 +396,14 @@ export function DiscoveryPanel({
           disabled={readOnly}
           onChange={(event) => setAxis(event.target.value)}
           placeholder="initial ou axe complémentaire"
+        />
+      </label>
+      <label className="axis-field">
+        Profil de sources
+        <input
+          value={sourceProfile}
+          disabled={readOnly}
+          onChange={(event) => setSourceProfile(event.target.value)}
         />
       </label>
       <p className="verification-warning" role="note">

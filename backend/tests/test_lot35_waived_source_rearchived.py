@@ -31,7 +31,6 @@ from cti_app.application.production_parsers import (
     reference_report_to_json,
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
-from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -150,13 +149,6 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
 ) -> None:
     collection_factory = InMemoryCollectionUnitOfWorkFactory()
     subject, edition = _selected_subject(collection_factory, (SOURCE_ONE, SOURCE_TWO))
-    for step in (
-        EditionStatus.DISCOVERY,
-        EditionStatus.SELECTION,
-        EditionStatus.PRODUCTION,
-        EditionStatus.REVIEW,
-    ):
-        edition.transition(step)
     collection_service = SubjectCollectionService(
         collection_factory,
         _collector(),

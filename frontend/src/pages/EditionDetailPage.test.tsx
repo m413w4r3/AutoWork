@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Edition } from "../api/editions";
@@ -16,20 +17,15 @@ const baseEdition: Edition = {
   period_end: "2026-08-31",
   tlp: "GREEN",
   languages: ["fr"],
-  target_articles: 3,
-  previous_edition_id: null,
-  source_profile: "default",
-  status: "assembling",
+  state: "archived",
   version: 2,
-  progress_percent: 90,
-  allowed_transitions: ["review", "published", "archived"],
   created_at: "2026-08-29T10:00:00Z",
   updated_at: "2026-08-29T10:00:00Z",
 };
 
 const release: EditionReleaseResponse = {
   edition_id: EDITION_ID,
-  edition_status: "assembling",
+  edition_state: "archived",
   manifest_id: "manifest-1",
   manifest_sha256: "a".repeat(64),
   release_id: null,
@@ -51,15 +47,13 @@ function urlOf(input: RequestInfo | URL): string {
 }
 
 function renderPage(edition: Edition, currentRelease: EditionReleaseResponse) {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn((input: RequestInfo | URL) => {
-      if (urlOf(input).endsWith(`/api/editions/${EDITION_ID}/release`)) {
-        return Promise.resolve(Response.json(currentRelease));
-      }
-      return Promise.resolve(Response.json(edition));
-    }),
-  );
+  const fetchMock = vi.fn((input: RequestInfo | URL) => {
+    if (urlOf(input).endsWith(`/api/editions/${EDITION_ID}/release`)) {
+      return Promise.resolve(Response.json(currentRelease));
+    }
+    return Promise.resolve(Response.json(edition));
+  });
+  vi.stubGlobal("fetch", fetchMock);
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
@@ -68,16 +62,17 @@ function renderPage(edition: Edition, currentRelease: EditionReleaseResponse) {
       <EditionDetailPage editionId={EDITION_ID} />
     </QueryClientProvider>,
   );
+  return fetchMock;
 }
 
 afterEach(() => vi.unstubAllGlobals());
 
 describe("EditionDetailPage archivage", () => {
-  it("n’affiche jamais Archiver pour une édition ASSEMBLING", async () => {
+  it("n’affiche jamais Archiver pour une édition archivée", async () => {
     renderPage(baseEdition, release);
 
     expect(
-      await screen.findByRole("heading", { name: "Manifest figé" }),
+      await screen.findByRole("heading", { name: "France" }),
     ).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Archiver l’édition" }),
@@ -87,17 +82,22 @@ describe("EditionDetailPage archivage", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("conserve l’archivage pour une édition PUBLISHED", async () => {
-    renderPage(
-      { ...baseEdition, status: "published", progress_percent: 100 },
-      { ...release, edition_status: "published", assembly_status: "succeeded" },
-    );
+  it("affiche Archiver pour une édition ouverte", async () => {
+    const fetchMock = renderPage({ ...baseEdition, state: "open" }, release);
 
-    expect(
-      await screen.findByRole("heading", { name: "Bulletin publié" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "Archiver l’édition" }),
-    ).toBeInTheDocument();
+    const archiveButton = await screen.findByRole("button", {
+      name: "Archiver l’édition",
+    });
+    expect(archiveButton).toBeInTheDocument();
+    await userEvent.setup().click(archiveButton);
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/editions/${EDITION_ID}/archive`,
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({ version: baseEdition.version }),
+        }),
+      ),
+    );
   });
 });

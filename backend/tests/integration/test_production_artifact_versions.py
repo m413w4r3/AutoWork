@@ -81,8 +81,6 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ARTIFACT-VERSIONS", slug="artifact-versions", tlp=TLP.AMBER)
 
@@ -144,8 +142,6 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
-        source_profile="test",
     )
     subject = Subject(external_id="SUBJ-MARK-STAGES-STALE", slug="mark-stages-stale", tlp=TLP.AMBER)
 
@@ -195,8 +191,6 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         period_end=date(2026, 12, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     subject = Subject(external_id="SUBJ-ANALYST-FK", slug="analyst-fk", tlp=TLP.AMBER)
     run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
@@ -262,8 +256,6 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         period_end=date(2026, 9, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     source = Subject(external_id="SUBJ-STATE-A", slug="state-a", tlp=TLP.AMBER)
     target = Subject(external_id="SUBJ-STATE-B", slug="state-b", tlp=TLP.AMBER)
@@ -377,8 +369,6 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         period_end=date(2026, 11, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     source = Subject(
         external_id="SUBJ-MAJOR-IMPORT-SOURCE", slug="major-import-source", tlp=TLP.AMBER
@@ -487,8 +477,6 @@ async def test_run_number_allocation_is_serialized_in_postgres(
         period_end=date(2026, 10, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     subject = Subject(external_id="SUBJ-RUN-LOCK", slug="run-lock", tlp=TLP.AMBER)
     async with uow_factory() as uow:
@@ -528,8 +516,6 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
         period_end=date(2027, 1, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
     )
     subject = Subject(
         external_id=f"SUBJ-CONCURRENT-{uuid4().hex}",

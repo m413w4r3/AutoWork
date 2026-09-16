@@ -22,7 +22,7 @@ from cti_app.application.production_resume import (
     resolve_retry_stage,
 )
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
-from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -451,17 +451,8 @@ class SubjectProductionService:
                 )
                 if edition is None:
                     raise ValueError("edition_not_found")
-                if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
-                    raise ValueError("edition_frozen_for_publication")
-
-                # A frozen edition owns immutable evidence of what it published;
-                # reviving one of its articles would contradict that manifest.
-                manifests = getattr(uow, "publication_manifests", None)
-                if (
-                    manifests is not None
-                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
-                ):
-                    raise ValueError("edition_frozen_for_publication")
+                if edition.state is EditionStatus.ARCHIVED:
+                    raise ValueError("edition_archived")
 
                 # A cancelled article of an edition batch is resumed inside its
                 # own batch: that batch is the dispatch fence and the
@@ -530,8 +521,8 @@ class SubjectProductionService:
         automatic: bool = False,
     ) -> SubjectProductionRetryResult:
         async with self._uow_factory() as uow:
-            # A user retry must acquire locks in the same order as publication
-            # freeze: Edition first, then SubjectProductionRun.  The initial
+            # A user retry must acquire locks in the same order as edition
+            # archival: Edition first, then SubjectProductionRun.  The initial
             # read only discovers the edition that owns the run.
             initial_run = await uow.subject_production_runs.get(run_id)
             if not initial_run:
@@ -547,8 +538,8 @@ class SubjectProductionService:
                 )
                 if edition is None:
                     raise ValueError("edition_not_found")
-                if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
-                    raise ValueError("edition_frozen_for_publication")
+                if edition.state is EditionStatus.ARCHIVED:
+                    raise ValueError("edition_archived")
 
                 # Reject a run that obviously cannot be retried before touching
                 # the batch: reopening a finished batch for a cancelled or
@@ -573,16 +564,6 @@ class SubjectProductionService:
                     item is None or not ProductionRecoveryPolicyV1.eligible(item, initial_run)
                 ):
                     raise ValueError("automatic_recovery_not_allowed")
-
-                # A manifest is immutable evidence of a freeze.  Keep this
-                # check under the Edition lock so a retry cannot race with the
-                # transaction that creates the manifest.
-                manifests = getattr(uow, "publication_manifests", None)
-                if (
-                    manifests is not None
-                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
-                ):
-                    raise ValueError("edition_frozen_for_publication")
 
                 # Edition, then batch, then run: a Review-time retry usually
                 # targets a batch that already finished with issues, and the
@@ -756,21 +737,14 @@ class EditionProductionService:
                 )
                 if edition is None:
                     raise ValueError("edition_not_found")
+                if edition.state is EditionStatus.ARCHIVED:
+                    raise ValueError("edition_archived")
 
             existing = await uow.edition_production_batches.get_active_for_edition(edition_id)
             if existing:
                 return existing
 
-            if edition is not None and edition.status is not EditionStatus.SELECTION:
-                raise ValueError("edition_must_be_in_selection")
-
             created_at = datetime.now(UTC)
-            before = edition.snapshot() if edition is not None else None
-            if edition is not None:
-                assert editions is not None
-                edition.transition(EditionStatus.PRODUCTION, now=created_at)
-                if not await editions.update(edition, edition.version - 1):
-                    raise ValueError("edition_concurrent_update")
 
             batch = EditionProductionBatch(
                 edition_id=edition_id,
@@ -779,19 +753,6 @@ class EditionProductionService:
                 created_at=created_at,
             )
             await uow.edition_production_batches.add(batch)
-
-            if edition is not None:
-                await uow.edition_audit.append(
-                    EditionAuditEvent(
-                        edition_id=edition_id,
-                        actor_id=actor_id,
-                        action="edition.transitioned",
-                        before=before,
-                        after=edition.snapshot(),
-                        correlation_id=correlation_id,
-                        occurred_at=created_at,
-                    )
-                )
 
             items = []
             for position, subject_id in enumerate(subject_ids, start=1):
@@ -845,7 +806,7 @@ class EditionProductionService:
         actor_id: str = "system",
         correlation_id: str = "-",
     ) -> EditionProductionCancellationResult:
-        """Compensate one active batch and return its exact affected runs.
+        """Cancel one active batch and return its exact affected runs.
 
         The owning Edition is the serialization point for production start,
         handoff, and cancellation.  The exact batch is then re-read under
@@ -859,6 +820,8 @@ class EditionProductionService:
             edition = await editions.get_for_update(edition_id)
             if edition is None:
                 raise EditionProductionBatchNotFoundError(str(edition_id))
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("edition_archived")
 
             batch = await uow.edition_production_batches.get_for_update(batch_id)
             if batch is None:
@@ -886,20 +849,13 @@ class EditionProductionService:
                     changed=False,
                 )
 
-            # Check terminal status before the Edition status so a completed
-            # batch always returns its typed business conflict, even if an
-            # older inconsistent record still says production.
+            # Check terminal status before touching any batch or run state.
             if batch.status in {
                 ProductionBatchStatus.COMPLETED,
                 ProductionBatchStatus.COMPLETED_WITH_ISSUES,
             }:
                 batch.cancel()
 
-            if edition.status is not EditionStatus.PRODUCTION:
-                raise ValueError("edition_not_in_production")
-
-            # The domain operation rejects completed terminal batches and is
-            # deliberately not represented by Edition.transition.
             now = datetime.now(UTC)
             batch.cancel(now=now)
             await uow.edition_production_batches.save(batch)
@@ -922,21 +878,6 @@ class EditionProductionService:
                     await uow.subject_production_runs.save(run)
                     cancelled_runs.append((run.id, run.subject_id))
 
-            before = edition.snapshot()
-            edition.return_to_selection_after_production_cancellation(now=now)
-            if not await editions.update(edition, edition.version - 1):
-                raise ValueError("edition_concurrent_update")
-            await uow.edition_audit.append(
-                EditionAuditEvent(
-                    edition_id=edition.id,
-                    actor_id=actor_id,
-                    action="edition.production_cancelled",
-                    before=before,
-                    after=edition.snapshot(),
-                    correlation_id=correlation_id,
-                    occurred_at=now,
-                )
-            )
             await uow.commit()
             return EditionProductionCancellationResult(
                 edition=edition,
@@ -994,6 +935,8 @@ class EditionProductionService:
             edition = await editions.get_for_update(probe.edition_id)
             if edition is None:
                 raise ValueError("edition_not_found")
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("edition_archived")
 
         batch = await uow.edition_production_batches.get_for_update(batch_id)
         if batch is None:
@@ -1115,8 +1058,6 @@ class EditionProductionService:
                     uow,
                     batch,
                     items,
-                    actor_id=actor_id,
-                    correlation_id=correlation_id,
                 )
             await uow.commit()
             return None
@@ -1168,9 +1109,6 @@ class EditionProductionService:
         uow: ProductionUnitOfWork,
         batch: EditionProductionBatch,
         items: Sequence[EditionProductionBatchItem],
-        *,
-        actor_id: str,
-        correlation_id: str,
     ) -> None:
         runs = [await uow.subject_production_runs.get(item.production_run_id) for item in items]
         has_non_ready = any(
@@ -1180,30 +1118,6 @@ class EditionProductionService:
         batch.enter_review()
         batch.finish(completed_with_issues=has_non_ready, now=now)
         await uow.edition_production_batches.save(batch)
-
-        editions = getattr(uow, "editions", None)
-        audit = getattr(uow, "edition_audit", None)
-        if editions is None or audit is None:
-            return
-        edition = await editions.get_for_update(batch.edition_id)
-        if edition is None or edition.status is not EditionStatus.PRODUCTION:
-            return
-        before = edition.snapshot()
-        edition.transition(EditionStatus.REVIEW, now=now)
-        update = getattr(editions, "update", None)
-        if update is not None and not await update(edition, edition.version - 1):
-            raise ValueError("edition_concurrent_update")
-        await audit.append(
-            EditionAuditEvent(
-                edition_id=edition.id,
-                actor_id=actor_id,
-                action="edition.transitioned",
-                before=before,
-                after=edition.snapshot(),
-                correlation_id=correlation_id,
-                occurred_at=now,
-            )
-        )
 
     async def clear_next_dispatch(self, run_id: UUID) -> None:
         """Clear the persisted subject schedule when its worker starts."""

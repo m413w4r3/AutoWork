@@ -23,6 +23,7 @@ from cti_app.application.production_reconciliation_resolver import (
     ProductionReconciliationResolver,
     ReconciliationOutcome,
 )
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import (
     ModelProvider,
     ModelRole,
@@ -68,10 +69,32 @@ class _BatchItems:
         return None
 
 
+class _EditionRepo:
+    def __init__(self, edition: SimpleNamespace) -> None:
+        self.edition = edition
+
+    async def get(self, edition_id: UUID) -> SimpleNamespace | None:
+        return self.edition if edition_id == self.edition.id else None
+
+    async def get_for_update(self, edition_id: UUID) -> SimpleNamespace | None:
+        return await self.get(edition_id)
+
+
 class _Uow:
-    def __init__(self, run: SubjectProductionRun, model: ModelRun) -> None:
+    def __init__(
+        self,
+        run: SubjectProductionRun,
+        model: ModelRun,
+        *,
+        with_edition: bool = False,
+        edition_state: EditionStatus = EditionStatus.OPEN,
+    ) -> None:
         self.subject_production_runs = _Runs(run)
         self.model_runs = _Models(model)
+        if with_edition:
+            self.editions = _EditionRepo(
+                SimpleNamespace(id=run.edition_id, state=edition_state)
+            )
         self.edition_production_batch_items = _BatchItems()
 
     async def __aenter__(self) -> _Uow:
@@ -144,6 +167,8 @@ def _fixture(
     bridge_result: dict[str, Any] | Exception,
     *,
     with_conversation: bool = True,
+    with_edition: bool = False,
+    edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[
     ProductionReconciliationResolver,
     SubjectProductionRun,
@@ -195,7 +220,12 @@ def _fixture(
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
     )
-    uow = _Uow(run, model)
+    uow = _Uow(
+        run,
+        model,
+        with_edition=with_edition,
+        edition_state=edition_state,
+    )
     bridge = _Bridge(bridge_result)
     conversations = _ConversationService()
     gateway = _Gateway(model)
@@ -247,7 +277,8 @@ async def test_bridge_404_releases_and_marks_conversation_unavailable() -> None:
 @pytest.mark.asyncio
 async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
     resolver, run, model, bridge, conversations, gateway = _fixture(
-        {"id": "resp_123", "status": "completed", "output_text": "# answer"}
+        {"id": "resp_123", "status": "completed", "output_text": "# answer"},
+        with_edition=True,
     )
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.RESUMED
@@ -256,6 +287,22 @@ async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
     assert run.reconciliation is not None
     assert run.reconciliation.output_sha256 == hashlib.sha256(b"# answer").hexdigest()
     assert run.reconciliation.provenance == "automatic_bridge_retrieval"
+    assert model.status is ModelRunStatus.SUCCEEDED
+    assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
+    assert conversations.calls == [(run.references_conversation_id, True, run.subject_id)]
+
+
+@pytest.mark.asyncio
+async def test_archived_edition_keeps_resolver_undecided() -> None:
+    resolver, run, model, bridge, conversations, gateway = _fixture(
+        {"id": "resp_123", "status": "completed", "output_text": "# answer"},
+        with_edition=True,
+        edition_state=EditionStatus.ARCHIVED,
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    assert bridge.calls == ["bridge-request:a1"]
+    assert run.requires_reconciliation
     assert model.status is ModelRunStatus.SUCCEEDED
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
     assert conversations.calls == [(run.references_conversation_id, True, run.subject_id)]

@@ -93,9 +93,6 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_articles=8,
-        previous_edition_id=None,
-        source_profile="iran-default",
         actor_id="dev-analyst",
         correlation_id="create",
     )
@@ -119,6 +116,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         launched = await client.post(
             f"/api/editions/{edition.id}/discovery",
             json={
+                "source_profile": "iran-default",
                 "country_aliases": ["République islamique d'Iran"],
                 "keywords": ["APT", "IOC"],
                 "exclusions": ["crypto scam"],
@@ -139,6 +137,7 @@ async def test_discovery_api_launch_follow_read_and_mark_source() -> None:
         duplicate = await client.post(
             f"/api/editions/{edition.id}/discovery",
             json={
+                "source_profile": "iran-default",
                 "country_aliases": ["République islamique d'Iran"],
                 "keywords": ["APT", "IOC"],
                 "exclusions": ["crypto scam"],
@@ -193,9 +192,6 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_articles=8,
-        previous_edition_id=None,
-        source_profile="iran-default",
         actor_id="dev-analyst",
         correlation_id="create-recovery",
     )
@@ -218,7 +214,7 @@ async def test_manual_recovery_previews_then_resumes_the_original_job() -> None:
     ) as client:
         launched = await client.post(
             f"/api/editions/{edition.id}/discovery",
-            json={"complementary_axis": "initial"},
+            json={"source_profile": "iran-default", "complementary_axis": "initial"},
         )
         job_id = launched.json()["job_id"]
         waiting = await client.get(f"/api/jobs/{job_id}")
@@ -283,9 +279,6 @@ async def _recovery_application() -> tuple[
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en"),
-        target_articles=8,
-        previous_edition_id=None,
-        source_profile="iran-default",
         actor_id="dev-analyst",
         correlation_id="create-recovery",
     )
@@ -314,7 +307,7 @@ async def test_recovery_of_cancelled_job_returns_original_job() -> None:
     ) as client:
         launched = await client.post(
             f"/api/editions/{edition.id}/discovery",
-            json={"complementary_axis": "initial"},
+            json={"source_profile": "iran-default", "complementary_axis": "initial"},
         )
         job_id = launched.json()["job_id"]
         waiting = await client.get(f"/api/jobs/{job_id}")
@@ -355,15 +348,23 @@ async def test_discovery_import_works_without_any_job_or_model_run() -> None:
     ) as client:
         preview = await client.post(
             f"/api/editions/{edition.id}/discovery/import/preview",
-            json={"markdown": markdown},
+            json={"source_profile": "iran-default", "markdown": markdown},
         )
         confirmed = await client.post(
             f"/api/editions/{edition.id}/discovery/import/confirm",
-            json={"markdown": markdown, "expected_sha256": preview.json()["sha256"]},
+            json={
+                "source_profile": "iran-default",
+                "markdown": markdown,
+                "expected_sha256": preview.json()["sha256"],
+            },
         )
         replay = await client.post(
             f"/api/editions/{edition.id}/discovery/import/confirm",
-            json={"markdown": markdown, "expected_sha256": preview.json()["sha256"]},
+            json={
+                "source_profile": "iran-default",
+                "markdown": markdown,
+                "expected_sha256": preview.json()["sha256"],
+            },
         )
         candidates = await client.get(f"/api/editions/{edition.id}/discovery/candidates")
 
@@ -379,3 +380,38 @@ async def test_discovery_import_works_without_any_job_or_model_run() -> None:
     assert len(candidates.json()["batches"]) == 1
     # Aucun job n'a été créé par ce chemin.
     assert not job_uow.state
+
+
+async def test_archived_edition_rejects_launch_and_import() -> None:
+    application, edition, _job_uow, _ = await _recovery_application()
+    await application.state.edition_service.archive(
+        edition.id,
+        expected_version=edition.version,
+        actor_id="dev-analyst",
+        correlation_id="archive-discovery-test",
+    )
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        launched = await client.post(
+            f"/api/editions/{edition.id}/discovery",
+            json={"source_profile": "iran-default"},
+        )
+        preview = await client.post(
+            f"/api/editions/{edition.id}/discovery/import/preview",
+            json={"source_profile": "iran-default", "markdown": "# import"},
+        )
+        confirmed = await client.post(
+            f"/api/editions/{edition.id}/discovery/import/confirm",
+            json={
+                "source_profile": "iran-default",
+                "markdown": "# import",
+                "expected_sha256": "0" * 64,
+            },
+        )
+
+    for response in (launched, preview, confirmed):
+        assert response.status_code == 422
+        assert response.json()["detail"]["code"] == "invalid_discovery"
+        assert "archived" in response.json()["detail"]["message"]

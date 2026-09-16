@@ -1,14 +1,6 @@
 export type Tlp = "CLEAR" | "GREEN" | "AMBER" | "AMBER+STRICT" | "RED";
 
-export type EditionStatus =
-  | "draft"
-  | "discovery"
-  | "selection"
-  | "production"
-  | "review"
-  | "assembling"
-  | "published"
-  | "archived";
+export type EditionStatus = "open" | "archived";
 
 export interface EditionFields {
   country: string;
@@ -17,17 +9,12 @@ export interface EditionFields {
   period_end: string;
   tlp: Tlp;
   languages: string[];
-  target_articles: number;
-  previous_edition_id: string | null;
-  source_profile: string;
 }
 
 export interface Edition extends EditionFields {
   id: string;
-  status: EditionStatus;
+  state: EditionStatus;
   version: number;
-  progress_percent: number;
-  allowed_transitions: EditionStatus[];
   created_at: string;
   updated_at: string;
 }
@@ -52,12 +39,12 @@ export class ApiError extends Error {
 export async function listEditions(filters: {
   countryCode?: string;
   period?: string;
-  status?: EditionStatus | "";
+  state?: EditionStatus | "";
 }): Promise<EditionPage> {
   const parameters = new URLSearchParams();
   if (filters.countryCode) parameters.set("country_code", filters.countryCode);
   if (filters.period) parameters.set("period", filters.period);
-  if (filters.status) parameters.set("status", filters.status);
+  if (filters.state) parameters.set("state", filters.state);
   return request<EditionPage>(`/api/editions?${parameters.toString()}`);
 }
 
@@ -73,19 +60,13 @@ export function createEdition(payload: EditionFields): Promise<Edition> {
   });
 }
 
-export function transitionEdition(
-  edition: Edition,
-  targetStatus: EditionStatus,
-): Promise<Edition> {
+export function archiveEdition(edition: Edition): Promise<Edition> {
   return request<Edition>(
-    `/api/editions/${encodeURIComponent(edition.id)}/transitions`,
+    `/api/editions/${encodeURIComponent(edition.id)}/archive`,
     {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        target_status: targetStatus,
-        version: edition.version,
-      }),
+      body: JSON.stringify({ version: edition.version }),
     },
   );
 }

@@ -7,16 +7,10 @@ from cti_app.domain.editions import (
     Edition,
     EditionImmutableError,
     EditionStatus,
-    InvalidEditionTransitionError,
-)
-from cti_app.domain.production import (
-    EditionProductionBatch,
-    ProductionBatchCancellationConflictError,
-    ProductionBatchStatus,
 )
 
 
-def make_edition(target_articles: int = 8) -> Edition:
+def make_edition() -> Edition:
     return Edition(
         country="Iran",
         country_code="IR",
@@ -24,9 +18,14 @@ def make_edition(target_articles: int = 8) -> Edition:
         period_end=date(2026, 7, 31),
         tlp=TLP.AMBER,
         languages=("fr", "en", "fa"),
-        target_articles=target_articles,
-        source_profile="iran-default",
     )
+
+
+def test_creation_starts_open() -> None:
+    edition = make_edition()
+
+    assert edition.state is EditionStatus.OPEN
+    assert not hasattr(edition, "status")
 
 
 def test_month_period_and_language_validation() -> None:
@@ -38,84 +37,51 @@ def test_month_period_and_language_validation() -> None:
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr",),
-            target_articles=8,
-            source_profile="iran-default",
         )
 
 
-@pytest.mark.parametrize("target_articles", (0, 100, 101, 120))
-def test_target_articles_accepts_the_complete_allowed_range(target_articles: int) -> None:
-    assert make_edition(target_articles).target_articles == target_articles
-
-
-def test_target_articles_above_the_bound_is_rejected() -> None:
-    with pytest.raises(ValueError, match="between 0 and 120"):
-        make_edition(121)
-
-
-def test_state_machine_exposes_only_valid_actions() -> None:
+def test_open_edition_can_be_modified() -> None:
     edition = make_edition()
-    assert edition.allowed_transitions == (EditionStatus.DISCOVERY, EditionStatus.ARCHIVED)
 
-    edition.transition(EditionStatus.DISCOVERY)
-
-    assert edition.status is EditionStatus.DISCOVERY
-    assert edition.progress_percent == 15
-    with pytest.raises(InvalidEditionTransitionError):
-        edition.transition(EditionStatus.PUBLISHED)
-
-
-def test_assembling_cannot_be_archived_but_published_can() -> None:
-    edition = make_edition()
-    edition.status = EditionStatus.ASSEMBLING
-    assert edition.allowed_transitions == (
-        EditionStatus.REVIEW,
-        EditionStatus.PUBLISHED,
+    edition.update_metadata(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en", "fa"),
     )
 
-    with pytest.raises(InvalidEditionTransitionError):
-        edition.transition(EditionStatus.ARCHIVED)
 
-    edition.status = EditionStatus.PUBLISHED
-    edition.transition(EditionStatus.ARCHIVED)
-
-    assert edition.status is EditionStatus.ARCHIVED
-
-
-def test_production_returns_to_selection_only_through_compensation() -> None:
+def test_tlp_downgrade_is_rejected() -> None:
     edition = make_edition()
-    edition.status = EditionStatus.PRODUCTION
 
-    assert edition.allowed_transitions == (EditionStatus.REVIEW,)
-    with pytest.raises(InvalidEditionTransitionError):
-        edition.transition(EditionStatus.SELECTION)
-
-    edition.return_to_selection_after_production_cancellation()
-
-    assert edition.status is EditionStatus.SELECTION
-
-
-def test_completed_production_batch_cannot_be_cancelled() -> None:
-    batch = EditionProductionBatch(
-        edition_id=make_edition().id,
-        status=ProductionBatchStatus.QUEUED,
-    )
-    batch.start()
-    batch.finish()
-
-    with pytest.raises(ProductionBatchCancellationConflictError):
-        batch.cancel()
-
-    assert batch.status is ProductionBatchStatus.COMPLETED
+    with pytest.raises(ValueError):
+        edition.update_metadata(
+            country="Iran",
+            country_code="IR",
+            period_start=date(2026, 7, 1),
+            period_end=date(2026, 7, 31),
+            tlp=TLP.GREEN,
+            languages=("fr", "en", "fa"),
+        )
 
 
-@pytest.mark.parametrize(
-    "status",
-    (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED),
-)
-def test_frozen_editions_reject_metadata_updates(status: EditionStatus) -> None:
+def test_archiving_is_terminal_and_advances_version() -> None:
     edition = make_edition()
-    edition.status = status
+    initial_version = edition.version
+
+    edition.archive()
+
+    assert edition.state is EditionStatus.ARCHIVED
+    assert edition.version == initial_version + 1
+    with pytest.raises(EditionImmutableError):
+        edition.archive()
+
+
+def test_archived_edition_rejects_metadata_updates() -> None:
+    edition = make_edition()
+    edition.archive()
 
     with pytest.raises(EditionImmutableError):
         edition.update_metadata(
@@ -125,26 +91,16 @@ def test_frozen_editions_reject_metadata_updates(status: EditionStatus) -> None:
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr", "en", "fa"),
-            target_articles=10,
-            previous_edition_id=None,
-            source_profile="iran-default",
         )
 
 
-def test_review_editions_allow_metadata_updates() -> None:
-    edition = make_edition()
-    edition.status = EditionStatus.REVIEW
+def test_progression_primitives_are_absent() -> None:
+    import cti_app.domain.editions as editions
 
-    edition.update_metadata(
-        country="Iran",
-        country_code="IR",
-        period_start=date(2026, 7, 1),
-        period_end=date(2026, 7, 31),
-        tlp=TLP.AMBER,
-        languages=("fr", "en", "fa"),
-        target_articles=10,
-        previous_edition_id=None,
-        source_profile="iran-default",
-    )
-
-    assert edition.target_articles == 10
+    assert not hasattr(editions, "EDITION_TRANSITIONS")
+    assert not hasattr(editions, "EDITION_PROGRESS")
+    assert not hasattr(editions, "InvalidEditionTransitionError")
+    assert not hasattr(Edition, "allowed_transitions")
+    assert not hasattr(Edition, "progress_percent")
+    assert not hasattr(Edition, "transition")
+    assert not hasattr(Edition, "return_to_selection_after_production_cancellation")

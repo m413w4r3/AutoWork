@@ -607,7 +607,7 @@ _REPAIR_FAILURE_DIAGNOSTICS: dict[str, tuple[RepairApplicationStage, RepairRemed
         RepairApplicationStage.FENCE,
         RepairRemediation.WAIT_FOR_RUN,
     ),
-    "edition_frozen_for_publication": (
+    "edition_archived": (
         RepairApplicationStage.FENCE,
         RepairRemediation.REOPEN_EDITION,
     ),
@@ -787,17 +787,8 @@ class ProductionRepairDecisionService:
 
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
-            if edition is None or _enum_value(edition.status) not in {
-                EditionStatus.PRODUCTION.value,
-                EditionStatus.REVIEW.value,
-            }:
-                raise ProductionRepairStatusError("edition_frozen_for_publication")
-            manifests = getattr(uow, "publication_manifests", None)
-            if (
-                manifests is not None
-                and await manifests.get_latest_for_edition(edition_id) is not None
-            ):
-                raise ProductionRepairStatusError("edition_frozen_for_publication")
+            if edition is None or edition.state is not EditionStatus.OPEN:
+                raise ProductionRepairStatusError("edition_archived")
             effective = await _effective_decisions_for_reader(uow, edition_id, subject_id)
             current = _effective_decision_for_key(effective, subject_id, repair_key)
             if (
@@ -922,17 +913,8 @@ class ProductionRepairDecisionService:
 
         async with self._uow_factory() as uow:
             edition = await _get_for_update(uow.editions, edition_id)
-            if edition is None or _enum_value(edition.status) not in {
-                EditionStatus.PRODUCTION.value,
-                EditionStatus.REVIEW.value,
-            }:
-                raise ProductionRepairStatusError("edition_frozen_for_publication")
-            manifests = getattr(uow, "publication_manifests", None)
-            if (
-                manifests is not None
-                and await manifests.get_latest_for_edition(edition_id) is not None
-            ):
-                raise ProductionRepairStatusError("edition_frozen_for_publication")
+            if edition is None or edition.state is not EditionStatus.OPEN:
+                raise ProductionRepairStatusError("edition_archived")
 
             repository = uow.production_repair_decisions
             effective_getter = getattr(repository, "effective_decisions", None)
@@ -2968,17 +2950,8 @@ class ProductionRepairProjectionService:
                 edition = await _get_for_update(editions, initial_run.edition_id)
                 if edition is None:
                     raise ProductionRepairProjectionError("edition_not_found")
-                if _enum_value(edition.status) not in {
-                    EditionStatus.PRODUCTION.value,
-                    EditionStatus.REVIEW.value,
-                }:
-                    raise ProductionRepairProjectionError("edition_frozen_for_publication")
-                manifests = getattr(uow, "publication_manifests", None)
-                if (
-                    manifests is not None
-                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
-                ):
-                    raise ProductionRepairProjectionError("edition_frozen_for_publication")
+                if edition.state is not EditionStatus.OPEN:
+                    raise ProductionRepairProjectionError("edition_archived")
 
             run = await _get_for_update(uow.subject_production_runs, run_id)
             if run is None:
@@ -4018,14 +3991,8 @@ class ProductionRepairMaterializationService:
         edition = await _get_for_update(editions, edition_id)
         if edition is None:
             raise ProductionRepairProjectionError("edition_not_found")
-        if _enum_value(getattr(edition, "status", None)) not in {
-            EditionStatus.PRODUCTION.value,
-            EditionStatus.REVIEW.value,
-        }:
-            raise ProductionRepairProjectionError("edition_frozen_for_publication")
-        manifests = getattr(uow, "publication_manifests", None)
-        if manifests is not None and await manifests.get_latest_for_edition(edition_id) is not None:
-            raise ProductionRepairProjectionError("edition_frozen_for_publication")
+        if edition.state is not EditionStatus.OPEN:
+            raise ProductionRepairProjectionError("edition_archived")
         return edition
 
     @staticmethod
@@ -5064,18 +5031,8 @@ class ProductionReferenceRepairService:
                 )
                 if edition is None:
                     raise ProductionReferenceRepairError("edition_not_found")
-                if _enum_value(edition.status) not in {
-                    EditionStatus.PRODUCTION.value,
-                    EditionStatus.REVIEW.value,
-                }:
-                    raise ProductionReferenceRepairError("edition_frozen_for_publication")
-
-                manifests = getattr(uow, "publication_manifests", None)
-                if (
-                    manifests is not None
-                    and await manifests.get_latest_for_edition(initial_run.edition_id) is not None
-                ):
-                    raise ProductionReferenceRepairError("edition_frozen_for_publication")
+                if edition.state is not EditionStatus.OPEN:
+                    raise ProductionReferenceRepairError("edition_archived")
 
             run = await uow.subject_production_runs.get_for_update(run_id)
             if run is None:

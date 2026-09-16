@@ -9,7 +9,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   let jobPolls = 0;
   let merged = false;
   let selected = false;
-  let selectionOpened = false;
   const edition = {
     id: editionId,
     country: "Iran",
@@ -18,23 +17,11 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     period_end: "2026-05-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_articles: 3,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: "discovery",
+    state: "open",
     version: 2,
-    progress_percent: 25,
-    allowed_transitions: ["selection", "archived"],
     created_at: "2026-06-01T00:00:00Z",
     updated_at: "2026-06-01T00:00:00Z",
   };
-  const currentEdition = () => ({
-    ...edition,
-    status: selectionOpened ? "selection" : "discovery",
-    allowed_transitions: selectionOpened
-      ? ["production", "archived"]
-      : ["selection", "archived"],
-  });
   const source = (
     id: string,
     title: string,
@@ -181,14 +168,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     const request = route.request();
     const path = new URL(request.url()).pathname;
     if (path === `/api/editions/${editionId}`)
-      return route.fulfill({ json: currentEdition() });
-    if (
-      path === `/api/editions/${editionId}/transitions` &&
-      request.method() === "POST"
-    ) {
-      selectionOpened = true;
-      return route.fulfill({ json: currentEdition() });
-    }
+      return route.fulfill({ json: edition });
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
@@ -230,6 +210,9 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       });
     if (path.endsWith("/discovery") && request.method() === "POST") {
       searched = true;
+      expect(request.postDataJSON()).toMatchObject({
+        source_profile: "iran-default",
+      });
       return route.fulfill({
         status: 202,
         json: {
@@ -296,7 +279,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
           selected_articles: selected ? 1 : 0,
           ignored: 0,
           undecided: selected ? 0 : merged ? 1 : 2,
-          target_articles: 3,
           automatic_selection: false,
         },
       });
@@ -329,7 +311,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     page.getByRole("heading", { name: ncc.title }).first(),
   ).toBeVisible();
 
-  await page.getByRole("button", { name: "Ouvrir la sélection" }).click();
+  await page.getByRole("link", { name: "Sélection" }).click();
   await expect(
     page.getByRole("heading", { name: "Sélection des sujets" }),
   ).toBeVisible();

@@ -24,40 +24,6 @@ class EditionConcurrencyError(RuntimeError):
     pass
 
 
-class PreviousEditionError(ValueError):
-    pass
-
-
-class EditionTransitionRequiresUseCaseError(ValueError):
-    """Raised when the generic transition API would bypass a workflow use case."""
-
-    code = "edition_transition_requires_use_case"
-
-    def __init__(self, source: EditionStatus, target: EditionStatus) -> None:
-        super().__init__(
-            f"Transition from {source.value} to {target.value} must be performed by its use case"
-        )
-
-
-class ActiveProductionEditionError(ValueError):
-    """An active production must be stopped through its compensation use case."""
-
-    code = "active_production_requires_cancellation"
-
-    def __init__(self) -> None:
-        super().__init__("Active production must be stopped before the edition can be archived")
-
-
-_USE_CASE_OWNED_TRANSITIONS = {
-    (EditionStatus.SELECTION, EditionStatus.PRODUCTION),
-    (EditionStatus.PRODUCTION, EditionStatus.REVIEW),
-    (EditionStatus.REVIEW, EditionStatus.PRODUCTION),
-    (EditionStatus.REVIEW, EditionStatus.ASSEMBLING),
-    (EditionStatus.ASSEMBLING, EditionStatus.REVIEW),
-    (EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED),
-}
-
-
 @dataclass(frozen=True, slots=True)
 class EditionPage:
     items: list[Edition]
@@ -79,9 +45,6 @@ class EditionService:
         period_end: date,
         tlp: TLP,
         languages: tuple[str, ...],
-        target_articles: int,
-        previous_edition_id: UUID | None,
-        source_profile: str,
         actor_id: str,
         correlation_id: str,
     ) -> Edition:
@@ -92,12 +55,8 @@ class EditionService:
             period_end=period_end,
             tlp=tlp,
             languages=languages,
-            target_articles=target_articles,
-            previous_edition_id=previous_edition_id,
-            source_profile=source_profile,
         )
         async with self._uow_factory() as uow:
-            await self._validate_previous(uow, previous_edition_id, edition.id)
             if not await uow.editions.add_if_absent(edition):
                 existing = await uow.editions.get_by_logical_key(
                     edition.country_code, edition.period_start, edition.period_end
@@ -131,7 +90,7 @@ class EditionService:
         country_code: str | None = None,
         period_start: date | None = None,
         period_end: date | None = None,
-        status: EditionStatus | None = None,
+        state: EditionStatus | None = None,
     ) -> EditionPage:
         async with self._uow_factory() as uow:
             editions, total = await uow.editions.list(
@@ -140,7 +99,7 @@ class EditionService:
                 country_code=country_code.upper() if country_code else None,
                 period_start=period_start,
                 period_end=period_end,
-                status=status,
+                state=state,
             )
             return EditionPage(list(editions), total, page, page_size)
 
@@ -155,9 +114,6 @@ class EditionService:
         period_end: date,
         tlp: TLP,
         languages: tuple[str, ...],
-        target_articles: int,
-        previous_edition_id: UUID | None,
-        source_profile: str,
         actor_id: str,
         correlation_id: str,
     ) -> Edition:
@@ -167,8 +123,12 @@ class EditionService:
                 raise EditionNotFoundError(str(edition_id))
             if edition.version != expected_version:
                 raise EditionConcurrencyError("Edition was modified by another request")
-            await self._validate_previous(uow, previous_edition_id, edition.id)
             before = edition.snapshot()
+            previous_logical_key = (
+                edition.country_code,
+                edition.period_start,
+                edition.period_end,
+            )
             edition.update_metadata(
                 country=country,
                 country_code=country_code,
@@ -176,11 +136,13 @@ class EditionService:
                 period_end=period_end,
                 tlp=tlp,
                 languages=languages,
-                target_articles=target_articles,
-                previous_edition_id=previous_edition_id,
-                source_profile=source_profile,
             )
-            await self._ensure_logical_key_available(uow, edition)
+            if previous_logical_key != (
+                edition.country_code,
+                edition.period_start,
+                edition.period_end,
+            ):
+                await self._ensure_logical_key_available(uow, edition)
             if not await uow.editions.update(edition, expected_version):
                 raise EditionConcurrencyError("Edition was modified by another request")
             await uow.edition_audit.append(
@@ -196,14 +158,13 @@ class EditionService:
             await uow.commit()
             return edition
 
-    async def transition(
+    async def archive(
         self,
         edition_id: UUID,
         *,
-        target: EditionStatus,
         expected_version: int,
         actor_id: str,
-        correlation_id: str,
+        correlation_id: str = "-",
     ) -> Edition:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(edition_id)
@@ -211,19 +172,15 @@ class EditionService:
                 raise EditionNotFoundError(str(edition_id))
             if edition.version != expected_version:
                 raise EditionConcurrencyError("Edition was modified by another request")
-            if edition.status is EditionStatus.PRODUCTION and target is EditionStatus.ARCHIVED:
-                raise ActiveProductionEditionError()
-            if (edition.status, target) in _USE_CASE_OWNED_TRANSITIONS:
-                raise EditionTransitionRequiresUseCaseError(edition.status, target)
             before = edition.snapshot()
-            edition.transition(target)
+            edition.archive()
             if not await uow.editions.update(edition, expected_version):
                 raise EditionConcurrencyError("Edition was modified by another request")
             await uow.edition_audit.append(
                 EditionAuditEvent(
                     edition_id=edition.id,
                     actor_id=actor_id,
-                    action="edition.transitioned",
+                    action="edition.archived",
                     before=before,
                     after=edition.snapshot(),
                     correlation_id=correlation_id,
@@ -237,17 +194,6 @@ class EditionService:
             if await uow.editions.get(edition_id) is None:
                 raise EditionNotFoundError(str(edition_id))
             return list(await uow.edition_audit.list_for_edition(edition_id))
-
-    @staticmethod
-    async def _validate_previous(
-        uow: EditionUnitOfWork, previous_edition_id: UUID | None, edition_id: UUID
-    ) -> None:
-        if previous_edition_id is None:
-            return
-        if previous_edition_id == edition_id:
-            raise PreviousEditionError("An edition cannot reference itself")
-        if await uow.editions.get(previous_edition_id) is None:
-            raise PreviousEditionError("Previous edition does not exist")
 
     @staticmethod
     async def _ensure_logical_key_available(uow: EditionUnitOfWork, edition: Edition) -> None:

@@ -258,7 +258,7 @@ class _DecisionUow:
         artifact_status: object = ProductionArtifactStatus.VERIFIED,
     ) -> None:
         async def get_edition(_id: UUID) -> object:
-            return SimpleNamespace(status=EditionStatus.REVIEW)
+            return SimpleNamespace(state=EditionStatus.OPEN)
 
         async def get_run(_id: UUID) -> object:
             return SimpleNamespace(
@@ -517,7 +517,7 @@ class _ProjectionUow:
         self.production_repair_decisions = _ProjectionDecisionRepository(decisions)
         self.editions = SimpleNamespace(
             get_for_update=lambda _edition_id: _async_value(
-                SimpleNamespace(status=EditionStatus.REVIEW)
+                SimpleNamespace(state=EditionStatus.OPEN)
             )
         )
 

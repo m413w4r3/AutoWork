@@ -1,20 +1,14 @@
 import type { EditionStatus, Tlp } from "../../api/editions";
 
 export const statusLabels: Record<EditionStatus, string> = {
-  draft: "Brouillon",
-  discovery: "Découverte",
-  selection: "Sélection",
-  production: "Production",
-  review: "Revue",
-  assembling: "Assemblage",
-  published: "Publiée",
+  open: "Ouverte",
   archived: "Archivée",
 };
 
-export function StatusBadge({ status }: { status: EditionStatus }) {
+export function StatusBadge({ state }: { state: EditionStatus }) {
   return (
-    <span className={`badge badge--status badge--${status}`}>
-      {statusLabels[status]}
+    <span className={`badge badge--status badge--${state}`}>
+      {statusLabels[state]}
     </span>
   );
 }

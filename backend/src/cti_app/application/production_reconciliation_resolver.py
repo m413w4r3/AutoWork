@@ -243,8 +243,8 @@ class ProductionReconciliationResolver:
             )
             if edition is None:
                 raise ValueError("edition_not_found")
-            if edition.status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
-                raise ValueError("edition_frozen_for_publication")
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("edition_archived")
         await prepare_batch_for_recovery(uow, run, reopen=True)
 
 

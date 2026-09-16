@@ -437,8 +437,6 @@ def _selected_subject(
         period_end=date(2026, 8, calendar.monthrange(2026, 8)[1]),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=2,
-        source_profile="default",
     )
     sources = [
         SourceCandidate(
@@ -569,13 +567,6 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
 ) -> None:
     collection_factory = InMemoryCollectionUnitOfWorkFactory()
     subject, edition = _selected_subject(collection_factory, (SOURCE_ONE, SOURCE_TWO))
-    for step in (
-        EditionStatus.DISCOVERY,
-        EditionStatus.SELECTION,
-        EditionStatus.PRODUCTION,
-        EditionStatus.REVIEW,
-    ):
-        edition.transition(step)
     collection_service = SubjectCollectionService(
         collection_factory,
         _collector(),
@@ -695,7 +686,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert world.manifests.items == []
-    assert world.edition.status is EditionStatus.REVIEW
+    assert world.edition.state is EditionStatus.OPEN
 
     # --- 6. The rebuild reparses the archived Q1 with no model call. --------
     async with _client(fresh) as client:
@@ -771,13 +762,6 @@ async def test_audit4_source_without_collection_is_visible_and_preparable(
     """A Q1 proposal the collection pass never registered is not a dead end."""
     collection_factory = InMemoryCollectionUnitOfWorkFactory()
     subject, edition = _selected_subject(collection_factory, (SOURCE_ONE,))
-    for step in (
-        EditionStatus.DISCOVERY,
-        EditionStatus.SELECTION,
-        EditionStatus.PRODUCTION,
-        EditionStatus.REVIEW,
-    ):
-        edition.transition(step)
     collection_service = SubjectCollectionService(
         collection_factory,
         _collector(),

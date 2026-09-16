@@ -8,11 +8,12 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import DBAPIError
 
 from cti_app.application.blobs import BlobCatalogService
-from cti_app.application.editions import EditionService
+from cti_app.application.editions import EditionConcurrencyError, EditionService
 from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.persistence import EditionUnitOfWork, JobUnitOfWork, UnitOfWork
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.errors import BlobStillReferencedError
 from cti_app.domain.model_conversations import (
@@ -151,12 +152,65 @@ async def test_edition_audit_and_job_transitions_are_append_only(
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr", "fa"),
-            target_articles=8,
-            previous_edition_id=None,
-            source_profile="iran-default",
             actor_id="dev-analyst",
             correlation_id="edition-integration",
         )
+        assert edition.state is EditionStatus.OPEN
+        persisted = await edition_service.get(edition.id)
+        assert persisted.state is EditionStatus.OPEN
+
+        updated = await edition_service.update(
+            edition.id,
+            expected_version=edition.version,
+            country="Iran updated",
+            country_code="IR",
+            period_start=date(2026, 7, 1),
+            period_end=date(2026, 7, 31),
+            tlp=TLP.AMBER,
+            languages=("fr", "fa", "en"),
+            actor_id="dev-analyst",
+            correlation_id="edition-update",
+        )
+        assert updated.state is EditionStatus.OPEN
+        assert updated.version == 2
+
+        with pytest.raises(EditionConcurrencyError):
+            await edition_service.update(
+                edition.id,
+                expected_version=edition.version,
+                country="Iran stale",
+                country_code="IR",
+                period_start=date(2026, 7, 1),
+                period_end=date(2026, 7, 31),
+                tlp=TLP.AMBER,
+                languages=("fr", "fa"),
+                actor_id="dev-analyst",
+                correlation_id="edition-stale-update",
+            )
+
+        archived = await edition_service.archive(
+            edition.id,
+            expected_version=updated.version,
+            actor_id="dev-analyst",
+            correlation_id="edition-archive",
+        )
+        assert archived.state is EditionStatus.ARCHIVED
+        assert archived.version == 3
+        round_trip = await edition_service.get(edition.id)
+        assert round_trip.state is EditionStatus.ARCHIVED
+        archived_page = await edition_service.list(
+            page=1,
+            page_size=10,
+            country_code="ir",
+            state=EditionStatus.ARCHIVED,
+        )
+        assert archived_page.total == 1
+        assert archived_page.items[0].state is EditionStatus.ARCHIVED
+        assert [event.action for event in await edition_service.audit(edition.id)] == [
+            "edition.created",
+            "edition.updated",
+            "edition.archived",
+        ]
         job = await job_service.submit(
             kind="demo.deterministic",
             aggregate_type="edition",

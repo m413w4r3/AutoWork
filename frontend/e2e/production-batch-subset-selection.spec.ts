@@ -15,7 +15,6 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   const runB = "f6666666-6666-4666-8666-666666666666";
   const runD = "f6666666-6666-4666-8666-666666666667";
 
-  let productionStarted = false;
   let productionPostBody: unknown = null;
 
   const groupFor = (title: string, subjectId: string, id: string) => ({
@@ -55,7 +54,6 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
     selected_articles: 4,
     ignored: 0,
     undecided: 0,
-    target_articles: 4,
     automatic_selection: false,
   };
 
@@ -67,13 +65,8 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
     period_end: "2026-08-31",
     tlp: "AMBER",
     languages: ["fr"],
-    target_articles: 4,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: productionStarted ? "production" : "selection",
-    version: productionStarted ? 3 : 2,
-    progress_percent: 40,
-    allowed_transitions: ["archived"],
+    state: "open",
+    version: 2,
     created_at: "2026-08-29T00:00:00Z",
     updated_at: "2026-08-29T00:00:00Z",
   });
@@ -137,7 +130,6 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
       path === `/api/editions/${editionId}/production` &&
       request.method() === "POST"
     ) {
-      productionStarted = true;
       productionPostBody = request.postDataJSON();
       await route.fulfill({ status: 202, json: batchStatus() });
       return;

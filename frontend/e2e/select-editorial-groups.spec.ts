@@ -23,13 +23,8 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
     period_end: "2026-08-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_articles: 2,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: "selection",
+    state: "open",
     version: 3,
-    progress_percent: 28,
-    allowed_transitions: ["production", "archived"],
     created_at: "2026-08-08T00:00:00Z",
     updated_at: "2026-08-10T00:00:00Z",
   };
@@ -171,7 +166,6 @@ test("cinq cartes deviennent deux sujets prêts dans un lot atomique et restent 
           ignored: [...decisions.values()].filter((item) => item === "ignore")
             .length,
           undecided: titles.length - decisions.size,
-          target_articles: 2,
           automatic_selection: false,
         },
       });

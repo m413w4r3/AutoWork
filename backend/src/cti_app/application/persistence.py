@@ -366,7 +366,7 @@ class EditionRepository(Protocol):
         country_code: str | None,
         period_start: date | None,
         period_end: date | None,
-        status: EditionStatus | None,
+        state: EditionStatus | None,
     ) -> tuple[Sequence[Edition], int]: ...
 
 

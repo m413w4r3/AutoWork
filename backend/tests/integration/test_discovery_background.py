@@ -62,9 +62,6 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
             period_end=date(2026, 7, 31),
             tlp=TLP.AMBER,
             languages=("fr", "en", "fa"),
-            target_articles=8,
-            previous_edition_id=None,
-            source_profile="iran-default",
             actor_id="integration-analyst",
             correlation_id="durable-discovery-integration",
         )
@@ -75,7 +72,7 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
             period_start=edition.period_start,
             period_end=edition.period_end,
             languages=list(edition.languages),
-            source_profile=edition.source_profile,
+            source_profile="iran-default",
             keywords=["APT", "IOC"],
             exclusions=[],
             complementary_axis="campagnes techniques",

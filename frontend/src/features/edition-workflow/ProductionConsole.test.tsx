@@ -19,7 +19,7 @@ function renderConsole(
     action: "cancel",
     batch_id: batch?.batch_id ?? "batch-none",
     status: "cancelled",
-    edition_status: "selection",
+    edition_state: "open",
     edition_version: 4,
   },
 ) {
@@ -34,13 +34,8 @@ function renderConsole(
     period_end: "2026-08-31",
     tlp: "GREEN",
     languages: ["fr"],
-    target_articles: 1,
-    previous_edition_id: null,
-    source_profile: "default",
-    status: "production",
+    state: "open",
     version: 3,
-    progress_percent: 55,
-    allowed_transitions: ["review"],
     created_at: "2026-08-29T10:00:00Z",
     updated_at: "2026-08-29T10:00:00Z",
   };
@@ -393,7 +388,7 @@ describe("ProductionConsole", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("arrête le lot exact et invalide le batch, l’édition et la revue", async () => {
+  it("arrête le lot exact sans muter l’édition en cache", async () => {
     const batch: BatchStatus = {
       batch_id: "batch-stop",
       edition_id: EDITION_ID,
@@ -444,9 +439,9 @@ describe("ProductionConsole", () => {
       expect(invalidate).toHaveBeenCalledWith({
         queryKey: ["editorial-board", EDITION_ID],
       });
-      expect(
-        client.getQueryData<Edition>(["edition", EDITION_ID])?.status,
-      ).toBe("selection");
+      const cached = client.getQueryData<Edition>(["edition", EDITION_ID]);
+      expect(cached?.state).toBe("open");
+      expect(cached?.version).toBe(3);
     });
   });
 

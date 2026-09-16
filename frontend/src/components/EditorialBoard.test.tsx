@@ -137,7 +137,6 @@ it("désactive le polling malgré la valeur globale de production", async () => 
     selected_articles: 0,
     ignored: 0,
     undecided: 0,
-    target_articles: 6,
     automatic_selection: false,
   };
   const fetchMock = vi.fn(withProductionNotStarted(() => Response.json(board)));
@@ -174,7 +173,6 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
     selected_articles: 0,
     ignored: 0,
     undecided: 2,
-    target_articles: 6,
     automatic_selection: false,
   };
   const postedBodies: unknown[] = [];
@@ -267,7 +265,6 @@ it("ajoute immédiatement un autre sujet aux articles", async () => {
     selected_articles: 1,
     ignored: 0,
     undecided: 1,
-    target_articles: 2,
     automatic_selection: false,
   };
   const postedBodies: unknown[] = [];

@@ -14,10 +14,10 @@ import { Link, navigate } from "../routing";
 type EditionFilters = {
   countryCode: string;
   period: string;
-  status: EditionStatus | "";
+  state: EditionStatus | "";
 };
 
-function isEditionStatus(value: string): value is EditionStatus {
+function isEditionState(value: string): value is EditionStatus {
   return Object.prototype.hasOwnProperty.call(statusLabels, value);
 }
 
@@ -25,14 +25,14 @@ function readEditionFilters(search: string): EditionFilters {
   const parameters = new URLSearchParams(search);
   const countryCode = parameters.get("country_code") ?? "";
   const period = parameters.get("period") ?? "";
-  const status = parameters.get("status") ?? "";
+  const state = parameters.get("state") ?? "";
 
   return {
     countryCode: /^[A-Za-z]{2}$/.test(countryCode)
       ? countryCode.toUpperCase()
       : "",
     period: /^\d{4}-(0[1-9]|1[0-2])$/.test(period) ? period : "",
-    status: isEditionStatus(status) ? status : "",
+    state: isEditionState(state) ? state : "",
   };
 }
 
@@ -41,7 +41,7 @@ function replaceEditionFilterQuery(filters: EditionFilters) {
   const filterParameters: Array<[string, string]> = [
     ["country_code", filters.countryCode],
     ["period", filters.period],
-    ["status", filters.status],
+    ["state", filters.state],
   ];
   for (const [name, value] of filterParameters) {
     if (value) {
@@ -59,7 +59,7 @@ export function EditionListPage() {
   const [filters, setFilters] = useState<EditionFilters>(() =>
     readEditionFilters(window.location.search),
   );
-  const { countryCode, period, status } = filters;
+  const { countryCode, period, state } = filters;
 
   useEffect(() => {
     const updateFiltersFromLocation = () => {
@@ -77,8 +77,8 @@ export function EditionListPage() {
   };
 
   const editions = useQuery({
-    queryKey: ["editions", countryCode, period, status],
-    queryFn: () => listEditions({ countryCode, period, status }),
+    queryKey: ["editions", countryCode, period, state],
+    queryFn: () => listEditions({ countryCode, period, state }),
   });
 
   return (
@@ -87,7 +87,7 @@ export function EditionListPage() {
         <div>
           <p className="eyebrow">Pilotage mensuel</p>
           <h1>Éditions</h1>
-          <p>Créez une édition et suivez son passage jusqu’à la publication.</p>
+          <p>Créez et consultez les éditions mensuelles.</p>
         </div>
         <button className="button" onClick={() => navigate("/editions/new")}>
           Nouvelle édition
@@ -115,12 +115,12 @@ export function EditionListPage() {
           />
         </label>
         <label>
-          Statut
+          État
           <select
-            value={status}
+            value={state}
             onChange={(event) =>
               updateFilters({
-                status: event.target.value as EditionStatus | "",
+                state: event.target.value as EditionStatus | "",
               })
             }
           >
@@ -153,14 +153,11 @@ export function EditionListPage() {
           {editions.data.items.map((edition) => (
             <article className="edition-card" key={edition.id}>
               <div className="badge-row">
-                <StatusBadge status={edition.status} />
+                <StatusBadge state={edition.state} />
                 <TlpBadge tlp={edition.tlp} />
               </div>
               <h2>{edition.country}</h2>
               <p>{formatPeriod(edition.period_start)}</p>
-              <progress max={100} value={edition.progress_percent}>
-                {edition.progress_percent} %
-              </progress>
               <Link to={`/editions/${edition.id}`}>Ouvrir l’édition</Link>
             </article>
           ))}

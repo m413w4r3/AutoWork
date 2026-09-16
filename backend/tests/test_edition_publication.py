@@ -6,7 +6,7 @@ import json
 import shutil
 import zipfile
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.publication import router as publication_router
+from cti_app.application.edition_document import edition_metadata_projection
 from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
@@ -69,6 +70,7 @@ DECISION_C = UUID("88888888-8888-4888-8888-888888888889")
 
 
 def _edition(*, target_articles: int = 3) -> Edition:
+    del target_articles
     return Edition(
         id=EDITION_ID,
         country="France",
@@ -77,9 +79,7 @@ def _edition(*, target_articles: int = 3) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=target_articles,
-        source_profile="test",
-        status=EditionStatus.REVIEW,
+        state=EditionStatus.OPEN,
     )
 
 
@@ -124,6 +124,34 @@ def _document(title: str) -> PublicationDocumentV2:
     )
 
 
+def test_edition_metadata_projection_is_the_versioned_publication_metadata() -> None:
+    edition = _edition()
+
+    projection = edition_metadata_projection(edition)
+
+    assert set(projection) == {
+        "id",
+        "country",
+        "country_code",
+        "period_start",
+        "period_end",
+        "tlp",
+        "languages",
+        "state",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert projection["id"] == str(EDITION_ID)
+    assert projection["period_start"] == "2026-08-01"
+    assert projection["period_end"] == "2026-08-31"
+    assert projection["tlp"] == TLP.GREEN.value
+    assert projection["state"] == EditionStatus.OPEN.value
+    assert projection["version"] == edition.version
+    assert datetime.fromisoformat(projection["created_at"])
+    assert datetime.fromisoformat(projection["updated_at"])
+
+
 class _BlobStore:
     def __init__(self) -> None:
         self.blobs: dict[UUID, bytes] = {}
@@ -160,22 +188,38 @@ class _BlobStore:
 
 class _ManifestRepo:
     def __init__(self, blobs: _BlobStore) -> None:
-        self.manifest = None
-        self.blob_id: UUID | None = None
+        self.manifests: dict[UUID, Any] = {}
+        self.manifest_blobs: dict[UUID, UUID] = {}
         self.blobs = blobs
 
+    @property
+    def manifest(self) -> Any:
+        return next(reversed(self.manifests.values()), None)
+
+    @property
+    def blob_id(self) -> UUID | None:
+        manifest = self.manifest
+        return self.manifest_blobs.get(manifest.id) if manifest is not None else None
+
     async def add(self, manifest: Any, manifest_blob_id: UUID) -> None:
-        self.manifest = manifest
-        self.blob_id = manifest_blob_id
+        self.manifests[manifest.id] = manifest
+        self.manifest_blobs[manifest.id] = manifest_blob_id
 
     async def get(self, manifest_id: UUID) -> Any:
-        return self.manifest if self.manifest and self.manifest.id == manifest_id else None
+        return self.manifests.get(manifest_id)
 
     async def get_blob_id(self, manifest_id: UUID) -> UUID | None:
-        return self.blob_id if self.manifest and self.manifest.id == manifest_id else None
+        return self.manifest_blobs.get(manifest_id)
 
     async def get_latest_for_edition(self, edition_id: UUID) -> Any:
-        return self.manifest if self.manifest and self.manifest.edition_id == edition_id else None
+        return next(
+            (
+                manifest
+                for manifest in reversed(tuple(self.manifests.values()))
+                if manifest.edition_id == edition_id
+            ),
+            None,
+        )
 
     async def get_for_edition_version(self, edition_id: UUID, edition_version: int) -> Any:
         return (
@@ -202,21 +246,32 @@ class _Exclusions(_Entries):
 
 class _ReleaseRepo:
     def __init__(self) -> None:
-        self.release = None
+        self.releases: dict[UUID, Any] = {}
         self.add_calls = 0
+
+    @property
+    def release(self) -> Any:
+        return next(reversed(self.releases.values()), None)
 
     async def add_if_absent(self, release: Any) -> bool:
         self.add_calls += 1
-        if self.release is not None:
+        if release.manifest_id in self.releases:
             return False
-        self.release = release
+        self.releases[release.manifest_id] = release
         return True
 
     async def get_by_manifest(self, manifest_id: UUID) -> Any:
-        return self.release if self.release and self.release.manifest_id == manifest_id else None
+        return self.releases.get(manifest_id)
 
     async def get_for_edition(self, edition_id: UUID) -> Any:
-        return self.release if self.release and self.release.edition_id == edition_id else None
+        return next(
+            (
+                release
+                for release in reversed(tuple(self.releases.values()))
+                if release.edition_id == edition_id
+            ),
+            None,
+        )
 
 
 class _Editions:
@@ -529,8 +584,131 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
     assert first.manifest_id == second.manifest_id
     assert [entry.subject_id for entry in first.manifest.entries] == [SUBJECT_A]
     assert first.manifest.exclusions[0].review_decision_id == DECISION_B
+    assert first.edition_state is EditionStatus.OPEN
+    assert uow.editions.edition.state is EditionStatus.OPEN
+    assert uow.editions.edition.version == first.manifest.edition_version
     assert len(jobs.jobs) == 1
     assert len(dispatcher.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
+
+    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    await assembly.assemble(first.manifest_id)
+    assert uow.editions.edition.state is EditionStatus.OPEN
+    assert uow.editions.edition.version == first.manifest.edition_version
+
+    # A snapshot is unique per Edition version: re-accepting is idempotent.
+    replay = await publication.accept(EDITION_ID, actor_id="analyst")
+    assert replay.manifest_id == first.manifest_id
+    assert replay.job_id is None
+
+    uow.editions.edition.update_metadata(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+    )
+    second = await publication.accept(EDITION_ID, actor_id="analyst")
+    await assembly.assemble(second.manifest_id)
+
+    assert second.manifest_id != first.manifest_id
+    assert len(uow.publication_manifests.manifests) == 2
+    assert len(uow.edition_releases.releases) == 2
+    assert uow.editions.edition.state is EditionStatus.OPEN
+    assert uow.editions.edition.version == second.manifest.edition_version
+
+
+@pytest.mark.asyncio
+async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_one() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+
+    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    uow.editions.edition.update_metadata(
+        country="Belgium",
+        country_code="BE",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.GREEN,
+        languages=("fr",),
+    )
+    second = await publication.accept(EDITION_ID, actor_id="analyst")
+
+    assert second.manifest_id != first.manifest_id
+    assert first.manifest.edition_version != uow.editions.edition.version
+    assert second.manifest.edition_version == uow.editions.edition.version
+    assert uow.editions.edition.state is EditionStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_archived_edition_blocks_accept_and_pending_snapshot_retry() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    uow.editions.edition.archive()
+
+    with pytest.raises(PublicationAcceptanceError, match="edition_must_be_open"):
+        await publication.accept(EDITION_ID, actor_id="analyst")
+    release_status = await publication.release_status(EDITION_ID)
+
+    assert release_status.edition_state is EditionStatus.ARCHIVED
+    assert release_status.manifest_id == accepted.manifest_id
+    assert release_status.can_retry_assembly is False
 
 
 @pytest.mark.asyncio
@@ -585,7 +763,7 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
     assert response.status_code == 409
     assert response.json()["detail"]["code"] == "review_cannot_be_accepted"
     assert uow.publication_manifests.manifest is None
-    assert uow.editions.edition.status is EditionStatus.REVIEW
+    assert uow.editions.edition.state is EditionStatus.OPEN
 
 
 @pytest.mark.asyncio
@@ -801,7 +979,7 @@ async def test_dispatch_failure_keeps_freeze_and_retry_reuses_job() -> None:
     result = await service.accept(EDITION_ID, actor_id="analyst")
 
     assert result.manifest_id == uow.publication_manifests.manifest.id
-    assert uow.editions.edition.status is EditionStatus.ASSEMBLING
+    assert uow.editions.edition.state is EditionStatus.OPEN
     assert len(jobs.jobs) == 1
 
 
@@ -876,7 +1054,7 @@ async def test_job_creation_failure_keeps_freeze_for_a_later_retry() -> None:
     assert result.job_id is None
     assert not result.job_dispatched
     assert result.manifest_id == uow.publication_manifests.manifest.id
-    assert uow.editions.edition.status is EditionStatus.ASSEMBLING
+    assert uow.editions.edition.state is EditionStatus.OPEN
 
 
 @pytest.mark.asyncio
@@ -887,7 +1065,7 @@ async def test_empty_review_is_rejected_without_freeze() -> None:
 
     with pytest.raises(PublicationAcceptanceError):
         await service.accept(EDITION_ID, actor_id="analyst")
-    assert uow.editions.edition.status is EditionStatus.REVIEW
+    assert uow.editions.edition.state is EditionStatus.OPEN
 
 
 @pytest.mark.asyncio
@@ -923,7 +1101,7 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
     content = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
     edition_document = await blobs.read_json(release.edition_document_blob_id)
 
-    assert uow.editions.edition.status is EditionStatus.PUBLISHED
+    assert uow.editions.edition.state is EditionStatus.OPEN
     assert edition_document["schema_version"] == "2"
     assert edition_document["publications"][0]["document"]["schema_version"] == "2"
     assert content[:2] == b"PK"
@@ -1054,7 +1232,7 @@ async def test_assembly_filesystem_failure_keeps_canonical_release_published() -
     release = await assembly.assemble(accepted.manifest_id)
 
     assert release.edition_id == EDITION_ID
-    assert uow.editions.edition.status is EditionStatus.PUBLISHED
+    assert uow.editions.edition.state is EditionStatus.OPEN
     assert uow.edition_releases.release is release
 
 
@@ -1086,7 +1264,7 @@ async def test_assembly_rejects_an_edition_changed_after_freeze() -> None:
         await assembly.assemble(accepted.manifest_id)
 
     assert uow.edition_releases.release is None
-    assert uow.editions.edition.status is EditionStatus.ASSEMBLING
+    assert uow.editions.edition.state is EditionStatus.OPEN
 
 
 @pytest.mark.asyncio
@@ -1242,6 +1420,8 @@ async def test_release_endpoint_exposes_public_assembly_failure_state() -> None:
 
     body = response.json()
     assert response.status_code == 200
+    assert body["edition_state"] == EditionStatus.OPEN.value
+    assert "edition_status" not in body
     assert body["assembly_job_id"] == str(job.id)
     assert body["assembly_status"] == "failed"
     assert body["assembly_error_code"] == "pandoc_failed"

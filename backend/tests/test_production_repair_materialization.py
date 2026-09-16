@@ -134,7 +134,12 @@ class _Artifacts:
 
 
 class _Uow:
-    def __init__(self, edition_status: EditionStatus = EditionStatus.REVIEW) -> None:
+    def __init__(
+        self,
+        edition_state: EditionStatus = EditionStatus.OPEN,
+        *,
+        manifest_exists: bool = False,
+    ) -> None:
         self.artifacts = _Artifacts()
         self.run = SimpleNamespace(
             id=RUN_ID,
@@ -152,10 +157,10 @@ class _Uow:
         )
         self.production_artifacts = self.artifacts
         self.editions = SimpleNamespace(
-            get_for_update=lambda _edition_id: self._edition(edition_status),
+            get_for_update=lambda _edition_id: self._edition(edition_state),
         )
         self.publication_manifests = SimpleNamespace(
-            get_latest_for_edition=lambda _edition_id: self._none(),
+            get_latest_for_edition=lambda _edition_id: self._manifest(manifest_exists),
         )
         self.production_input_snapshots = SimpleNamespace(
             get_by_run=lambda _run_id: self._snapshot(),
@@ -169,8 +174,11 @@ class _Uow:
     async def _run(self) -> object:
         return self.run
 
-    async def _edition(self, status: EditionStatus) -> object:
-        return SimpleNamespace(status=status)
+    async def _edition(self, state: EditionStatus) -> object:
+        return SimpleNamespace(state=state)
+
+    async def _manifest(self, exists: bool) -> object | None:
+        return object() if exists else None
 
     async def _none(self) -> None:
         return None
@@ -293,13 +301,14 @@ class _Checkpoint:
 def _service(
     kind: ProductionRepairImpactKind,
     *,
-    edition_status: EditionStatus = EditionStatus.REVIEW,
+    edition_state: EditionStatus = EditionStatus.OPEN,
+    manifest_exists: bool = False,
     diagnostics: DiagnosticsLog | None = None,
     assembly_error: Exception | None = None,
     qa_passed: bool = True,
     checkpoint_result: object | _Unset = _UNSET,
 ) -> tuple[ProductionRepairMaterializationService, _Uow, _Projection, _Assembly, _QA, _Checkpoint]:
-    uow = _Uow(edition_status)
+    uow = _Uow(edition_state, manifest_exists=manifest_exists)
     projection = _Projection(
         ProductionRepairProjectionResult(
             artifact=_artifact(ProductionArtifactStage.EXTRACTION, version=2),
@@ -383,13 +392,26 @@ async def test_no_deliverable_change_does_not_stale_or_checkpoint() -> None:
 
 
 @pytest.mark.asyncio
-async def test_materialization_refuses_a_frozen_edition() -> None:
+async def test_materialization_allows_an_open_edition_with_historical_manifest() -> None:
     service, _uow, projection, _assembly, _qa, _checkpoint = _service(
         ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        edition_status=EditionStatus.PUBLISHED,
+        manifest_exists=True,
     )
 
-    with pytest.raises(ProductionRepairProjectionError, match="edition_frozen_for_publication"):
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+
+    assert result.action == "rules_materialized"
+    assert projection.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_materialization_refuses_an_archived_edition() -> None:
+    service, _uow, projection, _assembly, _qa, _checkpoint = _service(
+        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
+        edition_state=EditionStatus.ARCHIVED,
+    )
+
+    with pytest.raises(ProductionRepairProjectionError, match="edition_archived"):
         await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
     assert projection.calls == 0
 

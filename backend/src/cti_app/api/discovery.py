@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import (
+    SOURCE_PROFILE_PATTERN,
     DiscoverEditionParameters,
     discovery_idempotency_key,
 )
@@ -54,6 +55,11 @@ router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discove
 class DiscoveryLaunch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    source_profile: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=SOURCE_PROFILE_PATTERN.pattern,
+    )
     country_aliases: list[str] = Field(default_factory=list, max_length=30)
     keywords: list[str] = Field(default_factory=list, max_length=100)
     exclusions: list[str] = Field(default_factory=list, max_length=100)
@@ -275,8 +281,8 @@ async def launch_discovery(
     provider: IdentityProvider = request.app.state.identity_provider
     try:
         edition = await editions.get(edition_id)
-        if edition.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
-            raise ValueError("A published or archived edition cannot start discovery")
+        if edition.state is EditionStatus.ARCHIVED:
+            raise ValueError("An archived edition cannot start discovery")
         aliases = list(
             dict.fromkeys([edition.country, edition.country_code, *payload.country_aliases])
         )
@@ -287,7 +293,7 @@ async def launch_discovery(
             period_start=edition.period_start,
             period_end=edition.period_end,
             languages=list(edition.languages),
-            source_profile=edition.source_profile,
+            source_profile=payload.source_profile,
             keywords=payload.keywords,
             exclusions=payload.exclusions,
             complementary_axis=payload.complementary_axis,
@@ -553,6 +559,7 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
 def _discovery_parameters_from_edition(
     edition: Edition,
     *,
+    source_profile: str,
     complementary_axis: str,
     sensitivity: str,
     external_llm_allowed: bool,
@@ -561,8 +568,8 @@ def _discovery_parameters_from_edition(
     exclusions: list[str] | None = None,
     research_nonce: UUID | None = None,
 ) -> DiscoverEditionParameters:
-    # Single source of truth shared by launch, retry and both import endpoints so the scope
-    # (country, period, languages, source profile) stays identical across all entry points.
+    # Single source of truth shared by both import endpoints so the edition scope stays
+    # identical across all entry points.
     aliases = list(dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])]))
     return DiscoverEditionParameters(
         edition_id=edition.id,
@@ -571,7 +578,7 @@ def _discovery_parameters_from_edition(
         period_start=edition.period_start,
         period_end=edition.period_end,
         languages=list(edition.languages),
-        source_profile=edition.source_profile,
+        source_profile=source_profile,
         keywords=keywords or [],
         exclusions=exclusions or [],
         complementary_axis=complementary_axis,

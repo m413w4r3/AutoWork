@@ -69,43 +69,6 @@ export function EditionCreatePage() {
         <small id="languages-help">
           Codes séparés par des virgules, par exemple fr,en,fa.
         </small>
-        <fieldset className="indicative-targets">
-          <legend>Paramètres indicatifs</legend>
-          <p>Ces objectifs ne limitent jamais la sélection éditoriale.</p>
-          <label>
-            Objectif indicatif d’articles — sans limite de sélection
-            <input
-              name="target_articles"
-              type="number"
-              min={0}
-              max={120}
-              defaultValue={8}
-              required
-            />
-          </label>
-        </fieldset>
-        <label>
-          Profil de sources
-          <input
-            name="source_profile"
-            defaultValue="default"
-            required
-            pattern="[a-z0-9._-]+"
-          />
-        </label>
-        <label>
-          Édition précédente
-          <input
-            name="previous_edition_id"
-            type="text"
-            inputMode="text"
-            pattern="[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-            aria-describedby="previous-edition-help"
-          />
-        </label>
-        <small id="previous-edition-help">
-          UUID optionnel d’une édition déjà existante.
-        </small>
         <div className="form-actions">
           <button
             type="button"
@@ -138,18 +101,10 @@ function fieldsFromForm(data: FormData): EditionFields {
       .split(",")
       .map((language) => language.trim())
       .filter(Boolean),
-    target_articles: Number(data.get("target_articles")),
-    previous_edition_id: optionalFormValue(data, "previous_edition_id"),
-    source_profile: formValue(data, "source_profile").trim(),
   };
 }
 
 function formValue(data: FormData, key: string): string {
   const value = data.get(key);
   return typeof value === "string" ? value : "";
-}
-
-function optionalFormValue(data: FormData, key: string): string | null {
-  const value = formValue(data, key).trim();
-  return value || null;
 }

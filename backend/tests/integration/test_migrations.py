@@ -438,6 +438,27 @@ async def _database_snapshot(database_url: str) -> dict[str, dict[str, Any]]:
         await engine.dispose()
 
 
+async def _edition_schema(database_url: str) -> tuple[set[str], dict[str, str], set[str]]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            def inspect_edition(
+                sync_connection: Connection,
+            ) -> tuple[set[str], dict[str, str], set[str]]:
+                inspector = inspect(sync_connection)
+                columns = {column["name"] for column in inspector.get_columns("editions")}
+                checks = {
+                    str(check["name"]): str(check.get("sqltext", ""))
+                    for check in inspector.get_check_constraints("editions")
+                }
+                indexes = {str(index["name"]) for index in inspector.get_indexes("editions")}
+                return columns, checks, indexes
+
+            return await connection.run_sync(inspect_edition)
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # 1 & 2: exact table set, and concordance with Base.metadata.tables
 # ---------------------------------------------------------------------------
@@ -589,6 +610,34 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
     assert len([table for table in tables if table == _REPAIR_TABLE]) == 1
+    edition_columns, edition_checks, edition_indexes = asyncio.run(
+        _edition_schema(temporary_postgres_url)
+    )
+    assert edition_columns == {
+        "id",
+        "country",
+        "country_code",
+        "period_start",
+        "period_end",
+        "tlp",
+        "languages",
+        "state",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert not edition_columns & {
+        "target_articles",
+        "previous_edition_id",
+        "source_profile",
+        "status",
+    }
+    state_check = edition_checks["ck_editions_state"].lower()
+    assert "'open'" in state_check
+    assert "'archived'" in state_check
+    assert "status" not in state_check
+    assert "ix_editions_country_state" in edition_indexes
+    assert "ix_editions_country_status" not in edition_indexes
     triggers = asyncio.run(_trigger_function_pairs(temporary_postgres_url))
     repair_triggers = {
         key: function for key, function in triggers.items() if key[0] == _REPAIR_TABLE

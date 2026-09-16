@@ -12,6 +12,7 @@ from cti_app.api.discovery import (
 )
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import (
+    SOURCE_PROFILE_PATTERN,
     DiscoverEditionParameters,
     discovery_request_hash,
 )
@@ -60,6 +61,11 @@ class RecoveryPreviewView(BaseModel):
 class DiscoveryImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    source_profile: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=SOURCE_PROFILE_PATTERN.pattern,
+    )
     markdown: str = Field(min_length=1, max_length=10_000_000)
     complementary_axis: str = Field(
         default="manual-import",
@@ -236,11 +242,12 @@ async def preview_discovery_import(
     service: DiscoveryService = request.app.state.discovery_service
     try:
         edition = await request.app.state.edition_service.get(edition_id)
-        if edition.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
-            raise ValueError("A published or archived edition cannot import discovery")
+        if edition.state is EditionStatus.ARCHIVED:
+            raise ValueError("An archived edition cannot import discovery")
 
         parameters = _discovery_parameters_from_edition(
             edition,
+            source_profile=payload.source_profile,
             complementary_axis=payload.complementary_axis,
             sensitivity=payload.sensitivity,
             external_llm_allowed=payload.external_llm_allowed,
@@ -264,12 +271,13 @@ async def confirm_discovery_import(
     provider: IdentityProvider = request.app.state.identity_provider
     try:
         edition = await request.app.state.edition_service.get(edition_id)
-        if edition.status in {EditionStatus.PUBLISHED, EditionStatus.ARCHIVED}:
-            raise ValueError("A published or archived edition cannot import discovery")
+        if edition.state is EditionStatus.ARCHIVED:
+            raise ValueError("An archived edition cannot import discovery")
 
         identity = await provider.current()
         parameters = _discovery_parameters_from_edition(
             edition,
+            source_profile=payload.source_profile,
             complementary_axis=payload.complementary_axis,
             sensitivity=payload.sensitivity,
             external_llm_allowed=payload.external_llm_allowed,

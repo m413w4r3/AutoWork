@@ -167,9 +167,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         period_end=date(period_year, 11, 30),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
-        source_profile="lot34",
-        status=EditionStatus.REVIEW,
+        state=EditionStatus.OPEN,
     )
     subject = Subject(
         external_id=f"LOT34-{uuid4().hex}",

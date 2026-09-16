@@ -157,9 +157,7 @@ class _CountingRetryModelAdapter:
         raise ModelGatewayError("retry test adapter does not support background responses")
 
 
-def _edition(
-    *, country: str = "France", country_code: str = "FR", target_articles: int = 1
-) -> Edition:
+def _edition(*, country: str = "France", country_code: str = "FR") -> Edition:
     return Edition(
         country=country,
         country_code=country_code,
@@ -167,9 +165,6 @@ def _edition(
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=target_articles,
-        source_profile="test",
-        status=EditionStatus.SELECTION,
     )
 
 
@@ -906,18 +901,6 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert publication_b.reused_from_artifact_id is None
     assert publication_b.id != publication_a.id
 
-    async with uow_factory() as uow:
-        edition_before_retry = await uow.editions.get_for_update(edition.id)
-        assert edition_before_retry is not None
-        assert await uow.publication_manifests.get_latest_for_edition(edition.id) is None
-        if edition_before_retry.status is EditionStatus.SELECTION:
-            expected_version = edition_before_retry.version
-            edition_before_retry.transition(EditionStatus.PRODUCTION)
-            assert await uow.editions.update(edition_before_retry, expected_version)
-        else:
-            assert edition_before_retry.status is EditionStatus.PRODUCTION
-        await uow.commit()
-
     retry = await production.retry_from_stage(run_b.id, SubjectProductionStage.EXTRACTION)
     assert retry.previous_status is SubjectProductionStatus.READY
     assert retry.run.status is SubjectProductionStatus.RUNNING
@@ -1034,11 +1017,6 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
 
     async with uow_factory() as uow:
         await uow.edition_production_batch_items.append_many((review_item,))
-        locked_edition = await uow.editions.get_for_update(edition.id)
-        assert locked_edition is not None
-        expected_version = locked_edition.version
-        locked_edition.transition(EditionStatus.REVIEW)
-        assert await uow.editions.update(locked_edition, expected_version)
         await uow.commit()
 
     async with uow_factory() as uow:
@@ -1062,7 +1040,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:
     """Mirror the low-cost manual batch with two real PostgreSQL-backed runs."""
-    edition = _edition(country="Italy", country_code="IT", target_articles=2)
+    edition = _edition(country="Italy", country_code="IT")
     subjects = [
         Subject(
             external_id=f"SUBJ-TWO-ARTICLE-{label}-{uuid4()}",
@@ -1166,7 +1144,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
                 )
             )
     assert persisted_edition is not None
-    assert persisted_edition.status is EditionStatus.REVIEW
+    assert persisted_edition.state is EditionStatus.OPEN
     assert [row.position for row in review_rows] == [1, 2]
     assert [row.run_id for row in review_rows] == [first.id, second.id]
     assert [artifact.id for artifact in target_publications] != [

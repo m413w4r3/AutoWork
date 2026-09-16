@@ -11,7 +11,7 @@ const EDITION_ID = "edition-1";
 
 const baseRelease: EditionReleaseResponse = {
   edition_id: EDITION_ID,
-  edition_status: "assembling",
+  edition_state: "open",
   manifest_id: "manifest-1",
   manifest_sha256: "a".repeat(64),
   release_id: null,
@@ -33,13 +33,13 @@ function urlOf(input: RequestInfo | URL): string {
 }
 
 function renderConsole(
-  editionStatus: "assembling" | "published" | "archived",
   release: EditionReleaseResponse | null = baseRelease,
+  readOnly = false,
 ) {
   const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === "POST") {
       return Promise.resolve(
-        Response.json({ edition_id: EDITION_ID, edition_status: "assembling" }),
+        Response.json({ edition_id: EDITION_ID, edition_state: "open" }),
       );
     }
     if (release === null) {
@@ -58,10 +58,7 @@ function renderConsole(
   });
   render(
     <QueryClientProvider client={client}>
-      <PublicationConsole
-        editionId={EDITION_ID}
-        editionStatus={editionStatus}
-      />
+      <PublicationConsole editionId={EDITION_ID} readOnly={readOnly} />
     </QueryClientProvider>,
   );
   return { client, fetchMock };
@@ -77,7 +74,7 @@ describe("PublicationConsole", () => {
     "%s conserve un polling de 2 secondes",
     (status) => {
       expect(
-        publicationPollingInterval("assembling", {
+        publicationPollingInterval({
           ...baseRelease,
           assembly_status: status,
         }),
@@ -90,7 +87,7 @@ describe("PublicationConsole", () => {
     ["running", "Assemblage en cours"],
     ["succeeded", "Assemblage terminé"],
   ] as const)("%s n’affiche pas de retry", async (assembly_status, label) => {
-    renderConsole("assembling", {
+    renderConsole({
       ...baseRelease,
       assembly_status,
     });
@@ -107,35 +104,44 @@ describe("PublicationConsole", () => {
       "succeeded",
     ] as const) {
       expect(
-        publicationPollingInterval("assembling", {
+        publicationPollingInterval({
           ...baseRelease,
           assembly_status,
         }),
       ).toBe(false);
     }
     expect(
-      publicationPollingInterval("assembling", {
+      publicationPollingInterval({
         ...baseRelease,
-        edition_status: "published",
+        edition_state: "open",
+        release_id: "release-1",
         assembly_status: "succeeded",
       }),
     ).toBe(false);
+    expect(publicationPollingInterval(undefined)).toBe(false);
   });
 
   it("cesse le polling quand aucun job ne peut être relancé", () => {
     expect(
-      publicationPollingInterval("assembling", {
+      publicationPollingInterval({
         ...baseRelease,
         assembly_status: null,
         assembly_job_id: null,
         can_retry_assembly: true,
       }),
     ).toBe(false);
+    expect(
+      publicationPollingInterval({
+        ...baseRelease,
+        manifest_id: null,
+        assembly_status: "running",
+      }),
+    ).toBe(false);
   });
 
   it("suit can_retry_assembly même si le statut du job est actif", () => {
     expect(
-      publicationPollingInterval("assembling", {
+      publicationPollingInterval({
         ...baseRelease,
         assembly_status: "running",
         can_retry_assembly: true,
@@ -144,7 +150,7 @@ describe("PublicationConsole", () => {
   });
 
   it("affiche le retry quand aucun job d’assemblage n’existe", async () => {
-    const { fetchMock } = renderConsole("assembling", {
+    const { fetchMock } = renderConsole({
       ...baseRelease,
       assembly_job_id: null,
       assembly_status: null,
@@ -174,7 +180,7 @@ describe("PublicationConsole", () => {
   });
 
   it("affiche le retry pour un assemblage annulé", async () => {
-    renderConsole("assembling", {
+    renderConsole({
       ...baseRelease,
       assembly_status: "cancelled",
       can_retry_assembly: true,
@@ -189,7 +195,7 @@ describe("PublicationConsole", () => {
   });
 
   it("affiche l’intervention requise sans retry par défaut", async () => {
-    renderConsole("assembling", {
+    renderConsole({
       ...baseRelease,
       assembly_status: "waiting_human",
       can_retry_assembly: false,
@@ -204,7 +210,7 @@ describe("PublicationConsole", () => {
   });
 
   it("affiche une erreur publique, les diagnostics et le retry avec le POST Accept", async () => {
-    const { fetchMock } = renderConsole("assembling", {
+    const { fetchMock } = renderConsole({
       ...baseRelease,
       assembly_status: "failed",
       assembly_error_code: "pandoc_failed",
@@ -241,13 +247,13 @@ describe("PublicationConsole", () => {
   it("affiche le lien DOCX sans fetcher le binaire", async () => {
     const release = {
       ...baseRelease,
-      edition_status: "published" as const,
+      edition_state: "open" as const,
       assembly_status: "succeeded" as const,
       release_id: "release-1",
       docx_available: true,
       published_at: "2026-08-29T10:00:00Z",
     };
-    const { fetchMock } = renderConsole("published", release);
+    const { fetchMock } = renderConsole(release);
     const link = await screen.findByRole("link", {
       name: "Télécharger le bulletin DOCX",
     });
@@ -261,16 +267,32 @@ describe("PublicationConsole", () => {
     ).toBe(true);
   });
 
+  it("ne répercute pas automatiquement une publication dans Edition", async () => {
+    const release = {
+      ...baseRelease,
+      edition_state: "open" as const,
+      release_id: "release-1",
+      assembly_status: "succeeded" as const,
+    };
+    const { client } = renderConsole(release);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+
+    expect(
+      await screen.findByRole("heading", { name: "Bulletin publié" }),
+    ).toBeInTheDocument();
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it("propose l’archive des règles à côté du bulletin, sans fetcher le ZIP", async () => {
     const release = {
       ...baseRelease,
-      edition_status: "published" as const,
+      edition_state: "open" as const,
       assembly_status: "succeeded" as const,
       release_id: "release-1",
       docx_available: true,
       published_at: "2026-08-29T10:00:00Z",
     };
-    const { fetchMock } = renderConsole("published", release);
+    const { fetchMock } = renderConsole(release);
     const link = await screen.findByRole("link", {
       name: "Télécharger les règles (ZIP)",
     });
@@ -286,7 +308,7 @@ describe("PublicationConsole", () => {
 
   it("conserve le téléchargement en mode ARCHIVED et n’affiche pas de commande", async () => {
     const release = { ...baseRelease, docx_available: true };
-    renderConsole("archived", release);
+    renderConsole(release, true);
     expect(
       await screen.findByRole("link", {
         name: "Télécharger le bulletin DOCX",
@@ -299,7 +321,7 @@ describe("PublicationConsole", () => {
   });
 
   it("affiche un état archivé simple si le release est absent", async () => {
-    renderConsole("archived", null);
+    renderConsole(null, true);
     expect(
       await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();

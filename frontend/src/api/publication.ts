@@ -68,7 +68,7 @@ export type AssemblyJobStatus =
 
 export interface PublicationAcceptResponse {
   edition_id: string;
-  edition_status: EditionStatus;
+  edition_state: EditionStatus;
   manifest_id: string;
   manifest_sha256: string;
   edition_version: number;
@@ -79,7 +79,7 @@ export interface PublicationAcceptResponse {
 
 export interface EditionReleaseResponse {
   edition_id: string;
-  edition_status: EditionStatus;
+  edition_state: EditionStatus;
   manifest_id: string | null;
   manifest_sha256: string | null;
   release_id: string | null;

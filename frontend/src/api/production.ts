@@ -1,4 +1,4 @@
-import { ApiError } from "./editions";
+import { ApiError, type EditionStatus } from "./editions";
 
 export type SubjectProductionStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
@@ -246,7 +246,7 @@ export interface CancelProductionBatchResponse {
   action: string;
   batch_id: string;
   status: "cancelled";
-  edition_status: "selection";
+  edition_state: EditionStatus;
   edition_version: number;
 }
 

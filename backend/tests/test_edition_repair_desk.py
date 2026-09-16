@@ -41,7 +41,7 @@ SUBJECT_A = UUID("22222222-2222-4222-8222-222222222222")
 SUBJECT_B = UUID("33333333-3333-4333-8333-333333333333")
 
 
-def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
+def _edition(state: EditionStatus = EditionStatus.OPEN) -> Edition:
     return Edition(
         id=EDITION_ID,
         country="France",
@@ -50,9 +50,7 @@ def _edition(status: EditionStatus = EditionStatus.REVIEW) -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
-        status=status,
+        state=state,
     )
 
 
@@ -79,11 +77,11 @@ class _ReadModelUow:
     def __init__(
         self,
         rows: list[EditionReviewReadItem],
-        edition_status: EditionStatus = EditionStatus.REVIEW,
+        edition_state: EditionStatus = EditionStatus.OPEN,
     ) -> None:
         self.rows = rows
         self.editions = SimpleNamespace(
-            get=lambda _edition_id: _async_value(_edition(edition_status))
+            get=lambda _edition_id: _async_value(_edition(edition_state))
         )
         self.edition_review_read_model = SimpleNamespace(
             list_for_edition=lambda _edition_id: _async_value(self.rows)
@@ -599,10 +597,10 @@ class _BulkUow:
         self,
         runs: dict[UUID, SubjectProductionRun],
         artifacts: dict[UUID, ProductionArtifact],
-        edition_status: EditionStatus = EditionStatus.REVIEW,
+        edition_state: EditionStatus = EditionStatus.OPEN,
     ) -> None:
         self.editions = SimpleNamespace(
-            get_for_update=lambda _edition_id: _async_value(SimpleNamespace(status=edition_status))
+            get_for_update=lambda _edition_id: _async_value(SimpleNamespace(state=edition_state))
         )
         self.subject_production_runs = SimpleNamespace(
             get_for_update=lambda run_id: _async_value(runs.get(run_id))
@@ -623,7 +621,7 @@ class _BulkUow:
 
 def _bulk_case(
     status_b: ProductionArtifactStatus = ProductionArtifactStatus.VERIFIED,
-    edition_status: EditionStatus = EditionStatus.REVIEW,
+    edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[_BulkUow, list[ProductionRepairDecisionInput]]:
     runs: dict[UUID, SubjectProductionRun] = {}
     artifacts: dict[UUID, ProductionArtifact] = {}
@@ -660,7 +658,7 @@ def _bulk_case(
                 action=ProductionRepairAction.EXCLUDE,
             )
         )
-    return _BulkUow(runs, artifacts, edition_status), inputs
+    return _BulkUow(runs, artifacts, edition_state), inputs
 
 
 @pytest.mark.asyncio
@@ -689,16 +687,16 @@ async def test_bulk_repair_decision_is_single_commit_and_rolls_back_on_stale_ite
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "edition_status",
-    [EditionStatus.ASSEMBLING, EditionStatus.PUBLISHED, EditionStatus.ARCHIVED],
+    "edition_state",
+    [EditionStatus.OPEN, EditionStatus.ARCHIVED],
 )
-async def test_frozen_edition_repair_desk_stays_readable(
-    edition_status: EditionStatus,
+async def test_repair_desk_stays_readable_for_open_and_archived(
+    edition_state: EditionStatus,
 ) -> None:
     """A historical review shows its real queue; only writes are frozen."""
     row = _row(SUBJECT_A, 1)
     service = EditionRepairReadService(
-        _ReadModelFactory(_ReadModelUow([row], edition_status)),  # type: ignore[arg-type]
+        _ReadModelFactory(_ReadModelUow([row], edition_state)),  # type: ignore[arg-type]
         _IssueReader([_issue(index, row) for index in range(250)]),
     )
 
@@ -714,11 +712,11 @@ async def test_frozen_edition_repair_desk_stays_readable(
 
 
 @pytest.mark.asyncio
-async def test_frozen_edition_still_refuses_a_repair_decision() -> None:
-    """Read policy and write policy are separate: the freeze only blocks writes."""
-    uow, inputs = _bulk_case(edition_status=EditionStatus.PUBLISHED)
+async def test_archived_edition_still_refuses_a_repair_decision() -> None:
+    """Read policy and write policy are separate: archival only blocks writes."""
+    uow, inputs = _bulk_case(edition_state=EditionStatus.ARCHIVED)
 
-    with pytest.raises(ValueError, match="edition_frozen_for_publication"):
+    with pytest.raises(ValueError, match="edition_archived"):
         await ProductionRepairDecisionService(lambda: uow).decide_bulk(
             edition_id=EDITION_ID,
             decisions=inputs,

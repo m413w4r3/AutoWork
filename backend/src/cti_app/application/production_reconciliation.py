@@ -332,7 +332,7 @@ class ProductionReconciliationService:
                 )
             # Lock in the same order as ordinary production retry/cancellation
             # and as the batch hand-off: edition, then batch, then run, so
-            # reconciliation cannot race a publication freeze, a cancellation
+            # reconciliation cannot race an edition archive, a cancellation
             # or a batch transition.
             edition = await uow.editions.get_for_update(probe.edition_id)
             if edition is None or edition.id != probe.edition_id:
@@ -340,8 +340,7 @@ class ProductionReconciliationService:
                     "production_reconciliation_identity_mismatch",
                     "Le run de production n'est plus associé à la même édition.",
                 )
-            self._ensure_edition_safety(edition.status)
-            await self._ensure_no_publication_freeze(uow, edition.id)
+            self._ensure_edition_safety(edition.state)
             await self._ensure_batch_safety(uow, probe, reopen=True)
             run = await uow.subject_production_runs.get_for_update(run_id)
             if run is None:
@@ -515,30 +514,15 @@ class ProductionReconciliationService:
                     "production_reconciliation_identity_mismatch",
                     "L'édition du run de production est introuvable.",
                 )
-            self._ensure_edition_safety(edition.status)
-            await self._ensure_no_publication_freeze(uow, edition.id)
+            self._ensure_edition_safety(edition.state)
             await self._ensure_batch_safety(uow, run)
 
     @staticmethod
-    def _ensure_edition_safety(status: EditionStatus) -> None:
-        if status is EditionStatus.SELECTION:
+    def _ensure_edition_safety(state: EditionStatus) -> None:
+        if state is EditionStatus.ARCHIVED:
             raise ProductionReconciliationError(
-                "production_reconciliation_edition_selection",
-                "L'édition est revenue à la sélection ; le run ne peut pas être repris.",
-            )
-        if status not in {EditionStatus.PRODUCTION, EditionStatus.REVIEW}:
-            raise ProductionReconciliationError(
-                "production_reconciliation_publication_frozen",
-                "La publication de l'édition est gelée ; le run ne peut pas être repris.",
-            )
-
-    @staticmethod
-    async def _ensure_no_publication_freeze(uow: Any, edition_id: UUID) -> None:
-        manifests = getattr(uow, "publication_manifests", None)
-        if manifests is not None and await manifests.get_latest_for_edition(edition_id) is not None:
-            raise ProductionReconciliationError(
-                "production_reconciliation_publication_frozen",
-                "La publication de l'édition est gelée ; le run ne peut pas être repris.",
+                "production_reconciliation_edition_archived",
+                "L'édition est archivée ; le run ne peut pas être repris.",
             )
 
     @staticmethod

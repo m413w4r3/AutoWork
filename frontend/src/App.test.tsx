@@ -15,21 +15,14 @@ const iranEdition: Edition = {
   period_end: "2026-07-31",
   tlp: "AMBER",
   languages: ["fr", "en", "fa"],
-  target_articles: 8,
-  previous_edition_id: null,
-  source_profile: "iran-default",
-  status: "draft",
+  state: "open",
   version: 1,
-  progress_percent: 0,
-  allowed_transitions: ["discovery", "archived"],
   created_at: "2026-08-08T00:00:00Z",
   updated_at: "2026-08-08T00:00:00Z",
 };
 
 const discoveryEdition: Edition = {
   ...iranEdition,
-  status: "discovery",
-  allowed_transitions: ["selection", "archived"],
 };
 
 const emptyEditorialBoard = {
@@ -37,7 +30,6 @@ const emptyEditorialBoard = {
   selected_articles: 0,
   ignored: 0,
   undecided: 0,
-  target_articles: 8,
   automatic_selection: false,
 };
 
@@ -113,7 +105,7 @@ afterEach(() => {
 });
 
 describe("App éditions", () => {
-  it("affiche la liste avec badges, progression et lien détail", async () => {
+  it("affiche la liste avec badges et lien détail", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(
@@ -134,9 +126,9 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("TLP:AMBER")).toBeInTheDocument();
     expect(
-      screen.getByText("Brouillon", { selector: "span" }),
+      screen.getByText("Ouverte", { selector: "span" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("progressbar")).toHaveValue(0);
+    expect(screen.queryByRole("progressbar")).not.toBeInTheDocument();
   });
 
   it("présente un état vide exploitable", async () => {
@@ -185,25 +177,13 @@ describe("App éditions", () => {
     await user.type(screen.getByLabelText("Période"), "2026-07");
     await user.clear(screen.getByLabelText("Langues"));
     await user.type(screen.getByLabelText("Langues"), "fr,en,fa");
-    expect(
-      screen.getByText(
-        "Ces objectifs ne limitent jamais la sélection éditoriale.",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByLabelText(
-        "Objectif indicatif d’articles — sans limite de sélection",
-      ),
-    ).toBeInTheDocument();
-    await user.clear(screen.getByLabelText("Profil de sources"));
-    await user.type(screen.getByLabelText("Profil de sources"), "iran-default");
     await user.click(screen.getByRole("button", { name: "Créer l’édition" }));
 
     expect(
       await screen.findByRole("heading", { name: "Iran" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Démarrer la découverte" }),
+      screen.getByRole("heading", { name: "Sujets candidats" }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Archiver l’édition" }),
@@ -223,7 +203,6 @@ describe("App éditions", () => {
       period_start: "2026-07-01",
       period_end: "2026-07-31",
       languages: ["fr", "en", "fa"],
-      previous_edition_id: null,
     });
   });
 

@@ -44,7 +44,7 @@ from cti_app.application.production_state import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
-from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -276,9 +276,6 @@ def _edition() -> Edition:
         period_end=date(2026, 8, 31),
         tlp=TLP.GREEN,
         languages=("fr",),
-        target_articles=2,
-        source_profile="test",
-        status=EditionStatus.REVIEW,
     )
 
 

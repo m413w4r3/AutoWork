@@ -48,7 +48,7 @@ from cti_app.domain.edition_publication import (
     PublicationManifestExclusionV1,
     PublicationManifestV1,
 )
-from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 
@@ -83,7 +83,7 @@ class PublicationAcceptResult:
     manifest: PublicationManifestV1
     job_id: UUID | None
     job_dispatched: bool
-    edition_status: EditionStatus
+    edition_state: EditionStatus
 
     @property
     def manifest_id(self) -> UUID:
@@ -93,7 +93,7 @@ class PublicationAcceptResult:
 @dataclass(frozen=True, slots=True)
 class EditionReleaseStatus:
     edition_id: UUID
-    edition_status: EditionStatus
+    edition_state: EditionStatus
     manifest_id: UUID | None
     manifest_sha256: str | None
     release: EditionRelease | None
@@ -165,33 +165,28 @@ class EditionPublicationService:
             if edition is None:
                 raise PublicationAcceptanceError("edition_not_found")
 
-            if edition.status is EditionStatus.PUBLISHED:
-                manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
-                if manifest is None:
-                    raise PublicationAcceptanceError("published_edition_has_no_manifest")
-                result = PublicationAcceptResult(manifest, None, False, EditionStatus.PUBLISHED)
-            elif edition.status is EditionStatus.ASSEMBLING:
-                manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
-                if manifest is None:
-                    raise PublicationAcceptanceError("assembling_edition_has_no_manifest")
-                result = PublicationAcceptResult(manifest, None, False, EditionStatus.ASSEMBLING)
-            elif edition.status is EditionStatus.REVIEW:
-                result = await self._freeze(uow, edition, actor_id, correlation_id)
+            if edition.state is EditionStatus.ARCHIVED:
+                raise PublicationAcceptanceError("edition_must_be_open")
+            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            if manifest is not None:
+                release = await uow.edition_releases.get_by_manifest(manifest.id)
             else:
-                raise PublicationAcceptanceError("edition_must_be_in_review_or_assembling")
+                release = None
+            if manifest is not None and manifest.edition_version == edition.version:
+                # A snapshot is unique per Edition version: a pending one is
+                # resumed, a released one is returned as-is.
+                result = PublicationAcceptResult(manifest, None, False, edition.state)
+                if release is not None:
+                    return result
+            else:
+                result = await self._freeze(uow, edition, actor_id)
 
-        if result.manifest is not None and edition.status is not EditionStatus.PUBLISHED:
-            job_id, dispatched = await self._ensure_assembly_job(
-                result.manifest, correlation_id=correlation_id, actor_id=actor_id
-            )
-            return PublicationAcceptResult(
-                result.manifest, job_id, dispatched, result.edition_status
-            )
-        return result
+        job_id, dispatched = await self._ensure_assembly_job(
+            result.manifest, correlation_id=correlation_id, actor_id=actor_id
+        )
+        return PublicationAcceptResult(result.manifest, job_id, dispatched, result.edition_state)
 
-    async def _freeze(
-        self, uow: Any, edition: Edition, actor_id: str, correlation_id: str
-    ) -> PublicationAcceptResult:
+    async def _freeze(self, uow: Any, edition: Edition, actor_id: str) -> PublicationAcceptResult:
         batch = await uow.edition_production_batches.get_latest_for_edition(edition.id)
         if batch is None:
             raise PublicationAcceptanceError("edition_has_no_production_batch")
@@ -295,22 +290,8 @@ class EditionPublicationService:
         await uow.publication_manifests.add(manifest, manifest_blob_id)
         await uow.publication_manifest_entries.append_many(manifest.id, manifest.entries)
         await uow.publication_manifest_exclusions.append_many(manifest.id, manifest.exclusions)
-        before = edition.snapshot()
-        edition.transition(EditionStatus.ASSEMBLING)
-        if not await uow.editions.update(edition, manifest.edition_version):
-            raise PublicationAcceptanceError("edition_changed_during_freeze")
-        await uow.edition_audit.append(
-            EditionAuditEvent(
-                edition_id=edition.id,
-                actor_id=actor_id,
-                action="edition.publication_manifest_created",
-                before=before,
-                after=edition.snapshot(),
-                correlation_id=correlation_id,
-            )
-        )
         await uow.commit()
-        return PublicationAcceptResult(manifest, None, False, EditionStatus.ASSEMBLING)
+        return PublicationAcceptResult(manifest, None, False, edition.state)
 
     async def _ensure_assembly_job(
         self,
@@ -426,13 +407,19 @@ class EditionPublicationService:
                     "edition", edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
                 )
                 assembly_job = _latest_assembly_job(assembly_jobs, manifest.id)
-            can_retry_assembly = edition.status is EditionStatus.ASSEMBLING and (
-                assembly_job is None
-                or assembly_job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+            can_retry_assembly = (
+                edition.state is EditionStatus.OPEN
+                and manifest is not None
+                and release is None
+                and manifest.edition_version == edition.version
+                and (
+                    assembly_job is None
+                    or assembly_job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
+                )
             )
             return EditionReleaseStatus(
                 edition_id=edition_id,
-                edition_status=edition.status,
+                edition_state=edition.state,
                 manifest_id=manifest.id if manifest is not None else None,
                 manifest_sha256=manifest.content_sha256 if manifest is not None else None,
                 release=release,
@@ -491,11 +478,10 @@ class EditionAssemblyService:
             edition = await uow.editions.get(manifest.edition_id)
             if edition is None:
                 raise PublicationAssemblyError("edition_not_found")
-            expected_version = manifest.edition_version + 1
             if existing is None:
-                if edition.status is not EditionStatus.ASSEMBLING:
-                    raise PublicationAssemblyError("edition_must_be_assembling")
-                if edition.version != expected_version:
+                if edition.state is not EditionStatus.OPEN:
+                    raise PublicationAssemblyError("edition_must_be_open")
+                if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
             manifest_blob_id = None
             if existing is None:
@@ -575,8 +561,6 @@ class EditionAssemblyService:
         else:
             candidate_release = None
 
-        correlation_id = await context.correlation_id() if context else "-"
-
         # Phase 2: only short database work occurs while Edition is locked.
         async with self._uow_factory() as uow:
             edition = await uow.editions.get_for_update(manifest.edition_id)
@@ -585,29 +569,10 @@ class EditionAssemblyService:
             existing = await uow.edition_releases.get_by_manifest(manifest_id)
             if existing is not None:
                 release = existing
-                if edition.status is EditionStatus.ASSEMBLING:
-                    if edition.version != expected_version:
-                        raise PublicationAssemblyError("edition_changed_after_publication_freeze")
-                    before = edition.snapshot()
-                    edition.transition(EditionStatus.PUBLISHED)
-                    if not await uow.editions.update(edition, before["version"]):
-                        raise PublicationAssemblyError("edition_changed_during_assembly")
-                    await uow.edition_audit.append(
-                        EditionAuditEvent(
-                            edition_id=edition.id,
-                            actor_id="system:publication",
-                            action="edition.published",
-                            before=before,
-                            after=edition.snapshot(),
-                            correlation_id=correlation_id,
-                        )
-                    )
-                elif edition.status is not EditionStatus.PUBLISHED:
-                    raise PublicationAssemblyError("edition_must_be_assembling")
             else:
-                if edition.status is not EditionStatus.ASSEMBLING:
-                    raise PublicationAssemblyError("edition_must_be_assembling")
-                if edition.version != expected_version:
+                if edition.state is not EditionStatus.OPEN:
+                    raise PublicationAssemblyError("edition_must_be_open")
+                if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
                 if candidate_release is None:
                     raise PublicationAssemblyError("release_candidate_missing")
@@ -617,20 +582,6 @@ class EditionAssemblyService:
                     if persisted is None:
                         raise PublicationAssemblyError("release_idempotency_conflict")
                     release = persisted
-                before = edition.snapshot()
-                edition.transition(EditionStatus.PUBLISHED)
-                if not await uow.editions.update(edition, before["version"]):
-                    raise PublicationAssemblyError("edition_changed_during_assembly")
-                await uow.edition_audit.append(
-                    EditionAuditEvent(
-                        edition_id=edition.id,
-                        actor_id="system:publication",
-                        action="edition.published",
-                        before=before,
-                        after=edition.snapshot(),
-                        correlation_id=correlation_id,
-                    )
-                )
             await uow.commit()
 
         if self._rematerialization_service is not None:

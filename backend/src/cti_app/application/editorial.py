@@ -86,7 +86,6 @@ class EditorialBoard:
     selected_articles: int
     ignored: int
     undecided: int
-    target_articles: int
 
 
 class EditorialGroupingService:
@@ -241,7 +240,6 @@ class EditorialGroupingService:
                 selected_articles=len(selected),
                 ignored=len(ignored),
                 undecided=len(undecided),
-                target_articles=edition.target_articles,
             )
 
     async def decide_many(

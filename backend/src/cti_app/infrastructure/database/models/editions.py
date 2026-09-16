@@ -18,10 +18,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from .base import Base
 from .classification import TLP_VALUES_SQL
 
-EDITION_STATUS_VALUES_SQL = (
-    "'draft', 'discovery', 'selection', 'production', 'review', "
-    "'assembling', 'published', 'archived'"
-)
+EDITION_STATUS_VALUES_SQL = "'open', 'archived'"
 
 
 class EditionRow(Base):
@@ -34,9 +31,8 @@ class EditionRow(Base):
             name="uq_editions_country_period",
         ),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_editions_tlp"),
-        CheckConstraint(f"status IN ({EDITION_STATUS_VALUES_SQL})", name="ck_editions_status"),
+        CheckConstraint(f"state IN ({EDITION_STATUS_VALUES_SQL})", name="ck_editions_state"),
         CheckConstraint("version >= 1", name="ck_editions_version"),
-        CheckConstraint("target_articles BETWEEN 0 AND 120", name="ck_editions_articles"),
         CheckConstraint("period_start <= period_end", name="ck_editions_period_order"),
         CheckConstraint(
             "period_start = date_trunc('month', period_start)::date "
@@ -45,7 +41,7 @@ class EditionRow(Base):
             name="ck_editions_complete_month",
         ),
         CheckConstraint("jsonb_typeof(languages) = 'array'", name="ck_editions_languages"),
-        Index("ix_editions_country_status", "country_code", "status"),
+        Index("ix_editions_country_state", "country_code", "state"),
         Index("ix_editions_period", "period_start", "period_end"),
     )
 
@@ -56,12 +52,7 @@ class EditionRow(Base):
     period_end: Mapped[date] = mapped_column(nullable=False)
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     languages: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
-    target_articles: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    previous_edition_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="SET NULL")
-    )
-    source_profile: Mapped[str] = mapped_column(String(128), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
     version: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

@@ -82,7 +82,7 @@ class SqlAlchemyEditionRepository:
         country_code: str | None,
         period_start: date | None,
         period_end: date | None,
-        status: EditionStatus | None,
+        state: EditionStatus | None,
     ) -> tuple[Sequence[Edition], int]:
         filters = []
         if country_code:
@@ -91,8 +91,8 @@ class SqlAlchemyEditionRepository:
             filters.append(EditionRow.period_start >= period_start)
         if period_end:
             filters.append(EditionRow.period_end <= period_end)
-        if status:
-            filters.append(EditionRow.status == status.value)
+        if state:
+            filters.append(EditionRow.state == state.value)
         total = int(
             await self._session.scalar(select(func.count()).select_from(EditionRow).where(*filters))
             or 0
@@ -144,10 +144,7 @@ def _edition_values(edition: Edition) -> dict[str, object]:
         "period_end": edition.period_end,
         "tlp": edition.tlp.value,
         "languages": list(edition.languages),
-        "target_articles": edition.target_articles,
-        "previous_edition_id": edition.previous_edition_id,
-        "source_profile": edition.source_profile,
-        "status": edition.status.value,
+        "state": edition.state.value,
         "version": edition.version,
         "created_at": edition.created_at,
         "updated_at": edition.updated_at,
@@ -163,10 +160,7 @@ def _edition_from_row(row: EditionRow) -> Edition:
         period_end=row.period_end,
         tlp=TLP(row.tlp),
         languages=tuple(row.languages),
-        target_articles=row.target_articles,
-        previous_edition_id=row.previous_edition_id,
-        source_profile=row.source_profile,
-        status=EditionStatus(row.status),
+        state=EditionStatus(row.state),
         version=row.version,
         created_at=row.created_at,
         updated_at=row.updated_at,

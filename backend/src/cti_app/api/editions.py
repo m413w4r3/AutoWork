@@ -8,14 +8,11 @@ from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.editions import (
-    ActiveProductionEditionError,
     DuplicateEditionError,
     EditionConcurrencyError,
     EditionNotFoundError,
     EditionPage,
     EditionService,
-    EditionTransitionRequiresUseCaseError,
-    PreviousEditionError,
 )
 from cti_app.application.identity import Identity, IdentityProvider
 from cti_app.domain.classification import TLP
@@ -24,7 +21,6 @@ from cti_app.domain.editions import (
     EditionAuditEvent,
     EditionImmutableError,
     EditionStatus,
-    InvalidEditionTransitionError,
 )
 from cti_app.domain.errors import TlpDowngradeError
 from cti_app.logging import get_correlation_id
@@ -42,9 +38,6 @@ class EditionFields(BaseModel):
     period_end: date
     tlp: TLP
     languages: list[str] = Field(min_length=1, max_length=10)
-    target_articles: int = Field(ge=0, le=120)
-    previous_edition_id: UUID | None = None
-    source_profile: str = Field(min_length=1, max_length=128)
 
 
 class EditionCreate(EditionFields):
@@ -55,19 +48,16 @@ class EditionUpdate(EditionFields):
     version: int = Field(ge=1)
 
 
-class EditionTransition(BaseModel):
+class EditionArchiveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    target_status: EditionStatus
     version: int = Field(ge=1)
 
 
 class EditionView(EditionFields):
     id: UUID
-    status: EditionStatus
+    state: EditionStatus
     version: int
-    progress_percent: int
-    allowed_transitions: list[EditionStatus]
     created_at: datetime
     updated_at: datetime
 
@@ -111,7 +101,7 @@ async def list_editions(
     page_size: Annotated[int, Query(ge=1, le=100)] = 20,
     country_code: Annotated[str | None, Query(pattern=r"^[A-Za-z]{2}$")] = None,
     period: Annotated[str | None, Query(pattern=r"^\d{4}-\d{2}$")] = None,
-    edition_status: Annotated[EditionStatus | None, Query(alias="status")] = None,
+    state: Annotated[EditionStatus | None, Query()] = None,
 ) -> EditionPageView:
     service, _ = await _runtime(request)
     period_start, period_end = _parse_month(period) if period else (None, None)
@@ -121,7 +111,7 @@ async def list_editions(
         country_code=country_code,
         period_start=period_start,
         period_end=period_end,
-        status=edition_status,
+        state=state,
     )
     return _page_view(page_result)
 
@@ -151,15 +141,14 @@ async def update_edition(edition_id: UUID, payload: EditionUpdate, request: Requ
         _raise_api_error(exc)
 
 
-@router.post("/{edition_id}/transitions", response_model=EditionView)
-async def transition_edition(
-    edition_id: UUID, payload: EditionTransition, request: Request
+@router.post("/{edition_id}/archive", response_model=EditionView)
+async def archive_edition(
+    edition_id: UUID, payload: EditionArchiveRequest, request: Request
 ) -> EditionView:
     service, identity = await _runtime(request)
     try:
-        edition = await service.transition(
+        edition = await service.archive(
             edition_id,
-            target=payload.target_status,
             expected_version=payload.version,
             actor_id=identity.actor_id,
             correlation_id=get_correlation_id(),
@@ -191,9 +180,6 @@ class EditionFieldArguments(TypedDict):
     period_end: date
     tlp: TLP
     languages: tuple[str, ...]
-    target_articles: int
-    previous_edition_id: UUID | None
-    source_profile: str
 
 
 def _field_arguments(payload: EditionFields) -> EditionFieldArguments:
@@ -204,9 +190,6 @@ def _field_arguments(payload: EditionFields) -> EditionFieldArguments:
         "period_end": payload.period_end,
         "tlp": payload.tlp,
         "languages": tuple(payload.languages),
-        "target_articles": payload.target_articles,
-        "previous_edition_id": payload.previous_edition_id,
-        "source_profile": payload.source_profile,
     }
 
 
@@ -219,13 +202,8 @@ def _edition_view(edition: Edition) -> EditionView:
         period_end=edition.period_end,
         tlp=edition.tlp,
         languages=list(edition.languages),
-        target_articles=edition.target_articles,
-        previous_edition_id=edition.previous_edition_id,
-        source_profile=edition.source_profile,
-        status=edition.status,
+        state=edition.state,
         version=edition.version,
-        progress_percent=edition.progress_percent,
-        allowed_transitions=list(edition.allowed_transitions),
         created_at=edition.created_at,
         updated_at=edition.updated_at,
     )
@@ -287,22 +265,12 @@ def _raise_api_error(exc: Exception) -> NoReturn:
                 "message": "L'édition a été modifiée ailleurs. Rechargez-la avant de réessayer.",
             },
         ) from exc
-    if isinstance(exc, EditionTransitionRequiresUseCaseError):
-        raise HTTPException(
-            status_code=409,
-            detail={"code": exc.code, "message": str(exc)},
-        ) from exc
-    if isinstance(exc, ActiveProductionEditionError):
-        raise HTTPException(
-            status_code=409,
-            detail={"code": exc.code, "message": str(exc)},
-        ) from exc
-    if isinstance(exc, (InvalidEditionTransitionError, EditionImmutableError)):
+    if isinstance(exc, EditionImmutableError):
         raise HTTPException(
             status_code=409,
             detail={"code": "invalid_edition_action", "message": str(exc)},
         ) from exc
-    if isinstance(exc, (PreviousEditionError, TlpDowngradeError, ValueError)):
+    if isinstance(exc, (TlpDowngradeError, ValueError)):
         raise HTTPException(
             status_code=422,
             detail={"code": "invalid_edition", "message": str(exc)},

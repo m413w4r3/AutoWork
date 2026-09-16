@@ -238,8 +238,6 @@ async def test_filesystem_error_is_best_effort_and_returns_no_failure(tmp_path: 
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
-        source_profile="default",
         id=run.edition_id,
     )
     item = EditionProductionBatchItem(
@@ -270,8 +268,6 @@ async def test_checkpoint_exports_the_requested_run_exactly(tmp_path: Path) -> N
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
-        source_profile="default",
         id=run.edition_id,
     )
     item = EditionProductionBatchItem(
@@ -312,8 +308,6 @@ async def test_non_exportable_checkpoint_has_no_failure_diagnostic(tmp_path: Pat
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
         languages=("fr",),
-        target_articles=1,
-        source_profile="default",
         id=run.edition_id,
     )
     item = EditionProductionBatchItem(

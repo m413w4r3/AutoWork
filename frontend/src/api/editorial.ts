@@ -82,7 +82,6 @@ export interface EditorialBoardResult {
   selected_articles: number;
   ignored: number;
   undecided: number;
-  target_articles: number;
   automatic_selection: false;
 }
 

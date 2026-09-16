@@ -11,13 +11,8 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
     period_end: "2026-07-31",
     tlp: "AMBER",
     languages: ["fr", "en", "fa"],
-    target_articles: 8,
-    previous_edition_id: null,
-    source_profile: "iran-default",
-    status: "draft",
+    state: "open",
     version: 1,
-    progress_percent: 0,
-    allowed_transitions: ["discovery", "archived"],
     created_at: "2026-08-08T00:00:00Z",
     updated_at: "2026-08-08T00:00:00Z",
   };
@@ -52,7 +47,6 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
           body: JSON.stringify({
             groups: [],
             selected_articles: 0,
-            target_articles: 8,
             automatic_selection: false,
           }),
         });
@@ -83,6 +77,5 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
     period_start: "2026-07-01",
     period_end: "2026-07-31",
     languages: ["fr", "en", "fa"],
-    previous_edition_id: null,
   });
 });

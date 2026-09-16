@@ -71,6 +71,7 @@ from cti_app.application.production_repairs import (
     repair_application_diagnostic,
     repair_issue_execution_state,
 )
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
@@ -316,7 +317,7 @@ class ReviewDecisionView(BaseModel):
 
 class PublicationAcceptView(BaseModel):
     edition_id: UUID
-    edition_status: str
+    edition_state: str
     manifest_id: UUID
     manifest_sha256: str
     edition_version: int
@@ -327,7 +328,7 @@ class PublicationAcceptView(BaseModel):
 
 class EditionReleaseView(BaseModel):
     edition_id: UUID
-    edition_status: str
+    edition_state: str
     manifest_id: UUID | None
     manifest_sha256: str | None
     release_id: UUID | None
@@ -964,10 +965,10 @@ async def _edition_subject_production_state(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail={"code": "edition_not_found"},
             )
-        if getattr(edition.status, "value", edition.status) not in {"review", "production"}:
+        if edition.state is not EditionStatus.OPEN:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_frozen_for_publication"},
+                detail={"code": "edition_archived"},
             )
         run = await uow.subject_production_runs.get_current_for_subject(subject_id)
         if run is None or run.edition_id != edition_id:
@@ -1353,7 +1354,7 @@ async def accept_edition_publication(edition_id: UUID, request: Request) -> Publ
         )
         return PublicationAcceptView(
             edition_id=result.manifest.edition_id,
-            edition_status=result.edition_status.value,
+            edition_state=result.edition_state.value,
             manifest_id=result.manifest.id,
             manifest_sha256=result.manifest.content_sha256,
             edition_version=result.manifest.edition_version,
@@ -1667,7 +1668,7 @@ def _decision_view(decision: PublicationReviewDecision) -> ReviewDecisionView:
 def _release_view(release: EditionReleaseStatus) -> EditionReleaseView:
     return EditionReleaseView(
         edition_id=release.edition_id,
-        edition_status=release.edition_status.value,
+        edition_state=release.edition_state.value,
         manifest_id=release.manifest_id,
         manifest_sha256=release.manifest_sha256,
         release_id=release.release.id if release.release is not None else None,
