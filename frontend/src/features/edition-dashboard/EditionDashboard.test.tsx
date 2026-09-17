@@ -238,6 +238,11 @@ describe("EditionDashboard", () => {
     expect(
       screen.getByText("REF_TIMEOUT — Les références n'ont pas répondu."),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Références : STAGE_TIMEOUT — Délai de référence dépassé.",
+      ),
+    ).toBeInTheDocument();
     expect(screen.getByText("TLP:AMBER")).toBeInTheDocument();
     expect(
       screen.getByText("En cours", { selector: "td" }),
@@ -260,6 +265,123 @@ describe("EditionDashboard", () => {
     expect(
       screen.getByRole("link", { name: "Sélectionner les sujets" }),
     ).toHaveAttribute("href", "/editions/edition-1/selection");
+  });
+
+  it("projette le chargement de production dans chaque cellule de stage", async () => {
+    listSubjectsMock.mockResolvedValue([subjects[0]]);
+    getSubjectProductionMock.mockReturnValue(new Promise(() => {}));
+
+    renderDashboard();
+
+    expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
+    expect(screen.getAllByText("Chargement…", { selector: "td" })).toHaveLength(
+      4,
+    );
+    expect(
+      screen.queryAllByText("Non démarrée", { selector: "td" }),
+    ).toHaveLength(0);
+  });
+
+  it("projette le rejet de production comme indisponible dans chaque stage", async () => {
+    listSubjectsMock.mockResolvedValue([subjects[0]]);
+    getSubjectProductionMock.mockRejectedValue(new Error("production down"));
+
+    renderDashboard();
+
+    expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Indisponible", { selector: "td" }),
+    ).toHaveLength(4);
+    expect(
+      screen.queryAllByText("Non démarrée", { selector: "td" }),
+    ).toHaveLength(0);
+  });
+
+  it("réserve l'état non démarré à une production null réussie", async () => {
+    listSubjectsMock.mockResolvedValue([subjects[0]]);
+    getSubjectProductionMock.mockResolvedValue(null);
+
+    renderDashboard();
+
+    expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
+    expect(
+      screen.getAllByText("Non démarrée", { selector: "td" }),
+    ).toHaveLength(5);
+  });
+
+  it("signale un payload Subjects non conforme sans afficher l'état vide", async () => {
+    listSubjectsMock.mockResolvedValue("payload invalide");
+
+    renderDashboard();
+
+    expect(
+      await screen.findByText(
+        "Les sujets de cette édition ont renvoyé des données invalides.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        "Aucun sujet n'a encore été sélectionné pour cette édition.",
+      ),
+    ).not.toBeInTheDocument();
+  });
+
+  it("affiche le diagnostic d'un stage non courant", async () => {
+    const subject = subjects[0]!;
+    listSubjectsMock.mockResolvedValue([subject]);
+    getSubjectProductionMock.mockResolvedValue(
+      makeProduction(subject.id, {
+        current_stage: "assembly",
+        stages: {
+          ...makeProduction(subject.id).stages,
+          references: {
+            status: "failed",
+            version: 1,
+            error_code: "REF_STAGE_ERROR",
+            error_message: "Échec de lecture des références.",
+          },
+        },
+      }),
+    );
+
+    renderDashboard();
+
+    expect(
+      await screen.findByText(
+        "Références : REF_STAGE_ERROR — Échec de lecture des références.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("ne duplique pas le diagnostic repris du stage courant", async () => {
+    const subject = subjects[0]!;
+    listSubjectsMock.mockResolvedValue([subject]);
+    getSubjectProductionMock.mockResolvedValue(
+      makeProduction(subject.id, {
+        status: "failed",
+        current_stage: "extraction",
+        error_code: null,
+        error_message: null,
+        stages: {
+          ...makeProduction(subject.id).stages,
+          extraction: {
+            status: "failed",
+            version: 1,
+            error_code: "EXT_FAIL",
+            error_message: "Extraction interrompue.",
+          },
+        },
+      }),
+    );
+
+    renderDashboard();
+
+    expect(
+      await screen.findAllByText("EXT_FAIL — Extraction interrompue."),
+    ).toHaveLength(1);
+    expect(
+      screen.queryByText("Extraction : EXT_FAIL — Extraction interrompue."),
+    ).not.toBeInTheDocument();
   });
 
   it("ouvre le sujet depuis son lien clavier-accessible", async () => {

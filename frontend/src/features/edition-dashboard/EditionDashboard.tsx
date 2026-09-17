@@ -57,18 +57,39 @@ function stageStatusLabel(stage: StageStatus | undefined): string {
   return stage ? stageStatusLabels[stage.status] : "Non démarrée";
 }
 
-function productionDiagnostic(production: ProductionStatus): string | null {
-  if (production.status !== "failed" && production.status !== "needs_review") {
-    return null;
-  }
-  const currentStage = production.stages[production.current_stage];
-  const code = production.error_code ?? currentStage?.error_code;
-  const message = production.error_message ?? currentStage?.error_message;
-  return (
-    [code, message]
+function stageDiagnostic(stage: StageStatus | undefined): string {
+  return [stage?.error_code, stage?.error_message]
+    .filter((value): value is string => Boolean(value))
+    .join(" — ");
+}
+
+function productionDiagnostic(production: ProductionStatus): string[] {
+  const diagnostics: string[] = [];
+  // Le diagnostic global reprend à défaut les métadonnées du stage courant :
+  // lui seul peut donc produire un doublon exact.
+  let duplicatedStage: ProductionStatus["current_stage"] | null = null;
+
+  if (production.status === "failed" || production.status === "needs_review") {
+    const currentStage = production.stages[production.current_stage];
+    const code = production.error_code ?? currentStage?.error_code;
+    const message = production.error_message ?? currentStage?.error_message;
+    const diagnostic = [code, message]
       .filter((value): value is string => Boolean(value))
-      .join(" — ") || "Diagnostic non communiqué."
-  );
+      .join(" — ");
+    diagnostics.push(diagnostic || "Diagnostic non communiqué.");
+    if (diagnostic && diagnostic === stageDiagnostic(currentStage)) {
+      duplicatedStage = production.current_stage;
+    }
+  }
+
+  for (const stage of stageKeys) {
+    if (stage === duplicatedStage) continue;
+    const diagnostic = stageDiagnostic(production.stages[stage]);
+    if (!diagnostic) continue;
+    diagnostics.push(`${stageLabel(stage)} : ${diagnostic}`);
+  }
+
+  return diagnostics;
 }
 
 function Summary({
@@ -124,17 +145,23 @@ function Summary({
 }
 
 function StageCell({
-  production,
+  productionQuery,
   stage,
 }: {
-  production: ProductionStatus | null | undefined;
+  productionQuery: ProductionQuery;
   stage: (typeof stageKeys)[number];
 }) {
-  return (
-    <td>
-      {production ? stageStatusLabel(production.stages[stage]) : "Non démarrée"}
-    </td>
-  );
+  const label = productionQuery.isError
+    ? "Indisponible"
+    : productionQuery.isPending
+      ? "Chargement…"
+      : productionQuery.isSuccess && productionQuery.data === null
+        ? "Non démarrée"
+        : productionQuery.isSuccess && productionQuery.data
+          ? stageStatusLabel(productionQuery.data.stages[stage])
+          : "Indisponible";
+
+  return <td>{label}</td>;
 }
 
 function SubjectRow({
@@ -145,7 +172,7 @@ function SubjectRow({
   productionQuery: ProductionQuery;
 }) {
   const production = productionQuery.data;
-  const diagnostic = production ? productionDiagnostic(production) : null;
+  const diagnostics = production ? productionDiagnostic(production) : [];
   const overall = productionQuery.isError
     ? "Indisponible"
     : productionQuery.isPending
@@ -168,9 +195,11 @@ function SubjectRow({
             État de production indisponible
           </p>
         ) : null}
-        {diagnostic ? (
-          <p className="edition-dashboard__row-error">{diagnostic}</p>
-        ) : null}
+        {diagnostics.map((diagnostic) => (
+          <p className="edition-dashboard__row-error" key={diagnostic}>
+            {diagnostic}
+          </p>
+        ))}
       </td>
       <td>
         {productionQuery.isError || productionQuery.isPending
@@ -180,7 +209,11 @@ function SubjectRow({
             : "Non démarrée"}
       </td>
       {stageKeys.map((stage) => (
-        <StageCell key={stage} production={production} stage={stage} />
+        <StageCell
+          key={stage}
+          productionQuery={productionQuery}
+          stage={stage}
+        />
       ))}
     </tr>
   );
@@ -191,8 +224,8 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
     queryKey: ["edition-subjects", edition.id],
     queryFn: () => listSubjects(edition.id),
   });
-  // Une réponse non conforme au contrat liste ne doit pas faire tomber
-  // l’arbre React : elle se projette comme une édition sans sujet.
+  // useQueries doit recevoir une liste stable même si l’API renvoie un
+  // payload non conforme. Cette valeur ne devient jamais un état métier.
   const subjects = Array.isArray(subjectsQuery.data) ? subjectsQuery.data : [];
   const productionQueries = useQueries({
     queries: subjects.map((subject) => ({
@@ -212,6 +245,14 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
     return (
       <p role="alert" className="error-message">
         Les sujets de cette édition sont indisponibles.
+      </p>
+    );
+  }
+
+  if (subjectsQuery.isSuccess && !Array.isArray(subjectsQuery.data)) {
+    return (
+      <p role="alert" className="error-message">
+        Les sujets de cette édition ont renvoyé des données invalides.
       </p>
     );
   }
