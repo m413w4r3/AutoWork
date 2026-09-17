@@ -3,13 +3,20 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from time import monotonic
 from uuid import uuid4
 
 import pytest
 
+from cti_app.application.edition_publication import (
+    EditionAssemblyService,
+    EditionPublicationService,
+    PublicationAssemblyError,
+)
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import PublicationManifestEntryV1, PublicationManifestV1
@@ -26,8 +33,182 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.publication import PublicationDocumentV2
+from tests.integration.production.support import ProductionScenario
 
 pytestmark = pytest.mark.integration
+
+
+async def _seed_review_snapshot(
+    uow_factory: UnitOfWorkFactory,
+    scenario: ProductionScenario,
+    store: ProductionArtifactStore,
+    *,
+    created_at: datetime,
+    title: str,
+    input_hash: str,
+    run_number: int,
+) -> tuple[EditionProductionBatch, SubjectProductionRun, ProductionArtifact]:
+    document = PublicationDocumentV2(
+        schema_version="2",
+        title=title,
+        timeline=(),
+        synthesis=(),
+        indicators=(),
+        sources=(),
+        uncertainties=(),
+    )
+    document_blob_id, _ = await store.put_canonical_json(
+        document.to_json(), bucket="test-publication"
+    )
+    run = SubjectProductionRun(
+        subject_id=scenario.subject.id,
+        edition_id=scenario.edition.id,
+        status=SubjectProductionStatus.READY,
+        current_stage=SubjectProductionStage.ASSEMBLY,
+        run_number=run_number,
+        pipeline_generation=1,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=scenario.subject.id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash=input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=document_blob_id,
+        created_at=created_at,
+    )
+    batch = EditionProductionBatch(
+        edition_id=scenario.edition.id,
+        status="running",
+        phase=ProductionBatchPhase.REVIEW,
+        created_at=created_at,
+    )
+    item = EditionProductionBatchItem(
+        batch_id=batch.id,
+        subject_id=scenario.subject.id,
+        production_run_id=run.id,
+        position=1,
+        created_at=created_at,
+    )
+    async with uow_factory() as uow:
+        await uow.subject_production_runs.add(run)
+        await uow.production_artifacts.append(artifact)
+        await uow.edition_production_batches.add(batch)
+        await uow.commit()
+        await uow.edition_production_batch_items.append_many((item,))
+        await uow.commit()
+    return batch, run, artifact
+
+
+async def _publication_scenario(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> ProductionScenario:
+    scenario = ProductionScenario(
+        uow_factory,
+        tmp_path / "publication-blobs",
+        {"https://example.test/publication": {"body": "publication"}},
+    )
+    await scenario.seed()
+    return scenario
+
+
+@pytest.mark.asyncio
+async def test_same_version_publication_snapshots_and_releases_are_chronological(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    scenario = await _publication_scenario(uow_factory, tmp_path)
+    store = scenario.artifact_store
+    first_at = datetime.now(UTC)
+    await _seed_review_snapshot(
+        uow_factory,
+        scenario,
+        store,
+        created_at=first_at,
+        title="Snapshot A",
+        input_hash="a" * 64,
+        run_number=1,
+    )
+    publication = EditionPublicationService(uow_factory, store)
+    assembly = EditionAssemblyService(uow_factory, store)
+
+    accepted_a = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    release_a = await assembly.assemble(accepted_a.manifest.id)
+
+    await _seed_review_snapshot(
+        uow_factory,
+        scenario,
+        store,
+        created_at=first_at + timedelta(seconds=1),
+        title="Snapshot B",
+        input_hash="b" * 64,
+        run_number=2,
+    )
+    accepted_b = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    release_b = await assembly.assemble(accepted_b.manifest.id)
+
+    async with uow_factory() as uow:
+        latest = await uow.publication_manifests.get_latest_for_edition(scenario.edition.id)
+        persisted_a = await uow.publication_manifests.get(accepted_a.manifest.id)
+        persisted_b = await uow.publication_manifests.get(accepted_b.manifest.id)
+        release_for_a = await uow.edition_releases.get_by_manifest(accepted_a.manifest.id)
+        release_for_b = await uow.edition_releases.get_by_manifest(accepted_b.manifest.id)
+        edition = await uow.editions.get(scenario.edition.id)
+
+    assert persisted_a is not None and persisted_b is not None
+    assert release_for_a is not None and release_for_b is not None
+    assert release_a.id == release_for_a.id
+    assert release_b.id == release_for_b.id
+    assert latest is not None and latest.id == accepted_b.manifest.id
+    assert persisted_a.edition_version == persisted_b.edition_version
+    assert edition is not None and edition.version == persisted_a.edition_version
+
+
+@pytest.mark.asyncio
+async def test_same_version_pending_snapshot_rejects_changed_production_review_inputs(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    scenario = await _publication_scenario(uow_factory, tmp_path)
+    store = scenario.artifact_store
+    first_at = datetime.now(UTC)
+    await _seed_review_snapshot(
+        uow_factory,
+        scenario,
+        store,
+        created_at=first_at,
+        title="Pending A",
+        input_hash="a" * 64,
+        run_number=1,
+    )
+    publication = EditionPublicationService(uow_factory, store)
+    assembly = EditionAssemblyService(uow_factory, store)
+    accepted_a = await publication.accept(scenario.edition.id, actor_id="reviewer")
+    version = accepted_a.manifest.edition_version
+
+    await _seed_review_snapshot(
+        uow_factory,
+        scenario,
+        store,
+        created_at=first_at + timedelta(seconds=1),
+        title="Pending B",
+        input_hash="b" * 64,
+        run_number=2,
+    )
+
+    with pytest.raises(
+        PublicationAssemblyError, match="publication_inputs_changed_after_freeze"
+    ):
+        await assembly.assemble(accepted_a.manifest.id)
+
+    async with uow_factory() as uow:
+        release = await uow.edition_releases.get_by_manifest(accepted_a.manifest.id)
+        edition = await uow.editions.get(scenario.edition.id)
+
+    assert release is None
+    assert edition is not None and edition.version == version
 
 
 @pytest.mark.asyncio

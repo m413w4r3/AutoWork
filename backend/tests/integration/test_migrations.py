@@ -644,6 +644,14 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     }
     assert repair_triggers == {(_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"}
     schema_definitions = asyncio.run(_database_snapshot(temporary_postgres_url))
+    publication_manifest_schema = schema_definitions["publication_manifests"]
+    assert frozenset({"edition_id", "edition_version"}) not in publication_manifest_schema[
+        "uniques"
+    ]
+    assert "ck_publication_manifest_edition_version" in publication_manifest_schema["checks"]
+    assert "ix_publication_manifests_edition_created" in {
+        index[0] for index in publication_manifest_schema["indexes"]
+    }
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
 
     # The single mutable baseline is idempotent: repeating the upgrade is a

@@ -618,10 +618,14 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert uow.editions.edition.version == first.manifest.edition_version
 
-    # A snapshot is unique per Edition version: re-accepting is idempotent.
+    # A released snapshot is immutable, so an explicit accept creates a new
+    # snapshot even though the Edition metadata version is unchanged.
     replay = await publication.accept(EDITION_ID, actor_id="analyst")
-    assert replay.manifest_id == first.manifest_id
-    assert replay.job_id is None
+    await assembly.assemble(replay.manifest_id)
+    assert replay.manifest_id != first.manifest_id
+    assert replay.manifest.edition_version == first.manifest.edition_version
+    assert len(uow.publication_manifests.manifests) == 2
+    assert len(uow.edition_releases.releases) == 2
 
     uow.editions.edition.update_metadata(
         country="France",
@@ -634,9 +638,9 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
     second = await publication.accept(EDITION_ID, actor_id="analyst")
     await assembly.assemble(second.manifest_id)
 
-    assert second.manifest_id != first.manifest_id
-    assert len(uow.publication_manifests.manifests) == 2
-    assert len(uow.edition_releases.releases) == 2
+    assert second.manifest_id != replay.manifest_id
+    assert len(uow.publication_manifests.manifests) == 3
+    assert len(uow.edition_releases.releases) == 3
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert uow.editions.edition.version == second.manifest.edition_version
 
@@ -677,6 +681,50 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
     assert first.manifest.edition_version != uow.editions.edition.version
     assert second.manifest.edition_version == uow.editions.edition.version
     assert uow.editions.edition.state is EditionStatus.OPEN
+
+
+@pytest.mark.asyncio
+async def test_changed_review_input_supersedes_pending_snapshot_without_version_bump() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=SubjectProductionStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
+
+    first = await publication.accept(EDITION_ID, actor_id="analyst")
+    uow.edition_review_read_model.rows[0] = replace(
+        row,
+        subject_id=SUBJECT_B,
+        run_id=RUN_B,
+        document_artifact_id=ARTIFACT_B,
+    )
+
+    with pytest.raises(
+        PublicationAssemblyError, match="publication_inputs_changed_after_freeze"
+    ):
+        await assembly.assemble(first.manifest_id)
+    assert uow.edition_releases.release is None
+    assert (await publication.release_status(EDITION_ID)).can_retry_assembly is False
+
+    second = await publication.accept(EDITION_ID, actor_id="analyst")
+
+    assert second.manifest_id != first.manifest_id
+    assert second.manifest.edition_version == first.manifest.edition_version
+    assert uow.editions.edition.version == first.manifest.edition_version
 
 
 @pytest.mark.asyncio

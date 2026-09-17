@@ -20,9 +20,6 @@ from .base import Base
 class PublicationManifestRow(Base):
     __tablename__ = "publication_manifests"
     __table_args__ = (
-        UniqueConstraint(
-            "edition_id", "edition_version", name="uq_publication_manifest_edition_version"
-        ),
         CheckConstraint("edition_version >= 1", name="ck_publication_manifest_edition_version"),
         CheckConstraint(
             "char_length(content_sha256) = 64 AND content_sha256 ~ '^[0-9a-f]{64}$'",

@@ -64,6 +64,8 @@ class SqlAlchemyPublicationManifestRepository:
                 PublicationManifestRow.edition_id == edition_id,
                 PublicationManifestRow.edition_version == edition_version,
             )
+            .order_by(PublicationManifestRow.created_at.desc(), PublicationManifestRow.id.desc())
+            .limit(1)
         )
 
     async def get_latest_for_edition(self, edition_id: UUID) -> PublicationManifestV1 | None:
@@ -71,7 +73,7 @@ class SqlAlchemyPublicationManifestRepository:
             select(PublicationManifestRow)
             .where(PublicationManifestRow.edition_id == edition_id)
             .order_by(
-                PublicationManifestRow.edition_version.desc(), PublicationManifestRow.id.desc()
+                PublicationManifestRow.created_at.desc(), PublicationManifestRow.id.desc()
             )
             .limit(1)
         )

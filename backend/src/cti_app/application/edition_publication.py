@@ -120,6 +120,14 @@ class EditionReleaseStatus:
         return self.release.created_at if self.release is not None else None
 
 
+@dataclass(frozen=True, slots=True)
+class _ResolvedPublicationInputs:
+    edition_version: int
+    batch_id: UUID
+    entries: tuple[PublicationManifestEntryV1, ...]
+    exclusions: tuple[PublicationManifestExclusionV1, ...]
+
+
 class _WorkspaceReleaseMaterializer(Protocol):
     async def materialize_release(
         self,
@@ -167,122 +175,47 @@ class EditionPublicationService:
 
             if edition.state is EditionStatus.ARCHIVED:
                 raise PublicationAcceptanceError("edition_must_be_open")
+            current_inputs = await _resolve_current_publication_inputs(
+                uow,
+                edition,
+                repair_issue_reader=self._repair_issue_reader,
+                validate_review=True,
+            )
             manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
             if manifest is not None:
                 release = await uow.edition_releases.get_by_manifest(manifest.id)
             else:
                 release = None
-            if manifest is not None and manifest.edition_version == edition.version:
-                # A snapshot is unique per Edition version: a pending one is
-                # resumed, a released one is returned as-is.
+            if (
+                manifest is not None
+                and release is None
+                and _publication_inputs_match(manifest, current_inputs)
+            ):
+                # A matching pending snapshot is resumed. A released snapshot
+                # is never reused: every explicit accept creates a new one.
                 result = PublicationAcceptResult(manifest, None, False, edition.state)
-                if release is not None:
-                    return result
             else:
-                result = await self._freeze(uow, edition, actor_id)
+                result = await self._freeze(uow, edition, actor_id, current_inputs)
 
         job_id, dispatched = await self._ensure_assembly_job(
             result.manifest, correlation_id=correlation_id, actor_id=actor_id
         )
         return PublicationAcceptResult(result.manifest, job_id, dispatched, result.edition_state)
 
-    async def _freeze(self, uow: Any, edition: Edition, actor_id: str) -> PublicationAcceptResult:
-        batch = await uow.edition_production_batches.get_latest_for_edition(edition.id)
-        if batch is None:
-            raise PublicationAcceptanceError("edition_has_no_production_batch")
-        rows = await uow.edition_review_read_model.list_for_edition(edition.id)
-        repairs: tuple[Any, ...] = ()
-        if self._repair_issue_reader is not None:
-            getter = getattr(self._repair_issue_reader, "list_issue_views", None)
-            extraction = (
-                await getter(edition.id)
-                if callable(getter)
-                else await self._repair_issue_reader.list_issues(edition.id)  # type: ignore[attr-defined]
-            )
-            supplemental = await self._repair_issue_reader.list_supplemental_source_issues(
-                edition.id
-            )
-            repairs = tuple([*extraction, *supplemental])
-        review = EditionReviewService.from_rows(edition.id, rows, repair_issues=repairs)
-        if not review.can_accept:
-            raise PublicationAcceptanceError("review_cannot_be_accepted")
-
-        entries: list[PublicationManifestEntryV1] = []
-        exclusions: list[PublicationManifestExclusionV1] = []
-        for item in review.items:
-            if item.included:
-                if item.document_artifact_id is None:
-                    raise PublicationAcceptanceError("included_item_has_no_document")
-                run = await _get_run_for_update(uow, item.run_id)
-                artifact = await uow.production_artifacts.get(item.document_artifact_id)
-                if (
-                    run is None
-                    or artifact is None
-                    or run.edition_id != edition.id
-                    or run.subject_id != item.subject_id
-                    or run.pipeline_generation != item.pipeline_generation
-                    or artifact.production_run_id != item.run_id
-                    or artifact.subject_id != item.subject_id
-                    or artifact.id != item.document_artifact_id
-                    or artifact.version != item.document_artifact_version
-                    or artifact.input_hash != item.document_input_hash
-                    or artifact.stage is not ProductionArtifactStage.PUBLICATION
-                    or artifact.status is not ProductionArtifactStatus.VERIFIED
-                    or artifact.canonical_blob_id is None
-                ):
-                    raise PublicationAcceptanceError("included_artifact_mismatch")
-                # Defence in depth: the manifest must never freeze a document
-                # older than the repair already applied to its Extraction.
-                # The proof comes from the document's own recorded inputs, not
-                # from a decision marker on the Extraction.
-                current_extraction = await uow.production_artifacts.get_current(
-                    item.run_id, ProductionArtifactStage.EXTRACTION.value
-                )
-                current_references = await uow.production_artifacts.get_current(
-                    item.run_id, ProductionArtifactStage.REFERENCES.value
-                )
-                if current_extraction is not None and (
-                    not publication_is_compatible_with_current_effective_inputs(
-                        publication=artifact,
-                        extraction=current_extraction,
-                        references=current_references,
-                    )
-                ):
-                    raise PublicationAcceptanceError("repair_materialization_incomplete")
-                entries.append(
-                    PublicationManifestEntryV1(
-                        position=item.position,
-                        subject_id=item.subject_id,
-                        production_run_id=item.run_id,
-                        pipeline_generation=item.pipeline_generation,
-                        document_artifact_id=artifact.id,
-                        document_artifact_version=artifact.version,
-                        document_input_hash=artifact.input_hash,
-                    )
-                )
-            elif item.effective_decision is not None:
-                if item.effective_decision_id is None:
-                    raise PublicationAcceptanceError("excluded_item_has_no_decision")
-                if item.effective_decision.value != "exclude":
-                    raise PublicationAcceptanceError("non_publishable_item_is_not_excluded")
-                exclusions.append(
-                    PublicationManifestExclusionV1(
-                        subject_id=item.subject_id,
-                        review_decision_id=item.effective_decision_id,
-                    )
-                )
-            else:
-                raise PublicationAcceptanceError("review_item_has_no_effective_decision")
-
-        if not entries:
-            raise PublicationAcceptanceError("review_must_include_at_least_one_item")
+    async def _freeze(
+        self,
+        uow: Any,
+        edition: Edition,
+        actor_id: str,
+        inputs: _ResolvedPublicationInputs,
+    ) -> PublicationAcceptResult:
         manifest = PublicationManifestV1.create(
             edition_id=edition.id,
             edition_version=edition.version,
-            batch_id=batch.id,
+            batch_id=inputs.batch_id,
             created_by=actor_id,
-            entries=tuple(entries),
-            exclusions=tuple(exclusions),
+            entries=inputs.entries,
+            exclusions=inputs.exclusions,
         )
         manifest_blob_id, _ = await self._artifact_store.put_canonical_json(
             manifest.to_json(), bucket=MANIFEST_BLOB_BUCKET
@@ -407,11 +340,26 @@ class EditionPublicationService:
                     "edition", edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
                 )
                 assembly_job = _latest_assembly_job(assembly_jobs, manifest.id)
+            current_inputs_match = False
+            if manifest is not None and release is None:
+                try:
+                    current_inputs = await _resolve_current_publication_inputs(
+                        uow,
+                        edition,
+                        repair_issue_reader=None,
+                        validate_review=False,
+                    )
+                except PublicationError:
+                    current_inputs = None
+                current_inputs_match = (
+                    current_inputs is not None
+                    and _publication_inputs_match(manifest, current_inputs)
+                )
             can_retry_assembly = (
                 edition.state is EditionStatus.OPEN
                 and manifest is not None
                 and release is None
-                and manifest.edition_version == edition.version
+                and current_inputs_match
                 and (
                     assembly_job is None
                     or assembly_job.status in {JobStatus.FAILED, JobStatus.CANCELLED}
@@ -483,6 +431,19 @@ class EditionAssemblyService:
                     raise PublicationAssemblyError("edition_must_be_open")
                 if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+                try:
+                    current_inputs = await _resolve_current_publication_inputs(
+                        uow,
+                        edition,
+                        repair_issue_reader=None,
+                        validate_review=False,
+                    )
+                except PublicationError as exc:
+                    raise PublicationAssemblyError(
+                        "publication_inputs_changed_after_freeze"
+                    ) from exc
+                if not _publication_inputs_match(manifest, current_inputs):
+                    raise PublicationAssemblyError("publication_inputs_changed_after_freeze")
             manifest_blob_id = None
             if existing is None:
                 manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest_id)
@@ -574,6 +535,19 @@ class EditionAssemblyService:
                     raise PublicationAssemblyError("edition_must_be_open")
                 if edition.version != manifest.edition_version:
                     raise PublicationAssemblyError("edition_changed_after_publication_freeze")
+                try:
+                    current_inputs = await _resolve_current_publication_inputs(
+                        uow,
+                        edition,
+                        repair_issue_reader=None,
+                        validate_review=False,
+                    )
+                except PublicationError as exc:
+                    raise PublicationAssemblyError(
+                        "publication_inputs_changed_after_freeze"
+                    ) from exc
+                if not _publication_inputs_match(manifest, current_inputs):
+                    raise PublicationAssemblyError("publication_inputs_changed_after_freeze")
                 if candidate_release is None:
                     raise PublicationAssemblyError("release_candidate_missing")
                 release = candidate_release
@@ -625,6 +599,121 @@ def register_publication_jobs(
         EditionAssembleParameters,
         handle,
         resume_after_worker_loss=True,
+    )
+
+
+async def _resolve_current_publication_inputs(
+    uow: Any,
+    edition: Edition,
+    *,
+    repair_issue_reader: ProductionRepairIssueReader | None,
+    validate_review: bool,
+) -> _ResolvedPublicationInputs:
+    batch = await uow.edition_production_batches.get_latest_for_edition(edition.id)
+    if batch is None:
+        raise PublicationAcceptanceError("edition_has_no_production_batch")
+
+    rows = await uow.edition_review_read_model.list_for_edition(edition.id)
+    repairs: tuple[Any, ...] = ()
+    if repair_issue_reader is not None:
+        getter = getattr(repair_issue_reader, "list_issue_views", None)
+        extraction = (
+            await getter(edition.id)
+            if callable(getter)
+            else await repair_issue_reader.list_issues(edition.id)  # type: ignore[attr-defined]
+        )
+        supplemental = await repair_issue_reader.list_supplemental_source_issues(edition.id)
+        repairs = tuple([*extraction, *supplemental])
+    review = EditionReviewService.from_rows(edition.id, rows, repair_issues=repairs)
+    if validate_review and not review.can_accept:
+        raise PublicationAcceptanceError("review_cannot_be_accepted")
+
+    entries: list[PublicationManifestEntryV1] = []
+    exclusions: list[PublicationManifestExclusionV1] = []
+    for item in review.items:
+        if item.included:
+            if item.document_artifact_id is None:
+                raise PublicationAcceptanceError("included_item_has_no_document")
+            run = await _get_run_for_update(uow, item.run_id)
+            artifact = await uow.production_artifacts.get(item.document_artifact_id)
+            if (
+                run is None
+                or artifact is None
+                or run.edition_id != edition.id
+                or run.subject_id != item.subject_id
+                or run.pipeline_generation != item.pipeline_generation
+                or artifact.production_run_id != item.run_id
+                or artifact.subject_id != item.subject_id
+                or artifact.id != item.document_artifact_id
+                or artifact.version != item.document_artifact_version
+                or artifact.input_hash != item.document_input_hash
+                or artifact.stage is not ProductionArtifactStage.PUBLICATION
+                or artifact.status is not ProductionArtifactStatus.VERIFIED
+                or artifact.canonical_blob_id is None
+            ):
+                raise PublicationAcceptanceError("included_artifact_mismatch")
+            if validate_review:
+                # Defence in depth: the manifest must never freeze a document
+                # older than the repair already applied to its Extraction.
+                # The proof comes from the document's own recorded inputs, not
+                # from a decision marker on the Extraction.
+                current_extraction = await uow.production_artifacts.get_current(
+                    item.run_id, ProductionArtifactStage.EXTRACTION.value
+                )
+                current_references = await uow.production_artifacts.get_current(
+                    item.run_id, ProductionArtifactStage.REFERENCES.value
+                )
+                if current_extraction is not None and (
+                    not publication_is_compatible_with_current_effective_inputs(
+                        publication=artifact,
+                        extraction=current_extraction,
+                        references=current_references,
+                    )
+                ):
+                    raise PublicationAcceptanceError("repair_materialization_incomplete")
+            entries.append(
+                PublicationManifestEntryV1(
+                    position=item.position,
+                    subject_id=item.subject_id,
+                    production_run_id=item.run_id,
+                    pipeline_generation=item.pipeline_generation,
+                    document_artifact_id=artifact.id,
+                    document_artifact_version=artifact.version,
+                    document_input_hash=artifact.input_hash,
+                )
+            )
+        elif item.effective_decision is not None:
+            if item.effective_decision_id is None:
+                raise PublicationAcceptanceError("excluded_item_has_no_decision")
+            if item.effective_decision.value != "exclude":
+                raise PublicationAcceptanceError("non_publishable_item_is_not_excluded")
+            exclusions.append(
+                PublicationManifestExclusionV1(
+                    subject_id=item.subject_id,
+                    review_decision_id=item.effective_decision_id,
+                )
+            )
+        else:
+            raise PublicationAcceptanceError("review_item_has_no_effective_decision")
+
+    if not entries:
+        raise PublicationAcceptanceError("review_must_include_at_least_one_item")
+    return _ResolvedPublicationInputs(
+        edition_version=edition.version,
+        batch_id=batch.id,
+        entries=tuple(sorted(entries, key=lambda item: item.position)),
+        exclusions=tuple(sorted(exclusions, key=lambda item: str(item.subject_id))),
+    )
+
+
+def _publication_inputs_match(
+    manifest: PublicationManifestV1, inputs: _ResolvedPublicationInputs
+) -> bool:
+    return (
+        manifest.edition_version == inputs.edition_version
+        and manifest.batch_id == inputs.batch_id
+        and manifest.entries == inputs.entries
+        and manifest.exclusions == inputs.exclusions
     )
 
 
