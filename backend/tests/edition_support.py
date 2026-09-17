@@ -26,6 +26,9 @@ class InMemoryEditionRepository:
         edition = self._state.get(edition_id)
         return deepcopy(edition) if edition else None
 
+    async def get_for_update(self, edition_id: UUID) -> Edition | None:
+        return await self.get(edition_id)
+
     async def get_by_logical_key(
         self, country_code: str, period_start: date, period_end: date
     ) -> Edition | None:

@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -55,7 +55,9 @@ def test_sample_control_enums_and_derived_mixed_policy() -> None:
         "validated",
         "rejected",
     }
-    subject = Subject(external_id="SAMPLE-ENUM", slug="sample-enum", tlp=TLP.CLEAR)
+    subject = Subject(
+        edition_id=uuid4(), title="Test subject", slug="sample-enum", tlp=TLP.CLEAR
+    )
     members = [
         _sample(subject, subject.id, tlp=TLP.GREEN),
         _sample(subject, subject.id, tlp=TLP.RED, do_not_submit=True),
@@ -88,7 +90,9 @@ async def test_sample_routing_manifest_and_idempotent_rematerialization(
         mime_type="application/octet-stream",
     )
     blob = BlobRecord(descriptor=descriptor)
-    subject = Subject(external_id="SAMPLE-ROUTE", slug="sample-route", tlp=TLP.RED)
+    subject = Subject(
+        edition_id=uuid4(), title="Test subject", slug="sample-route", tlp=TLP.RED
+    )
     sample = _sample(subject, blob.id, origin_kind=origin_kind, state=state)
     materializer = SubjectWorkspaceMaterializer(store)
     first = await materializer.materialize(
@@ -115,7 +119,9 @@ async def test_sample_workspace_refuses_symlink(tmp_path: Path) -> None:
         mime_type="application/octet-stream",
     )
     blob = BlobRecord(descriptor=descriptor)
-    subject = Subject(external_id="SAMPLE-SYMLINK", slug="sample-symlink", tlp=TLP.RED)
+    subject = Subject(
+        edition_id=uuid4(), title="Test subject", slug="sample-symlink", tlp=TLP.RED
+    )
     workspace_root = tmp_path / "workspaces"
     materializer = SubjectWorkspaceMaterializer(store)
     await materializer.materialize(subject, [], [], {}, workspace_root)

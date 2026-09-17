@@ -72,19 +72,25 @@ async def build_subject_production_context(
         raise ValueError("research_date or production input snapshot is required")
     relevant_urls = frozenset(relevant_source_urls or ())
 
-    group = await uow.editorial_groups.get_by_subject(subject_id)
-    title = snapshot.subject_title if snapshot else (group.title if group else str(subject_id))
-    description = (
-        snapshot.subject_description if snapshot else group.grouping_justification if group else ""
-    )
-
-    period_start = snapshot.period_start.isoformat() if snapshot else ""
-    period_end = snapshot.period_end.isoformat() if snapshot else ""
-    if snapshot is None and group is not None:
-        edition = await uow.editions.get(group.edition_id)
-        if edition is not None:
-            period_start = edition.period_start.isoformat()
-            period_end = edition.period_end.isoformat()
+    if snapshot is not None:
+        title = snapshot.subject_title
+        description = snapshot.subject_description
+        period_start = snapshot.period_start.isoformat()
+        period_end = snapshot.period_end.isoformat()
+        actor_info = snapshot.actor_or_campaign
+    else:
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise ValueError("subject_not_found")
+        edition = await uow.editions.get(subject.edition_id)
+        if edition is None:
+            raise ValueError("subject_edition_not_found")
+        group = await uow.editorial_groups.get_by_subject(subject_id)
+        title = subject.title
+        description = group.grouping_justification if group else ""
+        period_start = edition.period_start.isoformat()
+        period_end = edition.period_end.isoformat()
+        actor_info = (getattr(group, "actor_or_campaign", "") or "") if group is not None else ""
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
     if snapshot is not None:
@@ -138,10 +144,6 @@ async def build_subject_production_context(
         if archived
         else "Aucune publication archivée pour l'instant."
     )
-
-    actor_info = snapshot.actor_or_campaign if snapshot else ""
-    if snapshot is None and group is not None:
-        actor_info = getattr(group, "actor_or_campaign", "") or ""
 
     return SubjectProductionContext(
         subject_title=title,

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.selectable import FromClause, TableClause
@@ -1054,10 +1054,13 @@ class SqlAlchemySubjectRepository:
         self._session.add(
             SubjectRow(
                 id=subject.id,
-                external_id=subject.external_id,
+                edition_id=subject.edition_id,
+                title=subject.title,
                 slug=subject.slug,
                 tlp=subject.tlp.value,
+                version=subject.version,
                 created_at=subject.created_at,
+                updated_at=subject.updated_at,
             )
         )
         await self._session.flush()
@@ -1068,11 +1071,47 @@ class SqlAlchemySubjectRepository:
             return None
         return Subject(
             id=row.id,
-            external_id=row.external_id,
+            edition_id=row.edition_id,
+            title=row.title,
             slug=row.slug,
             tlp=TLP(row.tlp),
+            version=row.version,
             created_at=row.created_at,
+            updated_at=row.updated_at,
         )
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[Subject]:
+        rows = await self._session.scalars(
+            select(SubjectRow)
+            .where(SubjectRow.edition_id == edition_id)
+            .order_by(SubjectRow.created_at, SubjectRow.id)
+        )
+        return [
+            Subject(
+                id=row.id,
+                edition_id=row.edition_id,
+                title=row.title,
+                slug=row.slug,
+                tlp=TLP(row.tlp),
+                version=row.version,
+                created_at=row.created_at,
+                updated_at=row.updated_at,
+            )
+            for row in rows
+        ]
+
+    async def update(self, subject: Subject, *, expected_version: int) -> bool:
+        result = await self._session.execute(
+            update(SubjectRow)
+            .where(SubjectRow.id == subject.id, SubjectRow.version == expected_version)
+            .values(
+                title=subject.title,
+                tlp=subject.tlp.value,
+                version=subject.version,
+                updated_at=subject.updated_at,
+            )
+        )
+        return bool(getattr(result, "rowcount", 0) == 1)
 
 
 class SqlAlchemySourceDocumentRepository:

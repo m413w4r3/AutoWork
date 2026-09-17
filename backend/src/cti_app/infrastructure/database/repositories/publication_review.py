@@ -22,7 +22,7 @@ from cti_app.domain.production import (
     SubjectProductionStatus,
 )
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
-from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
+from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
@@ -195,14 +195,9 @@ class SqlAlchemyEditionReviewReadRepository:
             .group_by(ProductionArtifactRow.production_run_id)
             .subquery("current_review_live_stages")
         )
-        group_title = (
-            select(EditorialGroupRow.title)
-            .where(
-                EditorialGroupRow.edition_id == edition_id,
-                EditorialGroupRow.subject_id == EditionProductionBatchItemRow.subject_id,
-            )
-            .order_by(EditorialGroupRow.created_at.desc(), EditorialGroupRow.id.desc())
-            .limit(1)
+        subject_title = (
+            select(SubjectRow.title)
+            .where(SubjectRow.id == EditionProductionBatchItemRow.subject_id)
             .correlate(EditionProductionBatchItemRow)
             .scalar_subquery()
         )
@@ -213,7 +208,7 @@ class SqlAlchemyEditionReviewReadRepository:
                 EditionProductionBatchItemRow.subject_id.label("subject_id"),
                 func.coalesce(
                     ProductionInputSnapshotRow.subject_title,
-                    group_title,
+                    subject_title,
                     cast(EditionProductionBatchItemRow.subject_id, String),
                 ).label("title"),
                 SubjectProductionRunRow.id.label("run_id"),

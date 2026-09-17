@@ -155,6 +155,14 @@ async def test_ioc_signal_auto_selects_article_without_edition_quota() -> None:
     assert second[0].id == first[0].id
     assert second[0].subject_id == first[0].subject_id
     assert len(uow.subjects) == 1
+    subject_id = first[0].subject_id
+    assert subject_id is not None
+    subject = uow.subjects[subject_id]
+    assert subject.edition_id == edition.id
+    assert subject.title == candidate.title
+    assert subject.tlp is edition.tlp
+    assert not hasattr(subject, "external_id")
+    assert first[0].subject_id == subject.id
     assert len(uow.decisions) == 1
     decision = uow.decisions[0]
     assert decision.actor_id == "system:editorial-auto-selection"
@@ -199,6 +207,14 @@ async def test_snapshot_enrichment_keeps_selected_editorial_group_and_subject() 
         correlation_id="test",
     )
     editorial_subject_id = selected.subject_id
+    assert editorial_subject_id is not None
+    subject = uow.subjects[editorial_subject_id]
+
+    assert subject.edition_id == edition.id
+    assert subject.title == first.title
+    assert subject.tlp is edition.tlp
+    assert not hasattr(subject, "external_id")
+    assert selected.subject_id == subject.id
 
     update = _candidate("Renamed incoming title", "https://example.test/b")
     second_ref = DiscoveryMemberReference(uuid4(), update.id)

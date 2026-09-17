@@ -175,7 +175,10 @@ def selected_subject(
         parser_version="test-parser-v1",
     )
     subject = Subject(
-        external_id=f"subject-{uuid4()}", slug=f"subject-{uuid4().hex}", tlp=TLP.AMBER
+        edition_id=edition.id,
+        title="Test subject",
+        slug=f"subject-{uuid4().hex}",
+        tlp=TLP.AMBER,
     )
     group = EditorialGroup(
         edition_id=edition.id,

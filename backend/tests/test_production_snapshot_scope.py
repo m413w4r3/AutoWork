@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import date
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -14,6 +14,7 @@ from cti_app.application.jobs import JobHandlerError
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_parsers import ParsedEvent, ParsedSource, ReferenceReport
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.discovery import SourceRole
@@ -37,10 +38,28 @@ class _Collections:
 
 
 class _Uow:
-    def __init__(self, items: Sequence[SourceCollection]) -> None:
+    def __init__(
+        self,
+        items: Sequence[SourceCollection],
+        *,
+        subject: object | None = None,
+        group: object | None = None,
+        edition: object | None = None,
+        batches: Sequence[object] = (),
+    ) -> None:
         self.source_collections = _Collections(items)
-        self.editorial_groups = SimpleNamespace(get_by_subject=AsyncMock(return_value=None))
-        self.editions = SimpleNamespace(get=AsyncMock(return_value=None))
+        self.subjects = SimpleNamespace(
+            get=AsyncMock(
+                return_value=subject
+                if subject is not None
+                else SimpleNamespace(title="Subject", edition_id=uuid4())
+            )
+        )
+        self.editorial_groups = SimpleNamespace(get_by_subject=AsyncMock(return_value=group))
+        self.editions = SimpleNamespace(get=AsyncMock(return_value=edition))
+        self.discovery_batches = SimpleNamespace(
+            list_for_edition=AsyncMock(return_value=list(batches))
+        )
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -109,6 +128,71 @@ def _snapshot(subject_id: UUID, url: str, *, allowed: bool = True) -> Production
             ),
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_new_snapshot_uses_subject_title_and_edition_with_editorial_provenance() -> None:
+    subject_id = uuid4()
+    edition_id = uuid4()
+    batch_id = uuid4()
+    candidate_id = uuid4()
+    source = SimpleNamespace(
+        id=uuid4(),
+        canonical_url="https://example.test/editorial-source",
+        role=SourceRole.PRIMARY,
+        title="Candidate source",
+        publisher="Publisher",
+        published_at=date(2026, 8, 2),
+        tlp=TLP.CLEAR,
+        sensitivity="public",
+        external_llm_allowed=True,
+    )
+    candidate = SimpleNamespace(
+        id=candidate_id,
+        sources=(source,),
+        actor_or_campaign="Campaign X",
+        actors=("Actor Y",),
+        campaigns=(),
+    )
+    group = SimpleNamespace(
+        id=uuid4(),
+        version=7,
+        title="Titre historique du groupe",
+        grouping_justification="Provenance éditoriale conservée",
+        candidate_references=(SimpleNamespace(batch_id=batch_id, candidate_id=candidate_id),),
+    )
+    edition = SimpleNamespace(
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+    )
+    uow = _Uow(
+        [],
+        subject=SimpleNamespace(
+            title="Titre canonique du Subject",
+            edition_id=edition_id,
+        ),
+        group=group,
+        edition=edition,
+        batches=[SimpleNamespace(id=batch_id, candidates=(candidate,))],
+    )
+
+    snapshot = await capture_production_input_snapshot(
+        cast(Any, uow),
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        edition_id=edition_id,
+        research_date=date(2026, 8, 28),
+        captured_at=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+
+    assert snapshot.subject_title == "Titre canonique du Subject"
+    assert snapshot.edition_id == edition_id
+    assert snapshot.period_start == edition.period_start
+    assert snapshot.period_end == edition.period_end
+    assert snapshot.editorial_group_id == group.id
+    assert snapshot.editorial_group_version == 7
+    assert snapshot.subject_description == "Provenance éditoriale conservée"
+    assert snapshot.actor_or_campaign == "Actor Y · Campaign X"
 
 
 @pytest.mark.asyncio

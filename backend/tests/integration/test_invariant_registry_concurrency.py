@@ -53,26 +53,31 @@ async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigat
         tlp=TLP.AMBER,
         languages=("en",),
     )
-    subject = Subject(external_id=f"P09-{suffix}", slug=f"p09-{suffix}", tlp=TLP.AMBER)
-    run = SubjectProductionRun(
-        subject_id=subject.id,
-        edition_id=edition.id,
-    )
-    artifact = ProductionArtifact(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        stage=ProductionArtifactStage.SYNTHESIS,
-        version=1,
-        input_hash="a" * 64,
-    )
-    investigation = AnalystInvestigation(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        synthesis_artifact_id=artifact.id,
-        budget=LoopBudget(),
-    )
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
         assert await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug=f"p09-{suffix}",
+            tlp=TLP.AMBER,
+        )
+        run = SubjectProductionRun(
+            subject_id=subject.id,
+            edition_id=edition.id,
+        )
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash="a" * 64,
+        )
+        investigation = AnalystInvestigation(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            synthesis_artifact_id=artifact.id,
+            budget=LoopBudget(),
+        )
         await uow.subjects.add(subject)
         await uow.subject_production_runs.add(run)
         await uow.production_artifacts.append(artifact)

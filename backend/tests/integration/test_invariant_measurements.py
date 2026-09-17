@@ -1,6 +1,6 @@
 """PostgreSQL coverage for invariant measurement batching."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 import pytest
@@ -13,6 +13,7 @@ from cti_app.infrastructure.database.models.core import (
     SampleRow,
     SubjectRow,
 )
+from cti_app.infrastructure.database.models.editions import EditionRow
 
 pytestmark = pytest.mark.integration
 
@@ -23,17 +24,37 @@ async def test_measure_features_bulk_matches_single_measurements_and_chunks(
 ) -> None:
     now = datetime.now(UTC)
     subject_id, sample_id, blob_id = uuid4(), uuid4(), uuid4()
+    edition_id = uuid4()
     async with uow_factory() as uow:
         session = uow._require_session()
 
+        session.add(
+            EditionRow(
+                id=edition_id,
+                country=f"Test edition {edition_id}",
+                country_code="ZZ",
+                period_start=date(2026, 1, 1),
+                period_end=date(2026, 1, 31),
+                tlp="CLEAR",
+                languages=["en"],
+                state="open",
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.flush()
         session.add_all(
             [
                 SubjectRow(
                     id=subject_id,
-                    external_id=f"bulk-{subject_id}",
+                    edition_id=edition_id,
+                    title="Test subject",
                     slug=f"bulk-{subject_id.hex}",
                     tlp="CLEAR",
+                    version=1,
                     created_at=now,
+                    updated_at=now,
                 ),
                 BlobRow(
                     id=blob_id,

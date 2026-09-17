@@ -537,8 +537,18 @@ def test_prevent_tlp_downgrade_guard_rejects_a_downgrade(migrated_postgres_url: 
             async with engine.begin() as connection:
                 await connection.execute(
                     text(
-                        "INSERT INTO subjects (id, external_id, slug, tlp, created_at) "
-                        "VALUES (gen_random_uuid(), 'ext-1', 'subject-one', 'AMBER', now())"
+                        "WITH edition AS ("
+                        "INSERT INTO editions ("
+                        "id, country, country_code, period_start, period_end, tlp, languages, "
+                        "state, version, created_at, updated_at"
+                        ") VALUES ("
+                        "gen_random_uuid(), 'France', 'FR', DATE '2026-01-01', "
+                        "DATE '2026-01-31', 'AMBER', '[\"fr\"]'::jsonb, 'open', 1, now(), now()"
+                        ") RETURNING id) "
+                        "INSERT INTO subjects ("
+                        "id, edition_id, title, slug, tlp, version, created_at, updated_at"
+                        ") SELECT gen_random_uuid(), id, 'Subject One', 'subject-one', 'AMBER', "
+                        "1, now(), now() FROM edition"
                     )
                 )
             try:

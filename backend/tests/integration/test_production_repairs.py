@@ -44,10 +44,15 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         tlp=TLP.GREEN,
         languages=("fr",),
     )
+    now = datetime(2098, 1, 2, tzinfo=UTC)
     subject = Subject(
-        external_id=f"repair-{uuid4().hex}",
+        edition_id=edition.id,
+        title="Repair subject",
         slug=f"repair-{uuid4().hex}",
         tlp=TLP.GREEN,
+        version=1,
+        created_at=now,
+        updated_at=now,
     )
     run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
     artifact = ProductionArtifact(
@@ -65,7 +70,6 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         artifact_type="sigma",
         value="rule body",
     )
-    now = datetime(2098, 1, 2, tzinfo=UTC)
     first = ProductionRepairDecision(
         id=UUID("00000000-0000-0000-0000-000000000001"),
         edition_id=edition.id,

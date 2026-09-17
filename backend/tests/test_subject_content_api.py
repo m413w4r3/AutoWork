@@ -130,7 +130,13 @@ def _app(uow: _Uow, payloads: _Payloads) -> FastAPI:
 
 @pytest.fixture
 def subject() -> Subject:
-    return Subject(external_id="subject-external", slug="subject-one", tlp=TLP.AMBER, id=SUBJECT_ID)
+    return Subject(
+        edition_id=uuid4(),
+        title="Test subject",
+        slug="subject-one",
+        tlp=TLP.AMBER,
+        id=SUBJECT_ID,
+    )
 
 
 def _run(*, created_at: datetime | None = None, generation: int = 1) -> SubjectProductionRun:

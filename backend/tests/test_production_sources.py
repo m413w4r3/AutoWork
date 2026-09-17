@@ -9,6 +9,7 @@ actually archived.
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 from uuid import uuid4
 
 from cti_app.application.production_context import build_subject_production_context
@@ -105,7 +106,7 @@ class _Groups:
             "Group",
             (),
             {
-                "title": "TAG-182 et MarkiRAT",
+                "title": "Titre historique du groupe",
                 "grouping_justification": "Campagne contre la diaspora",
                 "edition_id": self._edition_id,
                 "actor_or_campaign": "TAG-182",
@@ -114,12 +115,27 @@ class _Groups:
 
 
 class _Editions:
+    def __init__(self, edition_id: object) -> None:
+        self._edition_id = edition_id
+        self.requested_ids: list[object] = []
+
     async def get(self, edition_id: object) -> object:
+        self.requested_ids.append(edition_id)
+        if edition_id != self._edition_id:
+            return None
         return type(
             "Edition",
             (),
             {"period_start": date(2026, 7, 1), "period_end": date(2026, 7, 31)},
         )()
+
+
+class _Subjects:
+    def __init__(self, edition_id: object) -> None:
+        self._edition_id = edition_id
+
+    async def get(self, subject_id: object) -> object:
+        return SimpleNamespace(title="Titre canonique du Subject", edition_id=self._edition_id)
 
 
 class _Collections:
@@ -133,8 +149,10 @@ class _Collections:
 class _Uow:
     def __init__(self, collections: list[SourceCollection]) -> None:
         edition_id = uuid4()
-        self.editorial_groups = _Groups(edition_id)
-        self.editions = _Editions()
+        self.subject_edition_id = edition_id
+        self.editorial_groups = _Groups(uuid4())
+        self.subjects = _Subjects(edition_id)
+        self.editions = _Editions(edition_id)
         self.source_collections = _Collections(collections)
 
 
@@ -148,11 +166,12 @@ async def test_context_carries_the_real_editorial_anchors() -> None:
         date(2026, 8, 1),
     )
 
-    assert ctx.subject_title == "TAG-182 et MarkiRAT"
+    assert ctx.subject_title == "Titre canonique du Subject"
     assert ctx.subject_description == "Campagne contre la diaspora"
     assert ctx.actor_info == "TAG-182"
     assert ctx.period_start == "2026-07-01"
     assert ctx.period_end == "2026-07-31"
+    assert uow.editions.requested_ids == [uow.subject_edition_id]
     assert ctx.research_date == date(2026, 8, 1)
     assert "https://research.example/rapport" in ctx.core_sources_text
     assert ctx.supporting_sources_text == ""

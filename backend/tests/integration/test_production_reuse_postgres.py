@@ -168,6 +168,14 @@ def _edition(*, country: str = "France", country_code: str = "FR") -> Edition:
     )
 
 
+async def _persist_edition(uow_factory: UnitOfWorkFactory, edition: Edition) -> None:
+    # add_if_absent may rebind `edition.id` to an existing logical edition, so
+    # Subjects (whose edition_id is immutable) are only built afterwards.
+    async with uow_factory() as uow:
+        await uow.editions.add_if_absent(edition)
+        await uow.commit()
+
+
 def _production_context_entities(
     *, edition: Edition, subject: Subject, title: str = "Production subject"
 ) -> tuple[DiscoveryBatch, EditorialGroup, SourceCandidate]:
@@ -491,8 +499,10 @@ async def test_postgres_run_b_reuses_all_costly_artifacts_from_run_a(
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:
     edition = _edition()
+    await _persist_edition(uow_factory, edition)
     subject = Subject(
-        external_id=f"SUBJ-REUSE-{uuid4()}",
+        edition_id=edition.id,
+        title="Reuse subject",
         slug=f"reuse-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
@@ -561,8 +571,10 @@ async def test_postgres_invalidation_blocks_only_downstream_stages(
     extraction_allowed: bool,
 ) -> None:
     edition = _edition()
+    await _persist_edition(uow_factory, edition)
     subject = Subject(
-        external_id=f"SUBJ-INVALIDATE-{uuid4()}",
+        edition_id=edition.id,
+        title="Invalidation subject",
         slug=f"invalidate-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
@@ -629,8 +641,10 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
 ) -> None:
     """Run the canonical A -> B proof through the real SQL UoW and orchestrator."""
     edition = _edition(country="Germany", country_code="DE")
+    await _persist_edition(uow_factory, edition)
     subject = Subject(
-        external_id=f"SUBJ-ORCHESTRATOR-{uuid4()}",
+        edition_id=edition.id,
+        title="Orchestrator subject",
         slug=f"orchestrator-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
@@ -1041,9 +1055,11 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
 ) -> None:
     """Mirror the low-cost manual batch with two real PostgreSQL-backed runs."""
     edition = _edition(country="Italy", country_code="IT")
+    await _persist_edition(uow_factory, edition)
     subjects = [
         Subject(
-            external_id=f"SUBJ-TWO-ARTICLE-{label}-{uuid4()}",
+            edition_id=edition.id,
+            title=f"Article {label}",
             slug=f"two-article-{label.lower()}-{uuid4().hex}",
             tlp=TLP.AMBER,
         )

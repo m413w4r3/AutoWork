@@ -88,6 +88,20 @@ class InMemorySubjectRepository:
         value = self._subjects.get(subject_id)
         return deepcopy(value) if value else None
 
+    async def list_for_edition(self, edition_id: UUID) -> list[Subject]:
+        return [
+            deepcopy(subject)
+            for subject in self._subjects.values()
+            if subject.edition_id == edition_id
+        ]
+
+    async def update(self, subject: Subject, *, expected_version: int) -> bool:
+        current = self._subjects.get(subject.id)
+        if current is None or current.version != expected_version:
+            return False
+        self._subjects[subject.id] = deepcopy(subject)
+        return True
+
 
 class EmptySourceDocumentRepository:
     async def list_for_subject(self, subject_id: UUID) -> list[object]:

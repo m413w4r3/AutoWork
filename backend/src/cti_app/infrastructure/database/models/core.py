@@ -220,15 +220,23 @@ class CodeFeatureSetRow(Base):
 class SubjectRow(Base):
     __tablename__ = "subjects"
     __table_args__ = (
+        UniqueConstraint("edition_id", "slug", name="uq_subjects_edition_slug"),
+        Index("ix_subjects_edition_id", "edition_id"),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_subjects_tlp"),
         CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="ck_subjects_slug_format"),
+        CheckConstraint("version > 0", name="ck_subjects_version"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
-    external_id: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
-    slug: Mapped[str] = mapped_column(String(128), nullable=False, unique=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(1000), nullable=False)
+    slug: Mapped[str] = mapped_column(String(128), nullable=False)
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class SourceDocumentRow(Base):

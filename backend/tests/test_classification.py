@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from cti_app.domain.classification import TLP
@@ -6,7 +8,9 @@ from cti_app.domain.errors import TlpDowngradeError
 
 
 def test_tlp_can_only_stay_equal_or_become_more_restrictive() -> None:
-    subject = Subject(external_id="SUBJ-TEST-1", slug="test-subject", tlp=TLP.AMBER)
+    subject = Subject(
+        edition_id=uuid4(), title="Test subject", slug="test-subject", tlp=TLP.AMBER
+    )
 
     subject.restrict_tlp(TLP.RED)
 

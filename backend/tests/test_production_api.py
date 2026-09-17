@@ -11,7 +11,7 @@ import asyncio
 import dataclasses
 import hashlib
 import json
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +33,7 @@ from cti_app.application.production_state import (
     ProductionStateSnapshotV1,
     compute_production_state_checksum,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRelationshipStatus
 from cti_app.domain.editions import EditionStatus
@@ -44,6 +45,7 @@ from cti_app.domain.editorial import (
     GroupingConfidence,
     GroupingOutcome,
 )
+from cti_app.domain.entities import Subject
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -96,14 +98,49 @@ def _group(edition_id: UUID, title: str, subject_id: UUID) -> EditorialGroup:
 
 
 class _Groups:
-    def __init__(self, groups: list[EditorialGroup]) -> None:
-        self._groups = groups
+    def __init__(self, groups: list[EditorialGroup], subjects: _Subjects) -> None:
+        self._groups = _GroupList(groups, subjects)
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditorialGroup]:
         return [g for g in self._groups if g.edition_id == edition_id]
 
     async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
         return next((g for g in self._groups if g.subject_id == subject_id), None)
+
+
+class _Subjects:
+    def __init__(self) -> None:
+        self.items: dict[UUID, Subject] = {}
+
+    def add_for_group(self, group: EditorialGroup) -> None:
+        if group.subject_id is None or group.subject_id in self.items:
+            return
+        self.items[group.subject_id] = Subject(
+            id=group.subject_id,
+            edition_id=group.edition_id,
+            title=group.title,
+            slug=f"subject-{group.subject_id.hex}",
+            tlp=TLP.AMBER,
+        )
+
+    async def get(self, subject_id: UUID) -> Subject | None:
+        return self.items.get(subject_id)
+
+
+class _GroupList(list[EditorialGroup]):
+    def __init__(self, groups: list[EditorialGroup], subjects: _Subjects) -> None:
+        super().__init__(groups)
+        self._subjects = subjects
+        for group in groups:
+            subjects.add_for_group(group)
+
+    def append(self, group: EditorialGroup) -> None:
+        super().append(group)
+        self._subjects.add_for_group(group)
+
+    def extend(self, groups: Iterable[EditorialGroup]) -> None:
+        for group in groups:
+            self.append(group)
 
 
 class _Edition:
@@ -271,13 +308,13 @@ class _BatchStatusReadModel:
             if item.batch_id == batch_id
         ]
         runs = self._uow.subject_production_runs.items
-        groups = {group.subject_id: group for group in self._uow.editorial_groups._groups}
+        subjects = self._uow.subjects.items
         result: list[BatchStatusItem] = []
         for item in items:
             run = runs.get(item.production_run_id)
             if run is None:
                 continue
-            group = groups.get(item.subject_id)
+            subject = subjects.get(item.subject_id)
             snapshot = self.snapshots.get(run.id)
             result.append(
                 BatchStatusItem(
@@ -286,8 +323,8 @@ class _BatchStatusReadModel:
                     title=(
                         snapshot.subject_title
                         if snapshot is not None
-                        else group.title
-                        if group is not None
+                        else subject.title
+                        if subject is not None
                         else str(item.subject_id)
                     ),
                     run_id=run.id,
@@ -418,9 +455,10 @@ class _Uow:
     """Single shared in-memory unit of work; commit is a no-op."""
 
     def __init__(self, groups: list[EditorialGroup]) -> None:
-        self.editorial_groups = _Groups(groups)
+        self.subjects = _Subjects()
+        self.editorial_groups = _Groups(groups, self.subjects)
         self.editions = _Editions()
-        self.discovery_batches = _DiscoveryBatches(groups)
+        self.discovery_batches = _DiscoveryBatches(self.editorial_groups._groups)
         self.subject_production_runs = _Runs()
         self.production_input_snapshots = _Snapshots()
         self.edition_production_batches = _Batches()
@@ -1116,6 +1154,7 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    uow.subjects.items[subjects[2]].title = "Canonical subject title C"
 
     started = await api.post(f"/api/editions/{edition_id}/production", json={})
     assert started.status_code == 200, started.text
@@ -1133,8 +1172,31 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     details = response.json()["item_details"]
     assert [detail["position"] for detail in details] == [1, 2, 3]
     assert details[0]["title"] == "Snapshot title"
+    assert details[2]["title"] == "Canonical subject title C"
     assert details[0]["pipeline_generation"] == 3
     assert uow.batch_status_read_model.calls == 1
+
+
+async def test_subject_status_uses_current_subject_title(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Editorial group title", subject_id))
+    uow.subjects.items[subject_id].title = "Canonical subject title"
+    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    await uow.subject_production_runs.add(run)
+    await uow.production_input_snapshots.add(
+        SimpleNamespace(
+            production_run_id=run.id,
+            subject_title="Frozen snapshot title",
+            research_date=None,
+        )
+    )
+
+    response = await api.get(f"/api/subjects/{subject_id}/production")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["title"] == "Canonical subject title"
 
 
 async def test_start_edition_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
@@ -1390,6 +1452,7 @@ async def test_production_state_export_import_is_transparent(
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    uow.subjects.items[subject_id].title = "Canonical export title"
     store = production_app.state.production_artifact_store
     run = await _seed_exportable_run(uow, store, edition_id, subject_id)
 
@@ -1398,6 +1461,7 @@ async def test_production_state_export_import_is_transparent(
     snapshot = exported.json()
     assert snapshot["format"] == "autowork.production-state"
     assert snapshot["schema_version"] == 3
+    assert snapshot["origin"]["subject_title"] == "Canonical export title"
     # A run with no repair projection exports an explicitly empty audit block.
     assert snapshot["repair"] is None
     assert snapshot["content_sha256"]

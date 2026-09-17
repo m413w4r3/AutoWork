@@ -2,6 +2,7 @@ import json
 from datetime import UTC, datetime
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
@@ -24,7 +25,12 @@ async def test_subject_workspace_materializes_logical_tree_without_using_origina
         mime_type="application/octet-stream",
     )
     blob = BlobRecord(descriptor=descriptor)
-    subject = Subject(external_id="SUBJ-2026-TEST-1", slug="workspace-test", tlp=TLP.RED)
+    subject = Subject(
+        edition_id=UUID("11111111-1111-1111-1111-111111111111"),
+        title="Workspace test subject",
+        slug="workspace-test",
+        tlp=TLP.RED,
+    )
     document = SourceDocument(
         subject_id=subject.id,
         blob_id=blob.id,
@@ -69,6 +75,9 @@ async def test_subject_workspace_materializes_logical_tree_without_using_origina
     assert not (result.path / "03_samples/original/do-not-run.sh").exists()
     manifest = json.loads((result.path / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["canonical"] is False
+    assert manifest["subject"]["edition_id"] == str(subject.edition_id)
+    assert manifest["subject"]["title"] == subject.title
+    assert "external_id" not in manifest["subject"]
     assert manifest["samples"][0]["do_not_submit"] is True
     assert manifest["sources"][0]["logical_filename"] == (
         "2026-08-07_TLP AMBER_Rapport_Example.pdf"

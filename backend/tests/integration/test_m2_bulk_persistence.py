@@ -1,6 +1,6 @@
 """PostgreSQL validation for the M2 bulk persistence paths."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,6 +17,7 @@ from cti_app.infrastructure.database.models.core import (
     SampleRow,
     SubjectRow,
 )
+from cti_app.infrastructure.database.models.editions import EditionRow
 
 pytestmark = pytest.mark.integration
 
@@ -27,6 +28,7 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         session = uow._require_session()  # type: ignore[attr-defined]
         now = datetime.now(UTC)
         subject_id = uuid4()
+        edition_id = uuid4()
         sample_id = uuid4()
         blob_id = uuid4()
         baseline_id = uuid4()
@@ -34,14 +36,34 @@ async def test_m2_bulk_persistence_on_postgresql(uow_factory: object) -> None:
         code_feature_set_id = uuid4()
         capability_set_id = uuid4()
 
+        session.add(
+            EditionRow(
+                id=edition_id,
+                country=f"Test edition {edition_id}",
+                country_code="ZZ",
+                period_start=date(2026, 2, 1),
+                period_end=date(2026, 2, 28),
+                tlp="CLEAR",
+                languages=["en"],
+                state="open",
+                version=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await session.flush()
+
         session.add_all(
             [
                 SubjectRow(
                     id=subject_id,
-                    external_id=f"synthetic-{subject_id}",
+                    edition_id=edition_id,
+                    title="Test subject",
                     slug=f"synthetic-{subject_id.hex}",
                     tlp="CLEAR",
+                    version=1,
                     created_at=now,
+                    updated_at=now,
                 ),
                 BlobRow(
                     id=blob_id,

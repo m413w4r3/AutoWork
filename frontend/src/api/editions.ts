@@ -19,6 +19,17 @@ export interface Edition extends EditionFields {
   updated_at: string;
 }
 
+export interface Subject {
+  id: string;
+  edition_id: string;
+  title: string;
+  slug: string;
+  tlp: Tlp;
+  version: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface EditionPage {
   items: Edition[];
   total: number;
@@ -50,6 +61,16 @@ export async function listEditions(filters: {
 
 export function getEdition(editionId: string): Promise<Edition> {
   return request<Edition>(`/api/editions/${encodeURIComponent(editionId)}`);
+}
+
+export function listSubjects(editionId: string): Promise<Subject[]> {
+  return request<Subject[]>(
+    `/api/editions/${encodeURIComponent(editionId)}/subjects`,
+  );
+}
+
+export function getSubject(subjectId: string): Promise<Subject> {
+  return request<Subject>(`/api/subjects/${encodeURIComponent(subjectId)}`);
 }
 
 export function createEdition(payload: EditionFields): Promise<Edition> {

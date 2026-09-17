@@ -224,10 +224,15 @@ async def test_publication_lock_keeps_the_edition_open_for_a_concurrent_retry(
         languages=("fr",),
         state=EditionStatus.OPEN,
     )
+    subject_created_at = datetime.now(UTC)
     subject = Subject(
-        external_id=f"freeze-{uuid4().hex}",
+        edition_id=edition.id,
+        title="Freeze subject",
         slug=f"freeze-{uuid4().hex}",
         tlp=TLP.GREEN,
+        version=1,
+        created_at=subject_created_at,
+        updated_at=subject_created_at,
     )
     run = SubjectProductionRun(
         subject_id=subject.id,

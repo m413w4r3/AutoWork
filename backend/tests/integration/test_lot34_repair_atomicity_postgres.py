@@ -170,7 +170,8 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         state=EditionStatus.OPEN,
     )
     subject = Subject(
-        external_id=f"LOT34-{uuid4().hex}",
+        edition_id=edition.id,
+        title="LOT 34",
         slug=f"lot34-{uuid4().hex}",
         tlp=TLP.AMBER,
     )

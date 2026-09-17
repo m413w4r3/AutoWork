@@ -436,7 +436,8 @@ class ProductionScenario:
             state=EditionStatus.OPEN,
         )
         self.subject = Subject(
-            external_id=f"BUSINESS-{uuid4().hex}",
+            edition_id=self.edition.id,
+            title="ExampleRAT campaign activity",
             slug=f"production-{uuid4().hex[:12]}",
             tlp=TLP.AMBER,
         )

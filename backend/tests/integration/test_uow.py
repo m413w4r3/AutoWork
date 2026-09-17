@@ -13,7 +13,7 @@ from cti_app.application.jobs import JobService, create_job_registry
 from cti_app.application.persistence import EditionUnitOfWork, JobUnitOfWork, UnitOfWork
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
-from cti_app.domain.editions import EditionStatus
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.errors import BlobStillReferencedError
 from cti_app.domain.model_conversations import (
@@ -39,17 +39,36 @@ from cti_app.infrastructure.database.models.jobs import JobEventRow
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
+from .edition_codes import reserve_edition_code
+
 pytestmark = pytest.mark.integration
+
+
+def _new_edition() -> Edition:
+    # The integration database is shared by the session: allocate a unique
+    # logical key so add_if_absent never rebinds the edition to another row.
+    return Edition(
+        country="Test country",
+        country_code=reserve_edition_code(),
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 1, 31),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+    )
 
 
 @pytest.mark.asyncio
 async def test_unit_of_work_commits_and_rolls_back(migrated_postgres_url: str) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
-    committed = Subject(external_id="SUBJ-COMMITTED", slug="committed", tlp=TLP.AMBER)
-    rolled_back = Subject(external_id="SUBJ-ROLLED-BACK", slug="rolled-back", tlp=TLP.GREEN)
+    edition = _new_edition()
+    committed = Subject(edition_id=edition.id, title="Committed", slug="committed", tlp=TLP.AMBER)
+    rolled_back = Subject(
+        edition_id=edition.id, title="Rolled back", slug="rolled-back", tlp=TLP.GREEN
+    )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(committed)
             await uow.commit()
 
@@ -66,12 +85,82 @@ async def test_unit_of_work_commits_and_rolls_back(migrated_postgres_url: str) -
 
 
 @pytest.mark.asyncio
+async def test_subject_repository_scopes_slugs_and_updates_optimistically(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = _new_edition()
+    other_edition = _new_edition()
+    first = Subject(
+        edition_id=edition.id,
+        title="First subject",
+        slug="shared-slug",
+        tlp=TLP.AMBER,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+    second = Subject(
+        edition_id=edition.id,
+        title="Second subject",
+        slug="second-subject",
+        tlp=TLP.GREEN,
+        created_at=datetime(2026, 1, 2, tzinfo=UTC),
+    )
+    same_slug_other_edition = Subject(
+        edition_id=other_edition.id,
+        title="Other edition subject",
+        slug="shared-slug",
+        tlp=TLP.GREEN,
+    )
+    duplicate = Subject(
+        edition_id=edition.id,
+        title="Duplicate subject",
+        slug="shared-slug",
+        tlp=TLP.GREEN,
+    )
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            assert await uow.editions.add_if_absent(other_edition)
+            await uow.subjects.add(first)
+            await uow.subjects.add(second)
+            await uow.subjects.add(same_slug_other_edition)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.subjects.get(first.id) == first
+            assert list(await uow.subjects.list_for_edition(edition.id)) == [first, second]
+            assert list(await uow.subjects.list_for_edition(other_edition.id)) == [
+                same_slug_other_edition
+            ]
+
+        first.update_metadata(title="Updated subject", tlp=TLP.RED)
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.subjects.update(first, expected_version=1)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert not await uow.subjects.update(first, expected_version=1)
+
+        with pytest.raises(DBAPIError):
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                await uow.subjects.add(duplicate)
+                await uow.commit()
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_database_prevents_tlp_downgrade(migrated_postgres_url: str) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
-    subject = Subject(external_id="SUBJ-TLP-GUARD", slug="tlp-guard", tlp=TLP.RED)
+    edition = _new_edition()
+    subject = Subject(
+        edition_id=edition.id, title="TLP guard", slug="tlp-guard", tlp=TLP.RED
+    )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
             await uow.commit()
 
@@ -94,7 +183,10 @@ async def test_database_prevents_tlp_downgrade(migrated_postgres_url: str) -> No
 async def test_provenance_events_are_append_only(migrated_postgres_url: str) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
-    subject = Subject(external_id="SUBJ-PROVENANCE", slug="provenance", tlp=TLP.AMBER)
+    edition = _new_edition()
+    subject = Subject(
+        edition_id=edition.id, title="Provenance", slug="provenance", tlp=TLP.AMBER
+    )
     event = ProvenanceEvent(
         subject_id=subject.id,
         aggregate_type="subject",
@@ -106,6 +198,7 @@ async def test_provenance_events_are_append_only(migrated_postgres_url: str) -> 
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
             await uow.provenance.append(event)
             await uow.commit()
@@ -314,8 +407,10 @@ async def test_model_run_round_trip_never_persists_prompt_content(
 async def test_model_conversation_and_turn_round_trip(migrated_postgres_url: str) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
+    edition = _new_edition()
     subject = Subject(
-        external_id=f"SUBJ-CONVERSATION-{uuid4().hex}",
+        edition_id=edition.id,
+        title="Conversation subject",
         slug=f"conversation-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
@@ -338,6 +433,7 @@ async def test_model_conversation_and_turn_round_trip(migrated_postgres_url: str
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
             await uow.model_conversations.add(conversation)
             await uow.commit()
@@ -421,8 +517,10 @@ async def test_document_and_sample_keep_distinct_semantics(
 ) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
+    edition = _new_edition()
     subject = Subject(
-        external_id=f"SUBJ-SEMANTICS-{uuid4().hex}",
+        edition_id=edition.id,
+        title="Semantics subject",
         slug=f"semantics-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
@@ -460,6 +558,7 @@ async def test_document_and_sample_keep_distinct_semantics(
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             await uow.blobs.add(blob)
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
             await uow.source_documents.add(document)
             await uow.samples.add(sample)
@@ -484,8 +583,12 @@ async def test_referenced_blob_cannot_be_physically_deleted(
         return SqlAlchemyUnitOfWork(session_factory)
 
     service = BlobCatalogService(store, uow_factory)
+    edition = _new_edition()
     subject = Subject(
-        external_id=f"SUBJ-BLOB-{uuid4().hex}", slug=f"blob-{uuid4().hex}", tlp=TLP.RED
+        edition_id=edition.id,
+        title="Blob subject",
+        slug=f"blob-{uuid4().hex}",
+        tlp=TLP.RED,
     )
     acquired_at = datetime(2026, 8, 7, tzinfo=UTC)
     try:
@@ -506,6 +609,7 @@ async def test_referenced_blob_cannot_be_physically_deleted(
             external_llm_allowed=False,
         )
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
             await uow.source_documents.add(document)
             await uow.commit()

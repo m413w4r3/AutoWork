@@ -255,6 +255,10 @@ class SubjectRepository(Protocol):
 
     async def get(self, subject_id: UUID) -> Subject | None: ...
 
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[Subject]: ...
+
+    async def update(self, subject: Subject, *, expected_version: int) -> bool: ...
+
 
 class SourceDocumentRepository(Protocol):
     async def add(self, document: SourceDocument) -> None: ...
@@ -896,6 +900,7 @@ class ProductionUnitOfWork(Protocol):
     jobs: JobRepository
     model_runs: ModelRunRepository
     editions: EditionRepository
+    subjects: SubjectRepository
     edition_audit: EditionAuditRepository
     subject_production_runs: SubjectProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository

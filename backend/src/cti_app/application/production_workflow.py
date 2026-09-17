@@ -1830,17 +1830,14 @@ class ProductionWorkflowOrchestrator:
         subject_id: UUID,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> tuple[str, str]:
-        """Editorial title and context for a subject.
-
-        `Subject` itself only carries identifiers; the human-readable title
-        lives on the editorial group that selected it.
-        """
+        """Canonical subject title and editorial context for a subject."""
         if snapshot is not None:
             return snapshot.subject_title, snapshot.subject_description
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise ValueError("production_subject_missing")
         group = await uow.editorial_groups.get_by_subject(subject_id)
-        if group is None:
-            return str(subject_id), ""
-        return group.title, group.grouping_justification
+        return subject.title, group.grouping_justification if group is not None else ""
 
     async def _turn_output_text(self, conversation_id: UUID, turn_id: UUID) -> str | None:
         """Read a turn's output text.

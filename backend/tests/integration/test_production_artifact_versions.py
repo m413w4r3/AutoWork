@@ -82,14 +82,18 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(external_id="SUBJ-ARTIFACT-VERSIONS", slug="artifact-versions", tlp=TLP.AMBER)
-
     async with uow_factory() as uow:
         # Editions are unique on (country_code, period_start, period_end) and
         # the integration database is shared for the whole session, so
         # add_if_absent may rebind `edition.id` to a row another module already
         # owns. Nothing referencing the edition may be built before that.
         await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="artifact-versions",
+            tlp=TLP.AMBER,
+        )
         await uow.subjects.add(subject)
         run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.subject_production_runs.add(run)
@@ -143,12 +147,16 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(external_id="SUBJ-MARK-STAGES-STALE", slug="mark-stages-stale", tlp=TLP.AMBER)
-
     async with uow_factory() as uow:
         # See the note above: the edition identity is only settled once
         # add_if_absent has returned.
         await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="mark-stages-stale",
+            tlp=TLP.AMBER,
+        )
         await uow.subjects.add(subject)
         run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
         await uow.subject_production_runs.add(run)
@@ -192,16 +200,6 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(external_id="SUBJ-ANALYST-FK", slug="analyst-fk", tlp=TLP.AMBER)
-    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
-    run.start_running()
-    synthesis = ProductionArtifact(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        stage=ProductionArtifactStage.SYNTHESIS,
-        version=1,
-        input_hash="a" * 64,
-    )
     catalog = BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
     blob = await catalog.ingest(
         BytesIO(b'{"schema_version":"analyst-input-pack-v1"}'),
@@ -212,6 +210,21 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
 
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="analyst-fk",
+            tlp=TLP.AMBER,
+        )
+        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
+        run.start_running()
+        synthesis = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash="a" * 64,
+        )
         await uow.subjects.add(subject)
         await uow.subject_production_runs.add(run)
         await uow.production_artifacts.append(synthesis)
@@ -257,8 +270,6 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    source = Subject(external_id="SUBJ-STATE-A", slug="state-a", tlp=TLP.AMBER)
-    target = Subject(external_id="SUBJ-STATE-B", slug="state-b", tlp=TLP.AMBER)
     store = ProductionArtifactStore(
         BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
     )
@@ -288,6 +299,18 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         # session-scoped database already created for the same period, so the
         # run may only be built once that identity is settled.
         await uow.editions.add_if_absent(edition)
+        source = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="state-a",
+            tlp=TLP.AMBER,
+        )
+        target = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="state-b",
+            tlp=TLP.AMBER,
+        )
         await uow.subjects.add(source)
         await uow.subjects.add(target)
         run = SubjectProductionRun(subject_id=source.id, edition_id=edition.id)
@@ -370,12 +393,6 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    source = Subject(
-        external_id="SUBJ-MAJOR-IMPORT-SOURCE", slug="major-import-source", tlp=TLP.AMBER
-    )
-    target = Subject(
-        external_id="SUBJ-MAJOR-IMPORT-TARGET", slug="major-import-target", tlp=TLP.AMBER
-    )
     store = ProductionArtifactStore(
         BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
     )
@@ -391,20 +408,32 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         "events": [],
     }
     extraction: dict[str, Any] = {"items": [], "uncertainties": []}
-    run = SubjectProductionRun(
-        subject_id=source.id,
-        edition_id=edition.id,
-        research_date=date(2026, 11, 12),
-    )
-    run.start_running()
-    run.current_stage = SubjectProductionStage.ASSEMBLY
-    run.mark_needs_review(code="seed", message="seed")
     ref_blob = await store.store_stage_payloads(canonical=refs)
     extraction_blob = await store.store_stage_payloads(canonical=extraction)
     synthesis_blob = await store.store_stage_payloads(rendered="Fait [S1]")
 
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
+        source = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="major-import-source",
+            tlp=TLP.AMBER,
+        )
+        target = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="major-import-target",
+            tlp=TLP.AMBER,
+        )
+        run = SubjectProductionRun(
+            subject_id=source.id,
+            edition_id=edition.id,
+            research_date=date(2026, 11, 12),
+        )
+        run.start_running()
+        run.current_stage = SubjectProductionStage.ASSEMBLY
+        run.mark_needs_review(code="seed", message="seed")
         await uow.subjects.add(source)
         await uow.subjects.add(target)
         await uow.subject_production_runs.add(run)
@@ -478,9 +507,14 @@ async def test_run_number_allocation_is_serialized_in_postgres(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(external_id="SUBJ-RUN-LOCK", slug="run-lock", tlp=TLP.AMBER)
     async with uow_factory() as uow:
         await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug="run-lock",
+            tlp=TLP.AMBER,
+        )
         await uow.subjects.add(subject)
         await uow.commit()
 
@@ -517,91 +551,91 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
         tlp=TLP.AMBER,
         languages=("fr",),
     )
-    subject = Subject(
-        external_id=f"SUBJ-CONCURRENT-{uuid4().hex}",
-        slug=f"concurrent-{uuid4().hex}",
-        tlp=TLP.AMBER,
-    )
-    source = SourceCandidate(
-        url="https://example.test/concurrent-source",
-        title="Concurrent source",
-        publisher="Example publisher",
-        role=SourceRole.PRIMARY,
-        tlp=TLP.AMBER,
-        sensitivity="public",
-        external_llm_allowed=True,
-    )
-    candidate = CandidateTopic(
-        title="Concurrent subject",
-        summary="A selected subject for the concurrency test.",
-        novelty="new",
-        technical_potential=3,
-        uncertainties=(),
-        relevance_reasons=("test",),
-        actors=(),
-        campaigns=(),
-        malware=(),
-        cves=(),
-        victims=(),
-        sectors=(),
-        countries=(),
-        likely_artifacts=(),
-        sources=[source],
-        tlp=TLP.AMBER,
-        sensitivity="public",
-        external_llm_allowed=True,
-    )
-    discovery_batch = DiscoveryBatch(
-        edition_id=edition.id,
-        request_hash=(subject.id.hex * 2)[:64],
-        complementary_axis="concurrency",
-        queries=(),
-        citations=(),
-        discovery_model_run_id=uuid4(),
-        tlp=TLP.AMBER,
-        sensitivity="public",
-        external_llm_allowed=True,
-        parser_version="test",
-        candidates=[candidate],
-        source_mode=DiscoverySourceMode.NATIVE_COMPLETE,
-        source_coverage_complete=True,
-        source_coverage_incomplete_reason=None,
-    )
-    group = EditorialGroup(
-        edition_id=edition.id,
-        title="Concurrent subject",
-        candidate_references=(CandidateReference(discovery_batch.id, candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=EditorialScore(
-            impact=3,
-            novelty=3,
-            technical_depth=3,
-            hunting_potential=3,
-            actionability=3,
-            source_quality=3,
-            justifications={},
-        ),
-        source_relationship_status=SourceRelationshipStatus.VERIFIED,
-        needs_source_verification=False,
-        needs_source_expansion=False,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="A stable test subject.",
-    )
-    group.select(subject.id)
-    discovery_model_run = ModelRun(
-        provider=ModelProvider.FAKE,
-        model_role=ModelRole.RESEARCH,
-        requested_model="test",
-        prompt_template_id="test",
-        prompt_template_version="1",
-        authorized_input_hash="0" * 64,
-        evidence_pack_hash="0" * 64,
-        parameters={},
-    )
-    discovery_batch.discovery_model_run_id = discovery_model_run.id
-
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
         assert await uow.editions.add_if_absent(edition)
+        subject = Subject(
+            edition_id=edition.id,
+            title="Test subject",
+            slug=f"concurrent-{uuid4().hex}",
+            tlp=TLP.AMBER,
+        )
+        source = SourceCandidate(
+            url="https://example.test/concurrent-source",
+            title="Concurrent source",
+            publisher="Example publisher",
+            role=SourceRole.PRIMARY,
+            tlp=TLP.AMBER,
+            sensitivity="public",
+            external_llm_allowed=True,
+        )
+        candidate = CandidateTopic(
+            title="Concurrent subject",
+            summary="A selected subject for the concurrency test.",
+            novelty="new",
+            technical_potential=3,
+            uncertainties=(),
+            relevance_reasons=("test",),
+            actors=(),
+            campaigns=(),
+            malware=(),
+            cves=(),
+            victims=(),
+            sectors=(),
+            countries=(),
+            likely_artifacts=(),
+            sources=[source],
+            tlp=TLP.AMBER,
+            sensitivity="public",
+            external_llm_allowed=True,
+        )
+        discovery_batch = DiscoveryBatch(
+            edition_id=edition.id,
+            request_hash=(subject.id.hex * 2)[:64],
+            complementary_axis="concurrency",
+            queries=(),
+            citations=(),
+            discovery_model_run_id=uuid4(),
+            tlp=TLP.AMBER,
+            sensitivity="public",
+            external_llm_allowed=True,
+            parser_version="test",
+            candidates=[candidate],
+            source_mode=DiscoverySourceMode.NATIVE_COMPLETE,
+            source_coverage_complete=True,
+            source_coverage_incomplete_reason=None,
+        )
+        group = EditorialGroup(
+            edition_id=edition.id,
+            title="Concurrent subject",
+            candidate_references=(CandidateReference(discovery_batch.id, candidate.id),),
+            outcome=GroupingOutcome.NEW_SUBJECT,
+            score=EditorialScore(
+                impact=3,
+                novelty=3,
+                technical_depth=3,
+                hunting_potential=3,
+                actionability=3,
+                source_quality=3,
+                justifications={},
+            ),
+            source_relationship_status=SourceRelationshipStatus.VERIFIED,
+            needs_source_verification=False,
+            needs_source_expansion=False,
+            grouping_confidence=GroupingConfidence.HIGH,
+            grouping_justification="A stable test subject.",
+        )
+        group.select(subject.id)
+        discovery_model_run = ModelRun(
+            provider=ModelProvider.FAKE,
+            model_role=ModelRole.RESEARCH,
+            requested_model="test",
+            prompt_template_id="test",
+            prompt_template_version="1",
+            authorized_input_hash="0" * 64,
+            evidence_pack_hash="0" * 64,
+            parameters={},
+        )
+        discovery_batch.discovery_model_run_id = discovery_model_run.id
         await uow.subjects.add(subject)
         await uow.model_runs.add(discovery_model_run)
         await uow.discovery_batches.add_if_absent(discovery_batch)

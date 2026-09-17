@@ -17,6 +17,7 @@ from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
 from cti_app.api.publication import router as publication_router
 from cti_app.api.subject_content import router as subject_content_router
+from cti_app.api.subjects import router as subjects_router
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.collection_review import CollectionReviewService
@@ -70,6 +71,7 @@ from cti_app.application.subject_production import (
     EditionProductionService,
     SubjectProductionService,
 )
+from cti_app.application.subjects import SubjectService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -284,6 +286,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.job_service = job_service
     app.state.job_dispatcher = job_dispatcher
     app.state.edition_service = EditionService(uow_factory)
+    app.state.subject_service = SubjectService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
     app.state.model_gateway = model_gateway
     app.state.bridge_capabilities_provider = bridge_provider
@@ -384,6 +387,7 @@ def create_app() -> FastAPI:
     application.include_router(model_conversations_router)
     application.include_router(production_router)
     application.include_router(publication_router)
+    application.include_router(subjects_router)
     application.include_router(subject_content_router)
     return application
 

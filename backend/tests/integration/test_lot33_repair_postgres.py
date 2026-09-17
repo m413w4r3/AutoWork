@@ -38,7 +38,8 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         languages=("fr",),
     )
     subject = Subject(
-        external_id=f"LOT33-{uuid4().hex}",
+        edition_id=edition.id,
+        title="LOT 33",
         slug=f"lot33-{uuid4().hex}",
         tlp=TLP.AMBER,
     )

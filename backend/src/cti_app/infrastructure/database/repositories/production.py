@@ -38,7 +38,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
-from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
+from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.production import (
     AnalystDecisionRow,
     AnalystInputPackRow,
@@ -1006,14 +1006,10 @@ class SqlAlchemyBatchStatusReadRepository:
         self._session = session
 
     async def list_for_batch(self, batch_id: UUID) -> Sequence[BatchStatusItem]:
-        # A subject can have historical editorial-group rows.  The scalar
-        # subquery preserves one result row per batch item while retaining the
-        # same group-title fallback as the transactional API used to have.
-        group_title = (
-            select(EditorialGroupRow.title)
-            .where(EditorialGroupRow.subject_id == EditionProductionBatchItemRow.subject_id)
-            .order_by(EditorialGroupRow.created_at.desc(), EditorialGroupRow.id.desc())
-            .limit(1)
+        subject_title = (
+            select(SubjectRow.title)
+            .where(SubjectRow.id == EditionProductionBatchItemRow.subject_id)
+            .correlate(EditionProductionBatchItemRow)
             .scalar_subquery()
         )
         query = (
@@ -1022,7 +1018,7 @@ class SqlAlchemyBatchStatusReadRepository:
                 EditionProductionBatchItemRow.subject_id.label("subject_id"),
                 func.coalesce(
                     ProductionInputSnapshotRow.subject_title,
-                    group_title,
+                    subject_title,
                 ).label("title"),
                 EditionProductionBatchItemRow.production_run_id.label("run_id"),
                 SubjectProductionRunRow.status.label("status"),

@@ -1410,10 +1410,17 @@ async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
 ) -> ProductionStateSnapshotV3:
-    group = await _selected_article_group(request, subject_id)
+    await _selected_article_group(request, subject_id)
+    async with request.app.state.uow_factory() as uow:
+        subject = await uow.subjects.get(subject_id)
+    if subject is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No subject found for {subject_id}",
+        )
     service = _production_state_service(request)
     try:
-        return await service.export_state(subject_id=subject_id, subject_title=group.title)
+        return await service.export_state(subject_id=subject_id, subject_title=subject.title)
     except ProductionStateError as exc:
         raise _production_state_error(exc) from exc
 
@@ -1452,7 +1459,12 @@ async def get_subject_production(
                 detail=f"No production run found for subject {subject_id}",
             )
 
-        group = await uow.editorial_groups.get_by_subject(subject_id)
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No subject found for {subject_id}",
+            )
         get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
         batch_item = await get_by_run(run.id) if get_by_run is not None else None
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
@@ -1487,13 +1499,7 @@ async def get_subject_production(
         return ProductionStatus(
             subject_id=str(run.subject_id),
             edition_id=str(run.edition_id),
-            title=(
-                snapshot.subject_title
-                if snapshot.subject_title
-                else group.title
-                if group
-                else str(run.subject_id)
-            ),
+            title=subject.title,
             status=run.status.value,
             current_stage=run.current_stage.value,
             progress_current=completed_stages,

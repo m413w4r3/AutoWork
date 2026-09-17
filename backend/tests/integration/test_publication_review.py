@@ -12,6 +12,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from cti_app.domain.classification import TLP
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.editions import EditionRow
+from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
 from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
@@ -64,13 +65,38 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                     updated_at=now,
                 )
             )
+            # subjects.edition_id is FK-backed: persist the Edition first.
+            await session.flush()
             session.add(
                 SubjectRow(
                     id=subject_id,
-                    external_id=f"review-{uuid4().hex}",
+                    edition_id=edition_id,
+                    title="Subject review title",
                     slug=f"review-{uuid4().hex}",
                     tlp=TLP.GREEN.value,
+                    version=1,
                     created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                EditorialGroupRow(
+                    id=uuid4(),
+                    edition_id=edition_id,
+                    title="Editorial review title",
+                    outcome="new_subject",
+                    status="selected",
+                    source_relationship_status="provisional",
+                    needs_source_verification=False,
+                    needs_source_expansion=False,
+                    grouping_confidence="high",
+                    grouping_justification="integration test",
+                    subject_id=subject_id,
+                    discovery_subject_id=None,
+                    payload={},
+                    version=1,
+                    created_at=now,
+                    updated_at=now,
                 )
             )
             session.add(
@@ -125,10 +151,33 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             session.add(
                 SubjectRow(
                     id=no_document_subject_id,
-                    external_id=f"review-no-document-{uuid4().hex}",
+                    edition_id=edition_id,
+                    title="Subject without document title",
                     slug=f"review-no-document-{uuid4().hex}",
                     tlp=TLP.GREEN.value,
+                    version=1,
                     created_at=now,
+                    updated_at=now,
+                )
+            )
+            session.add(
+                EditorialGroupRow(
+                    id=uuid4(),
+                    edition_id=edition_id,
+                    title="Editorial without document title",
+                    outcome="new_subject",
+                    status="selected",
+                    source_relationship_status="provisional",
+                    needs_source_verification=False,
+                    needs_source_expansion=False,
+                    grouping_confidence="high",
+                    grouping_justification="integration test",
+                    subject_id=no_document_subject_id,
+                    discovery_subject_id=None,
+                    payload={},
+                    version=1,
+                    created_at=now,
+                    updated_at=now,
                 )
             )
             session.add(
@@ -242,6 +291,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             assert with_document.effective_decision is not None
             assert with_document.effective_decision.value == "exclude"
             assert with_document.effective_decision_id == decision_id
+            assert with_document.title == "Subject review title"
             assert with_document.document_artifact_id == artifact_id
             assert with_document.rejected_indicator_count == 7
             assert with_document.rejected_rule_count == 2
@@ -250,6 +300,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
             assert without_document.effective_decision is not None
             assert without_document.effective_decision.value == "exclude"
             assert without_document.effective_decision_id == no_document_decision_id
+            assert without_document.title == "Subject without document title"
             assert without_document.document_artifact_id is None
             assert without_document.document_artifact_version is None
             assert without_document.document_input_hash is None

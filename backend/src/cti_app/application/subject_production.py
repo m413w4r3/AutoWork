@@ -145,12 +145,18 @@ async def capture_production_input_snapshot(
     captured_at: datetime,
 ) -> ProductionInputSnapshot:
     """Capture the selected editorial input and resolve its exact candidates."""
+    subject = await uow.subjects.get(subject_id)
+    if subject is None:
+        raise ValueError("production_snapshot_subject_missing")
+    if subject.edition_id != edition_id:
+        raise ValueError("production_snapshot_subject_edition_mismatch")
+
     group = await uow.editorial_groups.get_by_subject(subject_id)
-    if group is None or group.edition_id != edition_id:
+    if group is None:
         raise ValueError("production_snapshot_editorial_group_missing")
 
     editions = getattr(uow, "editions", None)
-    edition = await editions.get(edition_id) if editions is not None else None
+    edition = await editions.get(subject.edition_id) if editions is not None else None
     if edition is None:
         raise ValueError("production_snapshot_edition_missing")
 
@@ -219,10 +225,10 @@ async def capture_production_input_snapshot(
     return ProductionInputSnapshot(
         production_run_id=production_run_id,
         subject_id=subject_id,
-        edition_id=edition_id,
+        edition_id=subject.edition_id,
         editorial_group_id=group.id,
         editorial_group_version=group.version,
-        subject_title=group.title,
+        subject_title=subject.title,
         subject_description=group.grouping_justification,
         actor_or_campaign=" · ".join(actor_values[key] for key in sorted(actor_values)),
         period_start=edition.period_start,

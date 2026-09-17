@@ -24,21 +24,51 @@ def _require_aware(value: datetime, field_name: str) -> None:
 
 @dataclass(slots=True, kw_only=True)
 class Subject:
-    external_id: str
+    edition_id: UUID
+    title: str
     slug: str
     tlp: TLP
     id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=utc_now)
+    version: int = 1
+    updated_at: datetime = field(default_factory=utc_now)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"edition_id", "slug"}:
+            try:
+                object.__getattribute__(self, name)
+            except AttributeError:
+                pass
+            else:
+                raise AttributeError(f"Subject.{name} is immutable")
+        object.__setattr__(self, name, value)
 
     def __post_init__(self) -> None:
-        _require_text(self.external_id, "external_id")
+        self.title = self.title.strip()
+        _require_text(self.title, "title")
         if not SLUG_PATTERN.fullmatch(self.slug):
             raise DomainError("slug must contain lowercase alphanumeric segments")
+        if self.version < 1:
+            raise DomainError("version must be positive")
         _require_aware(self.created_at, "created_at")
+        _require_aware(self.updated_at, "updated_at")
+
+    def update_metadata(self, *, title: str, tlp: TLP) -> None:
+        title = title.strip()
+        _require_text(title, "title")
+        ensure_tlp_not_downgraded(self.tlp, tlp)
+        self.title = title
+        self.tlp = tlp
+        self.version += 1
+        self.updated_at = utc_now()
 
     def restrict_tlp(self, requested: TLP) -> None:
         ensure_tlp_not_downgraded(self.tlp, requested)
+        if requested == self.tlp:
+            return
         self.tlp = requested
+        self.version += 1
+        self.updated_at = utc_now()
 
 
 @dataclass(slots=True, kw_only=True)

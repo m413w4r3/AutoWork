@@ -10,6 +10,7 @@ from uuid import UUID
 
 from cti_app.application.discovery_identity import normalize
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
+from cti_app.application.subjects import SubjectService
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.discovery import (
     CandidateTopic,
@@ -471,12 +472,11 @@ class EditorialGroupingService:
         batch_confirmation: bool = False,
     ) -> Subject:
         # All selection modes share this transaction and mutation sequence.
-        subject = Subject(
-            external_id=f"edition:{group.edition_id}:group:{group.id}",
-            slug=_subject_slug(group.title, group.id),
-            tlp=edition.tlp,
+        subject = await SubjectService(self._uow_factory).materialize_in_uow(
+            uow,
+            edition_id=group.edition_id,
+            title=group.title,
         )
-        await uow.subjects.add(subject)
         group.select(subject.id)
         await uow.editorial_groups.save(group)
         payload: dict[str, object] = {
@@ -563,8 +563,3 @@ def _editorial_score(candidate: CandidateTopic) -> EditorialScore:
             "source_quality": "Rôles de sources provisoires issus des citations visibles.",
         },
     )
-
-
-def _subject_slug(title: str, group_id: UUID) -> str:
-    base = "-".join(normalize(title).split())[:100].strip("-") or "subject"
-    return f"{base}-{group_id.hex[:8]}"

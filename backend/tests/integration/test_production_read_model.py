@@ -56,10 +56,13 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
     subjects = [
         SubjectRow(
             id=subject_id,
-            external_id=f"BATCH-READ-{index}-{uuid4().hex}",
+            edition_id=edition_id,
+            title=f"Subject title {index}",
             slug=f"batch-read-{index}-{uuid4().hex}",
             tlp=TLP.AMBER.value,
+            version=1,
             created_at=now,
+            updated_at=now,
         )
         for index, subject_id in enumerate(subject_ids, 1)
     ]
@@ -238,7 +241,7 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
     assert [item.title for item in result] == [
         "Snapshot title two",
         "Snapshot title one",
-        "Editorial title 3",
+        "Subject title 3",
     ]
     assert [item.pipeline_generation for item in result] == [2, 4, 3]
     assert [item.auto_recovery_count for item in result] == [1, 0, 0]

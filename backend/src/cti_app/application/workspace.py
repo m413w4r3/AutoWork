@@ -105,7 +105,8 @@ class SubjectWorkspaceMaterializer:
         manifest = {
             "subject": {
                 "id": str(subject.id),
-                "external_id": subject.external_id,
+                "edition_id": str(subject.edition_id),
+                "title": subject.title,
                 "slug": subject.slug,
                 "tlp": subject.tlp.value,
             },

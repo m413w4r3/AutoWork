@@ -28,6 +28,7 @@ from cti_app.domain.editorial import (
     GroupingConfidence,
     GroupingOutcome,
 )
+from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
     EditionProductionBatchItem,
     SubjectProductionRun,
@@ -88,6 +89,14 @@ class _Groups:
         return self.group if self.group.subject_id == subject_id else None
 
 
+class _Subjects:
+    def __init__(self, subject: Subject) -> None:
+        self.subject = subject
+
+    async def get(self, subject_id: UUID) -> Subject | None:
+        return self.subject if self.subject.id == subject_id else None
+
+
 class _Editions:
     def __init__(self, edition_id: UUID, state: EditionStatus = EditionStatus.OPEN) -> None:
         self.edition_id = edition_id
@@ -139,6 +148,7 @@ class _Uow:
         runs: _Runs,
         snapshots: _Snapshots,
         groups: _Groups,
+        subjects: _Subjects,
         editions: _Editions,
         batches: _Batches,
         items: _BatchItems,
@@ -146,6 +156,7 @@ class _Uow:
         self.subject_production_runs = runs
         self.production_input_snapshots = snapshots
         self.editorial_groups = groups
+        self.subjects = subjects
         self.editions = editions
         self.discovery_batches = batches
         self.edition_production_batch_items = items
@@ -315,10 +326,18 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     runs = _Runs(old_run)
     snapshots = _Snapshots()
     editions = _Editions(edition_id, state=edition_state)
+    subject = Subject(
+        id=subject_id,
+        edition_id=edition_id,
+        title="Blocked report",
+        slug=f"blocked-report-{subject_id.hex[:8]}",
+        tlp=TLP.AMBER,
+    )
     uow = _Uow(
         runs,
         snapshots,
         _Groups(group),
+        _Subjects(subject),
         editions,
         _Batches([old_batch, replacement_batch]),
         _BatchItems(item),
