@@ -89,8 +89,10 @@ class _Groups:
 
 
 class _Editions:
-    def __init__(self, edition_id: UUID) -> None:
+    def __init__(self, edition_id: UUID, state: EditionStatus = EditionStatus.OPEN) -> None:
         self.edition_id = edition_id
+        self.state = state
+        self.version = 1
 
     async def get(self, edition_id: UUID) -> Any | None:
         if edition_id != self.edition_id:
@@ -101,11 +103,15 @@ class _Editions:
             (),
             {
                 "id": edition_id,
-                "state": EditionStatus.OPEN,
+                "state": self.state,
+                "version": self.version,
                 "period_start": today - timedelta(days=7),
                 "period_end": today,
             },
         )()
+
+    async def get_for_update(self, edition_id: UUID) -> Any | None:
+        return await self.get(edition_id)
 
 
 class _Batches:
@@ -229,7 +235,19 @@ def _candidate(title: str, url: str) -> CandidateTopic:
 
 
 @pytest.mark.asyncio
-async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_batch() -> None:
+@pytest.mark.parametrize(
+    ("edition_state", "archive_before_repoint"),
+    (
+        (EditionStatus.OPEN, False),
+        (EditionStatus.ARCHIVED, False),
+        (EditionStatus.OPEN, True),
+    ),
+)
+async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_batch(
+    edition_state: EditionStatus,
+    archive_before_repoint: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
     old_run = SubjectProductionRun(
@@ -296,14 +314,27 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     )
     runs = _Runs(old_run)
     snapshots = _Snapshots()
+    editions = _Editions(edition_id, state=edition_state)
     uow = _Uow(
         runs,
         snapshots,
         _Groups(group),
-        _Editions(edition_id),
+        editions,
         _Batches([old_batch, replacement_batch]),
         _BatchItems(item),
     )
+    if archive_before_repoint:
+        original_get_for_update = editions.get_for_update
+        calls = 0
+
+        async def archive_on_repoint(locked_edition_id: UUID) -> Any | None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                editions.state = EditionStatus.ARCHIVED
+            return await original_get_for_update(locked_edition_id)
+
+        monkeypatch.setattr(editions, "get_for_update", archive_on_repoint)
     factory = _Factory(uow)
     jobs = _Jobs()
     dispatcher = _Dispatcher()
@@ -321,6 +352,25 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
             f"/api/production/subjects/{subject_id}/production/restart-with-new-sources"
         )
 
+    if edition_state is EditionStatus.ARCHIVED:
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "edition_archived"
+        assert len(runs.items) == 1
+        assert item.production_run_id == old_run.id
+        assert jobs.submitted == []
+        assert dispatcher.dispatched == []
+        return
+
+    if archive_before_repoint:
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "edition_archived"
+        assert len(runs.items) == 2
+        assert item.production_run_id == old_run.id
+        assert jobs.submitted == []
+        assert dispatcher.dispatched == []
+        assert editions.state is EditionStatus.ARCHIVED
+        return
+
     assert response.status_code == 200
     body = response.json()
     new_run_id = UUID(body["run_id"])
@@ -336,3 +386,5 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     assert item.auto_recovery_count == 0
     assert jobs.submitted[0]["kind"] == "production.subject.sources"
     assert dispatcher.dispatched == jobs.ids
+    assert editions.state is EditionStatus.OPEN
+    assert editions.version == 1

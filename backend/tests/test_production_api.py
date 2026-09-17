@@ -7,6 +7,7 @@ offer a start button based on a 404, so these endpoints must answer 404 — neve
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import hashlib
 import json
@@ -735,6 +736,100 @@ async def test_start_subject_production_returns_the_run_actually_started(
     sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
     assert len(sources_jobs) == 1
     assert sources_jobs[0]["max_attempts"] == 3
+    edition = await uow.editions.get(edition_id)
+    assert edition.state is EditionStatus.OPEN
+    assert edition.version == 1
+
+
+async def test_start_subject_production_rejects_archived_edition_without_mutation(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Archived", subject_id))
+    edition = await uow.editions.get(edition_id)
+    edition.state = EditionStatus.ARCHIVED
+    version = edition.version
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "edition_archived"
+    assert uow.subject_production_runs.items == {}
+    assert production_app.state.job_service.submitted == []
+    assert production_app.state.job_dispatcher.dispatched == []
+    assert edition.state is EditionStatus.ARCHIVED
+    assert edition.version == version
+
+
+async def test_archive_winning_final_standalone_dispatch_fence_submits_nothing(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Race", subject_id))
+    edition = await uow.editions.get(edition_id)
+    final_fence_entered = asyncio.Event()
+    archive_committed = asyncio.Event()
+    original_get_for_update = uow.editions.get_for_update
+    calls = 0
+
+    async def gated_get_for_update(locked_edition_id: UUID) -> _Edition:
+        nonlocal calls
+        calls += 1
+        locked = await original_get_for_update(locked_edition_id)
+        if calls == 3:
+            final_fence_entered.set()
+            await archive_committed.wait()
+        return locked
+
+    monkeypatch.setattr(uow.editions, "get_for_update", gated_get_for_update)
+
+    async def archive_after_final_fence_entry() -> None:
+        await final_fence_entered.wait()
+        edition.state = EditionStatus.ARCHIVED
+        archive_committed.set()
+
+    archive_task = asyncio.create_task(archive_after_final_fence_entry())
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    await archive_task
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "edition_archived"
+    assert production_app.state.job_service.submitted == []
+    assert production_app.state.job_dispatcher.dispatched == []
+    assert edition.state is EditionStatus.ARCHIVED
+
+
+async def test_standalone_cancellation_exposes_archived_conflict_without_mutation(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Cancel archived", subject_id))
+
+    started = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    assert started.status_code == 200, started.text
+    run_id = UUID(started.json()["run_id"])
+    edition = await uow.editions.get(edition_id)
+    edition.state = EditionStatus.ARCHIVED
+    version = edition.version
+
+    response = await api.post(f"/api/subjects/{subject_id}/production/cancel")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "edition_archived"
+    assert uow.subject_production_runs.items[run_id].status is SubjectProductionStatus.RUNNING
+    assert edition.state is EditionStatus.ARCHIVED
+    assert edition.version == version
+    assert len(production_app.state.job_service.submitted) == 1
 
 
 async def test_start_subject_production_rejects_non_selected_subject(

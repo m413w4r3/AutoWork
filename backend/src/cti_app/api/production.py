@@ -82,6 +82,7 @@ from cti_app.application.subject_production import (
     StaleEditionProductionBatchError,
     SubjectProductionService,
 )
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -776,37 +777,50 @@ async def _start_production_run(
     # the stale QUEUED one returned by create_run.
     run = await service.start_run(run.id)
 
-    if not await _production_run_can_dispatch(uow_factory, run.id):
-        return run, None
+    # This is the final standalone dispatch fence.  Keep the Edition row lock
+    # until the job has been handed to the dispatcher: an archive that wins
+    # first is rejected here, while an archive racing behind this fence waits.
+    async with uow_factory() as uow:
+        edition = await uow.editions.get_for_update(run.edition_id)
+        if edition is None:
+            raise ValueError("edition_not_found")
+        if edition.state is EditionStatus.ARCHIVED:
+            raise ValueError("edition_archived")
 
-    # The idempotency key makes a concurrent duplicate POST reuse this job.
-    parameters = ProductionStageParameters(
-        run_id=run.id,
-        expected_stage=SubjectProductionStage.SOURCES.value,
-        pipeline_generation=run.pipeline_generation,
-    )
-    try:
-        job = await jobs.submit(
-            kind="production.subject.sources",
-            aggregate_type="subject",
-            aggregate_id=run.subject_id,
-            idempotency_key=production_stage_idempotency_key(run, SubjectProductionStage.SOURCES),
-            correlation_id=get_correlation_id(),
-            input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-            actor_id=actor_id,
+        latest = await uow.subject_production_runs.get_for_update(run.id)
+        if latest is None:
+            return run, None
+        if latest.edition_id != edition.id:
+            raise ValueError("production_run_edition_changed")
+        if latest.status is not SubjectProductionStatus.RUNNING:
+            await uow.commit()
+            return latest, None
+
+        # The idempotency key makes a concurrent duplicate POST reuse this job.
+        parameters = ProductionStageParameters(
+            run_id=latest.id,
+            expected_stage=SubjectProductionStage.SOURCES.value,
+            pipeline_generation=latest.pipeline_generation,
         )
-    except DuplicateJobError as exc:
-        return run, exc.existing_job_id
-    if not await _production_run_can_dispatch(uow_factory, run.id):
-        await _cancel_non_terminal_run_jobs(
-            jobs,
-            [(run.id, run.subject_id)],
-            actor_id=actor_id,
-        )
-        return run, job.id
-    await dispatcher.dispatch(job.id)
-    return run, job.id
+        try:
+            job = await jobs.submit(
+                kind="production.subject.sources",
+                aggregate_type="subject",
+                aggregate_id=latest.subject_id,
+                idempotency_key=production_stage_idempotency_key(
+                    latest, SubjectProductionStage.SOURCES
+                ),
+                correlation_id=get_correlation_id(),
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            await uow.commit()
+            return latest, exc.existing_job_id
+        await dispatcher.dispatch(job.id)
+        await uow.commit()
+        return latest, job.id
 
 
 async def _create_and_start_run(
@@ -850,6 +864,9 @@ async def _production_run_can_dispatch(
     async with uow_factory() as uow:
         run = await uow.subject_production_runs.get(run_id)
         if run is None or run.status is not SubjectProductionStatus.RUNNING:
+            return False
+        edition = await uow.editions.get(run.edition_id)
+        if edition is None or edition.state is EditionStatus.ARCHIVED:
             return False
         if batch_id is None:
             return True
@@ -1185,6 +1202,11 @@ async def _cancel_production_run(
             detail=f"No production run found for run {run_id}",
         ) from exc
     except ValueError as exc:
+        if str(exc) == "edition_archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "edition_archived"},
+            ) from exc
         if str(exc) != "production_run_not_cancellable":
             raise
         raise HTTPException(
@@ -1274,6 +1296,11 @@ async def start_subject_production(
             actor_id=await _actor_id(request),
         )
     except ValueError as e:
+        if str(e) == "edition_archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "edition_archived"},
+            ) from e
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(e),
@@ -1318,6 +1345,11 @@ async def restart_subject_with_new_sources(
             edition_id=edition_id,
         )
     except ValueError as exc:
+        if str(exc) == "edition_archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "edition_archived"},
+            ) from exc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
@@ -1337,17 +1369,39 @@ async def restart_subject_with_new_sources(
             },
         )
 
-    async with uow_factory() as uow:
-        await _repoint_batch_item(uow, replaced_run_id, run.id)
-        await uow.commit()
+    try:
+        async with uow_factory() as uow:
+            edition = await uow.editions.get_for_update(edition_id)
+            if edition is None:
+                raise ValueError("edition_not_found")
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("edition_archived")
+            await _repoint_batch_item(uow, replaced_run_id, run.id)
+            await uow.commit()
+    except ValueError as exc:
+        if str(exc) == "edition_archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "edition_archived"},
+            ) from exc
+        raise
 
-    await _start_production_run(
-        uow_factory,
-        jobs,
-        dispatcher,
-        run=run,
-        actor_id=actor_id,
-    )
+    try:
+        await _start_production_run(
+            uow_factory,
+            jobs,
+            dispatcher,
+            run=run,
+            actor_id=actor_id,
+        )
+    except ValueError as exc:
+        if str(exc) == "edition_archived":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={"code": "edition_archived"},
+            ) from exc
+        raise
+
     return {"run_id": str(run.id), "replaced_run_id": str(replaced_run_id)}
 
 

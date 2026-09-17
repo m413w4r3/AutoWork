@@ -498,6 +498,8 @@ async def test_cancellation_only_writes_a_status() -> None:
     assert world.artifact_identities() == before
     assert world.uow.production_artifacts.staled == []
     assert world.run.extraction_progress == _progress("S1")
+    assert world.uow.editions.edition.state is EditionStatus.OPEN
+    assert world.uow.editions.edition.version == 1
 
 
 async def test_resume_opens_a_new_generation_without_invalidating_anything() -> None:
@@ -740,11 +742,25 @@ async def test_resume_is_refused_on_a_cancelled_batch() -> None:
 
 
 async def test_resume_is_refused_once_the_edition_is_archived() -> None:
-    world = _World(stage=SubjectProductionStage.SYNTHESIS, edition_state=EditionStatus.ARCHIVED)
+    world = _World(stage=SubjectProductionStage.SYNTHESIS, edition_state=EditionStatus.OPEN)
     await world.service().cancel_run_with_result(world.run.id)
+    world.uow.editions.edition.state = EditionStatus.ARCHIVED
 
     with pytest.raises(ValueError, match="edition_archived"):
         await world.service().resume_cancelled_run(world.run.id)
+
+
+async def test_standalone_cancellation_is_refused_once_the_edition_is_archived() -> None:
+    world = _World(stage=SubjectProductionStage.SOURCES, edition_state=EditionStatus.ARCHIVED)
+    world.uow.edition_production_batch_items.items.clear()
+
+    with pytest.raises(ValueError, match="edition_archived"):
+        await world.service().cancel_run_with_result(world.run.id)
+
+    assert world.run.status is SubjectProductionStatus.RUNNING
+    assert world.uow.subject_production_runs.saves == 0
+    assert world.uow.editions.edition.state is EditionStatus.ARCHIVED
+    assert world.uow.editions.edition.version == 1
 
 
 async def test_resume_is_refused_on_a_run_that_was_not_cancelled() -> None:

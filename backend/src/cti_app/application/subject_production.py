@@ -105,6 +105,16 @@ class SubjectProductionCancellationResult:
     changed: bool
 
 
+async def _lock_open_edition(uow: ProductionUnitOfWork, edition_id: UUID) -> Edition:
+    """Serialize a production mutation against the edition archive use case."""
+    edition = await uow.editions.get_for_update(edition_id)
+    if edition is None:
+        raise ValueError("edition_not_found")
+    if edition.state is EditionStatus.ARCHIVED:
+        raise ValueError("edition_archived")
+    return edition
+
+
 class EditionProductionBatchNotFoundError(LookupError):
     pass
 
@@ -286,6 +296,8 @@ class SubjectProductionService:
         """
         try:
             async with self._uow_factory() as uow:
+                await _lock_open_edition(uow, edition_id)
+
                 lock_creation = getattr(
                     uow.subject_production_runs, "lock_creation_for_subject", None
                 )
@@ -331,9 +343,16 @@ class SubjectProductionService:
 
     async def start_run(self, run_id: UUID) -> SubjectProductionRun:
         async with self._uow_factory() as uow:
+            initial_run = await uow.subject_production_runs.get(run_id)
+            if not initial_run:
+                raise ValueError(f"Production run {run_id} not found")
+            await _lock_open_edition(uow, initial_run.edition_id)
+
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
                 raise ValueError(f"Production run {run_id} not found")
+            if run.edition_id != initial_run.edition_id:
+                raise ValueError("production_run_edition_changed")
 
             if run.status is SubjectProductionStatus.CANCELLED:
                 await uow.commit()
@@ -408,9 +427,16 @@ class SubjectProductionService:
 
     async def cancel_run_with_result(self, run_id: UUID) -> SubjectProductionCancellationResult:
         async with self._uow_factory() as uow:
+            initial_run = await uow.subject_production_runs.get(run_id)
+            if not initial_run:
+                raise ProductionRunNotFoundError(str(run_id))
+            await _lock_open_edition(uow, initial_run.edition_id)
+
             run = await uow.subject_production_runs.get_for_update(run_id)
             if not run:
                 raise ProductionRunNotFoundError(str(run_id))
+            if run.edition_id != initial_run.edition_id:
+                raise ValueError("production_run_edition_changed")
 
             was_cancelled = run.status is SubjectProductionStatus.CANCELLED
             run.mark_cancelled(now=datetime.now(UTC))
