@@ -85,23 +85,7 @@ from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRun, Mod
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
-_USED_EDITION_CODES: set[str] = set()
-
-
-def reserve_edition_code() -> str:
-    """Allocate an edition country code unused by any scenario in this process.
-
-    The integration database is session-scoped and shared by every business
-    test, and editions are unique on (country_code, period_start, period_end).
-    All scenarios use the same period, so codes must be allocated here rather
-    than picked independently by each test module.
-    """
-    while True:
-        edition_token = uuid4().int
-        code = "".join(chr(65 + (edition_token // (26**offset)) % 26) for offset in (0, 1))
-        if code not in _USED_EDITION_CODES:
-            _USED_EDITION_CODES.add(code)
-            return code
+from ..edition_codes import reserve_edition_code
 
 
 class DeterministicSourceTransport(HttpTransport):

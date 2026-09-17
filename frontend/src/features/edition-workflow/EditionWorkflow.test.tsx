@@ -345,7 +345,7 @@ describe("rendu strict des états Edition", () => {
     expect(screen.queryByText("Campagne A")).not.toBeInTheDocument();
   });
 
-  it("ASSEMBLING charge le release et affiche l’état d’assemblage", async () => {
+  it("assemblage en attente : charge le release et affiche l’état d’assemblage", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
     renderWorkflow(editionWith("open"), "publication");
     expect(
@@ -356,7 +356,7 @@ describe("rendu strict des états Edition", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("PUBLISHED affiche son état sans action si le DOCX n’est pas disponible", async () => {
+  it("assemblage réussi : affiche le bulletin publié sans action si le DOCX est indisponible", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -375,7 +375,7 @@ describe("rendu strict des états Edition", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("ARCHIVED affiche son état en lecture seule", async () => {
+  it("édition archivée : affiche son état en lecture seule", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(Response.json(release)));
     renderWorkflow(editionWith("archived"), "publication");
     expect(

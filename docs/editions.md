@@ -2,10 +2,9 @@
 
 ## Modèle canonique
 
-Une édition est identifiée par un UUID et par la clé métier unique
-`(country_code, period_start, period_end)`. La période couvre obligatoirement un mois civil
-complet. PostgreSQL conserve l'état canonique ; l'interface ne déduit ni ne force une
-transition.
+Une édition est un **conteneur mensuel durable**, pas une machine d'état éditoriale. Elle est
+identifiée par un UUID et par la clé métier unique `(country_code, period_start, period_end)`.
+La période couvre obligatoirement un mois civil complet. PostgreSQL conserve l'état canonique.
 
 | Champ | Règle principale |
 | --- | --- |
@@ -13,43 +12,47 @@ transition.
 | `period_start`, `period_end` | premier et dernier jour du même mois |
 | `tlp` | `CLEAR` à `RED`, sans déclassement |
 | `languages` | liste non vide de codes BCP47 simples et uniques |
-| `target_articles` | objectif du nombre total d’articles, borné de 0 à 120 |
-| `previous_edition_id` | référence optionnelle à une édition existante |
-| `source_profile` | identifiant de configuration, pas un contenu de source |
-| `status`, `version` | état de workflow et verrou de concurrence optimiste |
+| `state` | `open` ou `archived` |
+| `version` | verrou de concurrence optimiste |
 
-Il n'existe aucun endpoint de suppression. L'archivage est une transition de workflow. Les
-éditions publiées ou archivées ne sont plus modifiables.
+Il n'existe aucun endpoint de suppression.
 
-## Machine d'état
+## Cycle de vie
 
-Le parcours nominal est :
+Le cycle de vie est administratif et minimal :
 
-`draft → discovery → selection → production → review → assembling → published → archived`
+`open → archived`
 
-Une revue peut revenir en production, et l'assemblage peut revenir en revue. L'archivage est
-possible depuis chaque état non archivé. L'API retourne `allowed_transitions` et le frontend
-n'affiche que ces actions, mais le domaine et la transaction SQL restent l'autorité finale.
-La progression globale affichée est une projection déterministe du statut, pas un second état.
+Une édition `open` accepte de nouvelles opérations. `archived` est terminal : les métadonnées ne
+sont plus modifiables et aucune réouverture n'est prévue. L'archivage est un cas d'usage
+explicite, jamais une conséquence automatique d'une publication ou d'un export.
+
+L'édition ne porte **aucune** progression de pipeline. La découverte, la sélection, la
+production, la revue et la publication peuvent survenir plusieurs fois pendant la vie d'une même
+édition ; leur état appartient aux entités spécialisées (`DiscoveryRun`, `Subject`,
+`ProductionRun`, snapshots de publication) et non au conteneur. Quand une opération doit savoir
+si elle est permise au niveau de l'édition, la seule règle est `open` / `archived`.
 
 ## API et concurrence
 
-- `POST /api/editions` crée une édition ;
-- `GET /api/editions` pagine et filtre par code pays, mois et statut ;
-- `GET /api/editions/{id}` retourne l'édition et ses actions autorisées ;
+- `POST /api/editions` crée une édition, toujours `open` ;
+- `GET /api/editions` pagine et filtre par code pays, mois et `state` ;
+- `GET /api/editions/{id}` retourne l'édition ;
 - `PUT /api/editions/{id}` met à jour les métadonnées avec `version` attendue ;
-- `POST /api/editions/{id}/transitions` applique une transition avec `version` attendue ;
+- `POST /api/editions/{id}/archive` archive l'édition avec `version` attendue ;
 - `GET /api/editions/{id}/audit` expose le journal d'audit.
 
-Une version périmée produit HTTP 409. L'unicité métier est vérifiée par le service et protégée
-par une contrainte PostgreSQL. Les erreurs publiques utilisent un code stable et un message
+Une version périmée produit HTTP 409 (`stale_edition_version`). Une modification d'une édition
+archivée produit HTTP 409 (`invalid_edition_action`). L'unicité métier est vérifiée par le
+service et protégée par une contrainte PostgreSQL (`uq_editions_country_period`), qui produit
+HTTP 409 (`duplicate_edition`). Les erreurs publiques utilisent un code stable et un message
 exploitable sans exposer de détail interne.
 
 ## Identité et audit
 
 `IdentityProvider` isole la provenance de l'acteur. En développement,
 `LocalIdentityProvider` fournit `dev-analyst`; il sera remplaçable par l'authentification de
-production. Création, mise à jour et transition enregistrent toujours cet `actor_id`, le
+production. Création, mise à jour et archivage enregistrent toujours cet `actor_id`, le
 `correlation_id`, l'avant et l'après dans `edition_audit_events` au sein de la même Unit of
 Work que la modification.
 

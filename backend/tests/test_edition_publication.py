@@ -69,8 +69,7 @@ DECISION_B = UUID("88888888-8888-4888-8888-888888888888")
 DECISION_C = UUID("88888888-8888-4888-8888-888888888889")
 
 
-def _edition(*, target_articles: int = 3) -> Edition:
-    del target_articles
+def _edition() -> Edition:
     return Edition(
         id=EDITION_ID,
         country="France",
@@ -609,7 +608,7 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
@@ -663,7 +662,7 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     first = await publication.accept(EDITION_ID, actor_id="analyst")
@@ -701,7 +700,7 @@ async def test_changed_review_input_supersedes_pending_snapshot_without_version_
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
@@ -745,7 +744,7 @@ async def test_archived_edition_blocks_accept_and_pending_snapshot_retry() -> No
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     accepted = await publication.accept(EDITION_ID, actor_id="analyst")
     uow.editions.edition.archive()
@@ -787,7 +786,7 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
         is_publication_ioc=True,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     service = EditionPublicationService(
         lambda: uow,
         blobs,
@@ -832,7 +831,7 @@ async def test_preview_is_read_only_and_uses_the_same_edition_document_as_final(
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
     before = uow.editions.edition.snapshot()
 
@@ -869,7 +868,7 @@ async def test_preview_becomes_stale_when_the_current_publication_artifact_chang
         effective_decision=None,
     )
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=1), [row], blobs)
+    uow = _Uow(_edition(), [row], blobs)
     preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
     previous = await preview_service.preview(EDITION_ID)
 
@@ -1197,7 +1196,7 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
         )
     ]
     blobs = _BlobStore()
-    uow = _Uow(_edition(target_articles=2), rows, blobs)
+    uow = _Uow(_edition(), rows, blobs)
     for artifact_id, title in ((ARTIFACT_A, "Article A"), (ARTIFACT_B, "Article B")):
         blob_id = uow.production_artifacts.artifacts[artifact_id].canonical_blob_id
         assert blob_id is not None

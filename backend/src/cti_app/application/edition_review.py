@@ -917,10 +917,8 @@ class EditionReviewService:
     def _require_review(edition: object, edition_id: UUID) -> None:
         if edition is None:
             raise EditionReviewNotFoundError(str(edition_id))
-        if getattr(edition, "state", None) is EditionStatus.ARCHIVED:
-            raise EditionReviewStatusError("edition_archived")
         if getattr(edition, "state", None) is not EditionStatus.OPEN:
-            raise EditionReviewStatusError("edition_must_be_open")
+            raise EditionReviewStatusError("edition_archived")
 
     @staticmethod
     def _require_readable(edition: object, edition_id: UUID) -> None:

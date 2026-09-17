@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, date, datetime
-from itertools import product
-from string import ascii_uppercase
 from uuid import uuid4
 
 import pytest
@@ -34,10 +32,11 @@ from cti_app.infrastructure.database.models.invariants import (
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 
+from .edition_codes import reserve_edition_code
+
 pytestmark = pytest.mark.integration
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
-_COUNTRY_CODES = iter("".join(pair) for pair in product(ascii_uppercase, repeat=2))
 
 
 class AlwaysBanal:
@@ -48,7 +47,7 @@ class AlwaysBanal:
 async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigation:
     edition = Edition(
         country=f"P09 {suffix}",
-        country_code=next(_COUNTRY_CODES),
+        country_code=reserve_edition_code(),
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
         tlp=TLP.AMBER,
