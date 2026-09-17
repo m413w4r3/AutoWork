@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("Édition : production séquentielle de deux articles, revue et DOCX", async ({
+test("Édition : production séquentielle de deux sujets, revue et DOCX", async ({
   page,
 }) => {
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -369,6 +369,34 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
       });
       return;
     }
+    if (path === `/api/subjects/${subjectA}`) {
+      await route.fulfill({
+        json: {
+          id: subjectA,
+          edition_id: editionId,
+          title: "Article A",
+          tlp: "AMBER",
+          state: "open",
+          created_at: "2026-08-29T00:00:00Z",
+          updated_at: "2026-08-29T00:00:00Z",
+        },
+      });
+      return;
+    }
+    if (path === `/api/subjects/${subjectB}`) {
+      await route.fulfill({
+        json: {
+          id: subjectB,
+          edition_id: editionId,
+          title: "Article B",
+          tlp: "AMBER",
+          state: "open",
+          created_at: "2026-08-29T00:00:00Z",
+          updated_at: "2026-08-29T00:00:00Z",
+        },
+      });
+      return;
+    }
     const subjectMatch = path.match(/^\/api\/subjects\/([^/]+)\/content$/);
     if (subjectMatch) {
       openedSubjects.push(subjectMatch[1]);
@@ -385,13 +413,13 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
     await route.fulfill({ status: 404, json: {} });
   });
 
-  await page.goto(`/editions/${editionId}`);
+  await page.goto(`/editions/${editionId}/selection`);
   await expect(
-    page.getByRole("heading", { name: "2 articles éligibles" }),
+    page.getByRole("heading", { name: "2 sujets éligibles" }),
   ).toBeVisible();
   await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Sélectionnez au moins un article" }),
+    page.getByRole("button", { name: "Sélectionnez au moins un sujet" }),
   ).toBeDisabled();
 
   // The real operator gesture: check A and B explicitly. Nothing is
@@ -401,12 +429,13 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   await expect(page.getByText("2 sélectionnés pour ce lot")).toBeVisible();
 
   await expect(
-    page.getByRole("button", { name: "Lancer la production de 2 articles" }),
+    page.getByRole("button", { name: "Lancer la production de 2 sujets" }),
   ).toBeEnabled();
   await page
-    .getByRole("button", { name: "Lancer la production de 2 articles" })
+    .getByRole("button", { name: "Lancer la production de 2 sujets" })
     .click();
 
+  await expect(page).toHaveURL(`/editions/${editionId}/production`);
   await expect
     .poll(() => productionPostBody)
     .toEqual({
@@ -414,7 +443,7 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
     });
 
   await expect(
-    page.getByRole("heading", { name: "0 / 2 articles traités" }),
+    page.getByRole("heading", { name: "0 / 2 sujets traités" }),
   ).toBeVisible();
   await expect(page.getByText("Article A")).toBeVisible();
   await expect(page.getByText("Article B")).toBeVisible();
@@ -422,16 +451,16 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   await expect(page.getByText("En attente")).toBeVisible();
 
   await expect(
-    page.getByRole("heading", { name: "1 / 2 articles traités" }),
+    page.getByRole("heading", { name: "1 / 2 sujets traités" }),
   ).toBeVisible();
   await expect(page.getByText("Prêt", { exact: true })).toBeVisible();
   await expect(page.getByText("En cours").first()).toBeVisible();
 
   await expect(
-    page.getByRole("heading", { name: "2 / 2 articles traités" }),
+    page.getByRole("heading", { name: "2 / 2 sujets traités" }),
   ).toBeVisible();
-  await page.reload();
-  await page.getByRole("link", { name: "Publication" }).click();
+  await page.getByRole("link", { name: "Revue" }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/review`);
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),
   ).toBeVisible();
@@ -455,6 +484,8 @@ test("Édition : production séquentielle de deux articles, revue et DOCX", asyn
   expect(openedSubjects).toEqual([subjectA, subjectB]);
 
   await page.getByRole("button", { name: "Accepter la production" }).click();
+  await page.getByRole("link", { name: "Publication" }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/publication`);
   await expect(
     page.getByRole("heading", { name: "Manifest figé" }),
   ).toBeVisible();

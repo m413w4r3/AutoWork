@@ -7,6 +7,16 @@ import { SubjectWorkbench } from "./SubjectWorkbench";
 import { withProductionNotStarted } from "../test-utils/fetchStubs";
 
 const subjectId = "30e5b0b8-2dba-48c3-81ca-9eaed5c22c62";
+const canonicalSubject = {
+  id: subjectId,
+  edition_id: "edition-canonique",
+  title: "Sujet canonique ExampleRAT",
+  slug: "sujet-canonique-exampl-rat",
+  tlp: "AMBER",
+  version: 1,
+  created_at: "2026-08-10T10:00:00Z",
+  updated_at: "2026-08-10T10:00:00Z",
+};
 const workbench = {
   subject_id: subjectId,
   sources: [
@@ -92,6 +102,23 @@ function requestUrl(input: RequestInfo | URL): string {
   return input.url;
 }
 
+type FetchHandler = (
+  input: RequestInfo | URL,
+  init?: RequestInit,
+) => Response | Promise<Response>;
+
+function withCanonicalSubject(fallback: FetchHandler): FetchHandler {
+  return (input, init) => {
+    if (
+      requestUrl(input) === `/api/subjects/${subjectId}` &&
+      (init?.method ?? "GET") === "GET"
+    ) {
+      return Response.json(canonicalSubject);
+    }
+    return fallback(input, init);
+  };
+}
+
 afterEach(() => {
   vi.unstubAllGlobals();
   window.history.replaceState({}, "", "/subjects/" + subjectId);
@@ -106,7 +133,11 @@ describe("SubjectWorkbench", () => {
     );
     vi.stubGlobal(
       "fetch",
-      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+      vi.fn(
+        withProductionNotStarted(
+          withCanonicalSubject(() => Response.json(workbench)),
+        ),
+      ),
     );
     renderWorkbench();
 
@@ -118,10 +149,23 @@ describe("SubjectWorkbench", () => {
   it("affiche les détails archivés et conserve la relation LLM provisoire", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+      vi.fn(
+        withProductionNotStarted(
+          withCanonicalSubject(() => Response.json(workbench)),
+        ),
+      ),
     );
     renderWorkbench();
 
+    expect(
+      await screen.findByRole("heading", {
+        name: "Sujet canonique ExampleRAT",
+      }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("TLP:AMBER")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "← Retour à l’édition" }),
+    ).toHaveAttribute("href", "/editions/edition-canonique");
     expect(
       await screen.findByRole("heading", {
         name: "Rapport ExampleRAT",
@@ -153,7 +197,11 @@ describe("SubjectWorkbench", () => {
   it("présente les passages surlignés et les IOC originaux et normalisés", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn(withProductionNotStarted(() => Response.json(workbench))),
+      vi.fn(
+        withProductionNotStarted(
+          withCanonicalSubject(() => Response.json(workbench)),
+        ),
+      ),
     );
     const user = userEvent.setup();
     renderWorkbench();
@@ -172,6 +220,9 @@ describe("SubjectWorkbench", () => {
 
   it("ouvre Article par défaut et charge uniquement le contenu", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      if (requestUrl(input) === `/api/subjects/${subjectId}`) {
+        return Promise.resolve(Response.json(canonicalSubject));
+      }
       expect(requestUrl(input)).toBe(`/api/subjects/${subjectId}/content`);
       return Promise.resolve(
         Response.json({
@@ -206,12 +257,19 @@ describe("SubjectWorkbench", () => {
       "aria-pressed",
       "true",
     );
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/subjects/${subjectId}`,
+      undefined,
+    );
   });
 
   it("charge IOC et sources/fichiers seulement à l’ouverture de leur onglet", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = requestUrl(input);
+      if (url === `/api/subjects/${subjectId}`) {
+        return Promise.resolve(Response.json(canonicalSubject));
+      }
       if (url.endsWith("/content")) {
         return Promise.resolve(
           Response.json({
@@ -248,7 +306,11 @@ describe("SubjectWorkbench", () => {
     const user = userEvent.setup();
     renderWorkbench();
     await screen.findByRole("heading", { name: "Article" });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/subjects/${subjectId}`,
+      undefined,
+    );
 
     await user.click(screen.getByRole("button", { name: "IOC" }));
     expect(

@@ -141,9 +141,9 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
     await route.fulfill({ status: 404, json: {} });
   });
 
-  await page.goto(`/editions/${editionId}`);
+  await page.goto(`/editions/${editionId}/selection`);
   await expect(
-    page.getByRole("heading", { name: "4 articles éligibles" }),
+    page.getByRole("heading", { name: "4 sujets éligibles" }),
   ).toBeVisible();
   await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
 
@@ -158,15 +158,16 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   ).not.toBeChecked();
 
   await page
-    .getByRole("button", { name: "Lancer la production de 2 articles" })
+    .getByRole("button", { name: "Lancer la production de 2 sujets" })
     .click();
 
+  await expect(page).toHaveURL(`/editions/${editionId}/production`);
   await expect
     .poll(() => productionPostBody)
     .toEqual({ subject_ids: [subjectB, subjectD] });
 
   await expect(
-    page.getByRole("heading", { name: "0 / 2 articles traités" }),
+    page.getByRole("heading", { name: "0 / 2 sujets traités" }),
   ).toBeVisible();
   await expect(page.getByText("Article B")).toBeVisible();
   await expect(page.getByText("Article D")).toBeVisible();

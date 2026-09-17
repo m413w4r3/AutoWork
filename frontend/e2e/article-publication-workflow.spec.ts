@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-test("Article : sélection, production, revue et publication DOCX", async ({
+test("Sujet : sélection, production, revue et publication DOCX", async ({
   page,
 }) => {
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
@@ -203,6 +203,20 @@ test("Article : sélection, production, revue et publication DOCX", async ({
       await route.fulfill({ json: release() });
       return;
     }
+    if (path === `/api/subjects/${subjectId}`) {
+      await route.fulfill({
+        json: {
+          id: subjectId,
+          edition_id: editionId,
+          title: "Campagne Iranian Proxy",
+          tlp: "AMBER",
+          state: "open",
+          created_at: "2026-08-29T00:00:00Z",
+          updated_at: "2026-08-29T00:00:00Z",
+        },
+      });
+      return;
+    }
     if (path === `/api/subjects/${subjectId}/content`) {
       await route.fulfill({
         json: {
@@ -233,27 +247,35 @@ test("Article : sélection, production, revue et publication DOCX", async ({
     await route.fulfill({ status: 404, json: {} });
   });
 
-  await page.goto(`/editions/${editionId}`);
+  await page.goto(`/editions/${editionId}/selection`);
   await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
   await page.getByRole("checkbox", { name: "Campagne Iranian Proxy" }).check();
   await expect(
-    page.getByRole("button", { name: "Lancer la production de 1 article" }),
+    page.getByRole("button", { name: "Lancer la production de 1 sujet" }),
   ).toBeEnabled();
   await page
-    .getByRole("button", { name: "Lancer la production de 1 article" })
+    .getByRole("button", { name: "Lancer la production de 1 sujet" })
     .click();
 
+  await expect(page).toHaveURL(`/editions/${editionId}/production`);
   await expect(
-    page.getByRole("heading", { name: "1 / 1 articles traités" }),
+    page.getByRole("heading", { name: "1 / 1 sujets traités" }),
   ).toBeVisible();
   await expect(page.getByText("1 prêts")).toBeVisible();
-  await page.reload();
-  await page.getByRole("link", { name: "Publication" }).click();
+  await page.getByRole("link", { name: "Revue" }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/review`);
 
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),
   ).toBeVisible();
   await page.getByRole("link", { name: "Ouvrir" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Campagne Iranian Proxy" }),
+  ).toBeVisible();
+  await expect(page.getByText("TLP:AMBER")).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Retour à l’édition" }),
+  ).toHaveAttribute("href", `/editions/${editionId}`);
   await expect(
     page.getByRole("heading", { name: "Article canonique Iranian Proxy" }),
   ).toBeVisible();
@@ -267,6 +289,8 @@ test("Article : sélection, production, revue et publication DOCX", async ({
     page.getByRole("button", { name: "Accepter la production" }),
   ).toBeEnabled();
   await page.getByRole("button", { name: "Accepter la production" }).click();
+  await page.getByRole("link", { name: "Publication" }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/publication`);
   await expect(
     page.getByRole("heading", { name: "Manifest figé" }),
   ).toBeVisible();

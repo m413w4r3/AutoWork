@@ -6,24 +6,16 @@ La recherche OpenAI peut être exécutée en arrière-plan et suivie par l’app
 
 ## Workflow cible
 
-```mermaid
-stateDiagram-v2
-    [*] --> Edition
-    Edition --> Decouverte
-    Decouverte --> Selection
-    Selection --> Breve
-    Selection --> ArticleLong
-    Breve --> Revue
-    ArticleLong --> PreAnalyse
-    PreAnalyse --> BoucleAnalyste
-    BoucleAnalyste --> Pivots
-    Pivots --> BoucleAnalyste: nouvelles preuves
-    Pivots --> Detection
-    Detection --> RedactionFinale
-    RedactionFinale --> Revue
-    Revue --> Assemblage
-    Assemblage --> Publication
-```
+Une édition est un conteneur mensuel vivant, en état canonique `OPEN` ou
+`ARCHIVED`. Elle regroupe les sujets et leurs livrables sans porter de phase
+de production courante. Plusieurs sujets peuvent donc occuper simultanément
+des `ProductionStatus` et des étapes différentes : l’avancement se lit au
+niveau de chaque sujet, sans phase de production portée par l’édition.
+
+Le Dashboard de l’édition donne la vue d’ensemble et permet d’accéder aux
+capacités indépendantes. Ces destinations de navigation ne représentent ni
+des étapes terminées ni des prochaines étapes à faire avancer dans une
+séquence.
 
 ### 1. Création de l’édition
 
@@ -310,13 +302,19 @@ L’utilisateur valide section par section, puis l’article rejoint le composit
 
 ## Écrans principaux
 
-Je viserais cinq écrans seulement pour le MVP :
+Le point d’entrée d’une édition est le Dashboard
+`/editions/{edition_id}` : il présente le conteneur mensuel, ses sujets, leurs
+statuts de production et les éléments de synthèse utiles à l’opérateur.
+Depuis ce Dashboard, les cinq destinations de capacité sont indépendantes :
 
-1. **Éditions** — pays, période et avancement.
-2. **Découverte** — candidats, doublons, sélection long/brève.
-3. **Workbench sujet** — sources, extraction, IOC, échantillons et synthèse.
-4. **Analyse et chasse** — demandes analyste, pivots, graphe et hits.
-5. **Rédaction et publication** — sections, références, détections et assemblage.
+1. `/editions/{edition_id}/discovery` — découverte des sujets, candidats et doublons.
+2. `/editions/{edition_id}/selection` — sélection éditoriale et composition du lot.
+3. `/editions/{edition_id}/production` — production des sujets et suivi des traitements.
+4. `/editions/{edition_id}/review` — revue des articles et validation éditoriale.
+5. `/editions/{edition_id}/publication` — assemblage, publication et téléchargement.
+
+Ces routes sont des destinations de navigation, et non une séquence de
+transitions d’état ou une indication de capacité terminée ou suivante.
 
 Le workbench pourrait utiliser ces onglets :
 
@@ -338,5 +336,9 @@ Le workbench pourrait utiliser ces onglets :
 
 La règle générale serait : **la machine prépare, exécute les tâches bornées et montre les preuves ; l’humain tranche tout ce qui change le sens analytique du livrable.**
 
-Techniquement, je construirais donc le backend et la machine d’état en premier, puis une interface web assez fine par-dessus. Il ne faut surtout pas faire d’une conversation OpenAI la mémoire du sujet : l’état canonique doit rester dans la base, les manifestes et les `evidence_packs`.
-
+Techniquement, je construirais donc le backend et une interface web centrée
+sur le Dashboard et les sujets. Le cycle canonique de l’édition reste
+`OPEN`/`ARCHIVED`, tandis que les statuts de production, preuves et décisions
+restent portés par chaque sujet et ses artefacts. Il ne faut surtout pas faire
+d’une conversation OpenAI la mémoire du sujet : l’état canonique doit rester
+dans la base, les manifestes et les `evidence_packs`.

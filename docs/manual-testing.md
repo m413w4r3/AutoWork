@@ -28,14 +28,16 @@ Bridge et de son extension Chrome relève de son repository autonome.
 
 ## Test manuel final — édition 2 articles
 
-Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
+Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
 éditorial A puis B.
 
-1. Dans l’interface sur `http://localhost:5173`, ouvrir une édition en phase
-   Sélection. L’édition peut contenir N articles éditorialement éligibles
+1. Dans l’interface sur `http://localhost:5173`, ouvrir le Dashboard
+   `/editions/{edition_id}`, puis naviguer vers la capacité explicite
+   `/editions/{edition_id}/selection`. L’édition peut contenir N sujets
+   éditorialement éligibles
    (par exemple les 22 de la base locale actuelle) — ce n’est pas un
    problème : le sélecteur du lot de production démarre toujours à
-   `0 sélectionné pour ce lot`, aucun article n’étant présélectionné à
+   `0 sélectionné pour ce lot`, aucun sujet n’étant présélectionné à
    l’ouverture ou au rechargement de la page.
 
    Dans le sélecteur du lot de production, cocher exactement deux sujets A et
@@ -47,39 +49,41 @@ Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
    Subject B ID = <subject-b-id>
    ```
 
-   Vérifier que le sélecteur affiche `2 sélectionnés pour ce lot` et que le
-   bouton affiche `Lancer la production de 2 articles` — jamais le nombre
-   total d’articles éligibles.
+   Vérifier que le sélecteur affiche `2 sélectionnés pour ce lot` et
+   que le bouton affiche `Lancer la production de 2 sujets` — jamais le nombre
+   total de sujets éligibles.
 
-2. Cliquer sur `Lancer la production de 2 articles`. Le premier retour doit
+2. Cliquer sur `Lancer la production de 2 sujets`. Le premier retour doit
    afficher simultanément :
 
    ```text
-   Article A = En cours
-   Article B = En attente
-   0 / 2 articles traités
+   Sujet A = En cours
+   Sujet B = En attente
+   0 / 2 sujets traités
    ```
 
    Le deuxième retour doit afficher :
 
    ```text
-   Article A = Prêt
-   Article B = En cours
-   1 / 2 articles traités
+   Sujet A = Prêt
+   Sujet B = En cours
+   1 / 2 sujets traités
    ```
 
-   Le retour terminal doit afficher les deux articles prêts et :
+   Le retour terminal doit afficher les deux sujets prêts et :
 
    ```text
-   2 / 2 articles traités
+   2 / 2 sujets traités
    ```
 
-   Puis ouvrir `Revue de publication`. Un seul article ne doit jamais être
-   déclaré terminé avant l’autre.
+   Puis naviguer explicitement vers `/editions/{edition_id}/review` (`Revue de
+   publication`). Un seul sujet ne doit jamais être déclaré terminé avant
+   l’autre.
 
-3. Dans la Review, vérifier qu’il y a exactement deux cartes : position 1 = A
-   et position 2 = B. Ouvrir A, revenir à la Review, puis ouvrir B. Les titres
-   et le contenu affichés doivent correspondre au bon sujet.
+3. Depuis `/editions/{edition_id}/review`, vérifier qu’il y a exactement deux
+   cartes : position 1 = A et position 2 = B. Ouvrir A, revenir à la Review,
+   puis ouvrir B. Les titres et le contenu affichés doivent correspondre au
+   bon sujet.
 
    Dans l’onglet `Pipeline` de chacun des deux sujets, vérifier aussi les
    quatre étapes `Références`, `Extraction`, `Synthèse` et `Assemblage` à
@@ -98,7 +102,8 @@ Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
    Les deux `run_id` et les deux `artifact_id` doivent être distincts.
 
 4. Vérifier que A et B sont inclus, puis cliquer sur `Accepter la production`.
-   Attendre `Bulletin publié`, puis vérifier la présence du lien :
+   Naviguer vers `/editions/{edition_id}/publication`, attendre `Bulletin
+   publié`, puis vérifier la présence du lien :
 
    ```text
    Télécharger le bulletin DOCX
@@ -161,15 +166,16 @@ Ce scénario vise exactement deux articles sélectionnés, dans l’ordre
 
 Le produit conserve l’édition publiée en lecture seule : une édition déjà
 publiée ne peut pas recevoir un nouveau batch. Le passage cache doit donc être
-préparé avant le batch cible, dans une édition encore en Sélection (ou dans une
+préparé avant le batch cible, dans une édition encore ouverte (ou dans une
 nouvelle édition de test si le premier passage est déjà publié).
 
 Depuis l’onglet `Pipeline` de chaque sujet, effectuer d’abord une production
 individuelle A1 puis B1 et attendre `prête` pour chacune. Cette étape crée les
 artefacts coûteux de référence.
 
-Revenir à l’édition de test, vérifier qu’A et B sont les deux sujets
-sélectionnés, puis lancer le batch cible `2 articles`. Ce nouveau batch produit
+Revenir au Dashboard de l’édition de test, naviguer vers
+`/editions/{edition_id}/selection`, vérifier qu’A et B sont les deux sujets
+sélectionnés, puis lancer le batch cible `2 sujets`. Ce nouveau batch produit
 A2 puis B2 séquentiellement et doit afficher, pour chaque article, dans l’onglet
 `Pipeline` :
 

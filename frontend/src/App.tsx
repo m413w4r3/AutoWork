@@ -1,5 +1,6 @@
 import { ProductionArtifactView } from "./components/ProductionArtifactView";
 import { SubjectWorkbench } from "./components/SubjectWorkbench";
+import type { EditionTool } from "./features/edition-tools/EditionWorkspace";
 import { EditionCreatePage } from "./pages/EditionCreatePage";
 import { EditionDetailPage } from "./pages/EditionDetailPage";
 import { EditionListPage } from "./pages/EditionListPage";
@@ -7,7 +8,9 @@ import { Link, usePathname } from "./routing";
 
 export function App() {
   const pathname = usePathname();
-  const detail = pathname.match(/^\/editions\/([^/]+)$/);
+  const detail = pathname.match(
+    /^\/editions\/([^/]+)(?:\/(discovery|selection|production|review|publication))?$/,
+  );
   const subject = pathname.match(/^\/subjects\/([^/]+)$/);
   const artifact = pathname.match(
     /^\/subjects\/([^/]+)\/production\/artifacts\/(references|extraction|synthesis|publication)$/,
@@ -32,7 +35,10 @@ export function App() {
       ) : pathname === "/editions/new" ? (
         <EditionCreatePage />
       ) : detail ? (
-        <EditionDetailPage editionId={detail[1]!} />
+        <EditionDetailPage
+          editionId={detail[1]!}
+          tool={detail[2] as EditionTool | undefined}
+        />
       ) : (
         <EditionListPage />
       )}

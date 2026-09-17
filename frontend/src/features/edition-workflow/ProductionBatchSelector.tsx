@@ -49,7 +49,7 @@ export function ProductionBatchSelector({
         </div>
       </div>
       {groups.length === 0 ? (
-        <p className="empty-state">Aucun article éligible pour le moment.</p>
+        <p className="empty-state">Aucun sujet éligible pour le moment.</p>
       ) : (
         <ul className="production-batch-selector__list">
           {groups.map((group) => (

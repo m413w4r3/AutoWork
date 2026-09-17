@@ -124,24 +124,25 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
     await route.fulfill({ status: 404, json: {} });
   });
 
-  await page.goto(`/editions/${editionId}`);
+  await page.goto(`/editions/${editionId}/production`);
   await expect(
     page.getByRole("button", {
-      name: "Arrêter et revenir à la sélection",
+      name: "Arrêter le lot de production",
     }),
   ).toBeVisible();
 
   await page
-    .getByRole("button", { name: "Arrêter et revenir à la sélection" })
+    .getByRole("button", { name: "Arrêter le lot de production" })
     .click();
 
   await page.getByRole("link", { name: "Sélection" }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/selection`);
 
   await expect(
-    page.getByRole("heading", { name: "1 article éligible" }),
+    page.getByRole("heading", { name: "1 sujet éligible" }),
   ).toBeVisible();
   await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Sélectionnez au moins un article" }),
+    page.getByRole("button", { name: "Sélectionnez au moins un sujet" }),
   ).toBeDisabled();
 });

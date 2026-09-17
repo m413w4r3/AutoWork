@@ -230,7 +230,7 @@ describe("ProductionConsole", () => {
     renderConsole(batch);
 
     expect(
-      await screen.findByRole("heading", { name: "3 / 4 articles traités" }),
+      await screen.findByRole("heading", { name: "3 / 4 sujets traités" }),
     ).toBeInTheDocument();
     expect(screen.getByText("Récupération automatique")).toBeInTheDocument();
     expect(screen.getByLabelText("Compteurs de production")).toHaveTextContent(
@@ -263,7 +263,7 @@ describe("ProductionConsole", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "Arrêter et revenir à la sélection",
+        name: "Arrêter le lot de production",
       }),
     ).toBeInTheDocument();
   });
@@ -289,7 +289,7 @@ describe("ProductionConsole", () => {
     renderConsole(batch);
 
     expect(
-      await screen.findByRole("heading", { name: "0 / 2 articles traités" }),
+      await screen.findByRole("heading", { name: "0 / 2 sujets traités" }),
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Compteurs de production")).toHaveTextContent(
       "2 annulés",
@@ -367,10 +367,10 @@ describe("ProductionConsole", () => {
     const { client, fetchMock } = renderConsole(batch);
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
-    await screen.findByRole("heading", { name: "0 / 0 articles traités" });
+    await screen.findByRole("heading", { name: "0 / 0 sujets traités" });
     expect(
       screen.queryByRole("button", {
-        name: "Arrêter et revenir à la sélection",
+        name: "Arrêter le lot de production",
       }),
     ).not.toBeInTheDocument();
     await waitFor(() =>
@@ -411,7 +411,7 @@ describe("ProductionConsole", () => {
 
     await user.click(
       await screen.findByRole("button", {
-        name: "Arrêter et revenir à la sélection",
+        name: "Arrêter le lot de production",
       }),
     );
 

@@ -166,7 +166,7 @@ export function ReviewConsole({
                       : pendingRebuildCount > 0
                         ? `${pendingRebuildCount} article${pendingRebuildCount > 1 ? "s" : ""} ${pendingRebuildCount > 1 ? "doivent" : "doit"} être reconstruit${pendingRebuildCount > 1 ? "s" : ""} avant finalisation.`
                         : canAccept
-                          ? "L’assemblage final sera activé à l’étape de publication."
+                          ? "L’assemblage final sera lancé après acceptation et suivi depuis Publication."
                           : "Résolvez ou excluez les articles bloquants."}
               </p>
             </div>

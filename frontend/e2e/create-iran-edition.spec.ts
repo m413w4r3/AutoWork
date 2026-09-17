@@ -34,6 +34,17 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
         });
         return;
       }
+      if (
+        request.method() === "GET" &&
+        new URL(request.url()).pathname ===
+          `/api/editions/${edition.id}/subjects`
+      ) {
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify([]),
+        });
+        return;
+      }
       if (request.url().endsWith(edition.id)) {
         await route.fulfill({
           contentType: "application/json",
@@ -71,6 +82,22 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
   await expect(page).toHaveURL(`/editions/${edition.id}`);
   await expect(page.getByRole("heading", { name: "Iran" })).toBeVisible();
   await expect(page.getByText("TLP:AMBER")).toBeVisible();
+  await expect(
+    page.getByText(
+      "Aucun sujet n'a encore été sélectionné pour cette édition.",
+    ),
+  ).toBeVisible();
+  for (const [label, suffix] of [
+    ["Découverte", "discovery"],
+    ["Sélection", "selection"],
+    ["Productions", "production"],
+    ["Revue", "review"],
+    ["Publication", "publication"],
+  ] as const) {
+    await expect(
+      page.getByRole("link", { name: label, exact: true }),
+    ).toHaveAttribute("href", `/editions/${edition.id}/${suffix}`);
+  }
   expect(submitted).toMatchObject({
     country: "Iran",
     country_code: "IR",

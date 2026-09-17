@@ -256,7 +256,7 @@ export function ProductionConsole({
         <div>
           <p className="eyebrow">Production</p>
           <h2 id="production-console-heading">
-            {processed} / {currentBatch.items} articles traités
+            {processed} / {currentBatch.items} sujets traités
           </h2>
         </div>
         <div className="production-phase" data-phase={currentBatch.phase}>
@@ -272,7 +272,7 @@ export function ProductionConsole({
             disabled={cancel.isPending}
             onClick={() => cancel.mutate()}
           >
-            {cancel.isPending ? "Arrêt…" : "Arrêter et revenir à la sélection"}
+            {cancel.isPending ? "Arrêt…" : "Arrêter le lot de production"}
           </button>
         ) : null}
       </div>

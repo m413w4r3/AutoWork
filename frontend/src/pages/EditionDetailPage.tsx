@@ -7,10 +7,19 @@ import {
   TlpBadge,
   formatPeriod,
 } from "../features/editions/editionPresentation";
-import { EditionWorkflow } from "../features/edition-workflow/EditionWorkflow";
+import {
+  EditionWorkspace,
+  type EditionTool,
+} from "../features/edition-tools/EditionWorkspace";
 import { Link } from "../routing";
 
-export function EditionDetailPage({ editionId }: { editionId: string }) {
+export function EditionDetailPage({
+  editionId,
+  tool,
+}: {
+  editionId: string;
+  tool?: EditionTool;
+}) {
   const queryClient = useQueryClient();
   const edition = useQuery({
     queryKey: ["edition", editionId],
@@ -63,7 +72,7 @@ export function EditionDetailPage({ editionId }: { editionId: string }) {
           </dd>
         </div>
       </dl>
-      <EditionWorkflow edition={current} />
+      <EditionWorkspace edition={current} current={tool ?? "overview"} />
       <section className="danger-zone" aria-labelledby="edition-archive">
         <h2 id="edition-archive">Actions secondaires</h2>
         {archive.error ? (

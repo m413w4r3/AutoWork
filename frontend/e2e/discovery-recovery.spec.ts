@@ -120,7 +120,7 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
       localStorage.setItem(`cti-discovery-job:${edition}`, job),
     { edition: editionId, job: jobId },
   );
-  await page.goto(`/editions/${editionId}`);
+  await page.goto(`/editions/${editionId}/discovery`);
 
   await expect(
     page.getByText(

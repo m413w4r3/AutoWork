@@ -735,6 +735,12 @@ describe("ReviewConsole", () => {
       name: "Accepter la production",
     });
     await waitFor(() => expect(acceptButton).toBeEnabled());
+    expect(
+      screen.getByText(
+        "L’assemblage final sera lancé après acceptation et suivi depuis Publication.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/étape de publication/)).not.toBeInTheDocument();
     await user.click(acceptButton);
 
     await waitFor(() =>

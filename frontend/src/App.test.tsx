@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -147,7 +147,7 @@ describe("App éditions", () => {
     ).toBeInTheDocument();
   });
 
-  it("crée une édition Iran et affiche les actions de workflow autorisées", async () => {
+  it("crée une édition Iran et ouvre son Dashboard", async () => {
     const fetchMock = vi.fn(
       withProductionNotStarted(
         (input: RequestInfo | URL, init?: RequestInit) => {
@@ -160,6 +160,8 @@ describe("App éditions", () => {
           if (url === "/api/editions" && init?.method === "POST") {
             return Response.json(iranEdition, { status: 201 });
           }
+          if (url.endsWith(`/api/editions/${iranEdition.id}/subjects`))
+            return Response.json([]);
           if (url.includes("/editorial-groups"))
             return Response.json(emptyEditorialBoard);
           if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
@@ -182,9 +184,16 @@ describe("App éditions", () => {
     expect(
       await screen.findByRole("heading", { name: "Iran" }),
     ).toBeInTheDocument();
+    // La racine d’une Edition ouvre le Dashboard, jamais la Découverte.
+    expect(window.location.pathname).toBe(`/editions/${iranEdition.id}`);
     expect(
-      screen.getByRole("heading", { name: "Sujets candidats" }),
+      await screen.findByText(
+        "Aucun sujet n'a encore été sélectionné pour cette édition.",
+      ),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: "Sujets candidats" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Archiver l’édition" }),
     ).toBeInTheDocument();
@@ -281,7 +290,11 @@ describe("App éditions", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}/discovery`,
+    );
 
     renderApp();
 
@@ -480,7 +493,11 @@ describe("App éditions", () => {
       ),
     );
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}/discovery`,
+    );
     const user = userEvent.setup();
     renderApp();
 
@@ -569,7 +586,11 @@ describe("App éditions", () => {
   it("ouvre le collage d’une réponse ChatGPT sans job ni recherche préalable", async () => {
     const fetchMock = discoveryFetchMock();
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}/discovery`,
+    );
     const user = userEvent.setup();
     renderApp();
 
@@ -588,7 +609,11 @@ describe("App éditions", () => {
   it("prévisualise puis confirme un import et rafraîchit découverte et chemin de fer", async () => {
     const fetchMock = discoveryFetchMock();
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}/discovery`,
+    );
     const user = userEvent.setup();
     renderApp();
 
@@ -751,7 +776,11 @@ describe("App éditions", () => {
       }),
     );
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}/discovery`,
+    );
     const user = userEvent.setup();
     renderApp();
 
@@ -788,5 +817,115 @@ describe("App éditions", () => {
         return url.includes(`/api/jobs/${reconciliationJobId}`);
       }),
     ).toBe(true);
+  });
+});
+
+/** Edition + Subjects servis séparément ; tout le reste répond « rien ici ». */
+function routingFetchMock() {
+  return vi.fn((input: RequestInfo | URL) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (url.endsWith(`/api/editions/${iranEdition.id}/subjects`)) {
+      return Promise.resolve(Response.json([]));
+    }
+    if (url.endsWith(`/api/editions/${iranEdition.id}`)) {
+      return Promise.resolve(Response.json(iranEdition));
+    }
+    return Promise.resolve(new Response(null, { status: 404 }));
+  });
+}
+
+describe("routage d’une Edition", () => {
+  it("ouvre le Dashboard sur la racine, sans progression linéaire", async () => {
+    vi.stubGlobal("fetch", routingFetchMock());
+    window.history.replaceState({}, "", `/editions/${iranEdition.id}`);
+    renderApp();
+
+    expect(
+      await screen.findByText(
+        "Aucun sujet n'a encore été sélectionné pour cette édition.",
+      ),
+    ).toBeInTheDocument();
+    for (const [label, path] of [
+      ["Vue d’ensemble", ""],
+      ["Découverte", "/discovery"],
+      ["Sélection", "/selection"],
+      ["Productions", "/production"],
+      ["Revue", "/review"],
+      ["Publication", "/publication"],
+    ] as const) {
+      expect(screen.getByRole("link", { name: label })).toHaveAttribute(
+        "href",
+        `/editions/${iranEdition.id}${path}`,
+      );
+    }
+    expect(
+      screen.getByRole("link", { name: "Vue d’ensemble" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      document.querySelector('[aria-current="step"]'),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/étape suivante/)).not.toBeInTheDocument();
+  });
+
+  it("ignore un ancien ?phase= et reste sur le Dashboard", async () => {
+    vi.stubGlobal("fetch", routingFetchMock());
+    window.history.replaceState(
+      {},
+      "",
+      `/editions/${iranEdition.id}?phase=selection`,
+    );
+    renderApp();
+
+    expect(
+      await screen.findByText(
+        "Aucun sujet n'a encore été sélectionné pour cette édition.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Vue d’ensemble" }),
+    ).toHaveAttribute("aria-current", "page");
+    expect(
+      screen.queryByRole("button", { name: /Sélectionnez au moins un sujet/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("adresse chaque capacité indépendamment, sans blocage", async () => {
+    const capabilities = [
+      ["discovery", "Découverte"],
+      ["selection", "Sélection"],
+      ["production", "Productions"],
+      ["review", "Revue"],
+      ["publication", "Publication"],
+    ] as const;
+
+    for (const [suffix, label] of capabilities) {
+      vi.stubGlobal("fetch", routingFetchMock());
+      window.history.replaceState(
+        {},
+        "",
+        `/editions/${iranEdition.id}/${suffix}`,
+      );
+      renderApp();
+
+      await screen.findByRole("heading", { name: "Iran" });
+      expect(screen.getByRole("link", { name: label })).toHaveAttribute(
+        "aria-current",
+        "page",
+      );
+      // Aucune capacité n’est désactivée parce qu’une autre serait
+      // « incomplète » : les six destinations restent des liens.
+      expect(screen.getAllByRole("link", { name: "Revue" })).toHaveLength(1);
+      expect(
+        screen.queryByText(
+          "Aucun sujet n'a encore été sélectionné pour cette édition.",
+        ),
+      ).not.toBeInTheDocument();
+      cleanup();
+    }
   });
 });
