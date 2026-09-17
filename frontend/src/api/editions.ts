@@ -73,6 +73,17 @@ export function getSubject(subjectId: string): Promise<Subject> {
   return request<Subject>(`/api/subjects/${encodeURIComponent(subjectId)}`);
 }
 
+export function updateSubjectMetadata(
+  subjectId: string,
+  payload: { version: number; title: string; tlp: Tlp },
+): Promise<Subject> {
+  return request<Subject>(`/api/subjects/${encodeURIComponent(subjectId)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
 export function createEdition(payload: EditionFields): Promise<Edition> {
   return request<Edition>("/api/editions", {
     method: "POST",

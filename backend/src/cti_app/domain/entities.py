@@ -62,14 +62,6 @@ class Subject:
         self.version += 1
         self.updated_at = utc_now()
 
-    def restrict_tlp(self, requested: TLP) -> None:
-        ensure_tlp_not_downgraded(self.tlp, requested)
-        if requested == self.tlp:
-            return
-        self.tlp = requested
-        self.version += 1
-        self.updated_at = utc_now()
-
 
 @dataclass(slots=True, kw_only=True)
 class SourceDocument:

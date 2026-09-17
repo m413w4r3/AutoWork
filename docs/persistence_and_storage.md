@@ -11,7 +11,7 @@ PostgreSQL est la source canonique des identités, métadonnées, relations et �
 | Table | Rôle | Invariants principaux |
 | --- | --- | --- |
 | `blobs` | Catalogue des objets binaires | unicité `(logical_bucket, sha256)`, taille positive, clé objet déterministe |
-| `subjects` | Identité stable minimale d'un dossier sujet | `external_id` et `slug` uniques, TLP sans déclassement |
+| `subjects` | Pivot canonique d'un dossier sujet, rattaché directement à son édition | `edition_id` obligatoire et immuable (`ON DELETE RESTRICT`), unicité `(edition_id, slug)`, slug stable, titre non vide, version optimiste, TLP sans déclassement |
 | `source_documents` | Sémantique d'une source acquise | référence restrictive vers `blobs`, provenance d'acquisition et politique de diffusion |
 | `samples` | Sémantique d'un échantillon | table et repository distincts des documents, référence restrictive vers `blobs` |
 | `provenance_events` | Journal factuel | insertion uniquement ; `UPDATE` et `DELETE` rejetés par trigger PostgreSQL |

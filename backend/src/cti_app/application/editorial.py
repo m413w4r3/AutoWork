@@ -99,6 +99,7 @@ class EditorialGroupingService:
         auto_selection_policy: EditorialAutoSelectionPolicyV1 | None = None,
     ) -> None:
         self._uow_factory = uow_factory
+        self._subjects = SubjectService(uow_factory)
         self._materializer = materializer
         self._workspace_root = workspace_root
         self._auto_selection_policy = auto_selection_policy or EditorialAutoSelectionPolicyV1()
@@ -472,7 +473,7 @@ class EditorialGroupingService:
         batch_confirmation: bool = False,
     ) -> Subject:
         # All selection modes share this transaction and mutation sequence.
-        subject = await SubjectService(self._uow_factory).materialize_in_uow(
+        subject = await self._subjects.materialize_in_uow(
             uow,
             edition_id=group.edition_id,
             title=group.title,

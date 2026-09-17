@@ -7,7 +7,8 @@ from uuid import UUID
 
 from cti_app.application.persistence import SubjectRepository
 from cti_app.domain.editions import Edition, EditionAuditEvent
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import ProvenanceEvent, Subject
+from tests.collection_support import InMemoryProvenanceRepository
 from tests.edition_support import InMemoryEditionAuditRepository, InMemoryEditionRepository
 
 
@@ -41,16 +42,19 @@ class InMemorySubjectUnitOfWork:
     editions: InMemoryEditionRepository
     edition_audit: InMemoryEditionAuditRepository
     subjects: SubjectRepository
+    provenance: InMemoryProvenanceRepository
 
     def __init__(
         self,
         edition_state: dict[UUID, Edition],
         subject_state: dict[UUID, Subject],
         events: list[EditionAuditEvent],
+        provenance_events: list[ProvenanceEvent],
     ) -> None:
         self.editions = InMemoryEditionRepository(edition_state)
         self.edition_audit = InMemoryEditionAuditRepository(events)
         self.subjects = InMemorySubjectRepository(subject_state)
+        self.provenance = InMemoryProvenanceRepository(provenance_events)
 
     async def __aenter__(self) -> InMemorySubjectUnitOfWork:
         return self
@@ -71,15 +75,13 @@ class InMemorySubjectUnitOfWork:
 
 
 class InMemorySubjectUnitOfWorkFactory:
-    def __init__(
-        self,
-        edition_state: dict[UUID, Edition] | None = None,
-        subject_state: dict[UUID, Subject] | None = None,
-    ) -> None:
-        self.edition_state = edition_state if edition_state is not None else {}
-        self.subject_state = subject_state if subject_state is not None else {}
+    def __init__(self) -> None:
+        self.state: dict[UUID, Edition] = {}
+        self.subject_state: dict[UUID, Subject] = {}
         self.events: list[EditionAuditEvent] = []
-        self.state = self.edition_state
+        self.provenance_events: list[ProvenanceEvent] = []
 
     def __call__(self) -> InMemorySubjectUnitOfWork:
-        return InMemorySubjectUnitOfWork(self.edition_state, self.subject_state, self.events)
+        return InMemorySubjectUnitOfWork(
+            self.state, self.subject_state, self.events, self.provenance_events
+        )

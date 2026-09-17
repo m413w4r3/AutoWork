@@ -8,7 +8,8 @@ from cti_app.application.editions import EditionNotFoundError
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import EditionImmutableError, EditionStatus
-from cti_app.domain.entities import Subject
+from cti_app.domain.entities import ProvenanceEvent, Subject
+from cti_app.logging import get_correlation_id
 
 
 class SubjectNotFoundError(LookupError):
@@ -74,6 +75,7 @@ class SubjectService:
         expected_version: int,
         title: str,
         tlp: TLP,
+        actor_id: str,
     ) -> Subject:
         async with self._uow_factory() as uow:
             subject = await uow.subjects.get(subject_id)
@@ -88,8 +90,27 @@ class SubjectService:
             if edition.state is EditionStatus.ARCHIVED:
                 raise EditionImmutableError("Archived editions cannot be modified")
 
+            before = {"title": subject.title, "tlp": subject.tlp.value}
             subject.update_metadata(title=title, tlp=tlp)
             if not await uow.subjects.update(subject, expected_version=expected_version):
                 raise SubjectConcurrencyError("Subject was modified by another request")
+            # Le journal de provenance générique porte déjà l'historique des
+            # agrégats ; AW-003 n'introduit pas de table d'audit dédiée.
+            await uow.provenance.append(
+                ProvenanceEvent(
+                    subject_id=subject.id,
+                    aggregate_type="subject",
+                    aggregate_id=subject.id,
+                    event_type="subject.metadata_updated",
+                    payload={
+                        "before": before,
+                        "after": {"title": subject.title, "tlp": subject.tlp.value},
+                        "version": subject.version,
+                        "correlation_id": get_correlation_id(),
+                    },
+                    tlp=subject.tlp,
+                    actor_id=actor_id,
+                )
+            )
             await uow.commit()
             return subject

@@ -1046,6 +1046,19 @@ def _feature_from_payload(data: dict[str, Any]) -> SampleFeatureSetV1:
     )
 
 
+def _subject_from_row(row: SubjectRow) -> Subject:
+    return Subject(
+        id=row.id,
+        edition_id=row.edition_id,
+        title=row.title,
+        slug=row.slug,
+        tlp=TLP(row.tlp),
+        version=row.version,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 class SqlAlchemySubjectRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -1067,18 +1080,7 @@ class SqlAlchemySubjectRepository:
 
     async def get(self, subject_id: UUID) -> Subject | None:
         row = await self._session.get(SubjectRow, subject_id)
-        if row is None:
-            return None
-        return Subject(
-            id=row.id,
-            edition_id=row.edition_id,
-            title=row.title,
-            slug=row.slug,
-            tlp=TLP(row.tlp),
-            version=row.version,
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-        )
+        return _subject_from_row(row) if row is not None else None
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[Subject]:
         rows = await self._session.scalars(
@@ -1086,19 +1088,7 @@ class SqlAlchemySubjectRepository:
             .where(SubjectRow.edition_id == edition_id)
             .order_by(SubjectRow.created_at, SubjectRow.id)
         )
-        return [
-            Subject(
-                id=row.id,
-                edition_id=row.edition_id,
-                title=row.title,
-                slug=row.slug,
-                tlp=TLP(row.tlp),
-                version=row.version,
-                created_at=row.created_at,
-                updated_at=row.updated_at,
-            )
-            for row in rows
-        ]
+        return [_subject_from_row(row) for row in rows]
 
     async def update(self, subject: Subject, *, expected_version: int) -> bool:
         result = await self._session.execute(

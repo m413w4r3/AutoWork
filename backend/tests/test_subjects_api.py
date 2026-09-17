@@ -123,6 +123,67 @@ async def test_list_subjects_from_archived_edition_is_available() -> None:
     assert len(response.json()) == 1
 
 
+async def test_update_metadata_renames_without_touching_slug_or_edition() -> None:
+    factory = InMemorySubjectUnitOfWorkFactory()
+    application = _application(factory)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        edition_id, subject_id = await _create_subject(client, factory)
+        original = (await client.get(f"/api/subjects/{subject_id}")).json()
+        updated = await client.put(
+            f"/api/subjects/{subject_id}",
+            json={"version": 1, "title": "APT 29 — Nobelium", "tlp": "RED"},
+        )
+        stale = await client.put(
+            f"/api/subjects/{subject_id}",
+            json={"version": 1, "title": "Stale", "tlp": "RED"},
+        )
+        downgraded = await client.put(
+            f"/api/subjects/{subject_id}",
+            json={"version": 2, "title": "Downgraded", "tlp": "GREEN"},
+        )
+        rejected_slug = await client.put(
+            f"/api/subjects/{subject_id}",
+            json={"version": 2, "title": "Renamed", "tlp": "RED", "slug": "renamed"},
+        )
+
+    assert updated.status_code == 200
+    _assert_minimal_view(updated.json())
+    assert updated.json()["title"] == "APT 29 — Nobelium"
+    assert updated.json()["tlp"] == "RED"
+    assert updated.json()["version"] == 2
+    assert updated.json()["slug"] == original["slug"]
+    assert updated.json()["edition_id"] == str(edition_id)
+
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "stale_subject_version"
+    assert downgraded.status_code == 422
+    assert downgraded.json()["detail"]["code"] == "invalid_subject"
+    assert rejected_slug.status_code == 422
+
+
+async def test_update_metadata_is_refused_on_an_archived_edition() -> None:
+    factory = InMemorySubjectUnitOfWorkFactory()
+    application = _application(factory)
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        edition_id, subject_id = await _create_subject(client, factory)
+        assert (
+            await client.post(f"/api/editions/{edition_id}/archive", json={"version": 1})
+        ).status_code == 200
+        response = await client.put(
+            f"/api/subjects/{subject_id}",
+            json={"version": 1, "title": "Blocked", "tlp": "AMBER"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "invalid_edition_action"
+
+
 async def test_subject_creation_is_not_public() -> None:
     factory = InMemorySubjectUnitOfWorkFactory()
     application = _application(factory)

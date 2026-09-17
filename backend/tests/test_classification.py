@@ -12,9 +12,9 @@ def test_tlp_can_only_stay_equal_or_become_more_restrictive() -> None:
         edition_id=uuid4(), title="Test subject", slug="test-subject", tlp=TLP.AMBER
     )
 
-    subject.restrict_tlp(TLP.RED)
+    subject.update_metadata(title="Test subject", tlp=TLP.RED)
 
     assert subject.tlp is TLP.RED
     with pytest.raises(TlpDowngradeError):
-        subject.restrict_tlp(TLP.GREEN)
+        subject.update_metadata(title="Test subject", tlp=TLP.GREEN)
     assert subject.tlp is TLP.RED

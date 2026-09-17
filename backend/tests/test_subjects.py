@@ -66,13 +66,13 @@ def test_subject_edition_and_slug_are_immutable() -> None:
 def test_subject_tlp_changes_preserve_downgrade_invariant() -> None:
     subject = _subject(uuid4(), tlp=TLP.GREEN)
     original_updated_at = subject.updated_at
-    subject.restrict_tlp(TLP.AMBER)
+    subject.update_metadata(title=subject.title, tlp=TLP.AMBER)
     assert subject.tlp is TLP.AMBER
     assert subject.version == 2
     assert subject.updated_at > original_updated_at
 
     with pytest.raises(TlpDowngradeError):
-        subject.restrict_tlp(TLP.CLEAR)
+        subject.update_metadata(title=subject.title, tlp=TLP.CLEAR)
     assert subject.version == 2
 
 
@@ -142,6 +142,7 @@ async def test_update_metadata_is_optimistic_and_rejects_archived_editions() -> 
         expected_version=1,
         title="  Updated Subject ",
         tlp=TLP.AMBER,
+        actor_id="analyst:1",
     )
     assert updated.title == "Updated Subject"
     assert updated.slug == original_slug
@@ -149,12 +150,35 @@ async def test_update_metadata_is_optimistic_and_rejects_archived_editions() -> 
     assert updated.version == 2
     assert updated.updated_at > original_updated_at
 
+    # La modification est journalisée par le mécanisme de provenance existant.
+    assert [
+        (event.event_type, event.actor_id, event.payload["before"], event.payload["after"])
+        for event in factory.provenance_events
+    ] == [
+        (
+            "subject.metadata_updated",
+            "analyst:1",
+            {"title": "A Subject", "tlp": "GREEN"},
+            {"title": "Updated Subject", "tlp": "AMBER"},
+        )
+    ]
+
     with pytest.raises(SubjectConcurrencyError):
         await service.update_metadata(
             subject.id,
             expected_version=1,
             title="Stale",
             tlp=TLP.AMBER,
+            actor_id="analyst:1",
+        )
+
+    with pytest.raises(TlpDowngradeError):
+        await service.update_metadata(
+            subject.id,
+            expected_version=2,
+            title="Downgraded",
+            tlp=TLP.CLEAR,
+            actor_id="analyst:1",
         )
 
     edition.state = EditionStatus.ARCHIVED
@@ -165,6 +189,7 @@ async def test_update_metadata_is_optimistic_and_rejects_archived_editions() -> 
             expected_version=2,
             title="Blocked",
             tlp=TLP.AMBER,
+            actor_id="analyst:1",
         )
 
 
