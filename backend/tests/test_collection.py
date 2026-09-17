@@ -5,6 +5,7 @@ import calendar
 import gzip
 import hashlib
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -20,6 +21,7 @@ from cti_app.application.collection import (
     ManualContentTypeError,
     ReferencedEvidence,
     SubjectCollectionService,
+    SupplementalSource,
     collection_idempotency_key,
 )
 from cti_app.application.collection_review import CollectionReviewService
@@ -213,6 +215,36 @@ def service(
         SafeHttpCollector(transport, Resolver()),
         FilesystemBlobStore(root),
     )
+
+
+async def test_collection_operations_use_subject_edition_when_group_differs(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://discovery.example/report",))
+    group = next(iter(factory.groups.values()))
+    batch = next(iter(factory.batches.values()))
+    subject_edition_id = uuid4()
+    factory.subjects[subject.id] = replace(subject, edition_id=subject_edition_id)
+    factory.batches[batch.id] = replace(batch, edition_id=subject_edition_id)
+
+    app = service(factory, Transport([]), tmp_path / "blobs")
+    initialized = await app.initialize(subject.id)
+
+    assert [item.requested_url for item in initialized] == ["https://discovery.example/report"]
+    assert initialized[0].edition_id == subject_edition_id
+    assert initialized[0].group_id == group.id
+    assert initialized[0].batch_id == group.candidate_references[0].batch_id
+
+    supplemental = await app.add_supplemental_sources(
+        subject.id,
+        [SupplementalSource(url="https://reference.example/report")],
+    )
+
+    assert len(supplemental) == 1
+    assert supplemental[0].edition_id == subject_edition_id
+    assert supplemental[0].group_id == group.id
+    assert {item.edition_id for item in factory.collections.values()} == {subject_edition_id}
 
 
 async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations(

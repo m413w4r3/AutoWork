@@ -1267,7 +1267,13 @@ async def start_subject_production(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Subject is not selected",
             )
-        edition_id = group.edition_id
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No subject found for {subject_id}",
+            )
+        edition_id = subject.edition_id
 
         # A subject produced inside an edition batch is repaired through that
         # batch, never by a standalone run: once the current run is terminal,
@@ -1431,12 +1437,19 @@ async def import_subject_production_state(
     request: Request,
     payload: dict[str, Any],
 ) -> ProductionStateImportResult:
-    group = await _selected_article_group(request, subject_id)
+    await _selected_article_group(request, subject_id)
+    async with request.app.state.uow_factory() as uow:
+        subject = await uow.subjects.get(subject_id)
+    if subject is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No subject found for {subject_id}",
+        )
     service = _production_state_service(request)
     try:
         return await service.import_state(
             subject_id=subject_id,
-            edition_id=group.edition_id,
+            edition_id=subject.edition_id,
             payload=payload,
         )
     except ProductionStateError as exc:

@@ -183,7 +183,9 @@ class _Audit:
 
 class _DiscoveryBatches:
     def __init__(self, groups: Sequence[EditorialGroup]) -> None:
-        self.groups = groups
+        # Tests that need a batch attached to another edition than the selected
+        # group substitute stand-ins exposing only the two fields read below.
+        self.groups: Sequence[Any] = groups
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[SimpleNamespace]:
         return [
@@ -725,14 +727,27 @@ async def test_invalidate_reuse_persists_identity_from_provider(
 
 async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uow: _Uow) -> None:
     """The subject page only knows the subject id; the edition is resolved server-side."""
-    edition_id = uuid4()
+    group_edition_id = uuid4()
+    subject_edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    uow.editorial_groups._groups.append(_group(group_edition_id, "TAG-182", subject_id))
+    uow.subjects.items[subject_id] = dataclasses.replace(
+        uow.subjects.items[subject_id], edition_id=subject_edition_id
+    )
+    uow.discovery_batches.groups = [
+        SimpleNamespace(
+            edition_id=subject_edition_id,
+            candidate_references=uow.editorial_groups._groups[-1].candidate_references,
+        )
+    ]
 
     response = await api.post(f"/api/subjects/{subject_id}/production", json={})
 
     assert response.status_code == 200, response.text
-    assert response.json()["edition_id"] == str(edition_id)
+    assert response.json()["edition_id"] == str(subject_edition_id)
+    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+    assert run is not None
+    assert run.edition_id == subject_edition_id
 
 
 async def test_start_subject_production_ignores_spoofed_user_query_parameter(
@@ -1474,6 +1489,16 @@ async def test_production_state_export_import_is_transparent(
 
     imported_subject = uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", imported_subject))
+    imported_edition_id = uuid4()
+    uow.subjects.items[imported_subject] = dataclasses.replace(
+        uow.subjects.items[imported_subject], edition_id=imported_edition_id
+    )
+    uow.discovery_batches.groups = [
+        SimpleNamespace(
+            edition_id=imported_edition_id,
+            candidate_references=uow.editorial_groups._groups[-1].candidate_references,
+        )
+    ]
     submitted = len(production_app.state.job_service.submitted)
     imported = await api.post(
         f"/api/subjects/{imported_subject}/production/state/import", json=snapshot
@@ -1515,6 +1540,7 @@ async def test_production_state_export_import_is_transparent(
 
     imported_run = await uow.subject_production_runs.get_current_for_subject(imported_subject)
     assert imported_run is not None
+    assert imported_run.edition_id == imported_edition_id
     extraction_artifact = await uow.production_artifacts.get_current(imported_run.id, "extraction")
     assert extraction_artifact is not None and extraction_artifact.canonical_blob_id is not None
     restored = await store.read_json(extraction_artifact.canonical_blob_id)

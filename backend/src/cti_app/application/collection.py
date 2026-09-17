@@ -256,17 +256,19 @@ class SubjectCollectionService:
     async def initialize(self, subject_id: UUID) -> list[SourceCollection]:
         async with self._uow_factory() as uow:
             group = await uow.editorial_groups.get_by_subject(subject_id)
+            subject = await uow.subjects.get(subject_id)
             if (
                 group is None
                 or group.status is not EditorialGroupStatus.SELECTED
                 or group.subject_id != subject_id
+                or subject is None
             ):
                 raise CollectionNotAllowedError(
                     "Only sources attached to a selected subject can be collected"
                 )
             batches = {
                 batch.id: batch
-                for batch in await uow.discovery_batches.list_for_edition(group.edition_id)
+                for batch in await uow.discovery_batches.list_for_edition(subject.edition_id)
             }
             # Une nouvelle contribution peut réintroduire une URL déjà rattachée au
             # sujet sous un SourceCandidate.id différent. La clé d'unicité en base
@@ -300,7 +302,7 @@ class SubjectCollectionService:
                     await uow.source_collections.add_if_absent(
                         _new_collection(
                             group.id,
-                            group.edition_id,
+                            subject.edition_id,
                             subject_id,
                             reference.batch_id,
                             source,
@@ -345,7 +347,12 @@ class SubjectCollectionService:
         """
         async with self._uow_factory() as uow:
             group = await uow.editorial_groups.get_by_subject(subject_id)
-            if group is None or group.status is not EditorialGroupStatus.SELECTED:
+            subject = await uow.subjects.get(subject_id)
+            if (
+                group is None
+                or group.status is not EditorialGroupStatus.SELECTED
+                or subject is None
+            ):
                 raise CollectionNotAllowedError(
                     "Only sources attached to a selected subject can be collected"
                 )
@@ -360,7 +367,7 @@ class SubjectCollectionService:
                     continue
                 collection = SourceCollection(
                     subject_id=subject_id,
-                    edition_id=group.edition_id,
+                    edition_id=subject.edition_id,
                     group_id=group.id,
                     requested_url=canonical,
                     canonical_url=canonical,

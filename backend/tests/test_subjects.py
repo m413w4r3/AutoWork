@@ -136,6 +136,7 @@ async def test_update_metadata_is_optimistic_and_rejects_archived_editions() -> 
     service = SubjectService(factory)
 
     original_updated_at = subject.updated_at
+    original_slug = subject.slug
     updated = await service.update_metadata(
         subject.id,
         expected_version=1,
@@ -143,6 +144,7 @@ async def test_update_metadata_is_optimistic_and_rejects_archived_editions() -> 
         tlp=TLP.AMBER,
     )
     assert updated.title == "Updated Subject"
+    assert updated.slug == original_slug
     assert updated.tlp is TLP.AMBER
     assert updated.version == 2
     assert updated.updated_at > original_updated_at
