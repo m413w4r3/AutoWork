@@ -71,7 +71,11 @@ class SubjectWorkspaceMaterializer:
         blobs: Mapping[UUID, BlobRecord],
         workspace_root: Path,
     ) -> WorkspaceMaterialization:
-        subject_path = self._prepare_directories(workspace_root, subject.slug)
+        subject_path = self._prepare_directories(
+            workspace_root,
+            subject.edition_id,
+            subject.slug,
+        )
         source_manifest = []
         for document in source_documents:
             raw_blob = self._require_blob(blobs, document.blob_id)
@@ -123,10 +127,16 @@ class SubjectWorkspaceMaterializer:
         )
 
     @staticmethod
-    def _prepare_directories(workspace_root: Path, slug: str) -> Path:
+    def _prepare_directories(workspace_root: Path, edition_id: UUID, slug: str) -> Path:
         workspace_root.mkdir(parents=True, exist_ok=True)
         root = workspace_root.resolve()
-        subject_path = root / slug
+        edition_path = root / str(edition_id)
+        if edition_path.is_symlink():
+            raise ValueError("Refusing to materialize through a symbolic link")
+        edition_path.mkdir(parents=True, exist_ok=True)
+        if not edition_path.resolve().is_relative_to(root):
+            raise ValueError("Workspace path escaped its configured root")
+        subject_path = edition_path / slug
         if subject_path.is_symlink():
             raise ValueError("Refusing to materialize through a symbolic link")
         subject_path.mkdir(parents=True, exist_ok=True)

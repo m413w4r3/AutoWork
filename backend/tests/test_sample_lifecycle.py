@@ -127,11 +127,28 @@ async def test_sample_workspace_refuses_symlink(tmp_path: Path) -> None:
     await materializer.materialize(subject, [], [], {}, workspace_root)
     target = tmp_path / "outside"
     target.mkdir()
-    (workspace_root / subject.slug / "03_samples" / "quarantine").rmdir()
-    (workspace_root / subject.slug / "03_samples" / "quarantine").symlink_to(
-        target, target_is_directory=True
+    quarantine = (
+        workspace_root / str(subject.edition_id) / subject.slug / "03_samples" / "quarantine"
     )
+    quarantine.rmdir()
+    quarantine.symlink_to(target, target_is_directory=True)
     with pytest.raises(ValueError, match="symbolic link"):
         await materializer.materialize(
             subject, [], [_sample(subject, blob.id)], {blob.id: blob}, workspace_root
         )
+
+
+@pytest.mark.asyncio
+async def test_sample_workspace_refuses_symlinked_edition_directory(tmp_path: Path) -> None:
+    store = FilesystemBlobStore(tmp_path / "blobs")
+    subject = Subject(
+        edition_id=uuid4(), title="Test subject", slug="edition-symlink", tlp=TLP.RED
+    )
+    workspace_root = tmp_path / "workspaces"
+    workspace_root.mkdir(parents=True)
+    target = tmp_path / "outside"
+    target.mkdir()
+    (workspace_root / str(subject.edition_id)).symlink_to(target, target_is_directory=True)
+    materializer = SubjectWorkspaceMaterializer(store)
+    with pytest.raises(ValueError, match="symbolic link"):
+        await materializer.materialize(subject, [], [], {}, workspace_root)
