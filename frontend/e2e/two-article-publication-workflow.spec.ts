@@ -467,7 +467,9 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await expect(page.getByRole("link", { name: "Ouvrir" })).toHaveCount(2);
 
   await page.getByRole("link", { name: "Ouvrir" }).nth(0).click();
-  await expect(page.getByText("Article A", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Article A", level: 1 }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Pipeline" }).click();
   await page.getByText("Diagnostic", { exact: true }).click();
   await expect(
@@ -476,7 +478,9 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await page.goBack();
 
   await page.getByRole("link", { name: "Ouvrir" }).nth(1).click();
-  await expect(page.getByText("Article B", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Article B", level: 1 }),
+  ).toBeVisible();
   await page.goBack();
   await expect(
     page.getByRole("heading", { name: "Revue de publication" }),

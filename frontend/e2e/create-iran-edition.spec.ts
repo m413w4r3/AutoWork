@@ -76,7 +76,6 @@ test("crée une édition Iran depuis le formulaire métier", async ({ page }) =>
   await page.getByLabel("Code pays").fill("IR");
   await page.getByLabel("Période").fill("2026-07");
   await page.getByLabel("Langues").fill("fr,en,fa");
-  await page.getByLabel("Profil de sources").fill("iran-default");
   await page.getByRole("button", { name: "Créer l’édition" }).click();
 
   await expect(page).toHaveURL(`/editions/${edition.id}`);

@@ -101,7 +101,8 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
     if (path.endsWith("/manual/preview")) {
       calls.manual += 1;
       expect(request.postDataJSON()).toMatchObject({
-        source_profile: "iran-default",
+        job_id: jobId,
+        markdown: "## SUBJECT S1\ntitle: Import manuel",
       });
       return route.fulfill({ json: preview });
     }

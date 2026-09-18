@@ -288,6 +288,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
 
   await page.clock.install({ time: new Date("2026-06-01T00:10:00Z") });
   await page.goto(`/editions/${editionId}/discovery`);
+  await page.getByLabel("Profil de sources").fill("iran-default");
   await page
     .getByRole("button", { name: "Nouvelle recherche ChatGPT" })
     .dispatchEvent("click");
