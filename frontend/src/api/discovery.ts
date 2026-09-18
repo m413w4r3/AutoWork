@@ -46,14 +46,11 @@ export interface IncompleteSourceCandidate {
   parsing_warnings: string[];
 }
 
-export interface CandidateReference {
-  batch_id: string;
-  candidate_id: string;
-}
-
-export interface CandidateTopic {
+export interface DiscoveryCandidate {
   id: string;
-  batch_id: string;
+  discovery_run_id: string;
+  discovery_batch_id: string;
+  created_at: string;
   title: string;
   summary: string;
   novelty: string;
@@ -74,7 +71,6 @@ export interface CandidateTopic {
   provisional_ioc_count?: number;
   provisional_ioc_type_counts?: Record<string, number>;
   has_publisher_ioc_count?: boolean;
-  editorial_status: "proposed";
   sources: SourceCandidate[];
   incomplete_sources: IncompleteSourceCandidate[];
   local_ref: string | null;
@@ -85,11 +81,6 @@ export interface CandidateTopic {
   selectable: boolean;
   valid_publication_count: number;
   incomplete_publication_count: number;
-  // Consolidation tracking (P2)
-  member_references?: CandidateReference[];
-  contribution_count?: number;
-  duplicate_publication_count?: number;
-  merge_warnings?: string[];
 }
 
 export interface ProvisionalDiscoveryIoc {
@@ -152,19 +143,10 @@ export interface DiscoveryBatch {
   archived_report_url: string;
 }
 
-export interface DiscoveryMergeStats {
-  raw_batch_count: number;
-  raw_candidate_count: number;
-  consolidated_candidate_count: number;
-  unique_publication_count: number;
-  duplicate_publication_occurrence_count: number;
-}
-
 export interface DiscoveryResult {
   batches: DiscoveryBatch[];
-  candidates: CandidateTopic[];
+  candidates: DiscoveryCandidate[];
   total: number;
-  merge_stats: DiscoveryMergeStats;
   warning: string;
 }
 
@@ -460,6 +442,15 @@ export function fetchDiscovery(
   );
 }
 
+export function fetchDiscoveryRunCandidates(
+  editionId: string,
+  runId: string,
+): Promise<DiscoveryCandidate[]> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/runs/${encodeURIComponent(runId)}/candidates`,
+  );
+}
+
 export type MergeDecisionAction =
   "accept" | "create_new" | "attach_to" | "merge_existing" | "defer";
 
@@ -542,11 +533,12 @@ export function resolveMergeRun(
 
 export function markDiscoverySource(
   editionId: string,
+  candidateId: string,
   sourceId: string,
   status: SourceVerificationStatus,
 ): Promise<SourceCandidate> {
   return request(
-    `/api/editions/${encodeURIComponent(editionId)}/discovery/sources/${encodeURIComponent(sourceId)}`,
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/${encodeURIComponent(candidateId)}/sources/${encodeURIComponent(sourceId)}`,
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -562,13 +554,13 @@ export interface IncompleteSourceAttachmentResult {
 
 export function attachIncompleteSourceUrl(
   editionId: string,
-  subjectId: string,
+  candidateId: string,
   incompleteSourceId: string,
   url: string,
 ): Promise<IncompleteSourceAttachmentResult> {
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/` +
-      `${encodeURIComponent(subjectId)}/incomplete-sources/${encodeURIComponent(incompleteSourceId)}`,
+      `${encodeURIComponent(candidateId)}/incomplete-sources/${encodeURIComponent(incompleteSourceId)}`,
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -577,6 +569,9 @@ export function attachIncompleteSourceUrl(
   );
 }
 
+// Used by the selected-Subject pipeline, which only knows the Subject id: the
+// backend resolves the persisted DiscoveryCandidate carrying the replaced URL.
+// Temporary adapter until AW-008 replaces the legacy Selection projection.
 export function attachReplacementSourceUrl(
   editionId: string,
   subjectId: string,
@@ -584,7 +579,7 @@ export function attachReplacementSourceUrl(
   url: string,
 ): Promise<IncompleteSourceAttachmentResult> {
   return request(
-    `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/` +
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/subjects/` +
       `${encodeURIComponent(subjectId)}/sources/replacement`,
     {
       method: "PATCH",

@@ -76,6 +76,12 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
         ],
       });
     }
+    if (
+      path ===
+      `/api/editions/${editionId}/discovery/runs/dddddddd-dddd-4ddd-8ddd-dddddddddddd/candidates`
+    ) {
+      return route.fulfill({ json: [] });
+    }
     if (path.endsWith("/discovery/candidates")) {
       return route.fulfill({
         json: { batches: [], candidates: [], total: 0, warning: "provisoire" },

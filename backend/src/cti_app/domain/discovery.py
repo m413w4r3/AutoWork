@@ -15,12 +15,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cti_app.domain.classification import TLP
 
 
-class ContributionStatus(StrEnum):
-    PENDING = "pending"
-    ACCEPTED = "accepted"
-    REJECTED = "rejected"
-
-
 class SourceRole(StrEnum):
     PRIMARY = "primary"
     INDEPENDENT = "independent"
@@ -279,6 +273,26 @@ class IncompleteSourceCandidate:
 
 
 @dataclass(slots=True)
+class DiscoveryCandidateEvidence:
+    uncertainties: tuple[str, ...] = ()
+    relevance_reasons: tuple[str, ...] = ()
+    actors: tuple[str, ...] = ()
+    campaigns: tuple[str, ...] = ()
+    malware: tuple[str, ...] = ()
+    cves: tuple[str, ...] = ()
+    victims: tuple[str, ...] = ()
+    sectors: tuple[str, ...] = ()
+    countries: tuple[str, ...] = ()
+    likely_artifacts: tuple[str, ...] = ()
+    iocs: tuple[str, ...] = ()
+    sources: list[SourceCandidate] = field(default_factory=list)
+    incomplete_sources: list[IncompleteSourceCandidate] = field(default_factory=list)
+    provisional_iocs: list[ProvisionalDiscoveryIoc] = field(default_factory=list)
+    parsing_warnings: tuple[str, ...] = ()
+    markdown_block: str | None = None
+
+
+@dataclass(slots=True)
 class CandidateTopic:
     title: str
     summary: str
@@ -310,7 +324,6 @@ class CandidateTopic:
     context_only: bool = False
     id: UUID = field(default_factory=uuid4)
     title_fingerprint: str = field(init=False)
-    editorial_status: str = "proposed"
 
     def __post_init__(self) -> None:
         self.title = self.title.strip()
@@ -322,8 +335,6 @@ class CandidateTopic:
             raise ValueError("Candidate title, summary and novelty are required")
         if not 0 <= self.technical_potential <= 4:
             raise ValueError("Technical potential must be between 0 and 4")
-        if self.editorial_status != "proposed":
-            raise ValueError("Discovery cannot select a topic automatically")
         self.sources, source_id_remap = deduplicate_sources(self.sources)
         if source_id_remap:
             self.provisional_iocs = remap_ioc_publication_ids(
@@ -339,16 +350,140 @@ class CandidateTopic:
 
 
 @dataclass(slots=True)
-class DiscoveryContribution:
-    candidate: CandidateTopic
-    status: ContributionStatus
-    created_at: datetime
-    accepted_at: datetime | None = None
-    human_note: str = ""
+class DiscoveryCandidate:
+    discovery_run_id: UUID
+    discovery_batch_id: UUID
+    position: int
+    title: str
+    summary: str
+    novelty: str
+    technical_potential: int
+    technical_potential_reason: str
+    event_date: date | None
+    actor_or_campaign: str
+    context_only: bool
+    tlp: TLP
+    sensitivity: str
+    external_llm_allowed: bool
+    evidence: DiscoveryCandidateEvidence = field(default_factory=DiscoveryCandidateEvidence)
+    id: UUID = field(default_factory=uuid4)
+    local_ref: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        if self.status == ContributionStatus.ACCEPTED and self.accepted_at is None:
-            self.accepted_at = datetime.now(UTC)
+        self.title = self.title.strip()
+        self.summary = self.summary.strip()
+        self.novelty = self.novelty.strip()
+        if not self.title or not self.summary or not self.novelty:
+            raise ValueError("Discovery candidate title, summary and novelty are required")
+        if not 0 <= self.technical_potential <= 4:
+            raise ValueError("Technical potential must be between 0 and 4")
+        if self.position < 0:
+            raise ValueError("Discovery candidate position cannot be negative")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("Discovery candidate creation time must be timezone-aware")
+
+    def to_candidate_topic(self) -> CandidateTopic:
+        return candidate_topic_from_discovery_candidate(self)
+
+    @staticmethod
+    def from_candidate_topic(
+        candidate: CandidateTopic,
+        *,
+        discovery_run_id: UUID,
+        discovery_batch_id: UUID,
+        position: int,
+        created_at: datetime | None = None,
+    ) -> DiscoveryCandidate:
+        return discovery_candidate_from_candidate_topic(
+            candidate,
+            discovery_run_id=discovery_run_id,
+            discovery_batch_id=discovery_batch_id,
+            position=position,
+            created_at=created_at,
+        )
+
+
+def candidate_topic_from_discovery_candidate(candidate: DiscoveryCandidate) -> CandidateTopic:
+    evidence = candidate.evidence
+    return CandidateTopic(
+        id=candidate.id,
+        title=candidate.title,
+        summary=candidate.summary,
+        novelty=candidate.novelty,
+        technical_potential=candidate.technical_potential,
+        uncertainties=evidence.uncertainties,
+        relevance_reasons=evidence.relevance_reasons,
+        actors=evidence.actors,
+        campaigns=evidence.campaigns,
+        malware=evidence.malware,
+        cves=evidence.cves,
+        victims=evidence.victims,
+        sectors=evidence.sectors,
+        countries=evidence.countries,
+        likely_artifacts=evidence.likely_artifacts,
+        sources=list(evidence.sources),
+        tlp=candidate.tlp,
+        sensitivity=candidate.sensitivity,
+        external_llm_allowed=candidate.external_llm_allowed,
+        incomplete_sources=list(evidence.incomplete_sources),
+        event_date=candidate.event_date,
+        iocs=evidence.iocs,
+        provisional_iocs=list(evidence.provisional_iocs),
+        local_ref=candidate.local_ref,
+        actor_or_campaign=candidate.actor_or_campaign,
+        technical_potential_reason=candidate.technical_potential_reason,
+        parsing_warnings=evidence.parsing_warnings,
+        markdown_block=evidence.markdown_block,
+        context_only=candidate.context_only,
+    )
+
+
+def discovery_candidate_from_candidate_topic(
+    candidate: CandidateTopic,
+    *,
+    discovery_run_id: UUID,
+    discovery_batch_id: UUID,
+    position: int,
+    created_at: datetime | None = None,
+) -> DiscoveryCandidate:
+    return DiscoveryCandidate(
+        id=candidate.id,
+        discovery_run_id=discovery_run_id,
+        discovery_batch_id=discovery_batch_id,
+        position=position,
+        local_ref=candidate.local_ref,
+        title=candidate.title,
+        summary=candidate.summary,
+        novelty=candidate.novelty,
+        technical_potential=candidate.technical_potential,
+        technical_potential_reason=candidate.technical_potential_reason,
+        event_date=candidate.event_date,
+        actor_or_campaign=candidate.actor_or_campaign,
+        context_only=candidate.context_only,
+        tlp=candidate.tlp,
+        sensitivity=candidate.sensitivity,
+        external_llm_allowed=candidate.external_llm_allowed,
+        evidence=DiscoveryCandidateEvidence(
+            uncertainties=candidate.uncertainties,
+            relevance_reasons=candidate.relevance_reasons,
+            actors=candidate.actors,
+            campaigns=candidate.campaigns,
+            malware=candidate.malware,
+            cves=candidate.cves,
+            victims=candidate.victims,
+            sectors=candidate.sectors,
+            countries=candidate.countries,
+            likely_artifacts=candidate.likely_artifacts,
+            iocs=candidate.iocs,
+            sources=list(candidate.sources),
+            incomplete_sources=list(candidate.incomplete_sources),
+            provisional_iocs=list(candidate.provisional_iocs),
+            parsing_warnings=candidate.parsing_warnings,
+            markdown_block=candidate.markdown_block,
+        ),
+        created_at=created_at or datetime.now(UTC),
+    )
 
 
 @dataclass(slots=True)
@@ -364,7 +499,6 @@ class DiscoveryBatch:
     sensitivity: str
     external_llm_allowed: bool
     parser_version: str
-    contributions: list[DiscoveryContribution] = field(default_factory=list)
     candidates: list[CandidateTopic] = field(default_factory=list)
     report_sha256: str | None = None
     parsing_status: str = "completed"
@@ -397,32 +531,12 @@ class DiscoveryBatch:
                 self.source_coverage_incomplete_reason
                 or "Le bridge expose uniquement les citations visibles de ChatGPT."
             )
-            for contribution in self.contributions:
-                for source in contribution.candidate.sources:
+            for candidate in self.candidates:
+                for source in candidate.sources:
                     source.relationship_status = SourceRelationshipStatus.PROVISIONAL
         if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
             raise ValueError("Incomplete source coverage requires a reason")
-        if self.candidates and not self.contributions:
-            self.contributions = [
-                DiscoveryContribution(
-                    candidate=candidate,
-                    status=ContributionStatus.ACCEPTED,
-                    created_at=self.created_at,
-                    accepted_at=self.created_at,
-                )
-                for candidate in self.candidates
-            ]
-        # `candidates` is the immutable raw-batch projection. Acceptance is a
-        # separate contribution attribute and must not make parsed subjects
-        # disappear from discovery reads.
-        candidates = [contribution.candidate for contribution in self.contributions]
-        deduplicated = deduplicate_topics(candidates)
-        # Update contributions with deduplicated candidates
-        candidate_map = {c.id: c for c in deduplicated}
-        for contribution in self.contributions:
-            if contribution.candidate.id in candidate_map:
-                contribution.candidate = candidate_map[contribution.candidate.id]
-        self.candidates = deduplicated
+        self.candidates = deduplicate_topics(self.candidates)
         if self.parsing_revision < 1:
             raise ValueError("Parsing revision must be positive")
 
@@ -430,21 +544,12 @@ class DiscoveryBatch:
     def is_active_revision(self) -> bool:
         return self.replaced_by_batch_id is None
 
-    @property
-    def history_hash(self) -> str:
-        """Hash of accepted contributions for idempotency checking."""
-        accepted = [
-            c.candidate.id for c in self.contributions if c.status == ContributionStatus.ACCEPTED
-        ]
-        content = "|".join(str(cid) for cid in sorted(accepted))
-        return hashlib.sha256(content.encode()).hexdigest()
-
     def source(self, source_id: UUID) -> SourceCandidate | None:
         return next(
             (
                 source
-                for contribution in self.contributions
-                for source in contribution.candidate.sources
+                for candidate in self.candidates
+                for source in candidate.sources
                 if source.id == source_id
             ),
             None,

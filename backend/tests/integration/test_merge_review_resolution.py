@@ -7,7 +7,7 @@ replays a snapshot id derived from (parent, intake, run) and dies on the
 primary key, which reaches the browser as an unexplained server error.
 """
 
-from datetime import UTC, date, datetime
+from datetime import date
 from uuid import UUID
 
 import pytest
@@ -27,9 +27,7 @@ from cti_app.application.discovery.cumulative.types import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
-    ContributionStatus,
     DiscoveryBatch,
-    DiscoveryContribution,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRole,
@@ -340,7 +338,6 @@ def _batch(
     request_hash: str = "c" * 64,
     local_ref: str = "S1",
 ) -> DiscoveryBatch:
-    now = datetime.now(UTC)
     candidate = CandidateTopic(
         title=title,
         summary=f"{title} summary",
@@ -378,14 +375,7 @@ def _batch(
         complementary_axis="initial",
         queries=(),
         citations=(),
-        contributions=[
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus.ACCEPTED,
-                created_at=now,
-                accepted_at=now,
-            )
-        ],
+        candidates=[candidate],
         discovery_run_id=discovery_run_id,
         discovery_model_run_id=model_run_id,
         tlp=TLP.AMBER,

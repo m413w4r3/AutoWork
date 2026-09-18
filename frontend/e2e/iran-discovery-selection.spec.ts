@@ -57,7 +57,9 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     publication: ReturnType<typeof source>,
   ) => ({
     id,
-    batch_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    discovery_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+    discovery_batch_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    created_at: "2026-06-01T00:00:00Z",
     local_ref: localRef,
     title,
     summary: "Présentation neutre issue du rapport ChatGPT.",
@@ -76,7 +78,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     countries: [],
     likely_artifacts: ["ioc", "configurations"],
     iocs: [],
-    editorial_status: "proposed",
     sources: [publication],
     incomplete_sources: [],
     actor_or_campaign: "unknown",
@@ -205,6 +206,13 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
           : [],
       });
     }
+    if (
+      path ===
+      `/api/editions/${editionId}/discovery/runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab/candidates`
+    )
+      return route.fulfill({
+        json: searched && jobCompleted ? [cyfirma, ncc] : [],
+      });
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
@@ -235,13 +243,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
               : [],
           candidates: searched && jobCompleted ? [cyfirma, ncc] : [],
           total: searched && jobCompleted ? 2 : 0,
-          merge_stats: {
-            raw_batch_count: searched && jobCompleted ? 1 : 0,
-            raw_candidate_count: searched && jobCompleted ? 2 : 0,
-            consolidated_candidate_count: searched && jobCompleted ? 2 : 0,
-            unique_publication_count: searched && jobCompleted ? 2 : 0,
-            duplicate_publication_occurrence_count: 0,
-          },
           warning: "provisoire",
         },
       });

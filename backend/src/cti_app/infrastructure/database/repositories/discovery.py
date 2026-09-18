@@ -10,10 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
-    ContributionStatus,
     DiscoveryBatch,
     DiscoveryBatchStatus,
-    DiscoveryContribution,
+    DiscoveryCandidate,
+    DiscoveryCandidateEvidence,
     DiscoveryIocStatus,
     DiscoveryIocType,
     DiscoveryRequestSnapshot,
@@ -30,7 +30,11 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow, DiscoveryRunRow
+from cti_app.infrastructure.database.models.discovery import (
+    DiscoveryBatchRow,
+    DiscoveryCandidateRow,
+    DiscoveryRunRow,
+)
 
 
 class SqlAlchemyDiscoveryRunRepository:
@@ -122,16 +126,36 @@ class SqlAlchemyDiscoveryBatchRepository:
         statement = (
             insert(DiscoveryBatchRow)
             .values(**_discovery_batch_values(batch))
-            .on_conflict_do_nothing(
-                index_elements=[DiscoveryBatchRow.id]
-            )
+            .on_conflict_do_nothing(index_elements=[DiscoveryBatchRow.id])
             .returning(DiscoveryBatchRow.id)
         )
-        return await self._session.scalar(statement) is not None
+        inserted_id = await self._session.scalar(statement)
+        if inserted_id is None:
+            return False
+        candidates = [
+            DiscoveryCandidate.from_candidate_topic(
+                candidate,
+                discovery_run_id=batch.discovery_run_id,
+                discovery_batch_id=batch.id,
+                position=position,
+                created_at=batch.created_at,
+            )
+            for position, candidate in enumerate(batch.candidates)
+        ]
+        if candidates:
+            await self._session.execute(
+                insert(DiscoveryCandidateRow),
+                [_discovery_candidate_values(candidate) for candidate in candidates],
+            )
+        await self._session.flush()
+        return True
 
     async def get(self, batch_id: UUID) -> DiscoveryBatch | None:
         row = await self._session.get(DiscoveryBatchRow, batch_id)
-        return _discovery_batch_from_row(row) if row else None
+        if row is None:
+            return None
+        candidates = await self._candidates_for_batch_ids([batch_id])
+        return _discovery_batch_from_row(row, candidates.get(batch_id, ()))
 
     async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
         row = await self._session.scalar(
@@ -140,32 +164,238 @@ class SqlAlchemyDiscoveryBatchRepository:
             .with_for_update()
             .execution_options(populate_existing=True)
         )
-        return _discovery_batch_from_row(row) if row else None
+        if row is None:
+            return None
+        candidates = await self._candidates_for_batch_ids([batch_id])
+        return _discovery_batch_from_row(row, candidates.get(batch_id, ()))
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]:
-        rows = await self._session.scalars(
-            select(DiscoveryBatchRow)
-            .where(DiscoveryBatchRow.edition_id == edition_id)
-            .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
+        rows = list(
+            await self._session.scalars(
+                select(DiscoveryBatchRow)
+                .where(DiscoveryBatchRow.edition_id == edition_id)
+                .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
+            )
         )
-        return [_discovery_batch_from_row(row) for row in rows]
+        candidates = await self._candidates_for_batch_ids([row.id for row in rows])
+        return [_discovery_batch_from_row(row, candidates.get(row.id, ())) for row in rows]
 
     async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryBatch]:
-        rows = await self._session.scalars(
-            select(DiscoveryBatchRow)
-            .where(DiscoveryBatchRow.discovery_run_id == discovery_run_id)
-            .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
+        rows = list(
+            await self._session.scalars(
+                select(DiscoveryBatchRow)
+                .where(DiscoveryBatchRow.discovery_run_id == discovery_run_id)
+                .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
+            )
         )
-        return [_discovery_batch_from_row(row) for row in rows]
+        candidates = await self._candidates_for_batch_ids([row.id for row in rows])
+        return [_discovery_batch_from_row(row, candidates.get(row.id, ())) for row in rows]
+
+    async def _candidates_for_batch_ids(
+        self, batch_ids: Sequence[UUID]
+    ) -> dict[UUID, list[DiscoveryCandidate]]:
+        if not batch_ids:
+            return {}
+        rows = await self._session.scalars(
+            select(DiscoveryCandidateRow)
+            .where(DiscoveryCandidateRow.discovery_batch_id.in_(batch_ids))
+            .order_by(DiscoveryCandidateRow.discovery_batch_id, DiscoveryCandidateRow.position)
+        )
+        result: dict[UUID, list[DiscoveryCandidate]] = {}
+        for row in rows:
+            result.setdefault(row.discovery_batch_id, []).append(
+                _discovery_candidate_from_row(row)
+            )
+        return result
 
     async def save(self, batch: DiscoveryBatch) -> None:
         row = await self._session.get(DiscoveryBatchRow, batch.id)
         if row is None:
             raise LookupError(f"Discovery batch {batch.id} does not exist")
         batch.updated_at = datetime.now(UTC)
-        for field_name, value in _discovery_batch_values(batch).items():
-            setattr(row, field_name, value)
+        row.payload = _discovery_batch_payload(batch)
+        row.updated_at = batch.updated_at
         await self._session.flush()
+
+
+class SqlAlchemyDiscoveryCandidateRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_many(self, candidates: Sequence[DiscoveryCandidate]) -> None:
+        if not candidates:
+            return
+        await self._session.execute(
+            insert(DiscoveryCandidateRow),
+            [_discovery_candidate_values(candidate) for candidate in candidates],
+        )
+        await self._session.flush()
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        row = await self._session.get(DiscoveryCandidateRow, candidate_id)
+        return _discovery_candidate_from_row(row) if row else None
+
+    async def list_for_batch(self, discovery_batch_id: UUID) -> Sequence[DiscoveryCandidate]:
+        rows = await self._session.scalars(
+            select(DiscoveryCandidateRow)
+            .where(DiscoveryCandidateRow.discovery_batch_id == discovery_batch_id)
+            .order_by(DiscoveryCandidateRow.position, DiscoveryCandidateRow.id)
+        )
+        return [_discovery_candidate_from_row(row) for row in rows]
+
+    async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryCandidate]:
+        rows = await self._session.scalars(
+            select(DiscoveryCandidateRow)
+            .join(
+                DiscoveryBatchRow,
+                DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
+            )
+            .where(DiscoveryCandidateRow.discovery_run_id == discovery_run_id)
+            .order_by(
+                DiscoveryBatchRow.created_at,
+                DiscoveryBatchRow.id,
+                DiscoveryCandidateRow.position,
+            )
+        )
+        return [_discovery_candidate_from_row(row) for row in rows]
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]:
+        statement = (
+            select(DiscoveryCandidateRow)
+            .join(
+                DiscoveryBatchRow,
+                DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
+            )
+            .join(DiscoveryRunRow, DiscoveryRunRow.id == DiscoveryBatchRow.discovery_run_id)
+            .where(DiscoveryRunRow.edition_id == edition_id)
+            .where(DiscoveryCandidateRow.discovery_run_id == DiscoveryBatchRow.discovery_run_id)
+        )
+        if not include_replaced:
+            statement = statement.where(
+                DiscoveryBatchRow.payload["replaced_by_batch_id"].astext.is_(None)
+            )
+        rows = await self._session.scalars(
+            statement.order_by(
+                DiscoveryBatchRow.created_at,
+                DiscoveryBatchRow.id,
+                DiscoveryCandidateRow.position,
+            )
+        )
+        return [_discovery_candidate_from_row(row) for row in rows]
+
+    async def save_evidence(self, candidate: DiscoveryCandidate) -> None:
+        """Persist source-verification annotations while leaving candidate metadata unchanged."""
+        row = await self._session.get(DiscoveryCandidateRow, candidate.id)
+        if row is None:
+            raise LookupError(f"Discovery candidate {candidate.id} does not exist")
+        row.evidence = _discovery_candidate_evidence_values(candidate.evidence)
+        await self._session.flush()
+
+
+def _discovery_candidate_values(candidate: DiscoveryCandidate) -> dict[str, object]:
+    return {
+        "id": candidate.id,
+        "discovery_run_id": candidate.discovery_run_id,
+        "discovery_batch_id": candidate.discovery_batch_id,
+        "position": candidate.position,
+        "local_ref": candidate.local_ref,
+        "title": candidate.title,
+        "summary": candidate.summary,
+        "novelty": candidate.novelty,
+        "technical_potential": candidate.technical_potential,
+        "technical_potential_reason": candidate.technical_potential_reason,
+        "event_date": candidate.event_date,
+        "actor_or_campaign": candidate.actor_or_campaign,
+        "context_only": candidate.context_only,
+        "tlp": candidate.tlp.value,
+        "sensitivity": candidate.sensitivity,
+        "external_llm_allowed": candidate.external_llm_allowed,
+        "evidence": _discovery_candidate_evidence_values(candidate.evidence),
+        "created_at": candidate.created_at,
+    }
+
+
+def _discovery_candidate_evidence_values(
+    evidence: DiscoveryCandidateEvidence,
+) -> dict[str, object]:
+    return {
+        "uncertainties": list(evidence.uncertainties),
+        "relevance_reasons": list(evidence.relevance_reasons),
+        "actors": list(evidence.actors),
+        "campaigns": list(evidence.campaigns),
+        "malware": list(evidence.malware),
+        "cves": list(evidence.cves),
+        "victims": list(evidence.victims),
+        "sectors": list(evidence.sectors),
+        "countries": list(evidence.countries),
+        "likely_artifacts": list(evidence.likely_artifacts),
+        "iocs": list(evidence.iocs),
+        "sources": [_source_payload(source) for source in evidence.sources],
+        "incomplete_sources": [
+            _incomplete_source_payload(source) for source in evidence.incomplete_sources
+        ],
+        "provisional_iocs": [_provisional_ioc_payload(ioc) for ioc in evidence.provisional_iocs],
+        "parsing_warnings": list(evidence.parsing_warnings),
+        "markdown_block": evidence.markdown_block,
+    }
+
+
+def _discovery_candidate_from_row(row: DiscoveryCandidateRow) -> DiscoveryCandidate:
+    evidence = row.evidence
+    return DiscoveryCandidate(
+        id=row.id,
+        discovery_run_id=row.discovery_run_id,
+        discovery_batch_id=row.discovery_batch_id,
+        position=row.position,
+        local_ref=row.local_ref,
+        title=row.title,
+        summary=row.summary,
+        novelty=row.novelty,
+        technical_potential=row.technical_potential,
+        technical_potential_reason=row.technical_potential_reason,
+        event_date=row.event_date,
+        actor_or_campaign=row.actor_or_campaign,
+        context_only=row.context_only,
+        tlp=TLP(row.tlp),
+        sensitivity=row.sensitivity,
+        external_llm_allowed=row.external_llm_allowed,
+        evidence=_discovery_candidate_evidence_from_values(evidence),
+        created_at=row.created_at,
+    )
+
+
+def _discovery_candidate_evidence_from_values(
+    value: dict[str, object],
+) -> DiscoveryCandidateEvidence:
+    return DiscoveryCandidateEvidence(
+        uncertainties=_string_tuple(value.get("uncertainties", [])),
+        relevance_reasons=_string_tuple(value.get("relevance_reasons", [])),
+        actors=_string_tuple(value.get("actors", [])),
+        campaigns=_string_tuple(value.get("campaigns", [])),
+        malware=_string_tuple(value.get("malware", [])),
+        cves=_string_tuple(value.get("cves", [])),
+        victims=_string_tuple(value.get("victims", [])),
+        sectors=_string_tuple(value.get("sectors", [])),
+        countries=_string_tuple(value.get("countries", [])),
+        likely_artifacts=_string_tuple(value.get("likely_artifacts", [])),
+        iocs=_string_tuple(value.get("iocs", [])),
+        sources=[
+            _source_from_payload(item)
+            for item in cast(list[dict[str, object]], value.get("sources", []))
+        ],
+        incomplete_sources=[
+            _incomplete_source_from_payload(item)
+            for item in cast(list[dict[str, object]], value.get("incomplete_sources", []))
+        ],
+        provisional_iocs=[
+            _provisional_ioc_from_payload(item)
+            for item in cast(list[dict[str, object]], value.get("provisional_iocs", []))
+        ],
+        parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
+        markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
+    )
 
 
 def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
@@ -180,44 +410,38 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
         "tlp": batch.tlp.value,
         "sensitivity": batch.sensitivity,
         "external_llm_allowed": batch.external_llm_allowed,
-        "payload": {
-            "report_sha256": batch.report_sha256,
-            "parser_version": batch.parser_version,
-            "parsing_status": batch.parsing_status,
-            "parsing_warnings": list(batch.parsing_warnings),
-            "unattached_visible_citations": list(batch.unattached_visible_citations),
-            "parsing_revision": batch.parsing_revision,
-            "supersedes_batch_id": (
-                str(batch.supersedes_batch_id) if batch.supersedes_batch_id else None
-            ),
-            "replaced_by_batch_id": (
-                str(batch.replaced_by_batch_id) if batch.replaced_by_batch_id else None
-            ),
-            "source_mode": batch.source_mode.value,
-            "bridge_capabilities": batch.bridge_capabilities,
-            "citation_count": batch.citation_count,
-            "source_coverage_complete": batch.source_coverage_complete,
-            "source_coverage_incomplete_reason": batch.source_coverage_incomplete_reason,
-            "queries": list(batch.queries),
-            "citations": list(batch.citations),
-            "candidates": [_candidate_payload(candidate) for candidate in batch.candidates],
-            "contributions_meta": [
-                {
-                    "candidate_id": str(contrib.candidate.id),
-                    "status": contrib.status.value,
-                    "created_at": contrib.created_at.isoformat(),
-                    "accepted_at": contrib.accepted_at.isoformat() if contrib.accepted_at else None,
-                    "human_note": contrib.human_note,
-                }
-                for contrib in batch.contributions
-            ],
-        },
+        "payload": _discovery_batch_payload(batch),
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
     }
 
 
+def _discovery_batch_payload(batch: DiscoveryBatch) -> dict[str, object]:
+    return {
+        "report_sha256": batch.report_sha256,
+        "parser_version": batch.parser_version,
+        "parsing_status": batch.parsing_status,
+        "parsing_warnings": list(batch.parsing_warnings),
+        "unattached_visible_citations": list(batch.unattached_visible_citations),
+        "parsing_revision": batch.parsing_revision,
+        "supersedes_batch_id": (
+            str(batch.supersedes_batch_id) if batch.supersedes_batch_id else None
+        ),
+        "replaced_by_batch_id": (
+            str(batch.replaced_by_batch_id) if batch.replaced_by_batch_id else None
+        ),
+        "source_mode": batch.source_mode.value,
+        "bridge_capabilities": batch.bridge_capabilities,
+        "citation_count": batch.citation_count,
+        "source_coverage_complete": batch.source_coverage_complete,
+        "source_coverage_incomplete_reason": batch.source_coverage_incomplete_reason,
+        "queries": list(batch.queries),
+        "citations": list(batch.citations),
+    }
+
+
 def _candidate_payload(candidate: CandidateTopic) -> dict[str, object]:
+    # This adapter is used by cumulative subject payloads, never by batch rows.
     return {
         "id": str(candidate.id),
         "title": candidate.title,
@@ -240,7 +464,6 @@ def _candidate_payload(candidate: CandidateTopic) -> dict[str, object]:
         "tlp": candidate.tlp.value,
         "sensitivity": candidate.sensitivity,
         "external_llm_allowed": candidate.external_llm_allowed,
-        "editorial_status": candidate.editorial_status,
         "sources": [_source_payload(source) for source in candidate.sources],
         "incomplete_sources": [
             _incomplete_source_payload(source) for source in candidate.incomplete_sources
@@ -326,26 +549,10 @@ def _provisional_ioc_payload(ioc: ProvisionalDiscoveryIoc) -> dict[str, object]:
     }
 
 
-def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
+def _discovery_batch_from_row(
+    row: DiscoveryBatchRow, candidates: Sequence[DiscoveryCandidate]
+) -> DiscoveryBatch:
     payload = row.payload
-    candidates = [_candidate_from_payload(item) for item in payload["candidates"]]
-
-    contributions_meta = payload["contributions_meta"]
-    contrib_map = {UUID(m["candidate_id"]): m for m in contributions_meta}
-
-    contributions = []
-    for candidate in candidates:
-        meta = contrib_map[candidate.id]
-        accepted_at_raw = meta["accepted_at"]
-        contributions.append(
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus(meta["status"]),
-                created_at=datetime.fromisoformat(meta["created_at"]),
-                accepted_at=(datetime.fromisoformat(accepted_at_raw) if accepted_at_raw else None),
-                human_note=meta["human_note"],
-            )
-        )
     return DiscoveryBatch(
         id=row.id,
         edition_id=row.edition_id,
@@ -359,7 +566,7 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
         external_llm_allowed=row.external_llm_allowed,
         queries=tuple(payload["queries"]),
         citations=tuple(payload["citations"]),
-        contributions=contributions,
+        candidates=[candidate.to_candidate_topic() for candidate in candidates],
         report_sha256=(str(payload["report_sha256"]) if payload["report_sha256"] else None),
         parser_version=str(payload["parser_version"]),
         parsing_status=str(payload["parsing_status"]),
@@ -429,7 +636,6 @@ def _candidate_from_payload(value: dict[str, object]) -> CandidateTopic:
         parsing_warnings=_string_tuple(value.get("parsing_warnings", [])),
         markdown_block=(str(value["markdown_block"]) if value.get("markdown_block") else None),
         context_only=bool(value.get("context_only", False)),
-        editorial_status=str(value.get("editorial_status", "proposed")),
     )
 
 

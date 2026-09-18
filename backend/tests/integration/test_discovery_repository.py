@@ -1,5 +1,5 @@
 from datetime import UTC, date, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -7,6 +7,8 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
+    DiscoveryCandidateEvidence,
     DiscoveryIocType,
     DiscoveryRequestSnapshot,
     DiscoveryRun,
@@ -24,6 +26,8 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+
+from .edition_codes import reserve_edition_code
 
 pytestmark = pytest.mark.integration
 
@@ -306,8 +310,11 @@ async def test_discovery_batch_round_trip_and_source_status(
             assert persisted_ioc.status.value == "provisional_visible"
             assert persisted_ioc.model_run_id == research_run.id
             assert persisted_ioc.publication_relations[0].publication_id == source.id
-            persisted_source.mark(SourceVerificationStatus.INVALID, actor_id="dev-analyst")
-            await uow.discovery_batches.save(persisted)
+            persisted_candidate = (await uow.discovery_candidates.list_for_batch(batch.id))[0]
+            persisted_candidate.evidence.sources[0].mark(
+                SourceVerificationStatus.INVALID, actor_id="dev-analyst"
+            )
+            await uow.discovery_candidates.save_evidence(persisted_candidate)
             await uow.commit()
 
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -322,10 +329,328 @@ async def test_discovery_batch_round_trip_and_source_status(
         await engine.dispose()
 
 
-async def test_discovery_batch_contributions_metadata_preserved(
+def test_discovery_candidate_domain_projection_and_invariants() -> None:
+    run_id = uuid4()
+    batch_id = uuid4()
+    source = SourceCandidate(
+        url="https://vendor.example/candidate",
+        title="Candidate source",
+        publisher="Vendor",
+        role=SourceRole.PRIMARY,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    topic = CandidateTopic(
+        id=uuid4(),
+        title=" Topic ",
+        summary=" Summary ",
+        novelty=" Novelty ",
+        technical_potential=3,
+        uncertainties=("uncertain",),
+        relevance_reasons=("relevant",),
+        actors=("actor",),
+        campaigns=("campaign",),
+        malware=("malware",),
+        cves=("CVE-2026-0001",),
+        victims=("victim",),
+        sectors=("sector",),
+        countries=("country",),
+        likely_artifacts=("artifact",),
+        iocs=("192.0.2.1",),
+        sources=[source],
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        local_ref="C1",
+        actor_or_campaign="actor",
+        technical_potential_reason="Reason",
+        parsing_warnings=("warning",),
+        markdown_block="candidate markdown",
+        context_only=True,
+    )
+    candidate = DiscoveryCandidate.from_candidate_topic(
+        topic,
+        discovery_run_id=run_id,
+        discovery_batch_id=batch_id,
+        position=4,
+    )
+
+    projected = candidate.to_candidate_topic()
+    assert projected.id == topic.id
+    assert projected.title == "Topic"
+    assert projected.uncertainties == topic.uncertainties
+    assert projected.relevance_reasons == topic.relevance_reasons
+    assert projected.iocs == topic.iocs
+    assert projected.sources[0].url == source.url
+    assert projected.context_only is True
+
+    with pytest.raises(ValueError, match="title, summary and novelty"):
+        DiscoveryCandidate(
+            discovery_run_id=run_id,
+            discovery_batch_id=batch_id,
+            position=0,
+            title=" ",
+            summary="summary",
+            novelty="novelty",
+            technical_potential=0,
+            technical_potential_reason="reason",
+            event_date=None,
+            actor_or_campaign="unknown",
+            context_only=False,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+    with pytest.raises(ValueError, match="between 0 and 4"):
+        DiscoveryCandidate(
+            discovery_run_id=run_id,
+            discovery_batch_id=batch_id,
+            position=0,
+            title="title",
+            summary="summary",
+            novelty="novelty",
+            technical_potential=5,
+            technical_potential_reason="reason",
+            event_date=None,
+            actor_or_campaign="unknown",
+            context_only=False,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+    with pytest.raises(ValueError, match="cannot be negative"):
+        DiscoveryCandidate(
+            discovery_run_id=run_id,
+            discovery_batch_id=batch_id,
+            position=-1,
+            title="title",
+            summary="summary",
+            novelty="novelty",
+            technical_potential=0,
+            technical_potential_reason="reason",
+            event_date=None,
+            actor_or_campaign="unknown",
+            context_only=False,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+
+
+async def test_discovery_candidate_repository_round_trip_and_provenance(
     migrated_postgres_url: str,
 ) -> None:
-    from cti_app.domain.discovery import ContributionStatus, DiscoveryContribution
+    from sqlalchemy import delete
+    from sqlalchemy.exc import IntegrityError
+
+    from cti_app.infrastructure.database.models.discovery import (
+        DiscoveryBatchRow,
+        DiscoveryCandidateRow,
+        DiscoveryRunRow,
+    )
+
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    # Editions are unique per (country_code, period) in the shared test database;
+    # reserve a code no other scenario of this process can allocate.
+    edition = Edition(
+        country="Candidate repository",
+        country_code=reserve_edition_code(),
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+    )
+    discovery_run = DiscoveryRun(
+        edition_id=edition.id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="default-v1",
+        complementary_axis="initial",
+        request_snapshot=DiscoveryRequestSnapshot(
+            country=edition.country,
+            country_code=edition.country_code,
+            country_aliases=(edition.country,),
+            period_start=date(2026, 8, 1),
+            period_end=date(2026, 8, 31),
+            as_of_date=date(2026, 9, 1),
+            languages=("fr",),
+            source_profile="default-v1",
+            keywords=(),
+            exclusions=(),
+            complementary_axis="initial",
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key="candidate-repository",
+        created_by="dev-analyst",
+    )
+    research_run = _run("research", "a")
+    old_batch = DiscoveryBatch(
+        id=uuid4(),
+        edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
+        request_hash="a" * 64,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=research_run.id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="v1",
+        created_at=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+    )
+    new_batch = DiscoveryBatch(
+        id=uuid4(),
+        edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
+        request_hash="b" * 64,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=research_run.id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="v1",
+        supersedes_batch_id=old_batch.id,
+        created_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+    )
+    old_batch.replaced_by_batch_id = new_batch.id
+    source = SourceCandidate(
+        url="https://vendor.example/candidate",
+        title="Candidate source",
+        publisher="Vendor",
+        role=SourceRole.PRIMARY,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    evidence = DiscoveryCandidateEvidence(
+        uncertainties=("uncertain",),
+        relevance_reasons=("relevant",),
+        actors=("actor",),
+        campaigns=("campaign",),
+        malware=("malware",),
+        cves=("CVE-2026-0001",),
+        victims=("victim",),
+        sectors=("sector",),
+        countries=("France",),
+        likely_artifacts=("artifact",),
+        iocs=("192.0.2.1",),
+        sources=[source],
+        parsing_warnings=("warning",),
+        markdown_block="candidate markdown",
+    )
+
+    def make_candidate(batch_id: UUID, position: int) -> DiscoveryCandidate:
+        return DiscoveryCandidate(
+            discovery_run_id=discovery_run.id,
+            discovery_batch_id=batch_id,
+            position=position,
+            local_ref=f"C{position}",
+            title="Candidate title",
+            summary="Candidate summary",
+            novelty="Candidate novelty",
+            technical_potential=4,
+            technical_potential_reason="Technical reason",
+            event_date=date(2026, 8, 20),
+            actor_or_campaign="actor",
+            context_only=True,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+            evidence=evidence,
+        )
+
+    old_candidate = make_candidate(old_batch.id, 0)
+    new_candidate_late = make_candidate(new_batch.id, 2)
+    new_candidate_early = make_candidate(new_batch.id, 0)
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            assert await uow.discovery_runs.add_if_absent(discovery_run)
+            await uow.model_runs.add(research_run)
+            assert await uow.discovery_batches.add_if_absent(old_batch)
+            assert await uow.discovery_batches.add_if_absent(new_batch)
+            await uow.discovery_batches.save(old_batch)
+            await uow.discovery_candidates.add_many(
+                [new_candidate_late, old_candidate, new_candidate_early]
+            )
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.discovery_candidates.get(new_candidate_early.id)
+            assert persisted is not None
+            assert persisted.id == new_candidate_early.id
+            assert persisted.context_only is True
+            assert persisted.evidence.uncertainties == evidence.uncertainties
+            assert persisted.evidence.sources[0].url == source.url
+            assert [
+                item.position
+                for item in await uow.discovery_candidates.list_for_batch(new_batch.id)
+            ] == [0, 2]
+            assert [
+                item.position
+                for item in await uow.discovery_candidates.list_for_run(discovery_run.id)
+            ] == [0, 0, 2]
+            assert [
+                item.id for item in await uow.discovery_candidates.list_for_edition(edition.id)
+            ] == [new_candidate_early.id, new_candidate_late.id]
+            assert {
+                item.id
+                for item in await uow.discovery_candidates.list_for_edition(
+                    edition.id, include_replaced=True
+                )
+            } == {old_candidate.id, new_candidate_early.id, new_candidate_late.id}
+
+            persisted.evidence.sources[0].mark(
+                SourceVerificationStatus.INVALID, actor_id="dev-analyst"
+            )
+            await uow.discovery_candidates.save_evidence(persisted)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            reread = await uow.discovery_candidates.get(new_candidate_early.id)
+            assert reread is not None
+            assert (
+                reread.evidence.sources[0].verification_status is SourceVerificationStatus.INVALID
+            )
+            duplicate = make_candidate(new_batch.id, 0)
+            with pytest.raises(IntegrityError):
+                await uow.discovery_candidates.add_many([duplicate])
+            await uow.rollback()
+
+        async with engine.connect() as connection:
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    delete(DiscoveryBatchRow).where(DiscoveryBatchRow.id == new_batch.id)
+                )
+            await connection.rollback()
+        # discovery_runs is append-only (its trigger fires before any FK check),
+        # so the run-side RESTRICT is asserted on the mapped foreign key.
+        run_foreign_keys = {
+            foreign_key.target_fullname.split(".")[0]: foreign_key.ondelete
+            for foreign_key in DiscoveryCandidateRow.metadata.tables[
+                DiscoveryCandidateRow.__tablename__
+            ].foreign_keys
+        }
+        assert run_foreign_keys == {
+            DiscoveryRunRow.__tablename__: "RESTRICT",
+            DiscoveryBatchRow.__tablename__: "RESTRICT",
+        }
+    finally:
+        await engine.dispose()
+
+
+async def test_discovery_batch_candidates_round_trip_without_payload_copy(
+    migrated_postgres_url: str,
+) -> None:
+    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
 
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
@@ -393,7 +718,6 @@ async def test_discovery_batch_contributions_metadata_preserved(
         sensitivity="internal",
         external_llm_allowed=True,
     )
-    now = datetime.now(UTC)
     batch = DiscoveryBatch(
         edition_id=edition.id,
         discovery_run_id=discovery_run.id,
@@ -408,15 +732,6 @@ async def test_discovery_batch_contributions_metadata_preserved(
         external_llm_allowed=True,
         parser_version="v1",
         parsing_status="completed",
-        contributions=[
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus.ACCEPTED,
-                created_at=now,
-                accepted_at=now,
-                human_note="Manual review: valid candidate",
-            )
-        ],
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -429,58 +744,69 @@ async def test_discovery_batch_contributions_metadata_preserved(
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             persisted = await uow.discovery_batches.get(batch.id)
             assert persisted is not None
-            assert len(persisted.contributions) == 1
-            contrib = persisted.contributions[0]
-            assert contrib.status == ContributionStatus.ACCEPTED
-            assert contrib.created_at == now
-            assert contrib.accepted_at == now
-            assert contrib.human_note == "Manual review: valid candidate"
-            assert contrib.candidate.id == candidate.id
+            assert [item.id for item in persisted.candidates] == [candidate.id]
+            row = await uow._session.get(DiscoveryBatchRow, batch.id)
+            assert row is not None
+            assert "candidates" not in row.payload
+            assert "contributions_meta" not in row.payload
+            canonical = await uow.discovery_candidates.list_for_batch(batch.id)
+            assert [(item.id, item.discovery_run_id, item.position) for item in canonical] == [
+                (candidate.id, discovery_run.id, 0)
+            ]
+
+        # A technical retry of the same deterministic batch never duplicates candidates.
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert not await uow.discovery_batches.add_if_absent(batch)
+            await uow.commit()
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert len(await uow.discovery_candidates.list_for_run(discovery_run.id)) == 1
+
+        # Batch and candidates share one transaction: a failure before commit
+        # leaves neither the batch nor its candidates durable.
+        rolled_back_candidate = CandidateTopic(
+            title="Rolled back",
+            summary="Summary.",
+            novelty="Novel.",
+            technical_potential=1,
+            uncertainties=(),
+            relevance_reasons=(),
+            actors=(),
+            campaigns=(),
+            malware=(),
+            cves=(),
+            victims=(),
+            sectors=(),
+            countries=(),
+            likely_artifacts=(),
+            sources=[],
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+        rolled_back_batch = DiscoveryBatch(
+            edition_id=edition.id,
+            discovery_run_id=discovery_run.id,
+            request_hash="e" * 64,
+            complementary_axis="initial",
+            queries=(),
+            citations=(),
+            candidates=[rolled_back_candidate],
+            discovery_model_run_id=research_run.id,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+            parser_version="v1",
+        )
+        with pytest.raises(RuntimeError, match="before commit"):
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                assert await uow.discovery_batches.add_if_absent(rolled_back_batch)
+                raise RuntimeError("failure before commit")
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.discovery_batches.get(rolled_back_batch.id) is None
+            assert await uow.discovery_candidates.get(rolled_back_candidate.id) is None
+            assert await uow.discovery_candidates.list_for_batch(rolled_back_batch.id) == []
     finally:
         await engine.dispose()
-
-
-async def test_discovery_batch_missing_contributions_meta_fails(
-    migrated_postgres_url: str,
-) -> None:
-    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
-    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
-
-    row = DiscoveryBatchRow(
-        id=uuid4(),
-        edition_id=uuid4(),
-        request_hash="test",
-        complementary_axis="initial",
-        status="completed",
-        discovery_model_run_id=uuid4(),
-        tlp="AMBER",
-        sensitivity="internal",
-        external_llm_allowed=True,
-        payload={
-            "candidates": [],
-            # Missing: contributions_meta
-            "queries": [],
-            "citations": [],
-            "parser_version": "v1",
-            "parsing_status": "completed",
-            "parsing_warnings": [],
-            "unattached_visible_citations": [],
-            "parsing_revision": 1,
-            "supersedes_batch_id": None,
-            "replaced_by_batch_id": None,
-            "source_mode": "visible_citations_only",
-            "bridge_capabilities": {},
-            "citation_count": 0,
-            "source_coverage_complete": False,
-            "source_coverage_incomplete_reason": None,
-            "report_sha256": None,
-        },
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-
-    with pytest.raises(KeyError, match="contributions_meta"):
-        _discovery_batch_from_row(row)
 
 
 async def test_discovery_batch_missing_parser_version_fails(
@@ -500,8 +826,6 @@ async def test_discovery_batch_missing_parser_version_fails(
         sensitivity="internal",
         external_llm_allowed=True,
         payload={
-            "candidates": [],
-            "contributions_meta": [],
             "queries": [],
             "citations": [],
             # Missing: parser_version
@@ -523,241 +847,7 @@ async def test_discovery_batch_missing_parser_version_fails(
     )
 
     with pytest.raises(KeyError, match="parser_version"):
-        _discovery_batch_from_row(row)
-
-
-async def test_discovery_batch_candidate_without_contribution_metadata_fails(
-    migrated_postgres_url: str,
-) -> None:
-    from uuid import uuid4 as make_uuid
-
-    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
-    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
-
-    candidate_id = make_uuid()
-    row = DiscoveryBatchRow(
-        id=make_uuid(),
-        edition_id=make_uuid(),
-        request_hash="test",
-        complementary_axis="initial",
-        status="completed",
-        discovery_model_run_id=make_uuid(),
-        tlp="AMBER",
-        sensitivity="internal",
-        external_llm_allowed=True,
-        payload={
-            "candidates": [
-                {
-                    "id": str(candidate_id),
-                    "title": "Test",
-                    "summary": "Summary.",
-                    "novelty": "Novel.",
-                    "technical_potential": 1,
-                    "tlp": "AMBER",
-                    "sensitivity": "internal",
-                    "external_llm_allowed": True,
-                    "sources": [],
-                    "incomplete_sources": [],
-                    "provisional_iocs": [],
-                    "likely_artifacts": [],
-                    "uncertainties": [],
-                    "relevance_reasons": [],
-                    "actors": [],
-                    "campaigns": [],
-                    "malware": [],
-                    "cves": [],
-                    "victims": [],
-                    "sectors": [],
-                    "countries": [],
-                    "iocs": [],
-                    "parsing_warnings": [],
-                }
-            ],
-            "contributions_meta": [
-                # Missing entry for candidate_id
-            ],
-            "queries": [],
-            "citations": [],
-            "parser_version": "v1",
-            "parsing_status": "completed",
-            "parsing_warnings": [],
-            "unattached_visible_citations": [],
-            "parsing_revision": 1,
-            "supersedes_batch_id": None,
-            "replaced_by_batch_id": None,
-            "source_mode": "visible_citations_only",
-            "bridge_capabilities": {},
-            "citation_count": 0,
-            "source_coverage_complete": False,
-            "source_coverage_incomplete_reason": None,
-            "report_sha256": None,
-        },
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-
-    with pytest.raises(KeyError):
-        _discovery_batch_from_row(row)
-
-
-async def test_discovery_batch_contribution_meta_missing_accepted_at_fails(
-    migrated_postgres_url: str,
-) -> None:
-    from uuid import uuid4 as make_uuid
-
-    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
-    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
-
-    candidate_id = make_uuid()
-    row = DiscoveryBatchRow(
-        id=make_uuid(),
-        edition_id=make_uuid(),
-        request_hash="test",
-        complementary_axis="initial",
-        status="completed",
-        discovery_model_run_id=make_uuid(),
-        tlp="AMBER",
-        sensitivity="internal",
-        external_llm_allowed=True,
-        payload={
-            "candidates": [
-                {
-                    "id": str(candidate_id),
-                    "title": "Test",
-                    "summary": "Summary.",
-                    "novelty": "Novel.",
-                    "technical_potential": 1,
-                    "tlp": "AMBER",
-                    "sensitivity": "internal",
-                    "external_llm_allowed": True,
-                    "sources": [],
-                    "incomplete_sources": [],
-                    "provisional_iocs": [],
-                    "likely_artifacts": [],
-                    "uncertainties": [],
-                    "relevance_reasons": [],
-                    "actors": [],
-                    "campaigns": [],
-                    "malware": [],
-                    "cves": [],
-                    "victims": [],
-                    "sectors": [],
-                    "countries": [],
-                    "iocs": [],
-                    "parsing_warnings": [],
-                }
-            ],
-            "contributions_meta": [
-                {
-                    "candidate_id": str(candidate_id),
-                    "status": "accepted",
-                    "created_at": datetime.now(UTC).isoformat(),
-                    # Missing: accepted_at
-                    "human_note": "",
-                }
-            ],
-            "queries": [],
-            "citations": [],
-            "parser_version": "v1",
-            "parsing_status": "completed",
-            "parsing_warnings": [],
-            "unattached_visible_citations": [],
-            "parsing_revision": 1,
-            "supersedes_batch_id": None,
-            "replaced_by_batch_id": None,
-            "source_mode": "visible_citations_only",
-            "bridge_capabilities": {},
-            "citation_count": 0,
-            "source_coverage_complete": False,
-            "source_coverage_incomplete_reason": None,
-            "report_sha256": None,
-        },
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-
-    with pytest.raises(KeyError, match="accepted_at"):
-        _discovery_batch_from_row(row)
-
-
-async def test_discovery_batch_contribution_meta_missing_human_note_fails(
-    migrated_postgres_url: str,
-) -> None:
-    from uuid import uuid4 as make_uuid
-
-    from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
-    from cti_app.infrastructure.database.repositories.discovery import _discovery_batch_from_row
-
-    candidate_id = make_uuid()
-    row = DiscoveryBatchRow(
-        id=make_uuid(),
-        edition_id=make_uuid(),
-        request_hash="test",
-        complementary_axis="initial",
-        status="completed",
-        discovery_model_run_id=make_uuid(),
-        tlp="AMBER",
-        sensitivity="internal",
-        external_llm_allowed=True,
-        payload={
-            "candidates": [
-                {
-                    "id": str(candidate_id),
-                    "title": "Test",
-                    "summary": "Summary.",
-                    "novelty": "Novel.",
-                    "technical_potential": 1,
-                    "tlp": "AMBER",
-                    "sensitivity": "internal",
-                    "external_llm_allowed": True,
-                    "sources": [],
-                    "incomplete_sources": [],
-                    "provisional_iocs": [],
-                    "likely_artifacts": [],
-                    "uncertainties": [],
-                    "relevance_reasons": [],
-                    "actors": [],
-                    "campaigns": [],
-                    "malware": [],
-                    "cves": [],
-                    "victims": [],
-                    "sectors": [],
-                    "countries": [],
-                    "iocs": [],
-                    "parsing_warnings": [],
-                }
-            ],
-            "contributions_meta": [
-                {
-                    "candidate_id": str(candidate_id),
-                    "status": "accepted",
-                    "created_at": datetime.now(UTC).isoformat(),
-                    "accepted_at": datetime.now(UTC).isoformat(),
-                    # Missing: human_note
-                }
-            ],
-            "queries": [],
-            "citations": [],
-            "parser_version": "v1",
-            "parsing_status": "completed",
-            "parsing_warnings": [],
-            "unattached_visible_citations": [],
-            "parsing_revision": 1,
-            "supersedes_batch_id": None,
-            "replaced_by_batch_id": None,
-            "source_mode": "visible_citations_only",
-            "bridge_capabilities": {},
-            "citation_count": 0,
-            "source_coverage_complete": False,
-            "source_coverage_incomplete_reason": None,
-            "report_sha256": None,
-        },
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-
-    with pytest.raises(KeyError, match="human_note"):
-        _discovery_batch_from_row(row)
+        _discovery_batch_from_row(row, ())
 
 
 def _run(template: str, hash_prefix: str) -> ModelRun:

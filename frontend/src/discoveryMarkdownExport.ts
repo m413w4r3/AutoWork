@@ -1,5 +1,5 @@
 import type {
-  CandidateTopic,
+  DiscoveryCandidate,
   IncompleteSourceCandidate,
   ProvisionalDiscoveryIoc,
   SourceCandidate,
@@ -27,7 +27,9 @@ import type {
  * duplicate refs verbatim silently drops every subject/publication but one
  * per collided ref on re-import.
  */
-export function renderDiscoveryMarkdown(candidates: CandidateTopic[]): string {
+export function renderDiscoveryMarkdown(
+  candidates: DiscoveryCandidate[],
+): string {
   const blocks = candidates.map((candidate, index) =>
     renderSubjectBlock(candidate, `S${index + 1}`),
   );
@@ -35,7 +37,7 @@ export function renderDiscoveryMarkdown(candidates: CandidateTopic[]): string {
 }
 
 function renderSubjectBlock(
-  candidate: CandidateTopic,
+  candidate: DiscoveryCandidate,
   subjectRef: string,
 ): string {
   const lines: string[] = [`## SUBJECT ${subjectRef}`, ""];

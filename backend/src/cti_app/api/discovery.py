@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from copy import deepcopy
-from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -13,8 +10,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import SOURCE_PROFILE_PATTERN
-from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
-from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.discovery.manual_source_edits import (
+    ManualSourceEditOriginNotFoundError,
+    ManualSourceEditService,
+)
 from cti_app.application.discovery.manual_source_edits import (
     SourceCandidateNotFoundError as ManualSourceCandidateNotFoundError,
 )
@@ -23,11 +22,15 @@ from cti_app.application.discovery.runs import (
     DiscoveryRunProjection,
     DiscoveryRunService,
 )
-from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.discovery.service import (
+    DiscoveryRunOwnershipError,
+    DiscoveryService,
+    SourceCandidateNotFoundError,
+)
 from cti_app.application.identity import IdentityProvider
 from cti_app.domain.discovery import (
-    CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoveryIocType,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
@@ -39,10 +42,10 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
+candidate_router = APIRouter(prefix="/api/discovery", tags=["discovery"])
 
 
 class DiscoveryLaunch(BaseModel):
@@ -162,43 +165,11 @@ class ProvisionalIocView(BaseModel):
     warnings: list[str]
 
 
-class CandidateReferenceView(BaseModel):
-    batch_id: UUID
-    candidate_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotCandidateProjection:
-    representative: CandidateTopic
-    member_references: tuple[DiscoveryMemberReference, ...]
-    sources: list[SourceCandidate]
-    duplicate_publication_count: int = 0
-    merge_warnings: tuple[str, ...] = ()
-
-    @property
-    def contribution_count(self) -> int:
-        return len(self.member_references)
-
-
-class DiscoveryMergeStats(BaseModel):
-    """Statistics about consolidation of multiple discovery batches."""
-
-    raw_batch_count: int = Field(description="Total number of active batches")
-    raw_candidate_count: int = Field(description="Total number of candidates across all batches")
-    consolidated_candidate_count: int = Field(
-        description="Number of unique subjects after consolidation"
-    )
-    unique_publication_count: int = Field(
-        description="Total number of unique URLs across consolidated candidates"
-    )
-    duplicate_publication_occurrence_count: int = Field(
-        description="Number of duplicate URL occurrences merged away"
-    )
-
-
 class CandidateView(BaseModel):
     id: UUID
-    batch_id: UUID
+    discovery_batch_id: UUID
+    discovery_run_id: UUID
+    created_at: datetime
     title: str
     summary: str
     novelty: str
@@ -219,7 +190,6 @@ class CandidateView(BaseModel):
     provisional_ioc_count: int
     provisional_ioc_type_counts: dict[str, int]
     has_publisher_ioc_count: bool
-    editorial_status: Literal["proposed"]
     sources: list[SourceView]
     incomplete_sources: list[IncompleteSourceView]
     local_ref: str | None
@@ -230,16 +200,6 @@ class CandidateView(BaseModel):
     selectable: bool
     valid_publication_count: int
     incomplete_publication_count: int
-    member_references: list[CandidateReferenceView] = Field(default_factory=list)
-    contribution_count: int = Field(
-        default=1, description="Number of batches contributing to this candidate"
-    )
-    duplicate_publication_count: int = Field(
-        default=0, description="Number of duplicate URLs merged"
-    )
-    merge_warnings: list[str] = Field(
-        default_factory=list, description="Metadata conflicts during consolidation"
-    )
 
 
 class BatchView(BaseModel):
@@ -271,10 +231,6 @@ class DiscoveryView(BaseModel):
     batches: list[BatchView]
     candidates: list[CandidateView]
     total: int
-    snapshot_version: int | None = None
-    merge_stats: DiscoveryMergeStats = Field(
-        description="Statistics about consolidation of multiple discovery batches"
-    )
     warning: str = (
         "Les métadonnées et comptes IOC de découverte sont provisoires. Ils seront vérifiés "
         "depuis les documents archivés après la sélection."
@@ -373,39 +329,12 @@ async def read_candidates(
 ) -> DiscoveryView:
     service: DiscoveryService = request.app.state.discovery_service
     batches = await service.list_batches(edition_id, include_replaced=include_replaced)
-    active_batches = [batch for batch in batches if batch.is_active_revision]
-
-    cumulative: CumulativeDiscoveryService | None = getattr(
-        request.app.state, "cumulative_discovery_service", None
+    candidates = await service.list_candidates_for_edition(
+        edition_id, include_replaced=include_replaced
     )
-    snapshot = await cumulative.active_snapshot(edition_id) if cumulative is not None else None
-    if snapshot is not None:
-        # Read-only projection of already-materialized state; no consolidation/merge here.
-        consolidated = []
-        for subject in snapshot.subjects:
-            candidate = deepcopy(subject.candidate)
-            candidate.id = subject.subject_id
-            consolidated.append(
-                SnapshotCandidateProjection(
-                    representative=candidate,
-                    member_references=subject.member_references,
-                    sources=candidate.sources,
-                )
-            )
-    else:
-        consolidated = []
 
-    raw_batch_count = len(active_batches)
-    raw_candidate_count = sum(len(batch.candidates) for batch in active_batches)
-    unique_publication_count = sum(len(cand.sources) for cand in consolidated)
-    total_duplicate_count = sum(cand.duplicate_publication_count for cand in consolidated)
-
-    filtered: list[
-        tuple[CandidateTopic, list[CandidateReferenceView], int, int, tuple[str, ...]]
-    ] = []
-    for cand in consolidated:
-        candidate = cand.representative
-
+    filtered: list[DiscoveryCandidate] = []
+    for candidate in candidates:
         if search:
             needle = search.casefold()
             if (
@@ -418,48 +347,63 @@ async def read_candidates(
             continue
 
         if source_status is not None:
-            if not any(source.verification_status is source_status for source in candidate.sources):
+            if not any(
+                source.verification_status is source_status
+                for source in candidate.evidence.sources
+            ):
                 continue
 
-        filtered.append(
-            (
-                candidate,
-                [
-                    CandidateReferenceView(batch_id=ref.batch_id, candidate_id=ref.candidate_id)
-                    for ref in cand.member_references
-                ],
-                cand.contribution_count,
-                cand.duplicate_publication_count,
-                cand.merge_warnings,
-            )
-        )
+        filtered.append(candidate)
 
     key = {
-        "newest": lambda item: (item[0].event_date or date.min, item[0].title.casefold()),
-        "technical": lambda item: (item[0].technical_potential, item[0].title.casefold()),
-        "novelty": lambda item: (item[0].novelty.casefold(), item[0].title.casefold()),
-        "title": lambda item: item[0].title.casefold(),
+        "newest": lambda item: (item.event_date or date.min, item.title.casefold()),
+        "technical": lambda item: (item.technical_potential, item.title.casefold()),
+        "novelty": lambda item: (item.novelty.casefold(), item.title.casefold()),
+        "title": lambda item: item.title.casefold(),
     }[sort]
     ordered = sorted(filtered, key=key, reverse=sort != "title")
 
-    candidate_views = [
-        _candidate_view(candidate, references, contribution_count, dup_count, merge_warnings)
-        for candidate, references, contribution_count, dup_count, merge_warnings in ordered
-    ]
+    candidate_views = [_candidate_view(candidate) for candidate in ordered]
 
     return DiscoveryView(
         batches=[_batch_view(edition_id, batch) for batch in batches],
         candidates=candidate_views,
         total=len(candidate_views),
-        snapshot_version=snapshot.version if snapshot else None,
-        merge_stats=DiscoveryMergeStats(
-            raw_batch_count=raw_batch_count,
-            raw_candidate_count=raw_candidate_count,
-            consolidated_candidate_count=len(consolidated),
-            unique_publication_count=unique_publication_count,
-            duplicate_publication_occurrence_count=total_duplicate_count,
-        ),
     )
+
+
+@router.get("/runs/{run_id}/candidates", response_model=list[CandidateView])
+async def read_run_candidates(
+    edition_id: UUID,
+    run_id: UUID,
+    request: Request,
+    include_replaced: bool = False,
+) -> list[CandidateView]:
+    service: DiscoveryService = request.app.state.discovery_service
+    try:
+        candidates = await service.list_candidates_for_run(
+            edition_id, run_id, include_replaced=include_replaced
+        )
+        return [_candidate_view(candidate) for candidate in candidates]
+    except DiscoveryRunOwnershipError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "discovery_run_not_found"},
+        ) from exc
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@candidate_router.get("/candidates/{candidate_id}", response_model=CandidateView)
+async def read_candidate(candidate_id: UUID, request: Request) -> CandidateView:
+    service: DiscoveryService = request.app.state.discovery_service
+    candidate = await service.get_candidate(candidate_id)
+    if candidate is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "discovery_candidate_not_found"},
+        )
+    return _candidate_view(candidate)
 
 
 @router.post(
@@ -514,30 +458,13 @@ async def read_archived_report(
         _raise_api_error(exc)
 
 
-@router.patch("/sources/{source_id}", response_model=SourceView)
-async def mark_source(
-    edition_id: UUID, source_id: UUID, payload: SourceStatusUpdate, request: Request
-) -> SourceView:
-    service: DiscoveryService = request.app.state.discovery_service
-    provider: IdentityProvider = request.app.state.identity_provider
-    try:
-        identity = await provider.current()
-        return _source_view(
-            await service.mark_source(
-                edition_id, source_id, payload.status, actor_id=identity.actor_id
-            )
-        )
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
 @router.patch(
-    "/candidates/{subject_id}/incomplete-sources/{incomplete_source_id}",
+    "/candidates/{candidate_id}/incomplete-sources/{incomplete_source_id}",
     response_model=IncompleteSourceAttachmentView,
 )
 async def attach_incomplete_source_url(
     edition_id: UUID,
-    subject_id: UUID,
+    candidate_id: UUID,
     incomplete_source_id: UUID,
     payload: IncompleteSourceUrlAttachment,
     request: Request,
@@ -548,7 +475,7 @@ async def attach_incomplete_source_url(
         identity = await provider.current()
         result = await service.attach_incomplete_source_url(
             edition_id,
-            subject_id,
+            candidate_id,
             incomplete_source_id,
             payload.url,
             actor_id=identity.actor_id,
@@ -557,17 +484,19 @@ async def attach_incomplete_source_url(
             source=_source_view(result.promoted_source),
             updated_subject_ids=list(result.updated_subject_ids),
         )
+    except ManualSourceEditOriginNotFoundError as exc:
+        raise _legacy_projection_conflict() from exc
     except Exception as exc:
         _raise_api_error(exc)
 
 
 @router.patch(
-    "/candidates/{subject_id}/sources/replacement",
+    "/candidates/{candidate_id}/sources/replacement",
     response_model=IncompleteSourceAttachmentView,
 )
 async def attach_replacement_source_url(
     edition_id: UUID,
-    subject_id: UUID,
+    candidate_id: UUID,
     payload: SourceUrlReplacement,
     request: Request,
 ) -> IncompleteSourceAttachmentView:
@@ -576,6 +505,51 @@ async def attach_replacement_source_url(
     try:
         identity = await provider.current()
         result = await service.attach_replacement_source_url(
+            edition_id,
+            candidate_id,
+            payload.replaced_canonical_url,
+            payload.url,
+            actor_id=identity.actor_id,
+        )
+        return IncompleteSourceAttachmentView(
+            source=_source_view(result.promoted_source),
+            updated_subject_ids=list(result.updated_subject_ids),
+        )
+    except ManualSourceCandidateNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "source_candidate_not_found"},
+        ) from exc
+    except ManualSourceEditOriginNotFoundError as exc:
+        raise _legacy_projection_conflict() from exc
+    except ValueError as exc:
+        # canonicalize_http_url rejects malformed replacement URLs at the
+        # service boundary; malformed request data is a client error.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_source_url", "message": str(exc)},
+        ) from exc
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.patch(
+    "/subjects/{subject_id}/sources/replacement",
+    response_model=IncompleteSourceAttachmentView,
+)
+async def attach_subject_replacement_source_url(
+    edition_id: UUID,
+    subject_id: UUID,
+    payload: SourceUrlReplacement,
+    request: Request,
+) -> IncompleteSourceAttachmentView:
+    """Temporary AW-008 adapter: the selected-Subject pipeline addresses a
+    replacement by its subject id; the persisted candidate is resolved internally."""
+    service: ManualSourceEditService = request.app.state.manual_source_edit_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        identity = await provider.current()
+        result = await service.attach_replacement_source_url_for_subject(
             edition_id,
             subject_id,
             payload.replaced_canonical_url,
@@ -591,15 +565,50 @@ async def attach_replacement_source_url(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "source_candidate_not_found"},
         ) from exc
+    except ManualSourceEditOriginNotFoundError as exc:
+        raise _legacy_projection_conflict() from exc
     except ValueError as exc:
-        # canonicalize_http_url rejects malformed replacement URLs at the
-        # service boundary; malformed request data is a client error.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_source_url", "message": str(exc)},
         ) from exc
     except Exception as exc:
         _raise_api_error(exc)
+
+
+@router.patch("/candidates/{candidate_id}/sources/{source_id}", response_model=SourceView)
+async def mark_source(
+    edition_id: UUID,
+    candidate_id: UUID,
+    source_id: UUID,
+    payload: SourceStatusUpdate,
+    request: Request,
+) -> SourceView:
+    service: DiscoveryService = request.app.state.discovery_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        identity = await provider.current()
+        return _source_view(
+            await service.mark_source(
+                edition_id, candidate_id, source_id, payload.status, actor_id=identity.actor_id
+            )
+        )
+    except SourceCandidateNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "source_candidate_not_found"},
+        ) from exc
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+def _legacy_projection_conflict() -> HTTPException:
+    # The candidate exists but the temporary cumulative adapter cannot map it to
+    # exactly one active legacy subject (not yet consolidated, or ambiguous).
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "discovery_candidate_not_consolidated"},
+    )
 
 
 def _discovery_run_view(projection: DiscoveryRunProjection) -> DiscoveryRunView:
@@ -676,61 +685,52 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
 
 
 def _candidate_view(
-    candidate: CandidateTopic,
-    member_references: list[CandidateReferenceView] | None = None,
-    contribution_count: int = 1,
-    duplicate_publication_count: int = 0,
-    merge_warnings: Sequence[str] | None = None,
+    candidate: DiscoveryCandidate,
 ) -> CandidateView:
-    # member_references, when given, lists cluster members oldest contribution first.
+    topic = candidate.to_candidate_topic()
     type_counts: dict[str, int] = {}
-    for ioc in candidate.provisional_iocs:
+    for ioc in topic.provisional_iocs:
         type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
 
-    batch_id = member_references[0].batch_id if member_references else candidate.id
-
     return CandidateView(
-        id=candidate.id,
-        batch_id=batch_id,
-        title=candidate.title,
-        summary=candidate.summary,
-        novelty=candidate.novelty,
-        technical_potential=candidate.technical_potential,
-        event_date=candidate.event_date,
-        uncertainties=list(candidate.uncertainties),
-        relevance_reasons=list(candidate.relevance_reasons),
-        actors=list(candidate.actors),
-        campaigns=list(candidate.campaigns),
-        malware=list(candidate.malware),
-        cves=list(candidate.cves),
-        victims=list(candidate.victims),
-        sectors=list(candidate.sectors),
-        countries=list(candidate.countries),
-        likely_artifacts=list(candidate.likely_artifacts),
-        iocs=list(candidate.iocs),
-        provisional_iocs=[_provisional_ioc_view(ioc) for ioc in candidate.provisional_iocs],
-        provisional_ioc_count=len(candidate.provisional_iocs),
+        id=topic.id,
+        discovery_batch_id=candidate.discovery_batch_id,
+        discovery_run_id=candidate.discovery_run_id,
+        created_at=candidate.created_at,
+        title=topic.title,
+        summary=topic.summary,
+        novelty=topic.novelty,
+        technical_potential=topic.technical_potential,
+        event_date=topic.event_date,
+        uncertainties=list(topic.uncertainties),
+        relevance_reasons=list(topic.relevance_reasons),
+        actors=list(topic.actors),
+        campaigns=list(topic.campaigns),
+        malware=list(topic.malware),
+        cves=list(topic.cves),
+        victims=list(topic.victims),
+        sectors=list(topic.sectors),
+        countries=list(topic.countries),
+        likely_artifacts=list(topic.likely_artifacts),
+        iocs=list(topic.iocs),
+        provisional_iocs=[_provisional_ioc_view(ioc) for ioc in topic.provisional_iocs],
+        provisional_ioc_count=len(topic.provisional_iocs),
         provisional_ioc_type_counts=type_counts,
         has_publisher_ioc_count=any(
-            source.ioc_declared_count is not None for source in candidate.sources
+            source.ioc_declared_count is not None for source in topic.sources
         ),
-        editorial_status="proposed",
-        sources=[_source_view(source) for source in candidate.sources],
+        sources=[_source_view(source) for source in topic.sources],
         incomplete_sources=[
-            _incomplete_source_view(source) for source in candidate.incomplete_sources
+            _incomplete_source_view(source) for source in topic.incomplete_sources
         ],
-        local_ref=candidate.local_ref,
-        actor_or_campaign=candidate.actor_or_campaign,
-        technical_potential_reason=candidate.technical_potential_reason,
-        parsing_warnings=list(candidate.parsing_warnings),
-        context_only=candidate.context_only,
-        selectable=candidate.selectable,
-        valid_publication_count=len(candidate.sources),
-        incomplete_publication_count=len(candidate.incomplete_sources),
-        member_references=member_references or [],
-        contribution_count=contribution_count,
-        duplicate_publication_count=duplicate_publication_count,
-        merge_warnings=list(merge_warnings or []),
+        local_ref=topic.local_ref,
+        actor_or_campaign=topic.actor_or_campaign,
+        technical_potential_reason=topic.technical_potential_reason,
+        parsing_warnings=list(topic.parsing_warnings),
+        context_only=topic.context_only,
+        selectable=topic.selectable,
+        valid_publication_count=len(topic.sources),
+        incomplete_publication_count=len(topic.incomplete_sources),
     )
 
 

@@ -12,6 +12,7 @@ import {
   confirmManualDiscoveryRecovery,
   confirmVisibleDiscoveryRecovery,
   fetchDiscovery,
+  fetchDiscoveryRunCandidates,
   fetchDiscoveryRuns,
   launchDiscoveryRun,
   markDiscoverySource,
@@ -142,6 +143,10 @@ export function DiscoveryPanel({
       ),
     [discoveryRuns.data],
   );
+  const discoveryRunById = useMemo(
+    () => new Map(runs.map((run) => [run.run_id, run])),
+    [runs],
+  );
   useEffect(() => {
     if (runs.length === 0) {
       setSelectedRunId(null);
@@ -153,6 +158,13 @@ export function DiscoveryPanel({
   }, [runs, selectedRunId]);
   const selectedRun =
     runs.find((run) => run.run_id === selectedRunId) ?? runs[0];
+  const selectedRunCandidates = useQuery({
+    // Nested under ["discovery", editionId] so every discovery invalidation
+    // (job completion, source verification, URL correction) refreshes it.
+    queryKey: ["discovery", editionId, "run-candidates", selectedRun?.run_id],
+    queryFn: () => fetchDiscoveryRunCandidates(editionId, selectedRun!.run_id),
+    enabled: Boolean(selectedRun),
+  });
   const selectedJobId = selectedRun?.execution?.job_id ?? null;
   const selectedJob = useQuery({
     queryKey: ["job", selectedJobId],
@@ -220,26 +232,33 @@ export function DiscoveryPanel({
   });
   const markSource = useMutation({
     mutationFn: ({
+      candidateId,
       sourceId,
       status,
     }: {
+      candidateId: string;
       sourceId: string;
       status: SourceVerificationStatus;
-    }) => markDiscoverySource(editionId, sourceId, status),
+    }) => markDiscoverySource(editionId, candidateId, sourceId, status),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
   const attachUrl = useMutation({
     mutationFn: ({
-      subjectId,
+      candidateId,
       incompleteSourceId,
       url,
     }: {
-      subjectId: string;
+      candidateId: string;
       incompleteSourceId: string;
       url: string;
     }) =>
-      attachIncompleteSourceUrl(editionId, subjectId, incompleteSourceId, url),
+      attachIncompleteSourceUrl(
+        editionId,
+        candidateId,
+        incompleteSourceId,
+        url,
+      ),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
@@ -380,13 +399,13 @@ export function DiscoveryPanel({
       });
     },
   });
-  const candidates = discovery.data?.candidates ?? [];
+  const candidateData = discovery.data?.candidates;
+  const candidates = useMemo(() => candidateData ?? [], [candidateData]);
   const discoveryMarkdownExport = useMemo(
     () => renderDiscoveryMarkdown(candidates),
     [candidates],
   );
   const batches = discovery.data?.batches ?? [];
-  const mergeStats = discovery.data?.merge_stats;
   const handleJobTerminal = useCallback(() => {
     void queryClient.invalidateQueries({
       queryKey: ["discovery-runs", editionId],
@@ -538,6 +557,38 @@ export function DiscoveryPanel({
             );
           })}
         </ol>
+        {selectedRun ? (
+          <section
+            className="discovery-run-candidates"
+            aria-label={`Candidats de la recherche ${selectedRun.complementary_axis}`}
+          >
+            <h4>Candidats produits par cette recherche</h4>
+            {selectedRunCandidates.isPending ? (
+              <p role="status">Chargement des candidats de la recherche…</p>
+            ) : null}
+            {selectedRunCandidates.isError ? (
+              <p role="alert" className="error-message">
+                Impossible de récupérer les candidats de cette recherche.
+              </p>
+            ) : null}
+            {!selectedRunCandidates.isPending &&
+            !selectedRunCandidates.isError ? (
+              <>
+                <p>
+                  {selectedRunCandidates.data?.length ?? 0} candidat(s)
+                  canonique(s)
+                </p>
+                {selectedRunCandidates.data?.length ? (
+                  <ul>
+                    {selectedRunCandidates.data.slice(0, 5).map((candidate) => (
+                      <li key={candidate.id}>{candidate.title}</li>
+                    ))}
+                  </ul>
+                ) : null}
+              </>
+            ) : null}
+          </section>
+        ) : null}
       </section>
       {mergeReconciling ? (
         <p className="merge-review__blocked" role="status">
@@ -918,70 +969,6 @@ export function DiscoveryPanel({
             fallback="Candidats inaccessibles."
           />
         ) : null}
-        {mergeStats ? (
-          <section className="discovery-consolidation-stats">
-            <h4>Découverte cumulée</h4>
-            <p className="stats-caption">
-              Chaque contribution apporte des candidats bruts, que la
-              consolidation regroupe en sujets uniques.
-            </p>
-            <div className="stats-grid">
-              <div className="stat-item">
-                <span className="stat-label">Contributions</span>
-                <span className="stat-value">{mergeStats.raw_batch_count}</span>
-                <span className="stat-hint">recherches et imports reçus</span>
-              </div>
-              <div className="stat-item">
-                <span className="stat-label">Candidats bruts</span>
-                <span className="stat-value">
-                  {mergeStats.raw_candidate_count}
-                </span>
-                <span className="stat-hint">avant regroupement</span>
-              </div>
-              <div className="stat-item">
-                <span className="stat-label">Sujets consolidés</span>
-                <span className="stat-value">
-                  {mergeStats.consolidated_candidate_count}
-                </span>
-                <span className="stat-hint">après regroupement</span>
-              </div>
-              <div className="stat-item">
-                <span className="stat-label">Candidats regroupés</span>
-                {/* The number the analyst actually looks for: how much the
-                    consolidation collapsed. It is derived, not returned. */}
-                <span className="stat-value">
-                  {Math.max(
-                    0,
-                    mergeStats.raw_candidate_count -
-                      mergeStats.consolidated_candidate_count,
-                  )}
-                </span>
-                <span className="stat-hint">
-                  candidats absorbés dans un sujet
-                </span>
-              </div>
-              <div className="stat-item">
-                <span className="stat-label">Publications uniques</span>
-                <span className="stat-value">
-                  {mergeStats.unique_publication_count}
-                </span>
-                <span className="stat-hint">URL distinctes citées</span>
-              </div>
-              <div className="stat-item">
-                {/* Named for what it counts: repeated publication URLs, not
-                    merged subjects — reading it as "no merge happened" is a
-                    trap this label used to set. */}
-                <span className="stat-label">Publications en double</span>
-                <span className="stat-value">
-                  {mergeStats.duplicate_publication_occurrence_count}
-                </span>
-                <span className="stat-hint">
-                  citées par plusieurs candidats
-                </span>
-              </div>
-            </div>
-          </section>
-        ) : null}
         <DiscoveryMergeReview
           editionId={editionId}
           readOnly={readOnly}
@@ -994,6 +981,23 @@ export function DiscoveryPanel({
                 <h3>{candidate.title}</h3>
                 <span>Technique {candidate.technical_potential}/4</span>
               </div>
+              <p>
+                <strong>Recherche d’origine :</strong>{" "}
+                {candidate.discovery_run_id}
+                {discoveryRunById.get(candidate.discovery_run_id)
+                  ? ` · ${discoveryRunById.get(candidate.discovery_run_id)?.complementary_axis}`
+                  : ""}
+              </p>
+              {candidate.event_date ? (
+                <p>
+                  <strong>Date de l’événement :</strong> {candidate.event_date}
+                </p>
+              ) : null}
+              {candidate.context_only ? (
+                <p>
+                  <strong>Contexte uniquement</strong>
+                </p>
+              ) : null}
               <p>{candidate.summary}</p>
               <p>
                 <strong>Acteur ou campagne proposé :</strong>{" "}
@@ -1107,6 +1111,7 @@ export function DiscoveryPanel({
                       disabled={readOnly || markSource.isPending}
                       onChange={(event) =>
                         markSource.mutate({
+                          candidateId: candidate.id,
                           sourceId: source.id,
                           status: event.target
                             .value as SourceVerificationStatus,
@@ -1148,7 +1153,7 @@ export function DiscoveryPanel({
                         }
                         onSubmit={(url) =>
                           attachUrl.mutate({
-                            subjectId: candidate.id,
+                            candidateId: candidate.id,
                             incompleteSourceId: source.id,
                             url,
                           })

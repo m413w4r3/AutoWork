@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application.discovery.manual_source_edits import (
     MANUAL_SOURCE_EDIT_VERSION,
+    IncompleteSourceCandidateNotFoundError,
     ManualSourceEditService,
     _build_manual_edit_batch,
 )
@@ -15,7 +16,9 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
+    IncompleteSourceCandidate,
     SourceCandidate,
     SourceRelationshipStatus,
     SourceRole,
@@ -93,6 +96,23 @@ class _BatchRepository:
         return [batch for batch in self.batches if batch.edition_id == edition_id]
 
 
+class _CandidateRepository:
+    def __init__(self, candidates: list[DiscoveryCandidate]) -> None:
+        self.candidates = {candidate.id: candidate for candidate in candidates}
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        return self.candidates.get(candidate_id)
+
+
+class _RunRepository:
+    def __init__(self, edition_id: object) -> None:
+        self.edition_id = edition_id
+
+    async def get(self, run_id: object) -> object:
+        del run_id
+        return type("Run", (), {"edition_id": self.edition_id})()
+
+
 class _GroupRepository:
     def __init__(self, groups: list[EditorialGroup]) -> None:
         self.groups = groups
@@ -105,9 +125,17 @@ class _GroupRepository:
 
 
 class _Uow:
-    def __init__(self, batches: _BatchRepository, groups: _GroupRepository) -> None:
+    def __init__(
+        self,
+        batches: _BatchRepository,
+        groups: _GroupRepository,
+        candidates: _CandidateRepository,
+        runs: _RunRepository,
+    ) -> None:
         self.discovery_batches = batches
         self.editorial_groups = groups
+        self.discovery_candidates = candidates
+        self.discovery_runs = runs
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -321,14 +349,29 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
         is_active=True,
     )
     batches = _BatchRepository([old_batch])
-    uow = _Uow(batches, _GroupRepository([group, other_group]))
+    uow = _Uow(
+        batches,
+        _GroupRepository([group, other_group]),
+        _CandidateRepository(
+            [
+                DiscoveryCandidate.from_candidate_topic(
+                    candidate,
+                    discovery_run_id=originating_run_id,
+                    discovery_batch_id=old_batch.id,
+                    position=0,
+                    created_at=old_batch.created_at,
+                )
+            ]
+        ),
+        _RunRepository(edition_id),
+    )
     archive = _Archive()
     cumulative = _Cumulative(snapshot)
     service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]
 
     result = await service.attach_replacement_source_url(
         edition_id,
-        subject_id,
+        candidate.id,
         old.canonical_url,
         "https://mirror.example/report",
         actor_id="analyst-1",
@@ -343,6 +386,9 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
         "https://mirror.example/report"
     ]
     assert manual_candidate.local_ref == "manual-url-replace"
+    # The correction is a new immutable candidate; the historical one keeps its identity.
+    assert manual_candidate.id != candidate.id
+    assert manual_batch.discovery_run_id == originating_run_id
     assert old.canonical_url not in {source.canonical_url for source in manual_candidate.sources}
     assert group.candidate_references == (CandidateReference(manual_batch.id, manual_candidate.id),)
     assert other_group.candidate_references == (
@@ -419,14 +465,29 @@ async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> Non
         is_active=True,
     )
     batches = _BatchRepository([unrelated_batch, originating_batch])
-    uow = _Uow(batches, _GroupRepository([]))
+    uow = _Uow(
+        batches,
+        _GroupRepository([]),
+        _CandidateRepository(
+            [
+                DiscoveryCandidate.from_candidate_topic(
+                    candidate,
+                    discovery_run_id=originating_run_id,
+                    discovery_batch_id=originating_batch.id,
+                    position=0,
+                    created_at=originating_batch.created_at,
+                )
+            ]
+        ),
+        _RunRepository(edition_id),
+    )
     archive = _Archive()
     cumulative = _Cumulative(snapshot)
     service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]
 
     await service.attach_replacement_source_url(
         edition_id,
-        subject_id,
+        candidate.id,
         old.canonical_url,
         "https://mirror.example/originating-report",
         actor_id="analyst-1",
@@ -438,3 +499,115 @@ async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> Non
         if batch.id not in {originating_batch.id, unrelated_batch.id}
     )
     assert manual_batch.discovery_run_id == originating_run_id
+
+
+@pytest.mark.asyncio
+async def test_attach_incomplete_source_by_candidate_id_creates_new_candidates() -> None:
+    edition_id = uuid4()
+    run_a, run_b = uuid4(), uuid4()
+    subject_a, subject_b = uuid4(), uuid4()
+
+    def incomplete() -> IncompleteSourceCandidate:
+        return IncompleteSourceCandidate(
+            title="Kharon research note on regional intrusion campaign",
+            publisher="Kharon",
+        )
+
+    candidate_a = _topic_candidate(title="Candidate A")
+    candidate_a.incomplete_sources = [incomplete()]
+    candidate_b = _topic_candidate(title="Candidate B")
+    candidate_b.incomplete_sources = [incomplete()]
+    batches_by_run = {
+        run_id: DiscoveryBatch(
+            edition_id=edition_id,
+            discovery_run_id=run_id,
+            request_hash=request_hash * 64,
+            complementary_axis="research",
+            queries=(),
+            citations=(),
+            discovery_model_run_id=uuid4(),
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+            parser_version="test",
+            candidates=[topic],
+            source_mode=DiscoverySourceMode.MANUAL_IMPORT,
+            source_coverage_complete=False,
+            source_coverage_incomplete_reason="test",
+        )
+        for run_id, topic, request_hash in (
+            (run_a, candidate_a, "a"),
+            (run_b, candidate_b, "b"),
+        )
+    }
+    batch_a, batch_b = batches_by_run[run_a], batches_by_run[run_b]
+    snapshot = DiscoverySnapshot(
+        edition_id=edition_id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=uuid4(),
+        merge_run_id=uuid4(),
+        planner_kind=DiscoveryPlannerKind.HEURISTIC,
+        subjects=(
+            DiscoverySubject(
+                subject_id=subject_a,
+                candidate=candidate_a,
+                member_references=(DiscoveryMemberReference(batch_a.id, candidate_a.id),),
+                created_at=datetime.now(UTC),
+            ),
+            DiscoverySubject(
+                subject_id=subject_b,
+                candidate=candidate_b,
+                member_references=(DiscoveryMemberReference(batch_b.id, candidate_b.id),),
+                created_at=datetime.now(UTC),
+            ),
+        ),
+        snapshot_hash="f" * 64,
+        is_active=True,
+    )
+    batches = _BatchRepository([batch_a, batch_b])
+    uow = _Uow(
+        batches,
+        _GroupRepository([]),
+        _CandidateRepository(
+            [
+                DiscoveryCandidate.from_candidate_topic(
+                    topic,
+                    discovery_run_id=batch.discovery_run_id,
+                    discovery_batch_id=batch.id,
+                    position=0,
+                    created_at=batch.created_at,
+                )
+                for topic, batch in ((candidate_a, batch_a), (candidate_b, batch_b))
+            ]
+        ),
+        _RunRepository(edition_id),
+    )
+    archive = _Archive()
+    cumulative = _Cumulative(snapshot)
+    service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]
+
+    result = await service.attach_incomplete_source_url(
+        edition_id,
+        candidate_a.id,
+        candidate_a.incomplete_sources[0].id,
+        "https://kharon.example/research-note",
+        actor_id="analyst-1",
+    )
+
+    assert result.promoted_source.canonical_url == "https://kharon.example/research-note"
+    assert result.updated_subject_ids == (subject_a, subject_b)
+    manual_batches = [batch for batch in batches.batches if batch not in (batch_a, batch_b)]
+    assert {batch.discovery_run_id for batch in manual_batches} == {run_a, run_b}
+    manual_ids = {batch.candidates[0].id for batch in manual_batches}
+    assert manual_ids.isdisjoint({candidate_a.id, candidate_b.id})
+    assert all(not batch.candidates[0].incomplete_sources for batch in manual_batches)
+
+    with pytest.raises(IncompleteSourceCandidateNotFoundError):
+        await service.attach_incomplete_source_url(
+            edition_id,
+            uuid4(),
+            candidate_a.incomplete_sources[0].id,
+            "https://kharon.example/research-note",
+            actor_id="analyst-1",
+        )

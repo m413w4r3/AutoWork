@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import date
 from uuid import UUID
 
 import pytest
@@ -7,9 +7,7 @@ from cti_app.application.discovery.cumulative.service import CumulativeDiscovery
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
-    ContributionStatus,
     DiscoveryBatch,
-    DiscoveryContribution,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRole,
@@ -156,7 +154,6 @@ def _batch(
     url: str = "https://vendor.example/report",
     request_hash: str = "c" * 64,
 ) -> DiscoveryBatch:
-    now = datetime.now(UTC)
     candidate = CandidateTopic(
         title=title,
         summary="Stable summary",
@@ -194,14 +191,7 @@ def _batch(
         complementary_axis="initial",
         queries=(),
         citations=(),
-        contributions=[
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus.ACCEPTED,
-                created_at=now,
-                accepted_at=now,
-            )
-        ],
+        candidates=[candidate],
         discovery_run_id=discovery_run_id,
         discovery_model_run_id=model_run_id,
         tlp=TLP.AMBER,

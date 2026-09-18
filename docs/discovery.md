@@ -39,16 +39,28 @@ depuis l'onglet actif.
 
 Les responsabilités sont séparées explicitement :
 
-- `DiscoveryRun = business wave/intention` : l'intention métier durable d'une vague de découverte,
-  portée par une édition ;
+- `DiscoveryRun = business wave/intention` : la vague de recherche durable, portée par une
+  édition ;
 - `Job = asynchronous execution state` : l'état d'exécution asynchrone, avec progression,
   erreurs, annulation et reprise ;
 - `ModelRun = model interaction` : une interaction avec le modèle et son rapport éventuellement
   archivé ;
-- `DiscoveryBatch = parsed result/revision` : un résultat parsé ou une révision de ce résultat.
+- `DiscoveryBatch = parsed result/revision` : une révision parsée d'un run ;
+- `DiscoveryCandidate = persisted raw proposal` : une proposition brute persistée par le parsing ;
+- `DiscoverySubject = future merged result` : le futur résultat de fusion des candidats, qui reste
+  le périmètre d'AW-007 ;
+- `Subject = operational dossier` : le dossier opérationnel après sélection, qui reste le périmètre
+  d'AW-008.
 
-`DiscoveryIntake` et les objets de fusion restent des structures cumulatives en aval. Un
-`DiscoveryRun` ne possède pas sa propre machine d'état d'exécution : le `Job` est la source
+La provenance relationnelle est donc `DiscoveryCandidate -> DiscoveryBatch -> DiscoveryRun ->
+Edition`. Chaque batch rattache aussi `DiscoveryBatch -> ModelRun -> rapport archivé` : le
+`ModelRun` identifie l'interaction et son rapport source, tandis que le batch identifie la
+révision locale parsée. `discovery_candidates` est le magasin canonique des propositions brutes.
+Le `payload` de `DiscoveryBatch` ne contient plus les candidats canoniques complets.
+
+`CandidateTopic`, `DiscoverySnapshot` et `CandidateReference` sont des projections temporaires du
+parseur ou de la lecture cumulative/Selection. Ils ne constituent pas un second magasin canonique.
+Un `DiscoveryRun` ne possède pas sa propre machine d'état d'exécution : le `Job` est la source
 canonique du statut, de la progression et des erreurs.
 
 Une édition peut posséder zéro, un ou plusieurs `DiscoveryRun`, y compris plusieurs runs
@@ -61,8 +73,11 @@ Pour une découverte ou un retraitement, le Job porte
 `Job.aggregate_type=discovery_run` et `Job.aggregate_id=DiscoveryRun.id`. Le Job reste la source
 canonique du statut et de la progression de ces traitements. Le champ `batch.discovery_run_id`
 rattache chaque `DiscoveryBatch` à son run ; le résultat initial et ses remplacements forment une
-chaîne de révisions, sans remplacer le run d'origine. Le retraitement d'un rapport et la reprise
-après récupération conservent donc le `DiscoveryRun` initial.
+chaîne de révisions, sans remplacer le run d'origine. Le retraitement conserve le même
+`DiscoveryRun`, crée une nouvelle révision `DiscoveryBatch` et de nouvelles identités immuables
+`DiscoveryCandidate`. Les candidats historiques restent adressables et les lectures
+opérationnelles actives dérivent leur activité de la révision de batch retenue. La reprise après
+récupération conserve donc elle aussi le `DiscoveryRun` initial.
 
 Un import manuel confirmé est un `DiscoveryRun` de type `MANUAL_IMPORT`. Sa prévisualisation est
 non persistante : l'aperçu peut être annulé sans créer de run, de Job ou de batch. Une édition
@@ -71,8 +86,29 @@ ni confirmer un nouvel import.
 
 L'API de découverte expose `POST /api/editions/{edition_id}/discovery/runs` pour créer ou
 réutiliser un run selon la clé explicite, et `GET /api/editions/{edition_id}/discovery/runs` pour
-lister les runs de l'édition, du plus récent au plus ancien. L'en-tête `Idempotency-Key` est
-obligatoire sur les endpoints qui créent un run ou une révision de batch. Les endpoints de
+lister les runs de l'édition, du plus récent au plus ancien. Les lectures de candidats sont
+disponibles à l'échelle de l'édition, dans le périmètre d'un run et globalement pour les usages
+d'administration ou de diagnostic. Une lecture active d'édition ou de run s'appuie sur la
+révision de batch retenue et retourne les `DiscoveryCandidate` persistés ; elle ne reconstruit pas
+la vérité depuis un `DiscoverySnapshot` ou des `CandidateTopic`.
+
+Ces lectures sont exposées par `GET /api/editions/{edition_id}/discovery/candidates`,
+`GET /api/editions/{edition_id}/discovery/runs/{run_id}/candidates` et
+`GET /api/discovery/candidates/{candidate_id}`. Les deux premières acceptent
+`include_replaced=true` pour retrouver les candidats des révisions remplacées. Aucune de ces
+réponses ne porte de champ de fusion (`member_references`, `contribution_count`,
+`merge_warnings`…) ni de statut éditorial.
+
+Les actions sur les sources sont qualifiées par le seul `candidate_id` :
+`PATCH .../discovery/candidates/{candidate_id}/sources/{source_id}` (vérification),
+`PATCH .../discovery/candidates/{candidate_id}/incomplete-sources/{incomplete_source_id}` et
+`PATCH .../discovery/candidates/{candidate_id}/sources/replacement` (corrections d'URL, qui créent
+un batch manuel et un nouveau `DiscoveryCandidate`). Le pipeline d'un `Subject` sélectionné
+utilise temporairement `PATCH .../discovery/subjects/{subject_id}/sources/replacement`, adapter
+interne qui retrouve le candidat persistant portant l'URL remplacée jusqu'à AW-008. Aucune paire
+`batch_id + candidate_id` ne sert d'identité fonctionnelle : l'identité est celle du candidat
+persistant, et le batch fournit son contexte de révision. L'en-tête `Idempotency-Key`
+est obligatoire sur les endpoints qui créent un run ou une révision de batch. Les endpoints de
 candidats et de rapports restent séparés de cet endpoint de cycle de vie.
 
 Le bloc `execution` d'un run est une projection, jamais un état stocké : il reflète le Job le
@@ -233,21 +269,27 @@ Un job `waiting_human` propose trois récupérations rattachées au ModelRun ori
   provenance `manual_import`, puis le même job reprend et produit une nouvelle révision de
   découverte.
 
-Les aperçus indiquent les sujets, publications, IOC provisoires, répartition par type et
+Les aperçus indiquent les propositions brutes, publications, IOC provisoires, répartition par type et
 avertissements. Annuler l'aperçu n'écrit rien ; « Abandonner la recherche » annule le job.
 
 `POST /api/editions/{edition_id}/discovery/reports/reprocess` relit le blob du ModelRun choisi et
-crée un nouveau résultat de parsing. Il effectue zéro appel bridge et zéro appel Qwen. Le rapport
-original n'est pas modifié. `GET /api/editions/{edition_id}/discovery/reports/{run_id}` permet de
-le consulter.
+crée une nouvelle révision de parsing du même `DiscoveryRun`, avec de nouvelles identités
+`DiscoveryCandidate`. Il effectue zéro appel bridge et zéro appel Qwen. Le rapport original et
+les candidats historiques ne sont pas modifiés et restent adressables. `GET
+/api/editions/{edition_id}/discovery/reports/{run_id}` permet de consulter le rapport archivé.
 
 Une nouvelle recherche explicite crée un nouveau `DiscoveryRun` avec une nouvelle clé
 d'idempotence, un nouveau ModelRun et une nouvelle conversation `fresh`, tout en conservant les
 rapports précédents. Une confirmation humaine est requise avant cette action.
 
 La découverte et son retraitement n'appellent jamais Qwen : le rapport ChatGPT archivé est parsé
-localement par `chatgpt-markdown-v2`. Le regroupement éditorial ne transforme pas une citation
-orpheline en sujet et ne fusionne pas deux blocs `SUBJECT` distincts d'un même lot. Le board
-présente tous les groupes sans quota ; l'analyste humain choisit librement `Brève`, `Article
-approfondi + pivots`, `Ignorer` ou laisse le sujet à décider. Les décisions de fusion, séparation,
-rejet et sélection restent append-only.
+localement par `chatgpt-markdown-v2`. La fusion des propositions vers un `DiscoverySubject` reste
+AW-007 ; la matérialisation et la sélection d'un `Subject` restent AW-008. AW-006 ne définit donc
+aucun nouveau comportement de fusion ni de sélection. Les projections de regroupement peuvent
+présenter tous les groupes sans quota, mais elles ne remplacent pas `discovery_candidates` comme
+source canonique.
+
+Les annotations de vérification des sources peuvent évoluer au fil des contrôles. En revanche,
+la provenance sémantique et le contenu d'un `DiscoveryCandidate` ne sont pas génériquement
+éditables ; une nouvelle interprétation ou un retraitement produit une nouvelle révision et de
+nouvelles identités.

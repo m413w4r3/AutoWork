@@ -2,11 +2,19 @@
 
 ## Pipeline en deux passes
 
-`EditorialGroupingService` transforme les `CandidateTopic` persistés en groupes éditoriaux.
-La première passe est déterministe et explicable : URL canonique, URL de document déjà
-archivé, domaine, proximité de date, titre normalisé, entités CTI déjà déclarées et IOC
+`EditorialGroupingService` transforme les `DiscoveryCandidate` persistés en projections de groupes
+éditoriaux. `CandidateTopic` peut être produit temporairement par le parseur ou une projection
+cumulative, mais il ne constitue pas un état persistant canonique et ne définit pas la lecture des
+candidats de découverte. La première passe est déterministe et explicable : URL canonique, URL de
+document déjà archivé, domaine, proximité de date, titre normalisé, entités CTI déjà déclarées et
+IOC
 connus. Elle compare le batch courant, les groupes de l'édition — y compris déjà sélectionnés
 — et les groupes sélectionnés des éditions antérieures du même pays.
+
+Les groupes éditoriaux et `CandidateReference` sont des projections de regroupement. Ils ne
+remplacent pas `discovery_candidates`, qui reste le magasin canonique des propositions brutes.
+Une annotation de vérification de source peut évoluer sans rendre éditable génériquement la
+provenance sémantique ou le contenu du `DiscoveryCandidate`.
 
 Une correspondance déterministe forte (hard identity evidence : URL anchor + corroborator,
 ou identifiant explicite de campagne/incident) enrichit un groupe — qu'il soit PROPOSED ou
@@ -61,6 +69,7 @@ actions `merge`, `split`, `reject` et `select`. Chaque action reçoit l'identit�
 contre `UPDATE` et `DELETE` par PostgreSQL. Une fusion peut être corrigée par une nouvelle
 décision de séparation ; l'historique précédent n'est pas réécrit.
 
-La sélection exige explicitement `brief` ou `major`, crée un `Subject`, matérialise son
-workspace logique avec un manifeste `canonical=false`, puis marque le groupe `selected`.
-Aucune collecte n'est lancée par cette action.
+La fusion des propositions vers un `DiscoverySubject` reste AW-007. La matérialisation et la
+sélection d'un `Subject` comme dossier opérationnel restent AW-008 ; elles ne font pas partie de
+la nouvelle frontière documentaire d'AW-006. Aucune nouvelle logique de fusion ou de sélection
+n'est définie ici.
