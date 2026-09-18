@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import date
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,9 +16,7 @@ from cti_app.application.discovery.cumulative.validation import validate_merge_p
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
-    ContributionStatus,
     DiscoveryBatch,
-    DiscoveryContribution,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     SourceCandidate,
@@ -540,7 +538,6 @@ def _candidate_with_incomplete(title: str, anchor_url: str) -> CandidateTopic:
 
 
 def _batch(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoveryBatch:
-    now = datetime.now(UTC)
     for index, candidate in enumerate(candidates, 1):
         candidate.local_ref = f"S{index}"
     return DiscoveryBatch(
@@ -549,15 +546,7 @@ def _batch(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoveryBatch
         complementary_axis="initial",
         queries=(),
         citations=(),
-        contributions=[
-            DiscoveryContribution(
-                candidate=candidate,
-                status=ContributionStatus.ACCEPTED,
-                created_at=now,
-                accepted_at=now,
-            )
-            for candidate in candidates
-        ],
+        candidates=candidates,
         discovery_run_id=uuid4(),
         discovery_model_run_id=uuid4(),
         tlp=TLP.AMBER,

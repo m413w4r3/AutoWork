@@ -71,13 +71,6 @@ function discoveryFetchMock() {
           batches: [],
           candidates: [],
           total: 0,
-          merge_stats: {
-            raw_batch_count: 0,
-            raw_candidate_count: 0,
-            consolidated_candidate_count: 0,
-            unique_publication_count: 0,
-            duplicate_publication_occurrence_count: 0,
-          },
           warning: "",
         });
       }
@@ -363,7 +356,9 @@ describe("App éditions", () => {
       candidates: [
         {
           id: "c20fb3d8-d56e-4215-b746-05fcbd02d30e",
-          batch_id: "61cb719a-6432-4381-911e-d4447ecf6332",
+          discovery_run_id: "run-launched",
+          discovery_batch_id: "61cb719a-6432-4381-911e-d4447ecf6332",
+          created_at: "2026-08-10T10:00:00Z",
           title: "Nouvelle campagne MuddyWater",
           summary: "Une publication technique propose des IOC.",
           novelty: "Nouvelle chaîne d’infection",
@@ -394,7 +389,6 @@ describe("App éditions", () => {
               warnings: [],
             },
           ],
-          editorial_status: "proposed",
           sources: [
             {
               id: "c6c38491-e0a3-4315-a64e-e27946a350a4",
@@ -475,6 +469,8 @@ describe("App éditions", () => {
           }
           if (url.includes("/discovery/candidates"))
             return Response.json(candidateResult);
+          if (url.includes("/discovery/runs/run-launched/candidates"))
+            return Response.json(candidateResult.candidates);
           if (url.includes("/editorial-groups"))
             return Response.json(emptyEditorialBoard);
           const launchedRun = {
@@ -709,7 +705,9 @@ describe("App éditions", () => {
     const reconciliationJobId = "8f14e45f-ceea-467e-88bb-7c31f5d59c37";
     const consolidatedCandidate = {
       id: "cand-1",
-      batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+      discovery_run_id: "manual-import-run",
+      discovery_batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
+      created_at: "2026-08-10T10:00:00Z",
       title: "Campagne consolidée",
       summary: "Résumé.",
       novelty: "Nouveau.",
@@ -726,7 +724,6 @@ describe("App éditions", () => {
       countries: [],
       likely_artifacts: [],
       iocs: [],
-      editorial_status: "proposed",
       sources: [],
       incomplete_sources: [],
       local_ref: "S1",
@@ -806,13 +803,6 @@ describe("App éditions", () => {
             batches: [],
             candidates: consolidated ? [consolidatedCandidate] : [],
             total: consolidated ? 1 : 0,
-            merge_stats: {
-              raw_batch_count: 1,
-              raw_candidate_count: 1,
-              consolidated_candidate_count: consolidated ? 1 : 0,
-              unique_publication_count: 0,
-              duplicate_publication_occurrence_count: 0,
-            },
             warning: "",
           });
         }

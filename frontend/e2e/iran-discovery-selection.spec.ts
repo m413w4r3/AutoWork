@@ -9,6 +9,8 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   let jobPolls = 0;
   let merged = false;
   let selected = false;
+  const subjectId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const selectedCandidateId = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
   const edition = {
     id: editionId,
     country: "Iran",
@@ -57,7 +59,9 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     publication: ReturnType<typeof source>,
   ) => ({
     id,
-    batch_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    discovery_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+    discovery_batch_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    created_at: "2026-06-01T00:00:00Z",
     local_ref: localRef,
     title,
     summary: "Présentation neutre issue du rapport ChatGPT.",
@@ -76,7 +80,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     countries: [],
     likely_artifacts: ["ioc", "configurations"],
     iocs: [],
-    editorial_status: "proposed",
     sources: [publication],
     incomplete_sources: [],
     actor_or_campaign: "unknown",
@@ -169,6 +172,90 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     const path = new URL(request.url()).pathname;
     if (path === `/api/editions/${editionId}`)
       return route.fulfill({ json: edition });
+    if (path === `/api/subjects/${subjectId}`)
+      return route.fulfill({
+        json: {
+          id: subjectId,
+          edition_id: editionId,
+          title: cyfirma.title,
+          tlp: "AMBER",
+        },
+      });
+    if (path === `/api/subjects/${subjectId}/production`)
+      return route.fulfill({
+        json: {
+          subject_id: subjectId,
+          edition_id: editionId,
+          title: cyfirma.title,
+          status: "failed",
+          current_stage: "sources",
+          progress_current: 0,
+          progress_total: 1,
+          error_code: "source_collection_no_success",
+          stages: {
+            sources: {
+              status: "failed",
+              error_code: "source_collection_no_success",
+            },
+          },
+        },
+      });
+    if (path === `/api/subjects/${subjectId}/workbench`)
+      return route.fulfill({
+        json: {
+          subject_id: subjectId,
+          sources: [
+            {
+              id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+              requested_url: cyfirma.sources[0].url,
+              discovery_candidate_id: selectedCandidateId,
+              state: "blocked",
+              proposed_role: "primary",
+              title: cyfirma.sources[0].title,
+              publisher: cyfirma.sources[0].publisher,
+              relationship_status: "provisional",
+              relationship_evidence: "model_proposal",
+              source_document_id: null,
+              attempt_count: 1,
+              error_reason: "blocked",
+              fetch_lease_expires_at: null,
+              latest_attempt: null,
+              published_at: cyfirma.sources[0].published_at,
+              tlp: "AMBER",
+              logical_filename: null,
+              detected_mime_type: null,
+              archive_receipt: null,
+            },
+          ],
+          claims: [],
+          indicators: [],
+        },
+      });
+    if (
+      path ===
+      `/api/editions/${editionId}/discovery/candidates/${selectedCandidateId}/sources/replacement`
+    ) {
+      expect(request.method()).toBe("PATCH");
+      expect(request.postDataJSON()).toEqual({
+        replaced_canonical_url: cyfirma.sources[0].url,
+        url: "https://mirror.example/replacement",
+      });
+      return route.fulfill({
+        json: {
+          source: cyfirma.sources[0],
+          updated_subject_ids: [subjectId],
+        },
+      });
+    }
+    if (
+      request.method() === "PATCH" &&
+      path.includes("/api/editions/") &&
+      path.includes("/discovery/subjects/")
+    ) {
+      throw new Error(
+        "Subject-addressed Discovery replacement route was called",
+      );
+    }
     if (
       path === `/api/editions/${editionId}/discovery/runs` &&
       request.method() === "GET"
@@ -205,6 +292,13 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
           : [],
       });
     }
+    if (
+      path ===
+      `/api/editions/${editionId}/discovery/runs/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab/candidates`
+    )
+      return route.fulfill({
+        json: searched && jobCompleted ? [cyfirma, ncc] : [],
+      });
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
@@ -235,13 +329,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
               : [],
           candidates: searched && jobCompleted ? [cyfirma, ncc] : [],
           total: searched && jobCompleted ? 2 : 0,
-          merge_stats: {
-            raw_batch_count: searched && jobCompleted ? 1 : 0,
-            raw_candidate_count: searched && jobCompleted ? 2 : 0,
-            consolidated_candidate_count: searched && jobCompleted ? 2 : 0,
-            unique_publication_count: searched && jobCompleted ? 2 : 0,
-            duplicate_publication_occurrence_count: 0,
-          },
           warning: "provisoire",
         },
       });
@@ -397,4 +484,20 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     .click();
   // Libellé rendu par EditorialBoard, hors périmètre d’AW-004.
   await expect(page.getByText("1 article prêt")).toBeVisible();
+
+  await page.goto(`/subjects/${subjectId}`);
+  await expect(
+    page.getByRole("heading", { name: cyfirma.title }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Pipeline" }).click();
+  await expect(
+    page.getByRole("heading", { name: "Fournir le contenu d'une source" }),
+  ).toBeVisible();
+  await page
+    .getByLabel("URL de remplacement")
+    .fill("https://mirror.example/replacement");
+  await page.getByRole("button", { name: "Remplacer" }).click();
+  await expect(
+    page.getByText("Le contenu ou la source de remplacement est enregistré."),
+  ).toBeVisible();
 });

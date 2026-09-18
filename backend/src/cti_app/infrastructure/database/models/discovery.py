@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 from uuid import UUID
 
@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     String,
     Text,
@@ -64,6 +65,14 @@ class DiscoveryRunRow(Base):
 class DiscoveryBatchRow(Base):
     __tablename__ = "discovery_batches"
     __table_args__ = (
+        # La provenance de révision est relationnelle, pas un détail de payload :
+        # elle porte les FK, l'unicité de chaînage et l'index d'activité.
+        UniqueConstraint("id", "discovery_run_id", name="uq_discovery_batches_id_run"),
+        UniqueConstraint("supersedes_batch_id", name="uq_discovery_batches_supersedes"),
+        UniqueConstraint("replaced_by_batch_id", name="uq_discovery_batches_replaced_by"),
+        CheckConstraint("supersedes_batch_id <> id", name="ck_discovery_batches_supersedes_self"),
+        CheckConstraint("replaced_by_batch_id <> id", name="ck_discovery_batches_replaced_self"),
+        CheckConstraint("parsing_revision > 0", name="ck_discovery_batches_parsing_revision"),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_discovery_batches_tlp"),
         CheckConstraint(
             "char_length(request_hash) = 64 AND request_hash ~ '^[0-9a-f]{64}$'",
@@ -74,6 +83,13 @@ class DiscoveryBatchRow(Base):
         Index("ix_discovery_batches_edition", "edition_id", "created_at"),
         # Révisions d'un même run, et vérification du RESTRICT à la suppression d'un run.
         Index("ix_discovery_batches_run", "discovery_run_id", "created_at"),
+        # Lecture opérationnelle par défaut : les révisions actives d'une édition.
+        Index(
+            "ix_discovery_batches_edition_active",
+            "edition_id",
+            "created_at",
+            postgresql_where=text("replaced_by_batch_id IS NULL"),
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -92,9 +108,99 @@ class DiscoveryBatchRow(Base):
     tlp: Mapped[str] = mapped_column(String(16), nullable=False)
     sensitivity: Mapped[str] = mapped_column(String(64), nullable=False)
     external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    parsing_revision: Mapped[int] = mapped_column(nullable=False)
+    supersedes_batch_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovery_batches.id",
+            name="fk_discovery_batches_supersedes",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
+    replaced_by_batch_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovery_batches.id",
+            name="fk_discovery_batches_replaced_by",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
     payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class DiscoveryCandidateRow(Base):
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        UniqueConstraint(
+            "discovery_batch_id",
+            "position",
+            name="uq_discovery_candidates_batch_position",
+        ),
+        # candidate.discovery_run_id == candidate.discovery_batch.discovery_run_id
+        # est un invariant de provenance : la base le refuse, pas seulement le service.
+        ForeignKeyConstraint(
+            ["discovery_batch_id", "discovery_run_id"],
+            ["discovery_batches.id", "discovery_batches.discovery_run_id"],
+            name="fk_discovery_candidates_batch_run",
+            ondelete="RESTRICT",
+        ),
+        # Une correction manuelle publie un nouveau candidat qui remplace un
+        # candidat historique ; celui-ci reste adressable mais quitte la lecture
+        # active. L'activité reste dérivée, jamais un statut porté par la ligne.
+        UniqueConstraint("supersedes_candidate_id", name="uq_discovery_candidates_supersedes"),
+        CheckConstraint(
+            "supersedes_candidate_id <> id", name="ck_discovery_candidates_supersedes_self"
+        ),
+        CheckConstraint("position >= 0", name="ck_discovery_candidates_position"),
+        CheckConstraint(
+            "technical_potential BETWEEN 0 AND 4",
+            name="ck_discovery_candidates_technical_potential",
+        ),
+        CheckConstraint("btrim(title) <> ''", name="ck_discovery_candidates_title"),
+        CheckConstraint("btrim(summary) <> ''", name="ck_discovery_candidates_summary"),
+        CheckConstraint("btrim(novelty) <> ''", name="ck_discovery_candidates_novelty"),
+        CheckConstraint(
+            "jsonb_typeof(evidence) = 'object'",
+            name="ck_discovery_candidates_evidence_object",
+        ),
+        CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_discovery_candidates_tlp"),
+        Index("ix_discovery_candidates_run", "discovery_run_id"),
+        Index("ix_discovery_candidates_batch", "discovery_batch_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    discovery_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    discovery_batch_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    supersedes_candidate_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            "discovery_candidates.id",
+            name="fk_discovery_candidates_supersedes",
+            ondelete="RESTRICT",
+            use_alter=True,
+        ),
+    )
+    position: Mapped[int] = mapped_column(nullable=False)
+    local_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    novelty: Mapped[str] = mapped_column(Text, nullable=False)
+    technical_potential: Mapped[int] = mapped_column(nullable=False)
+    technical_potential_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    event_date: Mapped[date | None] = mapped_column(nullable=True)
+    actor_or_campaign: Mapped[str] = mapped_column(Text, nullable=False)
+    context_only: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    tlp: Mapped[str] = mapped_column(String(16), nullable=False)
+    sensitivity: Mapped[str] = mapped_column(String(64), nullable=False)
+    external_llm_allowed: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class DiscoveryIntakeRow(Base):

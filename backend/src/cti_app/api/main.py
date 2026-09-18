@@ -6,6 +6,7 @@ from fastapi import FastAPI, Request
 from minio import Minio
 
 from cti_app.api.collection import router as collection_router
+from cti_app.api.discovery import candidate_router as discovery_candidate_router
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.api.discovery_recovery import router as discovery_recovery_router
@@ -367,6 +368,7 @@ def create_app() -> FastAPI:
     application.include_router(health_router)
     application.include_router(editions_router)
     application.include_router(discovery_router)
+    application.include_router(discovery_candidate_router)
     application.include_router(discovery_recovery_router)
     application.include_router(merge_runs_router)
     application.include_router(editorial_router)

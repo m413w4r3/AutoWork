@@ -45,10 +45,8 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.persistence import DiscoveryUnitOfWorkFactory
 from cti_app.domain.discovery import (
-    CandidateTopic,
-    ContributionStatus,
     DiscoveryBatch,
-    DiscoveryContribution,
+    DiscoveryCandidate,
     DiscoveryRun,
     DiscoveryRunInputMode,
     DiscoverySourceMode,
@@ -62,23 +60,11 @@ from cti_app.logging import get_correlation_id
 logger = logging.getLogger(__name__)
 
 
-def _wrap_candidates_as_contributions(
-    candidates: list[CandidateTopic],
-    status: ContributionStatus = ContributionStatus.PENDING,
-) -> list[DiscoveryContribution]:
-    now = datetime.now(UTC)
-    return [
-        DiscoveryContribution(
-            candidate=candidate,
-            status=status,
-            created_at=now,
-            accepted_at=now if status == ContributionStatus.ACCEPTED else None,
-        )
-        for candidate in candidates
-    ]
-
-
 class SourceCandidateNotFoundError(LookupError):
+    pass
+
+
+class DiscoveryRunOwnershipError(LookupError):
     pass
 
 
@@ -650,23 +636,61 @@ class DiscoveryService:
                 else [item for item in batches if item.is_active_revision]
             )
 
+    async def get_candidate(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        async with self._uow_factory() as uow:
+            return await uow.discovery_candidates.get(candidate_id)
+
+    async def list_candidates_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        async with self._uow_factory() as uow:
+            return list(
+                await uow.discovery_candidates.list_for_edition(
+                    edition_id, include_replaced=include_replaced
+                )
+            )
+
+    async def list_candidates_for_run(
+        self,
+        edition_id: UUID,
+        run_id: UUID,
+        *,
+        include_replaced: bool = False,
+    ) -> list[DiscoveryCandidate]:
+        async with self._uow_factory() as uow:
+            run = await uow.discovery_runs.get(run_id)
+            if run is None or run.edition_id != edition_id:
+                raise DiscoveryRunOwnershipError(str(run_id))
+            return list(
+                await uow.discovery_candidates.list_for_run(
+                    run_id, include_replaced=include_replaced
+                )
+            )
+
     async def mark_source(
         self,
         edition_id: UUID,
+        candidate_id: UUID,
         source_id: UUID,
         status: SourceVerificationStatus,
         *,
         actor_id: str,
     ) -> SourceCandidate:
         async with self._uow_factory() as uow:
-            batches = await uow.discovery_batches.list_for_edition(edition_id)
-            for batch in batches:
-                source = batch.source(source_id)
-                if source is not None:
-                    source.mark(status, actor_id=actor_id)
-                    await uow.discovery_batches.save(batch)
-                    await uow.commit()
-                    return source
+            candidate = await uow.discovery_candidates.get_for_update(candidate_id)
+            if candidate is None:
+                raise SourceCandidateNotFoundError(str(source_id))
+            run = await uow.discovery_runs.get(candidate.discovery_run_id)
+            if run is None or run.edition_id != edition_id:
+                raise SourceCandidateNotFoundError(str(source_id))
+            source = next(
+                (item for item in candidate.evidence.sources if item.id == source_id), None
+            )
+            if source is not None:
+                source.mark(status, actor_id=actor_id)
+                await uow.discovery_candidates.save_evidence(candidate)
+                await uow.commit()
+                return source
         raise SourceCandidateNotFoundError(str(source_id))
 
 
@@ -682,6 +706,11 @@ def _parsed_to_domain_batch(
     parsing_revision: int = 1,
     supersedes_batch_id: UUID | None = None,
 ) -> DiscoveryBatch:
+    canonical_batch_id = batch_id or discovery_initial_batch_id(parameters.discovery_run_id)
+    for position, candidate in enumerate(result.candidates):
+        candidate.id = uuid5(
+            NAMESPACE_URL, f"cti-discovery-candidate:{canonical_batch_id}:{position}"
+        )
     return DiscoveryBatch(
         edition_id=parameters.edition_id,
         discovery_run_id=parameters.discovery_run_id,
@@ -689,9 +718,7 @@ def _parsed_to_domain_batch(
         complementary_axis=parameters.complementary_axis,
         queries=(),
         citations=result.citations,
-        contributions=_wrap_candidates_as_contributions(
-            result.candidates, ContributionStatus.ACCEPTED
-        ),
+        candidates=result.candidates,
         discovery_model_run_id=research_run_id,
         tlp=parameters.tlp,
         sensitivity=parameters.sensitivity,
@@ -709,7 +736,7 @@ def _parsed_to_domain_batch(
             "Le rapport Markdown et les citations visibles ne constituent pas une liste "
             "exhaustive des sources consultées."
         ),
-        id=batch_id or discovery_initial_batch_id(parameters.discovery_run_id),
+        id=canonical_batch_id,
         parsing_revision=parsing_revision,
         supersedes_batch_id=supersedes_batch_id,
     )

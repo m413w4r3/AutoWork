@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from cti_app.api.discovery import candidate_router as discovery_candidate_router
 from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.jobs import router as jobs_router
@@ -19,11 +20,14 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.model_gateway import ModelGateway, ModelRouter
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery_cumulative import (
-    DiscoveryMemberReference,
-    DiscoveryPlannerKind,
-    DiscoverySnapshot,
-    DiscoverySubject,
+from cti_app.domain.discovery import (
+    CandidateTopic,
+    DiscoveryBatch,
+    DiscoveryRequestSnapshot,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
+    SourceCandidate,
+    SourceRole,
 )
 from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelBackend, ModelRunStatus
@@ -32,40 +36,6 @@ from cti_app.logging import CorrelationIdMiddleware
 from tests.discovery_support import InMemoryDiscoveryUnitOfWorkFactory
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
 from tests.test_discovery import DeferredResearchAdapter, research_markdown_fixture
-
-
-class SnapshotProjectionForApiTests:
-    def __init__(self, discovery: DiscoveryService) -> None:
-        self._discovery = discovery
-
-    async def active_snapshot(self, edition_id: UUID) -> DiscoverySnapshot | None:
-        batches = await self._discovery.list_batches(edition_id)
-        subjects = {
-            candidate.id: DiscoverySubject(
-                subject_id=candidate.id,
-                candidate=candidate,
-                member_references=(DiscoveryMemberReference(batch.id, candidate.id),),
-                created_at=batch.created_at,
-            )
-            for batch in batches
-            if batch.is_active_revision
-            for candidate in batch.candidates
-        }
-        if not subjects:
-            return None
-        return DiscoverySnapshot(
-            id=uuid4(),
-            edition_id=edition_id,
-            version=1,
-            parent_snapshot_id=None,
-            intake_id=uuid4(),
-            merge_run_id=uuid4(),
-            planner_kind=DiscoveryPlannerKind.HEURISTIC,
-            subjects=tuple(subjects.values()),
-            snapshot_hash="a" * 64,
-            is_active=True,
-            created_at=datetime.now(UTC),
-        )
 
 
 async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeated_configuration(
@@ -108,7 +78,6 @@ async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeate
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
-    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = jobs
     application.state.job_dispatcher = dispatcher
     application.state.discovery_run_service = DiscoveryRunService(shared_uow, jobs, dispatcher)
@@ -187,7 +156,9 @@ async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeate
     assert candidates.json()["candidates"][0]["sources"][0]["relationship_status"] == (
         "provisional"
     )
-    assert candidates.json()["candidates"][0]["editorial_status"] == "proposed"
+    assert "editorial_status" not in candidates.json()["candidates"][0]
+    assert candidates.json()["candidates"][0]["discovery_batch_id"]
+    assert candidates.json()["candidates"][0]["discovery_run_id"]
     assert candidates.json()["candidates"][0]["selectable"] is True
     assert candidates.json()["candidates"][0]["valid_publication_count"] == 3
     assert duplicate.status_code == 202
@@ -199,6 +170,247 @@ async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeate
     assert job.json()["aggregate_type"] == "discovery_run"
     assert job.json()["aggregate_id"] == launched.json()["run_id"]
     assert len(fake.calls) == 2
+
+
+class _SnapshotMustNotBeRead:
+    async def active_snapshot(self, edition_id: UUID) -> None:
+        raise AssertionError("raw candidate reads must not consult the DiscoverySnapshot")
+
+
+def _seeded_run(edition_id: UUID, key: str) -> DiscoveryRun:
+    return DiscoveryRun(
+        edition_id=edition_id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="iran-default",
+        complementary_axis=key,
+        request_snapshot=DiscoveryRequestSnapshot(
+            country="Iran",
+            country_code="IR",
+            country_aliases=("Iran",),
+            period_start=date(2026, 7, 1),
+            period_end=date(2026, 7, 31),
+            as_of_date=date(2026, 8, 1),
+            languages=("fr",),
+            source_profile="iran-default",
+            keywords=(),
+            exclusions=(),
+            complementary_axis=key,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key=key,
+        created_by="dev-analyst",
+    )
+
+
+def _seeded_topic(title: str, url: str | None, *, context_only: bool = False) -> CandidateTopic:
+    sources = (
+        [
+            SourceCandidate(
+                url=url,
+                title=f"{title} source",
+                publisher="Vendor",
+                role=SourceRole.PRIMARY,
+                tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=True,
+            )
+        ]
+        if url
+        else []
+    )
+    return CandidateTopic(
+        title=title,
+        summary=f"{title} summary",
+        novelty="Novel.",
+        technical_potential=3,
+        uncertainties=(),
+        relevance_reasons=(),
+        actors=(),
+        campaigns=(),
+        malware=(),
+        cves=(),
+        victims=(),
+        sectors=(),
+        countries=(),
+        likely_artifacts=(),
+        sources=sources,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        context_only=context_only,
+    )
+
+
+def _seeded_batch(
+    run: DiscoveryRun,
+    candidates: list[CandidateTopic],
+    *,
+    request_hash: str,
+    created_at: datetime,
+) -> DiscoveryBatch:
+    return DiscoveryBatch(
+        edition_id=run.edition_id,
+        discovery_run_id=run.id,
+        request_hash=request_hash,
+        complementary_axis=run.complementary_axis,
+        queries=(),
+        citations=(),
+        candidates=candidates,
+        discovery_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="test",
+        created_at=created_at,
+        updated_at=created_at,
+    )
+
+
+async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -> None:
+    fake = FakeModelAdapter(research_text=research_markdown_fixture())
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake,
+            openai_structured=fake,
+            qwen=fake,
+            fake=fake,
+            forced_backend=ModelBackend.FAKE,
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        InMemoryModelOutputStore(),
+    )
+    shared_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    edition_id = uuid4()
+    run_a = _seeded_run(edition_id, "wave-a")
+    run_b = _seeded_run(edition_id, "wave-b")
+    foreign_run = _seeded_run(uuid4(), "foreign")
+    for run in (run_a, run_b, foreign_run):
+        shared_uow.runs[run.id] = run
+
+    # Two waves proposing the same campaign stay two raw candidates.
+    historical = _seeded_topic("Same campaign", "https://vendor.example/a-v1")
+    revised = _seeded_topic("Same campaign", "https://vendor.example/a-v2")
+    wave_b = _seeded_topic("Same campaign", "https://vendor.example/b")
+    # Same title inside one batch: two parsed proposals, never fused on ingestion.
+    wave_b_twin = _seeded_topic("Same campaign", "https://vendor.example/b-twin")
+    context = _seeded_topic("Background context", None, context_only=True)
+    batch_a1 = _seeded_batch(
+        run_a, [historical], request_hash="a" * 64, created_at=datetime(2026, 8, 1, tzinfo=UTC)
+    )
+    batch_a2 = _seeded_batch(
+        run_a, [revised], request_hash="b" * 64, created_at=datetime(2026, 8, 2, tzinfo=UTC)
+    )
+    batch_a2.parsing_revision = 2
+    batch_a2.supersedes_batch_id = batch_a1.id
+    batch_a1.replaced_by_batch_id = batch_a2.id
+    batch_b = _seeded_batch(
+        run_b,
+        [wave_b, wave_b_twin, context],
+        request_hash="c" * 64,
+        created_at=datetime(2026, 8, 3, tzinfo=UTC),
+    )
+    async with shared_uow() as uow:
+        for batch in (batch_a1, batch_a2, batch_b):
+            assert await uow.discovery_batches.add_if_absent(batch)
+
+    application = FastAPI()
+    application.include_router(discovery_router)
+    application.include_router(discovery_candidate_router)
+    application.state.discovery_service = DiscoveryService(shared_uow, gateway, archive=gateway)
+    application.state.cumulative_discovery_service = _SnapshotMustNotBeRead()
+    application.state.identity_provider = LocalIdentityProvider()
+    base = f"/api/editions/{edition_id}/discovery"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        active = await client.get(f"{base}/candidates")
+        with_history = await client.get(f"{base}/candidates?include_replaced=true")
+        filtered = await client.get(f"{base}/candidates?search=background")
+        run_a_active = await client.get(f"{base}/runs/{run_a.id}/candidates")
+        run_a_history = await client.get(
+            f"{base}/runs/{run_a.id}/candidates?include_replaced=true"
+        )
+        foreign = await client.get(f"{base}/runs/{foreign_run.id}/candidates")
+        by_id = await client.get(f"/api/discovery/candidates/{historical.id}")
+        missing = await client.get(f"/api/discovery/candidates/{uuid4()}")
+        wave_b_source_id = wave_b.sources[0].id
+        marked = await client.patch(
+            f"{base}/candidates/{wave_b.id}/sources/{wave_b_source_id}",
+            json={"status": "invalid"},
+        )
+        wrong_candidate = await client.patch(
+            f"{base}/candidates/{revised.id}/sources/{wave_b_source_id}",
+            json={"status": "unavailable"},
+        )
+        after_mark = await client.get(f"{base}/candidates")
+
+    assert active.status_code == 200
+    raw = active.json()
+    assert set(raw) == {"batches", "candidates", "total", "warning"}
+    assert {item["id"] for item in raw["candidates"]} == {
+        str(revised.id),
+        str(wave_b.id),
+        str(wave_b_twin.id),
+        str(context.id),
+    }
+    assert raw["total"] == 4
+    same_campaign = [item for item in raw["candidates"] if item["title"] == "Same campaign"]
+    assert {item["discovery_run_id"] for item in same_campaign} == {str(run_a.id), str(run_b.id)}
+    # The two same-title proposals of batch_b keep their own identity and evidence.
+    twins = [item for item in same_campaign if item["discovery_batch_id"] == str(batch_b.id)]
+    assert [item["id"] for item in twins] == [str(wave_b.id), str(wave_b_twin.id)]
+    assert [len(item["sources"]) for item in twins] == [1, 1]
+    assert {item["sources"][0]["url"] for item in twins} == {
+        "https://vendor.example/b",
+        "https://vendor.example/b-twin",
+    }
+    for item in raw["candidates"]:
+        for merge_field in (
+            "member_references",
+            "contribution_count",
+            "duplicate_publication_count",
+            "merge_warnings",
+            "editorial_status",
+            "batch_id",
+        ):
+            assert merge_field not in item
+    context_view = next(item for item in raw["candidates"] if item["id"] == str(context.id))
+    assert context_view["context_only"] is True
+    assert context_view["selectable"] is False
+
+    assert {item["id"] for item in with_history.json()["candidates"]} == {
+        str(historical.id),
+        str(revised.id),
+        str(wave_b.id),
+        str(wave_b_twin.id),
+        str(context.id),
+    }
+    assert [item["id"] for item in filtered.json()["candidates"]] == [str(context.id)]
+
+    assert run_a_active.status_code == 200
+    assert [item["id"] for item in run_a_active.json()] == [str(revised.id)]
+    assert [item["id"] for item in run_a_history.json()] == [str(historical.id), str(revised.id)]
+    assert foreign.status_code == 404
+
+    assert by_id.status_code == 200
+    assert by_id.json()["discovery_batch_id"] == str(batch_a1.id)
+    assert by_id.json()["discovery_run_id"] == str(run_a.id)
+    assert missing.status_code == 404
+
+    assert marked.status_code == 200
+    assert marked.json()["verification_status"] == "invalid"
+    assert wrong_candidate.status_code == 404
+    marked_view = next(
+        item for item in after_mark.json()["candidates"] if item["id"] == str(wave_b.id)
+    )
+    assert marked_view["sources"][0]["verification_status"] == "invalid"
+    revised_view = next(
+        item for item in after_mark.json()["candidates"] if item["id"] == str(revised.id)
+    )
+    assert revised_view["sources"][0]["verification_status"] == "unverified"
 
 
 async def test_discovery_request_snapshot_keyword_and_exclusion_boundaries() -> None:
@@ -427,7 +639,6 @@ async def test_manual_recovery_previews_then_resumes_the_original_run_job() -> N
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
-    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = JobService(job_uow, registry)
     application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     application.state.identity_provider = LocalIdentityProvider()
@@ -523,7 +734,6 @@ async def _recovery_application() -> tuple[
     application.include_router(jobs_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
-    application.state.cumulative_discovery_service = SnapshotProjectionForApiTests(discovery)
     application.state.job_service = JobService(job_uow, registry)
     application.state.job_dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     application.state.identity_provider = LocalIdentityProvider()

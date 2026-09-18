@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { renderDiscoveryMarkdown } from "./discoveryMarkdownExport";
-import type { CandidateTopic, SourceCandidate } from "./api/discovery";
+import type { DiscoveryCandidate, SourceCandidate } from "./api/discovery";
 
 const baseSource: SourceCandidate = {
   id: "source-1",
@@ -27,10 +27,14 @@ const baseSource: SourceCandidate = {
   verification_changed_by: null,
 };
 
-function candidate(overrides: Partial<CandidateTopic> = {}): CandidateTopic {
+function candidate(
+  overrides: Partial<DiscoveryCandidate> = {},
+): DiscoveryCandidate {
   return {
     id: "candidate-1",
-    batch_id: "batch-1",
+    discovery_run_id: "run-1",
+    discovery_batch_id: "batch-1",
+    created_at: "2026-05-12T00:00:00Z",
     title: "Campagne exemple",
     summary: "Résumé sur\nplusieurs lignes.",
     novelty: "n/a",
@@ -60,7 +64,6 @@ function candidate(overrides: Partial<CandidateTopic> = {}): CandidateTopic {
         warnings: [],
       },
     ],
-    editorial_status: "proposed",
     sources: [baseSource],
     incomplete_sources: [
       {
@@ -86,11 +89,6 @@ function candidate(overrides: Partial<CandidateTopic> = {}): CandidateTopic {
     selectable: true,
     valid_publication_count: 1,
     incomplete_publication_count: 1,
-    // Merge/consolidation-only fields — must NOT leak into the export.
-    member_references: [{ batch_id: "batch-1", candidate_id: "candidate-1" }],
-    contribution_count: 3,
-    duplicate_publication_count: 2,
-    merge_warnings: ["dropped a duplicate"],
     ...overrides,
   };
 }
@@ -116,13 +114,11 @@ describe("renderDiscoveryMarkdown", () => {
     expect(markdown).toContain("url: \n");
   });
 
-  it("never leaks merge/consolidation bookkeeping into the export", () => {
+  it("preserves the discovery report schema without merge bookkeeping", () => {
     const markdown = renderDiscoveryMarkdown([candidate()]);
 
-    expect(markdown).not.toContain("member_references");
-    expect(markdown).not.toContain("contribution_count");
-    expect(markdown).not.toContain("duplicate_publication_count");
-    expect(markdown).not.toContain("dropped a duplicate");
+    expect(markdown).not.toContain("discovery_run_id");
+    expect(markdown).not.toContain("discovery_batch_id");
   });
 
   it("falls back to a generated subject ref when local_ref is missing", () => {

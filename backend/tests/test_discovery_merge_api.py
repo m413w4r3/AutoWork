@@ -152,13 +152,13 @@ class FakeManualSourceEditService:
     async def attach_incomplete_source_url(
         self,
         edition_id: UUID,
-        subject_id: UUID,
+        candidate_id: UUID,
         incomplete_source_id: UUID,
         url: str,
         *,
         actor_id: str,
     ) -> ManualSourceEditResult:
-        self.calls.append((edition_id, subject_id, incomplete_source_id, url, actor_id))
+        self.calls.append((edition_id, candidate_id, incomplete_source_id, url, actor_id))
         if self.error is not None:
             raise self.error
         assert self.result is not None
@@ -167,20 +167,19 @@ class FakeManualSourceEditService:
     async def attach_replacement_source_url(
         self,
         edition_id: UUID,
-        subject_id: UUID,
+        candidate_id: UUID,
         replaced_canonical_url: str,
         url: str,
         *,
         actor_id: str,
     ) -> ManualSourceEditResult:
         self.replacement_calls.append(
-            (edition_id, subject_id, replaced_canonical_url, url, actor_id)
+            (edition_id, candidate_id, replaced_canonical_url, url, actor_id)
         )
         if self.error is not None:
             raise self.error
         assert self.result is not None
         return self.result
-
 
 def _promoted_source(url: str) -> SourceCandidate:
     return SourceCandidate(
@@ -197,14 +196,14 @@ def _promoted_source(url: str) -> SourceCandidate:
 @pytest.mark.asyncio
 async def test_attach_incomplete_source_url_promotes_and_reports_updated_subjects() -> None:
     edition_id = uuid4()
-    subject_id = uuid4()
+    candidate_id = uuid4()
     incomplete_source_id = uuid4()
     other_subject_id = uuid4()
     promoted = _promoted_source("https://bne-intellinews.example/story")
     service = FakeManualSourceEditService(
         ManualSourceEditResult(
             promoted_source=promoted,
-            updated_subject_ids=(subject_id, other_subject_id),
+            updated_subject_ids=(candidate_id, other_subject_id),
         )
     )
     application = FastAPI()
@@ -216,7 +215,7 @@ async def test_attach_incomplete_source_url_promotes_and_reports_updated_subject
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}"
+            f"/api/editions/{edition_id}/discovery/candidates/{candidate_id}"
             f"/incomplete-sources/{incomplete_source_id}",
             json={"url": "https://bne-intellinews.example/story"},
         )
@@ -224,11 +223,11 @@ async def test_attach_incomplete_source_url_promotes_and_reports_updated_subject
     assert response.status_code == 200
     body = response.json()
     assert body["source"]["url"] == "https://bne-intellinews.example/story"
-    assert set(body["updated_subject_ids"]) == {str(subject_id), str(other_subject_id)}
+    assert set(body["updated_subject_ids"]) == {str(candidate_id), str(other_subject_id)}
     assert service.calls == [
         (
             edition_id,
-            subject_id,
+            candidate_id,
             incomplete_source_id,
             "https://bne-intellinews.example/story",
             "dev-analyst",
@@ -238,7 +237,7 @@ async def test_attach_incomplete_source_url_promotes_and_reports_updated_subject
 
 @pytest.mark.asyncio
 async def test_attach_incomplete_source_url_reports_not_found_as_404() -> None:
-    edition_id, subject_id, incomplete_source_id = uuid4(), uuid4(), uuid4()
+    edition_id, candidate_id, incomplete_source_id = uuid4(), uuid4(), uuid4()
     service = FakeManualSourceEditService(
         None, error=IncompleteSourceCandidateNotFoundError(str(incomplete_source_id))
     )
@@ -251,7 +250,7 @@ async def test_attach_incomplete_source_url_reports_not_found_as_404() -> None:
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}"
+            f"/api/editions/{edition_id}/discovery/candidates/{candidate_id}"
             f"/incomplete-sources/{incomplete_source_id}",
             json={"url": "https://example.test/a"},
         )
@@ -263,12 +262,12 @@ async def test_attach_incomplete_source_url_reports_not_found_as_404() -> None:
 @pytest.mark.asyncio
 async def test_attach_replacement_source_url_uses_canonical_url_and_reports_result() -> None:
     edition_id = uuid4()
-    subject_id = uuid4()
+    candidate_id = uuid4()
     replaced_url = "https://blocked.example/report"
     replacement_url = "https://mirror.example/report"
     promoted = _promoted_source(replacement_url)
     service = FakeManualSourceEditService(
-        ManualSourceEditResult(promoted_source=promoted, updated_subject_ids=(subject_id,))
+        ManualSourceEditResult(promoted_source=promoted, updated_subject_ids=(candidate_id,))
     )
     application = FastAPI()
     application.include_router(router)
@@ -279,7 +278,7 @@ async def test_attach_replacement_source_url_uses_canonical_url_and_reports_resu
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            f"/api/editions/{edition_id}/discovery/candidates/{candidate_id}/sources/replacement",
             json={
                 "replaced_canonical_url": replaced_url,
                 "url": replacement_url,
@@ -289,13 +288,18 @@ async def test_attach_replacement_source_url_uses_canonical_url_and_reports_resu
     assert response.status_code == 200
     assert response.json()["source"]["url"] == replacement_url
     assert service.replacement_calls == [
-        (edition_id, subject_id, replaced_url, replacement_url, "dev-analyst")
+        (edition_id, candidate_id, replaced_url, replacement_url, "dev-analyst")
     ]
+    assert not any(
+        getattr(route, "path", None)
+        == "/api/editions/{edition_id}/discovery/subjects/{subject_id}/sources/replacement"
+        for route in application.routes
+    )
 
 
 @pytest.mark.asyncio
 async def test_attach_replacement_source_url_reports_not_found_as_404() -> None:
-    edition_id, subject_id = uuid4(), uuid4()
+    edition_id, candidate_id = uuid4(), uuid4()
     service = FakeManualSourceEditService(
         None, error=SourceCandidateNotFoundError("https://blocked.example/report")
     )
@@ -308,7 +312,7 @@ async def test_attach_replacement_source_url_reports_not_found_as_404() -> None:
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            f"/api/editions/{edition_id}/discovery/candidates/{candidate_id}/sources/replacement",
             json={
                 "replaced_canonical_url": "https://blocked.example/report",
                 "url": "https://mirror.example/report",
@@ -321,7 +325,7 @@ async def test_attach_replacement_source_url_reports_not_found_as_404() -> None:
 
 @pytest.mark.asyncio
 async def test_attach_replacement_source_url_reports_malformed_url_as_400() -> None:
-    edition_id, subject_id = uuid4(), uuid4()
+    edition_id, candidate_id = uuid4(), uuid4()
     service = FakeManualSourceEditService(None, error=ValueError("Source URL must use HTTP"))
     application = FastAPI()
     application.include_router(router)
@@ -332,7 +336,7 @@ async def test_attach_replacement_source_url_reports_malformed_url_as_400() -> N
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
         response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/candidates/{subject_id}/sources/replacement",
+            f"/api/editions/{edition_id}/discovery/candidates/{candidate_id}/sources/replacement",
             json={
                 "replaced_canonical_url": "https://blocked.example/report",
                 "url": "ftp://not-supported.example/report",

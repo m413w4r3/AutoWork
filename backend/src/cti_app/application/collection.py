@@ -45,7 +45,12 @@ from cti_app.domain.collection import (
     SourceCollection,
     SourceOriginKind,
 )
-from cti_app.domain.discovery import SourceCandidate, SourceRole, canonicalize_http_url
+from cti_app.domain.discovery import (
+    DiscoveryCandidate,
+    SourceCandidate,
+    SourceRole,
+    canonicalize_http_url,
+)
 from cti_app.domain.editorial import EditorialGroupStatus
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument
 from cti_app.domain.production import ProductionInputSnapshot, ProductionInputSource
@@ -494,18 +499,20 @@ class SubjectCollectionService:
 
     async def source_context(
         self, source: SourceCollection
-    ) -> tuple[SourceCandidate | None, SourceDocument | None]:
+    ) -> tuple[SourceCandidate | None, SourceDocument | None, UUID | None]:
         async with self._uow_factory() as uow:
-            candidate = None
-            if source.batch_id is not None and source.source_candidate_id is not None:
-                batch = await uow.discovery_batches.get(source.batch_id)
-                candidate = batch.source(source.source_candidate_id) if batch else None
+            candidate, owners = await _discovery_source(
+                uow, source.batch_id, source.source_candidate_id
+            )
+            # Only an unambiguous owner may be handed back as the canonical
+            # candidate identity for later candidate-addressed mutations.
+            discovery_candidate_id = owners[0].id if len(owners) == 1 else None
             document = (
                 await uow.source_documents.get(source.source_document_id)
                 if source.source_document_id
                 else None
             )
-            return candidate, document
+            return candidate, document, discovery_candidate_id
 
     async def manual_archive_receipt(self, source: SourceCollection) -> ManualArchiveReceipt | None:
         """Return the durable receipt of an analyst upload, or ``None``.
@@ -912,11 +919,11 @@ class SubjectCollectionService:
                 ),
                 None,
             )
-        if collection.batch_id is None or collection.source_candidate_id is None:
-            return None
         async with self._uow_factory() as uow:
-            batch = await uow.discovery_batches.get(collection.batch_id)
-            return batch.source(collection.source_candidate_id) if batch else None
+            found, _owners = await _discovery_source(
+                uow, collection.batch_id, collection.source_candidate_id
+            )
+            return found
 
     async def _ensure_archived_document_metadata(
         self, collection: SourceCollection, candidate: SourceCandidate | None
@@ -1110,13 +1117,10 @@ class SubjectCollectionService:
             collection = await _require_collection(uow, collection_id)
             subject = await uow.subjects.get(collection.subject_id)
             source = candidate
-            if (
-                source is None
-                and collection.batch_id is not None
-                and collection.source_candidate_id is not None
-            ):
-                batch = await uow.discovery_batches.get(collection.batch_id)
-                source = batch.source(collection.source_candidate_id) if batch else None
+            if source is None:
+                source, _owners = await _discovery_source(
+                    uow, collection.batch_id, collection.source_candidate_id
+                )
             if subject is None:
                 raise CollectionNotAllowedError("Collection source lost its canonical context")
             existing_names = {
@@ -1486,6 +1490,30 @@ def _interrupted_attempt(
         outcome=AttemptOutcome.INTERRUPTED,
         failure_reason=reason,
     )
+
+
+async def _discovery_source(
+    uow: UnitOfWork, batch_id: UUID | None, source_candidate_id: UUID | None
+) -> tuple[SourceCandidate | None, list[DiscoveryCandidate]]:
+    """Resolve a discovery publication from the persisted candidates of a batch.
+
+    A collection still records the batch it came from as provenance, but the
+    publication itself is read from `discovery_candidates` — the canonical
+    store — and never from the batch payload.
+    """
+    if batch_id is None or source_candidate_id is None:
+        return None, []
+    owners: list[DiscoveryCandidate] = []
+    found: SourceCandidate | None = None
+    for candidate in await uow.discovery_candidates.list_for_batch(batch_id):
+        match = next(
+            (item for item in candidate.evidence.sources if item.id == source_candidate_id), None
+        )
+        if match is None:
+            continue
+        owners.append(candidate)
+        found = found or match
+    return found, owners
 
 
 async def _require_collection(uow: UnitOfWork, collection_id: UUID) -> SourceCollection:

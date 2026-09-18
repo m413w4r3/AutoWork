@@ -89,6 +89,7 @@ class ArchiveReceiptView(BaseModel):
 class SourceView(BaseModel):
     id: UUID
     requested_url: str
+    discovery_candidate_id: UUID | None
     state: str
     proposed_role: str
     relationship_status: str
@@ -296,12 +297,13 @@ async def archive_manual_source_content(
 
     source, receipt = cast(tuple[SourceCollection, ManualArchiveReceipt], archived)
     attempts = await service.attempts(source.id)
-    candidate, document = await service.source_context(source)
+    candidate, document, discovery_candidate_id = await service.source_context(source)
     return _source_view(
         source,
         attempts[-1] if attempts else None,
         candidate,
         document,
+        discovery_candidate_id=discovery_candidate_id,
         archive_receipt=receipt,
     )
 
@@ -320,13 +322,14 @@ async def get_workbench(subject_id: UUID, request: Request) -> WorkbenchView:
     source_views: list[SourceView] = []
     for source in sources:
         attempts = await service.attempts(source.id)
-        candidate, document = await service.source_context(source)
+        candidate, document, discovery_candidate_id = await service.source_context(source)
         source_views.append(
             _source_view(
                 source,
                 attempts[-1] if attempts else None,
                 candidate,
                 document,
+                discovery_candidate_id=discovery_candidate_id,
                 archive_receipt=await service.manual_archive_receipt(source),
             )
         )
@@ -414,12 +417,13 @@ async def decide_relationship(
     except CollectionItemNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Source collection not found") from exc
     attempts = await service.attempts(source.id)
-    candidate, document = await service.source_context(source)
+    candidate, document, discovery_candidate_id = await service.source_context(source)
     return _source_view(
         source,
         attempts[-1] if attempts else None,
         candidate,
         document,
+        discovery_candidate_id=discovery_candidate_id,
         archive_receipt=await service.manual_archive_receipt(source),
     )
 
@@ -504,11 +508,13 @@ def _source_view(
     candidate: SourceCandidate | None,
     document: SourceDocument | None,
     *,
+    discovery_candidate_id: UUID | None = None,
     archive_receipt: ManualArchiveReceipt | None = None,
 ) -> SourceView:
     return SourceView(
         id=source.id,
         requested_url=source.requested_url,
+        discovery_candidate_id=discovery_candidate_id,
         state=source.state.value,
         proposed_role=source.proposed_role.value,
         relationship_status=source.relationship_status.value,

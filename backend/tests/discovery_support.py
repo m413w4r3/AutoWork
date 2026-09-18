@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
+from datetime import datetime
 from types import TracebackType
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,7 +19,12 @@ from cti_app.application.persistence import (
     JobEventRepository,
     JobRepository,
 )
-from cti_app.domain.discovery import DiscoveryBatch, DiscoveryRun, DiscoveryRunInputMode
+from cti_app.domain.discovery import (
+    DiscoveryBatch,
+    DiscoveryCandidate,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
+)
 from cti_app.domain.editions import Edition, EditionAuditEvent
 from cti_app.domain.jobs import Job, JobEvent
 from tests.edition_support import (
@@ -29,29 +35,71 @@ from tests.job_support import InMemoryJobEventRepository, InMemoryJobRepository
 
 
 class InMemoryDiscoveryBatchRepository:
-    def __init__(self, state: dict[UUID, DiscoveryBatch]) -> None:
+    def __init__(
+        self,
+        state: dict[UUID, DiscoveryBatch],
+        candidate_state: dict[UUID, DiscoveryCandidate] | None = None,
+    ) -> None:
+        # Without candidate_state, the repository serves legacy fixtures that seed
+        # batches (and their candidate projection) directly into ``state``.
         self._state = state
+        self._candidate_state = candidate_state
 
     async def add_if_absent(self, batch: DiscoveryBatch) -> bool:
         if batch.id in self._state:
             return False
-        self._state[batch.id] = deepcopy(batch)
+        if self._candidate_state is None:
+            self._state[batch.id] = deepcopy(batch)
+            return True
+        stored = deepcopy(batch)
+        stored.candidates = []
+        self._state[batch.id] = stored
+        for position, candidate in enumerate(batch.candidates):
+            canonical = DiscoveryCandidate.from_candidate_topic(
+                candidate,
+                discovery_run_id=batch.discovery_run_id,
+                discovery_batch_id=batch.id,
+                position=position,
+                created_at=batch.created_at,
+            )
+            self._candidate_state[canonical.id] = canonical
         return True
+
+    def _materialize(self, batch: DiscoveryBatch) -> DiscoveryBatch:
+        candidate_state = self._candidate_state
+        if candidate_state is None:
+            return batch
+        batch.candidates = [
+            candidate.to_candidate_topic()
+            for candidate in sorted(
+                (
+                    candidate
+                    for candidate in candidate_state.values()
+                    if candidate.discovery_batch_id == batch.id
+                ),
+                key=lambda candidate: candidate.position,
+            )
+        ]
+        return batch
 
     async def get(self, batch_id: UUID) -> DiscoveryBatch | None:
         batch = self._state.get(batch_id)
-        return deepcopy(batch) if batch else None
+        return self._materialize(deepcopy(batch)) if batch else None
 
     async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
         batch = self._state.get(batch_id)
-        return deepcopy(batch) if batch else None
+        return self._materialize(deepcopy(batch)) if batch else None
 
     async def list_for_edition(self, edition_id: UUID) -> list[DiscoveryBatch]:
-        return [deepcopy(item) for item in self._state.values() if item.edition_id == edition_id]
+        return [
+            self._materialize(deepcopy(item))
+            for item in self._state.values()
+            if item.edition_id == edition_id
+        ]
 
     async def list_for_run(self, discovery_run_id: UUID) -> list[DiscoveryBatch]:
         return [
-            deepcopy(item)
+            self._materialize(deepcopy(item))
             for item in self._state.values()
             if item.discovery_run_id == discovery_run_id
         ]
@@ -59,7 +107,130 @@ class InMemoryDiscoveryBatchRepository:
     async def save(self, batch: DiscoveryBatch) -> None:
         if batch.id not in self._state:
             raise LookupError(batch.id)
-        self._state[batch.id] = deepcopy(batch)
+        stored = deepcopy(batch)
+        if self._candidate_state is not None:
+            stored.candidates = []
+        self._state[batch.id] = stored
+
+
+class InMemoryDiscoveryCandidateRepository:
+    def __init__(
+        self,
+        candidate_state: dict[UUID, DiscoveryCandidate],
+        batches: dict[UUID, DiscoveryBatch],
+    ) -> None:
+        self._state = candidate_state
+        self._batches = batches
+
+    async def add_many(self, candidates: list[DiscoveryCandidate]) -> None:
+        for candidate in candidates:
+            self._state[candidate.id] = deepcopy(candidate)
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        candidate = self._state.get(candidate_id)
+        return deepcopy(candidate) if candidate else None
+
+    async def get_for_update(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        candidate = self._state.get(candidate_id)
+        return deepcopy(candidate) if candidate else None
+
+    async def list_for_batch(self, discovery_batch_id: UUID) -> list[DiscoveryCandidate]:
+        return sorted(
+            [
+                deepcopy(candidate)
+                for candidate in self._state.values()
+                if candidate.discovery_batch_id == discovery_batch_id
+            ],
+            key=lambda candidate: (candidate.position, candidate.id),
+        )
+
+    async def list_for_run(
+        self, discovery_run_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        return sorted(
+            [
+                deepcopy(candidate)
+                for candidate in self._state.values()
+                if candidate.discovery_run_id == discovery_run_id
+                and (include_replaced or self._is_active(candidate))
+            ],
+            key=self._revision_order,
+        )
+
+    def _is_active(self, candidate: DiscoveryCandidate) -> bool:
+        batch = self._batches.get(candidate.discovery_batch_id)
+        if batch is not None and batch.replaced_by_batch_id is not None:
+            return False
+        return not any(
+            item.supersedes_candidate_id == candidate.id for item in self._state.values()
+        )
+
+    def _revision_order(self, candidate: DiscoveryCandidate) -> tuple[datetime, str, int]:
+        # Mirrors the SQL ordering: batch revision chronology, then batch position.
+        batch = self._batches.get(candidate.discovery_batch_id)
+        created_at = batch.created_at if batch is not None else candidate.created_at
+        return created_at, str(candidate.discovery_batch_id), candidate.position
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        return sorted(
+            [
+                deepcopy(candidate)
+                for candidate in self._state.values()
+                if candidate.discovery_batch_id in self._batches
+                and self._batches[candidate.discovery_batch_id].edition_id == edition_id
+                and (include_replaced or self._is_active(candidate))
+            ],
+            key=self._revision_order,
+        )
+
+    async def save_evidence(self, candidate: DiscoveryCandidate) -> None:
+        if candidate.id not in self._state:
+            raise LookupError(candidate.id)
+        stored = deepcopy(self._state[candidate.id])
+        stored.evidence = deepcopy(candidate.evidence)
+        self._state[candidate.id] = stored
+
+    async def mark_supersedes(self, candidate_id: UUID, superseded_candidate_id: UUID) -> None:
+        if candidate_id not in self._state:
+            raise LookupError(candidate_id)
+        self._state[candidate_id].supersedes_candidate_id = superseded_candidate_id
+
+
+class BatchProjectedDiscoveryCandidateRepository:
+    """Candidate reads for fixtures that seed whole batches instead of candidates.
+
+    Production always persists candidates as their own rows; these fixtures
+    predate that and describe their world as `DiscoveryBatch` objects, so the
+    canonical rows are projected from them on read.
+    """
+
+    def __init__(self, batches: dict[UUID, DiscoveryBatch]) -> None:
+        self._batches = batches
+
+    def _for_batch(self, batch: DiscoveryBatch) -> list[DiscoveryCandidate]:
+        return [
+            DiscoveryCandidate.from_candidate_topic(
+                candidate,
+                discovery_run_id=batch.discovery_run_id,
+                discovery_batch_id=batch.id,
+                position=position,
+                created_at=batch.created_at,
+            )
+            for position, candidate in enumerate(batch.candidates)
+        ]
+
+    async def list_for_batch(self, discovery_batch_id: UUID) -> list[DiscoveryCandidate]:
+        batch = self._batches.get(discovery_batch_id)
+        return self._for_batch(batch) if batch else []
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        for batch in self._batches.values():
+            for candidate in self._for_batch(batch):
+                if candidate.id == candidate_id:
+                    return candidate
+        return None
 
 
 class InMemoryDiscoveryRunRepository:
@@ -103,6 +274,7 @@ class InMemoryDiscoveryRunRepository:
 
 class InMemoryDiscoveryUnitOfWork:
     discovery_batches: DiscoveryBatchRepository
+    discovery_candidates: Any
     discovery_runs: DiscoveryRunRepository
     editions: EditionRepository
     edition_audit: EditionAuditRepository
@@ -112,13 +284,15 @@ class InMemoryDiscoveryUnitOfWork:
     def __init__(
         self,
         state: dict[UUID, DiscoveryBatch],
+        candidate_state: dict[UUID, DiscoveryCandidate],
         runs: dict[UUID, DiscoveryRun],
         editions: dict[UUID, Edition],
         edition_events: list[EditionAuditEvent],
         jobs: dict[UUID, Job],
         job_events: list[JobEvent],
     ) -> None:
-        self.discovery_batches = InMemoryDiscoveryBatchRepository(state)
+        self.discovery_batches = InMemoryDiscoveryBatchRepository(state, candidate_state)
+        self.discovery_candidates = InMemoryDiscoveryCandidateRepository(candidate_state, state)
         self.discovery_runs = InMemoryDiscoveryRunRepository(runs)
         self.editions = InMemoryEditionRepository(editions)
         self.edition_audit = InMemoryEditionAuditRepository(edition_events)
@@ -146,6 +320,7 @@ class InMemoryDiscoveryUnitOfWork:
 class InMemoryDiscoveryUnitOfWorkFactory:
     def __init__(self) -> None:
         self.state: dict[UUID, DiscoveryBatch] = {}
+        self.candidate_state: dict[UUID, DiscoveryCandidate] = {}
         self.runs: dict[UUID, DiscoveryRun] = {}
         self.editions: dict[UUID, Edition] = {}
         self.edition_events: list[EditionAuditEvent] = []
@@ -155,6 +330,7 @@ class InMemoryDiscoveryUnitOfWorkFactory:
     def __call__(self) -> InMemoryDiscoveryUnitOfWork:
         return InMemoryDiscoveryUnitOfWork(
             self.state,
+            self.candidate_state,
             self.runs,
             self.editions,
             self.edition_events,

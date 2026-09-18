@@ -99,7 +99,7 @@ ALEMBIC_TABLE = "alembic_version"
 _REPAIR_TABLE = "production_repair_decisions"
 _REPAIR_TRIGGER = "trg_production_repair_decisions_append_only"
 
-EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE}
+EXPECTED_TABLES = frozenset(Base.metadata.tables) | {ALEMBIC_TABLE, "discovery_candidates"}
 
 # (local columns, referred table, referred columns, ON DELETE) — shared by
 # both the ORM-derived and the reflected-from-database foreign key shapes.

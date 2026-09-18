@@ -385,7 +385,6 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
         "snapshot_available": True,
     }
     candidate = batches[0].candidates[0]
-    assert candidate.editorial_status == "proposed"
     assert {source.role for source in candidate.sources} == {
         SourceRole.PRIMARY,
         SourceRole.RELAY,
@@ -1297,6 +1296,8 @@ async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_
     await dispatcher.dispatch(initial.id)
     batches_before = await discovery.list_batches(params.edition_id, include_replaced=True)
     assert len(batches_before) == 1
+    initial_candidate_ids = {candidate.id for candidate in batches_before[0].candidates}
+    assert set(discovery_uow.candidate_state) == initial_candidate_ids
     research_calls_before = len(adapter.calls)
     model_runs_before = len(model_uow.state)
 
@@ -1324,6 +1325,8 @@ async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_
     assert initial_batch.replaced_by_batch_id == revision.id
     assert revision.supersedes_batch_id == initial_batch.id
     assert revision.parsing_revision == 2
+    assert len(discovery_uow.candidate_state) == 2
+    assert initial_candidate_ids.isdisjoint({candidate.id for candidate in revision.candidates})
     assert len(model_uow.state) == model_runs_before
     assert len(adapter.calls) == research_calls_before
 
@@ -1374,6 +1377,7 @@ async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_n
     )
     assert len(initial_batches) == 1
     initial_batch = initial_batches[0]
+    initial_candidate_ids = {candidate.id for candidate in initial_batch.candidates}
     archived_model_run_id = initial_batch.discovery_model_run_id
     research_calls_before = len(adapter.calls)
     model_runs_before = len(model_uow.state)
@@ -1442,6 +1446,10 @@ async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_n
     assert revision.parsing_revision == 2
     assert revision.discovery_run_id == run.id
     assert handoff_batch_ids == [revision.id]
+    assert len(discovery_uow.candidate_state) == 2
+    assert initial_candidate_ids.isdisjoint(
+        {candidate.id for candidate in revision.candidates}
+    )
 
     handoff_fails = False
     replayed = await reprocessing.reprocess_archived_report(
@@ -1460,5 +1468,6 @@ async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_n
     assert after_replay[1].supersedes_batch_id == initial_batch.id
     assert after_replay[1].replaced_by_batch_id is None
     assert len(discovery_uow.runs) == 1
+    assert len(discovery_uow.candidate_state) == 2
     assert len(model_uow.state) == model_runs_before
     assert len(adapter.calls) == research_calls_before

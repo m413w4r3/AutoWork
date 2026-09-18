@@ -3,7 +3,11 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { DiscoveryInputMode, DiscoveryRun } from "../../api/discovery";
+import type {
+  DiscoveryCandidate,
+  DiscoveryInputMode,
+  DiscoveryRun,
+} from "../../api/discovery";
 import type { JobStatus } from "../../api/jobs";
 import { DiscoveryPanel } from "./DiscoveryPanel";
 
@@ -90,6 +94,46 @@ function renderPanel(readOnly = false) {
   );
 }
 
+function candidate(
+  id: string,
+  runId: string,
+  title: string,
+  contextOnly = false,
+): DiscoveryCandidate {
+  return {
+    id,
+    discovery_run_id: runId,
+    discovery_batch_id: `batch-${runId}`,
+    created_at: "2026-09-18T10:00:00Z",
+    title,
+    summary: "Résumé brut.",
+    novelty: "Nouvelle information.",
+    technical_potential: 3,
+    event_date: "2026-09-12",
+    uncertainties: [],
+    relevance_reasons: [],
+    actors: ["Acteur"],
+    campaigns: [],
+    malware: [],
+    cves: [],
+    victims: [],
+    sectors: [],
+    countries: [],
+    likely_artifacts: ["IOC"],
+    iocs: [],
+    sources: [],
+    incomplete_sources: [],
+    local_ref: "S1",
+    actor_or_campaign: "Acteur",
+    technical_potential_reason: "Potentiel.",
+    parsing_warnings: [],
+    context_only: contextOnly,
+    selectable: !contextOnly,
+    valid_publication_count: 0,
+    incomplete_publication_count: 0,
+  };
+}
+
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
@@ -158,19 +202,14 @@ describe("DiscoveryPanel durable run history", () => {
           }),
         );
       }
+      if (/\/discovery\/runs\/[^/]+\/candidates/.test(url))
+        return Promise.resolve(Response.json([]));
       if (url.includes("/discovery/candidates"))
         return Promise.resolve(
           Response.json({
             batches: [],
             candidates: [],
             total: 0,
-            merge_stats: {
-              raw_batch_count: 0,
-              raw_candidate_count: 0,
-              consolidated_candidate_count: 0,
-              unique_publication_count: 0,
-              duplicate_publication_occurrence_count: 0,
-            },
             warning: "",
           }),
         );
@@ -222,6 +261,7 @@ describe("DiscoveryPanel durable run history", () => {
   it("shows a newly launched run without localStorage and refetches after remount", async () => {
     let runs: DiscoveryRun[] = [];
     let runListCalls = 0;
+    let candidateCalls = 0;
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = requestUrl(input);
       if (url.endsWith("/discovery/runs") && init?.method === "POST") {
@@ -232,6 +272,14 @@ describe("DiscoveryPanel durable run history", () => {
       if (url.endsWith("/discovery/runs")) {
         runListCalls += 1;
         return Promise.resolve(Response.json(runs));
+      }
+      if (/\/discovery\/runs\/[^/]+\/candidates/.test(url)) {
+        candidateCalls += 1;
+        return Promise.resolve(
+          Response.json([
+            candidate("remount-candidate", "newest", "Candidat persistant"),
+          ]),
+        );
       }
       if (url.includes("/discovery/candidates"))
         return Promise.resolve(
@@ -249,13 +297,84 @@ describe("DiscoveryPanel durable run history", () => {
       await screen.findByRole("button", { name: "Nouvelle recherche ChatGPT" }),
     );
     expect(await screen.findByText("initial")).toBeInTheDocument();
+    expect(await screen.findByText("Candidat persistant")).toBeInTheDocument();
     expect(window.localStorage.length).toBe(0);
     const callsBeforeRemount = runListCalls;
+    const candidateCallsBeforeRemount = candidateCalls;
     view.unmount();
     renderPanel();
     await waitFor(() =>
       expect(runListCalls).toBeGreaterThan(callsBeforeRemount),
     );
+    await waitFor(() =>
+      expect(candidateCalls).toBeGreaterThan(candidateCallsBeforeRemount),
+    );
+    expect(await screen.findByText("Candidat persistant")).toBeInTheDocument();
+  });
+
+  it("keeps raw candidates distinct, shows their run origins and filters through the API", async () => {
+    const runs = [
+      run("newest", "succeeded", { axis: "axe-nouveau" }),
+      run("older", "succeeded", { axis: "axe-ancien" }),
+    ];
+    const rawCandidates = [
+      candidate("candidate-new", "newest", "Même campagne — vague A"),
+      candidate("candidate-old", "older", "Même campagne — vague B", true),
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/discovery/runs"))
+        return Promise.resolve(Response.json(runs));
+      if (url.includes("/discovery/runs/newest/candidates"))
+        return Promise.resolve(Response.json([rawCandidates[0]]));
+      if (url.includes("/discovery/runs/older/candidates"))
+        return Promise.resolve(Response.json([rawCandidates[1]]));
+      if (url.includes("/discovery/candidates")) {
+        const filtered = new URL(url, "http://localhost").searchParams.has(
+          "search",
+        )
+          ? [rawCandidates[0]]
+          : rawCandidates;
+        return Promise.resolve(
+          Response.json({
+            batches: [],
+            candidates: filtered,
+            total: filtered.length,
+            warning: "",
+          }),
+        );
+      }
+      if (url.includes("/editorial-groups"))
+        return Promise.resolve(Response.json({ groups: [] }));
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+
+    renderPanel();
+
+    // Also listed under the selected run's history, hence findAll.
+    expect(
+      (await screen.findAllByText("Même campagne — vague A")).length,
+    ).toBeGreaterThan(0);
+    await user.click(screen.getByText("Détails techniques de la découverte"));
+    expect(screen.getByText("Même campagne — vague B")).toBeInTheDocument();
+    expect(screen.getByText(/newest · axe-nouveau/)).toBeInTheDocument();
+    expect(screen.getByText(/older · axe-ancien/)).toBeInTheDocument();
+    expect(screen.getByText("Contexte uniquement")).toBeInTheDocument();
+    expect(screen.queryByText("Découverte cumulée")).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Recherche"), "même");
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          requestUrl(input).includes("search=m%C3%AAme"),
+        ),
+      ).toBe(true),
+    );
+    expect(
+      screen.queryByText("Même campagne — vague B"),
+    ).not.toBeInTheDocument();
   });
 
   it("renders archived history in read-only mode and disables launch", async () => {
@@ -273,6 +392,8 @@ describe("DiscoveryPanel durable run history", () => {
         const url = requestUrl(input);
         if (url.endsWith("/discovery/runs"))
           return Promise.resolve(Response.json([historical]));
+        if (/\/discovery\/runs\/[^/]+\/candidates/.test(url))
+          return Promise.resolve(Response.json([]));
         if (url.includes("/discovery/candidates"))
           return Promise.resolve(
             Response.json({

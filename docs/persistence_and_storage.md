@@ -19,9 +19,35 @@ PostgreSQL est la source canonique des identités, métadonnées, relations et �
 | `edition_audit_events` | Audit métier des éditions | avant/après, acteur et corrélation ; append-only |
 | `job_events` | Transitions techniques des jobs | statuts avant/après et acteur ; append-only |
 | `model_runs` | Exécutions de modèles | hash d'entrée, versions, usage, statut et références de sortie ; aucun prompt en clair |
-| `discovery_batches` | Propositions de découverte | paramètres hachés, runs, requêtes, citations et candidats/sources non vérifiés |
+| `discovery_runs` | Vagues de recherche de découverte | rattachement immuable à l'édition, intention et configuration de la vague |
+| `discovery_batches` | Révisions parsées d'une vague | rattachement au run et au `ModelRun`, rapport archivé, version de parseur et avertissements |
+| `discovery_candidates` | Propositions brutes de découverte | identité immuable, provenance du batch et contenu sémantique non génériquement éditable |
 | `editorial_groups` | Groupes proposés et sélectionnés | références de candidats, score explicable, rapprochement historique, version et état |
 | `human_decisions` | Décisions de sélection, fusion, séparation et rejet | acteur, corrélation et payload ; append-only |
+
+La provenance relationnelle des propositions est `DiscoveryCandidate -> DiscoveryBatch ->
+DiscoveryRun -> Edition`. Chaque `DiscoveryBatch` référence en outre le `ModelRun` et son rapport
+archivé : `DiscoveryBatch -> ModelRun -> rapport archivé`. `discovery_candidates` est la source
+canonique des candidats bruts ; le `payload` d'un batch ne stocke plus les candidats canoniques
+complets. Un retraitement conserve le même `DiscoveryRun`, ajoute une nouvelle révision de
+`DiscoveryBatch` et crée de nouvelles identités immuables de `DiscoveryCandidate`. Les anciennes
+identités restent adressables ; les lectures opérationnelles actives se déterminent par la
+révision de batch, et non par une paire `batch_id + candidate_id`.
+
+La chaîne de révision est relationnelle : `discovery_batches.supersedes_batch_id` et
+`discovery_batches.replaced_by_batch_id` sont des colonnes avec clé étrangère `ON DELETE RESTRICT`
+et chaînage unique, jamais des entrées de `payload`. Une clé étrangère composite
+`(discovery_batch_id, discovery_run_id)` garantit en base que le run d'un candidat est celui de
+son batch. Une correction manuelle d'URL publie un nouveau candidat qui pointe vers le candidat
+historique via `discovery_candidates.supersedes_candidate_id` ; le candidat historique n'est
+jamais modifié et reste lisible avec `include_replaced`. L'activité d'un candidat reste dérivée
+de ces relations : `discovery_candidates` ne porte aucune colonne de statut.
+
+`CandidateTopic`, `DiscoverySnapshot` et `CandidateReference` peuvent servir de structures de
+parsing, de cumul ou de Selection, mais ne sont pas des magasins canoniques concurrents. Les
+annotations de vérification des sources peuvent évoluer ; la provenance sémantique et le contenu
+d'un candidat ne sont pas modifiables génériquement. La fusion en `DiscoverySubject` appartient à
+AW-007 et la matérialisation/sélection de `Subject` à AW-008.
 
 `source_documents` et `samples` conservent séparément : nom d'origine, origine, date d'acquisition, licence ou restriction, TLP, `do_not_submit` et `external_llm_allowed`. Partager les mêmes octets ne leur donne donc jamais la même sémantique.
 

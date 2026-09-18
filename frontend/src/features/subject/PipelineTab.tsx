@@ -119,7 +119,7 @@ function SourceContentPanel({
     mutationFn: (input: { source: CollectedSource; url: string }) =>
       attachReplacementSourceUrl(
         editionId,
-        subjectId,
+        input.source.discovery_candidate_id!,
         input.source.requested_url,
         input.url,
       ),
@@ -258,38 +258,40 @@ function SourceContentPanel({
                 </button>
               </form>
               {receipt ? <ArchiveReceiptSummary receipt={receipt} /> : null}
-              <form
-                className="source-replacement-form"
-                onSubmit={(event) => {
-                  event.preventDefault();
-                  const url = (urls[source.id] ?? "").trim();
-                  if (!url) return;
-                  replacement.mutate({ source, url });
-                }}
-              >
-                <label htmlFor={`replacement-url-${source.id}`}>
-                  URL de remplacement
-                </label>
-                <input
-                  id={`replacement-url-${source.id}`}
-                  type="url"
-                  required
-                  value={urls[source.id] ?? ""}
-                  onChange={(event) =>
-                    setUrls((current) => ({
-                      ...current,
-                      [source.id]: event.target.value,
-                    }))
-                  }
-                />
-                <button
-                  type="submit"
-                  className="button"
-                  disabled={replacementPending}
+              {source.discovery_candidate_id ? (
+                <form
+                  className="source-replacement-form"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const url = (urls[source.id] ?? "").trim();
+                    if (!url) return;
+                    replacement.mutate({ source, url });
+                  }}
                 >
-                  {replacementPending ? "Remplacement…" : "Remplacer"}
-                </button>
-              </form>
+                  <label htmlFor={`replacement-url-${source.id}`}>
+                    URL de remplacement
+                  </label>
+                  <input
+                    id={`replacement-url-${source.id}`}
+                    type="url"
+                    required
+                    value={urls[source.id] ?? ""}
+                    onChange={(event) =>
+                      setUrls((current) => ({
+                        ...current,
+                        [source.id]: event.target.value,
+                      }))
+                    }
+                  />
+                  <button
+                    type="submit"
+                    className="button"
+                    disabled={replacementPending}
+                  >
+                    {replacementPending ? "Remplacement…" : "Remplacer"}
+                  </button>
+                </form>
+              ) : null}
             </li>
           );
         })}
