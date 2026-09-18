@@ -7,7 +7,7 @@ from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -15,22 +15,20 @@ from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import (
     SOURCE_PROFILE_PATTERN,
     DiscoverEditionParameters,
-    discovery_idempotency_key,
+    discover_parameters_from_edition,
 )
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
-from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.manual_source_edits import (
     SourceCandidateNotFoundError as ManualSourceCandidateNotFoundError,
 )
-from cti_app.application.discovery.service import DiscoveryService
-from cti_app.application.editions import EditionService
-from cti_app.application.identity import IdentityProvider
-from cti_app.application.jobs import (
-    DuplicateJobError,
-    JobDispatcher,
-    JobService,
+from cti_app.application.discovery.runs import (
+    DiscoveryRunNotFoundError,
+    DiscoveryRunProjection,
+    DiscoveryRunService,
 )
+from cti_app.application.discovery.service import DiscoveryService
+from cti_app.application.identity import IdentityProvider
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -46,7 +44,7 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
-from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.editions import Edition
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
@@ -55,24 +53,64 @@ router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discove
 class DiscoveryLaunch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Capped at the durable DiscoveryRun.source_profile width so an accepted
+    # request can always be persisted in its immutable request snapshot.
     source_profile: str = Field(
         min_length=1,
-        max_length=128,
+        max_length=64,
         pattern=SOURCE_PROFILE_PATTERN.pattern,
     )
-    country_aliases: list[str] = Field(default_factory=list, max_length=30)
+    aliases: list[str] = Field(default_factory=list, max_length=30)
     keywords: list[str] = Field(default_factory=list, max_length=100)
     exclusions: list[str] = Field(default_factory=list, max_length=100)
     complementary_axis: str = Field(default="initial", min_length=1, max_length=500)
     sensitivity: str = Field(default="internal", min_length=1, max_length=64)
     external_llm_allowed: bool = True
-    confirm_new_research: bool = False
 
 
-class DiscoveryLaunchView(BaseModel):
+class DiscoveryReportReprocess(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: UUID
+    research_model_run_id: UUID
+
+
+class DiscoveryJobActionView(BaseModel):
     job_id: UUID
     status: str
     reused: bool
+
+
+class DiscoveryRunExecutionView(BaseModel):
+    job_id: UUID
+    status: str
+    progress_current: int
+    progress_total: int
+    user_message: str | None
+    error_code: str | None
+    error_message: str | None
+    error_details: dict[str, object] | None
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class DiscoveryRunResultView(BaseModel):
+    batch_id: UUID
+    research_model_run_id: UUID
+    archived_report_url: str
+
+
+class DiscoveryRunView(BaseModel):
+    run_id: UUID
+    edition_id: UUID
+    input_mode: str
+    source_profile: str
+    complementary_axis: str
+    request_snapshot: dict[str, object]
+    created_by: str
+    created_at: datetime
+    execution: DiscoveryRunExecutionView | None
+    result: DiscoveryRunResultView | None
 
 
 class SourceView(BaseModel):
@@ -211,6 +249,7 @@ class CandidateView(BaseModel):
 
 class BatchView(BaseModel):
     id: UUID
+    discovery_run_id: UUID
     complementary_axis: str
     queries: list[str]
     citations: list[dict[str, str | None]]
@@ -271,54 +310,58 @@ class IncompleteSourceAttachmentView(BaseModel):
     updated_subject_ids: list[UUID]
 
 
-@router.post("", response_model=DiscoveryLaunchView, status_code=status.HTTP_202_ACCEPTED)
+@router.post("/runs", response_model=DiscoveryRunView, status_code=status.HTTP_202_ACCEPTED)
 async def launch_discovery(
-    edition_id: UUID, payload: DiscoveryLaunch, request: Request
-) -> DiscoveryLaunchView:
-    editions: EditionService = request.app.state.edition_service
-    jobs: JobService = request.app.state.job_service
-    dispatcher: JobDispatcher = request.app.state.job_dispatcher
+    edition_id: UUID,
+    payload: DiscoveryLaunch,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> DiscoveryRunView:
+    service: DiscoveryRunService = request.app.state.discovery_run_service
     provider: IdentityProvider = request.app.state.identity_provider
     try:
-        edition = await editions.get(edition_id)
-        if edition.state is EditionStatus.ARCHIVED:
-            raise ValueError("An archived edition cannot start discovery")
-        aliases = list(
-            dict.fromkeys([edition.country, edition.country_code, *payload.country_aliases])
-        )
-        parameters = DiscoverEditionParameters(
-            edition_id=edition.id,
-            country=edition.country,
-            country_aliases=aliases,
-            period_start=edition.period_start,
-            period_end=edition.period_end,
-            languages=list(edition.languages),
+        identity = await provider.current()
+        projection = await service.create_bridge_run(
+            edition_id,
+            idempotency_key=idempotency_key or "",
             source_profile=payload.source_profile,
+            country_aliases=payload.aliases,
             keywords=payload.keywords,
             exclusions=payload.exclusions,
             complementary_axis=payload.complementary_axis,
-            tlp=edition.tlp,
             sensitivity=payload.sensitivity,
             external_llm_allowed=payload.external_llm_allowed,
-            research_nonce=uuid4() if payload.confirm_new_research else None,
+            actor_id=identity.actor_id,
+            correlation_id=get_correlation_id(),
         )
-        identity = await provider.current()
-        try:
-            job = await jobs.submit(
-                kind=DISCOVERY_JOB_KIND,
-                aggregate_type="edition",
-                aggregate_id=edition.id,
-                idempotency_key=discovery_idempotency_key(parameters),
-                correlation_id=get_correlation_id(),
-                input_parameters=parameters.model_dump(mode="json"),
-                max_attempts=1,
-                actor_id=identity.actor_id,
-            )
-            await dispatcher.dispatch(job.id)
-            return DiscoveryLaunchView(job_id=job.id, status=job.status.value, reused=False)
-        except DuplicateJobError as exc:
-            job = await jobs.get(exc.existing_job_id)
-            return DiscoveryLaunchView(job_id=job.id, status=job.status.value, reused=True)
+        return _discovery_run_view(projection)
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.get("/runs", response_model=list[DiscoveryRunView])
+async def list_discovery_runs(edition_id: UUID, request: Request) -> list[DiscoveryRunView]:
+    service: DiscoveryRunService = request.app.state.discovery_run_service
+    try:
+        return [_discovery_run_view(item) for item in await service.list_for_edition(edition_id)]
+    except Exception as exc:
+        _raise_api_error(exc)
+
+
+@router.get("/runs/{run_id}", response_model=DiscoveryRunView)
+async def read_discovery_run(
+    edition_id: UUID, run_id: UUID, request: Request
+) -> DiscoveryRunView:
+    service: DiscoveryRunService = request.app.state.discovery_run_service
+    try:
+        projection = await service.get(run_id)
+        if projection.run.edition_id != edition_id:
+            raise DiscoveryRunNotFoundError(str(run_id))
+        return _discovery_run_view(projection)
+    except DiscoveryRunNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "discovery_run_not_found"}
+        ) from exc
     except Exception as exc:
         _raise_api_error(exc)
 
@@ -422,6 +465,42 @@ async def read_candidates(
             duplicate_publication_occurrence_count=total_duplicate_count,
         ),
     )
+
+
+@router.post(
+    "/reports/reprocess",
+    response_model=DiscoveryJobActionView,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def reprocess_archived_report(
+    edition_id: UUID,
+    payload: DiscoveryReportReprocess,
+    request: Request,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+) -> DiscoveryJobActionView:
+    service: DiscoveryRunService = request.app.state.discovery_run_service
+    provider: IdentityProvider = request.app.state.identity_provider
+    try:
+        identity = await provider.current()
+        _projection, job, reused = await service.reprocess_archived_report(
+            edition_id,
+            payload.run_id,
+            payload.research_model_run_id,
+            transport_key=idempotency_key or "",
+            actor_id=identity.actor_id,
+            correlation_id=get_correlation_id(),
+        )
+        return DiscoveryJobActionView(
+            job_id=job.id,
+            status=job.status.value,
+            reused=reused,
+        )
+    except DiscoveryRunNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail={"code": "discovery_run_not_found"}
+        ) from exc
+    except Exception as exc:
+        _raise_api_error(exc)
 
 
 @router.get("/reports/{research_model_run_id}", response_class=PlainTextResponse)
@@ -528,9 +607,54 @@ async def attach_replacement_source_url(
         _raise_api_error(exc)
 
 
+def _discovery_run_view(projection: DiscoveryRunProjection) -> DiscoveryRunView:
+    run = projection.run
+    job = projection.job
+    batch = projection.result
+    return DiscoveryRunView(
+        run_id=run.id,
+        edition_id=run.edition_id,
+        input_mode=run.input_mode.value,
+        source_profile=run.source_profile,
+        complementary_axis=run.complementary_axis,
+        request_snapshot=run.request_snapshot.model_dump(mode="json"),
+        created_by=run.created_by,
+        created_at=run.created_at,
+        execution=(
+            DiscoveryRunExecutionView(
+                job_id=job.id,
+                status=job.status.value,
+                progress_current=job.progress_current,
+                progress_total=job.progress_total,
+                user_message=job.user_message,
+                error_code=job.error_code,
+                error_message=job.error_message,
+                error_details=job.error_details,
+                started_at=job.started_at,
+                finished_at=job.finished_at,
+            )
+            if job is not None
+            else None
+        ),
+        result=(
+            DiscoveryRunResultView(
+                batch_id=batch.id,
+                research_model_run_id=batch.discovery_model_run_id,
+                archived_report_url=(
+                    f"/api/editions/{run.edition_id}/discovery/reports/"
+                    f"{batch.discovery_model_run_id}"
+                ),
+            )
+            if batch is not None
+            else None
+        ),
+    )
+
+
 def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
     return BatchView(
         id=batch.id,
+        discovery_run_id=batch.discovery_run_id,
         complementary_axis=batch.complementary_axis,
         queries=list(batch.queries),
         citations=list(batch.citations),
@@ -566,26 +690,20 @@ def _discovery_parameters_from_edition(
     country_aliases: list[str] | None = None,
     keywords: list[str] | None = None,
     exclusions: list[str] | None = None,
-    research_nonce: UUID | None = None,
+    discovery_run_id: UUID | None = None,
 ) -> DiscoverEditionParameters:
     # Single source of truth shared by both import endpoints so the edition scope stays
     # identical across all entry points.
-    aliases = list(dict.fromkeys([edition.country, edition.country_code, *(country_aliases or [])]))
-    return DiscoverEditionParameters(
-        edition_id=edition.id,
-        country=edition.country,
-        country_aliases=aliases,
-        period_start=edition.period_start,
-        period_end=edition.period_end,
-        languages=list(edition.languages),
+    return discover_parameters_from_edition(
+        edition,
+        discovery_run_id=discovery_run_id or uuid4(),
         source_profile=source_profile,
+        country_aliases=country_aliases,
         keywords=keywords or [],
         exclusions=exclusions or [],
         complementary_axis=complementary_axis,
-        tlp=edition.tlp,
         sensitivity=sensitivity,
         external_llm_allowed=external_llm_allowed,
-        research_nonce=research_nonce,
     )
 
 

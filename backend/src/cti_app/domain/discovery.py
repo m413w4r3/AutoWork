@@ -6,8 +6,11 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
+from typing import ClassVar
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID, uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from cti_app.domain.classification import TLP
 
@@ -44,6 +47,97 @@ class DiscoverySourceMode(StrEnum):
     VISIBLE_CITATIONS_ONLY = "visible_citations_only"
     MODEL_DECLARED_URLS = "model_declared_urls"
     MANUAL_IMPORT = "manual_import"
+
+
+class DiscoveryRunInputMode(StrEnum):
+    BRIDGE_RESEARCH = "bridge_research"
+    MANUAL_IMPORT = "manual_import"
+
+
+class DiscoveryRequestSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    country: str = Field(min_length=1, max_length=255)
+    country_code: str = Field(min_length=1, max_length=16)
+    country_aliases: tuple[str, ...] = Field(max_length=32)
+    period_start: date
+    period_end: date
+    as_of_date: date
+    languages: tuple[str, ...] = Field(min_length=1, max_length=16)
+    source_profile: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
+    )
+    keywords: tuple[str, ...] = Field(max_length=64)
+    exclusions: tuple[str, ...] = Field(max_length=64)
+    complementary_axis: str = Field(min_length=1, max_length=500)
+    tlp: TLP
+    sensitivity: str = Field(min_length=1, max_length=64)
+    external_llm_allowed: bool
+
+    _COLLECTION_ITEM_MAX_LENGTH: ClassVar[int] = 500
+
+    @field_validator("country", "country_code", "complementary_axis", "sensitivity")
+    @classmethod
+    def _nonblank_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Request snapshot text values must not be blank")
+        return value
+
+    @field_validator("country_aliases", "languages", "keywords", "exclusions")
+    @classmethod
+    def _valid_collection_items(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(not item.strip() for item in value):
+            raise ValueError("Request snapshot collection values must not be blank")
+        if any(len(item) > cls._COLLECTION_ITEM_MAX_LENGTH for item in value):
+            raise ValueError("Request snapshot collection values are too long")
+        return value
+
+    @field_validator("period_end")
+    @classmethod
+    def _period_is_ordered(cls, value: date, info: object) -> date:
+        period_start = info.data.get("period_start")  # type: ignore[attr-defined]
+        if period_start is not None and value < period_start:
+            raise ValueError("Request snapshot period end must not precede its start")
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class DiscoveryRun:
+    edition_id: UUID
+    input_mode: DiscoveryRunInputMode
+    source_profile: str
+    complementary_axis: str
+    request_snapshot: DiscoveryRequestSnapshot
+    idempotency_key: str
+    created_by: str
+    id: UUID = field(default_factory=uuid4)
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.input_mode, DiscoveryRunInputMode):
+            raise ValueError("Discovery run input mode is invalid")
+        if not self.source_profile or not re.fullmatch(
+            r"[a-z0-9]+(?:[._-][a-z0-9]+)*", self.source_profile
+        ):
+            raise ValueError("Discovery run source profile is invalid")
+        if not self.complementary_axis.strip():
+            raise ValueError("Discovery run complementary axis is required")
+        if not self.idempotency_key.strip():
+            raise ValueError("Discovery run idempotency key is required")
+        if len(self.idempotency_key) > 255:
+            raise ValueError("Discovery run idempotency key is too long")
+        if not self.created_by.strip():
+            raise ValueError("Discovery run creator is required")
+        if len(self.created_by) > 255:
+            raise ValueError("Discovery run creator is too long")
+        if self.source_profile != self.request_snapshot.source_profile:
+            raise ValueError("Discovery run source profile must match its request snapshot")
+        if self.complementary_axis != self.request_snapshot.complementary_axis:
+            raise ValueError("Discovery run axis must match its request snapshot")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("Discovery run creation time must be timezone-aware")
 
 
 class DiscoveryBatchStatus(StrEnum):
@@ -260,6 +354,7 @@ class DiscoveryContribution:
 @dataclass(slots=True)
 class DiscoveryBatch:
     edition_id: UUID
+    discovery_run_id: UUID
     request_hash: str
     complementary_axis: str
     queries: tuple[str, ...]

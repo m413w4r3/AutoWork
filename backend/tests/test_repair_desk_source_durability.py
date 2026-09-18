@@ -477,6 +477,7 @@ def _selected_subject(
         queries=("query",),
         citations=(),
         candidates=[candidate],
+        discovery_run_id=uuid4(),
         discovery_model_run_id=uuid4(),
         tlp=TLP.AMBER,
         sensitivity="internal",

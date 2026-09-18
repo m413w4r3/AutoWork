@@ -23,7 +23,7 @@ from cti_app.application.jobs import (
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.domain.jobs import Job, JobStatus
 from cti_app.domain.production import SubjectProductionStage
-from tests.job_support import InMemoryJobUnitOfWorkFactory
+from tests.job_support import InMemoryJobUnitOfWork, InMemoryJobUnitOfWorkFactory
 
 
 async def test_submission_is_idempotent() -> None:
@@ -50,6 +50,41 @@ async def test_submission_is_idempotent() -> None:
         )
     assert duplicate.value.existing_job_id == first.id
     assert len(factory.state) == 1
+
+
+async def test_submit_in_uow_does_not_commit_caller_transaction() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+
+    class RecordingJobUnitOfWork(InMemoryJobUnitOfWork):
+        def __init__(self) -> None:
+            super().__init__(factory.state, factory.events)
+            self.commit_count = 0
+
+        async def commit(self) -> None:
+            self.commit_count += 1
+
+    service = JobService(factory, create_job_registry())
+    uow = RecordingJobUnitOfWork()
+
+    async with uow:
+        job = await service.submit_in_uow(
+            uow,
+            kind="demo.deterministic",
+            aggregate_type="subject",
+            aggregate_id=uuid4(),
+            idempotency_key="caller-owned-transaction",
+            correlation_id="test",
+            input_parameters={"steps": 2},
+            actor_id="test-actor",
+        )
+        assert job.id in factory.state
+        assert len(factory.events) == 1
+        assert factory.events[0].event_type == "job.submitted"
+        assert factory.events[0].actor_id == "test-actor"
+        assert uow.commit_count == 0
+
+    await uow.commit()
+    assert uow.commit_count == 1
 
 
 async def test_synchronous_dispatcher_retries_transient_bridge_timeout() -> None:

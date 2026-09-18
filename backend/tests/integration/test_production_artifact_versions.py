@@ -53,6 +53,7 @@ from cti_app.domain.production import (
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
 
@@ -553,6 +554,12 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
     )
     async with SqlAlchemyUnitOfWork(session_factory) as uow:
         assert await uow.editions.add_if_absent(edition)
+        await uow.commit()
+        discovery_parent = await make_discovery_run_for_edition(
+            lambda: SqlAlchemyUnitOfWork(session_factory),
+            edition,
+            complementary_axis="concurrency",
+        )
         subject = Subject(
             edition_id=edition.id,
             title="Test subject",
@@ -594,6 +601,7 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
             complementary_axis="concurrency",
             queries=(),
             citations=(),
+            discovery_run_id=discovery_parent.id,
             discovery_model_run_id=uuid4(),
             tlp=TLP.AMBER,
             sensitivity="public",

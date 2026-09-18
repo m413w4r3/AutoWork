@@ -2,17 +2,24 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import UTC, date, datetime, timedelta
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel
 
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
-    discovery_idempotency_key,
+    ReprocessDiscoveryReportParameters,
+    discovery_conversation_id,
+    discovery_job_idempotency_key,
     discovery_request_hash,
+    discovery_request_snapshot,
+    discovery_research_model_run_id,
 )
-from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.jobs import (
+    DISCOVERY_JOB_KIND,
+    REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+)
 from cti_app.application.discovery.prompts import _research_prompt
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.jobs import (
@@ -32,6 +39,8 @@ from cti_app.application.model_gateway import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     DiscoveryBatch,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
     DiscoverySourceMode,
     SourceRelationshipStatus,
     SourceRole,
@@ -216,7 +225,7 @@ def persisted_research_run(
         authorized_input_hash="a" * 64,
         evidence_pack_hash=request_hash,
         parameters={},
-        id=uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}"),
+        id=discovery_research_model_run_id(params.discovery_run_id),
     )
     if status is ModelRunStatus.WAITING_BACKGROUND:
         run.wait_for_background(
@@ -288,7 +297,9 @@ Recherche non exhaustive.
 def parameters(axis: str = "initial") -> DiscoverEditionParameters:
     return DiscoverEditionParameters(
         edition_id=uuid4(),
+        discovery_run_id=uuid4(),
         country="Iran",
+        country_code="IR",
         country_aliases=["Iran", "IR", "République islamique d'Iran"],
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
@@ -349,9 +360,9 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
 
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="test-discovery",
         input_parameters=params.model_dump(mode="json"),
     )
@@ -396,9 +407,9 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     with pytest.raises(DuplicateJobError):
         await jobs.submit(
             kind=DISCOVERY_JOB_KIND,
-            aggregate_type="edition",
-            aggregate_id=params.edition_id,
-            idempotency_key=discovery_idempotency_key(params),
+            aggregate_type="discovery_run",
+            aggregate_id=params.discovery_run_id,
+            idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
             correlation_id="test-retry",
             input_parameters=params.model_dump(mode="json"),
         )
@@ -406,12 +417,12 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert len(fake.calls) == 1
     immutable_first_batch = deepcopy((await discovery.list_batches(params.edition_id))[0])
 
-    complementary = params.model_copy(update={"complementary_axis": "configurations publiées"})
+    complementary = params.model_copy(update={"discovery_run_id": uuid4()})
     second_job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(complementary),
+        aggregate_type="discovery_run",
+        aggregate_id=complementary.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(complementary.discovery_run_id),
         correlation_id="test-complement",
         input_parameters=complementary.model_dump(mode="json"),
     )
@@ -421,6 +432,9 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert sum(len(batch.candidates) for batch in batches) == 2
     assert batches[0] == immutable_first_batch
     assert len(fake.calls) == 2
+    assert discovery_request_hash(params) == discovery_request_hash(complementary)
+    assert batches[0].discovery_model_run_id != batches[1].discovery_model_run_id
+    assert batches[0].id != batches[1].id
     assert fake.calls[1].conversation is not None
     assert fake.calls[1].conversation.mode == "fresh"
     assert fake.calls[1].conversation.id != fake.calls[0].conversation.id
@@ -447,14 +461,13 @@ async def test_successful_discovery_archives_conversation_once_after_batch_persi
     jobs = JobService(job_uow, registry)
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     params = parameters()
-    request_hash = discovery_request_hash(params)
-    expected_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
+    expected_conversation_id = discovery_conversation_id(params.discovery_run_id)
 
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="lifecycle-success",
         input_parameters=params.model_dump(mode="json"),
     )
@@ -495,9 +508,9 @@ async def test_failed_research_never_deletes_conversation_or_batch() -> None:
 
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="lifecycle-failure",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -535,9 +548,9 @@ async def test_needs_review_keeps_conversation_recoverable_without_archiving() -
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="lifecycle-needs-review",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -583,9 +596,9 @@ async def test_discovery_renews_job_heartbeat_while_bridge_remains_running() -> 
     params = parameters()
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="durable-heartbeat",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -624,9 +637,9 @@ async def test_worker_restart_resumes_waiting_model_run_by_get_without_second_po
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="worker-restart",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -676,9 +689,9 @@ async def test_completed_model_run_is_reparsed_after_resume_without_bridge_call(
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="completed-resume",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -704,9 +717,9 @@ async def test_incomplete_model_run_waits_for_human_without_automatic_relaunch()
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="incomplete-review",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -744,9 +757,9 @@ async def test_manual_recovery_archives_exact_report_and_resumes_original_job() 
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="manual-recovery",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -842,9 +855,9 @@ async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="terminal-bridge-error",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -885,9 +898,9 @@ async def test_human_cancellation_stops_background_polling_without_resubmission(
     params = parameters()
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="cancel-background",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -935,9 +948,9 @@ url: ftp://invalid.example/report
     params = parameters()
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="partial-output",
         input_parameters=params.model_dump(mode="json"),
     )
@@ -983,9 +996,9 @@ async def test_totally_invalid_output_is_archived_before_safe_failure(
     params = parameters()
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="invalid-output",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -1026,9 +1039,9 @@ async def test_transient_job_error_never_creates_a_second_research() -> None:
     params = parameters()
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="transient-single-attempt",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -1125,6 +1138,7 @@ async def test_standalone_import_creates_batch_without_job_or_model_call() -> No
         markdown,
         expected_sha256=preview["sha256"],
         actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
 
     assert reused is False
@@ -1145,7 +1159,11 @@ async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
     digest = (await service.preview_standalone_import(params, markdown))["sha256"]
 
     first, reused_first, _first_job_id = await service.import_standalone_report(
-        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
+        params,
+        markdown,
+        expected_sha256=digest,
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
     # L'axe ne doit pas entrer dans l'idempotence du contenu.
     second, reused_second, _second_job_id = await service.import_standalone_report(
@@ -1153,6 +1171,7 @@ async def test_standalone_import_is_idempotent_on_identical_markdown() -> None:
         markdown,
         expected_sha256=digest,
         actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
 
     assert reused_first is False
@@ -1199,7 +1218,11 @@ async def test_standalone_import_returns_reconciliation_job_id() -> None:
     digest = (await service.preview_standalone_import(params, markdown))["sha256"]
 
     batch, reused, job_id = await service.import_standalone_report(
-        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
+        params,
+        markdown,
+        expected_sha256=digest,
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
     assert reused is False
     assert job_id == expected_job_id
@@ -1207,7 +1230,11 @@ async def test_standalone_import_returns_reconciliation_job_id() -> None:
     # Un réimport idempotent ne redéclenche pas de réconciliation : rien à
     # attendre de plus.
     _replay_batch, replay_reused, replay_job_id = await service.import_standalone_report(
-        params, markdown, expected_sha256=digest, actor_id="dev-analyst"
+        params,
+        markdown,
+        expected_sha256=digest,
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
     assert replay_reused is True
     assert replay_job_id is None
@@ -1226,6 +1253,74 @@ async def test_standalone_import_rejects_stale_confirmation() -> None:
             markdown,
             expected_sha256="0" * 64,
             actor_id="dev-analyst",
+            idempotency_key="manual-import-1",
         )
 
     assert await service.list_batches(params.edition_id) == []
+
+
+async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_without_model_call(
+) -> None:
+    adapter = FakeModelAdapter(research_text=research_markdown_fixture())
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    params = parameters()
+    run = DiscoveryRun(
+        id=params.discovery_run_id,
+        edition_id=params.edition_id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile=params.source_profile,
+        complementary_axis=params.complementary_axis,
+        request_snapshot=discovery_request_snapshot(params),
+        idempotency_key="reprocess-test-run",
+        created_by="dev-analyst",
+    )
+    async with discovery_uow() as uow:
+        assert await uow.discovery_runs.add_if_absent(run)
+        await uow.commit()
+
+    discovery = DiscoveryService(discovery_uow, gateway, archive=gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    initial = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="discovery_run",
+        aggregate_id=run.id,
+        idempotency_key=discovery_job_idempotency_key(run.id),
+        correlation_id="initial-discovery",
+        input_parameters=params.model_dump(mode="json"),
+    )
+    await dispatcher.dispatch(initial.id)
+    batches_before = await discovery.list_batches(params.edition_id, include_replaced=True)
+    assert len(batches_before) == 1
+    research_calls_before = len(adapter.calls)
+    model_runs_before = len(model_uow.state)
+
+    reprocess = await jobs.submit(
+        kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+        aggregate_type="discovery_run",
+        aggregate_id=run.id,
+        idempotency_key="reprocess-discovery-run:test",
+        correlation_id="reprocess-discovery",
+        input_parameters=ReprocessDiscoveryReportParameters(
+            edition_id=run.edition_id,
+            discovery_run_id=run.id,
+            research_model_run_id=batches_before[0].discovery_model_run_id,
+            actor_id="dev-analyst",
+        ).model_dump(mode="json"),
+    )
+    await dispatcher.dispatch(reprocess.id)
+
+    batches = await discovery.list_batches(params.edition_id, include_replaced=True)
+    assert reprocess.id in job_uow.state
+    assert len(discovery_uow.runs) == 1
+    assert len(batches) == 2
+    initial_batch, revision = sorted(batches, key=lambda batch: batch.parsing_revision)
+    assert initial_batch.discovery_run_id == revision.discovery_run_id == run.id
+    assert initial_batch.replaced_by_batch_id == revision.id
+    assert revision.supersedes_batch_id == initial_batch.id
+    assert revision.parsing_revision == 2
+    assert len(model_uow.state) == model_runs_before
+    assert len(adapter.calls) == research_calls_before

@@ -249,6 +249,34 @@ class JobService:
         max_attempts: int = 3,
         actor_id: str = "system",
     ) -> Job:
+        async with self._uow_factory() as uow:
+            job = await self.submit_in_uow(
+                uow,
+                kind=kind,
+                aggregate_type=aggregate_type,
+                aggregate_id=aggregate_id,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                input_parameters=input_parameters,
+                max_attempts=max_attempts,
+                actor_id=actor_id,
+            )
+            await uow.commit()
+        return job
+
+    async def submit_in_uow(
+        self,
+        uow: JobUnitOfWork,
+        *,
+        kind: str,
+        aggregate_type: str,
+        aggregate_id: UUID,
+        idempotency_key: str,
+        correlation_id: str,
+        input_parameters: dict[str, Any],
+        max_attempts: int = 3,
+        actor_id: str = "system",
+    ) -> Job:
         parameters = self._registry.validate(kind, input_parameters)
         job = Job(
             kind=kind,
@@ -260,15 +288,13 @@ class JobService:
             max_attempts=max_attempts,
             user_message="Tâche en attente",
         )
-        async with self._uow_factory() as uow:
-            inserted = await uow.jobs.add_if_absent(job)
-            if not inserted:
-                existing = await uow.jobs.get_by_idempotency_key(idempotency_key)
-                if existing is None:
-                    raise RuntimeError("Idempotency conflict without an existing job")
-                raise DuplicateJobError(existing.id)
-            await _append_job_event(uow, job, None, "job.submitted", actor_id)
-            await uow.commit()
+        inserted = await uow.jobs.add_if_absent(job)
+        if not inserted:
+            existing = await uow.jobs.get_by_idempotency_key(idempotency_key)
+            if existing is None:
+                raise RuntimeError("Idempotency conflict without an existing job")
+            raise DuplicateJobError(existing.id)
+        await _append_job_event(uow, job, None, "job.submitted", actor_id)
         return job
 
     async def get(self, job_id: UUID) -> Job:

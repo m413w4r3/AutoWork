@@ -35,6 +35,45 @@ antérieurs, l'ancre du tour initial, l'onglet, le run bridge, le ModelRun et la
 vérification. La reprise ouvre exclusivement ce locator ; elle ne déduit jamais la conversation
 depuis l'onglet actif.
 
+## Identité durable du cycle de découverte
+
+Les responsabilités sont séparées explicitement :
+
+- `DiscoveryRun = business wave/intention` : l'intention métier durable d'une vague de découverte,
+  portée par une édition ;
+- `Job = asynchronous execution state` : l'état d'exécution asynchrone, avec progression,
+  erreurs, annulation et reprise ;
+- `ModelRun = model interaction` : une interaction avec le modèle et son rapport éventuellement
+  archivé ;
+- `DiscoveryBatch = parsed result/revision` : un résultat parsé ou une révision de ce résultat.
+
+`DiscoveryIntake` et les objets de fusion restent des structures cumulatives en aval. Un
+`DiscoveryRun` ne possède pas sa propre machine d'état d'exécution : le `Job` est la source
+canonique du statut, de la progression et des erreurs.
+
+Une édition peut posséder zéro, un ou plusieurs `DiscoveryRun`, y compris plusieurs runs
+distincts portant des snapshots de requête identiques. Le `request_snapshot` est immuable.
+La création et les retries utilisent explicitement l'en-tête `Idempotency-Key` : un retry avec
+la même clé réutilise un seul run ; une nouvelle action délibérée doit employer une nouvelle clé
+et peut conserver exactement la même configuration.
+
+Pour une découverte ou un retraitement, le Job porte
+`Job.aggregate_type=discovery_run` et `Job.aggregate_id=DiscoveryRun.id`. Le Job reste la source
+canonique du statut et de la progression de ces traitements. Le champ `batch.discovery_run_id`
+rattache chaque `DiscoveryBatch` à son run ; le résultat initial et ses remplacements forment une
+chaîne de révisions, sans remplacer le run d'origine. Le retraitement d'un rapport et la reprise
+après récupération conservent donc le `DiscoveryRun` initial.
+
+Un import manuel confirmé est un `DiscoveryRun` de type `MANUAL_IMPORT`. Sa prévisualisation est
+non persistante : l'aperçu peut être annulé sans créer de run, de Job ou de batch. Une édition
+`ARCHIVED` peut lister et lire ses runs et leurs résultats, mais ne peut ni créer un nouveau run
+ni confirmer un nouvel import.
+
+L'API de découverte expose `POST /api/editions/{edition_id}/discovery/runs` pour créer ou
+réutiliser un run selon la clé explicite, et `GET /api/editions/{edition_id}/discovery/runs` pour
+lister les runs de l'édition. Les endpoints de candidats et de rapports restent séparés de cet
+endpoint de cycle de vie.
+
 ## Prompt métier `monthly-cti-discovery` 4.1
 
 Le prompt reçoit la date de recherche, la période demandée et la période réellement observable.
@@ -196,9 +235,9 @@ crée un nouveau résultat de parsing. Il effectue zéro appel bridge et zéro a
 original n'est pas modifié. `GET /api/editions/{edition_id}/discovery/reports/{run_id}` permet de
 le consulter.
 
-Une relance web explicite envoie `confirm_new_research=true`, crée une nouvelle clé d'idempotence,
-un nouveau ModelRun et une nouvelle conversation `fresh`, tout en conservant les rapports
-précédents. L'interface demande confirmation avant cette action.
+Une nouvelle recherche explicite crée un nouveau `DiscoveryRun` avec une nouvelle clé
+d'idempotence, un nouveau ModelRun et une nouvelle conversation `fresh`, tout en conservant les
+rapports précédents. Une confirmation humaine est requise avant cette action.
 
 La découverte et son retraitement n'appellent jamais Qwen : le rapport ChatGPT archivé est parsé
 localement par `chatgpt-markdown-v2`. Le regroupement éditorial ne transforme pas une citation

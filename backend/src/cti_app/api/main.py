@@ -27,6 +27,7 @@ from cti_app.application.discovery.cumulative.contracts import ReconcileDiscover
 from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JOB_KIND
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.discovery.runs import DiscoveryRunService
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
@@ -281,6 +282,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.production_pacing = production_pacing
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
+    discovery_run_service = DiscoveryRunService(uow_factory, job_service, job_dispatcher)
     # Registry must exist before the service consuming it, so bind only once both are ready.
     production_chain.bind(job_service, job_dispatcher)
     app.state.job_service = job_service
@@ -292,6 +294,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
     app.state.discovery_service = discovery_service
+    app.state.discovery_run_service = discovery_run_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
     app.state.manual_source_edit_service = manual_source_edit_service
     app.state.editorial_service = editorial_service

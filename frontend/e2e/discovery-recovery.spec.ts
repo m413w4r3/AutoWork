@@ -43,6 +43,39 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
         },
       });
     }
+    if (path === `/api/editions/${editionId}/discovery/runs`) {
+      return route.fulfill({
+        json: [
+          {
+            run_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            edition_id: editionId,
+            input_mode: "bridge_research",
+            source_profile: "default",
+            complementary_axis: "initial",
+            created_by: "dev-analyst",
+            created_at: "2026-08-13T10:00:00Z",
+            request_snapshot: {},
+            execution: {
+              job_id: jobId,
+              status: "waiting_human",
+              progress_current: 2,
+              progress_total: 4,
+              user_message:
+                "ChatGPT s'est arrêté sans produire de réponse finale. La conversation a été conservée et peut être reprise.",
+              error_code: null,
+              error_message: null,
+              error_details: {
+                phase: "chatgpt_incomplete",
+                model_run_id: modelRunId,
+              },
+              started_at: null,
+              finished_at: null,
+            },
+            result: null,
+          },
+        ],
+      });
+    }
     if (path.endsWith("/discovery/candidates")) {
       return route.fulfill({
         json: { batches: [], candidates: [], total: 0, warning: "provisoire" },
@@ -116,11 +149,6 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
     return route.fulfill({ status: 404, body: "{}" });
   });
 
-  await page.addInitScript(
-    ({ edition, job }) =>
-      localStorage.setItem(`cti-discovery-job:${edition}`, job),
-    { edition: editionId, job: jobId },
-  );
   await page.goto(`/editions/${editionId}/discovery`);
 
   await expect(

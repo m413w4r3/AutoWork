@@ -49,6 +49,7 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
 
@@ -98,18 +99,22 @@ async def test_resolving_a_merge_retires_it_and_stays_idempotent(
 
     edition = _edition("Resolve Iran", "RA")
     model_run = _model_run()
-    first = _batch(edition.id, model_run.id, url="https://vendor.example/one")
-    second = _batch(
-        edition.id,
-        model_run.id,
-        title="Second topic",
-        url="https://vendor.example/two",
-        request_hash="e" * 64,
-        local_ref="S2",
-    )
     try:
         async with uow_factory() as uow:
             assert await uow.editions.add_if_absent(edition)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        first = _batch(edition.id, model_run.id, discovery_run.id, url="https://vendor.example/one")
+        second = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Second topic",
+            url="https://vendor.example/two",
+            request_hash="e" * 64,
+            local_ref="S2",
+        )
+        async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
             assert await uow.discovery_batches.add_if_absent(first)
             assert await uow.discovery_batches.add_if_absent(second)
@@ -163,23 +168,6 @@ async def test_a_merge_planned_against_a_superseded_snapshot_is_replanned(
 
     edition = _edition("Stale Iran", "RB")
     model_run = _model_run()
-    first = _batch(edition.id, model_run.id, url="https://vendor.example/one")
-    second = _batch(
-        edition.id,
-        model_run.id,
-        title="Second topic",
-        url="https://vendor.example/two",
-        request_hash="e" * 64,
-        local_ref="S2",
-    )
-    third = _batch(
-        edition.id,
-        model_run.id,
-        title="Third topic",
-        url="https://vendor.example/three",
-        request_hash="f" * 64,
-        local_ref="S3",
-    )
     replanned: list[ReconcileDiscoveryParameters] = []
 
     async def replan(parameters: ReconcileDiscoveryParameters) -> object:
@@ -189,6 +177,28 @@ async def test_a_merge_planned_against_a_superseded_snapshot_is_replanned(
     try:
         async with uow_factory() as uow:
             assert await uow.editions.add_if_absent(edition)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        first = _batch(edition.id, model_run.id, discovery_run.id, url="https://vendor.example/one")
+        second = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Second topic",
+            url="https://vendor.example/two",
+            request_hash="e" * 64,
+            local_ref="S2",
+        )
+        third = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Third topic",
+            url="https://vendor.example/three",
+            request_hash="f" * 64,
+            local_ref="S3",
+        )
+        async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
             for batch in (first, second, third):
                 assert await uow.discovery_batches.add_if_absent(batch)
@@ -251,18 +261,22 @@ async def test_a_decision_naming_an_unknown_group_is_refused(
 
     edition = _edition("Bounds Iran", "RC")
     model_run = _model_run()
-    first = _batch(edition.id, model_run.id, url="https://vendor.example/one")
-    second = _batch(
-        edition.id,
-        model_run.id,
-        title="Second topic",
-        url="https://vendor.example/two",
-        request_hash="e" * 64,
-        local_ref="S2",
-    )
     try:
         async with uow_factory() as uow:
             assert await uow.editions.add_if_absent(edition)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        first = _batch(edition.id, model_run.id, discovery_run.id, url="https://vendor.example/one")
+        second = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Second topic",
+            url="https://vendor.example/two",
+            request_hash="e" * 64,
+            local_ref="S2",
+        )
+        async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
             assert await uow.discovery_batches.add_if_absent(first)
             assert await uow.discovery_batches.add_if_absent(second)
@@ -319,6 +333,7 @@ def _model_run() -> ModelRun:
 def _batch(
     edition_id: UUID,
     model_run_id: UUID,
+    discovery_run_id: UUID,
     *,
     title: str = "Stable title",
     url: str = "https://vendor.example/report",
@@ -371,6 +386,7 @@ def _batch(
                 accepted_at=now,
             )
         ],
+        discovery_run_id=discovery_run_id,
         discovery_model_run_id=model_run_id,
         tlp=TLP.AMBER,
         sensitivity="internal",

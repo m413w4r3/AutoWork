@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 from typing import Literal
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import UUID
 
-from fastapi import APIRouter, Request, status
+from fastapi import APIRouter, Header, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.discovery import (
-    DiscoveryLaunchView,
+    DiscoveryJobActionView,
     _discovery_parameters_from_edition,
 )
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import (
     SOURCE_PROFILE_PATTERN,
     DiscoverEditionParameters,
-    discovery_request_hash,
+    discovery_research_model_run_id,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
@@ -61,9 +61,11 @@ class RecoveryPreviewView(BaseModel):
 class DiscoveryImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    # Capped at the durable DiscoveryRun.source_profile width: a confirmed
+    # import persists this value in its immutable request snapshot.
     source_profile: str = Field(
         min_length=1,
-        max_length=128,
+        max_length=64,
         pattern=SOURCE_PROFILE_PATTERN.pattern,
     )
     markdown: str = Field(min_length=1, max_length=10_000_000)
@@ -81,6 +83,7 @@ class DiscoveryImportConfirmation(DiscoveryImportRequest):
 
 
 class DiscoveryImportConfirmView(BaseModel):
+    run_id: UUID
     batch_id: UUID
     reused: bool
     source_mode: Literal["manual_import"]
@@ -116,7 +119,7 @@ async def preview_visible_recovery(
 
 @router.post(
     "/recovery/{research_model_run_id}/visible/confirm",
-    response_model=DiscoveryLaunchView,
+    response_model=DiscoveryJobActionView,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def confirm_visible_recovery(
@@ -124,7 +127,7 @@ async def confirm_visible_recovery(
     research_model_run_id: UUID,
     payload: RecoveryConfirmation,
     request: Request,
-) -> DiscoveryLaunchView:
+) -> DiscoveryJobActionView:
     service: DiscoveryService = request.app.state.discovery_service
     try:
         parameters, job = await _recovery_context(
@@ -141,7 +144,7 @@ async def confirm_visible_recovery(
         resumed = await _continue_after_recovery(
             job, research_model_run_id, actor.actor_id, request
         )
-        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+        return DiscoveryJobActionView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
 
@@ -172,7 +175,7 @@ async def preview_manual_recovery(
 
 @router.post(
     "/recovery/{research_model_run_id}/manual/confirm",
-    response_model=DiscoveryLaunchView,
+    response_model=DiscoveryJobActionView,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def confirm_manual_recovery(
@@ -180,7 +183,7 @@ async def confirm_manual_recovery(
     research_model_run_id: UUID,
     payload: ManualRecoveryConfirmation,
     request: Request,
-) -> DiscoveryLaunchView:
+) -> DiscoveryJobActionView:
     service: DiscoveryService = request.app.state.discovery_service
     try:
         parameters, job = await _recovery_context(
@@ -199,14 +202,14 @@ async def confirm_manual_recovery(
         resumed = await _continue_after_recovery(
             job, research_model_run_id, actor.actor_id, request
         )
-        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+        return DiscoveryJobActionView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
 
 
 @router.post(
     "/recovery/{research_model_run_id}/complete",
-    response_model=DiscoveryLaunchView,
+    response_model=DiscoveryJobActionView,
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def request_completion_recovery(
@@ -214,7 +217,7 @@ async def request_completion_recovery(
     research_model_run_id: UUID,
     payload: RecoveryRequest,
     request: Request,
-) -> DiscoveryLaunchView:
+) -> DiscoveryJobActionView:
     service: DiscoveryService = request.app.state.discovery_service
     try:
         parameters, job = await _recovery_context(
@@ -226,7 +229,7 @@ async def request_completion_recovery(
         resumed = await _continue_after_recovery(
             job, research_model_run_id, actor.actor_id, request
         )
-        return DiscoveryLaunchView(job_id=resumed.id, status=resumed.status.value, reused=True)
+        return DiscoveryJobActionView(job_id=resumed.id, status=resumed.status.value, reused=True)
     except Exception as exc:
         _raise_api_error(exc)
 
@@ -264,7 +267,10 @@ async def preview_discovery_import(
     response_model=DiscoveryImportConfirmView,
 )
 async def confirm_discovery_import(
-    edition_id: UUID, payload: DiscoveryImportConfirmation, request: Request
+    edition_id: UUID,
+    payload: DiscoveryImportConfirmation,
+    request: Request,
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> DiscoveryImportConfirmView:
     # Creates a synthetic ModelRun and a DiscoveryBatch with source_mode=manual_import.
     service: DiscoveryService = request.app.state.discovery_service
@@ -287,9 +293,11 @@ async def confirm_discovery_import(
             payload.markdown,
             expected_sha256=payload.expected_sha256,
             actor_id=identity.actor_id,
+            idempotency_key=idempotency_key,
         )
 
         return DiscoveryImportConfirmView(
+            run_id=batch.discovery_run_id,
             batch_id=batch.id,
             reused=reused,
             reconciliation_job_id=reconciliation_job_id,
@@ -314,10 +322,8 @@ async def _recovery_context(
         raise ValueError("Recovery job does not exist") from exc
     if (
         job.kind != DISCOVERY_JOB_KIND
-        or job.aggregate_type != "edition"
-        or job.aggregate_id != edition_id
-        or job.status
-        not in {
+        or job.aggregate_type != "discovery_run"
+        or job.status not in {
             JobStatus.WAITING_HUMAN,
             JobStatus.QUEUED,
             JobStatus.RUNNING,
@@ -328,11 +334,10 @@ async def _recovery_context(
     ):
         raise ValueError("Job is not waiting for this discovery recovery")
     parameters = DiscoverEditionParameters.model_validate(job.input_parameters)
+    if parameters.edition_id != edition_id or job.aggregate_id != parameters.discovery_run_id:
+        raise ValueError("Job is not waiting for this discovery recovery")
     details = job.error_details or {}
-    expected_original = uuid5(
-        NAMESPACE_URL,
-        f"cti-discovery-model-run:{discovery_request_hash(parameters)}",
-    )
+    expected_original = discovery_research_model_run_id(parameters.discovery_run_id)
     if (
         details.get("model_run_id") != str(research_model_run_id)
         and research_model_run_id != expected_original

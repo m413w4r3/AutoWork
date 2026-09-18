@@ -94,6 +94,7 @@ from cti_app.domain.production import (
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore
+from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
 
@@ -177,7 +178,11 @@ async def _persist_edition(uow_factory: UnitOfWorkFactory, edition: Edition) -> 
 
 
 def _production_context_entities(
-    *, edition: Edition, subject: Subject, title: str = "Production subject"
+    *,
+    edition: Edition,
+    subject: Subject,
+    discovery_run_id: UUID,
+    title: str = "Production subject",
 ) -> tuple[DiscoveryBatch, EditorialGroup, SourceCandidate]:
     source = SourceCandidate(
         url=f"https://example.test/{subject.slug}",
@@ -215,6 +220,7 @@ def _production_context_entities(
         complementary_axis="reuse integration",
         queries=(),
         citations=(),
+        discovery_run_id=discovery_run_id,
         discovery_model_run_id=uuid4(),
         tlp=TLP.AMBER,
         sensitivity="public",
@@ -331,8 +337,14 @@ async def _seed_reusable_article(
     ProductionArtifact,
 ]:
     """Create one complete first pass whose costly inputs can be reused."""
+    discovery_run = await make_discovery_run_for_edition(
+        uow_factory, edition, complementary_axis="reuse integration"
+    )
     batch, group, source = _production_context_entities(
-        edition=edition, subject=subject, title=title
+        edition=edition,
+        subject=subject,
+        discovery_run_id=discovery_run.id,
+        title=title,
     )
     discovery_model_run = ModelRun(
         id=batch.discovery_model_run_id,
@@ -657,7 +669,14 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         await uow.subjects.add(subject)
         await uow.commit()
 
-    batch, group, source = _production_context_entities(edition=edition, subject=subject)
+    discovery_run = await make_discovery_run_for_edition(
+        uow_factory, edition, complementary_axis="reuse integration"
+    )
+    batch, group, source = _production_context_entities(
+        edition=edition,
+        subject=subject,
+        discovery_run_id=discovery_run.id,
+    )
     discovery_model_run = ModelRun(
         id=batch.discovery_model_run_id,
         provider=ModelProvider.FAKE,

@@ -6,7 +6,7 @@ import pytest
 
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
-    discovery_idempotency_key,
+    discovery_job_idempotency_key,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
@@ -22,6 +22,7 @@ from cti_app.infrastructure.database.session import (
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.integrations.models import InMemoryModelOutputStore
+from tests.discovery_support import make_discovery_run_for_edition
 from tests.test_discovery import DeferredResearchAdapter, research_markdown_fixture
 
 pytestmark = pytest.mark.integration
@@ -65,9 +66,17 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
             actor_id="integration-analyst",
             correlation_id="durable-discovery-integration",
         )
+        discovery_run = await make_discovery_run_for_edition(
+            uow_factory,
+            edition,
+            source_profile="iran-default",
+            complementary_axis="campagnes techniques",
+        )
         parameters = DiscoverEditionParameters(
             edition_id=edition.id,
+            discovery_run_id=discovery_run.id,
             country=edition.country,
+            country_code=edition.country_code,
             country_aliases=["DB"],
             period_start=edition.period_start,
             period_end=edition.period_end,
@@ -104,9 +113,9 @@ async def test_postgres_job_lease_survives_long_background_bridge_run(
         executor = JobExecutor(uow_factory, registry)
         job = await jobs.submit(
             kind=DISCOVERY_JOB_KIND,
-            aggregate_type="edition",
-            aggregate_id=edition.id,
-            idempotency_key=discovery_idempotency_key(parameters),
+            aggregate_type="discovery_run",
+            aggregate_id=discovery_run.id,
+            idempotency_key=discovery_job_idempotency_key(discovery_run.id),
             correlation_id="durable-discovery-integration",
             input_parameters=parameters.model_dump(mode="json"),
             max_attempts=1,

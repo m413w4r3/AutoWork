@@ -10,6 +10,7 @@ from cti_app.infrastructure.database.models.collection import SourceCollectionRo
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
+from tests.discovery_support import make_discovery_run_for_edition
 from tests.test_collection import selected_subject
 
 pytestmark = pytest.mark.integration
@@ -54,6 +55,12 @@ async def test_database_rejects_verified_relationship_without_qualified_evidence
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(
+            lambda: SqlAlchemyUnitOfWork(session_factory), edition
+        )
+        batch.discovery_run_id = discovery_run.id
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
             await uow.subjects.add(subject)
             for run in model_runs:
                 await uow.model_runs.add(run)

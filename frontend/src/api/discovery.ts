@@ -1,4 +1,5 @@
 import { ApiError } from "./editions";
+import type { JobStatus, JobView } from "./jobs";
 
 export type SourceRole =
   "primary" | "independent" | "relay" | "aggregator" | "social" | "unknown";
@@ -119,6 +120,7 @@ export interface ProvisionalDiscoveryIoc {
 
 export interface DiscoveryBatch {
   id: string;
+  discovery_run_id: string;
   complementary_axis: string;
   queries: string[];
   citations: Array<{ label: string; url: string; excerpt: string | null }>;
@@ -166,10 +168,62 @@ export interface DiscoveryResult {
   warning: string;
 }
 
-export interface DiscoveryLaunchResult {
+/** Résultat d'une action Job (recovery, reprocessing) : jamais une identité de run. */
+export interface DiscoveryJobActionResult {
   job_id: string;
-  status: string;
+  status: JobStatus;
   reused: boolean;
+}
+
+export type DiscoveryInputMode = "bridge_research" | "manual_import";
+
+export interface DiscoveryRunRequestSnapshot {
+  country: string;
+  country_code: string;
+  country_aliases: string[];
+  period_start: string;
+  period_end: string;
+  as_of_date: string;
+  languages: string[];
+  source_profile: string;
+  keywords: string[];
+  exclusions: string[];
+  complementary_axis: string;
+  tlp: string;
+  sensitivity: string;
+  external_llm_allowed: boolean;
+}
+
+export interface DiscoveryRunExecution {
+  job_id: string;
+  status: JobStatus;
+  progress_current: number;
+  progress_total: number;
+  user_message: string | null;
+  error_code: string | null;
+  error_message: string | null;
+  error_details: JobView["error_details"];
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface DiscoveryRunResult {
+  batch_id: string;
+  research_model_run_id: string;
+  archived_report_url: string;
+}
+
+export interface DiscoveryRun {
+  run_id: string;
+  edition_id: string;
+  input_mode: DiscoveryInputMode;
+  source_profile: string;
+  complementary_axis: string;
+  request_snapshot: Readonly<DiscoveryRunRequestSnapshot>;
+  created_by: string;
+  created_at: string;
+  execution: DiscoveryRunExecution | null;
+  result: DiscoveryRunResult | null;
 }
 
 export interface DiscoveryRecoveryPreview {
@@ -183,6 +237,7 @@ export interface DiscoveryRecoveryPreview {
 }
 
 export interface DiscoveryImportConfirmResult {
+  run_id: string;
   batch_id: string;
   reused: boolean;
   source_mode: "manual_import";
@@ -195,36 +250,61 @@ export interface DiscoveryImportConfirmResult {
   reconciliation_job_id: string | null;
 }
 
-export function launchDiscovery(
+export interface DiscoveryLaunchPayload {
+  complementary_axis: string;
+  source_profile: string;
+}
+
+export function launchDiscoveryRun(
   editionId: string,
-  complementaryAxis: string,
-  sourceProfile: string,
-  confirmNewResearch = false,
-): Promise<DiscoveryLaunchResult> {
-  return request(`/api/editions/${encodeURIComponent(editionId)}/discovery`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      complementary_axis: complementaryAxis,
-      source_profile: sourceProfile,
-      confirm_new_research: confirmNewResearch,
-    }),
-  });
+  payload: DiscoveryLaunchPayload,
+  idempotencyKey: string,
+): Promise<DiscoveryRun> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/runs`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function fetchDiscoveryRuns(editionId: string): Promise<DiscoveryRun[]> {
+  return request<DiscoveryRun[]>(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/runs`,
+  );
+}
+
+export function fetchDiscoveryRun(
+  editionId: string,
+  runId: string,
+): Promise<DiscoveryRun> {
+  return request<DiscoveryRun>(
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/runs/${encodeURIComponent(runId)}`,
+  );
 }
 
 export function reprocessReport(
   editionId: string,
+  runId: string,
   researchModelRunId: string,
-  complementaryAxis: string,
-): Promise<DiscoveryLaunchResult> {
+  idempotencyKey: string,
+): Promise<DiscoveryJobActionResult> {
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/reports/reprocess`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
       body: JSON.stringify({
+        run_id: runId,
         research_model_run_id: researchModelRunId,
-        complementary_axis: complementaryAxis,
       }),
     },
   );
@@ -250,7 +330,7 @@ export function confirmVisibleDiscoveryRecovery(
   modelRunId: string,
   jobId: string,
   expectedSha256: string,
-): Promise<DiscoveryLaunchResult> {
+): Promise<DiscoveryJobActionResult> {
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/visible/confirm`,
     {
@@ -268,7 +348,7 @@ export function requestDiscoveryCompletion(
   editionId: string,
   modelRunId: string,
   jobId: string,
-): Promise<DiscoveryLaunchResult> {
+): Promise<DiscoveryJobActionResult> {
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/complete`,
     {
@@ -301,7 +381,7 @@ export function confirmManualDiscoveryRecovery(
   jobId: string,
   markdown: string,
   expectedSha256: string,
-): Promise<DiscoveryLaunchResult> {
+): Promise<DiscoveryJobActionResult> {
   return request(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/recovery/${encodeURIComponent(modelRunId)}/manual/confirm`,
     {
@@ -344,6 +424,7 @@ export function confirmDiscoveryImport(
   markdown: string,
   expectedSha256: string,
   sourceProfile: string,
+  idempotencyKey: string,
   complementaryAxis: string = "manual-import",
   sensitivity: string = "internal",
 ): Promise<DiscoveryImportConfirmResult> {
@@ -351,7 +432,10 @@ export function confirmDiscoveryImport(
     `/api/editions/${encodeURIComponent(editionId)}/discovery/import/confirm`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
       body: JSON.stringify({
         markdown,
         expected_sha256: expectedSha256,
