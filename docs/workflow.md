@@ -37,7 +37,16 @@ L’application charge :
 
 ### 2. Découverte des sujets
 
-L’utilisateur clique sur « Rechercher les sujets ».
+L’utilisateur clique sur « Rechercher les sujets ». Cette action crée ou réutilise un
+`DiscoveryRun` via `POST /api/editions/{edition_id}/discovery/runs`, avec une clé
+`Idempotency-Key` explicite. `GET /api/editions/{edition_id}/discovery/runs` liste ensuite les
+runs de l’édition et leurs résultats. Une édition peut en posséder plusieurs, y compris avec la
+même configuration ; une nouvelle action utilise une nouvelle clé.
+
+Le run est l’intention métier de la vague. Le `Job` associé porte l’exécution asynchrone et son
+statut canonique ; le `ModelRun` porte l’interaction avec le modèle ; le `DiscoveryBatch` porte le
+résultat parsé et sa révision. Les endpoints de candidats et de rapports restent distincts des
+endpoints de création et de lecture des runs.
 
 Le backend lance une recherche OpenAI en arrière-plan avec plusieurs axes :
 
@@ -49,6 +58,16 @@ Le backend lance une recherche OpenAI en arrière-plan avec plusieurs axes :
 * publications dans la période demandée.
 
 En parallèle, le système interroge les sources suivies, RSS, résultats Livehunt et imports manuels.
+
+L’inventaire des endpoints conserve séparément les opérations de rapports :
+`POST /api/editions/{edition_id}/discovery/reports/reprocess` relance le parsing d’un rapport
+archivé et `GET /api/editions/{edition_id}/discovery/reports/{run_id}` le consulte. Le batch
+initial et ses remplacements restent rattachés par `batch.discovery_run_id` au run d’origine ;
+un retraitement ou une récupération ne crée pas une nouvelle identité de run.
+
+Un import manuel confirmé devient un `MANUAL_IMPORT` `DiscoveryRun`, tandis que sa prévisualisation
+reste non persistante. Une édition archivée peut lister et lire les runs et résultats existants,
+mais ne peut pas créer de run ni confirmer un nouvel import.
 
 OpenAI est chargé de :
 

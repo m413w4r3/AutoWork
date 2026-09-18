@@ -24,9 +24,13 @@ from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
-from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JOB_KIND
+from cti_app.application.discovery.cumulative.jobs import (
+    RECONCILE_DISCOVERY_JOB_KIND,
+    ensure_discovery_reconciliation_job,
+)
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
+from cti_app.application.discovery.runs import DiscoveryRunService
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
@@ -141,33 +145,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
         if not isinstance(batch, DiscoveryBatch) or not isinstance(input_mode, DiscoveryInputMode):
             raise TypeError("Invalid discovery reconciliation request")
-        intake, _ = await cumulative_discovery_service.ingest_batch(
+        return await ensure_discovery_reconciliation_job(
             batch,
             input_mode=input_mode,
             actor_id=actor_id,
+            cumulative_discovery_service=cumulative_discovery_service,
+            job_service=job_service,
+            job_dispatcher=job_dispatcher,
+            correlation_id=get_correlation_id(),
         )
-        parent = await cumulative_discovery_service.active_snapshot(batch.edition_id)
-        parameters = ReconcileDiscoveryParameters(
-            intake_id=intake.id,
-            edition_id=batch.edition_id,
-            expected_parent_snapshot_id=parent.id if parent else None,
-            actor_id=actor_id,
-        )
-        try:
-            job = await job_service.submit(
-                kind=RECONCILE_DISCOVERY_JOB_KIND,
-                aggregate_type="edition",
-                aggregate_id=batch.edition_id,
-                idempotency_key=f"reconcile-discovery:{intake.id}",
-                correlation_id=get_correlation_id(),
-                input_parameters=parameters.model_dump(mode="json"),
-                max_attempts=3,
-                actor_id=actor_id,
-            )
-            await job_dispatcher.dispatch(job.id)
-            return job
-        except DuplicateJobError as exc:
-            return await job_service.get(exc.existing_job_id)
 
     async def replan_discovery_intake(parameters: ReconcileDiscoveryParameters) -> object:
         # Parent snapshot is part of the key: the bare key was already claimed by this
@@ -281,6 +267,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.production_pacing = production_pacing
     job_service = JobService(uow_factory, registry)
     job_dispatcher = DramatiqJobDispatcher()
+    discovery_run_service = DiscoveryRunService(uow_factory, job_service, job_dispatcher)
     # Registry must exist before the service consuming it, so bind only once both are ready.
     production_chain.bind(job_service, job_dispatcher)
     app.state.job_service = job_service
@@ -292,6 +279,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.bridge_capabilities_provider = bridge_provider
     app.state.model_conversation_service = model_conversation_service
     app.state.discovery_service = discovery_service
+    app.state.discovery_run_service = discovery_run_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
     app.state.manual_source_edit_service = manual_source_edit_service
     app.state.editorial_service = editorial_service

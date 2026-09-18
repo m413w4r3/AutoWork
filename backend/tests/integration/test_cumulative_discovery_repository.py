@@ -19,6 +19,7 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
 
@@ -50,19 +51,23 @@ async def test_cumulative_snapshot_identity_and_contribution_round_trip(
         evidence_pack_hash="b" * 64,
         parameters={},
     )
-    batch = _batch(edition.id, run.id)
-    second_batch = _batch(
-        edition.id,
-        run.id,
-        title="Distinct title",
-        url="https://vendor.example/distinct",
-        request_hash="e" * 64,
-    )
-    second_batch.candidates[0].campaigns = ("Distinct Campaign",)
-    second_batch.candidates[0].malware = ("Distinct Malware",)
     try:
         async with uow_factory() as uow:
             assert await uow.editions.add_if_absent(edition)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        batch = _batch(edition.id, run.id, discovery_run.id)
+        second_batch = _batch(
+            edition.id,
+            run.id,
+            discovery_run.id,
+            title="Distinct title",
+            url="https://vendor.example/distinct",
+            request_hash="e" * 64,
+        )
+        second_batch.candidates[0].campaigns = ("Distinct Campaign",)
+        second_batch.candidates[0].malware = ("Distinct Malware",)
+        async with uow_factory() as uow:
             await uow.model_runs.add(run)
             assert await uow.discovery_batches.add_if_absent(batch)
             assert await uow.discovery_batches.add_if_absent(second_batch)
@@ -145,6 +150,7 @@ async def test_cumulative_snapshot_identity_and_contribution_round_trip(
 def _batch(
     edition_id: UUID,
     model_run_id: UUID,
+    discovery_run_id: UUID,
     *,
     title: str = "Stable title",
     url: str = "https://vendor.example/report",
@@ -196,6 +202,7 @@ def _batch(
                 accepted_at=now,
             )
         ],
+        discovery_run_id=discovery_run_id,
         discovery_model_run_id=model_run_id,
         tlp=TLP.AMBER,
         sensitivity="internal",

@@ -8,6 +8,9 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
     DiscoveryIocType,
+    DiscoveryRequestSnapshot,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
     IncompleteSourceCandidate,
     IocPresence,
     PeriodRelation,
@@ -25,6 +28,113 @@ from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 pytestmark = pytest.mark.integration
 
 
+async def test_discovery_run_repository_round_trip_idempotency_and_order(
+    migrated_postgres_url: str,
+) -> None:
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+    )
+    snapshot = DiscoveryRequestSnapshot(
+        country=edition.country,
+        country_code=edition.country_code,
+        country_aliases=("French Republic",),
+        period_start=edition.period_start,
+        period_end=edition.period_end,
+        as_of_date=date(2026, 9, 1),
+        languages=edition.languages,
+        source_profile="default-v1",
+        keywords=("cyber", "intrusion"),
+        exclusions=("sport",),
+        complementary_axis="initial",
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
+    run_times = (
+        datetime(2026, 9, 1, 9, 0, tzinfo=UTC),
+        datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
+        datetime(2026, 9, 1, 11, 0, tzinfo=UTC),
+        datetime(2026, 9, 1, 12, 0, tzinfo=UTC),
+    )
+    runs = (
+        DiscoveryRun(
+            edition_id=edition.id,
+            input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+            source_profile="default-v1",
+            complementary_axis="initial",
+            request_snapshot=snapshot,
+            idempotency_key="run-old",
+            created_by="analyst-1",
+            created_at=run_times[0],
+        ),
+        DiscoveryRun(
+            edition_id=edition.id,
+            input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+            source_profile="default-v1",
+            complementary_axis="initial",
+            request_snapshot=snapshot,
+            idempotency_key="run-same-snapshot",
+            created_by="analyst-1",
+            created_at=run_times[1],
+        ),
+        DiscoveryRun(
+            edition_id=edition.id,
+            input_mode=DiscoveryRunInputMode.MANUAL_IMPORT,
+            source_profile="default-v1",
+            complementary_axis="initial",
+            request_snapshot=snapshot,
+            idempotency_key="run-old",
+            created_by="analyst-2",
+            created_at=run_times[2],
+        ),
+        DiscoveryRun(
+            edition_id=edition.id,
+            input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+            source_profile="default-v1",
+            complementary_axis="initial",
+            request_snapshot=snapshot,
+            idempotency_key="run-latest",
+            created_by="analyst-1",
+            created_at=run_times[3],
+        ),
+    )
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            for run in runs:
+                assert await uow.discovery_runs.add_if_absent(run)
+            assert not await uow.discovery_runs.add_if_absent(runs[0])
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.discovery_runs.get(runs[1].id)
+            assert persisted == runs[1]
+            assert (
+                await uow.discovery_runs.get_by_idempotency_key(
+                    edition.id, DiscoveryRunInputMode.BRIDGE_RESEARCH, "run-old"
+                )
+                == runs[0]
+            )
+            assert (
+                await uow.discovery_runs.get_by_idempotency_key(
+                    edition.id, DiscoveryRunInputMode.MANUAL_IMPORT, "run-old"
+                )
+                == runs[2]
+            )
+            assert [run.id for run in await uow.discovery_runs.list_for_edition(edition.id)] == [
+                run.id for run in reversed(runs)
+            ]
+    finally:
+        await engine.dispose()
+
+
 async def test_discovery_batch_round_trip_and_source_status(
     migrated_postgres_url: str,
 ) -> None:
@@ -39,6 +149,30 @@ async def test_discovery_batch_round_trip_and_source_status(
         languages=("fr", "en", "fa"),
     )
     research_run = _run("research", "a")
+    discovery_run = DiscoveryRun(
+        edition_id=edition.id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="default-v1",
+        complementary_axis="initial",
+        request_snapshot=DiscoveryRequestSnapshot(
+            country=edition.country,
+            country_code=edition.country_code,
+            country_aliases=(edition.country, edition.country_code),
+            period_start=edition.period_start,
+            period_end=edition.period_end,
+            as_of_date=date(2026, 9, 1),
+            languages=edition.languages,
+            source_profile="default-v1",
+            keywords=(),
+            exclusions=(),
+            complementary_axis="initial",
+            tlp=edition.tlp,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key="batch-round-trip",
+        created_by="dev-analyst",
+    )
     source = SourceCandidate(
         url="https://vendor.example/report?utm_source=test",
         title="Original report",
@@ -110,6 +244,7 @@ async def test_discovery_batch_round_trip_and_source_status(
     )
     batch = DiscoveryBatch(
         edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
         request_hash="c" * 64,
         complementary_axis="initial",
         queries=("Iran APT July 2026",),
@@ -143,13 +278,18 @@ async def test_discovery_batch_round_trip_and_source_status(
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
+            assert await uow.discovery_runs.add_if_absent(discovery_run)
             await uow.model_runs.add(research_run)
             assert await uow.discovery_batches.add_if_absent(batch)
             await uow.commit()
 
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
-            persisted = await uow.discovery_batches.get_by_request_hash(edition.id, "c" * 64)
+            persisted = await uow.discovery_batches.get(batch.id)
             assert persisted is not None
+            assert persisted.discovery_run_id == discovery_run.id
+            assert [
+                item.id for item in await uow.discovery_batches.list_for_run(discovery_run.id)
+            ] == [batch.id]
             persisted_source = persisted.candidates[0].sources[0]
             assert persisted_source.canonical_url == "https://vendor.example/report"
             assert persisted_source.verification_status is SourceVerificationStatus.UNVERIFIED
@@ -198,6 +338,30 @@ async def test_discovery_batch_contributions_metadata_preserved(
         languages=("fr", "en", "fa"),
     )
     research_run = _run("research", "a")
+    discovery_run = DiscoveryRun(
+        edition_id=edition.id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="default-v1",
+        complementary_axis="initial",
+        request_snapshot=DiscoveryRequestSnapshot(
+            country=edition.country,
+            country_code=edition.country_code,
+            country_aliases=(edition.country, edition.country_code),
+            period_start=edition.period_start,
+            period_end=edition.period_end,
+            as_of_date=date(2026, 9, 1),
+            languages=edition.languages,
+            source_profile="default-v1",
+            keywords=(),
+            exclusions=(),
+            complementary_axis="initial",
+            tlp=edition.tlp,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key="contributions-meta",
+        created_by="dev-analyst",
+    )
     source = SourceCandidate(
         url="https://vendor.example/report",
         title="Report",
@@ -232,6 +396,7 @@ async def test_discovery_batch_contributions_metadata_preserved(
     now = datetime.now(UTC)
     batch = DiscoveryBatch(
         edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
         request_hash="d" * 64,
         complementary_axis="initial",
         queries=("Query",),
@@ -256,12 +421,13 @@ async def test_discovery_batch_contributions_metadata_preserved(
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
+            assert await uow.discovery_runs.add_if_absent(discovery_run)
             await uow.model_runs.add(research_run)
             assert await uow.discovery_batches.add_if_absent(batch)
             await uow.commit()
 
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
-            persisted = await uow.discovery_batches.get_by_request_hash(edition.id, "d" * 64)
+            persisted = await uow.discovery_batches.get(batch.id)
             assert persisted is not None
             assert len(persisted.contributions) == 1
             contrib = persisted.contributions[0]

@@ -17,6 +17,7 @@ from cti_app.application.persistence import (
     DiscoveryBatchRepository,
     DiscoveryIntakeRepository,
     DiscoveryMergeRunRepository,
+    DiscoveryRunRepository,
     DiscoverySnapshotRepository,
     DiscoverySubjectIdentityRepository,
     EditionAuditRepository,
@@ -88,6 +89,7 @@ from cti_app.infrastructure.database.repositories.core import (
 )
 from cti_app.infrastructure.database.repositories.discovery import (
     SqlAlchemyDiscoveryBatchRepository,
+    SqlAlchemyDiscoveryRunRepository,
 )
 from cti_app.infrastructure.database.repositories.discovery_cumulative import (
     SqlAlchemyDiscoveryIntakeRepository,
@@ -172,6 +174,7 @@ class SqlAlchemyUnitOfWork:
     model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
+    discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
     discovery_intakes: DiscoveryIntakeRepository
     discovery_subject_identities: DiscoverySubjectIdentityRepository
@@ -242,6 +245,7 @@ class SqlAlchemyUnitOfWork:
         self.model_output_rejections = SqlAlchemyModelOutputRejectionRepository(self._session)
         self.model_conversations = SqlAlchemyModelConversationRepository(self._session)
         self.model_conversation_turns = SqlAlchemyModelConversationTurnRepository(self._session)
+        self.discovery_runs = SqlAlchemyDiscoveryRunRepository(self._session)
         self.discovery_batches = SqlAlchemyDiscoveryBatchRepository(self._session)
         self.discovery_intakes = SqlAlchemyDiscoveryIntakeRepository(self._session)
         self.discovery_subject_identities = SqlAlchemyDiscoverySubjectIdentityRepository(

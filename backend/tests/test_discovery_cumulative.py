@@ -558,6 +558,7 @@ def _batch(edition_id: UUID, candidates: list[CandidateTopic]) -> DiscoveryBatch
             )
             for candidate in candidates
         ],
+        discovery_run_id=uuid4(),
         discovery_model_run_id=uuid4(),
         tlp=TLP.AMBER,
         sensitivity="internal",

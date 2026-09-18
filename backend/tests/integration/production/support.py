@@ -66,6 +66,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryRun,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRelationshipStatus,
@@ -84,6 +85,7 @@ from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRun, ModelTransport
 from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from tests.discovery_support import make_discovery_run_for_edition
 
 from ..edition_codes import reserve_edition_code
 
@@ -407,6 +409,7 @@ class ProductionScenario:
     sources: Mapping[str, Mapping[str, object]]
     edition: Edition = field(init=False)
     subject: Subject = field(init=False)
+    discovery_run: DiscoveryRun = field(init=False)
     discovery_batch: DiscoveryBatch = field(init=False)
     editorial_group: EditorialGroup = field(init=False)
     source_candidates: tuple[SourceCandidate, ...] = field(init=False)
@@ -487,6 +490,7 @@ class ProductionScenario:
             complementary_axis="business pipeline",
             queries=("ExampleRAT",),
             citations=(),
+            discovery_run_id=uuid4(),
             discovery_model_run_id=discovery_model_run_id,
             tlp=TLP.AMBER,
             sensitivity="public",
@@ -603,6 +607,16 @@ class ProductionScenario:
         self.discovery_batch.candidates[0].sources = list(self.source_candidates)
 
     async def seed(self) -> None:
+        async with self.uow_factory() as uow:
+            await uow.editions.add_if_absent(self.edition)
+            await uow.commit()
+        self.discovery_run = await make_discovery_run_for_edition(
+            self.uow_factory,
+            self.edition,
+            complementary_axis="business pipeline",
+            actor_id="business-test",
+        )
+        self.discovery_batch.discovery_run_id = self.discovery_run.id
         discovery_run = ModelRun(
             id=self.discovery_batch.discovery_model_run_id,
             provider=ModelProvider.FAKE,
@@ -626,7 +640,6 @@ class ProductionScenario:
             response_id=f"seeded-discovery-response-{self.discovery_batch.id}",
         )
         async with self.uow_factory() as uow:
-            await uow.editions.add_if_absent(self.edition)
             await uow.subjects.add(self.subject)
             await uow.model_runs.add(discovery_run)
             assert await uow.discovery_batches.add_if_absent(self.discovery_batch)

@@ -1,0 +1,306 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import type { DiscoveryInputMode, DiscoveryRun } from "../../api/discovery";
+import type { JobStatus } from "../../api/jobs";
+import { DiscoveryPanel } from "./DiscoveryPanel";
+
+const editionId = "edition-discovery-test";
+const jobId = "job-discovery-test";
+
+function requestUrl(input: RequestInfo | URL): string {
+  return typeof input === "string"
+    ? input
+    : input instanceof URL
+      ? input.href
+      : input.url;
+}
+
+function snapshot(axis: string): DiscoveryRun["request_snapshot"] {
+  return {
+    country: "Iran",
+    country_code: "IR",
+    country_aliases: ["Iran"],
+    period_start: "2026-07-01",
+    period_end: "2026-07-31",
+    as_of_date: "2026-09-18",
+    languages: ["fr"],
+    source_profile: "default-profile",
+    keywords: [],
+    exclusions: [],
+    complementary_axis: axis,
+    tlp: "AMBER",
+    sensitivity: "internal",
+    external_llm_allowed: true,
+  };
+}
+
+function run(
+  id: string,
+  status: JobStatus,
+  options: {
+    axis: string;
+    inputMode?: DiscoveryInputMode;
+    result?: DiscoveryRun["result"];
+    userMessage?: string | null;
+    errorCode?: string | null;
+    errorMessage?: string | null;
+  },
+): DiscoveryRun {
+  const inputMode: DiscoveryInputMode = options.inputMode ?? "bridge_research";
+  return {
+    run_id: id,
+    edition_id: editionId,
+    input_mode: inputMode,
+    source_profile: "default-profile",
+    complementary_axis: options.axis,
+    created_by: "dev-analyst",
+    created_at:
+      id === "newest" ? "2026-09-18T10:00:00Z" : "2026-09-17T10:00:00Z",
+    request_snapshot: snapshot(options.axis),
+    execution:
+      inputMode === "manual_import"
+        ? null
+        : {
+            job_id: jobId,
+            status,
+            progress_current: status === "running" ? 2 : 4,
+            progress_total: 4,
+            user_message: options.userMessage ?? null,
+            error_code: options.errorCode ?? null,
+            error_message: options.errorMessage ?? null,
+            error_details: null,
+            started_at: null,
+            finished_at: null,
+          },
+    result: options.result ?? null,
+  };
+}
+
+function renderPanel(readOnly = false) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, refetchInterval: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <DiscoveryPanel editionId={editionId} readOnly={readOnly} />
+    </QueryClientProvider>,
+  );
+}
+
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
+
+describe("DiscoveryPanel durable run history", () => {
+  it("renders newest-first history and every execution projection", async () => {
+    const runs = [
+      run("newest", "running", {
+        axis: "new-axis",
+        userMessage: "Recherche en cours",
+      }),
+      run("waiting", "waiting_human", { axis: "human-axis" }),
+      run("failed", "failed", {
+        axis: "failed-axis",
+        errorCode: "bridge_timeout",
+        errorMessage: "Bridge indisponible",
+      }),
+      run("succeeded", "succeeded", {
+        axis: "succeeded-axis",
+        result: {
+          batch_id: "batch-succeeded",
+          research_model_run_id: "model-run-succeeded",
+          archived_report_url: "/reports/succeeded.md",
+        },
+      }),
+      run("manual", "succeeded", {
+        axis: "manual-axis",
+        inputMode: "manual_import",
+        result: {
+          batch_id: "batch-manual",
+          research_model_run_id: "model-run-manual",
+          archived_report_url: "/reports/manual.md",
+        },
+      }),
+    ];
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/discovery/runs"))
+        return Promise.resolve(Response.json(runs));
+      if (url.includes(`/api/jobs/${jobId}`)) {
+        return Promise.resolve(
+          Response.json({
+            id: jobId,
+            kind: "discover_edition",
+            aggregate_type: "edition",
+            aggregate_id: editionId,
+            status: "running",
+            progress_current: 2,
+            progress_total: 4,
+            user_message: "Recherche en cours",
+            attempt: 1,
+            max_attempts: 1,
+            next_retry_at: null,
+            started_at: null,
+            finished_at: null,
+            heartbeat_at: null,
+            error_code: null,
+            error_message: null,
+            error_details: null,
+            correlation_id: "correlation",
+            output_reference: null,
+            cancellation_requested: false,
+            created_at: "2026-09-18T10:00:00Z",
+            updated_at: "2026-09-18T10:00:00Z",
+          }),
+        );
+      }
+      if (url.includes("/discovery/candidates"))
+        return Promise.resolve(
+          Response.json({
+            batches: [],
+            candidates: [],
+            total: 0,
+            merge_stats: {
+              raw_batch_count: 0,
+              raw_candidate_count: 0,
+              consolidated_candidate_count: 0,
+              unique_publication_count: 0,
+              duplicate_publication_occurrence_count: 0,
+            },
+            warning: "",
+          }),
+        );
+      if (url.includes("/editorial-groups"))
+        return Promise.resolve(
+          Response.json({
+            groups: [],
+            selected_articles: 0,
+            ignored: 0,
+            undecided: 0,
+            automatic_selection: false,
+          }),
+        );
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderPanel();
+
+    await screen.findByText("new-axis");
+    const history = await screen.findByRole("heading", {
+      name: "Historique des recherches",
+    });
+    expect(history).toBeInTheDocument();
+    const historyItems = history.parentElement?.querySelector("ol")?.children;
+    expect(historyItems?.[0]).toHaveTextContent("new-axis");
+    expect(historyItems?.[1]).toHaveTextContent("human-axis");
+    expect(screen.getByText(/Progression : 2\/4/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Recherche en cours/).length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/L’intervention d’un analyste est requise/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/bridge_timeout/)).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", {
+        name: "Consulter le rapport Markdown archivé",
+      })[0],
+    ).toHaveAttribute("href", "/reports/succeeded.md");
+    expect(
+      screen.getByText(/Import manuel · résultat disponible/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getAllByRole("link", {
+        name: "Consulter le rapport Markdown archivé",
+      }),
+    ).toHaveLength(2);
+  });
+
+  it("shows a newly launched run without localStorage and refetches after remount", async () => {
+    let runs: DiscoveryRun[] = [];
+    let runListCalls = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.endsWith("/discovery/runs") && init?.method === "POST") {
+        const created = run("newest", "queued", { axis: "initial" });
+        runs = [created];
+        return Promise.resolve(Response.json(created, { status: 202 }));
+      }
+      if (url.endsWith("/discovery/runs")) {
+        runListCalls += 1;
+        return Promise.resolve(Response.json(runs));
+      }
+      if (url.includes("/discovery/candidates"))
+        return Promise.resolve(
+          Response.json({ batches: [], candidates: [], total: 0, warning: "" }),
+        );
+      if (url.includes("/editorial-groups"))
+        return Promise.resolve(Response.json({ groups: [] }));
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    const view = renderPanel();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Nouvelle recherche ChatGPT" }),
+    );
+    expect(await screen.findByText("initial")).toBeInTheDocument();
+    expect(window.localStorage.length).toBe(0);
+    const callsBeforeRemount = runListCalls;
+    view.unmount();
+    renderPanel();
+    await waitFor(() =>
+      expect(runListCalls).toBeGreaterThan(callsBeforeRemount),
+    );
+  });
+
+  it("renders archived history in read-only mode and disables launch", async () => {
+    const historical = run("succeeded", "succeeded", {
+      axis: "archived-axis",
+      result: {
+        batch_id: "batch-archived",
+        research_model_run_id: "model-run-archived",
+        archived_report_url: "/reports/archived.md",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/discovery/runs"))
+          return Promise.resolve(Response.json([historical]));
+        if (url.includes("/discovery/candidates"))
+          return Promise.resolve(
+            Response.json({
+              batches: [],
+              candidates: [],
+              total: 0,
+              warning: "",
+            }),
+          );
+        if (url.includes("/editorial-groups"))
+          return Promise.resolve(Response.json({ groups: [] }));
+        return Promise.resolve(Response.json([]));
+      }),
+    );
+
+    renderPanel(true);
+
+    expect(await screen.findByText("archived-axis")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", {
+        name: "Consulter le rapport Markdown archivé",
+      }),
+    ).toHaveAttribute("href", "/reports/archived.md");
+    expect(
+      screen.queryByRole("button", { name: "Nouvelle recherche ChatGPT" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Coller une réponse ChatGPT" }),
+    ).not.toBeInTheDocument();
+  });
+});

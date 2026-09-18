@@ -1,0 +1,6 @@
+# Generated artifacts — not project sources.
+# Git ignores these, but Prettier does not read .gitignore.
+test-results/
+playwright-report/
+dist/
+coverage/

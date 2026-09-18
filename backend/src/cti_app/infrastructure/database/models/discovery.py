@@ -21,10 +21,49 @@ from .base import Base
 from .classification import TLP_VALUES_SQL
 
 
+class DiscoveryRunRow(Base):
+    __tablename__ = "discovery_runs"
+    __table_args__ = (
+        UniqueConstraint(
+            "edition_id",
+            "input_mode",
+            "idempotency_key",
+            name="uq_discovery_runs_idempotency",
+        ),
+        CheckConstraint(
+            "input_mode IN ('bridge_research', 'manual_import')",
+            name="ck_discovery_runs_input_mode",
+        ),
+        CheckConstraint(
+            "source_profile ~ '^[a-z0-9]+(?:[._-][a-z0-9]+)*$'",
+            name="ck_discovery_runs_source_profile",
+        ),
+        CheckConstraint("btrim(complementary_axis) <> ''", name="ck_discovery_runs_axis"),
+        CheckConstraint("btrim(idempotency_key) <> ''", name="ck_discovery_runs_idempotency_key"),
+        CheckConstraint("btrim(created_by) <> ''", name="ck_discovery_runs_created_by"),
+        CheckConstraint(
+            "jsonb_typeof(request_snapshot) = 'object'",
+            name="ck_discovery_runs_request_snapshot_object",
+        ),
+        Index("ix_discovery_runs_edition_created", "edition_id", "created_at", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    input_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_profile: Mapped[str] = mapped_column(String(64), nullable=False)
+    complementary_axis: Mapped[str] = mapped_column(String(500), nullable=False)
+    request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class DiscoveryBatchRow(Base):
     __tablename__ = "discovery_batches"
     __table_args__ = (
-        UniqueConstraint("edition_id", "request_hash", name="uq_discovery_batches_request"),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_discovery_batches_tlp"),
         CheckConstraint(
             "char_length(request_hash) = 64 AND request_hash ~ '^[0-9a-f]{64}$'",
@@ -38,6 +77,9 @@ class DiscoveryBatchRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    discovery_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="RESTRICT"), nullable=False
     )
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     complementary_axis: Mapped[str] = mapped_column(String(500), nullable=False)

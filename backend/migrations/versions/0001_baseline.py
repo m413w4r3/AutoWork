@@ -306,6 +306,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     (
+        "discovery_runs",
+        "trg_discovery_runs_append_only",
+        "reject_evidence_mutation",
+        "append_only",
+    ),
+    (
         "discovery_intakes",
         "trg_discovery_intakes_append_only",
         "reject_discovery_intakes_mutation",

@@ -6,11 +6,17 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
+    ReprocessDiscoveryReportParameters,
+    discover_parameters_from_run,
+    discovery_conversation_id,
+    discovery_initial_batch_id,
     discovery_request_hash,
+    discovery_request_snapshot,
+    discovery_research_model_run_id,
 )
 from cti_app.application.discovery.ports import (
     BridgeCapabilitiesProvider,
@@ -43,6 +49,8 @@ from cti_app.domain.discovery import (
     ContributionStatus,
     DiscoveryBatch,
     DiscoveryContribution,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
     DiscoverySourceMode,
     SourceCandidate,
     SourceVerificationStatus,
@@ -119,16 +127,16 @@ class DiscoveryService:
     ) -> DiscoveryBatch:
         request_hash = discovery_request_hash(parameters)
         async with self._uow_factory() as uow:
-            existing = await uow.discovery_batches.get_by_request_hash(
-                parameters.edition_id, request_hash
+            existing = await uow.discovery_batches.get(
+                discovery_initial_batch_id(parameters.discovery_run_id)
             )
             if existing is not None:
                 return existing
 
         await context.report_progress(1, 4, "Préparation de la recherche sourcée")
         bridge_capabilities = await self._capabilities_snapshot()
-        research_run_id = uuid5(NAMESPACE_URL, f"cti-discovery-model-run:{request_hash}")
-        fresh_conversation_id = uuid5(NAMESPACE_URL, f"cti-discovery-conversation:{request_hash}")
+        research_run_id = discovery_research_model_run_id(parameters.discovery_run_id)
+        fresh_conversation_id = discovery_conversation_id(parameters.discovery_run_id)
 
         research_request = ModelRequest(
             text=_research_prompt(parameters),
@@ -140,6 +148,8 @@ class DiscoveryService:
             sensitivity=parameters.sensitivity,
             metadata={
                 "edition_id": str(parameters.edition_id),
+                "discovery_run_id": str(parameters.discovery_run_id),
+                "discovery_request_hash": request_hash,
                 "tlp": parameters.tlp.value,
                 "source_profile_id": parameters.source_profile,
                 "collected_at": datetime.now(UTC).isoformat(),
@@ -180,9 +190,7 @@ class DiscoveryService:
         async with self._uow_factory() as uow:
             inserted = await uow.discovery_batches.add_if_absent(batch)
             if not inserted:
-                existing = await uow.discovery_batches.get_by_request_hash(
-                    parameters.edition_id, request_hash
-                )
+                existing = await uow.discovery_batches.get(batch.id)
                 if existing is None:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 batch = existing
@@ -201,6 +209,141 @@ class DiscoveryService:
             )
         await context.report_progress(4, 4, "Candidats proposés — vérification humaine requise")
         return batch
+
+    async def reprocess_archived_report(
+        self,
+        parameters: ReprocessDiscoveryReportParameters,
+        context: JobExecutionContext,
+    ) -> DiscoveryBatch:
+        async with self._uow_factory() as uow:
+            run = await uow.discovery_runs.get(parameters.discovery_run_id)
+            if run is None or run.edition_id != parameters.edition_id:
+                raise LookupError(str(parameters.discovery_run_id))
+            discover_parameters = discover_parameters_from_run(run)
+            current = await uow.discovery_batches.get(
+                discovery_initial_batch_id(run.id)
+            )
+            if current is None:
+                raise LookupError(str(run.id))
+            visited: set[UUID] = set()
+            chain: list[DiscoveryBatch] = []
+            while current is not None:
+                if current.id in visited:
+                    raise RuntimeError("Discovery batch replacement cycle")
+                if current.discovery_run_id != run.id:
+                    raise ValueError("Discovery batch does not belong to its run")
+                visited.add(current.id)
+                chain.append(current)
+                if current.replaced_by_batch_id is None:
+                    break
+                current = await uow.discovery_batches.get(current.replaced_by_batch_id)
+                if current is None:
+                    raise RuntimeError("Discovery batch replacement chain is incomplete")
+
+        if not any(
+            batch.discovery_model_run_id == parameters.research_model_run_id
+            for batch in chain
+        ):
+            raise ValueError("Archived report is not part of the discovery run revision chain")
+
+        # L'id est déterministe par Job : un batch déjà persisté sous cet id est
+        # un état durable du MÊME attempt métier, pas un doublon. Il est adopté
+        # sans créer de N+2 et sans retoucher la chaîne, puis le handoff
+        # cumulative est rejoué, car c'est précisément lui qui peut manquer
+        # quand le worker meurt juste après le commit du batch.
+        reprocess_batch_id = uuid5(
+            NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}"
+        )
+        async with self._uow_factory() as uow:
+            adopted = await uow.discovery_batches.get(reprocess_batch_id)
+        if adopted is not None:
+            batch = self._validated_reprocess_batch(adopted, run, parameters)
+        else:
+            report = await self.read_archived_report(
+                parameters.edition_id, parameters.research_model_run_id
+            )
+            await context.report_progress(1, 2, "Analyse locale du rapport archivé")
+            try:
+                parsed = parse_discovery_report(
+                    report,
+                    visible_citations=[],
+                    period_start=discover_parameters.period_start,
+                    period_end=discover_parameters.period_end,
+                    tlp=discover_parameters.tlp,
+                    sensitivity=discover_parameters.sensitivity,
+                    external_llm_allowed=discover_parameters.external_llm_allowed,
+                    research_model_run_id=parameters.research_model_run_id,
+                )
+            except ReportParsingError as exc:
+                exc.research_model_run_id = parameters.research_model_run_id
+                raise
+            await self._record_parser_diagnostics(parameters.research_model_run_id, parsed)
+
+            async with self._uow_factory() as uow:
+                visited = {batch.id for batch in chain}
+                locked_tail = await uow.discovery_batches.get_for_update(chain[-1].id)
+                if locked_tail is None or locked_tail.discovery_run_id != run.id:
+                    raise RuntimeError("Current discovery batch revision is unavailable")
+
+                while locked_tail.replaced_by_batch_id is not None:
+                    successor_id = locked_tail.replaced_by_batch_id
+                    if successor_id in visited:
+                        raise RuntimeError("Discovery batch replacement cycle")
+                    visited.add(successor_id)
+                    successor = await uow.discovery_batches.get_for_update(successor_id)
+                    if successor is None:
+                        raise RuntimeError("Discovery batch replacement chain is incomplete")
+                    if successor.discovery_run_id != run.id:
+                        raise ValueError("Discovery batch does not belong to its run")
+                    locked_tail = successor
+
+                batch = _parsed_to_domain_batch(
+                    discover_parameters,
+                    discovery_request_hash(discover_parameters),
+                    parsed,
+                    parameters.research_model_run_id,
+                    locked_tail.bridge_capabilities,
+                    source_mode=locked_tail.source_mode,
+                    batch_id=reprocess_batch_id,
+                    parsing_revision=locked_tail.parsing_revision + 1,
+                    supersedes_batch_id=locked_tail.id,
+                )
+                inserted = await uow.discovery_batches.add_if_absent(batch)
+                if not inserted:
+                    concurrent = await uow.discovery_batches.get(batch.id)
+                    if concurrent is None:
+                        raise RuntimeError("Discovery conflict without canonical batch")
+                    batch = self._validated_reprocess_batch(concurrent, run, parameters)
+                else:
+                    if locked_tail.replaced_by_batch_id is not None:
+                        raise RuntimeError("Discovery batch already has a replacement")
+                    locked_tail.replaced_by_batch_id = batch.id
+                    await uow.discovery_batches.save(locked_tail)
+                    await uow.commit()
+
+        if self._after_persisted_batch is not None:
+            await self._after_persisted_batch(
+                batch, DiscoveryInputMode.RECOVERY, parameters.actor_id
+            )
+        await context.report_progress(2, 2, "Révision du rapport archivé terminée")
+        return batch
+
+    @staticmethod
+    def _validated_reprocess_batch(
+        candidate: DiscoveryBatch,
+        run: DiscoveryRun,
+        parameters: ReprocessDiscoveryReportParameters,
+    ) -> DiscoveryBatch:
+        """Vérifie qu'un batch déterministe déjà persisté est bien le nôtre.
+
+        Adopter un batch sans revérifier son appartenance reviendrait à faire
+        confiance à un id dérivé d'un Job pour une décision de sécurité.
+        """
+        if candidate.discovery_run_id != run.id:
+            raise ValueError("Discovery batch does not belong to its run")
+        if candidate.discovery_model_run_id != parameters.research_model_run_id:
+            raise ValueError("Reprocessed batch does not match the archived report")
+        return candidate
 
     async def _research_or_resume(
         self,
@@ -302,12 +445,7 @@ class DiscoveryService:
         markdown: str,
     ) -> dict[str, Any]:
         """Preview only: no persistence, so the caller can confirm content before import."""
-        digest = hashlib.sha256(markdown.encode()).hexdigest()
-        manual_run_id = uuid5(
-            NAMESPACE_URL,
-            f"cti-discovery-manual-import:{parameters.edition_id}:{digest}",
-        )
-        return self._recovery.preview_report(parameters, manual_run_id, markdown)
+        return self._recovery.preview_report(parameters, parameters.discovery_run_id, markdown)
 
     async def import_standalone_report(
         self,
@@ -316,30 +454,40 @@ class DiscoveryService:
         *,
         expected_sha256: str,
         actor_id: str,
+        idempotency_key: str,
     ) -> tuple[DiscoveryBatch, bool, UUID | None]:
         """Import a standalone ChatGPT Markdown report as a self-contained contribution."""
         if self._output_archive is None:
             raise ModelGatewayError("Model output archive is unavailable")
+        if not idempotency_key.strip():
+            raise ValueError("Idempotency-Key is required")
+
+        async with self._uow_factory() as uow:
+            existing_run = await uow.discovery_runs.get_by_idempotency_key(
+                parameters.edition_id,
+                DiscoveryRunInputMode.MANUAL_IMPORT,
+                idempotency_key,
+            )
+            if existing_run is not None:
+                existing_batch = await uow.discovery_batches.get(
+                    discovery_initial_batch_id(existing_run.id)
+                )
+                if existing_batch is None:
+                    raise RuntimeError("Manual import run has no canonical batch")
+                return existing_batch, True, None
 
         digest = hashlib.sha256(markdown.encode()).hexdigest()
-        manual_run_id = uuid5(
-            NAMESPACE_URL,
-            f"cti-discovery-manual-import:{parameters.edition_id}:{digest}",
-        )
         manual_request_hash = hashlib.sha256(
             f"manual-import:v1:{parameters.edition_id}:{digest}".encode()
         ).hexdigest()
 
-        preview = self._recovery.preview_report(parameters, manual_run_id, markdown)
+        preview = self._recovery.preview_report(parameters, parameters.discovery_run_id, markdown)
         if preview["sha256"] != expected_sha256:
             raise ValueError("Import preview no longer matches the confirmed report")
 
-        async with self._uow_factory() as uow:
-            existing_batch = await uow.discovery_batches.get_by_request_hash(
-                parameters.edition_id, manual_request_hash
-            )
-            if existing_batch is not None:
-                return existing_batch, True, None
+        discovery_run_id = uuid4()
+        effective_parameters = parameters.model_copy(update={"discovery_run_id": discovery_run_id})
+        manual_run_id = discovery_research_model_run_id(discovery_run_id)
 
         await self._output_archive.create_manual_research_output(
             manual_run_id,
@@ -353,18 +501,18 @@ class DiscoveryService:
         parsed = parse_discovery_report(
             markdown,
             visible_citations=[],
-            period_start=parameters.period_start,
-            period_end=parameters.period_end,
-            tlp=parameters.tlp,
-            sensitivity=parameters.sensitivity,
-            external_llm_allowed=parameters.external_llm_allowed,
+            period_start=effective_parameters.period_start,
+            period_end=effective_parameters.period_end,
+            tlp=effective_parameters.tlp,
+            sensitivity=effective_parameters.sensitivity,
+            external_llm_allowed=effective_parameters.external_llm_allowed,
             research_model_run_id=manual_run_id,
         )
 
         await self._record_parser_diagnostics(manual_run_id, parsed)
 
         batch = _parsed_to_domain_batch(
-            parameters,
+            effective_parameters,
             manual_request_hash,
             parsed,
             manual_run_id,
@@ -378,18 +526,38 @@ class DiscoveryService:
             source_mode=DiscoverySourceMode.MANUAL_IMPORT,
         )
 
-        # Une insertion concurrente du même Markdown partage le même request_hash :
-        # on adopte le batch canonique.
+        run = DiscoveryRun(
+            id=discovery_run_id,
+            edition_id=effective_parameters.edition_id,
+            input_mode=DiscoveryRunInputMode.MANUAL_IMPORT,
+            source_profile=effective_parameters.source_profile,
+            complementary_axis=effective_parameters.complementary_axis,
+            request_snapshot=discovery_request_snapshot(effective_parameters),
+            idempotency_key=idempotency_key,
+            created_by=actor_id,
+        )
+
+        # Parse and archive are deliberately complete before this transaction. The run
+        # and its canonical initial batch become visible together.
         async with self._uow_factory() as uow:
-            inserted = await uow.discovery_batches.add_if_absent(batch)
+            inserted = await uow.discovery_runs.add_if_absent(run)
             if not inserted:
-                existing = await uow.discovery_batches.get_by_request_hash(
-                    parameters.edition_id, manual_request_hash
+                existing_run = await uow.discovery_runs.get_by_idempotency_key(
+                    effective_parameters.edition_id,
+                    DiscoveryRunInputMode.MANUAL_IMPORT,
+                    idempotency_key,
                 )
-                if existing is None:
+                if existing_run is None:
+                    raise RuntimeError("Discovery conflict without canonical run")
+                existing_batch = await uow.discovery_batches.get(
+                    discovery_initial_batch_id(existing_run.id)
+                )
+                if existing_batch is None:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 await uow.commit()
-                return existing, True, None
+                return existing_batch, True, None
+            if not await uow.discovery_batches.add_if_absent(batch):
+                raise RuntimeError("Discovery conflict without canonical batch")
             await uow.commit()
 
         # Ceci ne fait que soumettre et dispatcher un job de réconciliation
@@ -510,9 +678,13 @@ def _parsed_to_domain_batch(
     bridge_capabilities: Mapping[str, object],
     *,
     source_mode: DiscoverySourceMode = DiscoverySourceMode.MODEL_DECLARED_URLS,
+    batch_id: UUID | None = None,
+    parsing_revision: int = 1,
+    supersedes_batch_id: UUID | None = None,
 ) -> DiscoveryBatch:
     return DiscoveryBatch(
         edition_id=parameters.edition_id,
+        discovery_run_id=parameters.discovery_run_id,
         request_hash=request_hash,
         complementary_axis=parameters.complementary_axis,
         queries=(),
@@ -537,4 +709,7 @@ def _parsed_to_domain_batch(
             "Le rapport Markdown et les citations visibles ne constituent pas une liste "
             "exhaustive des sources consultées."
         ),
+        id=batch_id or discovery_initial_batch_id(parameters.discovery_run_id),
+        parsing_revision=parsing_revision,
+        supersedes_batch_id=supersedes_batch_id,
     )

@@ -169,6 +169,42 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     const path = new URL(request.url()).pathname;
     if (path === `/api/editions/${editionId}`)
       return route.fulfill({ json: edition });
+    if (
+      path === `/api/editions/${editionId}/discovery/runs` &&
+      request.method() === "GET"
+    ) {
+      return route.fulfill({
+        json: searched
+          ? [
+              {
+                run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+                edition_id: editionId,
+                input_mode: "bridge_research",
+                source_profile: "iran-default",
+                complementary_axis: "initial",
+                created_by: "dev-analyst",
+                created_at: "2026-06-01T00:00:00Z",
+                request_snapshot: {},
+                execution: {
+                  job_id: "99999999-9999-4999-8999-999999999999",
+                  status: jobCompleted ? "succeeded" : "running",
+                  progress_current: jobCompleted ? 4 : 2,
+                  progress_total: 4,
+                  user_message: jobCompleted
+                    ? "Analyse locale terminée"
+                    : "ChatGPT recherche et analyse les sources",
+                  error_code: null,
+                  error_message: null,
+                  error_details: null,
+                  started_at: null,
+                  finished_at: null,
+                },
+                result: null,
+              },
+            ]
+          : [],
+      });
+    }
     if (path.endsWith("/discovery/candidates"))
       return route.fulfill({
         json: {
@@ -177,6 +213,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
               ? [
                   {
                     id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    discovery_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
                     complementary_axis: "initial",
                     queries: [],
                     citations: [],
@@ -208,7 +245,10 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
           warning: "provisoire",
         },
       });
-    if (path.endsWith("/discovery") && request.method() === "POST") {
+    if (
+      path === `/api/editions/${editionId}/discovery/runs` &&
+      request.method() === "POST"
+    ) {
       searched = true;
       expect(request.postDataJSON()).toMatchObject({
         source_profile: "iran-default",
@@ -216,9 +256,27 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       return route.fulfill({
         status: 202,
         json: {
-          job_id: "99999999-9999-4999-8999-999999999999",
-          status: "running",
-          reused: false,
+          run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+          edition_id: editionId,
+          input_mode: "bridge_research",
+          source_profile: "iran-default",
+          complementary_axis: "initial",
+          created_by: "dev-analyst",
+          created_at: "2026-06-01T00:00:00Z",
+          request_snapshot: {},
+          execution: {
+            job_id: "99999999-9999-4999-8999-999999999999",
+            status: "running",
+            progress_current: 0,
+            progress_total: 4,
+            user_message: "ChatGPT recherche et analyse les sources",
+            error_code: null,
+            error_message: null,
+            error_details: null,
+            started_at: null,
+            finished_at: null,
+          },
+          result: null,
         },
       });
     }

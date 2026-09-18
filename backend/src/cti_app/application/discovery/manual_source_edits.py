@@ -27,7 +27,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.discovery.cumulative.planners import TargetedMergePlanner
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.ports import ModelOutputArchive
-from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.persistence import DiscoveryBatchRepository, UnitOfWorkFactory
 from cti_app.domain.discovery import (
     CandidateTopic,
     ContributionStatus,
@@ -55,6 +55,10 @@ class IncompleteSourceCandidateNotFoundError(LookupError):
 
 
 class SourceCandidateNotFoundError(LookupError):
+    pass
+
+
+class ManualSourceEditOriginNotFoundError(LookupError):
     pass
 
 
@@ -272,37 +276,39 @@ class ManualSourceEditService:
         operation: ManualSourceEditOperation,
         replaced_canonical_url: str | None = None,
     ) -> DiscoverySnapshot:
-        batch, digest = _build_manual_edit_batch(
-            edition_id,
-            subject_id,
-            source_id,
-            url,
-            candidate,
-            operation=operation,
-            replaced_canonical_url=replaced_canonical_url,
-        )
-        await self._model_output_archive.create_manual_research_output(
-            batch.discovery_model_run_id,
-            _manual_edit_content(
+        async with self._uow_factory() as uow:
+            discovery_run_id = await _find_originating_discovery_run_id(
+                uow.discovery_batches, snapshot, subject_id, source_id
+            )
+            batch, digest = _build_manual_edit_batch(
                 edition_id,
                 subject_id,
                 source_id,
                 url,
+                candidate,
+                discovery_run_id=discovery_run_id,
                 operation=operation,
                 replaced_canonical_url=replaced_canonical_url,
-            ),
-            evidence_pack_hash=digest,
-            actor_id=actor_id,
-            operation=operation,
-        )
-        async with self._uow_factory() as uow:
-            existing_batch = await uow.discovery_batches.get_by_request_hash(edition_id, digest)
+            )
+            await self._model_output_archive.create_manual_research_output(
+                batch.discovery_model_run_id,
+                _manual_edit_content(
+                    edition_id,
+                    subject_id,
+                    source_id,
+                    url,
+                    operation=operation,
+                    replaced_canonical_url=replaced_canonical_url,
+                ),
+                evidence_pack_hash=digest,
+                actor_id=actor_id,
+                operation=operation,
+            )
+            existing_batch = await uow.discovery_batches.get(batch.id)
             if existing_batch is None:
                 inserted = await uow.discovery_batches.add_if_absent(batch)
                 if not inserted:
-                    existing_batch = await uow.discovery_batches.get_by_request_hash(
-                        edition_id, digest
-                    )
+                    existing_batch = await uow.discovery_batches.get(batch.id)
                     if existing_batch is None:
                         raise RuntimeError("Discovery conflict without canonical batch")
                 await uow.commit()
@@ -413,6 +419,44 @@ def _find_source(
     return subject, source
 
 
+async def _find_originating_discovery_run_id(
+    batches: DiscoveryBatchRepository,
+    snapshot: DiscoverySnapshot,
+    subject_id: UUID,
+    source_id: UUID,
+) -> UUID:
+    subject = next((item for item in snapshot.subjects if item.subject_id == subject_id), None)
+    if subject is None:
+        raise ManualSourceEditOriginNotFoundError(
+            f"No discovery subject exists for manual source edit {subject_id}"
+        )
+
+    matching_run_ids: set[UUID] = set()
+    for reference in subject.member_references:
+        batch = await batches.get(reference.batch_id)
+        if batch is None:
+            continue
+        referenced_candidate = next(
+            (item for item in batch.candidates if item.id == reference.candidate_id), None
+        )
+        if referenced_candidate is None:
+            continue
+        if any(item.id == source_id for item in referenced_candidate.sources) or any(
+            item.id == source_id for item in referenced_candidate.incomplete_sources
+        ):
+            matching_run_ids.add(batch.discovery_run_id)
+
+    if not matching_run_ids:
+        raise ManualSourceEditOriginNotFoundError(
+            f"No referenced discovery candidate contains corrected source {source_id}"
+        )
+    if len(matching_run_ids) > 1:
+        raise ManualSourceEditOriginNotFoundError(
+            f"Corrected source {source_id} has multiple originating discovery runs"
+        )
+    return next(iter(matching_run_ids))
+
+
 # Not produced by discovery_report_parser: identifies analyst-attached URLs.
 MANUAL_SOURCE_EDIT_VERSION = "manual-url-attach-v1"
 
@@ -446,6 +490,7 @@ def _build_manual_edit_batch(
     url: str,
     candidate: CandidateTopic,
     *,
+    discovery_run_id: UUID,
     operation: ManualSourceEditOperation = "attach",
     replaced_canonical_url: str | None = None,
 ) -> tuple[DiscoveryBatch, str]:
@@ -460,12 +505,16 @@ def _build_manual_edit_batch(
             replaced_canonical_url=replaced_canonical_url,
         )
     ).hexdigest()
+    batch_id = uuid5(
+        NAMESPACE_URL, f"cti-discovery-manual-url-batch:{discovery_run_id}:{digest}"
+    )
     manual_run_id = uuid5(
-        NAMESPACE_URL, f"cti-discovery-manual-url-{operation}:{edition_id}:{digest}"
+        NAMESPACE_URL, f"cti-discovery-manual-url-run:{discovery_run_id}:{digest}"
     )
     now = datetime.now(UTC)
     batch = DiscoveryBatch(
         edition_id=edition_id,
+        discovery_run_id=discovery_run_id,
         request_hash=digest,
         complementary_axis=f"manual-url-{operation}",
         queries=(),
@@ -489,6 +538,7 @@ def _build_manual_edit_batch(
         source_coverage_incomplete_reason=(
             "Correction manuelle d'une publication : ne remplace pas une recherche complète."
         ),
+        id=batch_id,
     )
     return batch, digest
 

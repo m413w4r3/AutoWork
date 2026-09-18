@@ -11,10 +11,14 @@ from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
-from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
-from cti_app.application.discovery.cumulative.jobs import RECONCILE_DISCOVERY_JOB_KIND
+from cti_app.application.discovery.cumulative.jobs import (
+    ensure_discovery_reconciliation_job,
+)
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
-from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.jobs import (
+    DISCOVERY_JOB_KIND,
+    REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+)
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.edition_publication import (
     EDITION_ASSEMBLE_JOB_KIND,
@@ -32,7 +36,6 @@ from cti_app.application.http_collection import (
     parse_domain_policy,
 )
 from cti_app.application.jobs import (
-    DuplicateJobError,
     JobExecutor,
     JobService,
     create_job_registry,
@@ -79,6 +82,10 @@ DURABLE_RESUME_JOB_KINDS = frozenset(
     {
         EDITION_ASSEMBLE_JOB_KIND,
         DISCOVERY_JOB_KIND,
+        # Le batch reprocessé est committé avant son handoff cumulative : perdre
+        # le worker entre les deux doit reprendre le MÊME attempt (donc le même
+        # context.job_id, donc le même batch déterministe), pas en brûler un.
+        REPROCESS_DISCOVERY_REPORT_JOB_KIND,
         *(stage_job_kind(stage) for stage in production_stages()),
         production_reconciliation_resume_job_kind(),
     }
@@ -201,31 +208,15 @@ async def _execute_job(job_id: UUID) -> int | None:
                 input_mode, DiscoveryInputMode
             ):
                 raise TypeError("Invalid discovery reconciliation request")
-            intake, _ = await cumulative_discovery_service.ingest_batch(
-                batch, input_mode=input_mode, actor_id=actor_id
-            )
-            parent = await cumulative_discovery_service.active_snapshot(batch.edition_id)
-            parameters = ReconcileDiscoveryParameters(
-                intake_id=intake.id,
-                edition_id=batch.edition_id,
-                expected_parent_snapshot_id=parent.id if parent else None,
+            return await ensure_discovery_reconciliation_job(
+                batch,
+                input_mode=input_mode,
                 actor_id=actor_id,
+                cumulative_discovery_service=cumulative_discovery_service,
+                job_service=job_service,
+                job_dispatcher=job_dispatcher,
+                correlation_id=get_correlation_id(),
             )
-            try:
-                child = await job_service.submit(
-                    kind=RECONCILE_DISCOVERY_JOB_KIND,
-                    aggregate_type="edition",
-                    aggregate_id=batch.edition_id,
-                    idempotency_key=f"reconcile-discovery:{intake.id}",
-                    correlation_id=get_correlation_id(),
-                    input_parameters=parameters.model_dump(mode="json"),
-                    max_attempts=3,
-                    actor_id=actor_id,
-                )
-                await job_dispatcher.dispatch(child.id)
-                return child
-            except DuplicateJobError as exc:
-                return await job_service.get(exc.existing_job_id)
 
         discovery_service = DiscoveryService(
             uow_factory,

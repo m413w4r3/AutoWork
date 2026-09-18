@@ -19,7 +19,7 @@ import pytest
 
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
-    discovery_idempotency_key,
+    discovery_job_idempotency_key,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
 from cti_app.application.discovery.service import DiscoveryService
@@ -128,9 +128,9 @@ async def test_existing_succeeded_run_restores_visible_citations_without_new_pos
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="visible-citations-restore",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -178,9 +178,9 @@ async def test_needs_review_with_linked_child_resumes_exactly_that_child() -> No
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
-        aggregate_type="edition",
-        aggregate_id=params.edition_id,
-        idempotency_key=discovery_idempotency_key(params),
+        aggregate_type="discovery_run",
+        aggregate_id=params.discovery_run_id,
+        idempotency_key=discovery_job_idempotency_key(params.discovery_run_id),
         correlation_id="linked-child-resume",
         input_parameters=params.model_dump(mode="json"),
         max_attempts=1,
@@ -494,11 +494,12 @@ async def test_completion_recovery_returns_existing_continuation_source_without_
 # --- 7. Standalone import ----------------------------------------------------
 
 
-async def test_standalone_import_ids_are_deterministic_and_reimport_creates_no_second_run() -> None:
+async def test_standalone_import_reuses_same_key_but_allows_same_markdown_in_new_run() -> None:
     adapter = TransientResearchAdapter()
     gateway, model_uow, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
     discovery = DiscoveryService(
-        InMemoryDiscoveryUnitOfWorkFactory(),
+        discovery_uow,
         gateway,
         archive=gateway,
         bridge_capabilities_provider=FakeBridgeCapabilities(),
@@ -506,9 +507,6 @@ async def test_standalone_import_ids_are_deterministic_and_reimport_creates_no_s
     params = parameters(axis="manual-import")
     markdown = research_markdown_fixture()
     digest = hashlib.sha256(markdown.encode()).hexdigest()
-    expected_manual_run_id = uuid5(
-        NAMESPACE_URL, f"cti-discovery-manual-import:{params.edition_id}:{digest}"
-    )
     expected_request_hash = hashlib.sha256(
         f"manual-import:v1:{params.edition_id}:{digest}".encode()
     ).hexdigest()
@@ -517,23 +515,44 @@ async def test_standalone_import_ids_are_deterministic_and_reimport_creates_no_s
     assert preview["sha256"] == digest
     # Preview never persists.
     assert not model_uow.state
+    assert not discovery_uow.runs
 
     batch, reused, _job_id = await discovery.import_standalone_report(
-        params, markdown, expected_sha256=preview["sha256"], actor_id="dev-analyst"
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
     assert reused is False
-    assert batch.discovery_model_run_id == expected_manual_run_id
+    assert batch.discovery_model_run_id != params.discovery_run_id
     assert batch.request_hash == expected_request_hash
-    assert set(model_uow.state) == {expected_manual_run_id}
+    assert set(model_uow.state) == {batch.discovery_model_run_id}
 
     reimported, reused_again, job_id_again = await discovery.import_standalone_report(
-        params, markdown, expected_sha256=preview["sha256"], actor_id="dev-analyst"
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-1",
     )
     assert reused_again is True
     assert job_id_again is None
     assert reimported.id == batch.id
     # No second synthetic ModelRun was created for the identical Markdown.
-    assert set(model_uow.state) == {expected_manual_run_id}
+    assert set(model_uow.state) == {batch.discovery_model_run_id}
+
+    second, second_reused, _ = await discovery.import_standalone_report(
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id="dev-analyst",
+        idempotency_key="manual-import-2",
+    )
+    assert second_reused is False
+    assert second.id != batch.id
+    assert second.discovery_model_run_id != batch.discovery_model_run_id
+    assert len(model_uow.state) == 2
     assert adapter.calls == []
 
 
@@ -574,7 +593,11 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
 
     actor_id = "analyst:test-R27a"
     batch1, reused1, job_id1 = await discovery.import_standalone_report(
-        params, markdown, expected_sha256=preview["sha256"], actor_id=actor_id
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id=actor_id,
+        idempotency_key="callback-1",
     )
 
     assert reused1 is False
@@ -585,7 +608,11 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     assert job_id1 == expected_job_id
 
     batch2, reused2, job_id2 = await discovery.import_standalone_report(
-        params, markdown, expected_sha256=preview["sha256"], actor_id=actor_id
+        params,
+        markdown,
+        expected_sha256=preview["sha256"],
+        actor_id=actor_id,
+        idempotency_key="callback-1",
     )
 
     assert reused2 is True

@@ -68,5 +68,9 @@ et retourne une référence `demo://`. Il ne contacte aucun service et n’exéc
 Le composant React `JobStatusCard` consomme le SSE et conserve un polling HTTP comme fallback.
 
 Le kind métier `discover_edition` reçoit uniquement des paramètres validés et appelle le
-`DiscoveryService`. Sa clé d'idempotence dérive du hash des paramètres de recherche ; une
-relance identique retrouve donc le job canonique au lieu de créer un second batch.
+`DiscoveryService`. Pour une découverte ou un retraitement, le Job porte
+`Job.aggregate_type=discovery_run` et `Job.aggregate_id=DiscoveryRun.id`. Le `request_snapshot` du
+`DiscoveryRun` est immuable et la clé explicite `Idempotency-Key` est la règle de réutilisation :
+un retry avec la même clé retrouve le même run et son Job canonique ; une nouvelle action
+délibérée emploie une nouvelle clé, même si sa configuration est identique. Le Job reste la
+source canonique du statut, de la progression et des erreurs.

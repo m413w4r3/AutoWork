@@ -15,6 +15,9 @@ from cti_app.domain.discovery import (
     DiscoveryContribution,
     DiscoveryIocStatus,
     DiscoveryIocType,
+    DiscoveryRequestSnapshot,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     IocPresence,
@@ -26,7 +29,92 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow
+from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow, DiscoveryRunRow
+
+
+class SqlAlchemyDiscoveryRunRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_if_absent(self, run: DiscoveryRun) -> bool:
+        statement = (
+            insert(DiscoveryRunRow)
+            .values(**_discovery_run_values(run))
+            .on_conflict_do_nothing(
+                index_elements=[
+                    DiscoveryRunRow.edition_id,
+                    DiscoveryRunRow.input_mode,
+                    DiscoveryRunRow.idempotency_key,
+                ]
+            )
+            .returning(DiscoveryRunRow.id)
+        )
+        return await self._session.scalar(statement) is not None
+
+    async def get(self, run_id: UUID) -> DiscoveryRun | None:
+        row = await self._session.get(DiscoveryRunRow, run_id)
+        return _discovery_run_from_row(row) if row else None
+
+    async def get_by_idempotency_key(
+        self,
+        edition_id: UUID,
+        input_mode: DiscoveryRunInputMode,
+        idempotency_key: str,
+    ) -> DiscoveryRun | None:
+        from sqlalchemy import select
+
+        row = await self._session.scalar(
+            select(DiscoveryRunRow).where(
+                DiscoveryRunRow.edition_id == edition_id,
+                DiscoveryRunRow.input_mode == input_mode.value,
+                DiscoveryRunRow.idempotency_key == idempotency_key,
+            )
+        )
+        return _discovery_run_from_row(row) if row else None
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryRun]:
+        from sqlalchemy import select
+
+        rows = await self._session.scalars(
+            select(DiscoveryRunRow)
+            .where(DiscoveryRunRow.edition_id == edition_id)
+            .order_by(DiscoveryRunRow.created_at.desc(), DiscoveryRunRow.id.desc())
+        )
+        return [_discovery_run_from_row(row) for row in rows]
+
+
+def _discovery_run_values(run: DiscoveryRun) -> dict[str, object]:
+    return {
+        "id": run.id,
+        "edition_id": run.edition_id,
+        "input_mode": run.input_mode.value,
+        "source_profile": run.source_profile,
+        "complementary_axis": run.complementary_axis,
+        "request_snapshot": _discovery_request_snapshot_values(run.request_snapshot),
+        "idempotency_key": run.idempotency_key,
+        "created_by": run.created_by,
+        "created_at": run.created_at,
+    }
+
+
+def _discovery_request_snapshot_values(
+    snapshot: DiscoveryRequestSnapshot,
+) -> dict[str, object]:
+    return snapshot.model_dump(mode="json")
+
+
+def _discovery_run_from_row(row: DiscoveryRunRow) -> DiscoveryRun:
+    return DiscoveryRun(
+        id=row.id,
+        edition_id=row.edition_id,
+        input_mode=DiscoveryRunInputMode(row.input_mode),
+        source_profile=row.source_profile,
+        complementary_axis=row.complementary_axis,
+        request_snapshot=DiscoveryRequestSnapshot.model_validate(row.request_snapshot),
+        idempotency_key=row.idempotency_key,
+        created_by=row.created_by,
+        created_at=row.created_at,
+    )
 
 
 class SqlAlchemyDiscoveryBatchRepository:
@@ -38,7 +126,7 @@ class SqlAlchemyDiscoveryBatchRepository:
             insert(DiscoveryBatchRow)
             .values(**_discovery_batch_values(batch))
             .on_conflict_do_nothing(
-                index_elements=[DiscoveryBatchRow.edition_id, DiscoveryBatchRow.request_hash]
+                index_elements=[DiscoveryBatchRow.id]
             )
             .returning(DiscoveryBatchRow.id)
         )
@@ -48,16 +136,14 @@ class SqlAlchemyDiscoveryBatchRepository:
         row = await self._session.get(DiscoveryBatchRow, batch_id)
         return _discovery_batch_from_row(row) if row else None
 
-    async def get_by_request_hash(
-        self, edition_id: UUID, request_hash: str
-    ) -> DiscoveryBatch | None:
+    async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
         from sqlalchemy import select
 
         row = await self._session.scalar(
-            select(DiscoveryBatchRow).where(
-                DiscoveryBatchRow.edition_id == edition_id,
-                DiscoveryBatchRow.request_hash == request_hash,
-            )
+            select(DiscoveryBatchRow)
+            .where(DiscoveryBatchRow.id == batch_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
         return _discovery_batch_from_row(row) if row else None
 
@@ -67,6 +153,16 @@ class SqlAlchemyDiscoveryBatchRepository:
         rows = await self._session.scalars(
             select(DiscoveryBatchRow)
             .where(DiscoveryBatchRow.edition_id == edition_id)
+            .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
+        )
+        return [_discovery_batch_from_row(row) for row in rows]
+
+    async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryBatch]:
+        from sqlalchemy import select
+
+        rows = await self._session.scalars(
+            select(DiscoveryBatchRow)
+            .where(DiscoveryBatchRow.discovery_run_id == discovery_run_id)
             .order_by(DiscoveryBatchRow.created_at, DiscoveryBatchRow.id)
         )
         return [_discovery_batch_from_row(row) for row in rows]
@@ -85,6 +181,7 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
     return {
         "id": batch.id,
         "edition_id": batch.edition_id,
+        "discovery_run_id": batch.discovery_run_id,
         "request_hash": batch.request_hash,
         "complementary_axis": batch.complementary_axis,
         "status": batch.status.value,
@@ -261,6 +358,7 @@ def _discovery_batch_from_row(row: DiscoveryBatchRow) -> DiscoveryBatch:
     return DiscoveryBatch(
         id=row.id,
         edition_id=row.edition_id,
+        discovery_run_id=row.discovery_run_id,
         request_hash=row.request_hash,
         complementary_axis=row.complementary_axis,
         status=DiscoveryBatchStatus(row.status),

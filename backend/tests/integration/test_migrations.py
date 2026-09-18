@@ -176,6 +176,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "trg_rejected_model_proposals_append_only",
     ): "reject_evidence_mutation",
     (
+        "discovery_runs",
+        "trg_discovery_runs_append_only",
+    ): "reject_evidence_mutation",
+    (
         "discovery_intakes",
         "trg_discovery_intakes_append_only",
     ): "reject_discovery_intakes_mutation",
@@ -599,6 +603,42 @@ def test_append_only_guard_rejects_update_and_delete(migrated_postgres_url: str)
     update_sqlstate, delete_sqlstate = asyncio.run(_run())
     assert update_sqlstate == "55000"
     assert delete_sqlstate == "55000"
+
+
+def test_discovery_run_append_only_guard_rejects_update(migrated_postgres_url: str) -> None:
+    async def _run() -> str:
+        engine = create_async_engine(migrated_postgres_url)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text(
+                        "WITH edition AS ("
+                        "INSERT INTO editions ("
+                        "id, country, country_code, period_start, period_end, tlp, languages, "
+                        "state, version, created_at, updated_at"
+                        ") VALUES ("
+                        "gen_random_uuid(), 'Zzland', 'ZZ', DATE '2029-11-01', "
+                        "DATE '2029-11-30', 'AMBER', '[\"fr\"]'::jsonb, 'open', 1, now(), now()"
+                        ") RETURNING id) "
+                        "INSERT INTO discovery_runs ("
+                        "id, edition_id, input_mode, source_profile, complementary_axis, "
+                        "request_snapshot, idempotency_key, created_by, created_at"
+                        ") SELECT gen_random_uuid(), id, 'bridge_research', 'default-v1', "
+                        "'initial', '{}'::jsonb, 'migration-test', 'analyst-1', now() FROM edition"
+                    )
+                )
+            try:
+                async with engine.begin() as connection:
+                    await connection.execute(
+                        text("UPDATE discovery_runs SET created_by = 'tampered'")
+                    )
+            except DBAPIError as exc:
+                return _sqlstate(exc)
+            return ""
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(_run()) == "55000"
 
 
 # ---------------------------------------------------------------------------

@@ -56,13 +56,16 @@ function discoveryFetchMock() {
       }
       if (url.endsWith("/discovery/import/confirm")) {
         return Response.json({
+          run_id: "manual-import-run",
           batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
           reused: false,
           source_mode: "manual_import",
           subject_count: 2,
           publication_count: 3,
+          reconciliation_job_id: null,
         });
       }
+      if (url.endsWith("/discovery/runs")) return Response.json([]);
       if (url.includes("/discovery/candidates")) {
         return Response.json({
           batches: [],
@@ -239,9 +242,8 @@ describe("App éditions", () => {
     );
   });
 
-  it("reprend le suivi d’une recherche après rechargement", async () => {
+  it("charge le suivi durable d’une recherche après rechargement", async () => {
     const jobId = "20658589-a6d5-4af5-b026-d5c6fcb3b7f0";
-    window.localStorage.setItem(`cti-discovery-job:${iranEdition.id}`, jobId);
     const fetchMock = vi.fn(
       withProductionNotStarted((input: RequestInfo | URL) => {
         const url =
@@ -250,6 +252,32 @@ describe("App éditions", () => {
             : input instanceof URL
               ? input.href
               : input.url;
+        if (url.endsWith("/discovery/runs"))
+          return Response.json([
+            {
+              run_id: "run-reloaded",
+              edition_id: iranEdition.id,
+              input_mode: "bridge_research",
+              source_profile: "default",
+              complementary_axis: "initial",
+              created_by: "dev-analyst",
+              created_at: "2026-08-10T10:00:00Z",
+              request_snapshot: {},
+              execution: {
+                job_id: jobId,
+                status: "succeeded",
+                progress_current: 4,
+                progress_total: 4,
+                user_message: "Lot persisté",
+                error_code: null,
+                error_message: null,
+                error_details: null,
+                started_at: null,
+                finished_at: null,
+              },
+              result: null,
+            },
+          ]);
         if (url.includes(`/api/jobs/${jobId}`))
           return Response.json({
             id: jobId,
@@ -302,9 +330,6 @@ describe("App éditions", () => {
     expect(
       await screen.findByRole("heading", { name: "Sujets candidats" }),
     ).toBeInTheDocument();
-    expect(
-      window.localStorage.getItem(`cti-discovery-job:${iranEdition.id}`),
-    ).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(`/api/jobs/${jobId}`);
   });
 
@@ -407,6 +432,7 @@ describe("App éditions", () => {
       total: 1,
       warning: "Propositions non vérifiées",
     };
+    let launched = false;
     const fetchMock = vi.fn(
       withProductionNotStarted(
         (input: RequestInfo | URL, init?: RequestInit) => {
@@ -451,15 +477,35 @@ describe("App éditions", () => {
             return Response.json(candidateResult);
           if (url.includes("/editorial-groups"))
             return Response.json(emptyEditorialBoard);
-          if (url.endsWith("/discovery") && init?.method === "POST") {
-            return Response.json(
-              {
-                job_id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
-                status: "queued",
-                reused: false,
-              },
-              { status: 202 },
-            );
+          const launchedRun = {
+            run_id: "run-launched",
+            edition_id: iranEdition.id,
+            input_mode: "bridge_research",
+            source_profile: "default",
+            complementary_axis: "initial",
+            created_by: "dev-analyst",
+            created_at: "2026-08-10T10:00:00Z",
+            request_snapshot: {},
+            execution: {
+              job_id: "20658589-a6d5-4af5-b026-d5c6fcb3b7f0",
+              status: "succeeded",
+              progress_current: 4,
+              progress_total: 4,
+              user_message: null,
+              error_code: null,
+              error_message: null,
+              error_details: null,
+              started_at: null,
+              finished_at: null,
+            },
+            result: null,
+          };
+          if (url.endsWith("/discovery/runs") && init?.method === "POST") {
+            launched = true;
+            return Response.json(launchedRun, { status: 202 });
+          }
+          if (url.endsWith("/discovery/runs")) {
+            return Response.json(launched ? [launchedRun] : []);
           }
           if (url.includes("/api/jobs/")) {
             return Response.json({
@@ -578,7 +624,7 @@ describe("App éditions", () => {
             : input instanceof URL
               ? input.href
               : input.url;
-        return url.endsWith("/discovery") && init?.method === "POST";
+        return url.endsWith("/discovery/runs") && init?.method === "POST";
       }),
     ).toBe(true);
   });
@@ -714,6 +760,7 @@ describe("App éditions", () => {
         }
         if (url.endsWith("/discovery/import/confirm")) {
           return Response.json({
+            run_id: "manual-import-run",
             batch_id: "9e2f4a1c-1d2b-4a3f-8c5e-6a7b8c9d0e1f",
             reused: false,
             source_mode: "manual_import",
@@ -722,6 +769,7 @@ describe("App éditions", () => {
             reconciliation_job_id: reconciliationJobId,
           });
         }
+        if (url.endsWith("/discovery/runs")) return Response.json([]);
         if (url.includes(`/api/jobs/${reconciliationJobId}`)) {
           return Response.json({
             id: reconciliationJobId,
@@ -797,11 +845,8 @@ describe("App éditions", () => {
       screen.getByRole("button", { name: "Confirmer et intégrer" }),
     );
 
-    // Le job de réconciliation est suivi (comme une recherche ChatGPT) au
-    // lieu d'être ignoré.
-    expect(await screen.findByText("Terminée")).toBeInTheDocument();
-    // Et la sélection des sujets ne se met à jour qu'une fois ce job
-    // terminal, en montrant le sujet consolidé.
+    // Le job de réconciliation reste séparé de l’identité des DiscoveryRun.
+    // La sélection des sujets se met à jour une fois ce job terminal.
     expect(
       await screen.findByRole("heading", { name: "Sujets candidats" }),
     ).toBeInTheDocument();

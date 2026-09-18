@@ -20,7 +20,7 @@ from cti_app.domain.collection import (
     RejectedModelProposal,
     SourceCollection,
 )
-from cti_app.domain.discovery import DiscoveryBatch
+from cti_app.domain.discovery import DiscoveryBatch, DiscoveryRun, DiscoveryRunInputMode
 from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoveryMergeRun,
@@ -441,13 +441,25 @@ class DiscoveryBatchRepository(Protocol):
 
     async def get(self, batch_id: UUID) -> DiscoveryBatch | None: ...
 
-    async def get_by_request_hash(
-        self, edition_id: UUID, request_hash: str
-    ) -> DiscoveryBatch | None: ...
+    async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None: ...
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]: ...
 
+    async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryBatch]: ...
+
     async def save(self, batch: DiscoveryBatch) -> None: ...
+
+
+class DiscoveryRunRepository(Protocol):
+    async def add_if_absent(self, run: DiscoveryRun) -> bool: ...
+
+    async def get(self, run_id: UUID) -> DiscoveryRun | None: ...
+
+    async def get_by_idempotency_key(
+        self, edition_id: UUID, input_mode: DiscoveryRunInputMode, idempotency_key: str
+    ) -> DiscoveryRun | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryRun]: ...
 
 
 class DiscoveryIntakeRepository(Protocol):
@@ -627,6 +639,7 @@ class UnitOfWork(Protocol):
     model_output_rejections: ModelOutputRejectionRepository
     model_conversations: ModelConversationRepository
     model_conversation_turns: ModelConversationTurnRepository
+    discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
     discovery_intakes: DiscoveryIntakeRepository
     discovery_subject_identities: DiscoverySubjectIdentityRepository
@@ -724,6 +737,7 @@ class EditionUnitOfWorkFactory(Protocol):
 
 
 class DiscoveryUnitOfWork(Protocol):
+    discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
 
     async def __aenter__(self) -> Self: ...
@@ -742,6 +756,31 @@ class DiscoveryUnitOfWork(Protocol):
 
 class DiscoveryUnitOfWorkFactory(Protocol):
     def __call__(self) -> DiscoveryUnitOfWork: ...
+
+
+class DiscoveryRunUnitOfWork(Protocol):
+    editions: EditionRepository
+    discovery_runs: DiscoveryRunRepository
+    discovery_batches: DiscoveryBatchRepository
+    jobs: JobRepository
+    job_events: JobEventRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class DiscoveryRunUnitOfWorkFactory(Protocol):
+    def __call__(self) -> DiscoveryRunUnitOfWork: ...
 
 
 class SubjectProductionRunRepository(Protocol):

@@ -1,12 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type FormEvent, useCallback, useMemo, useState } from "react";
+import {
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   attachIncompleteSourceUrl,
   confirmManualDiscoveryRecovery,
   confirmVisibleDiscoveryRecovery,
   fetchDiscovery,
-  launchDiscovery,
+  fetchDiscoveryRuns,
+  launchDiscoveryRun,
   markDiscoverySource,
   previewDiscoveryImport,
   confirmDiscoveryImport,
@@ -15,6 +22,7 @@ import {
   requestDiscoveryCompletion,
   reprocessReport as reprocessReportFn,
   type DiscoveryRecoveryPreview,
+  type DiscoveryRun,
   type SourceVerificationStatus,
 } from "../../api/discovery";
 import { renderDiscoveryMarkdown } from "../../discoveryMarkdownExport";
@@ -23,11 +31,10 @@ import { DiscoveryMergeReview } from "../../components/DiscoveryMergeReview";
 import { ErrorMessage } from "../../components/ErrorMessage";
 import {
   cancelJob,
+  fetchJob,
   terminalJobStatuses,
-  type JobStatus,
   type JobView,
 } from "../../api/jobs";
-import { discoveryJobStorageKey } from "./discoveryStorage";
 
 function IncompleteSourceUrlForm({
   onSubmit,
@@ -81,12 +88,10 @@ export function DiscoveryPanel({
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
-  const storageKey = discoveryJobStorageKey(editionId);
-  const [jobId, setJobId] = useState<string | null>(() =>
-    window.localStorage.getItem(storageKey),
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [reconciliationJobId, setReconciliationJobId] = useState<string | null>(
+    null,
   );
-  const [jobStatus, setJobStatus] = useState<JobStatus | null>(null);
-  const [lastJob, setLastJob] = useState<JobView | null>(null);
   // The merge planner also calls the single-slot ChatGPT bridge, in the
   // background, before any merge run exists to poll on its own — launching a
   // second bridge action while it runs would just contend for the same slot
@@ -114,6 +119,57 @@ export function DiscoveryPanel({
   const [sort, setSort] = useState<
     "newest" | "technical" | "novelty" | "title"
   >("technical");
+  const discoveryRuns = useQuery({
+    queryKey: ["discovery-runs", editionId],
+    queryFn: () => fetchDiscoveryRuns(editionId),
+    refetchInterval: ({ state }) => {
+      const runs = state.data;
+      return runs?.some(
+        (run) =>
+          run.execution?.status === "queued" ||
+          run.execution?.status === "running",
+      )
+        ? 2_000
+        : false;
+    },
+  });
+  const runs = useMemo(
+    () =>
+      [...(discoveryRuns.data ?? [])].sort(
+        (left, right) =>
+          new Date(right.created_at).getTime() -
+          new Date(left.created_at).getTime(),
+      ),
+    [discoveryRuns.data],
+  );
+  useEffect(() => {
+    if (runs.length === 0) {
+      setSelectedRunId(null);
+      return;
+    }
+    if (!selectedRunId || !runs.some((run) => run.run_id === selectedRunId)) {
+      setSelectedRunId(runs[0]?.run_id ?? null);
+    }
+  }, [runs, selectedRunId]);
+  const selectedRun =
+    runs.find((run) => run.run_id === selectedRunId) ?? runs[0];
+  const selectedJobId = selectedRun?.execution?.job_id ?? null;
+  const selectedJob = useQuery({
+    queryKey: ["job", selectedJobId],
+    queryFn: () => fetchJob(selectedJobId!),
+    enabled: Boolean(selectedJobId),
+    refetchInterval: ({ state }) =>
+      state.data && terminalJobStatuses.has(state.data.status) ? false : 2_000,
+  });
+  const reconciliationJob = useQuery({
+    queryKey: ["job", reconciliationJobId],
+    queryFn: () => fetchJob(reconciliationJobId!),
+    enabled: Boolean(reconciliationJobId),
+    refetchInterval: ({ state }) =>
+      state.data && terminalJobStatuses.has(state.data.status) ? false : 2_000,
+  });
+  const lastJob: JobView | null = selectedJob.data ?? null;
+  const jobId = selectedJobId;
   const discovery = useQuery({
     queryKey: ["discovery", editionId, search, minimum, sourceStatus, sort],
     queryFn: () =>
@@ -123,32 +179,42 @@ export function DiscoveryPanel({
         sourceStatus,
         sort,
       }),
-    refetchInterval:
-      jobId && (jobStatus === null || !terminalJobStatuses.has(jobStatus))
-        ? 2_000
-        : false,
   });
-  const launch = useMutation({
-    mutationFn: () =>
-      launchDiscovery(editionId, axis.trim() || "initial", sourceProfile),
-    onSuccess: (result) => {
-      setJobId(result.job_id);
-      setJobStatus(null);
-      window.localStorage.setItem(storageKey, result.job_id);
+  useEffect(() => {
+    if (
+      reconciliationJob.data &&
+      terminalJobStatuses.has(reconciliationJob.data.status)
+    ) {
+      setReconciliationJobId(null);
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
-    },
-  });
-  const relaunch = useMutation({
-    mutationFn: () =>
-      launchDiscovery(editionId, axis.trim() || "initial", sourceProfile, true),
-    onSuccess: (result) => {
-      setJobId(result.job_id);
-      setJobStatus(null);
-      window.localStorage.setItem(storageKey, result.job_id);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery-runs", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["editorial-board", editionId],
+      });
+    }
+  }, [editionId, queryClient, reconciliationJob.data]);
+  const launch = useMutation({
+    mutationFn: ({
+      payload,
+      idempotencyKey,
+    }: {
+      payload: { complementary_axis: string; source_profile: string };
+      idempotencyKey: string;
+    }) => launchDiscoveryRun(editionId, payload, idempotencyKey),
+    onSuccess: (run) => {
+      setSelectedRunId(run.run_id);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery-runs", editionId],
+      });
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["editorial-board", editionId],
       });
     },
   });
@@ -178,16 +244,23 @@ export function DiscoveryPanel({
       queryClient.invalidateQueries({ queryKey: ["discovery", editionId] }),
   });
   const reprocessReport = useMutation({
-    mutationFn: (researchModelRunId: string) =>
-      reprocessReportFn(
-        editionId,
-        researchModelRunId,
-        axis.trim() || "initial",
-      ),
-    onSuccess: (result) => {
-      setJobId(result.job_id);
-      setJobStatus(null);
-      window.localStorage.setItem(storageKey, result.job_id);
+    mutationFn: ({
+      runId,
+      researchModelRunId,
+      idempotencyKey,
+    }: {
+      runId: string;
+      researchModelRunId: string;
+      idempotencyKey: string;
+    }) =>
+      reprocessReportFn(editionId, runId, researchModelRunId, idempotencyKey),
+    onSuccess: (_result, variables) => {
+      // Le retraitement reste rattaché au run d'origine : seule sa révision
+      // de batch change.
+      setSelectedRunId(variables.runId);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery-runs", editionId],
+      });
     },
   });
   const recoveryRunId =
@@ -196,21 +269,18 @@ export function DiscoveryPanel({
     typeof lastJob.error_details?.model_run_id === "string"
       ? lastJob.error_details.model_run_id
       : null;
-  // Sur un job terminal (FAILED/CANCELLED), la confirmation crée un NOUVEAU
-  // job reprocess_discovery_report : il faut suivre ce nouveau job, pas
-  // continuer à interroger l'ancien qui reste terminal dans l'historique.
-  const refreshRecoveredJob = useCallback(
-    (result: { job_id: string; status: string }) => {
-      setJobId(result.job_id);
-      setJobStatus(result.status as JobStatus);
-      setLastJob(null);
-      window.localStorage.setItem(storageKey, result.job_id);
-      setRecoveryPreview(null);
-      setShowManualRecovery(false);
-      void queryClient.invalidateQueries({ queryKey: ["job", result.job_id] });
-    },
-    [queryClient, storageKey],
-  );
+  // Une récupération poursuit le DiscoveryRun d'origine : elle ne change pas
+  // l'identité affichée, seulement l'état de son exécution.
+  const refreshRecoveredJob = useCallback(() => {
+    setRecoveryPreview(null);
+    setShowManualRecovery(false);
+    void queryClient.invalidateQueries({
+      queryKey: ["discovery-runs", editionId],
+    });
+    void queryClient.invalidateQueries({
+      queryKey: ["discovery", editionId],
+    });
+  }, [editionId, queryClient]);
   const visibleRecovery = useMutation({
     mutationFn: () =>
       previewVisibleDiscoveryRecovery(editionId, recoveryRunId!, jobId!),
@@ -264,7 +334,7 @@ export function DiscoveryPanel({
     onSuccess: setManualImportPreview,
   });
   const confirmImport = useMutation({
-    mutationFn: () => {
+    mutationFn: ({ idempotencyKey }: { idempotencyKey: string }) => {
       if (!manualImportPreview) {
         throw new Error("Aucun aperçu d’import à confirmer");
       }
@@ -273,6 +343,7 @@ export function DiscoveryPanel({
         manualImportMarkdown,
         manualImportPreview.sha256,
         sourceProfile,
+        idempotencyKey,
         axis.trim() || "manual-import",
       );
     },
@@ -285,29 +356,28 @@ export function DiscoveryPanel({
       setShowManualImport(false);
       setManualImportMarkdown("");
       setManualImportPreview(null);
-      if (result.reconciliation_job_id) {
-        setJobId(result.reconciliation_job_id);
-        setJobStatus(null);
-        window.localStorage.setItem(storageKey, result.reconciliation_job_id);
-      } else {
-        // reused=true : déjà consolidé par un import précédent, rien à attendre.
-        void queryClient.invalidateQueries({
-          queryKey: ["discovery", editionId],
-        });
-        void queryClient.invalidateQueries({
-          queryKey: ["editorial-board", editionId],
-        });
-      }
+      setSelectedRunId(result.run_id);
+      setReconciliationJobId(result.reconciliation_job_id);
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery-runs", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["editorial-board", editionId],
+      });
     },
   });
   const abandonRecovery = useMutation({
     mutationFn: () => cancelJob(jobId!),
-    onSuccess: (job) => {
-      setJobStatus(job.status);
-      setLastJob(job);
+    onSuccess: () => {
       setRecoveryPreview(null);
       setShowManualRecovery(false);
       void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["discovery-runs", editionId],
+      });
     },
   });
   const candidates = discovery.data?.candidates ?? [];
@@ -317,22 +387,17 @@ export function DiscoveryPanel({
   );
   const batches = discovery.data?.batches ?? [];
   const mergeStats = discovery.data?.merge_stats;
-  const searchRunning =
-    Boolean(jobId) &&
-    (jobStatus === null || !terminalJobStatuses.has(jobStatus));
-  const handleJobUpdate = useCallback((job: JobView) => {
-    setLastJob(job);
-    setJobStatus(job.status);
-  }, []);
   const handleJobTerminal = useCallback(() => {
-    window.localStorage.removeItem(storageKey);
+    void queryClient.invalidateQueries({
+      queryKey: ["discovery-runs", editionId],
+    });
     void queryClient.invalidateQueries({
       queryKey: ["discovery", editionId],
     });
     void queryClient.invalidateQueries({
       queryKey: ["editorial-board", editionId],
     });
-  }, [editionId, queryClient, storageKey]);
+  }, [editionId, queryClient]);
 
   return (
     <section className="discovery-panel" aria-labelledby="discovery-heading">
@@ -347,8 +412,16 @@ export function DiscoveryPanel({
           <div className="input-choice-buttons">
             <button
               className="button"
-              disabled={launch.isPending || searchRunning || mergeReconciling}
-              onClick={() => launch.mutate()}
+              disabled={launch.isPending || mergeReconciling}
+              onClick={() =>
+                launch.mutate({
+                  idempotencyKey: crypto.randomUUID(),
+                  payload: {
+                    complementary_axis: axis.trim() || "initial",
+                    source_profile: sourceProfile,
+                  },
+                })
+              }
             >
               {launch.isPending ? "Lancement…" : "Nouvelle recherche ChatGPT"}
             </button>
@@ -368,6 +441,104 @@ export function DiscoveryPanel({
           désactivées.
         </p>
       ) : null}
+      <section
+        className="discovery-run-history"
+        aria-labelledby="run-history-heading"
+      >
+        <h3 id="run-history-heading">Historique des recherches</h3>
+        {discoveryRuns.isPending ? (
+          <p role="status">Chargement de l’historique…</p>
+        ) : null}
+        {discoveryRuns.isError ? (
+          <p role="alert" className="error-message">
+            Impossible de récupérer l’historique des recherches.
+          </p>
+        ) : null}
+        {runs.length === 0 && !discoveryRuns.isPending ? (
+          <p>Aucune recherche enregistrée.</p>
+        ) : null}
+        <ol>
+          {runs.map((run: DiscoveryRun) => {
+            const execution = run.execution;
+            const isSelected = run.run_id === selectedRun?.run_id;
+            const manualImport = run.input_mode === "manual_import";
+            return (
+              <li key={run.run_id}>
+                <button
+                  className="button button--secondary"
+                  aria-pressed={isSelected}
+                  onClick={() => setSelectedRunId(run.run_id)}
+                >
+                  {new Date(run.created_at).toLocaleString("fr-FR")}
+                </button>
+                <div>
+                  <p>
+                    <strong>{run.complementary_axis}</strong> ·{" "}
+                    {run.source_profile} ·{" "}
+                    {manualImport ? "Import manuel" : "Recherche ChatGPT"}
+                  </p>
+                  {manualImport && !execution ? (
+                    <p role="status">Import manuel · résultat disponible</p>
+                  ) : null}
+                  {execution ? (
+                    <>
+                      <p>
+                        État :{" "}
+                        {execution.status === "queued"
+                          ? "En attente"
+                          : execution.status === "running"
+                            ? "En cours"
+                            : execution.status === "waiting_human"
+                              ? "Validation humaine requise"
+                              : execution.status === "succeeded"
+                                ? "Terminée"
+                                : execution.status === "failed"
+                                  ? "Échec"
+                                  : "Annulée"}
+                      </p>
+                      {execution.status === "queued" ||
+                      execution.status === "running" ? (
+                        <p>
+                          Progression : {execution.progress_current}/
+                          {execution.progress_total || "—"}
+                          {execution.user_message
+                            ? ` — ${execution.user_message}`
+                            : ""}
+                        </p>
+                      ) : null}
+                      {execution.status === "waiting_human" ? (
+                        <p role="status">
+                          L’intervention d’un analyste est requise.
+                          {execution.user_message
+                            ? ` ${execution.user_message}`
+                            : ""}
+                        </p>
+                      ) : null}
+                      {execution.status === "failed" ? (
+                        <p role="alert">
+                          {execution.error_code
+                            ? `${execution.error_code} — `
+                            : ""}
+                          {execution.error_message || "La recherche a échoué."}
+                        </p>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {run.result?.archived_report_url ? (
+                    <a
+                      href={run.result.archived_report_url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Consulter le rapport Markdown archivé
+                    </a>
+                  ) : null}
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      </section>
       {mergeReconciling ? (
         <p className="merge-review__blocked" role="status">
           Le bridge ChatGPT est occupé à évaluer la dernière contribution pour
@@ -489,7 +660,11 @@ export function DiscoveryPanel({
                 <button
                   className="button"
                   disabled={confirmImport.isPending}
-                  onClick={() => confirmImport.mutate()}
+                  onClick={() =>
+                    confirmImport.mutate({
+                      idempotencyKey: crypto.randomUUID(),
+                    })
+                  }
                 >
                   Confirmer et intégrer
                 </button>
@@ -513,10 +688,15 @@ export function DiscoveryPanel({
         <JobStatusCard
           jobId={jobId}
           readOnly={readOnly}
-          onUpdate={handleJobUpdate}
           onTerminal={handleJobTerminal}
           onReprocessReport={(researchModelRunId) =>
-            reprocessReport.mutate(researchModelRunId)
+            selectedRun
+              ? reprocessReport.mutate({
+                  runId: selectedRun.run_id,
+                  researchModelRunId,
+                  idempotencyKey: crypto.randomUUID(),
+                })
+              : undefined
           }
         />
       ) : null}
@@ -1026,21 +1206,31 @@ export function DiscoveryPanel({
                     className="button button--secondary"
                     disabled={reprocessReport.isPending}
                     onClick={() =>
-                      reprocessReport.mutate(batch.discovery_model_run_id)
+                      reprocessReport.mutate({
+                        runId: batch.discovery_run_id,
+                        researchModelRunId: batch.discovery_model_run_id,
+                        idempotencyKey: crypto.randomUUID(),
+                      })
                     }
                   >
                     Retraiter le rapport archivé
                   </button>
                   <button
                     className="button button--secondary"
-                    disabled={relaunch.isPending || mergeReconciling}
+                    disabled={launch.isPending || mergeReconciling}
                     onClick={() => {
                       if (
                         window.confirm(
                           "Relancer la recherche web créera une nouvelle conversation ChatGPT et conservera le rapport actuel. Continuer ?",
                         )
                       )
-                        relaunch.mutate();
+                        launch.mutate({
+                          idempotencyKey: crypto.randomUUID(),
+                          payload: {
+                            complementary_axis: axis.trim() || "initial",
+                            source_profile: sourceProfile,
+                          },
+                        });
                     }}
                   >
                     Relancer la recherche web

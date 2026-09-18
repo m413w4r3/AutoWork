@@ -65,6 +65,7 @@ from cti_app.infrastructure.database.session import (
     create_session_factory,
 )
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
+from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
 
@@ -191,6 +192,7 @@ async def _seed_subject(
         queries=("query",),
         citations=(),
         candidates=[topic],
+        discovery_run_id=uuid4(),
         discovery_model_run_id=uuid4(),
         tlp=TLP.AMBER,
         sensitivity="internal",
@@ -216,7 +218,7 @@ async def _seed_subject(
         grouping_justification="test",
     )
     group.select(subject.id)
-    discovery_run = ModelRun(
+    discovery_model_run = ModelRun(
         id=batch.discovery_model_run_id,
         provider=ModelProvider.FAKE,
         model_role=ModelRole.RESEARCH,
@@ -252,8 +254,12 @@ async def _seed_subject(
     )
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
+        await uow.commit()
+    discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+    batch.discovery_run_id = discovery_run.id
+    async with uow_factory() as uow:
         await uow.subjects.add(subject)
-        await uow.model_runs.add(discovery_run)
+        await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
         await uow.editorial_groups.add(group)
         for collection in collections:

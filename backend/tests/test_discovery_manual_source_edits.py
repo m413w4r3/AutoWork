@@ -61,33 +61,27 @@ def _candidate() -> CandidateTopic:
 
 
 def test_build_manual_edit_batch_uses_manual_source_edit_version() -> None:
+    discovery_run_id = uuid4()
     batch, _digest = _build_manual_edit_batch(
         edition_id=uuid4(),
         subject_id=uuid4(),
         incomplete_source_id=uuid4(),
         url="https://example.com/report",
         candidate=_candidate(),
+        discovery_run_id=discovery_run_id,
     )
 
     assert MANUAL_SOURCE_EDIT_VERSION == "manual-url-attach-v1"
     assert batch.parser_version == "manual-url-attach-v1"
+    assert batch.discovery_run_id == discovery_run_id
 
 
 class _BatchRepository:
     def __init__(self, batches: list[DiscoveryBatch]) -> None:
         self.batches = batches
 
-    async def get_by_request_hash(
-        self, edition_id: object, request_hash: str
-    ) -> DiscoveryBatch | None:
-        return next(
-            (
-                batch
-                for batch in self.batches
-                if batch.edition_id == edition_id and batch.request_hash == request_hash
-            ),
-            None,
-        )
+    async def get(self, batch_id: object) -> DiscoveryBatch | None:
+        return next((batch for batch in self.batches if batch.id == batch_id), None)
 
     async def add_if_absent(self, batch: DiscoveryBatch) -> bool:
         if any(item.id == batch.id for item in self.batches):
@@ -254,12 +248,14 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     edition_id = uuid4()
     subject_id = uuid4()
     other_subject_id = uuid4()
+    originating_run_id = uuid4()
     old = _source("https://blocked.example/report")
     other_old = _source("https://blocked.example/report", title="Other report")
     candidate = _topic_candidate(old)
     other_candidate = _topic_candidate(other_old, title="Other candidate")
     old_batch = DiscoveryBatch(
         edition_id=edition_id,
+        discovery_run_id=originating_run_id,
         request_hash="b" * 64,
         complementary_axis="research",
         queries=(),
@@ -355,3 +351,90 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     assert other_candidate.sources[0].canonical_url == old.canonical_url
     assert archive.calls[0]["operation"] == "replace"
     assert old.canonical_url.encode() in archive.calls[0]["content"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    originating_run_id = uuid4()
+    unrelated_run_id = uuid4()
+    old = _source("https://blocked.example/originating-report")
+    unrelated_source = _source("https://example.com/unrelated-report")
+    candidate = _topic_candidate(old)
+    unrelated_candidate = _topic_candidate(unrelated_source, title="Unrelated candidate")
+    originating_batch = DiscoveryBatch(
+        edition_id=edition_id,
+        discovery_run_id=originating_run_id,
+        request_hash="c" * 64,
+        complementary_axis="research",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="test",
+        candidates=[candidate],
+        source_mode=DiscoverySourceMode.MANUAL_IMPORT,
+        source_coverage_complete=False,
+        source_coverage_incomplete_reason="test",
+    )
+    unrelated_batch = DiscoveryBatch(
+        edition_id=edition_id,
+        discovery_run_id=unrelated_run_id,
+        request_hash="d" * 64,
+        complementary_axis="research",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=uuid4(),
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="test",
+        candidates=[unrelated_candidate],
+        source_mode=DiscoverySourceMode.MANUAL_IMPORT,
+        source_coverage_complete=False,
+        source_coverage_incomplete_reason="test",
+    )
+    snapshot = DiscoverySnapshot(
+        edition_id=edition_id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=uuid4(),
+        merge_run_id=uuid4(),
+        planner_kind=DiscoveryPlannerKind.HEURISTIC,
+        subjects=(
+            DiscoverySubject(
+                subject_id=subject_id,
+                candidate=candidate,
+                member_references=(
+                    DiscoveryMemberReference(unrelated_batch.id, unrelated_candidate.id),
+                    DiscoveryMemberReference(originating_batch.id, candidate.id),
+                ),
+                created_at=datetime.now(UTC),
+            ),
+        ),
+        snapshot_hash="e" * 64,
+        is_active=True,
+    )
+    batches = _BatchRepository([unrelated_batch, originating_batch])
+    uow = _Uow(batches, _GroupRepository([]))
+    archive = _Archive()
+    cumulative = _Cumulative(snapshot)
+    service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]
+
+    await service.attach_replacement_source_url(
+        edition_id,
+        subject_id,
+        old.canonical_url,
+        "https://mirror.example/originating-report",
+        actor_id="analyst-1",
+    )
+
+    manual_batch = next(
+        batch
+        for batch in batches.batches
+        if batch.id not in {originating_batch.id, unrelated_batch.id}
+    )
+    assert manual_batch.discovery_run_id == originating_run_id
