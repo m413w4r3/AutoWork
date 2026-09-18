@@ -69,8 +69,8 @@ class DiscoveryRequestSnapshot(BaseModel):
         max_length=64,
         pattern=r"^[a-z0-9]+(?:[._-][a-z0-9]+)*$",
     )
-    keywords: tuple[str, ...] = Field(max_length=64)
-    exclusions: tuple[str, ...] = Field(max_length=64)
+    keywords: tuple[str, ...] = Field(max_length=100)
+    exclusions: tuple[str, ...] = Field(max_length=100)
     complementary_axis: str = Field(min_length=1, max_length=500)
     tlp: TLP
     sensitivity: str = Field(min_length=1, max_length=64)

@@ -42,6 +42,10 @@ class InMemoryDiscoveryBatchRepository:
         batch = self._state.get(batch_id)
         return deepcopy(batch) if batch else None
 
+    async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
+        batch = self._state.get(batch_id)
+        return deepcopy(batch) if batch else None
+
     async def list_for_edition(self, edition_id: UUID) -> list[DiscoveryBatch]:
         return [deepcopy(item) for item in self._state.values() if item.edition_id == edition_id]
 

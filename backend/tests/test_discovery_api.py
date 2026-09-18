@@ -186,6 +186,94 @@ async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeate
     assert len(fake.calls) == 2
 
 
+async def test_discovery_request_snapshot_keyword_and_exclusion_boundaries() -> None:
+    fake = FakeModelAdapter(research_text=research_markdown_fixture())
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=fake,
+            openai_structured=fake,
+            qwen=fake,
+            fake=fake,
+            forced_backend=ModelBackend.FAKE,
+        ),
+        InMemoryModelRunUnitOfWorkFactory(),
+        InMemoryModelOutputStore(),
+    )
+    shared_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    discovery = DiscoveryService(shared_uow, gateway, archive=gateway)
+    edition_service = EditionService(shared_uow)
+    edition = await edition_service.create(
+        country="Iran",
+        country_code="IR",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+        actor_id="dev-analyst",
+        correlation_id="snapshot-boundaries",
+    )
+    registry = create_job_registry(gateway, discovery)
+    jobs = JobService(shared_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(shared_uow, registry))
+    application = FastAPI()
+    application.include_router(discovery_router)
+    application.include_router(jobs_router)
+    application.state.edition_service = edition_service
+    application.state.discovery_service = discovery
+    application.state.job_service = jobs
+    application.state.job_dispatcher = dispatcher
+    application.state.discovery_run_service = DiscoveryRunService(shared_uow, jobs, dispatcher)
+    application.state.identity_provider = LocalIdentityProvider()
+
+    accepted: dict[int, tuple[list[str], list[str], str]] = {}
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        for size in (64, 65, 100):
+            keywords = [f"keyword-{size}-{index}" for index in range(size)]
+            exclusions = [f"exclusion-{size}-{index}" for index in range(size)]
+            response = await client.post(
+                f"/api/editions/{edition.id}/discovery/runs",
+                headers={"Idempotency-Key": f"snapshot-boundary-{size}"},
+                json={
+                    "source_profile": "iran-default",
+                    "keywords": keywords,
+                    "exclusions": exclusions,
+                    "complementary_axis": "initial",
+                },
+            )
+            assert response.status_code == 202
+            run_id = response.json()["run_id"]
+            persisted = await client.get(
+                f"/api/editions/{edition.id}/discovery/runs/{run_id}"
+            )
+            assert persisted.status_code == 200
+            snapshot = persisted.json()["request_snapshot"]
+            assert snapshot["keywords"] == keywords
+            assert snapshot["exclusions"] == exclusions
+            accepted[size] = (keywords, exclusions, run_id)
+
+        too_many_keywords = [f"keyword-101-{index}" for index in range(101)]
+        too_many_exclusions = [f"exclusion-101-{index}" for index in range(101)]
+        rejected = await client.post(
+            f"/api/editions/{edition.id}/discovery/runs",
+            headers={"Idempotency-Key": "snapshot-boundary-101"},
+            json={
+                "source_profile": "iran-default",
+                "keywords": too_many_keywords,
+                "exclusions": too_many_exclusions,
+                "complementary_axis": "initial",
+            },
+        )
+        runs = await client.get(f"/api/editions/{edition.id}/discovery/runs")
+
+    assert set(accepted) == {64, 65, 100}
+    assert rejected.status_code == 422
+    assert runs.status_code == 200
+    assert len(runs.json()) == 3
+    assert all(item["run_id"] in {value[2] for value in accepted.values()} for item in runs.json())
+
+
 async def test_discovery_run_listing_is_newest_first_and_uses_job_projection() -> None:
     fake = FakeModelAdapter(research_text=research_markdown_fixture())
     model_uow = InMemoryModelRunUnitOfWorkFactory()

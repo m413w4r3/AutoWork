@@ -266,34 +266,52 @@ class DiscoveryService:
             raise
         await self._record_parser_diagnostics(parameters.research_model_run_id, parsed)
 
-        batch = _parsed_to_domain_batch(
-            discover_parameters,
-            discovery_request_hash(discover_parameters),
-            parsed,
-            parameters.research_model_run_id,
-            chain[-1].bridge_capabilities,
-            source_mode=chain[-1].source_mode,
-            batch_id=uuid5(NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}"),
-            parsing_revision=chain[-1].parsing_revision + 1,
-            supersedes_batch_id=chain[-1].id,
+        reprocess_batch_id = uuid5(
+            NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}"
         )
         async with self._uow_factory() as uow:
-            existing = await uow.discovery_batches.get(batch.id)
+            existing = await uow.discovery_batches.get(reprocess_batch_id)
             if existing is not None:
                 return existing
-            if batch.supersedes_batch_id is None:
-                raise RuntimeError("Reprocessed batch has no superseded batch")
-            previous = await uow.discovery_batches.get(batch.supersedes_batch_id)
-            if previous is None or previous.discovery_run_id != run.id:
+
+            visited = {batch.id for batch in chain}
+            locked_tail = await uow.discovery_batches.get_for_update(chain[-1].id)
+            if locked_tail is None or locked_tail.discovery_run_id != run.id:
                 raise RuntimeError("Current discovery batch revision is unavailable")
+
+            while locked_tail.replaced_by_batch_id is not None:
+                successor_id = locked_tail.replaced_by_batch_id
+                if successor_id in visited:
+                    raise RuntimeError("Discovery batch replacement cycle")
+                visited.add(successor_id)
+                successor = await uow.discovery_batches.get_for_update(successor_id)
+                if successor is None:
+                    raise RuntimeError("Discovery batch replacement chain is incomplete")
+                if successor.discovery_run_id != run.id:
+                    raise ValueError("Discovery batch does not belong to its run")
+                locked_tail = successor
+
+            batch = _parsed_to_domain_batch(
+                discover_parameters,
+                discovery_request_hash(discover_parameters),
+                parsed,
+                parameters.research_model_run_id,
+                locked_tail.bridge_capabilities,
+                source_mode=locked_tail.source_mode,
+                batch_id=reprocess_batch_id,
+                parsing_revision=locked_tail.parsing_revision + 1,
+                supersedes_batch_id=locked_tail.id,
+            )
             inserted = await uow.discovery_batches.add_if_absent(batch)
             if not inserted:
                 existing = await uow.discovery_batches.get(batch.id)
                 if existing is None:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 return existing
-            previous.replaced_by_batch_id = batch.id
-            await uow.discovery_batches.save(previous)
+            if locked_tail.replaced_by_batch_id is not None:
+                raise RuntimeError("Discovery batch already has a replacement")
+            locked_tail.replaced_by_batch_id = batch.id
+            await uow.discovery_batches.save(locked_tail)
             await uow.commit()
 
         if self._after_persisted_batch is not None:

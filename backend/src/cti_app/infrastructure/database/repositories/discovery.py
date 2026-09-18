@@ -136,6 +136,17 @@ class SqlAlchemyDiscoveryBatchRepository:
         row = await self._session.get(DiscoveryBatchRow, batch_id)
         return _discovery_batch_from_row(row) if row else None
 
+    async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
+        from sqlalchemy import select
+
+        row = await self._session.scalar(
+            select(DiscoveryBatchRow)
+            .where(DiscoveryBatchRow.id == batch_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return _discovery_batch_from_row(row) if row else None
+
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]:
         from sqlalchemy import select
 
