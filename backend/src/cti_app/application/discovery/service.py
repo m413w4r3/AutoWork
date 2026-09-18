@@ -246,73 +246,80 @@ class DiscoveryService:
         ):
             raise ValueError("Archived report is not part of the discovery run revision chain")
 
-        report = await self.read_archived_report(
-            parameters.edition_id, parameters.research_model_run_id
-        )
-        await context.report_progress(1, 2, "Analyse locale du rapport archivé")
-        try:
-            parsed = parse_discovery_report(
-                report,
-                visible_citations=[],
-                period_start=discover_parameters.period_start,
-                period_end=discover_parameters.period_end,
-                tlp=discover_parameters.tlp,
-                sensitivity=discover_parameters.sensitivity,
-                external_llm_allowed=discover_parameters.external_llm_allowed,
-                research_model_run_id=parameters.research_model_run_id,
-            )
-        except ReportParsingError as exc:
-            exc.research_model_run_id = parameters.research_model_run_id
-            raise
-        await self._record_parser_diagnostics(parameters.research_model_run_id, parsed)
-
+        # L'id est déterministe par Job : un batch déjà persisté sous cet id est
+        # un état durable du MÊME attempt métier, pas un doublon. Il est adopté
+        # sans créer de N+2 et sans retoucher la chaîne, puis le handoff
+        # cumulative est rejoué, car c'est précisément lui qui peut manquer
+        # quand le worker meurt juste après le commit du batch.
         reprocess_batch_id = uuid5(
             NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}"
         )
         async with self._uow_factory() as uow:
-            existing = await uow.discovery_batches.get(reprocess_batch_id)
-            if existing is not None:
-                return existing
-
-            visited = {batch.id for batch in chain}
-            locked_tail = await uow.discovery_batches.get_for_update(chain[-1].id)
-            if locked_tail is None or locked_tail.discovery_run_id != run.id:
-                raise RuntimeError("Current discovery batch revision is unavailable")
-
-            while locked_tail.replaced_by_batch_id is not None:
-                successor_id = locked_tail.replaced_by_batch_id
-                if successor_id in visited:
-                    raise RuntimeError("Discovery batch replacement cycle")
-                visited.add(successor_id)
-                successor = await uow.discovery_batches.get_for_update(successor_id)
-                if successor is None:
-                    raise RuntimeError("Discovery batch replacement chain is incomplete")
-                if successor.discovery_run_id != run.id:
-                    raise ValueError("Discovery batch does not belong to its run")
-                locked_tail = successor
-
-            batch = _parsed_to_domain_batch(
-                discover_parameters,
-                discovery_request_hash(discover_parameters),
-                parsed,
-                parameters.research_model_run_id,
-                locked_tail.bridge_capabilities,
-                source_mode=locked_tail.source_mode,
-                batch_id=reprocess_batch_id,
-                parsing_revision=locked_tail.parsing_revision + 1,
-                supersedes_batch_id=locked_tail.id,
+            adopted = await uow.discovery_batches.get(reprocess_batch_id)
+        if adopted is not None:
+            batch = self._validated_reprocess_batch(adopted, run, parameters)
+        else:
+            report = await self.read_archived_report(
+                parameters.edition_id, parameters.research_model_run_id
             )
-            inserted = await uow.discovery_batches.add_if_absent(batch)
-            if not inserted:
-                existing = await uow.discovery_batches.get(batch.id)
-                if existing is None:
-                    raise RuntimeError("Discovery conflict without canonical batch")
-                return existing
-            if locked_tail.replaced_by_batch_id is not None:
-                raise RuntimeError("Discovery batch already has a replacement")
-            locked_tail.replaced_by_batch_id = batch.id
-            await uow.discovery_batches.save(locked_tail)
-            await uow.commit()
+            await context.report_progress(1, 2, "Analyse locale du rapport archivé")
+            try:
+                parsed = parse_discovery_report(
+                    report,
+                    visible_citations=[],
+                    period_start=discover_parameters.period_start,
+                    period_end=discover_parameters.period_end,
+                    tlp=discover_parameters.tlp,
+                    sensitivity=discover_parameters.sensitivity,
+                    external_llm_allowed=discover_parameters.external_llm_allowed,
+                    research_model_run_id=parameters.research_model_run_id,
+                )
+            except ReportParsingError as exc:
+                exc.research_model_run_id = parameters.research_model_run_id
+                raise
+            await self._record_parser_diagnostics(parameters.research_model_run_id, parsed)
+
+            async with self._uow_factory() as uow:
+                visited = {batch.id for batch in chain}
+                locked_tail = await uow.discovery_batches.get_for_update(chain[-1].id)
+                if locked_tail is None or locked_tail.discovery_run_id != run.id:
+                    raise RuntimeError("Current discovery batch revision is unavailable")
+
+                while locked_tail.replaced_by_batch_id is not None:
+                    successor_id = locked_tail.replaced_by_batch_id
+                    if successor_id in visited:
+                        raise RuntimeError("Discovery batch replacement cycle")
+                    visited.add(successor_id)
+                    successor = await uow.discovery_batches.get_for_update(successor_id)
+                    if successor is None:
+                        raise RuntimeError("Discovery batch replacement chain is incomplete")
+                    if successor.discovery_run_id != run.id:
+                        raise ValueError("Discovery batch does not belong to its run")
+                    locked_tail = successor
+
+                batch = _parsed_to_domain_batch(
+                    discover_parameters,
+                    discovery_request_hash(discover_parameters),
+                    parsed,
+                    parameters.research_model_run_id,
+                    locked_tail.bridge_capabilities,
+                    source_mode=locked_tail.source_mode,
+                    batch_id=reprocess_batch_id,
+                    parsing_revision=locked_tail.parsing_revision + 1,
+                    supersedes_batch_id=locked_tail.id,
+                )
+                inserted = await uow.discovery_batches.add_if_absent(batch)
+                if not inserted:
+                    concurrent = await uow.discovery_batches.get(batch.id)
+                    if concurrent is None:
+                        raise RuntimeError("Discovery conflict without canonical batch")
+                    batch = self._validated_reprocess_batch(concurrent, run, parameters)
+                else:
+                    if locked_tail.replaced_by_batch_id is not None:
+                        raise RuntimeError("Discovery batch already has a replacement")
+                    locked_tail.replaced_by_batch_id = batch.id
+                    await uow.discovery_batches.save(locked_tail)
+                    await uow.commit()
 
         if self._after_persisted_batch is not None:
             await self._after_persisted_batch(
@@ -320,6 +327,23 @@ class DiscoveryService:
             )
         await context.report_progress(2, 2, "Révision du rapport archivé terminée")
         return batch
+
+    @staticmethod
+    def _validated_reprocess_batch(
+        candidate: DiscoveryBatch,
+        run: DiscoveryRun,
+        parameters: ReprocessDiscoveryReportParameters,
+    ) -> DiscoveryBatch:
+        """Vérifie qu'un batch déterministe déjà persisté est bien le nôtre.
+
+        Adopter un batch sans revérifier son appartenance reviendrait à faire
+        confiance à un id dérivé d'un Job pour une décision de sécurité.
+        """
+        if candidate.discovery_run_id != run.id:
+            raise ValueError("Discovery batch does not belong to its run")
+        if candidate.discovery_model_run_id != parameters.research_model_run_id:
+            raise ValueError("Reprocessed batch does not match the archived report")
+        return candidate
 
     async def _research_or_resume(
         self,

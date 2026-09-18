@@ -24,6 +24,7 @@ from cti_app.application.discovery.prompts import _research_prompt
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.jobs import (
     DuplicateJobError,
+    JobExecutionContext,
     JobExecutor,
     JobService,
     SynchronousJobDispatcher,
@@ -46,6 +47,7 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
+from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -1322,5 +1324,141 @@ async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_
     assert initial_batch.replaced_by_batch_id == revision.id
     assert revision.supersedes_batch_id == initial_batch.id
     assert revision.parsing_revision == 2
+    assert len(model_uow.state) == model_runs_before
+    assert len(adapter.calls) == research_calls_before
+
+
+async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_new_revision(
+) -> None:
+    """Le batch déterministe déjà persisté n'autorise pas à sauter le handoff.
+
+    Le batch est committé avant le handoff cumulative : si le worker meurt
+    entre les deux, le retry du MÊME Job retrouve ce batch. L'adopter en
+    retournant immédiatement laissait le reprocess Job conclure sans intake ni
+    réconciliation. Il doit au contraire rejouer le handoff, sans créer de N+2.
+    """
+    adapter = FakeModelAdapter(research_text=research_markdown_fixture())
+    gateway, model_uow, _ = gateway_for_adapter(adapter)
+    discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
+    params = parameters()
+    run = DiscoveryRun(
+        id=params.discovery_run_id,
+        edition_id=params.edition_id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile=params.source_profile,
+        complementary_axis=params.complementary_axis,
+        request_snapshot=discovery_request_snapshot(params),
+        idempotency_key="reprocess-handoff-retry-run",
+        created_by="dev-analyst",
+    )
+    async with discovery_uow() as uow:
+        assert await uow.discovery_runs.add_if_absent(run)
+        await uow.commit()
+
+    initial_discovery = DiscoveryService(discovery_uow, gateway, archive=gateway)
+    job_uow = InMemoryJobUnitOfWorkFactory()
+    registry = create_job_registry(gateway, initial_discovery)
+    jobs = JobService(job_uow, registry)
+    dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
+    initial_job = await jobs.submit(
+        kind=DISCOVERY_JOB_KIND,
+        aggregate_type="discovery_run",
+        aggregate_id=run.id,
+        idempotency_key=discovery_job_idempotency_key(run.id),
+        correlation_id="initial-discovery",
+        input_parameters=params.model_dump(mode="json"),
+    )
+    await dispatcher.dispatch(initial_job.id)
+    initial_batches = await initial_discovery.list_batches(
+        params.edition_id, include_replaced=True
+    )
+    assert len(initial_batches) == 1
+    initial_batch = initial_batches[0]
+    archived_model_run_id = initial_batch.discovery_model_run_id
+    research_calls_before = len(adapter.calls)
+    model_runs_before = len(model_uow.state)
+
+    handoff_batch_ids: list[UUID] = []
+    handoff_modes: list[object] = []
+    handoff_fails = True
+
+    async def after_persisted_batch(
+        batch: DiscoveryBatch, input_mode: object, actor_id: str
+    ) -> None:
+        handoff_batch_ids.append(batch.id)
+        handoff_modes.append(input_mode)
+        if handoff_fails:
+            raise RuntimeError("cumulative handoff lost with its worker")
+
+    reprocessing = DiscoveryService(
+        discovery_uow,
+        gateway,
+        archive=gateway,
+        after_persisted_batch=after_persisted_batch,
+    )
+    reprocess_parameters = ReprocessDiscoveryReportParameters(
+        edition_id=run.edition_id,
+        discovery_run_id=run.id,
+        research_model_run_id=archived_model_run_id,
+        actor_id="dev-analyst",
+    )
+    reprocess_job = await jobs.submit(
+        kind=REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+        aggregate_type="discovery_run",
+        aggregate_id=run.id,
+        idempotency_key="reprocess-discovery-run:handoff-retry",
+        correlation_id="reprocess-handoff-retry",
+        input_parameters=reprocess_parameters.model_dump(mode="json"),
+        max_attempts=1,
+    )
+
+    async def claim_reprocess_job() -> JobExecutionContext:
+        """Le même Job métier reprend son attempt : même id, même context."""
+        async with job_uow() as uow:
+            claimed = await uow.jobs.get_for_update(reprocess_job.id)
+            assert claimed is not None
+            if claimed.status is JobStatus.RUNNING:
+                claimed.recover_abandoned(resume_current_attempt=True)
+            claimed.start()
+            await uow.jobs.save(claimed)
+            await uow.commit()
+        return JobExecutionContext(reprocess_job.id, job_uow)
+
+    with pytest.raises(RuntimeError, match="cumulative handoff lost"):
+        await reprocessing.reprocess_archived_report(
+            reprocess_parameters, await claim_reprocess_job()
+        )
+
+    after_failure = sorted(
+        await reprocessing.list_batches(params.edition_id, include_replaced=True),
+        key=lambda batch: batch.parsing_revision,
+    )
+    assert len(after_failure) == 2
+    revision = after_failure[1]
+    assert after_failure[0].id == initial_batch.id
+    assert after_failure[0].replaced_by_batch_id == revision.id
+    assert revision.supersedes_batch_id == initial_batch.id
+    assert revision.replaced_by_batch_id is None
+    assert revision.parsing_revision == 2
+    assert revision.discovery_run_id == run.id
+    assert handoff_batch_ids == [revision.id]
+
+    handoff_fails = False
+    replayed = await reprocessing.reprocess_archived_report(
+        reprocess_parameters, await claim_reprocess_job()
+    )
+
+    assert replayed.id == revision.id
+    assert handoff_batch_ids == [revision.id, revision.id]
+    assert handoff_modes == [DiscoveryInputMode.RECOVERY, DiscoveryInputMode.RECOVERY]
+    after_replay = sorted(
+        await reprocessing.list_batches(params.edition_id, include_replaced=True),
+        key=lambda batch: batch.parsing_revision,
+    )
+    assert [batch.id for batch in after_replay] == [initial_batch.id, revision.id]
+    assert after_replay[0].replaced_by_batch_id == revision.id
+    assert after_replay[1].supersedes_batch_id == initial_batch.id
+    assert after_replay[1].replaced_by_batch_id is None
+    assert len(discovery_uow.runs) == 1
     assert len(model_uow.state) == model_runs_before
     assert len(adapter.calls) == research_calls_before

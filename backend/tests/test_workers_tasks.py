@@ -1,4 +1,7 @@
-from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.jobs import (
+    DISCOVERY_JOB_KIND,
+    REPROCESS_DISCOVERY_REPORT_JOB_KIND,
+)
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.config import get_settings
 from cti_app.domain.production import production_stages
@@ -16,6 +19,15 @@ def test_execute_job_outlives_the_dramatiq_default_time_limit() -> None:
 
 def test_discovery_is_declared_durable_for_the_recovery_process() -> None:
     assert DISCOVERY_JOB_KIND in DURABLE_RESUME_JOB_KINDS
+
+
+def test_archived_report_reprocessing_is_declared_durable_for_the_recovery_process() -> None:
+    # Le flag `resume_after_worker_loss=True` du registry ne suffit pas : le
+    # processus de recovery n'instancie pas les handlers métier et s'appuie
+    # uniquement sur cette liste. Sans le kind ici, un reprocess interrompu
+    # entre le commit du batch et son handoff cumulative brûle son unique
+    # attempt au lieu de reprendre le même.
+    assert REPROCESS_DISCOVERY_REPORT_JOB_KIND in DURABLE_RESUME_JOB_KINDS
 
 
 def test_every_article_production_stage_is_declared_durable() -> None:

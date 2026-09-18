@@ -8,13 +8,73 @@ from cti_app.application.discovery.cumulative.errors import (
 )
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.jobs import (
+    DuplicateJobError,
+    JobDispatcher,
     JobExecutionContext,
     JobHandlerError,
     JobParameters,
     JobRegistry,
+    JobService,
 )
+from cti_app.domain.discovery import DiscoveryBatch
+from cti_app.domain.discovery_cumulative import DiscoveryInputMode
+from cti_app.domain.jobs import Job, JobStatus
 
 RECONCILE_DISCOVERY_JOB_KIND = "reconcile_discovery"
+
+
+async def ensure_discovery_reconciliation_job(
+    batch: DiscoveryBatch,
+    *,
+    input_mode: DiscoveryInputMode,
+    actor_id: str,
+    cumulative_discovery_service: CumulativeDiscoveryService,
+    job_service: JobService,
+    job_dispatcher: JobDispatcher,
+    correlation_id: str,
+) -> Job:
+    """Handoff cumulative d'un DiscoveryBatch persisté, rejouable à l'identique.
+
+    Le batch est déjà durable quand on arrive ici : l'intake et le Job de
+    réconciliation sont donc adoptés plutôt que recréés si une tentative
+    précédente est morte en route. Le dispatch reste après le commit de
+    `JobService.submit`, et un échec de dispatch remonte, pour qu'un parent ne
+    puisse jamais conclure sur un enfant durable jamais remis à l'exécuteur.
+    """
+    intake, _ = await cumulative_discovery_service.ingest_batch(
+        batch,
+        input_mode=input_mode,
+        actor_id=actor_id,
+    )
+    parent = await cumulative_discovery_service.active_snapshot(batch.edition_id)
+    parameters = ReconcileDiscoveryParameters(
+        intake_id=intake.id,
+        edition_id=batch.edition_id,
+        expected_parent_snapshot_id=parent.id if parent else None,
+        actor_id=actor_id,
+    )
+    try:
+        job = await job_service.submit(
+            kind=RECONCILE_DISCOVERY_JOB_KIND,
+            aggregate_type="edition",
+            aggregate_id=batch.edition_id,
+            idempotency_key=f"reconcile-discovery:{intake.id}",
+            correlation_id=correlation_id,
+            input_parameters=parameters.model_dump(mode="json"),
+            max_attempts=3,
+            actor_id=actor_id,
+        )
+    except DuplicateJobError as exc:
+        existing = await job_service.get(exc.existing_job_id)
+        # QUEUED sans retry planifié = la ligne Job a été committée puis le
+        # dispatch a été perdu. C'est le seul état qu'on redispatche : un
+        # `next_retry_at` appartient au backoff, et un état RUNNING ou terminal
+        # signifie que le handoff a déjà atteint l'exécuteur.
+        if existing.status is JobStatus.QUEUED and existing.next_retry_at is None:
+            await job_dispatcher.dispatch(existing.id)
+        return existing
+    await job_dispatcher.dispatch(job.id)
+    return job
 
 
 def register_cumulative_discovery_jobs(
