@@ -29,6 +29,8 @@ frontend/dist/
 coverage/
 frontend/test-results/
 frontend/playwright-report/
+# Dotfile exception: tracked Prettier ignore list (see `.*` rule above).
+!frontend/.prettierignore
 
 # Editors and operating systems
 .idea/
