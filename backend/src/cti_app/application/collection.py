@@ -494,18 +494,33 @@ class SubjectCollectionService:
 
     async def source_context(
         self, source: SourceCollection
-    ) -> tuple[SourceCandidate | None, SourceDocument | None]:
+    ) -> tuple[SourceCandidate | None, SourceDocument | None, UUID | None]:
         async with self._uow_factory() as uow:
             candidate = None
+            discovery_candidate_id = None
             if source.batch_id is not None and source.source_candidate_id is not None:
                 batch = await uow.discovery_batches.get(source.batch_id)
                 candidate = batch.source(source.source_candidate_id) if batch else None
+                candidate_repository = getattr(uow, "discovery_candidates", None)
+                if candidate_repository is not None:
+                    owners = [
+                        persisted_candidate
+                        for persisted_candidate in await candidate_repository.list_for_batch(
+                            source.batch_id
+                        )
+                        if any(
+                            evidence_source.id == source.source_candidate_id
+                            for evidence_source in persisted_candidate.evidence.sources
+                        )
+                    ]
+                    if len(owners) == 1:
+                        discovery_candidate_id = owners[0].id
             document = (
                 await uow.source_documents.get(source.source_document_id)
                 if source.source_document_id
                 else None
             )
-            return candidate, document
+            return candidate, document, discovery_candidate_id
 
     async def manual_archive_receipt(self, source: SourceCollection) -> ManualArchiveReceipt | None:
         """Return the durable receipt of an analyst upload, or ``None``.

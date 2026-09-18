@@ -34,7 +34,13 @@ from cti_app.application.http_collection import (
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext, JobHandlerError
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceOriginKind
-from cti_app.domain.discovery import CandidateTopic, DiscoveryBatch, SourceCandidate, SourceRole
+from cti_app.domain.discovery import (
+    CandidateTopic,
+    DiscoveryBatch,
+    DiscoveryCandidate,
+    SourceCandidate,
+    SourceRole,
+)
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import (
     CandidateReference,
@@ -113,6 +119,29 @@ class CancelBeforeArchiveContext(NoopContext):
         self.checks += 1
         if self.checks >= 5:
             raise JobCancelledError
+
+
+class CandidateRepository:
+    def __init__(self, candidates: Sequence[DiscoveryCandidate]) -> None:
+        self.candidates = list(candidates)
+
+    async def list_for_batch(self, batch_id: UUID) -> list[DiscoveryCandidate]:
+        return [item for item in self.candidates if item.discovery_batch_id == batch_id]
+
+
+class CandidateAwareCollectionFactory:
+    def __init__(
+        self,
+        base: InMemoryCollectionUnitOfWorkFactory,
+        candidates: Sequence[DiscoveryCandidate],
+    ) -> None:
+        self.base = base
+        self.candidate_repository = CandidateRepository(candidates)
+
+    def __call__(self) -> object:
+        unit_of_work = self.base()
+        unit_of_work.discovery_candidates = self.candidate_repository
+        return unit_of_work
 
 
 def response(body: bytes = HTML, *, status: int = 200) -> RawHttpResponse:
@@ -246,6 +275,60 @@ async def test_collection_operations_use_subject_edition_when_group_differs(
     assert supplemental[0].edition_id == subject_edition_id
     assert supplemental[0].group_id == group.id
     assert {item.edition_id for item in factory.collections.values()} == {subject_edition_id}
+
+
+@pytest.mark.asyncio
+async def test_source_context_projects_exact_persisted_discovery_candidate_id(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://discovery.example/report",))
+    batch = next(iter(factory.batches.values()))
+    persisted = DiscoveryCandidate.from_candidate_topic(
+        batch.candidates[0],
+        discovery_run_id=batch.discovery_run_id,
+        discovery_batch_id=batch.id,
+        position=0,
+        created_at=batch.created_at,
+    )
+    app = service(
+        CandidateAwareCollectionFactory(factory, [persisted]),
+        Transport([]),
+        tmp_path / "blobs",
+    )
+
+    source = (await app.initialize(subject.id))[0]
+    _candidate, _document, discovery_candidate_id = await app.source_context(source)
+
+    assert discovery_candidate_id == persisted.id
+
+
+@pytest.mark.asyncio
+async def test_source_context_does_not_guess_discovery_candidate_from_url(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://discovery.example/report",))
+    batch = next(iter(factory.batches.values()))
+    unrelated_source = replace(batch.candidates[0].sources[0], id=uuid4())
+    persisted = DiscoveryCandidate.from_candidate_topic(
+        replace(batch.candidates[0], sources=[unrelated_source]),
+        discovery_run_id=batch.discovery_run_id,
+        discovery_batch_id=batch.id,
+        position=0,
+        created_at=batch.created_at,
+    )
+    app = service(
+        CandidateAwareCollectionFactory(factory, [persisted]),
+        Transport([]),
+        tmp_path / "blobs",
+    )
+
+    source = (await app.initialize(subject.id))[0]
+    _candidate, _document, discovery_candidate_id = await app.source_context(source)
+
+    assert source.requested_url == persisted.evidence.sources[0].canonical_url
+    assert discovery_candidate_id is None
 
 
 async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations(

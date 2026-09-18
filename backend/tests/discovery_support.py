@@ -130,6 +130,10 @@ class InMemoryDiscoveryCandidateRepository:
         candidate = self._state.get(candidate_id)
         return deepcopy(candidate) if candidate else None
 
+    async def get_for_update(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        candidate = self._state.get(candidate_id)
+        return deepcopy(candidate) if candidate else None
+
     async def list_for_batch(self, discovery_batch_id: UUID) -> list[DiscoveryCandidate]:
         return sorted(
             [

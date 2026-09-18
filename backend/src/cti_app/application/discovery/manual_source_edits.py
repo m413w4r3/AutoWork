@@ -292,53 +292,6 @@ class ManualSourceEditService:
             updated_subject_ids=(subject.subject_id,),
         )
 
-    async def attach_replacement_source_url_for_subject(
-        self,
-        edition_id: UUID,
-        subject_id: UUID,
-        replaced_canonical_url: str,
-        url: str,
-        *,
-        actor_id: str,
-    ) -> ManualSourceEditResult:
-        """Temporary adapter for the selected-Subject pipeline (until AW-008).
-
-        That caller only knows the legacy subject id. The persisted candidate
-        carrying the replaced URL is resolved from the subject's member
-        references (most recent contribution first), then the replacement
-        proceeds exactly as the candidate-qualified operation.
-        """
-        canonicalize_http_url(url)
-        snapshot = await self._cumulative.active_snapshot(edition_id)
-        subject = (
-            next((item for item in snapshot.subjects if item.subject_id == subject_id), None)
-            if snapshot is not None and snapshot.is_active
-            else None
-        )
-        if subject is None:
-            raise SourceCandidateNotFoundError(replaced_canonical_url)
-        for reference in reversed(subject.member_references):
-            try:
-                candidate, _ = await self._get_candidate_for_edit(
-                    edition_id, reference.candidate_id
-                )
-            except ManualSourceEditOriginNotFoundError:
-                continue
-            if candidate.discovery_batch_id != reference.batch_id:
-                continue
-            if any(
-                source.canonical_url == replaced_canonical_url
-                for source in candidate.evidence.sources
-            ):
-                return await self.attach_replacement_source_url(
-                    edition_id,
-                    candidate.id,
-                    replaced_canonical_url,
-                    url,
-                    actor_id=actor_id,
-                )
-        raise SourceCandidateNotFoundError(replaced_canonical_url)
-
     async def _get_candidate_for_edit(
         self, edition_id: UUID, candidate_id: UUID
     ) -> tuple[DiscoveryCandidate, UUID]:

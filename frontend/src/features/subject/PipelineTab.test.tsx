@@ -8,6 +8,7 @@ import { PipelineTab } from "./PipelineTab";
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const EDITION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const SOURCE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const CANDIDATE_ID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
 const BLOCKED_URL = "https://blocked.example/report";
 
 const production = {
@@ -46,6 +47,7 @@ const workbench = {
     {
       id: SOURCE_ID,
       requested_url: BLOCKED_URL,
+      discovery_candidate_id: CANDIDATE_ID,
       state: "blocked",
       title: "Rapport bloqué",
     },
@@ -89,6 +91,9 @@ describe("PipelineTab manual source content", () => {
         return Promise.resolve(
           Response.json({ ...workbench.sources[0], state: "archived" }),
         );
+      }
+      if (init?.method === "PATCH") {
+        return Promise.resolve(Response.json(workbench.sources[0]));
       }
       if (init?.method === "POST") {
         return Promise.resolve(
@@ -146,6 +151,61 @@ describe("PipelineTab manual source content", () => {
         }),
       ),
     );
+  });
+
+  it("remplace une source de découverte par son candidat canonique", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.includes("/workbench")) {
+        return Promise.resolve(Response.json(workbench));
+      }
+      if (init?.method === "PATCH") {
+        return Promise.resolve(Response.json(workbench.sources[0]));
+      }
+      return Promise.resolve(Response.json(production));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderPipeline();
+
+    await screen.findByRole("heading", {
+      name: "Fournir le contenu d'une source",
+    });
+    await screen.findByText("Rapport bloqué");
+    await user.type(
+      screen.getByLabelText("URL de remplacement"),
+      "https://mirror.example/report",
+    );
+    await user.click(screen.getByRole("button", { name: "Remplacer" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/editions/${EDITION_ID}/discovery/candidates/${CANDIDATE_ID}/sources/replacement`,
+        expect.objectContaining({
+          method: "PATCH",
+          body: JSON.stringify({
+            replaced_canonical_url: BLOCKED_URL,
+            url: "https://mirror.example/report",
+          }),
+        }),
+      ),
+    );
+    expect(
+      fetchMock.mock.calls.some(([input]) => {
+        const url =
+          typeof input === "string"
+            ? input
+            : input instanceof URL
+              ? input.href
+              : input.url;
+        return url.includes("/discovery/subjects/");
+      }),
+    ).toBe(false);
   });
 
   it("ne l’affiche pas pour un autre code d’échec", async () => {

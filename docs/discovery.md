@@ -103,9 +103,8 @@ Les actions sur les sources sont qualifiées par le seul `candidate_id` :
 `PATCH .../discovery/candidates/{candidate_id}/sources/{source_id}` (vérification),
 `PATCH .../discovery/candidates/{candidate_id}/incomplete-sources/{incomplete_source_id}` et
 `PATCH .../discovery/candidates/{candidate_id}/sources/replacement` (corrections d'URL, qui créent
-un batch manuel et un nouveau `DiscoveryCandidate`). Le pipeline d'un `Subject` sélectionné
-utilise temporairement `PATCH .../discovery/subjects/{subject_id}/sources/replacement`, adapter
-interne qui retrouve le candidat persistant portant l'URL remplacée jusqu'à AW-008. Aucune paire
+un batch manuel et un nouveau `DiscoveryCandidate`). Le workbench d'un `Subject` sélectionné
+transporte en interne le `candidate_id` canonique vers cette mutation adressée au candidat. Aucune paire
 `batch_id + candidate_id` ne sert d'identité fonctionnelle : l'identité est celle du candidat
 persistant, et le batch fournit son contexte de révision. L'en-tête `Idempotency-Key`
 est obligatoire sur les endpoints qui créent un run ou une révision de batch. Les endpoints de

@@ -148,7 +148,6 @@ class FakeManualSourceEditService:
         self.error = error
         self.calls: list[tuple[UUID, UUID, UUID, str, str]] = []
         self.replacement_calls: list[tuple[UUID, UUID, str, str, str]] = []
-        self.subject_replacement_calls: list[tuple[UUID, UUID, str, str, str]] = []
 
     async def attach_incomplete_source_url(
         self,
@@ -181,64 +180,6 @@ class FakeManualSourceEditService:
             raise self.error
         assert self.result is not None
         return self.result
-
-    async def attach_replacement_source_url_for_subject(
-        self,
-        edition_id: UUID,
-        subject_id: UUID,
-        replaced_canonical_url: str,
-        url: str,
-        *,
-        actor_id: str,
-    ) -> ManualSourceEditResult:
-        self.subject_replacement_calls.append(
-            (edition_id, subject_id, replaced_canonical_url, url, actor_id)
-        )
-        if self.error is not None:
-            raise self.error
-        assert self.result is not None
-        return self.result
-
-
-@pytest.mark.asyncio
-async def test_subject_replacement_adapter_route_delegates_by_subject_id() -> None:
-    edition_id, subject_id = uuid4(), uuid4()
-    replacement_url = "https://mirror.example/report"
-    service = FakeManualSourceEditService(
-        ManualSourceEditResult(
-            promoted_source=_promoted_source(replacement_url),
-            updated_subject_ids=(subject_id,),
-        )
-    )
-    application = FastAPI()
-    application.include_router(router)
-    application.state.manual_source_edit_service = service
-    application.state.identity_provider = LocalIdentityProvider()
-
-    async with AsyncClient(
-        transport=ASGITransport(app=application), base_url="http://test"
-    ) as client:
-        response = await client.patch(
-            f"/api/editions/{edition_id}/discovery/subjects/{subject_id}/sources/replacement",
-            json={
-                "replaced_canonical_url": "https://blocked.example/report",
-                "url": replacement_url,
-            },
-        )
-
-    assert response.status_code == 200
-    assert response.json()["updated_subject_ids"] == [str(subject_id)]
-    assert service.subject_replacement_calls == [
-        (
-            edition_id,
-            subject_id,
-            "https://blocked.example/report",
-            replacement_url,
-            "dev-analyst",
-        )
-    ]
-    assert service.replacement_calls == []
-
 
 def _promoted_source(url: str) -> SourceCandidate:
     return SourceCandidate(
@@ -349,6 +290,11 @@ async def test_attach_replacement_source_url_uses_canonical_url_and_reports_resu
     assert service.replacement_calls == [
         (edition_id, candidate_id, replaced_url, replacement_url, "dev-analyst")
     ]
+    assert not any(
+        getattr(route, "path", None)
+        == "/api/editions/{edition_id}/discovery/subjects/{subject_id}/sources/replacement"
+        for route in application.routes
+    )
 
 
 @pytest.mark.asyncio

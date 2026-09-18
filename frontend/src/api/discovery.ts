@@ -569,18 +569,15 @@ export function attachIncompleteSourceUrl(
   );
 }
 
-// Used by the selected-Subject pipeline, which only knows the Subject id: the
-// backend resolves the persisted DiscoveryCandidate carrying the replaced URL.
-// Temporary adapter until AW-008 replaces the legacy Selection projection.
 export function attachReplacementSourceUrl(
   editionId: string,
-  subjectId: string,
+  candidateId: string,
   replacedCanonicalUrl: string,
   url: string,
 ): Promise<IncompleteSourceAttachmentResult> {
   return request(
-    `/api/editions/${encodeURIComponent(editionId)}/discovery/subjects/` +
-      `${encodeURIComponent(subjectId)}/sources/replacement`,
+    `/api/editions/${encodeURIComponent(editionId)}/discovery/candidates/` +
+      `${encodeURIComponent(candidateId)}/sources/replacement`,
     {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

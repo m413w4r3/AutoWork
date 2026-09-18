@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
@@ -441,7 +442,7 @@ def test_discovery_candidate_domain_projection_and_invariants() -> None:
 async def test_discovery_candidate_repository_round_trip_and_provenance(
     migrated_postgres_url: str,
 ) -> None:
-    from sqlalchemy import delete
+    from sqlalchemy import delete, text
     from sqlalchemy.exc import IntegrityError
 
     from cti_app.infrastructure.database.models.discovery import (
@@ -530,6 +531,15 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         sensitivity="internal",
         external_llm_allowed=True,
     )
+    source_b = SourceCandidate(
+        url="https://vendor.example/candidate-secondary",
+        title="Candidate secondary source",
+        publisher="Vendor Secondary",
+        role=SourceRole.INDEPENDENT,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+    )
     evidence = DiscoveryCandidateEvidence(
         uncertainties=("uncertain",),
         relevance_reasons=("relevant",),
@@ -542,7 +552,7 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         countries=("France",),
         likely_artifacts=("artifact",),
         iocs=("192.0.2.1",),
-        sources=[source],
+        sources=[source, source_b],
         parsing_warnings=("warning",),
         markdown_block="candidate markdown",
     )
@@ -624,6 +634,75 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
             with pytest.raises(IntegrityError):
                 await uow.discovery_candidates.add_many([duplicate])
             await uow.rollback()
+
+        second_writer_started = asyncio.Event()
+
+        async def mark_source_in_transaction(
+            source_id: UUID, status: SourceVerificationStatus, actor_id: str
+        ) -> None:
+            async with SqlAlchemyUnitOfWork(session_factory) as uow:
+                second_writer_started.set()
+                candidate = await uow.discovery_candidates.get_for_update(new_candidate_early.id)
+                assert candidate is not None
+                first_source = next(
+                    item for item in candidate.evidence.sources if item.id == source.id
+                )
+                assert first_source.verification_status is SourceVerificationStatus.VERIFY_LATER
+                assert first_source.verification_changed_by == "analyst-a"
+                source_to_mark = next(
+                    item for item in candidate.evidence.sources if item.id == source_id
+                )
+                source_to_mark.mark(status, actor_id=actor_id)
+                await uow.discovery_candidates.save_evidence(candidate)
+                await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as first_uow:
+            candidate = await first_uow.discovery_candidates.get_for_update(new_candidate_early.id)
+            assert candidate is not None
+            source_a = next(item for item in candidate.evidence.sources if item.id == source.id)
+            source_a.mark(SourceVerificationStatus.VERIFY_LATER, actor_id="analyst-a")
+            await first_uow.discovery_candidates.save_evidence(candidate)
+
+            second_writer = asyncio.create_task(
+                mark_source_in_transaction(
+                    source_b.id, SourceVerificationStatus.INVALID, "analyst-b"
+                )
+            )
+            await second_writer_started.wait()
+            second_writer_was_blocked = False
+            async with engine.connect() as observer:
+                for _ in range(200):
+                    waiting = await observer.scalar(
+                        text(
+                            "SELECT count(*) FROM pg_stat_activity "
+                            "WHERE wait_event_type = 'Lock' AND pid <> pg_backend_pid()"
+                        )
+                    )
+                    if waiting:
+                        second_writer_was_blocked = not second_writer.done()
+                        break
+                    await asyncio.sleep(0.05)
+            await first_uow.commit()
+
+        await second_writer
+        assert second_writer_was_blocked
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = await uow.discovery_candidates.get(new_candidate_early.id)
+            assert persisted is not None
+            persisted_sources = {item.id: item for item in persisted.evidence.sources}
+            assert (
+                persisted_sources[source.id].verification_status
+                is SourceVerificationStatus.VERIFY_LATER
+            )
+            assert persisted_sources[source.id].verification_changed_by == "analyst-a"
+            assert persisted_sources[source.id].verification_changed_at is not None
+            assert (
+                persisted_sources[source_b.id].verification_status
+                is SourceVerificationStatus.INVALID
+            )
+            assert persisted_sources[source_b.id].verification_changed_by == "analyst-b"
+            assert persisted_sources[source_b.id].verification_changed_at is not None
 
         async with engine.connect() as connection:
             with pytest.raises(IntegrityError):

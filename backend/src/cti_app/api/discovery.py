@@ -533,49 +533,6 @@ async def attach_replacement_source_url(
         _raise_api_error(exc)
 
 
-@router.patch(
-    "/subjects/{subject_id}/sources/replacement",
-    response_model=IncompleteSourceAttachmentView,
-)
-async def attach_subject_replacement_source_url(
-    edition_id: UUID,
-    subject_id: UUID,
-    payload: SourceUrlReplacement,
-    request: Request,
-) -> IncompleteSourceAttachmentView:
-    """Temporary AW-008 adapter: the selected-Subject pipeline addresses a
-    replacement by its subject id; the persisted candidate is resolved internally."""
-    service: ManualSourceEditService = request.app.state.manual_source_edit_service
-    provider: IdentityProvider = request.app.state.identity_provider
-    try:
-        identity = await provider.current()
-        result = await service.attach_replacement_source_url_for_subject(
-            edition_id,
-            subject_id,
-            payload.replaced_canonical_url,
-            payload.url,
-            actor_id=identity.actor_id,
-        )
-        return IncompleteSourceAttachmentView(
-            source=_source_view(result.promoted_source),
-            updated_subject_ids=list(result.updated_subject_ids),
-        )
-    except ManualSourceCandidateNotFoundError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"code": "source_candidate_not_found"},
-        ) from exc
-    except ManualSourceEditOriginNotFoundError as exc:
-        raise _legacy_projection_conflict() from exc
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_source_url", "message": str(exc)},
-        ) from exc
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
 @router.patch("/candidates/{candidate_id}/sources/{source_id}", response_model=SourceView)
 async def mark_source(
     edition_id: UUID,

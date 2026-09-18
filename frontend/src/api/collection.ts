@@ -34,6 +34,7 @@ export interface CollectionAttempt {
 export interface CollectedSource {
   id: string;
   requested_url: string;
+  discovery_candidate_id: string | null;
   state: CollectionState;
   proposed_role: SourceRole;
   relationship_status: "provisional" | "verified";

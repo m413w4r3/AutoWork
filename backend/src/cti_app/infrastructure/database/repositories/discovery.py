@@ -235,6 +235,15 @@ class SqlAlchemyDiscoveryCandidateRepository:
         row = await self._session.get(DiscoveryCandidateRow, candidate_id)
         return _discovery_candidate_from_row(row) if row else None
 
+    async def get_for_update(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        row = await self._session.scalar(
+            select(DiscoveryCandidateRow)
+            .where(DiscoveryCandidateRow.id == candidate_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        return _discovery_candidate_from_row(row) if row else None
+
     async def list_for_batch(self, discovery_batch_id: UUID) -> Sequence[DiscoveryCandidate]:
         rows = await self._session.scalars(
             select(DiscoveryCandidateRow)

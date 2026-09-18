@@ -685,7 +685,7 @@ class DiscoveryService:
         actor_id: str,
     ) -> SourceCandidate:
         async with self._uow_factory() as uow:
-            candidate = await uow.discovery_candidates.get(candidate_id)
+            candidate = await uow.discovery_candidates.get_for_update(candidate_id)
             if candidate is None:
                 raise SourceCandidateNotFoundError(str(source_id))
             run = await uow.discovery_runs.get(candidate.discovery_run_id)
