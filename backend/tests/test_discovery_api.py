@@ -293,6 +293,8 @@ async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -
     historical = _seeded_topic("Same campaign", "https://vendor.example/a-v1")
     revised = _seeded_topic("Same campaign", "https://vendor.example/a-v2")
     wave_b = _seeded_topic("Same campaign", "https://vendor.example/b")
+    # Same title inside one batch: two parsed proposals, never fused on ingestion.
+    wave_b_twin = _seeded_topic("Same campaign", "https://vendor.example/b-twin")
     context = _seeded_topic("Background context", None, context_only=True)
     batch_a1 = _seeded_batch(
         run_a, [historical], request_hash="a" * 64, created_at=datetime(2026, 8, 1, tzinfo=UTC)
@@ -305,7 +307,7 @@ async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -
     batch_a1.replaced_by_batch_id = batch_a2.id
     batch_b = _seeded_batch(
         run_b,
-        [wave_b, context],
+        [wave_b, wave_b_twin, context],
         request_hash="c" * 64,
         created_at=datetime(2026, 8, 3, tzinfo=UTC),
     )
@@ -351,11 +353,20 @@ async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -
     assert {item["id"] for item in raw["candidates"]} == {
         str(revised.id),
         str(wave_b.id),
+        str(wave_b_twin.id),
         str(context.id),
     }
-    assert raw["total"] == 3
+    assert raw["total"] == 4
     same_campaign = [item for item in raw["candidates"] if item["title"] == "Same campaign"]
     assert {item["discovery_run_id"] for item in same_campaign} == {str(run_a.id), str(run_b.id)}
+    # The two same-title proposals of batch_b keep their own identity and evidence.
+    twins = [item for item in same_campaign if item["discovery_batch_id"] == str(batch_b.id)]
+    assert [item["id"] for item in twins] == [str(wave_b.id), str(wave_b_twin.id)]
+    assert [len(item["sources"]) for item in twins] == [1, 1]
+    assert {item["sources"][0]["url"] for item in twins} == {
+        "https://vendor.example/b",
+        "https://vendor.example/b-twin",
+    }
     for item in raw["candidates"]:
         for merge_field in (
             "member_references",
@@ -374,6 +385,7 @@ async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -
         str(historical.id),
         str(revised.id),
         str(wave_b.id),
+        str(wave_b_twin.id),
         str(context.id),
     }
     assert [item["id"] for item in filtered.json()["candidates"]] == [str(context.id)]

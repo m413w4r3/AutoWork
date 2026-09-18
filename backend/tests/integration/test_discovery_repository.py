@@ -22,6 +22,7 @@ from cti_app.domain.discovery import (
     SourceCandidate,
     SourceRole,
     SourceVerificationStatus,
+    canonicalize_http_url,
 )
 from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
@@ -927,6 +928,161 @@ async def test_discovery_batch_missing_parser_version_fails(
 
     with pytest.raises(KeyError, match="parser_version"):
         _discovery_batch_from_row(row, ())
+
+
+async def test_same_title_candidates_are_two_independent_raw_candidates(
+    migrated_postgres_url: str,
+) -> None:
+    """Two parsed proposals sharing a title stay two raw candidates.
+
+    Collapsing look-alike titles is a fusion decision (AW-007); the canonical
+    ingestion path must never reduce the cardinality or merge the evidence of
+    what the parser produced.
+    """
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = Edition(
+        country="Norway",
+        country_code="NO",
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+    )
+    research_run = _run("research", "b")
+    discovery_run = DiscoveryRun(
+        edition_id=edition.id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="default-v1",
+        complementary_axis="initial",
+        request_snapshot=DiscoveryRequestSnapshot(
+            country=edition.country,
+            country_code=edition.country_code,
+            country_aliases=(edition.country, edition.country_code),
+            period_start=edition.period_start,
+            period_end=edition.period_end,
+            as_of_date=date(2026, 9, 1),
+            languages=edition.languages,
+            source_profile="default-v1",
+            keywords=(),
+            exclusions=(),
+            complementary_axis="initial",
+            tlp=edition.tlp,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key="same-title-raw-candidates",
+        created_by="dev-analyst",
+    )
+
+    def _candidate(local_ref: str, url: str, reason: str) -> CandidateTopic:
+        return CandidateTopic(
+            title="Intrusion campaign against the energy sector",
+            summary=f"Summary {local_ref}.",
+            novelty=f"Novelty {local_ref}.",
+            technical_potential=2 if local_ref == "S1" else 4,
+            uncertainties=(f"uncertainty-{local_ref}",),
+            relevance_reasons=(reason,),
+            actors=(),
+            campaigns=(),
+            malware=(),
+            cves=(),
+            victims=(),
+            sectors=(),
+            countries=(),
+            likely_artifacts=(),
+            sources=[
+                SourceCandidate(
+                    url=url,
+                    title=f"Report {local_ref}",
+                    publisher="Vendor",
+                    role=SourceRole.PRIMARY,
+                    published_at=date(2026, 9, 10),
+                    citation=f"Citation {local_ref}",
+                    tlp=TLP.AMBER,
+                    sensitivity="internal",
+                    external_llm_allowed=True,
+                )
+            ],
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+            local_ref=local_ref,
+        )
+
+    first = _candidate("S1", "https://vendor.example/first", "reason-first")
+    second = _candidate("S2", "https://other.example/second", "reason-second")
+    batch = DiscoveryBatch(
+        edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
+        request_hash="f" * 64,
+        complementary_axis="initial",
+        queries=("Query",),
+        citations=(),
+        candidates=[first, second],
+        discovery_model_run_id=research_run.id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="v1",
+        parsing_status="completed",
+    )
+    # The domain batch itself must not fuse them before persistence.
+    assert [item.id for item in batch.candidates] == [first.id, second.id]
+    assert first.id != second.id
+
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            assert await uow.discovery_runs.add_if_absent(discovery_run)
+            await uow.model_runs.add(research_run)
+            assert await uow.discovery_batches.add_if_absent(batch)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            persisted = list(await uow.discovery_candidates.list_for_batch(batch.id))
+            assert [(item.id, item.local_ref, item.position) for item in persisted] == [
+                (first.id, "S1", 0),
+                (second.id, "S2", 1),
+            ]
+            # Evidence stays separate: neither row absorbed the other's sources,
+            # uncertainties, relevance reasons or technical potential.
+            assert [item.technical_potential for item in persisted] == [2, 4]
+            assert [
+                [source.canonical_url for source in item.evidence.sources] for item in persisted
+            ] == [
+                [canonicalize_http_url("https://vendor.example/first")],
+                [canonicalize_http_url("https://other.example/second")],
+            ]
+            assert [item.evidence.uncertainties for item in persisted] == [
+                ("uncertainty-S1",),
+                ("uncertainty-S2",),
+            ]
+            assert [item.evidence.relevance_reasons for item in persisted] == [
+                ("reason-first",),
+                ("reason-second",),
+            ]
+
+            # Both are directly addressable by their own UUID.
+            for candidate in (first, second):
+                fetched = await uow.discovery_candidates.get(candidate.id)
+                assert fetched is not None
+                assert fetched.discovery_batch_id == batch.id
+                assert fetched.discovery_run_id == discovery_run.id
+
+            # Run and edition reads return both, unmerged.
+            assert [item.id for item in await uow.discovery_candidates.list_for_run(
+                discovery_run.id
+            )] == [first.id, second.id]
+            assert [item.id for item in await uow.discovery_candidates.list_for_edition(
+                edition.id
+            )] == [first.id, second.id]
+
+            reloaded = await uow.discovery_batches.get(batch.id)
+            assert reloaded is not None
+            assert [item.id for item in reloaded.candidates] == [first.id, second.id]
+    finally:
+        await engine.dispose()
 
 
 def _run(template: str, hash_prefix: str) -> ModelRun:

@@ -536,7 +536,11 @@ class DiscoveryBatch:
                     source.relationship_status = SourceRelationshipStatus.PROVISIONAL
         if not self.source_coverage_complete and not self.source_coverage_incomplete_reason:
             raise ValueError("Incomplete source coverage requires a reason")
-        self.candidates = deduplicate_topics(self.candidates)
+        # No candidate-level fusion here: a batch carries exactly the raw
+        # proposals produced by the parser, one persisted DiscoveryCandidate
+        # each. Collapsing look-alike titles is a merge decision and belongs
+        # to the cumulative/fusion layer downstream, never to the canonical
+        # ingestion path.
         if self.parsing_revision < 1:
             raise ValueError("Parsing revision must be positive")
 
@@ -794,29 +798,3 @@ def recover_incomplete_source_urls(
             )
         remaining.append(incomplete)
     return remaining
-
-
-def deduplicate_topics(topics: list[CandidateTopic]) -> list[CandidateTopic]:
-    unique: dict[str, CandidateTopic] = {}
-    for topic in topics:
-        existing = unique.get(topic.title_fingerprint)
-        if existing is None:
-            unique[topic.title_fingerprint] = topic
-            continue
-        merged_sources, source_id_remap = deduplicate_sources([*existing.sources, *topic.sources])
-        existing.sources = merged_sources
-        if source_id_remap:
-            existing.provisional_iocs = remap_ioc_publication_ids(
-                [*existing.provisional_iocs, *topic.provisional_iocs], source_id_remap
-            )
-        existing.incomplete_sources = deduplicate_incomplete_sources(
-            [*existing.incomplete_sources, *topic.incomplete_sources]
-        )
-        existing.technical_potential = max(existing.technical_potential, topic.technical_potential)
-        existing.uncertainties = tuple(
-            dict.fromkeys((*existing.uncertainties, *topic.uncertainties))
-        )
-        existing.relevance_reasons = tuple(
-            dict.fromkeys((*existing.relevance_reasons, *topic.relevance_reasons))
-        )
-    return list(unique.values())

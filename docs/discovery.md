@@ -58,6 +58,13 @@ Edition`. Chaque batch rattache aussi `DiscoveryBatch -> ModelRun -> rapport arc
 révision locale parsée. `discovery_candidates` est le magasin canonique des propositions brutes.
 Le `payload` de `DiscoveryBatch` ne contient plus les candidats canoniques complets.
 
+L'ingestion canonique ne fusionne jamais les candidats : chaque proposition produite par le
+parseur devient un `DiscoveryCandidate` distinct, avec son propre UUID, son `local_ref` et sa
+`position`, même lorsque deux propositions d'un même batch portent le même titre. Rapprocher deux
+candidats qui se ressemblent est une décision de fusion, donc du périmètre d'AW-007 ; elle ne peut
+intervenir que dans une projection en aval, sans jamais modifier la cardinalité ni l'identité des
+`DiscoveryCandidate` persistés.
+
 `CandidateTopic`, `DiscoverySnapshot` et `CandidateReference` sont des projections temporaires du
 parseur ou de la lecture cumulative/Selection. Ils ne constituent pas un second magasin canonique.
 Un `DiscoveryRun` ne possède pas sa propre machine d'état d'exécution : le `Job` est la source
