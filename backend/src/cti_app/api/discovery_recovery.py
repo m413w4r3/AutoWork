@@ -1,19 +1,17 @@
 from __future__ import annotations
 
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Header, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
-from cti_app.api.discovery import (
-    DiscoveryJobActionView,
-    _discovery_parameters_from_edition,
-)
+from cti_app.api.discovery import DiscoveryJobActionView
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import (
     SOURCE_PROFILE_PATTERN,
     DiscoverEditionParameters,
+    discover_parameters_from_edition,
     discovery_research_model_run_id,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
@@ -24,10 +22,31 @@ from cti_app.application.jobs import (
     JobNotFoundError,
     JobService,
 )
-from cti_app.domain.editions import EditionStatus
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import Job, JobStatus
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
+
+
+def _import_parameters(
+    edition: Edition,
+    *,
+    source_profile: str,
+    complementary_axis: str,
+    sensitivity: str,
+    external_llm_allowed: bool,
+) -> DiscoverEditionParameters:
+    # Preview et confirmation résolvent la même portée d'édition. L'identité du run n'est
+    # pas encore décidée ici : la preview ne persiste rien et la confirmation crée le
+    # DiscoveryRun canonique, donc ce run id n'est qu'un marqueur de corrélation local.
+    return discover_parameters_from_edition(
+        edition,
+        discovery_run_id=uuid4(),
+        source_profile=source_profile,
+        complementary_axis=complementary_axis,
+        sensitivity=sensitivity,
+        external_llm_allowed=external_llm_allowed,
+    )
 
 
 class RecoveryRequest(BaseModel):
@@ -248,7 +267,7 @@ async def preview_discovery_import(
         if edition.state is EditionStatus.ARCHIVED:
             raise ValueError("An archived edition cannot import discovery")
 
-        parameters = _discovery_parameters_from_edition(
+        parameters = _import_parameters(
             edition,
             source_profile=payload.source_profile,
             complementary_axis=payload.complementary_axis,
@@ -281,7 +300,7 @@ async def confirm_discovery_import(
             raise ValueError("An archived edition cannot import discovery")
 
         identity = await provider.current()
-        parameters = _discovery_parameters_from_edition(
+        parameters = _import_parameters(
             edition,
             source_profile=payload.source_profile,
             complementary_axis=payload.complementary_axis,

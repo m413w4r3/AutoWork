@@ -72,6 +72,8 @@ class DiscoveryBatchRow(Base):
         CheckConstraint("status = 'completed'", name="ck_discovery_batches_status"),
         CheckConstraint("jsonb_typeof(payload) = 'object'", name="ck_discovery_payload_object"),
         Index("ix_discovery_batches_edition", "edition_id", "created_at"),
+        # Révisions d'un même run, et vérification du RESTRICT à la suppression d'un run.
+        Index("ix_discovery_batches_run", "discovery_run_id", "created_at"),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)

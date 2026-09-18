@@ -3,6 +3,7 @@ from datetime import UTC, date, datetime
 from typing import cast
 from uuid import UUID
 
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -61,8 +62,6 @@ class SqlAlchemyDiscoveryRunRepository:
         input_mode: DiscoveryRunInputMode,
         idempotency_key: str,
     ) -> DiscoveryRun | None:
-        from sqlalchemy import select
-
         row = await self._session.scalar(
             select(DiscoveryRunRow).where(
                 DiscoveryRunRow.edition_id == edition_id,
@@ -73,8 +72,6 @@ class SqlAlchemyDiscoveryRunRepository:
         return _discovery_run_from_row(row) if row else None
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryRun]:
-        from sqlalchemy import select
-
         rows = await self._session.scalars(
             select(DiscoveryRunRow)
             .where(DiscoveryRunRow.edition_id == edition_id)
@@ -137,8 +134,6 @@ class SqlAlchemyDiscoveryBatchRepository:
         return _discovery_batch_from_row(row) if row else None
 
     async def get_for_update(self, batch_id: UUID) -> DiscoveryBatch | None:
-        from sqlalchemy import select
-
         row = await self._session.scalar(
             select(DiscoveryBatchRow)
             .where(DiscoveryBatchRow.id == batch_id)
@@ -148,8 +143,6 @@ class SqlAlchemyDiscoveryBatchRepository:
         return _discovery_batch_from_row(row) if row else None
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoveryBatch]:
-        from sqlalchemy import select
-
         rows = await self._session.scalars(
             select(DiscoveryBatchRow)
             .where(DiscoveryBatchRow.edition_id == edition_id)
@@ -158,8 +151,6 @@ class SqlAlchemyDiscoveryBatchRepository:
         return [_discovery_batch_from_row(row) for row in rows]
 
     async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryBatch]:
-        from sqlalchemy import select
-
         rows = await self._session.scalars(
             select(DiscoveryBatchRow)
             .where(DiscoveryBatchRow.discovery_run_id == discovery_run_id)

@@ -157,7 +157,22 @@ async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeate
                 "complementary_axis": "initial",
             },
         )
+        # La frontière d'idempotence est le contrat : sans elle, on ne peut pas
+        # distinguer un retry transport d'une nouvelle vague volontaire.
+        without_key = await client.post(
+            f"/api/editions/{edition.id}/discovery/runs",
+            json={
+                "source_profile": "iran-default",
+                "aliases": ["République islamique d'Iran"],
+                "keywords": ["APT", "IOC"],
+                "exclusions": ["crypto scam"],
+                "complementary_axis": "initial",
+            },
+        )
+        listed = await client.get(f"/api/editions/{edition.id}/discovery/runs")
 
+    assert without_key.status_code == 422
+    assert len(listed.json()) == 2
     assert launched.status_code == 202
     assert job.json()["status"] == "succeeded"
     assert job.json()["max_attempts"] == 1
@@ -624,6 +639,19 @@ async def test_discovery_import_preview_creates_no_run_and_confirm_is_idempotent
 
 async def test_archived_edition_rejects_launch_and_import() -> None:
     application, edition, _job_uow, _ = await _recovery_application()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        before_archive = await client.post(
+            f"/api/editions/{edition.id}/discovery/runs",
+            headers={"Idempotency-Key": "pre-archive-launch"},
+            json={"source_profile": "iran-default", "complementary_axis": "initial"},
+        )
+    assert before_archive.status_code == 202
+    archived_run_id = before_archive.json()["run_id"]
+    edition = await application.state.edition_service.get(edition.id)
+
     await application.state.edition_service.archive(
         edition.id,
         expected_version=edition.version,
@@ -652,11 +680,21 @@ async def test_archived_edition_rejects_launch_and_import() -> None:
                 "expected_sha256": "0" * 64,
             },
         )
+        # Read-only depuis AW-002/AW-004 : l'historique reste consultable.
+        listed = await client.get(f"/api/editions/{edition.id}/discovery/runs")
+        detail = await client.get(
+            f"/api/editions/{edition.id}/discovery/runs/{archived_run_id}"
+        )
 
     for response in (launched, preview, confirmed):
         assert response.status_code == 422
         assert response.json()["detail"]["code"] == "invalid_discovery"
         assert "archived" in response.json()["detail"]["message"]
+
+    assert listed.status_code == 200
+    assert [item["run_id"] for item in listed.json()] == [archived_run_id]
+    assert detail.status_code == 200
+    assert detail.json()["execution"]["job_id"] is not None
 
 
 async def test_reprocess_job_uses_discovery_run_aggregate_and_keeps_run_identity() -> None:

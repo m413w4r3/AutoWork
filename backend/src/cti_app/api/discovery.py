@@ -5,18 +5,14 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Annotated, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.discovery_errors import _raise_api_error
-from cti_app.application.discovery.contracts import (
-    SOURCE_PROFILE_PATTERN,
-    DiscoverEditionParameters,
-    discover_parameters_from_edition,
-)
+from cti_app.application.discovery.contracts import SOURCE_PROFILE_PATTERN
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.manual_source_edits import (
@@ -44,7 +40,6 @@ from cti_app.domain.discovery import (
     SourceVerificationStatus,
 )
 from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
-from cti_app.domain.editions import Edition
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
@@ -315,7 +310,7 @@ async def launch_discovery(
     edition_id: UUID,
     payload: DiscoveryLaunch,
     request: Request,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> DiscoveryRunView:
     service: DiscoveryRunService = request.app.state.discovery_run_service
     provider: IdentityProvider = request.app.state.identity_provider
@@ -323,7 +318,7 @@ async def launch_discovery(
         identity = await provider.current()
         projection = await service.create_bridge_run(
             edition_id,
-            idempotency_key=idempotency_key or "",
+            idempotency_key=idempotency_key,
             source_profile=payload.source_profile,
             country_aliases=payload.aliases,
             keywords=payload.keywords,
@@ -476,7 +471,7 @@ async def reprocess_archived_report(
     edition_id: UUID,
     payload: DiscoveryReportReprocess,
     request: Request,
-    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> DiscoveryJobActionView:
     service: DiscoveryRunService = request.app.state.discovery_run_service
     provider: IdentityProvider = request.app.state.identity_provider
@@ -486,7 +481,7 @@ async def reprocess_archived_report(
             edition_id,
             payload.run_id,
             payload.research_model_run_id,
-            transport_key=idempotency_key or "",
+            transport_key=idempotency_key,
             actor_id=identity.actor_id,
             correlation_id=get_correlation_id(),
         )
@@ -677,33 +672,6 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
         archived_report_url=(
             f"/api/editions/{edition_id}/discovery/reports/{batch.discovery_model_run_id}"
         ),
-    )
-
-
-def _discovery_parameters_from_edition(
-    edition: Edition,
-    *,
-    source_profile: str,
-    complementary_axis: str,
-    sensitivity: str,
-    external_llm_allowed: bool,
-    country_aliases: list[str] | None = None,
-    keywords: list[str] | None = None,
-    exclusions: list[str] | None = None,
-    discovery_run_id: UUID | None = None,
-) -> DiscoverEditionParameters:
-    # Single source of truth shared by both import endpoints so the edition scope stays
-    # identical across all entry points.
-    return discover_parameters_from_edition(
-        edition,
-        discovery_run_id=discovery_run_id or uuid4(),
-        source_profile=source_profile,
-        country_aliases=country_aliases,
-        keywords=keywords or [],
-        exclusions=exclusions or [],
-        complementary_axis=complementary_axis,
-        sensitivity=sensitivity,
-        external_llm_allowed=external_llm_allowed,
     )
 
 

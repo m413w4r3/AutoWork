@@ -237,8 +237,8 @@ describe("EditionToolSurface", () => {
   });
 
   it("laisse la sélection disponible pendant une découverte active", () => {
-    window.localStorage.setItem("active-discovery-job", "job-1");
-
+    // Aucun état local ne porte plus l'identité d'une découverte : l'historique
+    // des runs vient de l'API, et les outils restent indépendants.
     render(
       <QueryClientProvider client={new QueryClient()}>
         <EditionWorkspace edition={edition} current="discovery" />

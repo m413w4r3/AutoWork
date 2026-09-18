@@ -279,15 +279,6 @@ export function fetchDiscoveryRuns(editionId: string): Promise<DiscoveryRun[]> {
   );
 }
 
-export function fetchDiscoveryRun(
-  editionId: string,
-  runId: string,
-): Promise<DiscoveryRun> {
-  return request<DiscoveryRun>(
-    `/api/editions/${encodeURIComponent(editionId)}/discovery/runs/${encodeURIComponent(runId)}`,
-  );
-}
-
 export function reprocessReport(
   editionId: string,
   runId: string,

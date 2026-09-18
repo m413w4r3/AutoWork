@@ -71,8 +71,14 @@ ni confirmer un nouvel import.
 
 L'API de découverte expose `POST /api/editions/{edition_id}/discovery/runs` pour créer ou
 réutiliser un run selon la clé explicite, et `GET /api/editions/{edition_id}/discovery/runs` pour
-lister les runs de l'édition. Les endpoints de candidats et de rapports restent séparés de cet
-endpoint de cycle de vie.
+lister les runs de l'édition, du plus récent au plus ancien. L'en-tête `Idempotency-Key` est
+obligatoire sur les endpoints qui créent un run ou une révision de batch. Les endpoints de
+candidats et de rapports restent séparés de cet endpoint de cycle de vie.
+
+Le bloc `execution` d'un run est une projection, jamais un état stocké : il reflète le Job le
+plus récent de l'agrégat `discovery_run`, donc le job de recherche puis, le cas échéant, le job
+de retraitement en cours. Un import manuel n'a pas de job de recherche : son `execution` est
+absent et son résultat est directement disponible.
 
 ## Prompt métier `monthly-cti-discovery` 4.1
 
