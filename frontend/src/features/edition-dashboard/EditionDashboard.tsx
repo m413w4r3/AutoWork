@@ -1,30 +1,39 @@
 import {
   useQueries,
   useQuery,
-  type Query,
   type UseQueryResult,
 } from "@tanstack/react-query";
 
 import { listSubjects, type Edition, type Subject } from "../../api/editions";
-import {
-  getSubjectProduction,
-  shouldPollProduction,
-  type ProductionStatus,
-  type StageStatus,
-} from "../../api/production";
+import type { ProductionStatus, StageStatus } from "../../api/production";
+import { STAGE_LABELS } from "../production/productionLabels";
+import { subjectProductionQuery } from "../production/subjectProductionQuery";
 import { TlpBadge } from "../editions/editionPresentation";
 import { Link } from "../../routing";
 
-const stageKeys = [
+/**
+ * Columns of the dashboard: a projection of the current ProductionRun, never a
+ * property of the Subject. `sources` is left out on purpose — it would add a
+ * column without telling the reader anything actionable.
+ */
+const STAGE_COLUMNS = [
   "references",
   "extraction",
   "synthesis",
   "assembly",
 ] as const;
+
+type StageColumn = (typeof STAGE_COLUMNS)[number];
 type ProductionQuery = UseQueryResult<ProductionStatus | null>;
 
-const stageStatusLabels: Record<StageStatus["status"], string> = {
-  pending: "Non démarrée",
+/** Display grouping of the existing statuses; the domain values are untouched. */
+type ProductionBucket =
+  "notStarted" | "running" | "attention" | "ready" | "cancelled";
+
+const NOT_STARTED = "Non démarrée";
+
+const STAGE_STATUS_LABELS: Record<StageStatus["status"], string> = {
+  pending: NOT_STARTED,
   running: "En cours",
   succeeded: "Terminée",
   needs_review: "Attention",
@@ -32,29 +41,39 @@ const stageStatusLabels: Record<StageStatus["status"], string> = {
   cancelled: "Annulée",
 };
 
-function productionLabel(production: ProductionStatus | null): string {
-  if (!production) return "Non démarrée";
-  if (production.status === "queued" || production.status === "running") {
-    return "En cours";
+const BUCKET_LABELS: Record<ProductionBucket, string> = {
+  notStarted: "Production non démarrée",
+  running: "En cours",
+  attention: "Attention requise",
+  ready: "Prêts",
+  cancelled: "Annulées",
+};
+
+function productionBucket(
+  production: ProductionStatus | null,
+): ProductionBucket {
+  if (!production) return "notStarted";
+  switch (production.status) {
+    case "queued":
+    case "running":
+      return "running";
+    case "needs_review":
+    case "failed":
+      return "attention";
+    case "ready":
+      return "ready";
+    case "cancelled":
+      return "cancelled";
   }
+}
+
+function productionLabel(production: ProductionStatus | null): string {
+  if (!production) return NOT_STARTED;
   if (production.status === "needs_review") return "Attention";
   if (production.status === "failed") return "Échec";
   if (production.status === "ready") return "Prête";
-  return "Annulée";
-}
-
-function stageLabel(stage: ProductionStatus["current_stage"]): string {
-  return {
-    sources: "Sources",
-    references: "Références",
-    extraction: "Extraction",
-    synthesis: "Synthèse",
-    assembly: "Assemblage",
-  }[stage];
-}
-
-function stageStatusLabel(stage: StageStatus | undefined): string {
-  return stage ? stageStatusLabels[stage.status] : "Non démarrée";
+  if (production.status === "cancelled") return "Annulée";
+  return "En cours";
 }
 
 function stageDiagnostic(stage: StageStatus | undefined): string {
@@ -63,7 +82,7 @@ function stageDiagnostic(stage: StageStatus | undefined): string {
     .join(" — ");
 }
 
-function productionDiagnostic(production: ProductionStatus): string[] {
+function productionDiagnostics(production: ProductionStatus): string[] {
   const diagnostics: string[] = [];
   // Le diagnostic global reprend à défaut les métadonnées du stage courant :
   // lui seul peut donc produire un doublon exact.
@@ -82,86 +101,89 @@ function productionDiagnostic(production: ProductionStatus): string[] {
     }
   }
 
-  for (const stage of stageKeys) {
+  for (const stage of STAGE_COLUMNS) {
     if (stage === duplicatedStage) continue;
     const diagnostic = stageDiagnostic(production.stages[stage]);
     if (!diagnostic) continue;
-    diagnostics.push(`${stageLabel(stage)} : ${diagnostic}`);
+    diagnostics.push(`${STAGE_LABELS[stage]} : ${diagnostic}`);
   }
 
   return diagnostics;
 }
 
+/**
+ * A row only claims "non démarrée" for an answered `null`: while the request is
+ * in flight, or once it failed, the dashboard says so instead of inventing an
+ * operational state.
+ */
+type RowProjection =
+  | { kind: "loading" }
+  | { kind: "unavailable" }
+  | { kind: "known"; production: ProductionStatus | null };
+
+function rowProjection(query: ProductionQuery): RowProjection {
+  if (query.isError) return { kind: "unavailable" };
+  if (query.isSuccess) return { kind: "known", production: query.data };
+  return { kind: "loading" };
+}
+
+function overallLabel(projection: RowProjection): string {
+  if (projection.kind === "loading") return "Chargement…";
+  if (projection.kind === "unavailable") return "Indisponible";
+  return productionLabel(projection.production);
+}
+
+function currentStageLabel(projection: RowProjection): string {
+  if (projection.kind !== "known") return "—";
+  const production = projection.production;
+  return production ? STAGE_LABELS[production.current_stage] : NOT_STARTED;
+}
+
+function stageLabel(projection: RowProjection, stage: StageColumn): string {
+  if (projection.kind === "loading") return "Chargement…";
+  if (projection.kind === "unavailable") return "Indisponible";
+  const stageStatus = projection.production?.stages[stage];
+  return stageStatus ? STAGE_STATUS_LABELS[stageStatus.status] : NOT_STARTED;
+}
+
 function Summary({
-  subjects,
+  subjectCount,
   productions,
 }: {
-  subjects: Subject[];
+  subjectCount: number;
   productions: ProductionQuery[];
 }) {
-  const counts = productions.reduce(
-    (summary, query) => {
-      const production = query.data;
-      if (!production) {
-        if (query.isSuccess) summary.notStarted += 1;
-        return summary;
-      }
-      if (production.status === "queued" || production.status === "running") {
-        summary.running += 1;
-      } else if (
-        production.status === "needs_review" ||
-        production.status === "failed"
-      ) {
-        summary.attention += 1;
-      } else if (production.status === "ready") {
-        summary.ready += 1;
-      }
-      return summary;
-    },
-    { notStarted: 0, running: 0, attention: 0, ready: 0 },
-  );
-
-  const items = [
-    ["Subjects", subjects.length],
-    ["Production non démarrée", counts.notStarted],
-    ["En cours", counts.running],
-    ["Attention requise", counts.attention],
-    ["Prêts", counts.ready],
-  ] as const;
+  const counts: Record<ProductionBucket, number> = {
+    notStarted: 0,
+    running: 0,
+    attention: 0,
+    ready: 0,
+    cancelled: 0,
+  };
+  for (const query of productions) {
+    // Une requête en vol ou en échec ne compte dans aucun groupe : la ligne
+    // correspondante l'annonce déjà, et deviner ici fausserait le total.
+    if (!query.isSuccess) continue;
+    counts[productionBucket(query.data)] += 1;
+  }
 
   return (
     <dl
       className="edition-dashboard__summary"
       aria-label="Résumé de production"
     >
-      {items.map(([label, count]) => (
-        <div className="edition-dashboard__summary-card" key={label}>
-          <dt>{label}</dt>
-          <dd>{count}</dd>
+      <div className="edition-dashboard__summary-card">
+        <dt>Subjects</dt>
+        <dd>{subjectCount}</dd>
+      </div>
+      {(Object.keys(BUCKET_LABELS) as ProductionBucket[]).map((bucket) => (
+        <div className="edition-dashboard__summary-card" key={bucket}>
+          <dt>{BUCKET_LABELS[bucket]}</dt>
+          <dd>{counts[bucket]}</dd>
         </div>
       ))}
     </dl>
   );
-}
-
-function StageCell({
-  productionQuery,
-  stage,
-}: {
-  productionQuery: ProductionQuery;
-  stage: (typeof stageKeys)[number];
-}) {
-  const label = productionQuery.isError
-    ? "Indisponible"
-    : productionQuery.isPending
-      ? "Chargement…"
-      : productionQuery.isSuccess && productionQuery.data === null
-        ? "Non démarrée"
-        : productionQuery.isSuccess && productionQuery.data
-          ? stageStatusLabel(productionQuery.data.stages[stage])
-          : "Indisponible";
-
-  return <td>{label}</td>;
 }
 
 function SubjectRow({
@@ -171,13 +193,11 @@ function SubjectRow({
   subject: Subject;
   productionQuery: ProductionQuery;
 }) {
-  const production = productionQuery.data;
-  const diagnostics = production ? productionDiagnostic(production) : [];
-  const overall = productionQuery.isError
-    ? "Indisponible"
-    : productionQuery.isPending
-      ? "Chargement…"
-      : productionLabel(production ?? null);
+  const projection = rowProjection(productionQuery);
+  const diagnostics =
+    projection.kind === "known" && projection.production
+      ? productionDiagnostics(projection.production)
+      : [];
 
   return (
     <tr>
@@ -189,8 +209,10 @@ function SubjectRow({
         <TlpBadge tlp={subject.tlp} />
       </td>
       <td>
-        <span className="edition-dashboard__status">{overall}</span>
-        {productionQuery.isError ? (
+        <span className="edition-dashboard__status">
+          {overallLabel(projection)}
+        </span>
+        {projection.kind === "unavailable" ? (
           <p className="edition-dashboard__row-error" role="alert">
             État de production indisponible
           </p>
@@ -201,19 +223,9 @@ function SubjectRow({
           </p>
         ))}
       </td>
-      <td>
-        {productionQuery.isError || productionQuery.isPending
-          ? "—"
-          : production
-            ? stageLabel(production.current_stage)
-            : "Non démarrée"}
-      </td>
-      {stageKeys.map((stage) => (
-        <StageCell
-          key={stage}
-          productionQuery={productionQuery}
-          stage={stage}
-        />
+      <td>{currentStageLabel(projection)}</td>
+      {STAGE_COLUMNS.map((stage) => (
+        <td key={stage}>{stageLabel(projection, stage)}</td>
       ))}
     </tr>
   );
@@ -228,13 +240,7 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
   // payload non conforme. Cette valeur ne devient jamais un état métier.
   const subjects = Array.isArray(subjectsQuery.data) ? subjectsQuery.data : [];
   const productionQueries = useQueries({
-    queries: subjects.map((subject) => ({
-      queryKey: ["production", subject.id],
-      queryFn: (): Promise<ProductionStatus | null> =>
-        getSubjectProduction(subject.id),
-      refetchInterval: (query: Query<ProductionStatus | null>) =>
-        shouldPollProduction(query.state.data?.status) ? 1000 : false,
-    })),
+    queries: subjects.map((subject) => subjectProductionQuery(subject.id)),
   });
 
   if (subjectsQuery.isPending) {
@@ -249,7 +255,7 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
     );
   }
 
-  if (subjectsQuery.isSuccess && !Array.isArray(subjectsQuery.data)) {
+  if (!Array.isArray(subjectsQuery.data)) {
     return (
       <p role="alert" className="error-message">
         Les sujets de cette édition ont renvoyé des données invalides.
@@ -265,11 +271,11 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
       <div className="edition-dashboard__heading">
         <div>
           <p className="eyebrow">Édition</p>
-          <h2 id="edition-dashboard-title">Dashboard Edition</h2>
+          <h2 id="edition-dashboard-title">Vue d’ensemble des sujets</h2>
         </div>
         <p>{edition.country}</p>
       </div>
-      <Summary subjects={subjects} productions={productionQueries} />
+      <Summary subjectCount={subjects.length} productions={productionQueries} />
       {subjects.length === 0 ? (
         <div className="empty-state edition-dashboard__empty">
           <p>Aucun sujet n'a encore été sélectionné pour cette édition.</p>
@@ -285,7 +291,14 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
           ) : null}
         </div>
       ) : (
-        <div className="edition-dashboard__table-wrapper">
+        // Le tableau déborde horizontalement sur petit écran : le conteneur
+        // doit donc être atteignable et défilable au clavier seul.
+        <div
+          className="edition-dashboard__table-wrapper"
+          role="region"
+          aria-label="Sujets et état de production"
+          tabIndex={0}
+        >
           <table className="edition-dashboard__table">
             <caption className="sr-only">Sujets et état de production</caption>
             <thead>
@@ -294,10 +307,11 @@ export function EditionDashboard({ edition }: { edition: Edition }) {
                 <th scope="col">TLP</th>
                 <th scope="col">Production</th>
                 <th scope="col">Étape en cours</th>
-                <th scope="col">Références</th>
-                <th scope="col">Extraction</th>
-                <th scope="col">Synthèse</th>
-                <th scope="col">Assemblage</th>
+                {STAGE_COLUMNS.map((stage) => (
+                  <th scope="col" key={stage}>
+                    {STAGE_LABELS[stage]}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>

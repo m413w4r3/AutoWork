@@ -307,11 +307,11 @@ Le point d’entrée d’une édition est le Dashboard
 statuts de production et les éléments de synthèse utiles à l’opérateur.
 Depuis ce Dashboard, les cinq destinations de capacité sont indépendantes :
 
-1. `/editions/{edition_id}/discovery` — découverte des sujets, candidats et doublons.
-2. `/editions/{edition_id}/selection` — sélection éditoriale et composition du lot.
-3. `/editions/{edition_id}/production` — production des sujets et suivi des traitements.
-4. `/editions/{edition_id}/review` — revue des articles et validation éditoriale.
-5. `/editions/{edition_id}/publication` — assemblage, publication et téléchargement.
+* `/editions/{edition_id}/discovery` — découverte des sujets, candidats et doublons.
+* `/editions/{edition_id}/selection` — sélection éditoriale et composition du lot.
+* `/editions/{edition_id}/production` — production des sujets et suivi des traitements.
+* `/editions/{edition_id}/review` — revue des articles et validation éditoriale.
+* `/editions/{edition_id}/publication` — assemblage, publication et téléchargement.
 
 Ces routes sont des destinations de navigation, et non une séquence de
 transitions d’état ou une indication de capacité terminée ou suivante.

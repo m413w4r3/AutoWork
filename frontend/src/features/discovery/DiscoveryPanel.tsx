@@ -75,11 +75,9 @@ function IncompleteSourceUrlForm({
 
 export function DiscoveryPanel({
   editionId,
-  onRunningChange,
   readOnly = false,
 }: {
   editionId: string;
-  onRunningChange: (running: boolean) => void;
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
@@ -137,7 +135,6 @@ export function DiscoveryPanel({
       setJobId(result.job_id);
       setJobStatus(null);
       window.localStorage.setItem(storageKey, result.job_id);
-      onRunningChange(true);
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
@@ -150,7 +147,6 @@ export function DiscoveryPanel({
       setJobId(result.job_id);
       setJobStatus(null);
       window.localStorage.setItem(storageKey, result.job_id);
-      onRunningChange(true);
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
@@ -192,7 +188,6 @@ export function DiscoveryPanel({
       setJobId(result.job_id);
       setJobStatus(null);
       window.localStorage.setItem(storageKey, result.job_id);
-      onRunningChange(true);
     },
   });
   const recoveryRunId =
@@ -212,10 +207,9 @@ export function DiscoveryPanel({
       window.localStorage.setItem(storageKey, result.job_id);
       setRecoveryPreview(null);
       setShowManualRecovery(false);
-      onRunningChange(true);
       void queryClient.invalidateQueries({ queryKey: ["job", result.job_id] });
     },
-    [onRunningChange, queryClient, storageKey],
+    [queryClient, storageKey],
   );
   const visibleRecovery = useMutation({
     mutationFn: () =>
@@ -295,7 +289,6 @@ export function DiscoveryPanel({
         setJobId(result.reconciliation_job_id);
         setJobStatus(null);
         window.localStorage.setItem(storageKey, result.reconciliation_job_id);
-        onRunningChange(true);
       } else {
         // reused=true : déjà consolidé par un import précédent, rien à attendre.
         void queryClient.invalidateQueries({
@@ -314,7 +307,6 @@ export function DiscoveryPanel({
       setLastJob(job);
       setRecoveryPreview(null);
       setShowManualRecovery(false);
-      onRunningChange(false);
       void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
     },
   });
@@ -334,14 +326,13 @@ export function DiscoveryPanel({
   }, []);
   const handleJobTerminal = useCallback(() => {
     window.localStorage.removeItem(storageKey);
-    onRunningChange(false);
     void queryClient.invalidateQueries({
       queryKey: ["discovery", editionId],
     });
     void queryClient.invalidateQueries({
       queryKey: ["editorial-board", editionId],
     });
-  }, [editionId, onRunningChange, queryClient, storageKey]);
+  }, [editionId, queryClient, storageKey]);
 
   return (
     <section className="discovery-panel" aria-labelledby="discovery-heading">

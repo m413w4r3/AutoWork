@@ -676,7 +676,7 @@ a:focus-visible {
 
 .edition-dashboard__summary {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
   gap: 0.75rem;
   margin: 0;
 }
@@ -719,6 +719,11 @@ a:focus-visible {
   border: 1px solid #c8d7cd;
   border-radius: 0.75rem;
   background: #fff;
+}
+
+.edition-dashboard__table-wrapper:focus-visible {
+  outline: 2px solid #1f6042;
+  outline-offset: 2px;
 }
 
 .edition-dashboard__table {
@@ -1069,14 +1074,6 @@ h1 {
 
   .edition-dashboard__heading {
     flex-direction: column;
-  }
-
-  .edition-dashboard__summary {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .edition-dashboard__summary-card:last-child {
-    grid-column: 1 / -1;
   }
 
   .edition-dashboard__table th,

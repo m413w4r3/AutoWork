@@ -27,6 +27,8 @@ vi.mock("../../api/production", async () => {
   return { ...actual, getSubjectProduction: getSubjectProductionMock };
 });
 
+const NON_DEMARREE = "Non démarrée";
+
 const edition: Edition = {
   id: "edition-1",
   country: "France",
@@ -382,6 +384,110 @@ describe("EditionDashboard", () => {
     expect(
       screen.queryByText("Extraction : EXT_FAIL — Extraction interrompue."),
     ).not.toBeInTheDocument();
+  });
+
+  it("représente les quatre stages en colonnes projetées du ProductionRun", async () => {
+    const subject = subjects[0]!;
+    listSubjectsMock.mockResolvedValue([subject]);
+    getSubjectProductionMock.mockResolvedValue(
+      makeProduction(subject.id, {
+        status: "running",
+        current_stage: "synthesis",
+        stages: {
+          references: {
+            status: "succeeded",
+            version: 1,
+            error_code: null,
+            error_message: null,
+          },
+          extraction: {
+            status: "needs_review",
+            version: 1,
+            error_code: null,
+            error_message: null,
+          },
+          synthesis: {
+            status: "running",
+            version: null,
+            error_code: null,
+            error_message: null,
+          },
+          assembly: {
+            status: "pending",
+            version: null,
+            error_code: null,
+            error_message: null,
+          },
+        },
+      }),
+    );
+
+    renderDashboard();
+
+    await screen.findByText(subject.title);
+    for (const stage of [
+      "Références",
+      "Extraction",
+      "Synthèse",
+      "Assemblage",
+    ]) {
+      expect(
+        screen.getByRole("columnheader", { name: stage }),
+      ).toBeInTheDocument();
+    }
+    const cells = screen
+      .getAllByRole("cell")
+      .map((cell) => cell.textContent)
+      .slice(-4);
+    expect(cells).toEqual(["Terminée", "Attention", "En cours", NON_DEMARREE]);
+    // Le stage courant reste une lecture du ProductionRun, pas du Subject.
+    expect(
+      screen.getByText("Synthèse", { selector: "td" }),
+    ).toBeInTheDocument();
+  });
+
+  it("compte une production annulée sans la perdre dans le résumé", async () => {
+    listSubjectsMock.mockResolvedValue(subjects.slice(0, 2));
+    getSubjectProductionMock.mockImplementation((subjectId: string) =>
+      Promise.resolve(
+        subjectId === "subject-null"
+          ? null
+          : makeProduction(subjectId, { status: "cancelled" }),
+      ),
+    );
+
+    renderDashboard();
+
+    await screen.findByText("Sujet en cours");
+    expect(screen.getByText("Annulées").parentElement).toHaveTextContent("1");
+    expect(screen.getByText("Annulée", { selector: "span" })).toBeVisible();
+    // Le résumé est une projection complète : chaque Subject tombe dans un
+    // groupe, sinon un état disparaîtrait silencieusement de la vue.
+    const buckets = [
+      "Production non démarrée",
+      "En cours",
+      "Attention requise",
+      "Prêts",
+      "Annulées",
+    ];
+    const total = buckets.reduce((sum, label) => {
+      const card = screen.getByText(label, { selector: "dt" }).parentElement;
+      return sum + Number(card?.querySelector("dd")?.textContent);
+    }, 0);
+    expect(total).toBe(2);
+    expect(screen.getByText("Subjects").parentElement).toHaveTextContent("2");
+  });
+
+  it("rend le tableau défilable atteignable au clavier", async () => {
+    listSubjectsMock.mockResolvedValue([subjects[0]]);
+    getSubjectProductionMock.mockResolvedValue(null);
+
+    renderDashboard();
+
+    const region = await screen.findByRole("region", {
+      name: "Sujets et état de production",
+    });
+    expect(region).toHaveAttribute("tabindex", "0");
   });
 
   it("ouvre le sujet depuis son lien clavier-accessible", async () => {

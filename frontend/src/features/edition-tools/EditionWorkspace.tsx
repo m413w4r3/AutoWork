@@ -181,10 +181,6 @@ function SelectionTool({
   );
 }
 
-function ignoreDiscoveryRunning(running: boolean): void {
-  void running;
-}
-
 export function EditionToolSurface({
   edition,
   tool,
@@ -194,25 +190,18 @@ export function EditionToolSurface({
 }) {
   const readOnly = edition.state === "archived";
 
-  if (tool === "discovery") {
-    return (
-      <DiscoveryPanel
-        editionId={edition.id}
-        onRunningChange={ignoreDiscoveryRunning}
-        readOnly={readOnly}
-      />
-    );
+  switch (tool) {
+    case "discovery":
+      return <DiscoveryPanel editionId={edition.id} readOnly={readOnly} />;
+    case "selection":
+      return <SelectionTool edition={edition} readOnly={readOnly} />;
+    case "production":
+      return <ProductionConsole editionId={edition.id} readOnly={readOnly} />;
+    case "review":
+      return <ReviewConsole editionId={edition.id} readOnly={readOnly} />;
+    case "publication":
+      return <PublicationConsole editionId={edition.id} readOnly={readOnly} />;
   }
-  if (tool === "selection") {
-    return <SelectionTool edition={edition} readOnly={readOnly} />;
-  }
-  if (tool === "production") {
-    return <ProductionConsole editionId={edition.id} readOnly={readOnly} />;
-  }
-  if (tool === "review") {
-    return <ReviewConsole editionId={edition.id} readOnly={readOnly} />;
-  }
-  return <PublicationConsole editionId={edition.id} readOnly={readOnly} />;
 }
 
 export function EditionWorkspace({
@@ -223,7 +212,10 @@ export function EditionWorkspace({
   current: EditionSurface;
 }) {
   return (
-    <section className="edition-workspace" aria-label="Outils de l’édition">
+    <section
+      className="edition-workspace"
+      aria-label="Espace de travail de l’édition"
+    >
       <EditionNavigation editionId={edition.id} current={current} />
       {current === "overview" ? (
         <EditionDashboard edition={edition} />

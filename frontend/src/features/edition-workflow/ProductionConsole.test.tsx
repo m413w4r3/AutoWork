@@ -9,7 +9,7 @@ import type {
   CancelProductionBatchResponse,
 } from "../../api/production";
 import { ProductionConsole } from "./ProductionConsole";
-import { productionBatchPollingInterval } from "./productionPolling";
+import { productionBatchPollingInterval } from "../production/productionPolling";
 
 const EDITION_ID = "edition-1";
 

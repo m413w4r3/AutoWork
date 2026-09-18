@@ -11,7 +11,7 @@ import {
   type ProductionReconciliation,
   type ProductionRecoveryPreview,
 } from "../../api/production";
-import { STAGE_LABELS } from "./productionLabels";
+import { STAGE_LABELS } from "../production/productionLabels";
 
 /**
  * The single recovery flow for an ambiguous ChatGPT submission.

@@ -52,11 +52,8 @@ export function EditionDetailPage({
         </div>
         <p>Version {current.version}</p>
       </div>
+      {/* L’état OPEN / ARCHIVED est déjà porté par le badge ci-dessus. */}
       <dl className="edition-facts">
-        <div>
-          <dt>État</dt>
-          <dd>{current.state}</dd>
-        </div>
         <div>
           <dt>Code pays</dt>
           <dd>{current.country_code}</dd>

@@ -1,10 +1,8 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
 import {
-  getSubjectProduction,
   resumeProduction,
   retryProductionStage,
   startSubjectProduction,
-  shouldPollProduction,
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
 import type {
@@ -18,6 +16,7 @@ import {
   getSkippedSources,
 } from "./productionFormatting";
 import { ReconciliationPanel } from "../features/edition-workflow/ReconciliationPanel";
+import { subjectProductionQuery } from "../features/production/subjectProductionQuery";
 import { ExtractionProgressView } from "./ExtractionProgress";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
@@ -171,15 +170,7 @@ export function SubjectProduction({
     isLoading,
     error,
     refetch,
-  } = useQuery({
-    queryKey: ["production", subjectId],
-    queryFn: () => getSubjectProduction(subjectId),
-    // Only poll while a run is actually in flight; a finished or absent run
-    // has nothing left to watch.
-    refetchInterval: (query) => {
-      return shouldPollProduction(query.state.data?.status) ? 2000 : false;
-    },
-  });
+  } = useQuery(subjectProductionQuery(subjectId));
 
   const retryStageMutation = useMutation({
     mutationFn: (stage: RetryStage) => retryProductionStage(subjectId, stage),

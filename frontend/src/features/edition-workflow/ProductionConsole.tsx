@@ -9,8 +9,12 @@ import {
 } from "../../api/production";
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { Link } from "../../routing";
-import { productionBatchPollingInterval } from "./productionPolling";
-import { PHASE_LABELS, STAGE_LABELS, STATUS_LABELS } from "./productionLabels";
+import { productionBatchPollingInterval } from "../production/productionPolling";
+import {
+  PHASE_LABELS,
+  STAGE_LABELS,
+  STATUS_LABELS,
+} from "../production/productionLabels";
 import { ReconciliationPanel } from "./ReconciliationPanel";
 
 const TERMINAL_BATCH_STATUSES = new Set([
@@ -260,7 +264,7 @@ export function ProductionConsole({
           </h2>
         </div>
         <div className="production-phase" data-phase={currentBatch.phase}>
-          <span>Phase courante</span>
+          <span>Phase du lot</span>
           <strong>{PHASE_LABELS[currentBatch.phase]}</strong>
         </div>
         {!readOnly &&
