@@ -13,6 +13,7 @@ from cti_app.application.discovery.contracts import SOURCE_PROFILE_PATTERN
 from cti_app.application.discovery.manual_source_edits import (
     ManualSourceEditOriginNotFoundError,
     ManualSourceEditService,
+    ManualSourceEditSupersededError,
 )
 from cti_app.application.discovery.manual_source_edits import (
     SourceCandidateNotFoundError as ManualSourceCandidateNotFoundError,
@@ -484,6 +485,8 @@ async def attach_incomplete_source_url(
             source=_source_view(result.promoted_source),
             updated_subject_ids=list(result.updated_subject_ids),
         )
+    except ManualSourceEditSupersededError as exc:
+        raise _superseded_candidate_conflict() from exc
     except ManualSourceEditOriginNotFoundError as exc:
         raise _legacy_projection_conflict() from exc
     except Exception as exc:
@@ -520,6 +523,8 @@ async def attach_replacement_source_url(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "source_candidate_not_found"},
         ) from exc
+    except ManualSourceEditSupersededError as exc:
+        raise _superseded_candidate_conflict() from exc
     except ManualSourceEditOriginNotFoundError as exc:
         raise _legacy_projection_conflict() from exc
     except ValueError as exc:
@@ -557,6 +562,15 @@ async def mark_source(
         ) from exc
     except Exception as exc:
         _raise_api_error(exc)
+
+
+def _superseded_candidate_conflict() -> HTTPException:
+    # An earlier correction already published a replacement for this candidate;
+    # the client is editing a stale copy and must reload the candidate list.
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"code": "discovery_candidate_superseded"},
+    )
 
 
 def _legacy_projection_conflict() -> HTTPException:
@@ -641,53 +655,60 @@ def _batch_view(edition_id: UUID, batch: DiscoveryBatch) -> BatchView:
     )
 
 
-def _candidate_view(
-    candidate: DiscoveryCandidate,
-) -> CandidateView:
-    topic = candidate.to_candidate_topic()
+def _candidate_view(candidate: DiscoveryCandidate) -> CandidateView:
+    """Render exactly what was persisted for this raw candidate.
+
+    No projection through `CandidateTopic`: that parser-side structure re-runs
+    publication deduplication and incomplete-URL recovery in its constructor,
+    so reading through it would answer with something subtly different from the
+    stored evidence a source-verification action operates on.
+    """
+    evidence = candidate.evidence
     type_counts: dict[str, int] = {}
-    for ioc in topic.provisional_iocs:
+    for ioc in evidence.provisional_iocs:
         type_counts[ioc.proposed_type.value] = type_counts.get(ioc.proposed_type.value, 0) + 1
 
     return CandidateView(
-        id=topic.id,
+        id=candidate.id,
         discovery_batch_id=candidate.discovery_batch_id,
         discovery_run_id=candidate.discovery_run_id,
         created_at=candidate.created_at,
-        title=topic.title,
-        summary=topic.summary,
-        novelty=topic.novelty,
-        technical_potential=topic.technical_potential,
-        event_date=topic.event_date,
-        uncertainties=list(topic.uncertainties),
-        relevance_reasons=list(topic.relevance_reasons),
-        actors=list(topic.actors),
-        campaigns=list(topic.campaigns),
-        malware=list(topic.malware),
-        cves=list(topic.cves),
-        victims=list(topic.victims),
-        sectors=list(topic.sectors),
-        countries=list(topic.countries),
-        likely_artifacts=list(topic.likely_artifacts),
-        iocs=list(topic.iocs),
-        provisional_iocs=[_provisional_ioc_view(ioc) for ioc in topic.provisional_iocs],
-        provisional_ioc_count=len(topic.provisional_iocs),
+        title=candidate.title,
+        summary=candidate.summary,
+        novelty=candidate.novelty,
+        technical_potential=candidate.technical_potential,
+        event_date=candidate.event_date,
+        uncertainties=list(evidence.uncertainties),
+        relevance_reasons=list(evidence.relevance_reasons),
+        actors=list(evidence.actors),
+        campaigns=list(evidence.campaigns),
+        malware=list(evidence.malware),
+        cves=list(evidence.cves),
+        victims=list(evidence.victims),
+        sectors=list(evidence.sectors),
+        countries=list(evidence.countries),
+        likely_artifacts=list(evidence.likely_artifacts),
+        iocs=list(evidence.iocs),
+        provisional_iocs=[_provisional_ioc_view(ioc) for ioc in evidence.provisional_iocs],
+        provisional_ioc_count=len(evidence.provisional_iocs),
         provisional_ioc_type_counts=type_counts,
         has_publisher_ioc_count=any(
-            source.ioc_declared_count is not None for source in topic.sources
+            source.ioc_declared_count is not None for source in evidence.sources
         ),
-        sources=[_source_view(source) for source in topic.sources],
+        sources=[_source_view(source) for source in evidence.sources],
         incomplete_sources=[
-            _incomplete_source_view(source) for source in topic.incomplete_sources
+            _incomplete_source_view(source) for source in evidence.incomplete_sources
         ],
-        local_ref=topic.local_ref,
-        actor_or_campaign=topic.actor_or_campaign,
-        technical_potential_reason=topic.technical_potential_reason,
-        parsing_warnings=list(topic.parsing_warnings),
-        context_only=topic.context_only,
-        selectable=topic.selectable,
-        valid_publication_count=len(topic.sources),
-        incomplete_publication_count=len(topic.incomplete_sources),
+        local_ref=candidate.local_ref,
+        actor_or_campaign=candidate.actor_or_campaign,
+        technical_potential_reason=candidate.technical_potential_reason,
+        parsing_warnings=list(evidence.parsing_warnings),
+        context_only=candidate.context_only,
+        # Projection UI, jamais un statut : une candidate sans source ou
+        # purement contextuelle n'est pas matérialisable en Subject.
+        selectable=bool(evidence.sources) and not candidate.context_only,
+        valid_publication_count=len(evidence.sources),
+        incomplete_publication_count=len(evidence.incomplete_sources),
     )
 
 

@@ -20,7 +20,10 @@ from cti_app.domain.discovery import DiscoveryBatch
 from cti_app.domain.editions import Edition
 from cti_app.domain.editorial import EditorialGroup, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument, Subject
-from tests.discovery_support import InMemoryDiscoveryBatchRepository
+from tests.discovery_support import (
+    BatchProjectedDiscoveryCandidateRepository,
+    InMemoryDiscoveryBatchRepository,
+)
 from tests.editorial_support import (
     InMemoryEditorialGroupRepository,
     InMemoryHumanDecisionRepository,
@@ -237,6 +240,9 @@ class InMemoryCollectionUnitOfWork:
         self.source_documents = InMemorySourceDocumentRepository(factory.documents)
         self.provenance = InMemoryProvenanceRepository(factory.provenance)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)
+        self.discovery_candidates = BatchProjectedDiscoveryCandidateRepository(
+            factory.batches
+        )
         self.editorial_groups = InMemoryEditorialGroupRepository(factory.groups, factory.editions)
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.source_collections = InMemorySourceCollectionRepository(factory.collections)

@@ -144,14 +144,25 @@ class InMemoryDiscoveryCandidateRepository:
             key=lambda candidate: (candidate.position, candidate.id),
         )
 
-    async def list_for_run(self, discovery_run_id: UUID) -> list[DiscoveryCandidate]:
+    async def list_for_run(
+        self, discovery_run_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
         return sorted(
             [
                 deepcopy(candidate)
                 for candidate in self._state.values()
                 if candidate.discovery_run_id == discovery_run_id
+                and (include_replaced or self._is_active(candidate))
             ],
             key=self._revision_order,
+        )
+
+    def _is_active(self, candidate: DiscoveryCandidate) -> bool:
+        batch = self._batches.get(candidate.discovery_batch_id)
+        if batch is not None and batch.replaced_by_batch_id is not None:
+            return False
+        return not any(
+            item.supersedes_candidate_id == candidate.id for item in self._state.values()
         )
 
     def _revision_order(self, candidate: DiscoveryCandidate) -> tuple[datetime, str, int]:
@@ -169,10 +180,7 @@ class InMemoryDiscoveryCandidateRepository:
                 for candidate in self._state.values()
                 if candidate.discovery_batch_id in self._batches
                 and self._batches[candidate.discovery_batch_id].edition_id == edition_id
-                and (
-                    include_replaced
-                    or self._batches[candidate.discovery_batch_id].replaced_by_batch_id is None
-                )
+                and (include_replaced or self._is_active(candidate))
             ],
             key=self._revision_order,
         )
@@ -183,6 +191,46 @@ class InMemoryDiscoveryCandidateRepository:
         stored = deepcopy(self._state[candidate.id])
         stored.evidence = deepcopy(candidate.evidence)
         self._state[candidate.id] = stored
+
+    async def mark_supersedes(self, candidate_id: UUID, superseded_candidate_id: UUID) -> None:
+        if candidate_id not in self._state:
+            raise LookupError(candidate_id)
+        self._state[candidate_id].supersedes_candidate_id = superseded_candidate_id
+
+
+class BatchProjectedDiscoveryCandidateRepository:
+    """Candidate reads for fixtures that seed whole batches instead of candidates.
+
+    Production always persists candidates as their own rows; these fixtures
+    predate that and describe their world as `DiscoveryBatch` objects, so the
+    canonical rows are projected from them on read.
+    """
+
+    def __init__(self, batches: dict[UUID, DiscoveryBatch]) -> None:
+        self._batches = batches
+
+    def _for_batch(self, batch: DiscoveryBatch) -> list[DiscoveryCandidate]:
+        return [
+            DiscoveryCandidate.from_candidate_topic(
+                candidate,
+                discovery_run_id=batch.discovery_run_id,
+                discovery_batch_id=batch.id,
+                position=position,
+                created_at=batch.created_at,
+            )
+            for position, candidate in enumerate(batch.candidates)
+        ]
+
+    async def list_for_batch(self, discovery_batch_id: UUID) -> list[DiscoveryCandidate]:
+        batch = self._batches.get(discovery_batch_id)
+        return self._for_batch(batch) if batch else []
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        for batch in self._batches.values():
+            for candidate in self._for_batch(batch):
+                if candidate.id == candidate_id:
+                    return candidate
+        return None
 
 
 class InMemoryDiscoveryRunRepository:

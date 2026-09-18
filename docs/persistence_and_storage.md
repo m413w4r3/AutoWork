@@ -34,6 +34,15 @@ complets. Un retraitement conserve le même `DiscoveryRun`, ajoute une nouvelle 
 identités restent adressables ; les lectures opérationnelles actives se déterminent par la
 révision de batch, et non par une paire `batch_id + candidate_id`.
 
+La chaîne de révision est relationnelle : `discovery_batches.supersedes_batch_id` et
+`discovery_batches.replaced_by_batch_id` sont des colonnes avec clé étrangère `ON DELETE RESTRICT`
+et chaînage unique, jamais des entrées de `payload`. Une clé étrangère composite
+`(discovery_batch_id, discovery_run_id)` garantit en base que le run d'un candidat est celui de
+son batch. Une correction manuelle d'URL publie un nouveau candidat qui pointe vers le candidat
+historique via `discovery_candidates.supersedes_candidate_id` ; le candidat historique n'est
+jamais modifié et reste lisible avec `include_replaced`. L'activité d'un candidat reste dérivée
+de ces relations : `discovery_candidates` ne porte aucune colonne de statut.
+
 `CandidateTopic`, `DiscoverySnapshot` et `CandidateReference` peuvent servir de structures de
 parsing, de cumul ou de Selection, mais ne sont pas des magasins canoniques concurrents. Les
 annotations de vérification des sources peuvent évoluer ; la provenance sémantique et le contenu

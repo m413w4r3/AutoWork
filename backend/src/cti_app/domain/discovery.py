@@ -368,6 +368,10 @@ class DiscoveryCandidate:
     evidence: DiscoveryCandidateEvidence = field(default_factory=DiscoveryCandidateEvidence)
     id: UUID = field(default_factory=uuid4)
     local_ref: str | None = None
+    # Provenance d'une correction manuelle : ce candidat publie une version
+    # corrigée d'un candidat historique, qui reste adressable. Ce n'est pas un
+    # statut — l'activité d'un candidat reste dérivée de ses relations.
+    supersedes_candidate_id: UUID | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
@@ -380,11 +384,49 @@ class DiscoveryCandidate:
             raise ValueError("Technical potential must be between 0 and 4")
         if self.position < 0:
             raise ValueError("Discovery candidate position cannot be negative")
+        if self.supersedes_candidate_id == self.id:
+            raise ValueError("A discovery candidate cannot supersede itself")
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("Discovery candidate creation time must be timezone-aware")
 
     def to_candidate_topic(self) -> CandidateTopic:
-        return candidate_topic_from_discovery_candidate(self)
+        """Project onto the parser-side structure the legacy cumulative path still reads.
+
+        Temporary adapter for AW-007/AW-008 consumers: `CandidateTopic` is a
+        parsing/merge structure, never a second canonical store.
+        """
+        evidence = self.evidence
+        return CandidateTopic(
+            id=self.id,
+            title=self.title,
+            summary=self.summary,
+            novelty=self.novelty,
+            technical_potential=self.technical_potential,
+            uncertainties=evidence.uncertainties,
+            relevance_reasons=evidence.relevance_reasons,
+            actors=evidence.actors,
+            campaigns=evidence.campaigns,
+            malware=evidence.malware,
+            cves=evidence.cves,
+            victims=evidence.victims,
+            sectors=evidence.sectors,
+            countries=evidence.countries,
+            likely_artifacts=evidence.likely_artifacts,
+            sources=list(evidence.sources),
+            tlp=self.tlp,
+            sensitivity=self.sensitivity,
+            external_llm_allowed=self.external_llm_allowed,
+            incomplete_sources=list(evidence.incomplete_sources),
+            event_date=self.event_date,
+            iocs=evidence.iocs,
+            provisional_iocs=list(evidence.provisional_iocs),
+            local_ref=self.local_ref,
+            actor_or_campaign=self.actor_or_campaign,
+            technical_potential_reason=self.technical_potential_reason,
+            parsing_warnings=evidence.parsing_warnings,
+            markdown_block=evidence.markdown_block,
+            context_only=self.context_only,
+        )
 
     @staticmethod
     def from_candidate_topic(
@@ -395,95 +437,44 @@ class DiscoveryCandidate:
         position: int,
         created_at: datetime | None = None,
     ) -> DiscoveryCandidate:
-        return discovery_candidate_from_candidate_topic(
-            candidate,
+        """Promote a freshly parsed proposal to its canonical, addressable identity."""
+        return DiscoveryCandidate(
+            id=candidate.id,
             discovery_run_id=discovery_run_id,
             discovery_batch_id=discovery_batch_id,
             position=position,
-            created_at=created_at,
+            local_ref=candidate.local_ref,
+            title=candidate.title,
+            summary=candidate.summary,
+            novelty=candidate.novelty,
+            technical_potential=candidate.technical_potential,
+            technical_potential_reason=candidate.technical_potential_reason,
+            event_date=candidate.event_date,
+            actor_or_campaign=candidate.actor_or_campaign,
+            context_only=candidate.context_only,
+            tlp=candidate.tlp,
+            sensitivity=candidate.sensitivity,
+            external_llm_allowed=candidate.external_llm_allowed,
+            evidence=DiscoveryCandidateEvidence(
+                uncertainties=candidate.uncertainties,
+                relevance_reasons=candidate.relevance_reasons,
+                actors=candidate.actors,
+                campaigns=candidate.campaigns,
+                malware=candidate.malware,
+                cves=candidate.cves,
+                victims=candidate.victims,
+                sectors=candidate.sectors,
+                countries=candidate.countries,
+                likely_artifacts=candidate.likely_artifacts,
+                iocs=candidate.iocs,
+                sources=list(candidate.sources),
+                incomplete_sources=list(candidate.incomplete_sources),
+                provisional_iocs=list(candidate.provisional_iocs),
+                parsing_warnings=candidate.parsing_warnings,
+                markdown_block=candidate.markdown_block,
+            ),
+            created_at=created_at or datetime.now(UTC),
         )
-
-
-def candidate_topic_from_discovery_candidate(candidate: DiscoveryCandidate) -> CandidateTopic:
-    evidence = candidate.evidence
-    return CandidateTopic(
-        id=candidate.id,
-        title=candidate.title,
-        summary=candidate.summary,
-        novelty=candidate.novelty,
-        technical_potential=candidate.technical_potential,
-        uncertainties=evidence.uncertainties,
-        relevance_reasons=evidence.relevance_reasons,
-        actors=evidence.actors,
-        campaigns=evidence.campaigns,
-        malware=evidence.malware,
-        cves=evidence.cves,
-        victims=evidence.victims,
-        sectors=evidence.sectors,
-        countries=evidence.countries,
-        likely_artifacts=evidence.likely_artifacts,
-        sources=list(evidence.sources),
-        tlp=candidate.tlp,
-        sensitivity=candidate.sensitivity,
-        external_llm_allowed=candidate.external_llm_allowed,
-        incomplete_sources=list(evidence.incomplete_sources),
-        event_date=candidate.event_date,
-        iocs=evidence.iocs,
-        provisional_iocs=list(evidence.provisional_iocs),
-        local_ref=candidate.local_ref,
-        actor_or_campaign=candidate.actor_or_campaign,
-        technical_potential_reason=candidate.technical_potential_reason,
-        parsing_warnings=evidence.parsing_warnings,
-        markdown_block=evidence.markdown_block,
-        context_only=candidate.context_only,
-    )
-
-
-def discovery_candidate_from_candidate_topic(
-    candidate: CandidateTopic,
-    *,
-    discovery_run_id: UUID,
-    discovery_batch_id: UUID,
-    position: int,
-    created_at: datetime | None = None,
-) -> DiscoveryCandidate:
-    return DiscoveryCandidate(
-        id=candidate.id,
-        discovery_run_id=discovery_run_id,
-        discovery_batch_id=discovery_batch_id,
-        position=position,
-        local_ref=candidate.local_ref,
-        title=candidate.title,
-        summary=candidate.summary,
-        novelty=candidate.novelty,
-        technical_potential=candidate.technical_potential,
-        technical_potential_reason=candidate.technical_potential_reason,
-        event_date=candidate.event_date,
-        actor_or_campaign=candidate.actor_or_campaign,
-        context_only=candidate.context_only,
-        tlp=candidate.tlp,
-        sensitivity=candidate.sensitivity,
-        external_llm_allowed=candidate.external_llm_allowed,
-        evidence=DiscoveryCandidateEvidence(
-            uncertainties=candidate.uncertainties,
-            relevance_reasons=candidate.relevance_reasons,
-            actors=candidate.actors,
-            campaigns=candidate.campaigns,
-            malware=candidate.malware,
-            cves=candidate.cves,
-            victims=candidate.victims,
-            sectors=candidate.sectors,
-            countries=candidate.countries,
-            likely_artifacts=candidate.likely_artifacts,
-            iocs=candidate.iocs,
-            sources=list(candidate.sources),
-            incomplete_sources=list(candidate.incomplete_sources),
-            provisional_iocs=list(candidate.provisional_iocs),
-            parsing_warnings=candidate.parsing_warnings,
-            markdown_block=candidate.markdown_block,
-        ),
-        created_at=created_at or datetime.now(UTC),
-    )
 
 
 @dataclass(slots=True)
@@ -547,17 +538,6 @@ class DiscoveryBatch:
     @property
     def is_active_revision(self) -> bool:
         return self.replaced_by_batch_id is None
-
-    def source(self, source_id: UUID) -> SourceCandidate | None:
-        return next(
-            (
-                source
-                for candidate in self.candidates
-                for source in candidate.sources
-                if source.id == source_id
-            ),
-            None,
-        )
 
 
 def canonicalize_http_url(value: str) -> str:

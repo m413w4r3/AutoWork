@@ -10,6 +10,7 @@ from cti_app.application.discovery.manual_source_edits import (
     MANUAL_SOURCE_EDIT_VERSION,
     IncompleteSourceCandidateNotFoundError,
     ManualSourceEditService,
+    ManualSourceEditSupersededError,
     _build_manual_edit_batch,
 )
 from cti_app.domain.classification import TLP
@@ -80,8 +81,11 @@ def test_build_manual_edit_batch_uses_manual_source_edit_version() -> None:
 
 
 class _BatchRepository:
-    def __init__(self, batches: list[DiscoveryBatch]) -> None:
+    def __init__(
+        self, batches: list[DiscoveryBatch], candidates: _CandidateRepository | None = None
+    ) -> None:
         self.batches = batches
+        self.candidates = candidates
 
     async def get(self, batch_id: object) -> DiscoveryBatch | None:
         return next((batch for batch in self.batches if batch.id == batch_id), None)
@@ -90,6 +94,18 @@ class _BatchRepository:
         if any(item.id == batch.id for item in self.batches):
             return False
         self.batches.append(batch)
+        if self.candidates is not None:
+            # Comme le repository réel : batch et candidates persistés ensemble.
+            for position, candidate in enumerate(batch.candidates):
+                self.candidates.add(
+                    DiscoveryCandidate.from_candidate_topic(
+                        candidate,
+                        discovery_run_id=batch.discovery_run_id,
+                        discovery_batch_id=batch.id,
+                        position=position,
+                        created_at=batch.created_at,
+                    )
+                )
         return True
 
     async def list_for_edition(self, edition_id: object) -> list[DiscoveryBatch]:
@@ -100,8 +116,29 @@ class _CandidateRepository:
     def __init__(self, candidates: list[DiscoveryCandidate]) -> None:
         self.candidates = {candidate.id: candidate for candidate in candidates}
 
+    def add(self, candidate: DiscoveryCandidate) -> None:
+        self.candidates[candidate.id] = candidate
+
     async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
         return self.candidates.get(candidate_id)
+
+    async def list_for_run(
+        self, discovery_run_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        superseded = {
+            item.supersedes_candidate_id
+            for item in self.candidates.values()
+            if item.supersedes_candidate_id is not None
+        }
+        return [
+            candidate
+            for candidate in self.candidates.values()
+            if candidate.discovery_run_id == discovery_run_id
+            and (include_replaced or candidate.id not in superseded)
+        ]
+
+    async def mark_supersedes(self, candidate_id: UUID, superseded_candidate_id: UUID) -> None:
+        self.candidates[candidate_id].supersedes_candidate_id = superseded_candidate_id
 
 
 class _RunRepository:
@@ -136,6 +173,7 @@ class _Uow:
         self.editorial_groups = groups
         self.discovery_candidates = candidates
         self.discovery_runs = runs
+        batches.candidates = candidates
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -602,6 +640,31 @@ async def test_attach_incomplete_source_by_candidate_id_creates_new_candidates()
     manual_ids = {batch.candidates[0].id for batch in manual_batches}
     assert manual_ids.isdisjoint({candidate_a.id, candidate_b.id})
     assert all(not batch.candidates[0].incomplete_sources for batch in manual_batches)
+
+    # Chaque correction remplace sa candidate d'origine : la liste brute active
+    # montre la version corrigée, pas les deux côte à côte.
+    candidates = uow.discovery_candidates
+    assert {
+        candidate.supersedes_candidate_id
+        for candidate in candidates.candidates.values()
+        if candidate.supersedes_candidate_id is not None
+    } == {candidate_a.id, candidate_b.id}
+    assert [item.id for item in await candidates.list_for_run(run_a)] != [candidate_a.id]
+    assert candidate_a.id not in {item.id for item in await candidates.list_for_run(run_a)}
+    assert candidate_a.id in {
+        item.id for item in await candidates.list_for_run(run_a, include_replaced=True)
+    }
+
+    # Une candidate déjà remplacée ne peut plus être éditée : le client doit
+    # recharger la liste au lieu de publier une seconde correction concurrente.
+    with pytest.raises(ManualSourceEditSupersededError):
+        await service.attach_incomplete_source_url(
+            edition_id,
+            candidate_a.id,
+            candidate_a.incomplete_sources[0].id,
+            "https://kharon.example/research-note-2",
+            actor_id="analyst-1",
+        )
 
     with pytest.raises(IncompleteSourceCandidateNotFoundError):
         await service.attach_incomplete_source_url(

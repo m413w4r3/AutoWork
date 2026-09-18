@@ -3,9 +3,10 @@ from datetime import UTC, date, datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import Select, exists, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -214,8 +215,30 @@ class SqlAlchemyDiscoveryBatchRepository:
             raise LookupError(f"Discovery batch {batch.id} does not exist")
         batch.updated_at = datetime.now(UTC)
         row.payload = _discovery_batch_payload(batch)
+        row.supersedes_batch_id = batch.supersedes_batch_id
+        row.replaced_by_batch_id = batch.replaced_by_batch_id
+        row.parsing_revision = batch.parsing_revision
         row.updated_at = batch.updated_at
         await self._session.flush()
+
+
+def _candidates_joined_to_batches() -> Select[tuple[DiscoveryCandidateRow]]:
+    return select(DiscoveryCandidateRow).join(
+        DiscoveryBatchRow,
+        DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
+    )
+
+
+_SUPERSEDER = aliased(DiscoveryCandidateRow, name="superseder")
+
+# Un candidat est actif quand sa révision de batch l'est encore et qu'aucune
+# correction manuelle n'a publié de version remplaçante. Les deux conditions
+# sont dérivées de relations : `discovery_candidates` ne porte aucun statut.
+_ACTIVE_CANDIDATE = DiscoveryBatchRow.replaced_by_batch_id.is_(None) & ~exists(
+    select(_SUPERSEDER.id).where(
+        _SUPERSEDER.supersedes_candidate_id == DiscoveryCandidateRow.id
+    )
+)
 
 
 class SqlAlchemyDiscoveryCandidateRepository:
@@ -252,39 +275,31 @@ class SqlAlchemyDiscoveryCandidateRepository:
         )
         return [_discovery_candidate_from_row(row) for row in rows]
 
-    async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryCandidate]:
-        rows = await self._session.scalars(
-            select(DiscoveryCandidateRow)
-            .join(
-                DiscoveryBatchRow,
-                DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
-            )
-            .where(DiscoveryCandidateRow.discovery_run_id == discovery_run_id)
-            .order_by(
-                DiscoveryBatchRow.created_at,
-                DiscoveryBatchRow.id,
-                DiscoveryCandidateRow.position,
-            )
+    async def list_for_run(
+        self, discovery_run_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]:
+        statement = _candidates_joined_to_batches().where(
+            DiscoveryCandidateRow.discovery_run_id == discovery_run_id
         )
-        return [_discovery_candidate_from_row(row) for row in rows]
+        if not include_replaced:
+            statement = statement.where(_ACTIVE_CANDIDATE)
+        return await self._ordered(statement)
 
     async def list_for_edition(
         self, edition_id: UUID, *, include_replaced: bool = False
     ) -> Sequence[DiscoveryCandidate]:
         statement = (
-            select(DiscoveryCandidateRow)
-            .join(
-                DiscoveryBatchRow,
-                DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
-            )
+            _candidates_joined_to_batches()
             .join(DiscoveryRunRow, DiscoveryRunRow.id == DiscoveryBatchRow.discovery_run_id)
             .where(DiscoveryRunRow.edition_id == edition_id)
-            .where(DiscoveryCandidateRow.discovery_run_id == DiscoveryBatchRow.discovery_run_id)
         )
         if not include_replaced:
-            statement = statement.where(
-                DiscoveryBatchRow.payload["replaced_by_batch_id"].astext.is_(None)
-            )
+            statement = statement.where(_ACTIVE_CANDIDATE)
+        return await self._ordered(statement)
+
+    async def _ordered(self, statement: Select[tuple[DiscoveryCandidateRow]]) -> list[
+        DiscoveryCandidate
+    ]:
         rows = await self._session.scalars(
             statement.order_by(
                 DiscoveryBatchRow.created_at,
@@ -302,12 +317,26 @@ class SqlAlchemyDiscoveryCandidateRepository:
         row.evidence = _discovery_candidate_evidence_values(candidate.evidence)
         await self._session.flush()
 
+    async def mark_supersedes(self, candidate_id: UUID, superseded_candidate_id: UUID) -> None:
+        """Record that a manual correction publishes a replacement for a candidate.
+
+        The historical candidate is never touched: the new candidate carries the
+        pointer, so provenance stays append-only and the old row stays
+        addressable through ``include_replaced``.
+        """
+        row = await self._session.get(DiscoveryCandidateRow, candidate_id)
+        if row is None:
+            raise LookupError(f"Discovery candidate {candidate_id} does not exist")
+        row.supersedes_candidate_id = superseded_candidate_id
+        await self._session.flush()
+
 
 def _discovery_candidate_values(candidate: DiscoveryCandidate) -> dict[str, object]:
     return {
         "id": candidate.id,
         "discovery_run_id": candidate.discovery_run_id,
         "discovery_batch_id": candidate.discovery_batch_id,
+        "supersedes_candidate_id": candidate.supersedes_candidate_id,
         "position": candidate.position,
         "local_ref": candidate.local_ref,
         "title": candidate.title,
@@ -357,6 +386,7 @@ def _discovery_candidate_from_row(row: DiscoveryCandidateRow) -> DiscoveryCandid
         id=row.id,
         discovery_run_id=row.discovery_run_id,
         discovery_batch_id=row.discovery_batch_id,
+        supersedes_candidate_id=row.supersedes_candidate_id,
         position=row.position,
         local_ref=row.local_ref,
         title=row.title,
@@ -419,6 +449,9 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
         "tlp": batch.tlp.value,
         "sensitivity": batch.sensitivity,
         "external_llm_allowed": batch.external_llm_allowed,
+        "parsing_revision": batch.parsing_revision,
+        "supersedes_batch_id": batch.supersedes_batch_id,
+        "replaced_by_batch_id": batch.replaced_by_batch_id,
         "payload": _discovery_batch_payload(batch),
         "created_at": batch.created_at,
         "updated_at": batch.updated_at,
@@ -426,19 +459,17 @@ def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:
 
 
 def _discovery_batch_payload(batch: DiscoveryBatch) -> dict[str, object]:
+    """Métadonnées propres au rapport parsé.
+
+    Ni les candidates ni la chaîne de révision ne vivent ici : elles ont leurs
+    propres lignes et colonnes relationnelles.
+    """
     return {
         "report_sha256": batch.report_sha256,
         "parser_version": batch.parser_version,
         "parsing_status": batch.parsing_status,
         "parsing_warnings": list(batch.parsing_warnings),
         "unattached_visible_citations": list(batch.unattached_visible_citations),
-        "parsing_revision": batch.parsing_revision,
-        "supersedes_batch_id": (
-            str(batch.supersedes_batch_id) if batch.supersedes_batch_id else None
-        ),
-        "replaced_by_batch_id": (
-            str(batch.replaced_by_batch_id) if batch.replaced_by_batch_id else None
-        ),
         "source_mode": batch.source_mode.value,
         "bridge_capabilities": batch.bridge_capabilities,
         "citation_count": batch.citation_count,
@@ -581,13 +612,9 @@ def _discovery_batch_from_row(
         parsing_status=str(payload["parsing_status"]),
         parsing_warnings=_string_tuple(payload["parsing_warnings"]),
         unattached_visible_citations=tuple(payload["unattached_visible_citations"]),
-        parsing_revision=int(payload["parsing_revision"]),
-        supersedes_batch_id=(
-            UUID(str(payload["supersedes_batch_id"])) if payload["supersedes_batch_id"] else None
-        ),
-        replaced_by_batch_id=(
-            UUID(str(payload["replaced_by_batch_id"])) if payload["replaced_by_batch_id"] else None
-        ),
+        parsing_revision=row.parsing_revision,
+        supersedes_batch_id=row.supersedes_batch_id,
+        replaced_by_batch_id=row.replaced_by_batch_id,
         source_mode=DiscoverySourceMode(str(payload["source_mode"])),
         bridge_capabilities=cast(dict[str, object], payload["bridge_capabilities"]),
         citation_count=int(payload["citation_count"]),

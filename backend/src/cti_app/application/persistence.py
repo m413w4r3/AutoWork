@@ -464,7 +464,9 @@ class DiscoveryCandidateRepository(Protocol):
 
     async def list_for_batch(self, discovery_batch_id: UUID) -> Sequence[DiscoveryCandidate]: ...
 
-    async def list_for_run(self, discovery_run_id: UUID) -> Sequence[DiscoveryCandidate]: ...
+    async def list_for_run(
+        self, discovery_run_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]: ...
 
     async def list_for_edition(
         self, edition_id: UUID, *, include_replaced: bool = False
@@ -472,6 +474,10 @@ class DiscoveryCandidateRepository(Protocol):
 
     async def save_evidence(self, candidate: DiscoveryCandidate) -> None:
         """Persist mutable source-verification annotations without changing candidate metadata."""
+        ...
+
+    async def mark_supersedes(self, candidate_id: UUID, superseded_candidate_id: UUID) -> None:
+        """Record that a manual correction published a replacement for a candidate."""
         ...
 
 

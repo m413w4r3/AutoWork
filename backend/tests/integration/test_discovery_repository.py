@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from uuid import UUID, uuid4
 
@@ -248,6 +249,21 @@ async def test_discovery_batch_round_trip_and_source_status(
         technical_potential_reason="Configurations annoncées.",
         parsing_warnings=("Métadonnées provisoires",),
     )
+    predecessor = DiscoveryBatch(
+        edition_id=edition.id,
+        discovery_run_id=discovery_run.id,
+        request_hash="e" * 64,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        discovery_model_run_id=research_run.id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="chatgpt-markdown-v1",
+        created_at=datetime(2026, 9, 1, 8, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 9, 1, 8, 0, tzinfo=UTC),
+    )
     batch = DiscoveryBatch(
         edition_id=edition.id,
         discovery_run_id=discovery_run.id,
@@ -279,14 +295,17 @@ async def test_discovery_batch_round_trip_and_source_status(
             },
         ),
         parsing_revision=2,
-        supersedes_batch_id=uuid4(),
+        supersedes_batch_id=predecessor.id,
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
             assert await uow.discovery_runs.add_if_absent(discovery_run)
             await uow.model_runs.add(research_run)
+            assert await uow.discovery_batches.add_if_absent(predecessor)
             assert await uow.discovery_batches.add_if_absent(batch)
+            predecessor.replaced_by_batch_id = batch.id
+            await uow.discovery_batches.save(predecessor)
             await uow.commit()
 
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
@@ -295,7 +314,7 @@ async def test_discovery_batch_round_trip_and_source_status(
             assert persisted.discovery_run_id == discovery_run.id
             assert [
                 item.id for item in await uow.discovery_batches.list_for_run(discovery_run.id)
-            ] == [batch.id]
+            ] == [predecessor.id, batch.id]
             persisted_source = persisted.candidates[0].sources[0]
             assert persisted_source.canonical_url == "https://vendor.example/report"
             assert persisted_source.verification_status is SourceVerificationStatus.UNVERIFIED
@@ -443,13 +462,16 @@ def test_discovery_candidate_domain_projection_and_invariants() -> None:
 async def test_discovery_candidate_repository_round_trip_and_provenance(
     migrated_postgres_url: str,
 ) -> None:
-    from sqlalchemy import delete, text
+    from sqlalchemy import delete, insert, text
     from sqlalchemy.exc import IntegrityError
 
     from cti_app.infrastructure.database.models.discovery import (
         DiscoveryBatchRow,
         DiscoveryCandidateRow,
         DiscoveryRunRow,
+    )
+    from cti_app.infrastructure.database.repositories.discovery import (
+        _discovery_candidate_values,
     )
 
     engine = create_postgres_engine(migrated_postgres_url)
@@ -488,6 +510,9 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         idempotency_key="candidate-repository",
         created_by="dev-analyst",
     )
+    # A second, equally valid run of the same edition: referencing it from a
+    # candidate whose batch belongs to `discovery_run` must still be rejected.
+    other_run = replace(discovery_run, id=uuid4(), idempotency_key="candidate-repository-other")
     research_run = _run("research", "a")
     old_batch = DiscoveryBatch(
         id=uuid4(),
@@ -522,7 +547,6 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         created_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
         updated_at=datetime(2026, 9, 1, 10, 0, tzinfo=UTC),
     )
-    old_batch.replaced_by_batch_id = new_batch.id
     source = SourceCandidate(
         url="https://vendor.example/candidate",
         title="Candidate source",
@@ -585,9 +609,13 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
             assert await uow.discovery_runs.add_if_absent(discovery_run)
+            assert await uow.discovery_runs.add_if_absent(other_run)
             await uow.model_runs.add(research_run)
             assert await uow.discovery_batches.add_if_absent(old_batch)
             assert await uow.discovery_batches.add_if_absent(new_batch)
+            # La chaîne de révision est une FK : le remplaçant doit exister avant
+            # que le batch remplacé ne le référence.
+            old_batch.replaced_by_batch_id = new_batch.id
             await uow.discovery_batches.save(old_batch)
             await uow.discovery_candidates.add_many(
                 [new_candidate_late, old_candidate, new_candidate_early]
@@ -608,6 +636,12 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
             assert [
                 item.position
                 for item in await uow.discovery_candidates.list_for_run(discovery_run.id)
+            ] == [0, 2]
+            assert [
+                item.position
+                for item in await uow.discovery_candidates.list_for_run(
+                    discovery_run.id, include_replaced=True
+                )
             ] == [0, 0, 2]
             assert [
                 item.id for item in await uow.discovery_candidates.list_for_edition(edition.id)
@@ -711,6 +745,16 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
                     delete(DiscoveryBatchRow).where(DiscoveryBatchRow.id == new_batch.id)
                 )
             await connection.rollback()
+
+        # candidate.discovery_run_id must be the run of its own batch. The
+        # composite foreign key makes an inconsistent pair unrepresentable
+        # rather than merely discouraged by the service.
+        async with engine.connect() as connection:
+            values = _discovery_candidate_values(make_candidate(new_batch.id, 9))
+            values["discovery_run_id"] = other_run.id
+            with pytest.raises(IntegrityError):
+                await connection.execute(insert(DiscoveryCandidateRow).values(**values))
+            await connection.rollback()
         # discovery_runs is append-only (its trigger fires before any FK check),
         # so the run-side RESTRICT is asserted on the mapped foreign key.
         run_foreign_keys = {
@@ -722,6 +766,8 @@ async def test_discovery_candidate_repository_round_trip_and_provenance(
         assert run_foreign_keys == {
             DiscoveryRunRow.__tablename__: "RESTRICT",
             DiscoveryBatchRow.__tablename__: "RESTRICT",
+            # Self-reference: a superseded candidate stays addressable.
+            DiscoveryCandidateRow.__tablename__: "RESTRICT",
         }
     finally:
         await engine.dispose()
@@ -1081,6 +1127,152 @@ async def test_same_title_candidates_are_two_independent_raw_candidates(
             reloaded = await uow.discovery_batches.get(batch.id)
             assert reloaded is not None
             assert [item.id for item in reloaded.candidates] == [first.id, second.id]
+    finally:
+        await engine.dispose()
+
+
+async def test_manual_correction_replaces_its_candidate_in_the_raw_list(
+    migrated_postgres_url: str,
+) -> None:
+    """A manual URL correction publishes a new candidate, not a duplicate.
+
+    The correction lands in its own manual batch of the same run, so without an
+    explicit replacement link the edition's raw list would show the candidate
+    twice — once before and once after the fix. The corrected candidate carries
+    the link; the historical one is never mutated and stays addressable.
+    """
+    from sqlalchemy import delete
+    from sqlalchemy.exc import IntegrityError
+
+    from cti_app.infrastructure.database.models.discovery import DiscoveryCandidateRow
+
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+    edition = Edition(
+        country="Manual correction",
+        country_code=reserve_edition_code(),
+        period_start=date(2026, 9, 1),
+        period_end=date(2026, 9, 30),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+    )
+    research_run = _run("research", "c")
+    discovery_run = DiscoveryRun(
+        edition_id=edition.id,
+        input_mode=DiscoveryRunInputMode.BRIDGE_RESEARCH,
+        source_profile="default-v1",
+        complementary_axis="initial",
+        request_snapshot=DiscoveryRequestSnapshot(
+            country=edition.country,
+            country_code=edition.country_code,
+            country_aliases=(edition.country, edition.country_code),
+            period_start=edition.period_start,
+            period_end=edition.period_end,
+            as_of_date=date(2026, 9, 1),
+            languages=edition.languages,
+            source_profile="default-v1",
+            keywords=(),
+            exclusions=(),
+            complementary_axis="initial",
+            tlp=edition.tlp,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        ),
+        idempotency_key="manual-correction-supersedes",
+        created_by="dev-analyst",
+    )
+
+    def _batch(request_hash: str, hour: int) -> DiscoveryBatch:
+        return DiscoveryBatch(
+            edition_id=edition.id,
+            discovery_run_id=discovery_run.id,
+            request_hash=request_hash * 64,
+            complementary_axis="initial",
+            queries=(),
+            citations=(),
+            discovery_model_run_id=research_run.id,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+            parser_version="v1",
+            created_at=datetime(2026, 9, 1, hour, 0, tzinfo=UTC),
+            updated_at=datetime(2026, 9, 1, hour, 0, tzinfo=UTC),
+        )
+
+    def _candidate(batch_id: UUID, supersedes: UUID | None = None) -> DiscoveryCandidate:
+        return DiscoveryCandidate(
+            discovery_run_id=discovery_run.id,
+            discovery_batch_id=batch_id,
+            supersedes_candidate_id=supersedes,
+            position=0,
+            title="Intrusion set targeting the grid",
+            summary="Summary.",
+            novelty="Novelty.",
+            technical_potential=3,
+            technical_potential_reason="Reason.",
+            event_date=None,
+            actor_or_campaign="actor",
+            context_only=False,
+            tlp=TLP.AMBER,
+            sensitivity="internal",
+            external_llm_allowed=True,
+        )
+
+    research_batch = _batch("a", 9)
+    manual_batch = _batch("b", 10)
+    original = _candidate(research_batch.id)
+    corrected = _candidate(manual_batch.id)
+
+    try:
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert await uow.editions.add_if_absent(edition)
+            assert await uow.discovery_runs.add_if_absent(discovery_run)
+            await uow.model_runs.add(research_run)
+            assert await uow.discovery_batches.add_if_absent(research_batch)
+            assert await uow.discovery_batches.add_if_absent(manual_batch)
+            await uow.discovery_candidates.add_many([original, corrected])
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            # Before the link the duplicate is visible — this is the failure the
+            # link exists to prevent.
+            assert {
+                item.id for item in await uow.discovery_candidates.list_for_edition(edition.id)
+            } == {original.id, corrected.id}
+            await uow.discovery_candidates.mark_supersedes(corrected.id, original.id)
+            await uow.commit()
+
+        async with SqlAlchemyUnitOfWork(session_factory) as uow:
+            assert [
+                item.id for item in await uow.discovery_candidates.list_for_edition(edition.id)
+            ] == [corrected.id]
+            assert [
+                item.id for item in await uow.discovery_candidates.list_for_run(discovery_run.id)
+            ] == [corrected.id]
+            # Provenance is preserved, not erased.
+            assert {
+                item.id
+                for item in await uow.discovery_candidates.list_for_edition(
+                    edition.id, include_replaced=True
+                )
+            } == {original.id, corrected.id}
+            historical = await uow.discovery_candidates.get(original.id)
+            assert historical is not None
+            assert historical.discovery_batch_id == research_batch.id
+            assert historical.supersedes_candidate_id is None
+            replacement = await uow.discovery_candidates.get(corrected.id)
+            assert replacement is not None
+            assert replacement.supersedes_candidate_id == original.id
+
+        # A superseded candidate is historical data, never collateral of a delete.
+        async with engine.connect() as connection:
+            with pytest.raises(IntegrityError):
+                await connection.execute(
+                    delete(DiscoveryCandidateRow).where(
+                        DiscoveryCandidateRow.id == original.id
+                    )
+                )
+            await connection.rollback()
     finally:
         await engine.dispose()
 

@@ -56,8 +56,21 @@ class SourceCandidateNotFoundError(LookupError):
     pass
 
 
-class ManualSourceEditOriginNotFoundError(LookupError):
+class ManualSourceEditOriginUnusableError(LookupError):
+    """Base for "this candidate cannot be the origin of a manual edit"."""
+
+
+class ManualSourceEditOriginNotFoundError(ManualSourceEditOriginUnusableError):
     pass
+
+
+class ManualSourceEditSupersededError(ManualSourceEditOriginUnusableError):
+    """The edited candidate has already been replaced by an earlier correction.
+
+    A client holding a stale candidate list would otherwise publish a second
+    replacement for the same historical candidate, which would make "active"
+    ambiguous. The caller must reload and edit the current candidate.
+    """
 
 
 ManualSourceEditOperation = Literal["attach", "replace"]
@@ -120,7 +133,7 @@ class ManualSourceEditService:
                     other_candidate, _ = await self._get_candidate_for_edit(
                         edition_id, reference.candidate_id
                     )
-                except ManualSourceEditOriginNotFoundError:
+                except ManualSourceEditOriginUnusableError:
                     continue
                 match = next(
                     (
@@ -302,6 +315,9 @@ class ManualSourceEditService:
             run = await uow.discovery_runs.get(candidate.discovery_run_id)
             if run is None or run.edition_id != edition_id:
                 raise ManualSourceEditOriginNotFoundError(str(candidate_id))
+            active = await uow.discovery_candidates.list_for_run(candidate.discovery_run_id)
+            if all(item.id != candidate_id for item in active):
+                raise ManualSourceEditSupersededError(str(candidate_id))
             return candidate, candidate.discovery_run_id
 
     async def _record_manual_edit(
@@ -351,6 +367,13 @@ class ManualSourceEditService:
                     existing_batch = await uow.discovery_batches.get(batch.id)
                     if existing_batch is None:
                         raise RuntimeError("Discovery conflict without canonical batch")
+                else:
+                    # La correction publie une nouvelle DiscoveryCandidate. Sans ce
+                    # lien, la liste brute de l'édition montrerait côte à côte la
+                    # candidate d'origine et sa version corrigée.
+                    await uow.discovery_candidates.mark_supersedes(
+                        batch.candidates[0].id, original_candidate.id
+                    )
                 await uow.commit()
             if existing_batch is not None:
                 batch = existing_batch
@@ -398,9 +421,7 @@ class ManualSourceEditService:
         inaccessible URL would be recaptured alongside its replacement.
         """
         async with self._uow_factory() as uow:
-            groups = getattr(uow, "editorial_groups", None)
-            if groups is None:
-                return
+            groups = uow.editorial_groups
             group = await groups.get_by_subject(subject_id)
             if group is None or group.edition_id != edition_id:
                 return
@@ -411,16 +432,13 @@ class ManualSourceEditService:
                 original_candidate.discovery_batch_id, original_candidate.id
             )
             replacements: dict[CandidateReference, CandidateReference] = {}
-            candidates = getattr(uow, "discovery_candidates", None)
             for reference in group.candidate_references:
                 if reference == original_reference:
                     replacements[reference] = replacement_reference
                     continue
-                if candidates is None:
-                    continue
                 # Other members of the legacy group still carrying the replaced
                 # URL are resolved through their canonical candidate identity.
-                member = await candidates.get(reference.candidate_id)
+                member = await uow.discovery_candidates.get(reference.candidate_id)
                 if (
                     member is not None
                     and member.discovery_batch_id == reference.batch_id

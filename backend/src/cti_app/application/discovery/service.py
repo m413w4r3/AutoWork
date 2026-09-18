@@ -661,19 +661,11 @@ class DiscoveryService:
             run = await uow.discovery_runs.get(run_id)
             if run is None or run.edition_id != edition_id:
                 raise DiscoveryRunOwnershipError(str(run_id))
-            candidates = list(await uow.discovery_candidates.list_for_run(run_id))
-            if include_replaced:
-                return candidates
-            active_batch_ids = {
-                batch.id
-                for batch in await uow.discovery_batches.list_for_run(run_id)
-                if batch.is_active_revision
-            }
-            return [
-                candidate
-                for candidate in candidates
-                if candidate.discovery_batch_id in active_batch_ids
-            ]
+            return list(
+                await uow.discovery_candidates.list_for_run(
+                    run_id, include_replaced=include_replaced
+                )
+            )
 
     async def mark_source(
         self,
