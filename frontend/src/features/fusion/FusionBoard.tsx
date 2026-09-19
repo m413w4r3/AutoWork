@@ -724,7 +724,9 @@ function originLabel(kind: string | null): string {
 function historyText(entry: FusionHistoryEntry): string {
   const label = historyLabels[entry.action] ?? entry.action;
   const origin = originLabel(entry.planner_kind);
-  return `${entry.created_at.slice(0, 10)} · ${label} · ${origin}`;
+  const parts = [entry.created_at.slice(0, 10), label, origin];
+  if (entry.actor_id) parts.push(entry.actor_id);
+  return parts.join(" · ");
 }
 
 function effectText(choice: ReviewChoice | undefined): string {

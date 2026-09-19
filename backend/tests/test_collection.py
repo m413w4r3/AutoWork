@@ -970,7 +970,14 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
         parser_version="test-parser-v1",
     )
     factory.batches[complement.id] = complement
-    group.add_candidates((CandidateReference(complement.id, complement_candidate.id),))
+    # Post-AW-007, a group only ever grows by projecting Fusion's canonical
+    # membership onto it; that is the path this fixture must exercise.
+    group.synchronize_candidate_references(
+        (
+            *group.candidate_references,
+            CandidateReference(complement.id, complement_candidate.id),
+        )
+    )
 
     collections = await app.initialize(subject.id)
 

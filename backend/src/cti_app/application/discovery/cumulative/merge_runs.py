@@ -143,11 +143,15 @@ def make_structural_merge_run(
     parent_snapshot: DiscoverySnapshot,
     operation: str,
     subject_ids: Sequence[UUID],
+    actor_id: str,
     candidate_ids: Sequence[UUID] = (),
 ) -> DiscoveryMergeRun:
+    # `DiscoveryMergeRun` carries no actor column; a structural merge/split has
+    # no plan either, so its payload is where the deciding analyst is recorded.
     payload: dict[str, object] = {
         "schema_version": "1",
         "operation": operation,
+        "actor_id": actor_id,
         "subject_ids": [str(value) for value in subject_ids],
         "candidate_ids": [str(value) for value in sorted(candidate_ids, key=str)],
         "groups": [],
@@ -156,6 +160,7 @@ def make_structural_merge_run(
     merge_input_hash = canonical_sha256(
         {
             "kind": operation,
+            "actor_id": actor_id,
             "parent_snapshot_id": str(parent_snapshot.id),
             "parent_snapshot_hash": parent_snapshot.snapshot_hash,
             "subject_ids": sorted(str(value) for value in subject_ids),

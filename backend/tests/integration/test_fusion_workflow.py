@@ -187,7 +187,7 @@ async def test_fusion_board_uses_canonical_candidate_ids_and_resolves_review(
             )
 
         fusion = FusionService(uow_factory)
-        board = await fusion.board(edition.id)
+        board = await fusion.get_board(edition.id)
         assert board.snapshot_version == initial_snapshot.version
         assert board.groups[0].candidate_ids == (persisted[0].id,)
         assert board.pending_reviews[0].candidate_ids == (
@@ -255,7 +255,7 @@ async def test_fusion_stale_version_is_non_mutating(
         _, next_snapshot = await cumulative.reconcile_batch(
             second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
         )
-        valid_board = await fusion.board(edition.id)
+        valid_board = await fusion.get_board(edition.id)
         runs_before_stale = await _merge_runs(uow_factory, edition.id)
         with pytest.raises(FusionSnapshotStaleError, match="stale"):
             await fusion.merge(
@@ -267,7 +267,7 @@ async def test_fusion_stale_version_is_non_mutating(
                 actor_id="analyst",
             )
         assert await _merge_runs(uow_factory, edition.id) == runs_before_stale
-        assert (await fusion.board(edition.id)).snapshot_id == valid_board.snapshot_id
+        assert (await fusion.get_board(edition.id)).snapshot_id == valid_board.snapshot_id
     finally:
         await engine.dispose()
 
@@ -300,7 +300,7 @@ async def test_manual_replacement_keeps_history_and_only_new_candidate_active(
             actor_id="analyst",
         )
 
-        board = await FusionService(uow_factory).board(edition.id)
+        board = await FusionService(uow_factory).get_board(edition.id)
         active_ids = [
             candidate_id for group in board.groups for candidate_id in group.candidate_ids
         ]
@@ -351,7 +351,7 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
             for candidate in await _candidates_for_edition(uow_factory, edition.id)
         ]
         fusion = FusionService(uow_factory)
-        merged = await fusion.manual_merge(
+        merged = await fusion.merge(
             edition.id,
             snapshot_version=second_snapshot.version,
             discovery_subject_ids=tuple(subject.subject_id for subject in second_snapshot.subjects),
@@ -359,10 +359,20 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         )
         assert merged.snapshot_version == second_snapshot.version + 1
         assert merged.group_count == 1
+        # The analyst's decision supersedes the plan that first assembled the
+        # group: the board must not keep crediting the planner for it.
+        assert merged.groups[0].origin == "human"
+        assert merged.groups[0].confidence is None
+        assert merged.groups[0].model_suggestion is None
+        assert [
+            entry.actor_id
+            for entry in merged.groups[0].history
+            if entry.action == "merged"
+        ] == ["analyst"]
         merged_snapshot = await _active_snapshot(uow_factory, edition.id)
         assert merged_snapshot is not None
 
-        split = await fusion.manual_split(
+        split = await fusion.split(
             edition.id,
             snapshot_version=merged.snapshot_version or 0,
             discovery_subject_id=merged.groups[0].discovery_subject_id,
@@ -374,6 +384,14 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         assert {
             candidate_id for group in split.groups for candidate_id in group.candidate_ids
         } == set(candidate_ids)
+        # A split has no plan and no merge event, so its run payload is the only
+        # place the deciding analyst can be recovered from.
+        assert {
+            entry.actor_id
+            for group in split.groups
+            for entry in group.history
+            if entry.action == "split"
+        } == {"analyst"}
         async with uow_factory() as uow:
             historical_merge = await uow.discovery_snapshots.get(merged_snapshot.id)
             runs = await uow.discovery_merge_runs.list_for_edition(edition.id)

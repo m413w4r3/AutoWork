@@ -169,7 +169,7 @@ def merge_plan_review_reasons(plan: DiscoveryMergePlanV1) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reasons))
 
 
-def _requires_review(group: DiscoveryMergeGroup) -> bool:
+def requires_review(group: DiscoveryMergeGroup) -> bool:
     return (
         group.disposition is MergeDisposition.REVIEW
         or group.confidence is not MergeConfidence.HIGH

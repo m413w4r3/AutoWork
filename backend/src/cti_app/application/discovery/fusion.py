@@ -33,7 +33,7 @@ from cti_app.application.discovery.cumulative.merge_runs import (
 )
 from cti_app.application.discovery.cumulative.types import ResolvedMergeHandles
 from cti_app.application.discovery.cumulative.validation import (
-    _requires_review,
+    requires_review,
     validate_candidate_coverage,
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
@@ -57,6 +57,7 @@ from cti_app.domain.discovery_cumulative import (
 from cti_app.domain.editions import Edition, EditionStatus
 
 HUMAN_DECIDED_FLAG = "human_decided"
+_STRUCTURAL_ACTIONS = frozenset({"merged", "split", "split_created"})
 _MODEL_SUMMARY_LIMIT = 280
 _TITLE_SIMILARITY_THRESHOLD = 0.8
 _DATE_PROXIMITY_DAYS = 7
@@ -198,9 +199,6 @@ class FusionService:
     async def get_board(self, edition_id: UUID) -> FusionBoard:
         async with self._uow_factory() as uow:
             return await self._board(uow, edition_id)
-
-    async def board(self, edition_id: UUID) -> FusionBoard:
-        return await self.get_board(edition_id)
 
     async def resolve_review(
         self,
@@ -356,6 +354,7 @@ class FusionService:
                 parent_snapshot=snapshot,
                 operation="merge",
                 subject_ids=discovery_subject_ids,
+                actor_id=actor_id,
             )
             applied = apply_structural_subject_merge(
                 snapshot,
@@ -384,7 +383,6 @@ class FusionService:
         candidate_ids: Sequence[UUID],
         actor_id: str,
     ) -> FusionBoard:
-        del actor_id  # The HUMAN merge run is the audit record of a split.
         async with self._uow_factory() as uow:
             edition = await uow.editions.get_for_update(edition_id)
             self._ensure_writable(edition)
@@ -397,6 +395,7 @@ class FusionService:
                 parent_snapshot=snapshot,
                 operation="split",
                 subject_ids=(discovery_subject_id,),
+                actor_id=actor_id,
                 candidate_ids=candidate_ids,
             )
             candidates = await uow.discovery_candidates.list_for_edition(
@@ -418,38 +417,6 @@ class FusionService:
             await uow.commit()
         await self._after_activation_call(edition_id)
         return await self.get_board(edition_id)
-
-    async def manual_merge(
-        self,
-        edition_id: UUID,
-        *,
-        snapshot_version: int,
-        discovery_subject_ids: Sequence[UUID],
-        actor_id: str,
-    ) -> FusionBoard:
-        return await self.merge(
-            edition_id,
-            snapshot_version=snapshot_version,
-            discovery_subject_ids=discovery_subject_ids,
-            actor_id=actor_id,
-        )
-
-    async def manual_split(
-        self,
-        edition_id: UUID,
-        *,
-        snapshot_version: int,
-        discovery_subject_id: UUID,
-        candidate_ids: Sequence[UUID],
-        actor_id: str,
-    ) -> FusionBoard:
-        return await self.split(
-            edition_id,
-            snapshot_version=snapshot_version,
-            discovery_subject_id=discovery_subject_id,
-            candidate_ids=candidate_ids,
-            actor_id=actor_id,
-        )
 
     async def _board(self, uow: UnitOfWork, edition_id: UUID) -> FusionBoard:
         edition = await uow.editions.get(edition_id)
@@ -682,7 +649,7 @@ class FusionService:
 
 
 def _needs_decision(group: DiscoveryMergeGroup) -> bool:
-    return _requires_review(group) and HUMAN_DECIDED_FLAG not in group.flags
+    return requires_review(group) and HUMAN_DECIDED_FLAG not in group.flags
 
 
 def _coalesce_existing_targets(plan: DiscoveryMergePlanV1) -> DiscoveryMergePlanV1:
@@ -825,6 +792,7 @@ def _group_view(
         if reference.candidate_id in active_map
     )
     signals, differences = _signals(members)
+    history = _history(subject.subject_id, contributions, runs_by_id, identity, events)
     latest = max(
         (item for item in contributions if item.subject_id == subject.subject_id),
         key=lambda item: (item.first_seen_version, item.created_at),
@@ -836,6 +804,23 @@ def _group_view(
         if latest is not None and latest_run is not None
         else None
     )
+    # A human restructuring supersedes the plan that first assembled the group:
+    # keeping the planner's confidence and suggestion would credit the model for
+    # a decision the analyst has since overruled.
+    restructured = max(
+        (entry for entry in history if entry.action in _STRUCTURAL_ACTIONS),
+        key=lambda item: item.created_at,
+        default=None,
+    )
+    if restructured is not None and (
+        latest is None or restructured.created_at >= latest.created_at
+    ):
+        latest_run = (
+            runs_by_id.get(restructured.merge_run_id)
+            if restructured.merge_run_id is not None
+            else None
+        )
+        latest_group = None
     return FusionGroup(
         discovery_subject_id=subject.subject_id,
         title=subject.canonical_title,
@@ -852,7 +837,7 @@ def _group_view(
             else None
         ),
         differences=differences,
-        history=_history(subject.subject_id, contributions, runs_by_id, identity, events),
+        history=history,
     )
 
 
@@ -914,12 +899,13 @@ def _history(
             and str(subject_id) in subject_ids
         ):
             raw_ids = payload.get("candidate_ids")
+            actor = payload.get("actor_id")
             entries.append(
                 FusionHistoryEntry(
                     action="split",
                     merge_run_id=run.id,
                     planner_kind=run.planner_kind.value,
-                    actor_id=None,
+                    actor_id=actor if isinstance(actor, str) else None,
                     candidate_ids=tuple(
                         UUID(value) for value in raw_ids if isinstance(value, str)
                     )

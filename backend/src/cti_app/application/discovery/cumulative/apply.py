@@ -21,7 +21,7 @@ from cti_app.application.discovery.cumulative.types import (
     ResolvedMergeHandles,
 )
 from cti_app.application.discovery.cumulative.validation import (
-    _requires_review,
+    requires_review,
     validate_merge_plan,
 )
 from cti_app.application.discovery_identity import normalize
@@ -68,7 +68,7 @@ def apply_discovery_merge_plan(
     review_groups = [
         index
         for index, group in enumerate(plan.groups)
-        if _requires_review(group) and planner_kind is not DiscoveryPlannerKind.HUMAN
+        if requires_review(group) and planner_kind is not DiscoveryPlannerKind.HUMAN
     ]
     if review_groups:
         raise ValueError(f"Merge plan requires human review for groups {review_groups}")
