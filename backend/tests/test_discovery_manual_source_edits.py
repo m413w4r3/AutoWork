@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import UTC, datetime
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -15,6 +15,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRelationshipStatus,
@@ -69,6 +70,7 @@ def test_build_manual_edit_batch_uses_manual_source_edit_version() -> None:
         url="https://example.com/report",
         candidate=_candidate(),
         discovery_run_id=discovery_run_id,
+        supersedes_candidate_id=uuid4(),
     )
 
     assert MANUAL_SOURCE_EDIT_VERSION == "manual-url-attach-v1"
@@ -93,6 +95,17 @@ class _BatchRepository:
         return [batch for batch in self.batches if batch.edition_id == edition_id]
 
 
+class _CandidateRepository:
+    def __init__(self, candidates: list[DiscoveryCandidate]) -> None:
+        self.candidates = {candidate.id: candidate for candidate in candidates}
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        return self.candidates.get(candidate_id)
+
+    async def add_sequence(self, candidates: list[DiscoveryCandidate]) -> None:
+        self.candidates.update({candidate.id: candidate for candidate in candidates})
+
+
 class _GroupRepository:
     def __init__(self, groups: list[EditorialGroup]) -> None:
         self.groups = groups
@@ -105,9 +118,15 @@ class _GroupRepository:
 
 
 class _Uow:
-    def __init__(self, batches: _BatchRepository, groups: _GroupRepository) -> None:
+    def __init__(
+        self,
+        batches: _BatchRepository,
+        groups: _GroupRepository,
+        candidates: _CandidateRepository,
+    ) -> None:
         self.discovery_batches = batches
         self.editorial_groups = groups
+        self.discovery_candidates = candidates
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -307,13 +326,13 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
             DiscoverySubject(
                 subject_id=subject_id,
                 candidate=candidate,
-                member_references=(DiscoveryMemberReference(old_batch.id, candidate.id),),
+                member_references=(DiscoveryMemberReference(candidate.id),),
                 created_at=datetime.now(UTC),
             ),
             DiscoverySubject(
                 subject_id=other_subject_id,
                 candidate=other_candidate,
-                member_references=(DiscoveryMemberReference(old_batch.id, other_candidate.id),),
+                member_references=(DiscoveryMemberReference(other_candidate.id),),
                 created_at=datetime.now(UTC),
             ),
         ),
@@ -321,7 +340,22 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
         is_active=True,
     )
     batches = _BatchRepository([old_batch])
-    uow = _Uow(batches, _GroupRepository([group, other_group]))
+    uow = _Uow(
+        batches,
+        _GroupRepository([group, other_group]),
+        _CandidateRepository(
+            [
+                DiscoveryCandidate(
+                    id=item.id,
+                    discovery_run_id=old_batch.discovery_run_id,
+                    discovery_batch_id=old_batch.id,
+                    position=index,
+                    candidate=item,
+                )
+                for index, item in enumerate(old_batch.candidates, 1)
+            ]
+        ),
+    )
     archive = _Archive()
     cumulative = _Cumulative(snapshot)
     service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]
@@ -344,7 +378,7 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     ]
     assert manual_candidate.local_ref == "manual-url-replace"
     assert old.canonical_url not in {source.canonical_url for source in manual_candidate.sources}
-    assert group.candidate_references == (CandidateReference(manual_batch.id, manual_candidate.id),)
+    assert group.candidate_references == (CandidateReference(old_batch.id, candidate.id),)
     assert other_group.candidate_references == (
         CandidateReference(old_batch.id, other_candidate.id),
     )
@@ -409,8 +443,8 @@ async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> Non
                 subject_id=subject_id,
                 candidate=candidate,
                 member_references=(
-                    DiscoveryMemberReference(unrelated_batch.id, unrelated_candidate.id),
-                    DiscoveryMemberReference(originating_batch.id, candidate.id),
+                    DiscoveryMemberReference(unrelated_candidate.id),
+                    DiscoveryMemberReference(candidate.id),
                 ),
                 created_at=datetime.now(UTC),
             ),
@@ -419,7 +453,23 @@ async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> Non
         is_active=True,
     )
     batches = _BatchRepository([unrelated_batch, originating_batch])
-    uow = _Uow(batches, _GroupRepository([]))
+    uow = _Uow(
+        batches,
+        _GroupRepository([]),
+        _CandidateRepository(
+            [
+                DiscoveryCandidate(
+                    id=item.id,
+                    discovery_run_id=batch.discovery_run_id,
+                    discovery_batch_id=batch.id,
+                    position=1,
+                    candidate=item,
+                )
+                for batch in (unrelated_batch, originating_batch)
+                for item in batch.candidates
+            ]
+        ),
+    )
     archive = _Archive()
     cumulative = _Cumulative(snapshot)
     service = ManualSourceEditService(_Factory(uow), archive, cumulative)  # type: ignore[arg-type]

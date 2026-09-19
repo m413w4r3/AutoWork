@@ -3,7 +3,11 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type { DiscoveryInputMode, DiscoveryRun } from "../../api/discovery";
+import type {
+  CandidateTopic,
+  DiscoveryInputMode,
+  DiscoveryRun,
+} from "../../api/discovery";
 import type { JobStatus } from "../../api/jobs";
 import { DiscoveryPanel } from "./DiscoveryPanel";
 
@@ -79,6 +83,40 @@ function run(
   };
 }
 
+function candidate(id: string, title: string): CandidateTopic {
+  return {
+    id,
+    batch_id: "batch-raw",
+    title,
+    summary: `${title} summary`,
+    novelty: "new",
+    technical_potential: 3,
+    event_date: "2026-07-10",
+    uncertainties: [],
+    relevance_reasons: [],
+    actors: [],
+    campaigns: [],
+    malware: [],
+    cves: [],
+    victims: [],
+    sectors: [],
+    countries: [],
+    likely_artifacts: [],
+    iocs: [],
+    editorial_status: "proposed",
+    sources: [],
+    incomplete_sources: [],
+    local_ref: null,
+    actor_or_campaign: "unknown",
+    technical_potential_reason: "reason",
+    parsing_warnings: [],
+    context_only: false,
+    selectable: true,
+    valid_publication_count: 0,
+    incomplete_publication_count: 0,
+  };
+}
+
 function renderPanel(readOnly = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, refetchInterval: false } },
@@ -96,6 +134,82 @@ afterEach(() => {
 });
 
 describe("DiscoveryPanel durable run history", () => {
+  it("affiche les cartes correspondant exactement aux candidats bruts renvoyés", async () => {
+    const rawCandidates = [
+      candidate("raw-a", "Candidat brut A"),
+      candidate("raw-b", "Candidat brut B"),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/discovery/runs"))
+          return Promise.resolve(Response.json([]));
+        if (url.includes("/discovery/candidates"))
+          return Promise.resolve(
+            Response.json({
+              batches: [],
+              candidates: rawCandidates,
+              total: rawCandidates.length,
+              merge_stats: {
+                raw_batch_count: 1,
+                raw_candidate_count: rawCandidates.length,
+                consolidated_candidate_count: rawCandidates.length,
+                unique_publication_count: 0,
+                duplicate_publication_occurrence_count: 0,
+              },
+              warning: "",
+            }),
+          );
+        if (url.includes("/editorial-groups"))
+          return Promise.resolve(Response.json({ groups: [] }));
+        return Promise.resolve(Response.json([]));
+      }),
+    );
+
+    renderPanel();
+
+    expect(
+      await screen.findByRole("heading", { name: "Candidat brut A" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Candidat brut B" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Candidat brut A summary")).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Voir la fusion" }),
+    ).toHaveAttribute("href", `/editions/${editionId}/fusion`);
+  });
+
+  it("bloque seulement lorsqu’une réconciliation bridge est active", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.includes("/api/jobs?") && url.includes("reconcile_discovery"))
+        return Promise.resolve(
+          Response.json([{ status: "running", kind: "reconcile_discovery" }]),
+        );
+      if (url.endsWith("/discovery/runs"))
+        return Promise.resolve(Response.json([]));
+      if (url.includes("/discovery/candidates"))
+        return Promise.resolve(
+          Response.json({ batches: [], candidates: [], total: 0, warning: "" }),
+        );
+      if (url.includes("/editorial-groups"))
+        return Promise.resolve(Response.json({ groups: [] }));
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderPanel();
+
+    expect(
+      await screen.findByText(/bridge ChatGPT est occupé/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Nouvelle recherche ChatGPT" }),
+    ).toBeDisabled();
+  });
+
   it("renders newest-first history and every execution projection", async () => {
     const runs = [
       run("newest", "running", {

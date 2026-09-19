@@ -20,7 +20,12 @@ from cti_app.domain.collection import (
     RejectedModelProposal,
     SourceCollection,
 )
-from cti_app.domain.discovery import DiscoveryBatch, DiscoveryRun, DiscoveryRunInputMode
+from cti_app.domain.discovery import (
+    DiscoveryBatch,
+    DiscoveryCandidate,
+    DiscoveryRun,
+    DiscoveryRunInputMode,
+)
 from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoveryMergeRun,
@@ -450,6 +455,20 @@ class DiscoveryBatchRepository(Protocol):
     async def save(self, batch: DiscoveryBatch) -> None: ...
 
 
+class DiscoveryCandidateRepository(Protocol):
+    async def add_sequence(self, candidates: Sequence[DiscoveryCandidate]) -> None: ...
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None: ...
+
+    async def list_for_batch(self, batch_id: UUID) -> Sequence[DiscoveryCandidate]: ...
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]: ...
+
+    async def save(self, candidate: DiscoveryCandidate) -> None: ...
+
+
 class DiscoveryRunRepository(Protocol):
     async def add_if_absent(self, run: DiscoveryRun) -> bool: ...
 
@@ -641,6 +660,7 @@ class UnitOfWork(Protocol):
     model_conversation_turns: ModelConversationTurnRepository
     discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
+    discovery_candidates: DiscoveryCandidateRepository
     discovery_intakes: DiscoveryIntakeRepository
     discovery_subject_identities: DiscoverySubjectIdentityRepository
     subject_merge_events: SubjectMergeEventRepository
@@ -739,6 +759,7 @@ class EditionUnitOfWorkFactory(Protocol):
 class DiscoveryUnitOfWork(Protocol):
     discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
+    discovery_candidates: DiscoveryCandidateRepository
 
     async def __aenter__(self) -> Self: ...
 
@@ -762,6 +783,7 @@ class DiscoveryRunUnitOfWork(Protocol):
     editions: EditionRepository
     discovery_runs: DiscoveryRunRepository
     discovery_batches: DiscoveryBatchRepository
+    discovery_candidates: DiscoveryCandidateRepository
     jobs: JobRepository
     job_events: JobEventRepository
 

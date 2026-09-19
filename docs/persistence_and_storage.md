@@ -19,9 +19,32 @@ PostgreSQL est la source canonique des identités, métadonnées, relations et �
 | `edition_audit_events` | Audit métier des éditions | avant/après, acteur et corrélation ; append-only |
 | `job_events` | Transitions techniques des jobs | statuts avant/après et acteur ; append-only |
 | `model_runs` | Exécutions de modèles | hash d'entrée, versions, usage, statut et références de sortie ; aucun prompt en clair |
-| `discovery_batches` | Propositions de découverte | paramètres hachés, runs, requêtes, citations et candidats/sources non vérifiés |
-| `editorial_groups` | Groupes proposés et sélectionnés | références de candidats, score explicable, rapprochement historique, version et état |
-| `human_decisions` | Décisions de sélection, fusion, séparation et rejet | acteur, corrélation et payload ; append-only |
+| `discovery_batches` | Provenance/audit des résultats de découverte | paramètres hachés, runs, requêtes, citations et révisions |
+| `discovery_candidates` | Identités fonctionnelles canoniques découvertes | UUID métier unique, hash/ordre déterministes, `supersedes_candidate_id` et provenance de batch |
+| `editorial_groups` | Projection de compatibilité pour Selection | références de candidats par UUID, score explicable, rapprochement historique, version et état |
+| `discovery_snapshots` | État versionné de la fusion (`DiscoverySnapshot`) | `version`, parent, sujets de découverte et membres par `candidate_id` ; `intake_id` nul pour une fusion/séparation humaine |
+| `discovery_merge_runs` | Trace auditable de chaque proposition ou décision de fusion (`DiscoveryMergeRun`) | planner, snapshot parent, plan, correspondance interne handle ↔ UUID, statut de revue ; `intake_id` nul pour une opération structurelle humaine |
+| `subject_contributions` | Apport d'une candidate à un sujet de découverte | unique par `candidate_id` (FK `discovery_candidates`) ; append-only |
+| `human_decisions` | Décisions de sélection et de rejet | acteur, corrélation et payload ; append-only |
+
+Il n'existe aucune table `fusion_groups` ni `candidate_groups` : un groupe de Fusion est un
+sujet d'un `DiscoverySnapshot` et ses membres sont toujours référencés par l'UUID métier du
+`DiscoveryCandidate` (`DiscoveryMemberReference(candidate_id)`), le batch d'origine étant
+retrouvé via `DiscoveryCandidate.discovery_batch_id`. Les snapshots et merge runs sont
+append-only : chaque décision Fusion produit un nouveau merge run `human` puis une nouvelle
+version de snapshot, sans réécrire les précédents. Le read model Fusion n'est pas persisté ; il
+est reconstruit à chaque lecture. Une édition `ARCHIVED` autorise la lecture, mais aucune
+mutation Fusion.
+
+Une correction ciblée crée une nouvelle ligne `discovery_candidates` portant
+`supersedes_candidate_id` (au plus un remplaçant direct par candidate, index unique partiel) ;
+l'ancienne ligne reste lisible par son identifiant mais ne participe plus au calcul actif, pas
+plus que les candidates d'un batch remplacé (`replaced_by_batch_id`).
+
+Les signaux déterministes sont recalculés localement à la lecture ; la suggestion modèle
+provient uniquement du plan et de la justification courte d'un merge run modèle persisté. Les
+handles de prompt (`C1`, `X1`) restent internes au merge run et ne sont jamais exposés ; aucune
+chaîne de pensée n'est persistée ou exposée.
 
 `source_documents` et `samples` conservent séparément : nom d'origine, origine, date d'acquisition, licence ou restriction, TLP, `do_not_submit` et `external_llm_allowed`. Partager les mêmes octets ne leur donne donc jamais la même sémantique.
 

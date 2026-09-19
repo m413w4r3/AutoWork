@@ -8,12 +8,11 @@ from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
 from cti_app.logging import CorrelationIdMiddleware
-from tests.editorial_support import InMemoryEditorialUnitOfWorkFactory
-from tests.test_editorial import _candidate, _edition, _snapshot
+from tests.test_editorial import _candidate, _edition, _factory, _snapshot
 
 
 async def test_editorial_api_group_select_and_decision_audit() -> None:
-    uow = InMemoryEditorialUnitOfWorkFactory()
+    uow = _factory()
     edition = _edition()
     candidates = [
         _candidate("Campagne A", "https://a.example/report"),
@@ -23,7 +22,7 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
     uow.snapshots[edition.id] = _snapshot(
         edition.id,
         [
-            (uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))
+            (uuid4(), candidate, (DiscoveryMemberReference(candidate.id),))
             for candidate in candidates
         ],
     )
@@ -40,6 +39,14 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
     ) as client:
         board = await client.get(f"/api/editions/{edition.id}/editorial-groups")
         group_id = board.json()["groups"][0]["id"]
+        merge = await client.post(
+            f"/api/editions/{edition.id}/editorial-groups/merge",
+            json={"group_ids": [group_id]},
+        )
+        split = await client.post(
+            f"/api/editions/{edition.id}/editorial-groups/{group_id}/split",
+            json={"candidate_ids": []},
+        )
         selected = await client.post(
             f"/api/editions/{edition.id}/editorial-groups/{group_id}/select",
             json={},
@@ -48,6 +55,8 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
         decisions = await client.get(f"/api/editions/{edition.id}/editorial-groups/decisions")
 
     assert board.status_code == 200
+    assert merge.status_code == 404
+    assert split.status_code == 404
     assert board.json()["automatic_selection"] is False
     selected_group = next(item for item in selected.json()["groups"] if item["id"] == group_id)
     assert selected_group["status"] == "selected"
@@ -57,7 +66,7 @@ async def test_editorial_api_group_select_and_decision_audit() -> None:
 
 
 async def test_editorial_api_applies_versioned_decisions_in_one_request() -> None:
-    uow = InMemoryEditorialUnitOfWorkFactory()
+    uow = _factory()
     edition = _edition()
     candidates = [
         _candidate("Campagne A", "https://a.example/report"),
@@ -67,7 +76,7 @@ async def test_editorial_api_applies_versioned_decisions_in_one_request() -> Non
     uow.snapshots[edition.id] = _snapshot(
         edition.id,
         [
-            (uuid4(), candidate, (DiscoveryMemberReference(uuid4(), candidate.id),))
+            (uuid4(), candidate, (DiscoveryMemberReference(candidate.id),))
             for candidate in candidates
         ],
     )

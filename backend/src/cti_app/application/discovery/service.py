@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
@@ -48,6 +49,7 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     ContributionStatus,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoveryContribution,
     DiscoveryRun,
     DiscoveryRunInputMode,
@@ -194,6 +196,8 @@ class DiscoveryService:
                 if existing is None:
                     raise RuntimeError("Discovery conflict without canonical batch")
                 batch = existing
+            else:
+                await _persist_discovery_candidates(uow, batch)
             await uow.commit()
 
         # This discovery conversation is bounded (DELETE_ON_SUCCESS semantics):
@@ -315,6 +319,7 @@ class DiscoveryService:
                         raise RuntimeError("Discovery conflict without canonical batch")
                     batch = self._validated_reprocess_batch(concurrent, run, parameters)
                 else:
+                    await _persist_discovery_candidates(uow, batch)
                     if locked_tail.replaced_by_batch_id is not None:
                         raise RuntimeError("Discovery batch already has a replacement")
                     locked_tail.replaced_by_batch_id = batch.id
@@ -558,6 +563,7 @@ class DiscoveryService:
                 return existing_batch, True, None
             if not await uow.discovery_batches.add_if_absent(batch):
                 raise RuntimeError("Discovery conflict without canonical batch")
+            await _persist_discovery_candidates(uow, batch)
             await uow.commit()
 
         # Ceci ne fait que soumettre et dispatcher un job de réconciliation
@@ -650,6 +656,16 @@ class DiscoveryService:
                 else [item for item in batches if item.is_active_revision]
             )
 
+    async def list_candidates(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        async with self._uow_factory() as uow:
+            return list(
+                await uow.discovery_candidates.list_for_edition(
+                    edition_id, include_replaced=include_replaced
+                )
+            )
+
     async def mark_source(
         self,
         edition_id: UUID,
@@ -659,12 +675,14 @@ class DiscoveryService:
         actor_id: str,
     ) -> SourceCandidate:
         async with self._uow_factory() as uow:
-            batches = await uow.discovery_batches.list_for_edition(edition_id)
-            for batch in batches:
-                source = batch.source(source_id)
+            candidates = await uow.discovery_candidates.list_for_edition(edition_id)
+            for persisted in candidates:
+                candidate = persisted.to_candidate_topic()
+                source = next((item for item in candidate.sources if item.id == source_id), None)
                 if source is not None:
                     source.mark(status, actor_id=actor_id)
-                    await uow.discovery_batches.save(batch)
+                    persisted.candidate = candidate
+                    await uow.discovery_candidates.save(persisted)
                     await uow.commit()
                     return source
         raise SourceCandidateNotFoundError(str(source_id))
@@ -713,3 +731,34 @@ def _parsed_to_domain_batch(
         parsing_revision=parsing_revision,
         supersedes_batch_id=supersedes_batch_id,
     )
+
+
+async def _persist_discovery_candidates(uow: Any, batch: DiscoveryBatch) -> None:
+    """Persist one canonical candidate per parsed topic, in report order.
+
+    A batch revision is expressed by `replaced_by_batch_id` on the batch, not by
+    guessing a candidate-to-candidate correspondence: `supersedes_candidate_id`
+    is reserved for targeted corrections.
+    """
+    persisted: list[DiscoveryCandidate] = []
+    allocated_ids: set[UUID] = set()
+    for position, candidate in enumerate(batch.candidates, start=1):
+        topic = deepcopy(candidate)
+        candidate_id = topic.id
+        while candidate_id in allocated_ids or await uow.discovery_candidates.get(candidate_id):
+            candidate_id = uuid4()
+        topic.id = candidate_id
+        candidate.id = candidate_id
+        allocated_ids.add(candidate_id)
+        persisted.append(
+            DiscoveryCandidate(
+                id=candidate_id,
+                discovery_run_id=batch.discovery_run_id,
+                discovery_batch_id=batch.id,
+                position=position,
+                candidate=topic,
+                created_at=batch.created_at,
+            )
+        )
+    await uow.discovery_candidates.add_sequence(persisted)
+    await uow.discovery_batches.save(batch)

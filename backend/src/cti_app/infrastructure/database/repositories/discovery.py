@@ -3,9 +3,10 @@ from datetime import UTC, date, datetime
 from typing import cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -13,6 +14,7 @@ from cti_app.domain.discovery import (
     ContributionStatus,
     DiscoveryBatch,
     DiscoveryBatchStatus,
+    DiscoveryCandidate,
     DiscoveryContribution,
     DiscoveryIocStatus,
     DiscoveryIocType,
@@ -30,7 +32,11 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.infrastructure.database.models.discovery import DiscoveryBatchRow, DiscoveryRunRow
+from cti_app.infrastructure.database.models.discovery import (
+    DiscoveryBatchRow,
+    DiscoveryCandidateRow,
+    DiscoveryRunRow,
+)
 
 
 class SqlAlchemyDiscoveryRunRepository:
@@ -166,6 +172,93 @@ class SqlAlchemyDiscoveryBatchRepository:
         for field_name, value in _discovery_batch_values(batch).items():
             setattr(row, field_name, value)
         await self._session.flush()
+
+
+class SqlAlchemyDiscoveryCandidateRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def add_sequence(self, candidates: Sequence[DiscoveryCandidate]) -> None:
+        if not candidates:
+            return
+        statement = insert(DiscoveryCandidateRow).values(
+            [_discovery_candidate_values(candidate) for candidate in candidates]
+        )
+        await self._session.execute(statement)
+        await self._session.flush()
+
+    async def get(self, candidate_id: UUID) -> DiscoveryCandidate | None:
+        row = await self._session.get(DiscoveryCandidateRow, candidate_id)
+        return _discovery_candidate_from_row(row) if row else None
+
+    async def list_for_batch(self, batch_id: UUID) -> Sequence[DiscoveryCandidate]:
+        rows = await self._session.scalars(
+            select(DiscoveryCandidateRow)
+            .where(DiscoveryCandidateRow.discovery_batch_id == batch_id)
+            .order_by(DiscoveryCandidateRow.position, DiscoveryCandidateRow.id)
+        )
+        return [_discovery_candidate_from_row(row) for row in rows]
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]:
+        successor_candidate = aliased(DiscoveryCandidateRow)
+        successor = exists(
+            select(successor_candidate.id).where(
+                successor_candidate.supersedes_candidate_id == DiscoveryCandidateRow.id
+            )
+        )
+        statement = (
+            select(DiscoveryCandidateRow)
+            .join(
+                DiscoveryBatchRow,
+                DiscoveryBatchRow.id == DiscoveryCandidateRow.discovery_batch_id,
+            )
+            .where(DiscoveryBatchRow.edition_id == edition_id)
+            .order_by(
+                DiscoveryCandidateRow.created_at,
+                DiscoveryCandidateRow.position,
+                DiscoveryCandidateRow.id,
+            )
+        )
+        if not include_replaced:
+            statement = statement.where(
+                DiscoveryBatchRow.payload["replaced_by_batch_id"].as_string().is_(None),
+                ~successor.correlate(DiscoveryCandidateRow),
+            )
+        rows = await self._session.scalars(statement)
+        return [_discovery_candidate_from_row(row) for row in rows]
+
+    async def save(self, candidate: DiscoveryCandidate) -> None:
+        row = await self._session.get(DiscoveryCandidateRow, candidate.id)
+        if row is None:
+            raise LookupError(f"Discovery candidate {candidate.id} does not exist")
+        row.payload = _candidate_payload(candidate.candidate)
+        await self._session.flush()
+
+
+def _discovery_candidate_values(candidate: DiscoveryCandidate) -> dict[str, object]:
+    return {
+        "id": candidate.id,
+        "discovery_run_id": candidate.discovery_run_id,
+        "discovery_batch_id": candidate.discovery_batch_id,
+        "position": candidate.position,
+        "supersedes_candidate_id": candidate.supersedes_candidate_id,
+        "payload": _candidate_payload(candidate.candidate),
+        "created_at": candidate.created_at,
+    }
+
+
+def _discovery_candidate_from_row(row: DiscoveryCandidateRow) -> DiscoveryCandidate:
+    return DiscoveryCandidate(
+        id=row.id,
+        discovery_run_id=row.discovery_run_id,
+        discovery_batch_id=row.discovery_batch_id,
+        position=row.position,
+        candidate=_candidate_from_payload(cast(dict[str, object], row.payload)),
+        supersedes_candidate_id=row.supersedes_candidate_id,
+        created_at=row.created_at,
+    )
 
 
 def _discovery_batch_values(batch: DiscoveryBatch) -> dict[str, object]:

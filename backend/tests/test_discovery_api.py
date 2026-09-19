@@ -44,7 +44,7 @@ class SnapshotProjectionForApiTests:
             candidate.id: DiscoverySubject(
                 subject_id=candidate.id,
                 candidate=candidate,
-                member_references=(DiscoveryMemberReference(batch.id, candidate.id),),
+                member_references=(DiscoveryMemberReference(candidate.id),),
                 created_at=batch.created_at,
             )
             for batch in batches

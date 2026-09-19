@@ -5,11 +5,9 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.discovery.cumulative.apply import apply_discovery_merge_plan
 from cti_app.application.discovery.cumulative.chatgpt_planner import ChatGptMergePlanner
 from cti_app.application.discovery.cumulative.context import (
     DiscoveryBlockingStrategy,
-    build_discovery_delta,
     build_merge_handles,
     project_merge_subject,
 )
@@ -36,10 +34,15 @@ from cti_app.domain.discovery_cumulative import (
     MergeDisposition,
     MergeEvidence,
     MergeValidationStatus,
-    discovery_candidate_key,
 )
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelRunStatus
-from tests.test_discovery_cumulative import _batch, _candidate, _intake
+from tests.test_discovery_cumulative import (
+    _batch,
+    _candidate,
+    _intake,
+    apply_discovery_merge_plan,
+    build_discovery_delta,
+)
 
 
 class RecordingBridgeCapabilitiesProvider:
@@ -130,7 +133,7 @@ async def test_chatgpt_merge_uses_fresh_non_web_request_and_opaque_handles() -> 
     assert request.routing_hint.value == "discovery_merge"
     assert request.conversation is not None and request.conversation.mode == "fresh"
     assert str(parent.subjects[0].subject_id) not in request.text
-    assert str(delta.candidates[0].candidate_key) not in request.text
+    assert str(delta.candidates[0].candidate_id) not in request.text
     assert "web_search" not in request.text
 
 
@@ -485,9 +488,9 @@ async def test_targeted_planner_deterministically_targets_the_known_subject() ->
     intake = _intake(batch)
     delta = build_discovery_delta(intake, batch)
     handles = build_merge_handles(parent, delta)
-    incoming_candidate_key = discovery_candidate_key(intake.id, "S1")
+    incoming_candidate_id = delta.candidates[0].candidate_id
 
-    planner = TargetedMergePlanner(target_subject_id, incoming_candidate_key)
+    planner = TargetedMergePlanner(target_subject_id, incoming_candidate_id)
     outcome = await planner.plan(
         parent,
         delta,
@@ -538,9 +541,9 @@ async def test_targeted_planner_rejects_a_subject_that_is_not_in_scope() -> None
     intake = _intake(batch)
     delta = build_discovery_delta(intake, batch)
     handles = build_merge_handles(parent, delta)
-    incoming_candidate_key = discovery_candidate_key(intake.id, "S1")
+    incoming_candidate_id = delta.candidates[0].candidate_id
 
-    planner = TargetedMergePlanner(uuid4(), incoming_candidate_key)
+    planner = TargetedMergePlanner(uuid4(), incoming_candidate_id)
     with pytest.raises(ValueError):
         await planner.plan(
             parent,

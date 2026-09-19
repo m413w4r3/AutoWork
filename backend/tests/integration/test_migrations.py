@@ -510,6 +510,37 @@ def test_orm_table_matches_migrated_schema(
     assert actual["indexes"] == _expected_indexes(table)
 
 
+def test_fusion_schema_uses_canonical_candidate_identity(
+    schema_snapshot: dict[str, dict[str, Any]],
+) -> None:
+    candidates = schema_snapshot["discovery_candidates"]
+    assert candidates["pk"] == frozenset({"id"})
+    assert frozenset({"discovery_batch_id", "position"}) in candidates["uniques"]
+    assert (
+        ("supersedes_candidate_id",),
+        "discovery_candidates",
+        ("id",),
+        "RESTRICT",
+    ) in candidates["fks"]
+    assert (
+        "uq_discovery_candidates_supersedes",
+        ("supersedes_candidate_id",),
+        True,
+        True,
+    ) in candidates["indexes"]
+
+    contributions = schema_snapshot["subject_contributions"]
+    assert "candidate_key" not in contributions["columns"]
+    assert frozenset({"candidate_id"}) in contributions["uniques"]
+    assert (("candidate_id",), "discovery_candidates", ("id",), "RESTRICT") in contributions[
+        "fks"
+    ]
+    # Structural human decisions (merge/split) have no intake.
+    assert schema_snapshot["discovery_snapshots"]["columns"]["intake_id"][1] is True
+    assert schema_snapshot["discovery_merge_runs"]["columns"]["intake_id"][1] is True
+    assert not {"fusion_groups", "candidate_groups"} & set(schema_snapshot)
+
+
 # ---------------------------------------------------------------------------
 # 4: PostgreSQL functions and triggers
 # ---------------------------------------------------------------------------

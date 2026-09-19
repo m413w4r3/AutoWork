@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -339,6 +340,28 @@ class CandidateTopic:
 
 
 @dataclass(slots=True)
+class DiscoveryCandidate:
+    id: UUID
+    discovery_run_id: UUID
+    discovery_batch_id: UUID
+    position: int
+    candidate: CandidateTopic
+    supersedes_candidate_id: UUID | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    def __post_init__(self) -> None:
+        if self.candidate.id != self.id:
+            raise ValueError("Discovery candidate identity must match its topic identity")
+        if self.position < 1:
+            raise ValueError("Discovery candidate position must be positive")
+        if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
+            raise ValueError("Discovery candidate creation time must be timezone-aware")
+
+    def to_candidate_topic(self) -> CandidateTopic:
+        return deepcopy(self.candidate)
+
+
+@dataclass(slots=True)
 class DiscoveryContribution:
     candidate: CandidateTopic
     status: ContributionStatus
@@ -414,15 +437,9 @@ class DiscoveryBatch:
             ]
         # `candidates` is the immutable raw-batch projection. Acceptance is a
         # separate contribution attribute and must not make parsed subjects
-        # disappear from discovery reads.
-        candidates = [contribution.candidate for contribution in self.contributions]
-        deduplicated = deduplicate_topics(candidates)
-        # Update contributions with deduplicated candidates
-        candidate_map = {c.id: c for c in deduplicated}
-        for contribution in self.contributions:
-            if contribution.candidate.id in candidate_map:
-                contribution.candidate = candidate_map[contribution.candidate.id]
-        self.candidates = deduplicated
+        # disappear from discovery reads. Distinct candidates remain distinct;
+        # canonical persistence owns their identity and ordering.
+        self.candidates = [contribution.candidate for contribution in self.contributions]
         if self.parsing_revision < 1:
             raise ValueError("Parsing revision must be positive")
 
@@ -689,29 +706,3 @@ def recover_incomplete_source_urls(
             )
         remaining.append(incomplete)
     return remaining
-
-
-def deduplicate_topics(topics: list[CandidateTopic]) -> list[CandidateTopic]:
-    unique: dict[str, CandidateTopic] = {}
-    for topic in topics:
-        existing = unique.get(topic.title_fingerprint)
-        if existing is None:
-            unique[topic.title_fingerprint] = topic
-            continue
-        merged_sources, source_id_remap = deduplicate_sources([*existing.sources, *topic.sources])
-        existing.sources = merged_sources
-        if source_id_remap:
-            existing.provisional_iocs = remap_ioc_publication_ids(
-                [*existing.provisional_iocs, *topic.provisional_iocs], source_id_remap
-            )
-        existing.incomplete_sources = deduplicate_incomplete_sources(
-            [*existing.incomplete_sources, *topic.incomplete_sources]
-        )
-        existing.technical_potential = max(existing.technical_potential, topic.technical_potential)
-        existing.uncertainties = tuple(
-            dict.fromkeys((*existing.uncertainties, *topic.uncertainties))
-        )
-        existing.relevance_reasons = tuple(
-            dict.fromkeys((*existing.relevance_reasons, *topic.relevance_reasons))
-        )
-    return list(unique.values())

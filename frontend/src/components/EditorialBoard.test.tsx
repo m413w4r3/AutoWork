@@ -167,7 +167,7 @@ it("désactive le polling malgré la valeur globale de production", async () => 
   expect(fetchMock).toHaveBeenCalledTimes(1);
 });
 
-it("propose quatre choix exclusifs et confirme les décisions dans un seul lot", async () => {
+it("confirme des décisions Article ou Ignorer dans un seul lot", async () => {
   const board = {
     groups,
     selected_articles: 0,
@@ -206,12 +206,19 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   expect(
     screen.getByText("52 annoncés · 1 valeur visible"),
   ).toBeInTheDocument();
-  expect(screen.getByText("Campagne du mois précédent")).not.toBeVisible();
+  expect(
+    screen.queryByText("Campagne du mois précédent"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByText("Organiser les publications"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: /Fusionner|Séparer/ }),
+  ).not.toBeInTheDocument();
 
   const first = screen
     .getAllByRole("heading", { name: "Campagne A" })[0]!
     .closest("article")!;
-  expect(within(first).getByRole("radio", { name: "À décider" })).toBeChecked();
   expect(
     within(first).getByRole("radio", { name: "Article" }),
   ).toBeInTheDocument();
@@ -223,10 +230,6 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
   expect(
     screen.getByRole("button", { name: "Confirmer la sélection (1)" }),
   ).toBeEnabled();
-  await user.click(within(first).getByRole("radio", { name: "À décider" }));
-  expect(
-    screen.getByRole("button", { name: "Confirmer la sélection (0)" }),
-  ).toBeDisabled();
   await user.click(within(first).getByRole("radio", { name: "Article" }));
   const second = screen
     .getAllByRole("heading", { name: "Campagne B" })[0]!
@@ -252,6 +255,55 @@ it("propose quatre choix exclusifs et confirme les décisions dans un seul lot",
       ],
     },
   ]);
+});
+
+it("affiche les sujets prêts dans la lecture historique", async () => {
+  const archived = {
+    ...groups[0],
+    status: "selected" as const,
+    subject_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  };
+  const board = {
+    groups: [archived],
+    selected_articles: 1,
+    ignored: 0,
+    undecided: 0,
+    automatic_selection: false,
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(withProductionNotStarted(() => Response.json(board))),
+  );
+
+  render(
+    <QueryClientProvider
+      client={
+        new QueryClient({ defaultOptions: { queries: { retry: false } } })
+      }
+    >
+      <EditorialBoard
+        editionId="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        readOnly
+      />
+    </QueryClientProvider>,
+  );
+
+  expect(
+    await screen.findByText(
+      "Consultation historique : les décisions éditoriales ne sont pas modifiables.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByText("1 article prêt")).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Ouvrir le sujet" })).toHaveAttribute(
+    "href",
+    "/subjects/dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+  );
+  expect(
+    screen.queryByText("Organiser les publications"),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: /Fusionner|Séparer/ }),
+  ).not.toBeInTheDocument();
 });
 
 it("ajoute immédiatement un autre sujet aux articles", async () => {

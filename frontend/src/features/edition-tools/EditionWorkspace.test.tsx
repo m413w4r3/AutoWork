@@ -26,6 +26,20 @@ vi.mock("../discovery/DiscoveryPanel", () => ({
   ),
 }));
 
+vi.mock("../fusion/FusionBoard", () => ({
+  FusionBoard: ({
+    editionId,
+    readOnly,
+  }: {
+    editionId: string;
+    readOnly?: boolean;
+  }) => (
+    <div data-testid="tool-fusion" data-read-only={String(readOnly)}>
+      Fusion {editionId}
+    </div>
+  ),
+}));
+
 vi.mock("../../components/EditorialBoard", () => ({
   EditorialBoard: () => <div data-testid="editorial-board" />,
 }));
@@ -163,6 +177,10 @@ describe("EditionNavigation", () => {
       "href",
       `/editions/${EDITION_ID}/discovery`,
     );
+    expect(screen.getByRole("link", { name: "Fusion" })).toHaveAttribute(
+      "href",
+      `/editions/${EDITION_ID}/fusion`,
+    );
     expect(screen.getByRole("link", { name: "Sélection" })).toHaveAttribute(
       "href",
       `/editions/${EDITION_ID}/selection`,
@@ -211,6 +229,7 @@ describe("EditionNavigation", () => {
 describe("EditionToolSurface", () => {
   it.each([
     ["discovery", "tool-discovery"],
+    ["fusion", "tool-fusion"],
     ["production", "tool-production"],
     ["review", "tool-review"],
     ["publication", "tool-publication"],
@@ -219,6 +238,14 @@ describe("EditionToolSurface", () => {
     expect(screen.getByTestId(testId)).toHaveAttribute(
       "data-read-only",
       "false",
+    );
+  });
+
+  it("rend Fusion en lecture seule pour une édition archivée", () => {
+    renderSurface("fusion", { ...edition, state: "archived" });
+    expect(screen.getByTestId("tool-fusion")).toHaveAttribute(
+      "data-read-only",
+      "true",
     );
   });
 

@@ -375,6 +375,13 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     batches = await discovery.list_batches(params.edition_id)
     assert len(batches) == 1
     assert len(batches[0].candidates) == 1
+    canonical_candidates = await discovery.list_candidates(params.edition_id)
+    assert [item.id for item in canonical_candidates] == [batches[0].candidates[0].id]
+    original_title = canonical_candidates[0].candidate.title
+    batches[0].candidates[0].title = "Artificial batch-only mutation"
+    reread_candidates = await discovery.list_candidates(params.edition_id)
+    assert reread_candidates[0].id == canonical_candidates[0].id
+    assert reread_candidates[0].candidate.title == original_title
     assert batches[0].source_mode is DiscoverySourceMode.MODEL_DECLARED_URLS
     assert batches[0].source_coverage_complete is False
     assert batches[0].citation_count == 0
@@ -1324,6 +1331,9 @@ async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_
     assert initial_batch.replaced_by_batch_id == revision.id
     assert revision.supersedes_batch_id == initial_batch.id
     assert revision.parsing_revision == 2
+    active_candidates = await discovery.list_candidates(params.edition_id)
+    assert [item.discovery_batch_id for item in active_candidates] == [revision.id]
+    assert [item.id for item in active_candidates] == [revision.candidates[0].id]
     assert len(model_uow.state) == model_runs_before
     assert len(adapter.calls) == research_calls_before
 

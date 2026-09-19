@@ -31,6 +31,13 @@ class DiscoveryPlannerKind(StrEnum):
     HUMAN = "human"
 
 
+class FusionReviewAction(StrEnum):
+    ACCEPT = "accept"
+    SEPARATE = "separate"
+    ATTACH = "attach"
+    DEFER = "defer"
+
+
 class MergeValidationStatus(StrEnum):
     VALID = "valid"
     REPAIRED = "repaired"
@@ -100,7 +107,6 @@ class DiscoverySubjectIdentity:
 
 @dataclass(frozen=True, slots=True)
 class DiscoveryMemberReference:
-    batch_id: UUID
     candidate_id: UUID
 
 
@@ -124,7 +130,6 @@ class DiscoverySubject:
 class SubjectContribution:
     subject_id: UUID
     intake_id: UUID
-    candidate_key: UUID
     candidate_id: UUID
     first_seen_snapshot_id: UUID
     first_seen_version: int
@@ -165,7 +170,7 @@ class DiscoverySnapshot:
     edition_id: UUID
     version: int
     parent_snapshot_id: UUID | None
-    intake_id: UUID
+    intake_id: UUID | None
     merge_run_id: UUID
     planner_kind: DiscoveryPlannerKind
     subjects: tuple[DiscoverySubject, ...]
@@ -188,7 +193,7 @@ class DiscoverySnapshot:
 class DiscoveryMergeRun:
     edition_id: UUID
     parent_snapshot_id: UUID | None
-    intake_id: UUID
+    intake_id: UUID | None
     planner_kind: DiscoveryPlannerKind
     prompt_version: str
     policy_version: str
@@ -247,14 +252,10 @@ class DiscoveryMergePlanV1(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
-def discovery_candidate_key(intake_id: UUID, local_ref: str) -> UUID:
-    return uuid5(NAMESPACE_URL, f"discovery-candidate:{intake_id}:{local_ref}")
-
-
-def discovery_origin_key(candidate_keys: list[UUID] | tuple[UUID, ...]) -> str:
-    if not candidate_keys:
+def discovery_origin_key(candidate_ids: list[UUID] | tuple[UUID, ...]) -> str:
+    if not candidate_ids:
         raise ValueError("A subject origin requires at least one candidate")
-    return ":".join(sorted(str(key) for key in candidate_keys))
+    return ":".join(sorted(str(candidate_id) for candidate_id in candidate_ids))
 
 
 def discovery_subject_id(edition_id: UUID, origin_key: str) -> UUID:

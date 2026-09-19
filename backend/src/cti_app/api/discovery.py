@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from copy import deepcopy
-from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Annotated, Literal
 from uuid import UUID
@@ -13,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.api.discovery_errors import _raise_api_error
 from cti_app.application.discovery.contracts import SOURCE_PROFILE_PATTERN
-from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.manual_source_edits import (
     SourceCandidateNotFoundError as ManualSourceCandidateNotFoundError,
@@ -39,7 +36,6 @@ from cti_app.domain.discovery import (
     SourceRole,
     SourceVerificationStatus,
 )
-from cti_app.domain.discovery_cumulative import DiscoveryMemberReference
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api/editions/{edition_id}/discovery", tags=["discovery"])
@@ -165,19 +161,6 @@ class ProvisionalIocView(BaseModel):
 class CandidateReferenceView(BaseModel):
     batch_id: UUID
     candidate_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class SnapshotCandidateProjection:
-    representative: CandidateTopic
-    member_references: tuple[DiscoveryMemberReference, ...]
-    sources: list[SourceCandidate]
-    duplicate_publication_count: int = 0
-    merge_warnings: tuple[str, ...] = ()
-
-    @property
-    def contribution_count(self) -> int:
-        return len(self.member_references)
 
 
 class DiscoveryMergeStats(BaseModel):
@@ -373,38 +356,28 @@ async def read_candidates(
 ) -> DiscoveryView:
     service: DiscoveryService = request.app.state.discovery_service
     batches = await service.list_batches(edition_id, include_replaced=include_replaced)
-    active_batches = [batch for batch in batches if batch.is_active_revision]
-
-    cumulative: CumulativeDiscoveryService | None = getattr(
-        request.app.state, "cumulative_discovery_service", None
+    persisted_candidates = await service.list_candidates(
+        edition_id, include_replaced=include_replaced
     )
-    snapshot = await cumulative.active_snapshot(edition_id) if cumulative is not None else None
-    if snapshot is not None:
-        # Read-only projection of already-materialized state; no consolidation/merge here.
-        consolidated = []
-        for subject in snapshot.subjects:
-            candidate = deepcopy(subject.candidate)
-            candidate.id = subject.subject_id
-            consolidated.append(
-                SnapshotCandidateProjection(
-                    representative=candidate,
-                    member_references=subject.member_references,
-                    sources=candidate.sources,
-                )
-            )
-    else:
-        consolidated = []
 
+    active_batches = [batch for batch in batches if batch.is_active_revision]
+    cumulative = getattr(request.app.state, "cumulative_discovery_service", None)
+    snapshot = await cumulative.active_snapshot(edition_id) if cumulative is not None else None
     raw_batch_count = len(active_batches)
-    raw_candidate_count = sum(len(batch.candidates) for batch in active_batches)
-    unique_publication_count = sum(len(cand.sources) for cand in consolidated)
-    total_duplicate_count = sum(cand.duplicate_publication_count for cand in consolidated)
+    raw_candidate_count = len(persisted_candidates)
+    publication_urls = [
+        source.canonical_url
+        for persisted in persisted_candidates
+        for source in persisted.candidate.sources
+    ]
+    unique_publication_count = len(set(publication_urls))
+    total_duplicate_count = len(publication_urls) - unique_publication_count
 
     filtered: list[
         tuple[CandidateTopic, list[CandidateReferenceView], int, int, tuple[str, ...]]
     ] = []
-    for cand in consolidated:
-        candidate = cand.representative
+    for persisted in persisted_candidates:
+        candidate = persisted.to_candidate_topic()
 
         if search:
             needle = search.casefold()
@@ -425,12 +398,14 @@ async def read_candidates(
             (
                 candidate,
                 [
-                    CandidateReferenceView(batch_id=ref.batch_id, candidate_id=ref.candidate_id)
-                    for ref in cand.member_references
+                    CandidateReferenceView(
+                        batch_id=persisted.discovery_batch_id,
+                        candidate_id=persisted.id,
+                    )
                 ],
-                cand.contribution_count,
-                cand.duplicate_publication_count,
-                cand.merge_warnings,
+                1,
+                0,
+                (),
             )
         )
 
@@ -455,7 +430,7 @@ async def read_candidates(
         merge_stats=DiscoveryMergeStats(
             raw_batch_count=raw_batch_count,
             raw_candidate_count=raw_candidate_count,
-            consolidated_candidate_count=len(consolidated),
+            consolidated_candidate_count=len(persisted_candidates),
             unique_publication_count=unique_publication_count,
             duplicate_publication_occurrence_count=total_duplicate_count,
         ),

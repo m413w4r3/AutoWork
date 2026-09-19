@@ -27,11 +27,11 @@ import {
 } from "../../api/discovery";
 import { renderDiscoveryMarkdown } from "../../discoveryMarkdownExport";
 import { JobStatusCard } from "../../components/JobStatusCard";
-import { DiscoveryMergeReview } from "../../components/DiscoveryMergeReview";
 import { ErrorMessage } from "../../components/ErrorMessage";
 import {
   cancelJob,
   fetchJob,
+  listJobs,
   terminalJobStatuses,
   type JobView,
 } from "../../api/jobs";
@@ -92,11 +92,6 @@ export function DiscoveryPanel({
   const [reconciliationJobId, setReconciliationJobId] = useState<string | null>(
     null,
   );
-  // The merge planner also calls the single-slot ChatGPT bridge, in the
-  // background, before any merge run exists to poll on its own — launching a
-  // second bridge action while it runs would just contend for the same slot
-  // and look stuck rather than fail cleanly.
-  const [mergeReconciling, setMergeReconciling] = useState(false);
   const [axis, setAxis] = useState("initial");
   const [sourceProfile, setSourceProfile] = useState("default");
   const [manualMarkdown, setManualMarkdown] = useState("");
@@ -168,6 +163,20 @@ export function DiscoveryPanel({
     refetchInterval: ({ state }) =>
       state.data && terminalJobStatuses.has(state.data.status) ? false : 2_000,
   });
+  const reconciliationJobs = useQuery({
+    queryKey: ["jobs", editionId, "reconcile_discovery"],
+    queryFn: () => listJobs("edition", editionId, "reconcile_discovery"),
+    refetchInterval: ({ state }) =>
+      state.data?.some(
+        (job) => job.status === "queued" || job.status === "running",
+      )
+        ? 2_000
+        : false,
+  });
+  const mergeReconciling =
+    reconciliationJobs.data?.some(
+      (job) => job.status === "queued" || job.status === "running",
+    ) ?? false;
   const lastJob: JobView | null = selectedJob.data ?? null;
   const jobId = selectedJobId;
   const discovery = useQuery({
@@ -380,7 +389,10 @@ export function DiscoveryPanel({
       });
     },
   });
-  const candidates = discovery.data?.candidates ?? [];
+  const candidates = useMemo(
+    () => discovery.data?.candidates ?? [],
+    [discovery.data?.candidates],
+  );
   const discoveryMarkdownExport = useMemo(
     () => renderDiscoveryMarkdown(candidates),
     [candidates],
@@ -406,6 +418,7 @@ export function DiscoveryPanel({
           <p className="eyebrow">Découverte mensuelle</p>
           <h2 id="discovery-heading">Sujets candidats</h2>
         </div>
+        <a href={`/editions/${editionId}/fusion`}>Voir la fusion</a>
         {/* Les deux actions restent disponibles tout au long du cycle de vie :
             avant la première recherche, après un import, après plusieurs lots. */}
         {!readOnly ? (
@@ -540,7 +553,7 @@ export function DiscoveryPanel({
         </ol>
       </section>
       {mergeReconciling ? (
-        <p className="merge-review__blocked" role="status">
+        <p role="status">
           Le bridge ChatGPT est occupé à évaluer la dernière contribution pour
           la fusion : attendez que cette évaluation se termine avant de lancer
           une nouvelle recherche.
@@ -982,11 +995,6 @@ export function DiscoveryPanel({
             </div>
           </section>
         ) : null}
-        <DiscoveryMergeReview
-          editionId={editionId}
-          readOnly={readOnly}
-          onReconciling={setMergeReconciling}
-        />
         <div className="candidate-list">
           {candidates.map((candidate) => (
             <article className="candidate-card" key={candidate.id}>

@@ -12,6 +12,11 @@ de production courante. Plusieurs sujets peuvent donc occuper simultanément
 des `ProductionStatus` et des étapes différentes : l’avancement se lit au
 niveau de chaque sujet, sans phase de production portée par l’édition.
 
+Discovery, Fusion et Selection sont des capacités accessibles indépendamment depuis l'édition.
+Discovery produit et versionne les `DiscoveryCandidate`, Fusion propose et enregistre les
+regroupements explicables, et Selection décide quels candidats/projections deviennent des sujets
+éditoriaux. Il n'existe ni nouvelle phase globale obligatoire, ni état `fusion_complete`.
+
 Le Dashboard de l’édition donne la vue d’ensemble et permet d’accéder aux
 capacités indépendantes. Ces destinations de navigation ne représentent ni
 des étapes terminées ni des prochaines étapes à faire avancer dans une
@@ -73,9 +78,9 @@ OpenAI est chargé de :
 
 * trouver les publications ;
 * identifier la source originale ;
-* regrouper les reprises d’un même rapport ;
+* signaler les relations possibles entre reprises d’un même rapport ;
 * distinguer les sources indépendantes des simples relais ;
-* proposer un sujet commun ;
+* proposer une compatibilité de sujet, sans créer l’identité ni la décision de fusion ;
 * évaluer la richesse technique du sujet.
 
 Le résultat affiché est une liste de cartes :
@@ -92,18 +97,22 @@ Le résultat affiché est une liste de cartes :
 | Déjà traité              | Non                            |
 | Proposition              | Article principal              |
 
-Le filtrage des doublons ne repose pas seulement sur le titre. Il utilise les URLs, dates, acteurs, familles, hash, IOC et similarité du contenu. Un sujet déjà traité peut apparaître comme « mise à jour » plutôt que disparaître.
+Les signaux de compatibilité ne reposent pas seulement sur le titre. Ils utilisent les URLs,
+dates, acteurs, familles, hash, IOC et similarité du contenu. Ils n'effacent ni ne fusionnent les
+candidats : un sujet déjà traité peut apparaître comme « mise à jour », puis être revu dans Fusion.
 
 ### 3. Sélection éditoriale
 
-L’utilisateur peut :
+L’utilisateur peut, dans Selection :
 
 * sélectionner ou rejeter un sujet ;
-* fusionner deux groupes ;
-* séparer un groupe mal construit ;
 * choisir `article principal` ou `brève` ;
 * ajouter une publication manquante ;
 * modifier le TLP ou la priorité.
+
+Les actions `merge` et `split` sont effectuées dans Fusion, sur des UUID métier et un
+`snapshot_version`. La revue Fusion reste lisible pour une édition `ARCHIVED`, mais ses décisions
+et toute autre mutation y sont interdites.
 
 À la validation, l’application crée automatiquement l’arborescence du sujet.
 
@@ -324,9 +333,10 @@ L’utilisateur valide section par section, puis l’article rejoint le composit
 Le point d’entrée d’une édition est le Dashboard
 `/editions/{edition_id}` : il présente le conteneur mensuel, ses sujets, leurs
 statuts de production et les éléments de synthèse utiles à l’opérateur.
-Depuis ce Dashboard, les cinq destinations de capacité sont indépendantes :
+Depuis ce Dashboard, les capacités sont indépendantes :
 
-* `/editions/{edition_id}/discovery` — découverte des sujets, candidats et doublons.
+* `/editions/{edition_id}/discovery` — découverte et lecture des candidats.
+* `/editions/{edition_id}/fusion` — revue, résolution, fusion et séparation explicables.
 * `/editions/{edition_id}/selection` — sélection éditoriale et composition du lot.
 * `/editions/{edition_id}/production` — production des sujets et suivi des traitements.
 * `/editions/{edition_id}/review` — revue des articles et validation éditoriale.
@@ -343,7 +353,8 @@ Le workbench pourrait utiliser ces onglets :
 
 | Étape                     | Automatique              | Humain obligatoire                    |
 | ------------------------- | ------------------------ | ------------------------------------- |
-| Recherche et regroupement | Oui                      | Sélection des sujets                  |
+| Discovery et signaux de compatibilité | Oui          | Revue des candidats                   |
+| Fusion (merge/split)      | Proposition              | Décision humaine et résolution         |
 | Extraction technique      | Oui                      | Correction des ambiguïtés importantes |
 | Rédaction d’une brève     | Oui                      | Validation finale                     |
 | Plan de rétroconception   | Proposition              | Réalisation/interprétation            |

@@ -27,11 +27,12 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.discovery.cumulative.planners import TargetedMergePlanner
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.ports import ModelOutputArchive
-from cti_app.application.persistence import DiscoveryBatchRepository, UnitOfWorkFactory
+from cti_app.application.persistence import DiscoveryCandidateRepository, UnitOfWorkFactory
 from cti_app.domain.discovery import (
     CandidateTopic,
     ContributionStatus,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoveryContribution,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
@@ -45,9 +46,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryInputMode,
     DiscoverySnapshot,
     DiscoverySubject,
-    discovery_candidate_key,
 )
-from cti_app.domain.editorial import CandidateReference
 
 
 class IncompleteSourceCandidateNotFoundError(LookupError):
@@ -277,16 +276,26 @@ class ManualSourceEditService:
         replaced_canonical_url: str | None = None,
     ) -> DiscoverySnapshot:
         async with self._uow_factory() as uow:
+            originating_candidate = await _find_originating_discovery_candidate(
+                uow.discovery_candidates, snapshot, subject_id, source_id
+            )
             discovery_run_id = await _find_originating_discovery_run_id(
-                uow.discovery_batches, snapshot, subject_id, source_id
+                uow.discovery_candidates, snapshot, subject_id, source_id
+            )
+            corrected_candidate = _correct_manual_candidate(
+                originating_candidate.candidate,
+                source_id=source_id,
+                url=url,
+                operation=operation,
             )
             batch, digest = _build_manual_edit_batch(
                 edition_id,
                 subject_id,
                 source_id,
                 url,
-                candidate,
+                corrected_candidate,
                 discovery_run_id=discovery_run_id,
+                supersedes_candidate_id=originating_candidate.id,
                 operation=operation,
                 replaced_canonical_url=replaced_canonical_url,
             )
@@ -311,78 +320,40 @@ class ManualSourceEditService:
                     existing_batch = await uow.discovery_batches.get(batch.id)
                     if existing_batch is None:
                         raise RuntimeError("Discovery conflict without canonical batch")
+                else:
+                    await uow.discovery_candidates.add_sequence(
+                        [
+                            DiscoveryCandidate(
+                                id=corrected_candidate.id,
+                                discovery_run_id=batch.discovery_run_id,
+                                discovery_batch_id=batch.id,
+                                position=1,
+                                candidate=corrected_candidate,
+                                supersedes_candidate_id=originating_candidate.id,
+                            )
+                        ]
+                    )
                 await uow.commit()
             if existing_batch is not None:
                 batch = existing_batch
+                canonical_candidate = await uow.discovery_candidates.get(corrected_candidate.id)
+                if canonical_candidate is None:
+                    raise RuntimeError("Manual edit batch exists without canonical candidate")
+                corrected_candidate = canonical_candidate.candidate
 
         intake, _ = await self._cumulative.ingest_batch(
             batch, input_mode=DiscoveryInputMode.MANUAL_IMPORT, actor_id=actor_id
         )
-        assert candidate.local_ref is not None
-        incoming_candidate_key = discovery_candidate_key(intake.id, candidate.local_ref)
+        replacement_candidate_id = corrected_candidate.id
         new_snapshot = await self._cumulative.reconcile_intake(
             intake.id,
             expected_parent_snapshot_id=snapshot.id,
             actor_id=actor_id,
             planner_override=TargetedMergePlanner(
-                subject_id, incoming_candidate_key, operation=operation
+                subject_id, replacement_candidate_id, operation=operation
             ),
         )
-        if operation == "replace":
-            assert replaced_canonical_url is not None
-            await self._replace_editorial_source_reference(
-                edition_id=edition_id,
-                subject_id=subject_id,
-                replaced_canonical_url=replaced_canonical_url,
-                replacement_batch=batch,
-                replacement_candidate=candidate,
-            )
         return new_snapshot
-
-    async def _replace_editorial_source_reference(
-        self,
-        *,
-        edition_id: UUID,
-        subject_id: UUID,
-        replaced_canonical_url: str,
-        replacement_batch: DiscoveryBatch,
-        replacement_candidate: CandidateTopic,
-    ) -> None:
-        """Make the editorial group consume the replacement candidate.
-
-        The cumulative snapshot keeps immutable member references for audit
-        lineage. The selected editorial group, however, must stop feeding the
-        old raw candidate to future production snapshots, otherwise the old
-        inaccessible URL would be recaptured alongside its replacement.
-        """
-        async with self._uow_factory() as uow:
-            groups = getattr(uow, "editorial_groups", None)
-            batches = getattr(uow, "discovery_batches", None)
-            if groups is None or batches is None:
-                return
-            group = await groups.get_by_subject(subject_id)
-            if group is None or group.edition_id != edition_id:
-                return
-            candidate_by_reference = {
-                CandidateReference(batch.id, item.id): item
-                for batch in await batches.list_for_edition(edition_id)
-                for item in batch.candidates
-            }
-            replacement_reference = CandidateReference(
-                replacement_batch.id, replacement_candidate.id
-            )
-            replacements: dict[CandidateReference, CandidateReference] = {}
-            for reference in group.candidate_references:
-                candidate = candidate_by_reference.get(reference)
-                if candidate is not None and any(
-                    source.canonical_url == replaced_canonical_url for source in candidate.sources
-                ):
-                    replacements[reference] = replacement_reference
-            group.replace_candidate_references(replacements)
-            if replacement_reference not in group.candidate_references:
-                group.add_candidates((replacement_reference,))
-            await groups.save(group)
-            await uow.commit()
 
 
 def _find_incomplete_source(
@@ -420,41 +391,121 @@ def _find_source(
 
 
 async def _find_originating_discovery_run_id(
-    batches: DiscoveryBatchRepository,
+    candidates: DiscoveryCandidateRepository,
     snapshot: DiscoverySnapshot,
     subject_id: UUID,
     source_id: UUID,
 ) -> UUID:
+    candidate = await _find_originating_discovery_candidate(
+        candidates, snapshot, subject_id, source_id
+    )
+    return candidate.discovery_run_id
+
+
+async def _find_originating_discovery_candidate(
+    candidates: DiscoveryCandidateRepository,
+    snapshot: DiscoverySnapshot,
+    subject_id: UUID,
+    source_id: UUID,
+) -> DiscoveryCandidate:
     subject = next((item for item in snapshot.subjects if item.subject_id == subject_id), None)
     if subject is None:
         raise ManualSourceEditOriginNotFoundError(
             f"No discovery subject exists for manual source edit {subject_id}"
         )
 
-    matching_run_ids: set[UUID] = set()
+    matching_candidates: list[DiscoveryCandidate] = []
     for reference in subject.member_references:
-        batch = await batches.get(reference.batch_id)
-        if batch is None:
+        candidate = await candidates.get(reference.candidate_id)
+        if candidate is None:
             continue
-        referenced_candidate = next(
-            (item for item in batch.candidates if item.id == reference.candidate_id), None
-        )
-        if referenced_candidate is None:
-            continue
-        if any(item.id == source_id for item in referenced_candidate.sources) or any(
-            item.id == source_id for item in referenced_candidate.incomplete_sources
+        if any(item.id == source_id for item in candidate.candidate.sources) or any(
+            item.id == source_id for item in candidate.candidate.incomplete_sources
         ):
-            matching_run_ids.add(batch.discovery_run_id)
+            matching_candidates.append(candidate)
 
-    if not matching_run_ids:
+    if not matching_candidates:
         raise ManualSourceEditOriginNotFoundError(
             f"No referenced discovery candidate contains corrected source {source_id}"
         )
-    if len(matching_run_ids) > 1:
+    if len({candidate.id for candidate in matching_candidates}) > 1:
         raise ManualSourceEditOriginNotFoundError(
-            f"Corrected source {source_id} has multiple originating discovery runs"
+            f"Corrected source {source_id} has multiple originating discovery candidates"
         )
-    return next(iter(matching_run_ids))
+    return matching_candidates[0]
+
+
+def _correct_manual_candidate(
+    candidate: CandidateTopic,
+    *,
+    source_id: UUID,
+    url: str,
+    operation: ManualSourceEditOperation,
+) -> CandidateTopic:
+    corrected = deepcopy(candidate)
+    if operation == "attach":
+        target = next(
+            item for item in corrected.incomplete_sources if item.id == source_id
+        )
+        promoted = SourceCandidate(
+            url=url,
+            title=target.title,
+            publisher=target.publisher,
+            role=target.role,
+            tlp=corrected.tlp,
+            sensitivity=corrected.sensitivity,
+            external_llm_allowed=corrected.external_llm_allowed,
+            published_at=target.published_at,
+            local_ref=target.local_ref,
+            period_relation=target.period_relation,
+            ioc_presence=target.ioc_presence,
+            ioc_declared_count=target.ioc_declared_count,
+            ioc_visible_count=target.ioc_visible_count,
+            parsing_warnings=(*target.parsing_warnings, "url_attached_manually"),
+            markdown_block=target.markdown_block,
+        )
+        corrected.incomplete_sources = [
+            item for item in corrected.incomplete_sources if item.id != source_id
+        ]
+        corrected.sources, source_id_remap = deduplicate_sources(
+            [*corrected.sources, promoted]
+        )
+        if source_id_remap:
+            corrected.provisional_iocs = remap_ioc_publication_ids(
+                corrected.provisional_iocs, source_id_remap
+            )
+    else:
+        replaced = next(item for item in corrected.sources if item.id == source_id)
+        replacement = SourceCandidate(
+            url=url,
+            title=replaced.title,
+            publisher=replaced.publisher,
+            role=replaced.role,
+            tlp=corrected.tlp,
+            sensitivity=corrected.sensitivity,
+            external_llm_allowed=corrected.external_llm_allowed,
+            published_at=replaced.published_at,
+            event_date=replaced.event_date,
+            citation=replaced.citation,
+            local_ref=replaced.local_ref,
+            period_relation=replaced.period_relation,
+            ioc_presence=replaced.ioc_presence,
+            ioc_declared_count=replaced.ioc_declared_count,
+            ioc_visible_count=replaced.ioc_visible_count,
+            parsing_warnings=(*replaced.parsing_warnings, "url_replaced_manually"),
+            markdown_block=replaced.markdown_block,
+        )
+        corrected.sources = [item for item in corrected.sources if item.id != source_id]
+        corrected.sources, source_id_remap = deduplicate_sources(
+            [*corrected.sources, replacement]
+        )
+        replacement_id = source_id_remap.get(replacement.id, replacement.id)
+        source_id_remap[source_id] = replacement_id
+        corrected.provisional_iocs = remap_ioc_publication_ids(
+            corrected.provisional_iocs, source_id_remap
+        )
+    corrected.local_ref = f"manual-url-{operation}"
+    return corrected
 
 
 # Not produced by discovery_report_parser: identifies analyst-attached URLs.
@@ -491,6 +542,7 @@ def _build_manual_edit_batch(
     candidate: CandidateTopic,
     *,
     discovery_run_id: UUID,
+    supersedes_candidate_id: UUID,
     operation: ManualSourceEditOperation = "attach",
     replaced_canonical_url: str | None = None,
 ) -> tuple[DiscoveryBatch, str]:
@@ -507,6 +559,9 @@ def _build_manual_edit_batch(
     ).hexdigest()
     batch_id = uuid5(
         NAMESPACE_URL, f"cti-discovery-manual-url-batch:{discovery_run_id}:{digest}"
+    )
+    candidate.id = uuid5(
+        NAMESPACE_URL, f"cti-discovery-manual-url-candidate:{supersedes_candidate_id}:{digest}"
     )
     manual_run_id = uuid5(
         NAMESPACE_URL, f"cti-discovery-manual-url-run:{discovery_run_id}:{digest}"

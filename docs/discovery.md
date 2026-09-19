@@ -47,7 +47,22 @@ Les responsabilités sont séparées explicitement :
   archivé ;
 - `DiscoveryBatch = parsed result/revision` : un résultat parsé ou une révision de ce résultat.
 
-`DiscoveryIntake` et les objets de fusion restent des structures cumulatives en aval. Un
+`DiscoveryCandidate.id` est l'identité fonctionnelle canonique d'un sujet découvert : c'est un
+UUID métier unique, stable entre les lectures, les décisions et les projections.
+Un `DiscoveryBatch` est la provenance et la trace d'audit d'un résultat parsé ; il peut produire
+plusieurs candidats et n'est pas l'identité d'un candidat. Un candidat remplacé porte
+`supersedes_candidate_id` vers le candidat précisément supersédé. Cette supersession ciblée
+préserve l'historique sans remplacer ou réidentifier les autres candidats.
+
+Les candidats d'un même batch et de batches différents sont ordonnés par une règle déterministe
+et portent un hash déterministe de leur contenu canonique. Il n'y a aucune déduplication
+cross-candidate avant la capacité Fusion : chaque candidat reste donc lisible et traçable, même
+si les signaux semblent proches. Les suggestions modèle sont conservées séparément des signaux
+déterministes et ne constituent ni une identité ni une décision. Aucune chaîne de pensée n'est
+stockée ou exposée ; seules une proposition structurée, ses signaux et une justification courte
+destinée à la revue peuvent être affichés.
+
+`DiscoveryIntake` et les projections de fusion restent des structures cumulatives en aval. Un
 `DiscoveryRun` ne possède pas sa propre machine d'état d'exécution : le `Job` est la source
 canonique du statut, de la progression et des erreurs.
 
@@ -247,7 +262,45 @@ rapports précédents. Une confirmation humaine est requise avant cette action.
 
 La découverte et son retraitement n'appellent jamais Qwen : le rapport ChatGPT archivé est parsé
 localement par `chatgpt-markdown-v2`. Le regroupement éditorial ne transforme pas une citation
-orpheline en sujet et ne fusionne pas deux blocs `SUBJECT` distincts d'un même lot. Le board
+orpheline en sujet et ne fusionne pas deux blocs `SUBJECT` distincts d'un même lot : ces blocs
+produisent des `DiscoveryCandidate` distincts jusqu'à la capacité Fusion. Le board
 présente tous les groupes sans quota ; l'analyste humain choisit librement `Brève`, `Article
 approfondi + pivots`, `Ignorer` ou laisse le sujet à décider. Les décisions de fusion, séparation,
 rejet et sélection restent append-only.
+
+## Capacité Fusion
+
+Vocabulaire :
+
+- `DiscoveryCandidate` = proposition brute canonique ;
+- `DiscoverySnapshot` = état versionné de la fusion (ses groupes sont identifiés par un
+  `discovery_subject_id`, qui n'est pas un `Subject.id`) ;
+- `Subject` = objet éditorial créé seulement après sélection (AW-008).
+
+La fusion appartient à Discovery/Fusion ; la sélection ne restructure pas les groupes.
+
+Fusion est une capacité indépendante qui lit exclusivement les `DiscoveryCandidate` actifs, le
+snapshot actif et les merge runs, sans modifier l'identité des candidates. La réconciliation
+charge les candidates persistées du batch de l'intake (`build_discovery_delta(intake,
+candidates)`), jamais `DiscoveryBatch.candidates`. Avant toute activation de snapshot, chaque
+candidate active dont le batch possède un intake doit avoir exactement une place : membre d'un
+groupe du snapshot, ou en attente dans une revue. `GET /api/editions/{edition_id}/fusion`
+retourne le board : snapshot et `snapshot_version`, groupes établis avec leurs candidates,
+signaux déterministes, suggestion modèle, différences et historique, revues en attente et
+candidates non encore stabilisées. Les mutations sont :
+
+- `POST /api/editions/{edition_id}/fusion/reviews/{merge_run_id}/resolve` : une décision
+  `accept`, `separate`, `attach` (avec `target_discovery_subject_id`) ou `defer` par groupe à
+  revoir, identifié par ses `candidate_ids` ;
+- `POST /api/editions/{edition_id}/fusion/merge` : `discovery_subject_ids` à fusionner ;
+- `POST /api/editions/{edition_id}/fusion/split` : `discovery_subject_id` et sous-ensemble
+  strict de `candidate_ids` à séparer.
+
+Toutes prennent le `snapshot_version` affiché et des UUID métier ; elles ne s'appuient ni sur une
+position dans l'interface ni sur un handle de prompt. Chacune produit un `DiscoveryMergeRun`
+`human` puis un nouveau `DiscoverySnapshot` (un `defer` ne produit qu'un merge run successeur).
+
+Une version devenue obsolète est refusée avec HTTP `409` et le code
+`fusion_snapshot_stale`. Une nouvelle lecture est alors nécessaire avant toute décision. Fusion
+peut être lue pour une édition `ARCHIVED`, mais aucune résolution, fusion, séparation ou autre
+mutation n'est autorisée sur cette édition.

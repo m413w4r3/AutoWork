@@ -7,7 +7,8 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   let searched = false;
   let jobCompleted = false;
   let jobPolls = 0;
-  let merged = false;
+  let fusionMerged = false;
+  let fusionBoardGets = 0;
   let selected = false;
   const edition = {
     id: editionId,
@@ -125,6 +126,71 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       source_quality: "Source provisoire",
     },
   };
+  const cyfirmaSubject = "33333333-3333-4333-8333-333333333331";
+  const nccSubject = "33333333-3333-4333-8333-333333333332";
+  const fusionCandidate = (topic: ReturnType<typeof candidate>) => ({
+    id: topic.id,
+    discovery_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab",
+    discovery_batch_id: topic.batch_id,
+    supersedes_candidate_id: null,
+    title: topic.title,
+    summary: topic.summary,
+    event_date: topic.event_date,
+    actors: topic.actors,
+    campaigns: topic.campaigns,
+    malware: topic.malware,
+    cves: topic.cves,
+    iocs: topic.iocs,
+    countries: topic.countries,
+    sectors: topic.sectors,
+    likely_artifacts: topic.likely_artifacts,
+    publications: topic.sources.map((item) => ({
+      id: item.id,
+      url: item.url,
+      canonical_url: item.canonical_url,
+      title: item.title,
+      publisher: item.publisher,
+      published_at: item.published_at,
+    })),
+  });
+  const fusionGroup = (
+    subjectId: string,
+    members: Array<ReturnType<typeof candidate>>,
+  ) => ({
+    discovery_subject_id: subjectId,
+    title: members[0]?.title ?? "",
+    summary: "Présentation neutre issue du rapport ChatGPT.",
+    candidate_ids: members.map((member) => member.id),
+    candidates: members.map((member) => fusionCandidate(member)),
+    confidence: "high",
+    origin: fusionMerged ? "human" : "heuristic",
+    resolution_state: "established",
+    deterministic_signals: [],
+    model_suggestion: null,
+    differences: [],
+    history: [],
+  });
+  const currentFusionGroups = () => {
+    if (fusionMerged) return [fusionGroup(cyfirmaSubject, [cyfirma, ncc])];
+    return [
+      fusionGroup(cyfirmaSubject, [cyfirma]),
+      fusionGroup(nccSubject, [ncc]),
+    ];
+  };
+  const fusionBoard = () => ({
+    edition_id: editionId,
+    snapshot_id: fusionMerged
+      ? "77777777-7777-4777-8777-777777777777"
+      : "66666666-6666-4666-8666-666666666666",
+    snapshot_version: fusionMerged ? 2 : 1,
+    read_only: false,
+    candidate_count: 2,
+    group_count: fusionMerged ? 1 : 2,
+    pending_review_count: 0,
+    groups: currentFusionGroups(),
+    pending_reviews: [],
+    unstabilized_candidates: [],
+  });
   const groups = () => [
     {
       id: "11111111-1111-4111-8111-111111111111",
@@ -133,24 +199,24 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       outcome: "new_subject",
       status: selected ? "selected" : "proposed",
       subject_id: selected ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : null,
-      candidates: merged ? [cyfirma, ncc] : [cyfirma],
+      candidates: fusionMerged ? [cyfirma, ncc] : [cyfirma],
       score,
       source_relationship_status: "provisional",
       needs_source_verification: true,
       needs_source_expansion: true,
       grouping_confidence: "high",
-      grouping_justification: merged
+      grouping_justification: fusionMerged
         ? "Fusion décidée par l'analyste."
         : "Bloc ChatGPT S1",
       historical_comparison: null,
-      version: merged || selected ? 2 : 1,
+      version: fusionMerged || selected ? 2 : 1,
     },
     {
       id: "22222222-2222-4222-8222-222222222222",
       edition_id: editionId,
       title: ncc.title,
       outcome: "new_subject",
-      status: merged ? "superseded" : "proposed",
+      status: fusionMerged ? "superseded" : "proposed",
       subject_id: null,
       candidates: [ncc],
       score,
@@ -160,7 +226,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       grouping_confidence: "high",
       grouping_justification: "Bloc ChatGPT S2",
       historical_comparison: null,
-      version: merged ? 2 : 1,
+      version: fusionMerged ? 2 : 1,
     },
   ];
 
@@ -327,8 +393,27 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
         },
       });
     }
+    if (
+      path === `/api/editions/${editionId}/fusion` &&
+      request.method() === "GET"
+    ) {
+      fusionBoardGets += 1;
+      return route.fulfill({ json: fusionBoard() });
+    }
+    if (
+      path === `/api/editions/${editionId}/fusion/merge` &&
+      request.method() === "POST"
+    ) {
+      // The only structural mutation goes through Fusion, with business
+      // UUIDs and the snapshot version the analyst was looking at.
+      expect(request.postDataJSON()).toEqual({
+        snapshot_version: 1,
+        discovery_subject_ids: [cyfirmaSubject, nccSubject],
+      });
+      fusionMerged = true;
+      return route.fulfill({ json: fusionBoard() });
+    }
     if (path.includes("/editorial-groups")) {
-      if (request.method() === "POST" && path.endsWith("/merge")) merged = true;
       if (request.method() === "POST" && path.endsWith("/decisions"))
         selected = true;
       return route.fulfill({
@@ -336,7 +421,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
           groups: groups(),
           selected_articles: selected ? 1 : 0,
           ignored: 0,
-          undecided: selected ? 0 : merged ? 1 : 2,
+          undecided: selected ? 0 : fusionMerged ? 1 : 2,
           automatic_selection: false,
         },
       });
@@ -370,23 +455,40 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     page.getByRole("heading", { name: ncc.title }).first(),
   ).toBeVisible();
 
+  // Discovery keeps the two raw candidates distinct; Fusion owns structure.
+  await page.getByRole("link", { name: "Fusion", exact: true }).click();
+  await expect(page).toHaveURL(`/editions/${editionId}/fusion`);
+  await expect(
+    page.getByRole("heading", { name: "Fusion explicable" }),
+  ).toBeVisible();
+  const fusionGroups = page.locator(".fusion-group-card");
+  await expect(fusionGroups).toHaveCount(2);
+  await expect(fusionGroups.first()).toContainText("Signaux déterministes");
+  await expect(fusionGroups.first()).toContainText("Suggestion du modèle");
+  await expect(page.getByText("C1", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("X1", { exact: true })).toHaveCount(0);
+  await fusionGroups.nth(0).getByLabel("Sélectionner pour fusion").check();
+  await fusionGroups.nth(1).getByLabel("Sélectionner pour fusion").check();
+  await page
+    .getByRole("button", { name: "Fusionner les groupes sélectionnés" })
+    .click();
+  await expect(fusionGroups).toHaveCount(1);
+  await expect(fusionGroups.first()).toContainText(cyfirma.title);
+  await expect(fusionGroups.first()).toContainText(ncc.title);
+  await expect(page.getByText("C1", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("X1", { exact: true })).toHaveCount(0);
+
+  // A refresh reads the same canonical state back from the server.
+  await page.reload();
+  await expect(fusionGroups).toHaveCount(1);
+  await expect(fusionGroups.first()).toContainText(ncc.title);
+  expect(fusionBoardGets).toBeGreaterThanOrEqual(2);
+
   await page.getByRole("link", { name: "Sélection" }).click();
   await expect(page).toHaveURL(`/editions/${editionId}/selection`);
   await expect(
     page.getByRole("heading", { name: "Sélection des sujets" }),
   ).toBeVisible();
-  await page.getByText("Organiser les publications").click();
-  const firstGroup = page
-    .locator(".advanced-group-card")
-    .filter({ hasText: cyfirma.title });
-  const secondGroup = page
-    .locator(".advanced-group-card")
-    .filter({ hasText: ncc.title });
-  await firstGroup.getByLabel("Retenir pour une fusion").check();
-  await secondGroup.getByLabel("Retenir pour une fusion").check();
-  await page
-    .getByRole("button", { name: "Fusionner les groupes cochés" })
-    .click();
   await expect(page.locator(".editorial-group-card")).toHaveCount(1);
   await page
     .locator(".editorial-group-card")

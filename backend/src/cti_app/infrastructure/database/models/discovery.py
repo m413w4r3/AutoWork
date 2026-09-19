@@ -97,6 +97,44 @@ class DiscoveryBatchRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class DiscoveryCandidateRow(Base):
+    __tablename__ = "discovery_candidates"
+    __table_args__ = (
+        CheckConstraint("position >= 1", name="ck_discovery_candidates_position"),
+        CheckConstraint(
+            "jsonb_typeof(payload) = 'object'",
+            name="ck_discovery_candidates_payload_object",
+        ),
+        UniqueConstraint(
+            "discovery_batch_id",
+            "position",
+            name="uq_discovery_candidates_batch_position",
+        ),
+        Index(
+            "uq_discovery_candidates_supersedes",
+            "supersedes_candidate_id",
+            unique=True,
+            postgresql_where=text("supersedes_candidate_id IS NOT NULL"),
+        ),
+        Index("ix_discovery_candidates_batch_position", "discovery_batch_id", "position", "id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    discovery_run_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_runs.id", ondelete="RESTRICT"), nullable=False
+    )
+    discovery_batch_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT"), nullable=False
+    )
+    position: Mapped[int] = mapped_column(nullable=False)
+    supersedes_candidate_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_candidates.id", ondelete="RESTRICT"),
+    )
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class DiscoveryIntakeRow(Base):
     __tablename__ = "discovery_intakes"
     __table_args__ = (
@@ -149,8 +187,8 @@ class DiscoveryMergeRunRow(Base):
             use_alter=True,
         ),
     )
-    intake_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=False
+    intake_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=True
     )
     planner_kind: Mapped[str] = mapped_column(String(32), nullable=False)
     merge_model_run_id: Mapped[UUID | None] = mapped_column(
@@ -230,8 +268,8 @@ class DiscoverySnapshotRow(Base):
     parent_snapshot_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("discovery_snapshots.id", ondelete="RESTRICT")
     )
-    intake_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=False
+    intake_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=True
     )
     merge_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
@@ -281,7 +319,7 @@ class SubjectMergeEventRow(Base):
 class SubjectContributionRow(Base):
     __tablename__ = "subject_contributions"
     __table_args__ = (
-        UniqueConstraint("intake_id", "candidate_key", name="uq_subject_contributions_candidate"),
+        UniqueConstraint("candidate_id", name="uq_subject_contributions_candidate"),
         CheckConstraint("first_seen_version > 0", name="ck_subject_contributions_version"),
         Index("ix_subject_contributions_subject", "subject_id", "created_at"),
     )
@@ -295,8 +333,11 @@ class SubjectContributionRow(Base):
     intake_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("discovery_intakes.id", ondelete="RESTRICT"), nullable=False
     )
-    candidate_key: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
-    candidate_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    candidate_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_candidates.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
     first_seen_snapshot_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("discovery_snapshots.id", ondelete="RESTRICT"),

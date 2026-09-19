@@ -163,6 +163,19 @@ class EditorialGroup:
             self.candidate_references = updated
             self._bump()
 
+    def synchronize_candidate_references(
+        self, references: tuple[CandidateReference, ...]
+    ) -> None:
+        """Project canonical Fusion membership onto a live editorial group."""
+        if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
+            raise ValueError("Only proposed or selected groups can be synchronized")
+        updated = tuple(dict.fromkeys(references))
+        if not updated:
+            raise ValueError("A synchronized editorial group cannot be empty")
+        if updated != self.candidate_references:
+            self.candidate_references = updated
+            self._bump()
+
     def supersede(self) -> None:
         if self.status is not EditorialGroupStatus.PROPOSED:
             raise ValueError("Only proposed groups can be merged")

@@ -2,15 +2,22 @@
 
 ## Pipeline en deux passes
 
-`EditorialGroupingService` transforme les `CandidateTopic` persistés en groupes éditoriaux.
-La première passe est déterministe et explicable : URL canonique, URL de document déjà
-archivé, domaine, proximité de date, titre normalisé, entités CTI déjà déclarées et IOC
-connus. Elle compare le batch courant, les groupes de l'édition — y compris déjà sélectionnés
-— et les groupes sélectionnés des éditions antérieures du même pays.
+`EditorialGroup` est une projection de compatibilité destinée à la lecture de Selection. Elle
+reflète les relations explicables entre `DiscoveryCandidate` et l'état de sélection ; elle ne
+remplace jamais l'identité fonctionnelle `DiscoveryCandidate.id`. `EditorialGroupingService`
+calcule cette projection à partir de signaux déterministes : URL canonique, URL de document déjà
+archivé, domaine, proximité de date, titre normalisé, entités CTI déjà déclarées et IOC connus.
+Il compare le batch courant, les groupes de l'édition — y compris déjà sélectionnés — et les
+groupes sélectionnés des éditions antérieures du même pays.
+
+Ce service n'est pas l'autorité de Fusion et n'expose pas les décisions métier `merge` ou `split`.
+Ces opérations appartiennent à la capacité Fusion, qui travaille sur des UUID métier et un
+`snapshot_version`. Selection consomme la projection pour décider de retenir, rejeter ou composer
+un sujet ; elle ne réécrit pas les candidats.
 
 Une correspondance déterministe forte (hard identity evidence : URL anchor + corroborator,
-ou identifiant explicite de campagne/incident) enrichit un groupe — qu'il soit PROPOSED ou
-SELECTED. Un groupe SELECTED conserve son `subject_id` lors de cet enrichissement,
+ou identifiant explicite de campagne/incident) enrichit la projection — qu'elle soit PROPOSED ou
+SELECTED. Une projection SELECTED conserve son `subject_id` lors de cet enrichissement,
 et ses `needs_source_expansion`/`needs_source_verification` sont marqués pour déclencher
 la collecte des nouvelles URL.
 
@@ -22,13 +29,13 @@ antérieur.
 
 La seconde passe s'exécute dans le job de découverte et appelle uniquement le port
 `StructuredExtractionModel`, seulement pour les scores déterministes ambigus (0.45–0.85).
-Son schéma fermé peut proposer merge, séparation, mise à jour ou reprise non indépendante.
+Son schéma fermé peut proposer merge, séparation, mise à jour ou reprise non indépendante, mais
+la suggestion modèle reste séparée des signaux déterministes et n'a aucune autorité structurelle.
 
-**Patch 1 (Consolidation d'identité)**: Le LLM n'a plus d'autorité de fusion structurelle.
 Même si le LLM recommande "merge", l'outcome reste `AMBIGUOUS_REVIEW` avec la suggestion du
-modèle flaggée pour révision humaine. Seule une action `HumanDecisionType.MERGE` appliquée
-par l'analyste peut causer une fusion structurelle; les correspondances déterministes fortes
-(hard identity evidence) s'enrichissent automatiquement sans intervention humaine.
+modèle flaggée pour révision humaine. Seule une décision humaine exécutée par Fusion peut causer
+une fusion structurelle ; les correspondances déterministes fortes (hard identity evidence)
+restent des signaux de compatibilité et ne réidentifient pas les candidats.
 
 La justification du LLM reste une confiance de regroupement : ce n'est ni un fait probant,
 ni un niveau d'attribution. Un résultat ambigu ou indisponible reste présenté à l'analyste.
@@ -55,11 +62,11 @@ Le score contient six dimensions de 0 à 4 : impact, nouveauté, profondeur tech
 potentiel de chasse, actionnabilité et qualité des sources. Chaque dimension possède une
 justification. Ce score ordonne l'information ; aucun seuil ne sélectionne un groupe.
 
-Les endpoints sous `/api/editions/{edition_id}/editorial-groups` exposent le board et les
-actions `merge`, `split`, `reject` et `select`. Chaque action reçoit l'identité locale
-`dev-analyst` et le `correlation_id`. Les décisions sont ajoutées à `human_decisions`, protégée
-contre `UPDATE` et `DELETE` par PostgreSQL. Une fusion peut être corrigée par une nouvelle
-décision de séparation ; l'historique précédent n'est pas réécrit.
+Les endpoints sous `/api/editions/{edition_id}/editorial-groups` exposent le board de Selection
+et les actions `reject` et `select`. Chaque action reçoit l'identité locale `dev-analyst` et le
+`correlation_id`. Les décisions sont ajoutées à `human_decisions`, protégée contre `UPDATE` et
+`DELETE` par PostgreSQL. Les décisions `merge` et `split` sont exposées par Fusion ; elles peuvent
+être corrigées par une nouvelle décision, sans réécrire l'historique précédent.
 
 La sélection exige explicitement `brief` ou `major`, crée un `Subject`, matérialise son
 workspace logique avec un manifeste `canonical=false`, puis marque le groupe `selected`.

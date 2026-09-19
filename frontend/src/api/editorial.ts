@@ -93,23 +93,6 @@ export function fetchEditorialBoard(
   );
 }
 
-export function mergeEditorialGroups(
-  editionId: string,
-  groupIds: string[],
-): Promise<EditorialBoardResult> {
-  return mutate(editionId, "/merge", { group_ids: groupIds });
-}
-
-export function splitEditorialGroup(
-  editionId: string,
-  groupId: string,
-  candidateIds: string[],
-): Promise<EditorialBoardResult> {
-  return mutate(editionId, `/${encodeURIComponent(groupId)}/split`, {
-    candidate_ids: candidateIds,
-  });
-}
-
 export function confirmEditorialDecisions(
   editionId: string,
   decisions: Array<{
