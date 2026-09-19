@@ -4,22 +4,11 @@ import { useMemo, useState } from "react";
 import {
   confirmEditorialDecisions,
   fetchEditorialBoard,
-  mergeEditorialGroups,
-  splitEditorialGroup,
   type EditorialBoardResult,
   type EditorialDecision,
   type EditorialGroup,
 } from "../api/editorial";
 import { Link } from "../routing";
-
-const scoreLabels: Record<string, string> = {
-  impact: "Impact",
-  novelty: "Nouveauté",
-  technical_depth: "Profondeur technique",
-  hunting_potential: "Potentiel de chasse",
-  actionability: "Actionnabilité",
-  source_quality: "Qualité des sources",
-};
 
 const typeLabels: Record<string, string> = {
   ipv4: "IPv4",
@@ -44,7 +33,6 @@ export function EditorialBoard({
   readOnly?: boolean;
 }) {
   const queryClient = useQueryClient();
-  const [checkedGroups, setCheckedGroups] = useState<string[]>([]);
   const [drafts, setDrafts] = useState<Record<string, EditorialDecision>>({});
   const board = useQuery({
     queryKey: ["editorial-board", editionId],
@@ -55,7 +43,6 @@ export function EditorialBoard({
     mutationFn: (operation: () => Promise<EditorialBoardResult>) => operation(),
     onSuccess: (updated) => {
       queryClient.setQueryData(["editorial-board", editionId], updated);
-      setCheckedGroups([]);
       setDrafts({});
     },
   });
@@ -92,8 +79,6 @@ export function EditorialBoard({
       board.data.groups.filter((group) => group.status === "rejected").length) +
     draftIgnored;
   const currentUndecided = proposed.length - activeDraftEntries.length;
-  const checkedProposed = checkedGroups.filter((id) => proposedIds.has(id));
-
   return (
     <>
       <section
@@ -201,46 +186,6 @@ export function EditorialBoard({
             <SubjectList groups={ready} />
           )}
         </section>
-
-        {!readOnly ? (
-          <details className="advanced-editorial-panel">
-            <summary>Organiser les publications</summary>
-            <p>
-              Fusion, séparation et signaux de regroupement restent disponibles
-              pour les cas ambigus.
-            </p>
-            <button
-              className="button button--secondary"
-              disabled={checkedProposed.length < 2 || action.isPending}
-              onClick={() =>
-                action.mutate(() =>
-                  mergeEditorialGroups(editionId, checkedProposed),
-                )
-              }
-            >
-              Fusionner les groupes cochés
-            </button>
-            <div className="advanced-group-list">
-              {proposed.map((group) => (
-                <AdvancedGroupControls
-                  key={group.id}
-                  group={group}
-                  checked={checkedGroups.includes(group.id)}
-                  pending={action.isPending}
-                  editionId={editionId}
-                  onChecked={(checked) =>
-                    setCheckedGroups((current) =>
-                      checked
-                        ? [...new Set([...current, group.id])]
-                        : current.filter((id) => id !== group.id),
-                    )
-                  }
-                  onAction={(operation) => action.mutate(operation)}
-                />
-              ))}
-            </div>
-          </details>
-        ) : null}
       </section>
     </>
   );
@@ -434,93 +379,5 @@ function SubjectList({ groups }: { groups: EditorialGroup[] }) {
         );
       })}
     </ul>
-  );
-}
-
-function AdvancedGroupControls({
-  group,
-  checked,
-  pending,
-  editionId,
-  onChecked,
-  onAction,
-}: {
-  group: EditorialGroup;
-  checked: boolean;
-  pending: boolean;
-  editionId: string;
-  onChecked: (checked: boolean) => void;
-  onAction: (operation: () => Promise<EditorialBoardResult>) => void;
-}) {
-  const [splitIds, setSplitIds] = useState<string[]>([]);
-  const canSplit =
-    splitIds.length > 0 && splitIds.length < group.candidates.length;
-
-  return (
-    <article className="advanced-group-card">
-      <h4>{group.title}</h4>
-      <label className="group-check">
-        <input
-          type="checkbox"
-          checked={checked}
-          disabled={pending}
-          onChange={(event) => onChecked(event.target.checked)}
-        />
-        Retenir pour une fusion
-      </label>
-      <p>
-        <strong>Justification du regroupement :</strong>{" "}
-        {group.grouping_justification}
-      </p>
-      {group.historical_comparison ? (
-        <aside className="historical-comparison">
-          <strong>Comparaison historique</strong>
-          <p>{group.historical_comparison.title}</p>
-        </aside>
-      ) : null}
-      <details className="score-details">
-        <summary>Détails du score — {group.score.total}/24</summary>
-        <dl>
-          {Object.entries(scoreLabels).map(([key, label]) => (
-            <div key={key}>
-              <dt>
-                {label} :{" "}
-                {group.score[key as keyof typeof group.score] as number}/4
-              </dt>
-              <dd>{group.score.justifications[key]}</dd>
-            </div>
-          ))}
-        </dl>
-      </details>
-      <fieldset className="group-candidates">
-        <legend>Publications regroupées</legend>
-        {group.candidates.map((candidate) => (
-          <label key={candidate.id}>
-            <input
-              type="checkbox"
-              checked={splitIds.includes(candidate.id)}
-              disabled={group.candidates.length < 2 || pending}
-              onChange={(event) =>
-                setSplitIds((current) =>
-                  event.target.checked
-                    ? [...current, candidate.id]
-                    : current.filter((id) => id !== candidate.id),
-                )
-              }
-            />
-            {candidate.title}
-          </label>
-        ))}
-      </fieldset>
-      <button
-        className="button button--secondary"
-        disabled={!canSplit || pending}
-        onClick={() =>
-          onAction(() => splitEditorialGroup(editionId, group.id, splitIds))
-        }
-      >
-        Séparer les publications cochées
-      </button>
-    </article>
   );
 }

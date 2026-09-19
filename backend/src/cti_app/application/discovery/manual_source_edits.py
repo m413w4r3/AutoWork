@@ -43,9 +43,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryInputMode,
     DiscoverySnapshot,
     DiscoverySubject,
-    discovery_candidate_key,
 )
-from cti_app.domain.editorial import CandidateReference
 
 
 class IncompleteSourceCandidateNotFoundError(LookupError):
@@ -381,78 +379,17 @@ class ManualSourceEditService:
         intake, _ = await self._cumulative.ingest_batch(
             batch, input_mode=DiscoveryInputMode.MANUAL_IMPORT, actor_id=actor_id
         )
-        assert candidate.local_ref is not None
-        incoming_candidate_key = discovery_candidate_key(intake.id, candidate.local_ref)
-        new_snapshot = await self._cumulative.reconcile_intake(
+        # L'identité de fusion est l'UUID canonique de la candidate corrigée,
+        # jamais une clé dérivée du `local_ref` : deux corrections successives
+        # partagent le même `local_ref` mais sont deux candidates distinctes.
+        return await self._cumulative.reconcile_intake(
             intake.id,
             expected_parent_snapshot_id=snapshot.id,
             actor_id=actor_id,
             planner_override=TargetedMergePlanner(
-                subject_id, incoming_candidate_key, operation=operation
+                subject_id, batch.candidates[0].id, operation=operation
             ),
         )
-        if operation == "replace":
-            assert replaced_canonical_url is not None
-            await self._replace_editorial_source_reference(
-                edition_id=edition_id,
-                subject_id=subject_id,
-                replacement_batch=batch,
-                replacement_candidate=batch.candidates[0],
-                original_candidate=original_candidate,
-                replaced_canonical_url=replaced_canonical_url,
-            )
-        return new_snapshot
-
-    async def _replace_editorial_source_reference(
-        self,
-        *,
-        edition_id: UUID,
-        subject_id: UUID,
-        replacement_batch: DiscoveryBatch,
-        replacement_candidate: CandidateTopic,
-        original_candidate: DiscoveryCandidate,
-        replaced_canonical_url: str,
-    ) -> None:
-        """Make the editorial group consume the replacement candidate.
-
-        The cumulative snapshot keeps immutable member references for audit
-        lineage. The selected editorial group, however, must stop feeding the
-        old raw candidate to future production snapshots, otherwise the old
-        inaccessible URL would be recaptured alongside its replacement.
-        """
-        async with self._uow_factory() as uow:
-            groups = uow.editorial_groups
-            group = await groups.get_by_subject(subject_id)
-            if group is None or group.edition_id != edition_id:
-                return
-            replacement_reference = CandidateReference(
-                replacement_batch.id, replacement_candidate.id
-            )
-            original_reference = CandidateReference(
-                original_candidate.discovery_batch_id, original_candidate.id
-            )
-            replacements: dict[CandidateReference, CandidateReference] = {}
-            for reference in group.candidate_references:
-                if reference == original_reference:
-                    replacements[reference] = replacement_reference
-                    continue
-                # Other members of the legacy group still carrying the replaced
-                # URL are resolved through their canonical candidate identity.
-                member = await uow.discovery_candidates.get(reference.candidate_id)
-                if (
-                    member is not None
-                    and member.discovery_batch_id == reference.batch_id
-                    and any(
-                        source.canonical_url == replaced_canonical_url
-                        for source in member.evidence.sources
-                    )
-                ):
-                    replacements[reference] = replacement_reference
-            group.replace_candidate_references(replacements)
-            if replacement_reference not in group.candidate_references:
-                group.add_candidates((replacement_reference,))
-            await groups.save(group)
-            await uow.commit()
 
 
 def _find_incomplete_source(

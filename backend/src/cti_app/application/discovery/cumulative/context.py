@@ -12,36 +12,38 @@ from cti_app.application.discovery.cumulative.types import (
     ResolvedMergeHandles,
 )
 from cti_app.application.discovery_identity import normalize
-from cti_app.domain.discovery import CandidateTopic, DiscoveryBatch
+from cti_app.domain.discovery import CandidateTopic, DiscoveryCandidate
 from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoverySnapshot,
     DiscoverySubject,
     canonical_sha256,
-    discovery_candidate_key,
 )
 
 NO_BLOCKING_VERSION = "all-active-v1"
 DISCOVERY_BLOCKING_VERSION = "recall-v1"
 
 
-def build_discovery_delta(intake: DiscoveryIntake, batch: DiscoveryBatch) -> DiscoveryDelta:
-    candidates = tuple(
+def build_discovery_delta(
+    intake: DiscoveryIntake, candidates: Sequence[DiscoveryCandidate]
+) -> DiscoveryDelta:
+    incoming = tuple(
         IncomingDiscoveryCandidate(
             handle=f"C{index}",
-            candidate_key=discovery_candidate_key(intake.id, candidate.local_ref or f"S{index}"),
-            candidate=deepcopy(candidate),
-            batch_id=batch.id,
+            candidate_id=candidate.id,
+            candidate=deepcopy(candidate.to_candidate_topic()),
         )
-        for index, candidate in enumerate(batch.candidates, 1)
+        for index, candidate in enumerate(
+            sorted(candidates, key=lambda item: (item.position, str(item.id))), 1
+        )
     )
     return DiscoveryDelta(
         intake_id=intake.id,
-        candidates=candidates,
+        candidates=incoming,
         delta_hash=canonical_sha256(
             [
-                _candidate_content(item.candidate, candidate_key=item.candidate_key)
-                for item in candidates
+                _candidate_content(item.candidate, candidate_id=item.candidate_id)
+                for item in incoming
             ]
         ),
     )
@@ -201,10 +203,10 @@ def project_merge_input(
 
 
 def _candidate_content(
-    candidate: CandidateTopic, *, candidate_key: UUID | None = None
+    candidate: CandidateTopic, *, candidate_id: UUID | None = None
 ) -> dict[str, object]:
     return {
-        "candidate_key": str(candidate_key) if candidate_key else None,
+        "candidate_id": str(candidate_id) if candidate_id else None,
         "title": candidate.title,
         "summary": candidate.summary,
         "novelty": candidate.novelty,

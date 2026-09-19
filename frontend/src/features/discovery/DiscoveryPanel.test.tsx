@@ -140,6 +140,75 @@ afterEach(() => {
 });
 
 describe("DiscoveryPanel durable run history", () => {
+  it("affiche les cartes correspondant exactement aux candidats bruts renvoyés", async () => {
+    const rawCandidates = [
+      candidate("raw-a", "run-raw", "Candidat brut A"),
+      candidate("raw-b", "run-raw", "Candidat brut B"),
+    ];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((input: RequestInfo | URL) => {
+        const url = requestUrl(input);
+        if (url.endsWith("/discovery/runs"))
+          return Promise.resolve(Response.json([]));
+        if (url.includes("/discovery/candidates"))
+          return Promise.resolve(
+            Response.json({
+              batches: [],
+              candidates: rawCandidates,
+              total: rawCandidates.length,
+              warning: "",
+            }),
+          );
+        if (url.includes("/editorial-groups"))
+          return Promise.resolve(Response.json({ groups: [] }));
+        return Promise.resolve(Response.json([]));
+      }),
+    );
+
+    renderPanel();
+
+    expect(
+      await screen.findByRole("heading", { name: "Candidat brut A" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Candidat brut B" }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Résumé brut.")).toHaveLength(2);
+    expect(
+      screen.getByRole("link", { name: "Voir la fusion" }),
+    ).toHaveAttribute("href", `/editions/${editionId}/fusion`);
+  });
+
+  it("bloque seulement lorsqu’une réconciliation bridge est active", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url.includes("/api/jobs?") && url.includes("reconcile_discovery"))
+        return Promise.resolve(
+          Response.json([{ status: "running", kind: "reconcile_discovery" }]),
+        );
+      if (url.endsWith("/discovery/runs"))
+        return Promise.resolve(Response.json([]));
+      if (url.includes("/discovery/candidates"))
+        return Promise.resolve(
+          Response.json({ batches: [], candidates: [], total: 0, warning: "" }),
+        );
+      if (url.includes("/editorial-groups"))
+        return Promise.resolve(Response.json({ groups: [] }));
+      return Promise.resolve(Response.json([]));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderPanel();
+
+    expect(
+      await screen.findByText(/bridge ChatGPT est occupé/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Nouvelle recherche ChatGPT" }),
+    ).toBeDisabled();
+  });
+
   it("renders newest-first history and every execution projection", async () => {
     const runs = [
       run("newest", "running", {

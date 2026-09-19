@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Collection, Sequence
 from uuid import UUID
 
 from cti_app.application.discovery.cumulative.types import ResolvedMergeHandles
 from cti_app.application.discovery_identity import normalize
-from cti_app.domain.discovery import CandidateTopic
+from cti_app.domain.discovery import CandidateTopic, DiscoveryCandidate
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeGroup,
     DiscoveryMergePlanV1,
@@ -70,6 +71,45 @@ def validate_merge_plan(
     return plan, tuple(plan.warnings)
 
 
+def validate_candidate_coverage(
+    eligible_candidates: Sequence[DiscoveryCandidate],
+    snapshot: DiscoverySnapshot,
+    *,
+    pending_candidate_ids: Collection[UUID] = (),
+) -> None:
+    """Require one and only one structural home for every eligible candidate.
+
+    Candidates without an intake are intentionally not passed as eligible: they
+    are unstabilized historical persistence and must not block a concurrent
+    intake.  Pending candidates are those belonging to an intaked batch whose
+    reconciliation has not produced a snapshot yet.
+    """
+    snapshot_counts: dict[UUID, int] = {}
+    for subject in snapshot.subjects:
+        for reference in subject.member_references:
+            snapshot_counts[reference.candidate_id] = (
+                snapshot_counts.get(reference.candidate_id, 0) + 1
+            )
+    pending = set(pending_candidate_ids)
+    eligible = {candidate.id for candidate in eligible_candidates}
+    if len(pending - eligible):
+        raise ValueError("Candidate coverage contains an unknown pending candidate")
+    invalid: list[str] = []
+    for candidate_id in sorted(eligible, key=str):
+        count = snapshot_counts.get(candidate_id, 0)
+        pending_count = int(candidate_id in pending)
+        if count + pending_count != 1 or (count and pending_count):
+            invalid.append(str(candidate_id))
+    unexpected = (set(snapshot_counts) | pending) - eligible
+    if unexpected:
+        invalid.extend(str(candidate_id) for candidate_id in sorted(unexpected, key=str))
+    if invalid:
+        raise ValueError(
+            "Every eligible canonical candidate must have exactly one structural home: "
+            + ", ".join(dict.fromkeys(invalid))
+        )
+
+
 def apply_editorial_duplicate_guard(
     plan: DiscoveryMergePlanV1,
     handles: ResolvedMergeHandles,
@@ -129,7 +169,7 @@ def merge_plan_review_reasons(plan: DiscoveryMergePlanV1) -> tuple[str, ...]:
     return tuple(dict.fromkeys(reasons))
 
 
-def _requires_review(group: DiscoveryMergeGroup) -> bool:
+def requires_review(group: DiscoveryMergeGroup) -> bool:
     return (
         group.disposition is MergeDisposition.REVIEW
         or group.confidence is not MergeConfidence.HIGH

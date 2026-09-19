@@ -30,7 +30,6 @@ class FakeCumulativeDiscoveryService:
     def __init__(self, run: DiscoveryMergeRun, snapshot: DiscoverySnapshot) -> None:
         self.run = run
         self.snapshot = snapshot
-        self.decisions: list[object] = []
 
     async def list_merge_runs(self, edition_id: UUID) -> list[DiscoveryMergeRun]:
         return [self.run] if edition_id == self.run.edition_id else []
@@ -55,23 +54,8 @@ class FakeCumulativeDiscoveryService:
             for handle in self.run.handle_map
         }
 
-    async def resolve_merge_run(
-        self,
-        edition_id: UUID,
-        run_id: UUID,
-        decisions: list[object],
-        *,
-        actor_id: str,
-    ) -> DiscoverySnapshot:
-        assert edition_id == self.run.edition_id
-        assert run_id == self.run.id
-        assert actor_id == "dev-analyst"
-        self.decisions = decisions
-        return self.snapshot
-
-
 @pytest.mark.asyncio
-async def test_merge_review_api_lists_details_and_resolves_plan() -> None:
+async def test_merge_review_api_lists_details_without_human_mutation_endpoint() -> None:
     edition_id = uuid4()
     run = DiscoveryMergeRun(
         id=uuid4(),
@@ -133,11 +117,10 @@ async def test_merge_review_api_lists_details_and_resolves_plan() -> None:
             json={"group_decisions": [{"group_index": 0, "action": "accept"}]},
         )
 
-    assert listing.status_code == detail.status_code == resolution.status_code == 200
+    assert listing.status_code == detail.status_code == 200
+    assert resolution.status_code == 404
     assert detail.json()["review_reasons"] == ["confidence_medium"]
     assert detail.json()["projected_diff"][0]["incoming_candidate_handles"] == ["C1"]
-    assert resolution.json() == {"snapshot_id": str(snapshot.id), "snapshot_version": 3}
-    assert len(service.decisions) == 1
 
 
 class FakeManualSourceEditService:

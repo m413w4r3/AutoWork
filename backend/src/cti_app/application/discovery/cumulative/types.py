@@ -19,9 +19,8 @@ from cti_app.domain.discovery_cumulative import (
 @dataclass(frozen=True, slots=True)
 class IncomingDiscoveryCandidate:
     handle: str
-    candidate_key: UUID
+    candidate_id: UUID
     candidate: CandidateTopic
-    batch_id: UUID
 
 
 @dataclass(frozen=True, slots=True)

@@ -21,12 +21,13 @@ from cti_app.application.discovery.cumulative.types import (
     ResolvedMergeHandles,
 )
 from cti_app.application.discovery.cumulative.validation import (
-    _requires_review,
+    requires_review,
     validate_merge_plan,
 )
 from cti_app.application.discovery_identity import normalize
 from cti_app.domain.discovery import (
     CandidateTopic,
+    DiscoveryCandidate,
     IncompleteSourceCandidate,
     ProvisionalDiscoveryIoc,
     SourceCandidate,
@@ -54,11 +55,12 @@ def apply_discovery_merge_plan(
     parent_snapshot: DiscoverySnapshot | None,
     delta: DiscoveryDelta,
     plan: DiscoveryMergePlanV1,
+    canonical_candidates: Sequence[DiscoveryCandidate],
     *,
     resolved_handles: ResolvedMergeHandles,
     planner_kind: DiscoveryPlannerKind,
     edition_id: UUID,
-    intake_id: UUID,
+    intake_id: UUID | None,
     merge_run_id: UUID,
     actor_id: str = "system",
 ) -> AppliedDiscoveryMerge:
@@ -66,16 +68,25 @@ def apply_discovery_merge_plan(
     review_groups = [
         index
         for index, group in enumerate(plan.groups)
-        if _requires_review(group) and planner_kind is not DiscoveryPlannerKind.HUMAN
+        if requires_review(group) and planner_kind is not DiscoveryPlannerKind.HUMAN
     ]
     if review_groups:
         raise ValueError(f"Merge plan requires human review for groups {review_groups}")
 
+    candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
     parent_subjects = {
         subject.subject_id: deepcopy(subject)
         for subject in (parent_snapshot.subjects if parent_snapshot else ())
     }
-    final_subjects = dict(parent_subjects)
+    # A historical snapshot may still contain members that were superseded by
+    # a later canonical candidate. Keep the historical subject available for a
+    # targeted replacement, but only carry subjects with active members into
+    # the new snapshot.
+    final_subjects: dict[UUID, DiscoverySubject] = {}
+    for subject in parent_subjects.values():
+        reconstructed = _reconstruct_subject(subject, candidates_by_id)
+        if reconstructed is not None:
+            final_subjects[subject.subject_id] = reconstructed
     identities: list[DiscoverySubjectIdentity] = []
     contributions: list[SubjectContribution] = []
     merge_events: list[SubjectMergeEvent] = []
@@ -96,25 +107,29 @@ def apply_discovery_merge_plan(
         ]
         if existing_ids:
             subject_id = existing_ids[0]
-            base = final_subjects[subject_id]
-            absorbed = [final_subjects[value] for value in existing_ids[1:]]
-            merged_candidate, merge_warnings = _merge_candidates(
-                base.candidate,
+            base = parent_subjects[subject_id]
+            absorbed = [parent_subjects[value] for value in existing_ids[1:]]
+            member_ids = _active_member_ids(
                 [
-                    *(subject.candidate for subject in absorbed),
-                    *(item.candidate for item in incoming),
+                    *(reference.candidate_id for reference in base.member_references),
+                    *(
+                        reference.candidate_id
+                        for subject in absorbed
+                        for reference in subject.member_references
+                    ),
+                    *(item.candidate_id for item in incoming),
                 ],
+                candidates_by_id,
+            )
+            if not member_ids:
+                final_subjects.pop(subject_id, None)
+                continue
+            merged_candidate, merge_warnings = _subject_topic(
+                member_ids, candidates_by_id, preferred_id=base.candidate.id
             )
             warnings.extend(merge_warnings)
             references = _unique_member_references(
-                [
-                    *base.member_references,
-                    *(reference for subject in absorbed for reference in subject.member_references),
-                    *(
-                        DiscoveryMemberReference(item.batch_id, item.candidate.id)
-                        for item in incoming
-                    ),
-                ]
+                DiscoveryMemberReference(candidate_id) for candidate_id in member_ids
             )
             final_subjects[subject_id] = DiscoverySubject(
                 subject_id=subject_id,
@@ -123,7 +138,7 @@ def apply_discovery_merge_plan(
                 created_at=base.created_at,
             )
             for absorbed_subject in absorbed:
-                final_subjects.pop(absorbed_subject.subject_id)
+                final_subjects.pop(absorbed_subject.subject_id, None)
                 merge_events.append(
                     SubjectMergeEvent(
                         edition_id=edition_id,
@@ -140,13 +155,28 @@ def apply_discovery_merge_plan(
                     )
                 )
         else:
-            keys = tuple(sorted((item.candidate_key for item in incoming), key=str))
-            origin_key = discovery_origin_key(keys)
+            active_incoming = [
+                item for item in incoming if item.candidate_id in candidates_by_id
+            ]
+            member_ids = tuple(
+                sorted({item.candidate_id for item in active_incoming}, key=str)
+            )
+            if not member_ids:
+                continue
+            origin_key = discovery_origin_key(member_ids)
             subject_id = discovery_subject_id(edition_id, origin_key)
-            representative = _pick_new_subject_representative(incoming)
+            canonical_incoming = [
+                IncomingDiscoveryCandidate(
+                    handle=item.handle,
+                    candidate_id=item.candidate_id,
+                    candidate=candidates_by_id[item.candidate_id].to_candidate_topic(),
+                )
+                for item in active_incoming
+            ]
+            representative = _pick_new_subject_representative(canonical_incoming)
             merged_candidate, merge_warnings = _merge_candidates(
                 representative.candidate,
-                [item.candidate for item in incoming if item is not representative],
+                [item.candidate for item in canonical_incoming if item is not representative],
             )
             warnings.extend(merge_warnings)
             created_at = datetime.now(UTC)
@@ -154,7 +184,7 @@ def apply_discovery_merge_plan(
                 subject_id=subject_id,
                 candidate=merged_candidate,
                 member_references=_unique_member_references(
-                    DiscoveryMemberReference(item.batch_id, item.candidate.id) for item in incoming
+                    DiscoveryMemberReference(candidate_id) for candidate_id in member_ids
                 ),
                 created_at=created_at,
             )
@@ -169,25 +199,29 @@ def apply_discovery_merge_plan(
             )
 
         for item in incoming:
+            if intake_id is None:
+                continue
+            if item.candidate_id not in candidates_by_id:
+                continue
+            candidate = candidates_by_id[item.candidate_id].to_candidate_topic()
             contributions.append(
                 SubjectContribution(
                     subject_id=subject_id,
                     intake_id=intake_id,
-                    candidate_key=item.candidate_key,
-                    candidate_id=item.candidate.id,
+                    candidate_id=item.candidate_id,
                     first_seen_snapshot_id=snapshot_id,
                     first_seen_version=next_version,
-                    contributed_title=item.candidate.title,
-                    contributed_summary=item.candidate.summary,
-                    contributed_source_ids=tuple(source.id for source in item.candidate.sources),
+                    contributed_title=candidate.title,
+                    contributed_summary=candidate.summary,
+                    contributed_source_ids=tuple(source.id for source in candidate.sources),
                     contributed_provisional_ioc_ids=tuple(
-                        ioc.id for ioc in item.candidate.provisional_iocs
+                        ioc.id for ioc in candidate.provisional_iocs
                     ),
                     merge_run_id=merge_run_id,
                     merge_group_index=group_index,
                     id=uuid5(
                         NAMESPACE_URL,
-                        f"discovery-contribution:{intake_id}:{item.candidate_key}:{subject_id}",
+                        f"discovery-contribution:{intake_id}:{item.candidate_id}:{subject_id}",
                     ),
                 )
             )
@@ -206,13 +240,220 @@ def apply_discovery_merge_plan(
         snapshot_hash=snapshot_hash,
         is_active=True,
     )
-    _assert_non_loss(parent_snapshot, delta, snapshot)
+    _assert_non_loss(parent_snapshot, delta, snapshot, candidates_by_id)
     return AppliedDiscoveryMerge(
         snapshot=snapshot,
         identities=tuple(identities),
         contributions=tuple(contributions),
         merge_events=tuple(merge_events),
         warnings=tuple(dict.fromkeys(warnings)),
+    )
+
+
+def apply_structural_subject_merge(
+    parent_snapshot: DiscoverySnapshot,
+    canonical_candidates: Sequence[DiscoveryCandidate],
+    *,
+    edition_id: UUID,
+    subject_ids: Sequence[UUID],
+    merge_run_id: UUID,
+    actor_id: str,
+) -> AppliedDiscoveryMerge:
+    """Reorganize existing memberships without inventing contributions."""
+    selected = [
+        subject for subject in parent_snapshot.subjects if subject.subject_id in subject_ids
+    ]
+    if (
+        len(set(subject_ids)) != len(subject_ids)
+        or len(selected) != len(set(subject_ids))
+        or len(selected) < 2
+    ):
+        raise ValueError("Manual merge subjects must all belong to the active snapshot")
+    survivor = min(selected, key=lambda item: (item.created_at, str(item.subject_id)))
+    candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
+    member_ids = _active_member_ids(
+        (
+            reference.candidate_id
+            for subject in selected
+            for reference in subject.member_references
+        ),
+        candidates_by_id,
+    )
+    if not member_ids:
+        raise ValueError("Manual merge subjects have no active canonical candidate")
+    merged_subject = _subject_from_member_ids(
+        survivor.subject_id,
+        survivor.created_at,
+        member_ids,
+        candidates_by_id,
+        preferred_id=survivor.candidate.id,
+    )
+    subjects = tuple(
+        sorted(
+            [
+                merged_subject,
+                *_reconstructed_others(
+                    parent_snapshot, candidates_by_id, excluded=set(subject_ids)
+                ),
+            ],
+            key=lambda item: str(item.subject_id),
+        )
+    )
+    events = tuple(
+        SubjectMergeEvent(
+            edition_id=edition_id,
+            from_subject_id=subject.subject_id,
+            into_subject_id=survivor.subject_id,
+            merge_run_id=merge_run_id,
+            actor_id=actor_id,
+            reason="human fusion merge",
+            id=uuid5(
+                NAMESPACE_URL,
+                f"discovery-subject-merge:{merge_run_id}:{subject.subject_id}:{survivor.subject_id}",
+            ),
+        )
+        for subject in selected
+        if subject.subject_id != survivor.subject_id
+    )
+    return _structural_result(
+        parent_snapshot,
+        subjects,
+        edition_id=edition_id,
+        merge_run_id=merge_run_id,
+        merge_events=events,
+    )
+
+
+def apply_structural_subject_split(
+    parent_snapshot: DiscoverySnapshot,
+    canonical_candidates: Sequence[DiscoveryCandidate],
+    *,
+    edition_id: UUID,
+    subject_id: UUID,
+    candidate_ids: Sequence[UUID],
+    merge_run_id: UUID,
+) -> AppliedDiscoveryMerge:
+    subjects_by_id = {subject.subject_id: subject for subject in parent_snapshot.subjects}
+    original = subjects_by_id.get(subject_id)
+    if original is None:
+        raise ValueError("The subject does not belong to the active snapshot")
+    candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
+    active_ids = set(
+        _active_member_ids(
+            (reference.candidate_id for reference in original.member_references),
+            candidates_by_id,
+        )
+    )
+    split_ids = set(candidate_ids)
+    if len(split_ids) != len(candidate_ids) or not split_ids or not split_ids < active_ids:
+        raise ValueError(
+            "Split candidate_ids must be a non-empty strict subset of the active members"
+        )
+    remaining_ids = tuple(sorted(active_ids - split_ids, key=str))
+    separated_ids = tuple(sorted(split_ids, key=str))
+    origin_key = f"split:{merge_run_id}:{':'.join(str(value) for value in separated_ids)}"
+    separated_subject_id = discovery_subject_id(edition_id, origin_key)
+    remaining = _subject_from_member_ids(
+        subject_id,
+        original.created_at,
+        remaining_ids,
+        candidates_by_id,
+        preferred_id=original.candidate.id,
+    )
+    separated = _subject_from_member_ids(
+        separated_subject_id,
+        datetime.now(UTC),
+        separated_ids,
+        candidates_by_id,
+    )
+    subjects = tuple(
+        sorted(
+            [
+                separated,
+                *_reconstructed_others(parent_snapshot, candidates_by_id, excluded={subject_id}),
+                remaining,
+            ],
+            key=lambda item: str(item.subject_id),
+        )
+    )
+    identity = DiscoverySubjectIdentity(
+        edition_id=edition_id,
+        origin_key=origin_key,
+        created_by_merge_run_id=merge_run_id,
+        id=separated_subject_id,
+    )
+    return _structural_result(
+        parent_snapshot,
+        subjects,
+        edition_id=edition_id,
+        merge_run_id=merge_run_id,
+        identities=(identity,),
+    )
+
+
+def _subject_from_member_ids(
+    subject_id: UUID,
+    created_at: datetime,
+    member_ids: Sequence[UUID],
+    candidates_by_id: dict[UUID, DiscoveryCandidate],
+    *,
+    preferred_id: UUID | None = None,
+) -> DiscoverySubject:
+    candidate, _ = _subject_topic(member_ids, candidates_by_id, preferred_id=preferred_id)
+    return DiscoverySubject(
+        subject_id=subject_id,
+        candidate=candidate,
+        member_references=tuple(DiscoveryMemberReference(value) for value in member_ids),
+        created_at=created_at,
+    )
+
+
+def _reconstructed_others(
+    parent_snapshot: DiscoverySnapshot,
+    candidates_by_id: dict[UUID, DiscoveryCandidate],
+    *,
+    excluded: set[UUID],
+) -> list[DiscoverySubject]:
+    others: list[DiscoverySubject] = []
+    for subject in parent_snapshot.subjects:
+        if subject.subject_id in excluded:
+            continue
+        reconstructed = _reconstruct_subject(subject, candidates_by_id)
+        if reconstructed is not None:
+            others.append(reconstructed)
+    return others
+
+
+def _structural_result(
+    parent_snapshot: DiscoverySnapshot,
+    subjects: tuple[DiscoverySubject, ...],
+    *,
+    edition_id: UUID,
+    merge_run_id: UUID,
+    identities: Sequence[DiscoverySubjectIdentity] = (),
+    merge_events: Sequence[SubjectMergeEvent] = (),
+) -> AppliedDiscoveryMerge:
+    snapshot = DiscoverySnapshot(
+        id=uuid5(
+            NAMESPACE_URL,
+            f"discovery-snapshot:{edition_id}:{parent_snapshot.id}:structural:{merge_run_id}",
+        ),
+        edition_id=edition_id,
+        version=parent_snapshot.version + 1,
+        parent_snapshot_id=parent_snapshot.id,
+        intake_id=None,
+        merge_run_id=merge_run_id,
+        planner_kind=DiscoveryPlannerKind.HUMAN,
+        subjects=subjects,
+        snapshot_hash=_snapshot_hash(subjects),
+        is_active=True,
+    )
+    return AppliedDiscoveryMerge(
+        snapshot=snapshot,
+        identities=tuple(identities),
+        contributions=(),
+        merge_events=tuple(merge_events),
+        warnings=(),
     )
 
 
@@ -228,13 +469,70 @@ def _pick_new_subject_representative(
             item.candidate.technical_potential,
             len(item.candidate.sources),
             # min() is used below; reverse the stable UUID preference separately.
-            str(item.candidate_key),
+            str(item.candidate_id),
         )
 
     best_rank = max(rank(item)[:3] for item in incoming)
     return min(
         (item for item in incoming if rank(item)[:3] == best_rank),
-        key=lambda item: str(item.candidate_key),
+        key=lambda item: str(item.candidate_id),
+    )
+
+
+def _active_member_ids(
+    candidate_ids: Iterable[UUID], candidates_by_id: dict[UUID, DiscoveryCandidate]
+) -> tuple[UUID, ...]:
+    return tuple(
+        sorted(
+            {candidate_id for candidate_id in candidate_ids if candidate_id in candidates_by_id},
+            key=str,
+        )
+    )
+
+
+def _subject_topic(
+    member_ids: Sequence[UUID],
+    candidates_by_id: dict[UUID, DiscoveryCandidate],
+    *,
+    preferred_id: UUID | None = None,
+) -> tuple[CandidateTopic, list[str]]:
+    """Rebuild a subject aggregate from its active canonical members.
+
+    D10: an existing subject keeps the prose of its current representative as
+    long as that member is still active; otherwise the deterministic
+    new-subject representative is chosen among the remaining members.
+    """
+    incoming = tuple(
+        IncomingDiscoveryCandidate(
+            handle=f"C{index}",
+            candidate_id=candidate_id,
+            candidate=candidates_by_id[candidate_id].to_candidate_topic(),
+        )
+        for index, candidate_id in enumerate(member_ids, 1)
+    )
+    representative = next(
+        (item for item in incoming if item.candidate_id == preferred_id), None
+    ) or _pick_new_subject_representative(incoming)
+    return _merge_candidates(
+        representative.candidate,
+        [item.candidate for item in incoming if item is not representative],
+    )
+
+
+def _reconstruct_subject(
+    subject: DiscoverySubject, candidates_by_id: dict[UUID, DiscoveryCandidate]
+) -> DiscoverySubject | None:
+    member_ids = _active_member_ids(
+        (reference.candidate_id for reference in subject.member_references), candidates_by_id
+    )
+    if not member_ids:
+        return None
+    return _subject_from_member_ids(
+        subject.subject_id,
+        subject.created_at,
+        member_ids,
+        candidates_by_id,
+        preferred_id=subject.candidate.id,
     )
 
 
@@ -393,9 +691,9 @@ def _unique_member_references(
     references: Iterable[DiscoveryMemberReference],
 ) -> tuple[DiscoveryMemberReference, ...]:
     materialized = list(references)
-    unique = {(item.batch_id, item.candidate_id): item for item in materialized}
+    unique = {item.candidate_id: item for item in materialized}
     return tuple(
-        unique[key] for key in sorted(unique, key=lambda item: (str(item[0]), str(item[1])))
+        unique[key] for key in sorted(unique, key=str)
     )
 
 
@@ -406,7 +704,7 @@ def _snapshot_hash(subjects: Sequence[DiscoverySubject]) -> str:
                 "subject_id": str(subject.subject_id),
                 "candidate": _candidate_content(subject.candidate),
                 "member_references": sorted(
-                    (str(ref.batch_id), str(ref.candidate_id)) for ref in subject.member_references
+                    str(ref.candidate_id) for ref in subject.member_references
                 ),
             }
             for subject in sorted(subjects, key=lambda item: str(item.subject_id))
@@ -415,23 +713,34 @@ def _snapshot_hash(subjects: Sequence[DiscoverySubject]) -> str:
 
 
 def _assert_non_loss(
-    parent: DiscoverySnapshot | None, delta: DiscoveryDelta, result: DiscoverySnapshot
+    parent: DiscoverySnapshot | None,
+    delta: DiscoveryDelta,
+    result: DiscoverySnapshot,
+    candidates_by_id: dict[UUID, DiscoveryCandidate],
 ) -> None:
     final_sources = [source for subject in result.subjects for source in subject.candidate.sources]
     expected_sources = [
-        source for candidate in delta.candidates for source in candidate.candidate.sources
+        source
+        for candidate in delta.candidates
+        if candidate.candidate_id in candidates_by_id
+        for source in candidates_by_id[candidate.candidate_id].evidence.sources
     ]
     if parent is not None:
         expected_sources.extend(
-            source for subject in parent.subjects for source in subject.candidate.sources
+            source
+            for subject in parent.subjects
+            for reference in subject.member_references
+            if reference.candidate_id in candidates_by_id
+            for source in candidates_by_id[reference.candidate_id].evidence.sources
         )
         parent_refs = {
-            (ref.batch_id, ref.candidate_id)
+            ref.candidate_id
             for subject in parent.subjects
             for ref in subject.member_references
+            if ref.candidate_id in candidates_by_id
         }
         final_refs = {
-            (ref.batch_id, ref.candidate_id)
+            ref.candidate_id
             for subject in result.subjects
             for ref in subject.member_references
         }

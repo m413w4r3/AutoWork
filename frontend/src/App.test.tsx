@@ -7,6 +7,14 @@ import { App } from "./App";
 import type { Edition } from "./api/editions";
 import { withProductionNotStarted } from "./test-utils/fetchStubs";
 
+vi.mock("./features/fusion/FusionBoard", () => ({
+  FusionBoard: ({ readOnly }: { readOnly?: boolean }) => (
+    <div data-testid="fusion-route" data-read-only={String(readOnly)}>
+      Fusion
+    </div>
+  ),
+}));
+
 const iranEdition: Edition = {
   id: "30e5b0b8-2dba-48c3-81ca-9eaed5c22c62",
   country: "Iran",
@@ -888,6 +896,7 @@ describe("routage d’une Edition", () => {
     for (const [label, path] of [
       ["Vue d’ensemble", ""],
       ["Découverte", "/discovery"],
+      ["Fusion", "/fusion"],
       ["Sélection", "/selection"],
       ["Productions", "/production"],
       ["Revue", "/review"],
@@ -932,6 +941,7 @@ describe("routage d’une Edition", () => {
   it("adresse chaque capacité indépendamment, sans blocage", async () => {
     const capabilities = [
       ["discovery", "Découverte"],
+      ["fusion", "Fusion"],
       ["selection", "Sélection"],
       ["production", "Productions"],
       ["review", "Revue"],

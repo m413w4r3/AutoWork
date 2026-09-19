@@ -12,6 +12,7 @@ from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.editions import router as editions_router
 from cti_app.api.editorial import router as editorial_router
+from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
@@ -30,6 +31,7 @@ from cti_app.application.discovery.cumulative.jobs import (
     ensure_discovery_reconciliation_job,
 )
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
+from cti_app.application.discovery.fusion import FusionService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.runs import DiscoveryRunService
 from cti_app.application.discovery.service import DiscoveryService
@@ -178,6 +180,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             return await job_service.get(exc.existing_job_id)
 
     cumulative_discovery_service.set_replan_intake(replan_discovery_intake)
+    fusion_service = FusionService(
+        uow_factory,
+        after_activation=editorial_service.synchronize,
+        replan_intake=replan_discovery_intake,
+    )
 
     discovery_service = DiscoveryService(
         uow_factory,
@@ -282,6 +289,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.discovery_service = discovery_service
     app.state.discovery_run_service = discovery_run_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
+    app.state.fusion_service = fusion_service
     app.state.manual_source_edit_service = manual_source_edit_service
     app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
@@ -371,6 +379,7 @@ def create_app() -> FastAPI:
     application.include_router(discovery_candidate_router)
     application.include_router(discovery_recovery_router)
     application.include_router(merge_runs_router)
+    application.include_router(fusion_router)
     application.include_router(editorial_router)
     application.include_router(jobs_router)
     application.include_router(collection_router)

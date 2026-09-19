@@ -138,27 +138,15 @@ class EditorialGroup:
         if self.source_relationship_status is SourceRelationshipStatus.PROVISIONAL:
             self.needs_source_verification = True
 
-    def add_candidates(self, references: tuple[CandidateReference, ...]) -> None:
-        # SELECTED fixes group identity, not membership; editors keep refining it.
-        if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
-            raise ValueError("Only proposed or selected groups can be enriched")
-        self.candidate_references = tuple(dict.fromkeys((*self.candidate_references, *references)))
-        self._bump()
-
-    def remove_candidates(self, references: set[CandidateReference]) -> None:
-        if self.status is not EditorialGroupStatus.PROPOSED:
-            raise ValueError("Only proposed groups can be split")
-        remaining = tuple(item for item in self.candidate_references if item not in references)
-        if not remaining:
-            raise ValueError("A split cannot empty its source group")
-        self.candidate_references = remaining
-        self._bump()
-
-    def replace_candidate_references(
-        self, replacements: dict[CandidateReference, CandidateReference]
+    def synchronize_candidate_references(
+        self, references: tuple[CandidateReference, ...]
     ) -> None:
-        updated = tuple(replacements.get(item, item) for item in self.candidate_references)
-        updated = tuple(dict.fromkeys(updated))
+        """Project canonical Fusion membership onto a live editorial group."""
+        if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
+            raise ValueError("Only proposed or selected groups can be synchronized")
+        updated = tuple(dict.fromkeys(references))
+        if not updated:
+            raise ValueError("A synchronized editorial group cannot be empty")
         if updated != self.candidate_references:
             self.candidate_references = updated
             self._bump()

@@ -14,7 +14,7 @@ from cti_app.application.subjects import SubjectService
 from cti_app.domain.blobs import BlobRecord
 from cti_app.domain.discovery import (
     CandidateTopic,
-    DiscoveryBatch,
+    DiscoveryCandidate,
     IocPresence,
     SourceRelationshipStatus,
     SourceRole,
@@ -132,13 +132,20 @@ class EditorialGroupingService:
             existing = list(await uow.editorial_groups.list_for_edition(edition_id))
             snapshot = await uow.discovery_snapshots.get_active(edition_id)
             if snapshot is None:
+                for group in existing:
+                    if (
+                        group.status is EditorialGroupStatus.PROPOSED
+                        and group.discovery_subject_id is not None
+                    ):
+                        group.supersede()
+                        await uow.editorial_groups.save(group)
+                await uow.commit()
                 return existing
-            batches = [
-                batch
-                for batch in await uow.discovery_batches.list_for_edition(edition_id)
-                if batch.is_active_revision
-            ]
-            candidates = _candidate_map(batches)
+            canonical_candidates = await uow.discovery_candidates.list_for_edition(
+                edition_id, include_replaced=False
+            )
+            candidates = _candidate_map(canonical_candidates)
+            candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
             snapshot_candidates: dict[UUID, CandidateTopic] = {}
             by_subject = {
                 group.discovery_subject_id: group
@@ -148,29 +155,37 @@ class EditorialGroupingService:
             for subject in snapshot.subjects:
                 snapshot_candidates[subject.subject_id] = subject.candidate
                 references = tuple(
-                    CandidateReference(item.batch_id, item.candidate_id)
-                    for item in subject.member_references
-                )
-                for reference in references:
-                    # A snapshot candidate is the canonical editorial view. It
-                    # remains a useful fallback when a test/import has no raw
-                    # batch projection for a member reference.
-                    candidates.setdefault(reference, subject.candidate)
-                group = by_subject.get(subject.subject_id)
-                if group is not None:
-                    additions = tuple(
-                        reference
-                        for reference in references
-                        if reference not in group.candidate_references
+                    CandidateReference(
+                        candidates_by_id[item.candidate_id].discovery_batch_id,
+                        item.candidate_id,
                     )
-                    if additions and group.status in {
+                    for item in subject.member_references
+                    if item.candidate_id in candidates_by_id
+                )
+                projected = by_subject.get(subject.subject_id)
+                if not references:
+                    if (
+                        projected is not None
+                        and projected.status is EditorialGroupStatus.PROPOSED
+                    ):
+                        projected.supersede()
+                        await uow.editorial_groups.save(projected)
+                    continue
+                for reference in references:
+                    candidates.setdefault(
+                        reference,
+                        candidates_by_id[reference.candidate_id].to_candidate_topic(),
+                    )
+                if projected is not None:
+                    if projected.status in {
                         EditorialGroupStatus.PROPOSED,
                         EditorialGroupStatus.SELECTED,
                     }:
-                        group.add_candidates(additions)
-                        group.needs_source_expansion = True
-                        group.needs_source_verification = True
-                        await uow.editorial_groups.save(group)
+                        if references != projected.candidate_references:
+                            projected.synchronize_candidate_references(references)
+                            projected.needs_source_expansion = True
+                            projected.needs_source_verification = True
+                            await uow.editorial_groups.save(projected)
                     continue
                 candidate = subject.candidate
                 group = EditorialGroup(
@@ -188,7 +203,16 @@ class EditorialGroupingService:
                 )
                 await uow.editorial_groups.add(group)
                 existing.append(group)
+            active_subject_ids = {subject.subject_id for subject in snapshot.subjects}
             for group in existing:
+                if (
+                    group.status is EditorialGroupStatus.PROPOSED
+                    and group.discovery_subject_id is not None
+                    and group.discovery_subject_id not in active_subject_ids
+                ):
+                    group.supersede()
+                    await uow.editorial_groups.save(group)
+                    continue
                 if group.status is not EditorialGroupStatus.PROPOSED:
                     continue
                 group_candidates = tuple(
@@ -227,17 +251,48 @@ class EditorialGroupingService:
                 raise EditorialGroupNotFoundError(str(edition_id))
             groups = list(await uow.editorial_groups.list_for_edition(edition_id))
             historical = list(await uow.editorial_groups.list_historical(edition_id))
-            batches = [
-                batch
-                for batch in await uow.discovery_batches.list_for_edition(edition_id)
-                if batch.is_active_revision
-            ]
+            snapshot = await uow.discovery_snapshots.get_active(edition_id)
+            canonical_candidates = await uow.discovery_candidates.list_for_edition(
+                edition_id, include_replaced=False
+            )
+            candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
+            if snapshot is not None:
+                subjects_by_id = {subject.subject_id: subject for subject in snapshot.subjects}
+                for group in groups:
+                    if (
+                        group.status is EditorialGroupStatus.PROPOSED
+                        and group.discovery_subject_id is not None
+                        and group.discovery_subject_id not in subjects_by_id
+                    ):
+                        group.supersede()
+                        await uow.editorial_groups.save(group)
+                        continue
+                    if group.discovery_subject_id is None:
+                        continue
+                    subject = subjects_by_id.get(group.discovery_subject_id)
+                    if subject is None or group.status not in {
+                        EditorialGroupStatus.PROPOSED,
+                        EditorialGroupStatus.SELECTED,
+                    }:
+                        continue
+                    references = tuple(
+                        CandidateReference(
+                            candidates_by_id[reference.candidate_id].discovery_batch_id,
+                            reference.candidate_id,
+                        )
+                        for reference in subject.member_references
+                        if reference.candidate_id in candidates_by_id
+                    )
+                    if references and references != group.candidate_references:
+                        group.synchronize_candidate_references(references)
+                        await uow.editorial_groups.save(group)
+                await uow.commit()
             selected = [group for group in groups if group.status is EditorialGroupStatus.SELECTED]
             ignored = [group for group in groups if group.status is EditorialGroupStatus.REJECTED]
             undecided = [group for group in groups if group.status is EditorialGroupStatus.PROPOSED]
             return EditorialBoard(
                 groups=groups,
-                candidates=_candidate_map(batches),
+                candidates=_candidate_map(canonical_candidates),
                 historical_groups={group.id: group for group in [*historical, *selected]},
                 selected_articles=len(selected),
                 ignored=len(ignored),
@@ -311,101 +366,6 @@ class EditorialGroupingService:
             await uow.commit()
         for group_id, subject in selected_subjects:
             await self._materialize_subject(edition_id, group_id, subject)
-
-    async def merge(
-        self,
-        edition_id: UUID,
-        group_ids: tuple[UUID, ...],
-        *,
-        actor_id: str,
-        correlation_id: str,
-    ) -> EditorialGroup:
-        if len(set(group_ids)) < 2:
-            raise EditorialActionError("At least two distinct groups are required")
-        async with self._uow_factory() as uow:
-            groups = [await uow.editorial_groups.get_for_update(item) for item in group_ids]
-            if any(group is None or group.edition_id != edition_id for group in groups):
-                raise EditorialGroupNotFoundError("One of the groups does not exist")
-            concrete = [group for group in groups if group is not None]
-            target = concrete[0]
-            for source in concrete[1:]:
-                target.add_candidates(source.candidate_references)
-                source.supersede()
-                await uow.editorial_groups.save(source)
-            target.grouping_justification = "Fusion décidée par l'analyste."
-            target.grouping_confidence = GroupingConfidence.HIGH
-            await uow.editorial_groups.save(target)
-            await uow.human_decisions.append(
-                HumanDecision(
-                    edition_id=edition_id,
-                    decision_type=HumanDecisionType.MERGE,
-                    group_ids=group_ids,
-                    actor_id=actor_id,
-                    correlation_id=correlation_id,
-                    payload={"target_group_id": str(target.id)},
-                )
-            )
-            await uow.commit()
-            return target
-
-    async def split(
-        self,
-        edition_id: UUID,
-        group_id: UUID,
-        candidate_ids: tuple[UUID, ...],
-        *,
-        actor_id: str,
-        correlation_id: str,
-    ) -> EditorialGroup:
-        async with self._uow_factory() as uow:
-            group = await uow.editorial_groups.get_for_update(group_id)
-            if group is None or group.edition_id != edition_id:
-                raise EditorialGroupNotFoundError(str(group_id))
-            requested_ids = set(candidate_ids)
-            group_candidate_ids = {
-                reference.candidate_id for reference in group.candidate_references
-            }
-            if requested_ids - group_candidate_ids:
-                raise EditorialActionError(
-                    "Every requested split candidate must belong to the group"
-                )
-            selected = {
-                reference
-                for reference in group.candidate_references
-                if reference.candidate_id in requested_ids
-            }
-            if not selected:
-                raise EditorialActionError("Split candidates do not belong to the group")
-            group.remove_candidates(selected)
-            batches = list(await uow.discovery_batches.list_for_edition(edition_id))
-            candidate_map = _candidate_map(batches)
-            first = candidate_map[next(iter(selected))]
-            new_group = EditorialGroup(
-                edition_id=edition_id,
-                title=first.title,
-                candidate_references=tuple(selected),
-                outcome=GroupingOutcome.NEW_SUBJECT,
-                score=_editorial_score(first),
-                source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-                needs_source_verification=True,
-                needs_source_expansion=True,
-                grouping_confidence=GroupingConfidence.HIGH,
-                grouping_justification="Séparation décidée par l'analyste.",
-            )
-            await uow.editorial_groups.save(group)
-            await uow.editorial_groups.add(new_group)
-            await uow.human_decisions.append(
-                HumanDecision(
-                    edition_id=edition_id,
-                    decision_type=HumanDecisionType.SPLIT,
-                    group_ids=(group.id, new_group.id),
-                    actor_id=actor_id,
-                    correlation_id=correlation_id,
-                    payload={"candidate_ids": [str(item) for item in candidate_ids]},
-                )
-            )
-            await uow.commit()
-            return new_group
 
     async def reject(
         self,
@@ -508,13 +468,17 @@ class EditorialGroupingService:
             return list(await uow.human_decisions.list_for_edition(edition_id))
 
 
-def _candidate_map(batches: Sequence[DiscoveryBatch]) -> dict[CandidateReference, CandidateTopic]:
-    return {
-        CandidateReference(batch.id, candidate.id): candidate
-        for batch in batches
-        for candidate in batch.candidates
-        if candidate.selectable
-    }
+def _candidate_map(
+    candidates: Sequence[DiscoveryCandidate],
+) -> dict[CandidateReference, CandidateTopic]:
+    projected = [
+        (
+            CandidateReference(candidate.discovery_batch_id, candidate.id),
+            candidate.to_candidate_topic(),
+        )
+        for candidate in candidates
+    ]
+    return {reference: topic for reference, topic in projected if topic.selectable}
 
 
 def _candidate_has_ioc_signal(candidate: CandidateTopic) -> bool:

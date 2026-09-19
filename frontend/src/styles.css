@@ -375,8 +375,7 @@ a:focus-visible {
   margin-top: 1rem;
 }
 
-.ready-subjects,
-.advanced-editorial-panel {
+.ready-subjects {
   padding-top: 1rem;
   border-top: 1px solid #d4ded7;
 }
@@ -425,81 +424,22 @@ a:focus-visible {
   overflow-wrap: anywhere;
 }
 
-.advanced-editorial-panel > summary,
 .technical-discovery-details > summary,
 .report-diagnostics > summary {
   cursor: pointer;
   font-weight: 700;
 }
 
-.advanced-group-list {
-  display: grid;
-  min-width: 0;
-  gap: 0.8rem;
-  margin-top: 1rem;
-}
-
-.advanced-group-card,
 .diagnostic-batch {
   padding: 1rem;
   border: 1px solid #d4ded7;
   border-radius: 0.75rem;
 }
 
-.advanced-group-card {
-  min-width: 0;
-}
-
-.advanced-group-card h4,
-.advanced-group-card p,
-.group-check,
-.group-candidates label {
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-
 .technical-discovery-details[open],
 .report-diagnostics[open] {
   display: grid;
   gap: 1rem;
-}
-
-.group-check,
-.group-candidates label {
-  display: flex;
-  align-items: center;
-  gap: 0.55rem;
-}
-
-.group-check input,
-.group-candidates input {
-  min-height: auto;
-}
-
-.historical-comparison {
-  padding: 0.8rem 1rem;
-  border-left: 4px solid #7c5aa6;
-  background: #f4eefb;
-}
-
-.score-details,
-.group-candidates {
-  min-width: 0;
-  margin: 1rem 0;
-  padding: 0.8rem;
-  border: 1px solid #d4ded7;
-  border-radius: 0.65rem;
-}
-
-.score-details dl {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
-  gap: 0.7rem;
-}
-
-.score-details dd {
-  margin: 0.2rem 0 0;
-  color: #5b6b62;
 }
 
 .discovery-heading,
@@ -1190,6 +1130,192 @@ h1 {
 
 .technical-details {
   margin-top: 0.75rem;
+}
+
+.fusion-board {
+  display: grid;
+  gap: 1.25rem;
+  margin-top: 2rem;
+}
+
+.fusion-board__heading,
+.fusion-section__heading,
+.fusion-group-card__heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.fusion-board__heading h1,
+.fusion-section__heading h2,
+.fusion-group-card__heading h3 {
+  margin-bottom: 0.5rem;
+}
+
+.fusion-counters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  gap: 0.75rem;
+  margin: 0;
+}
+
+.fusion-counters div {
+  padding: 0.85rem 1rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 0.7rem;
+  background: #fff;
+}
+
+.fusion-counters dt {
+  color: #53635a;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.fusion-counters dd {
+  margin: 0.15rem 0 0;
+  color: #173c2a;
+  font-size: 1.55rem;
+  font-weight: 800;
+}
+
+.fusion-section,
+.fusion-group-card,
+.fusion-review-card {
+  display: grid;
+  gap: 1rem;
+  padding: 1.25rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 1rem;
+  background: #fff;
+}
+
+.fusion-zone {
+  min-width: 0;
+  padding: 0.85rem 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+  background: #fbfdfb;
+}
+
+.fusion-zone h4 {
+  margin-bottom: 0.55rem;
+  font-size: 0.92rem;
+}
+
+.fusion-zone ul {
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.fusion-zone li + li {
+  margin-top: 0.35rem;
+}
+
+.fusion-check {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.fusion-check input {
+  min-height: auto;
+}
+
+.fusion-zone--model {
+  border-color: #c8b5dc;
+  background: #f7f1fb;
+}
+
+.fusion-stale-message {
+  margin: 0;
+  padding: 0.85rem 1rem;
+  border-left: 4px solid #c47a00;
+  background: #fff7df;
+  color: #654000;
+}
+
+.fusion-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  gap: 0.5rem 1rem;
+  margin: 0;
+}
+
+.fusion-facts dt {
+  color: #53635a;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.fusion-facts dd {
+  margin: 0.1rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.fusion-explanation {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr));
+  gap: 0.75rem;
+}
+
+.fusion-comparison {
+  display: block;
+  width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+
+.fusion-comparison th,
+.fusion-comparison td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid #d4ded7;
+  text-align: left;
+  vertical-align: top;
+}
+
+.fusion-model-warning {
+  color: #67458a;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.fusion-effect,
+.fusion-empty {
+  margin: 0;
+  color: #5b6b62;
+  font-size: 0.9rem;
+}
+
+.fusion-review-group,
+.fusion-split,
+.fusion-review-actions {
+  display: grid;
+  gap: 0.6rem;
+  min-width: 0;
+  padding: 0.85rem 1rem;
+  border: 1px solid #d4ded7;
+  border-radius: 0.65rem;
+}
+
+.fusion-split label,
+.fusion-review-actions label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.fusion-split input,
+.fusion-review-actions input {
+  min-height: auto;
+}
+
+.fusion-history > summary {
+  cursor: pointer;
+  font-weight: 700;
 }
 
 @media (max-width: 760px) {
@@ -2678,146 +2804,6 @@ h1 {
   font-weight: 700;
 }
 
-/* Revue de fusion : la consolidation s'arrête ici quand elle hésite. */
-.merge-review {
-  margin: 2rem 0;
-  padding: 1.5rem;
-  background: #fffbeb;
-  border: 1px solid #f59e0b;
-  border-radius: 0.5rem;
-}
-
-.merge-review h4 {
-  margin-top: 0;
-  margin-bottom: 0.5rem;
-  font-size: 1rem;
-  color: #78350f;
-}
-
-.merge-review__reasons {
-  margin: 0.5rem 0 1rem;
-  padding-left: 1.25rem;
-  color: #92400e;
-}
-
-.merge-review__warnings,
-.merge-review__blocked {
-  font-size: 0.875rem;
-  color: #92400e;
-}
-
-.merge-review-idle {
-  margin: 1rem 0;
-  font-size: 0.875rem;
-  color: #64748b;
-}
-
-.merge-group-card {
-  margin: 1rem 0;
-  padding: 1rem;
-  background: white;
-  border: 1px solid #e2e8f0;
-  border-radius: 0.375rem;
-}
-
-.merge-group-card__heading {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 1rem;
-}
-
-.merge-group-card__heading h4 {
-  margin: 0;
-  color: #1f2937;
-}
-
-.merge-group-card__sides {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-  gap: 1rem;
-  margin: 0.75rem 0;
-}
-
-.merge-handle-list {
-  margin: 0.25rem 0 0;
-  padding-left: 1.25rem;
-}
-
-.merge-handle {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.8125rem;
-  padding: 0 0.25rem;
-  background: #f1f5f9;
-  border-radius: 0.25rem;
-}
-
-.merge-handle-sources {
-  color: #64748b;
-  font-size: 0.875rem;
-}
-
-.merge-confidence {
-  font-size: 0.8125rem;
-  padding: 0.125rem 0.5rem;
-  border-radius: 999px;
-}
-
-.merge-confidence.is-high {
-  background: #dcfce7;
-  color: #166534;
-}
-
-.merge-confidence.is-medium {
-  background: #fef9c3;
-  color: #854d0e;
-}
-
-.merge-confidence.is-low {
-  background: #fee2e2;
-  color: #991b1b;
-}
-
-.merge-group-card__rationale {
-  font-size: 0.9375rem;
-}
-
-.merge-group-card__conflicts {
-  color: #991b1b;
-  font-size: 0.9375rem;
-}
-
-.merge-group-card__decision {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1rem;
-  margin-top: 0.75rem;
-  padding-top: 0.75rem;
-  border-top: 1px solid #e2e8f0;
-}
-
-.merge-group-card__decision label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.875rem;
-  color: #475569;
-}
-
-.merge-review.is-blocked {
-  background: #fef2f2;
-  border-color: #ef4444;
-}
-
-.merge-review.is-blocked h4 {
-  color: #991b1b;
-}
-
-.merge-review__queued {
-  font-size: 0.875rem;
-  color: #92400e;
-}
-
 .stats-caption {
   margin: -0.5rem 0 1rem;
   font-size: 0.875rem;
@@ -2828,100 +2814,4 @@ h1 {
   margin-top: 0.25rem;
   font-size: 0.75rem;
   color: #94a3b8;
-}
-
-.merge-side {
-  padding: 0.75rem;
-  border-radius: 0.375rem;
-}
-
-.merge-side h5 {
-  margin: 0 0 0.5rem;
-  font-size: 0.8125rem;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
-}
-
-.merge-side--existing {
-  background: #f1f5f9;
-}
-
-.merge-side--existing h5 {
-  color: #475569;
-}
-
-.merge-side--incoming {
-  background: #eff6ff;
-}
-
-.merge-side--incoming h5 {
-  color: #1d4ed8;
-}
-
-.merge-handle-list > li + li {
-  margin-top: 0.75rem;
-}
-
-.merge-handle-summary {
-  margin: 0.25rem 0;
-  font-size: 0.875rem;
-  color: #475569;
-}
-
-.merge-handle-sources {
-  margin: 0.25rem 0 0;
-  padding-left: 1rem;
-  font-size: 0.8125rem;
-}
-
-.merge-handle-sources a {
-  color: #1d4ed8;
-  word-break: break-all;
-}
-
-.merge-group-card__help {
-  margin: 0.5rem 0 0;
-  font-size: 0.875rem;
-  color: #475569;
-  font-style: italic;
-}
-
-/* Distinguishes a real merge proposal from a lone incoming candidate the
-   planner is only flagging for a look before it becomes a new subject. */
-.merge-group-kind {
-  font-size: 0.8125rem;
-  padding: 0.125rem 0.5rem;
-  border-radius: 999px;
-  background: #e0e7ff;
-  color: #3730a3;
-}
-
-.merge-group-kind.is-new {
-  background: #f1f5f9;
-  color: #475569;
-}
-
-.merge-group-card__hint {
-  margin: 0.5rem 0;
-  font-size: 0.875rem;
-  color: #64748b;
-}
-
-.merge-group-card__warnings {
-  margin: 0.5rem 0;
-  padding-left: 1.25rem;
-  font-size: 0.8125rem;
-  color: #92400e;
-}
-
-/* The bridge is single-slot: while the planner is calling ChatGPT in the
-   background, this replaces the silence that used to sit where a proposal
-   would eventually appear. */
-.merge-review__job {
-  background: #eff6ff;
-  border-color: #93c5fd;
-}
-
-.merge-review__job h4 {
-  color: #1d4ed8;
 }

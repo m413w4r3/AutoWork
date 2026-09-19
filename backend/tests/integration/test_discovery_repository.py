@@ -1277,6 +1277,144 @@ async def test_manual_correction_replaces_its_candidate_in_the_raw_list(
         await engine.dispose()
 
 
+async def test_discovery_candidate_repository_is_canonical_and_hides_superseded(
+    migrated_postgres_url: str,
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from tests.discovery_support import (
+        make_discovery_run_for_edition,
+        persist_batch_with_candidates,
+    )
+
+    engine = create_postgres_engine(migrated_postgres_url)
+    session_factory = create_session_factory(engine)
+
+    def uow_factory() -> SqlAlchemyUnitOfWork:
+        return SqlAlchemyUnitOfWork(session_factory)
+
+    edition = Edition(
+        country="Candidate Land",
+        country_code="CL",
+        period_start=date(2026, 10, 1),
+        period_end=date(2026, 10, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+    )
+    research_run = _run("research", "b")
+    try:
+        async with uow_factory() as uow:
+            assert await uow.editions.add_if_absent(edition)
+            await uow.model_runs.add(research_run)
+            await uow.commit()
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        # Two candidates with the same title stay two canonical identities.
+        batch = _canonical_batch(
+            edition.id, discovery_run.id, research_run.id, ("Same title", "Same title"), "f"
+        )
+        correction = _canonical_batch(
+            edition.id, discovery_run.id, research_run.id, ("Same title (corrigé)",), "0"
+        )
+        rival = _canonical_batch(
+            edition.id, discovery_run.id, research_run.id, ("Rival correction",), "1"
+        )
+        async with uow_factory() as uow:
+            await persist_batch_with_candidates(uow, batch)
+            await persist_batch_with_candidates(uow, correction)
+            await persist_batch_with_candidates(uow, rival)
+            await uow.commit()
+        original_ids = [candidate.id for candidate in batch.candidates]
+        replacement_id = correction.candidates[0].id
+        # Mutating the in-memory batch projection must not reach canonical state.
+        batch.candidates[0].title = "Artificial batch-only mutation"
+
+        async with uow_factory() as uow:
+            listed = await uow.discovery_candidates.list_for_batch(batch.id)
+            assert [item.id for item in listed] == original_ids
+            assert [item.position for item in listed] == [0, 1]
+            assert [item.title for item in listed] == ["Same title", "Same title"]
+            await uow.discovery_candidates.mark_supersedes(replacement_id, original_ids[0])
+            await uow.commit()
+
+        async with uow_factory() as uow:
+            active = await uow.discovery_candidates.list_for_edition(edition.id)
+            history = await uow.discovery_candidates.list_for_edition(
+                edition.id, include_replaced=True
+            )
+            historical = await uow.discovery_candidates.get(original_ids[0])
+        assert original_ids[0] not in {item.id for item in active}
+        assert {original_ids[1], replacement_id} <= {item.id for item in active}
+        assert {*original_ids, replacement_id} <= {item.id for item in history}
+        assert historical is not None and historical.title == "Same title"
+
+        # A candidate can only be superseded by one direct replacement.
+        with pytest.raises(IntegrityError):
+            async with uow_factory() as uow:
+                await uow.discovery_candidates.mark_supersedes(
+                    rival.candidates[0].id, original_ids[0]
+                )
+                await uow.commit()
+    finally:
+        await engine.dispose()
+
+
+def _canonical_topic(title: str) -> CandidateTopic:
+    return CandidateTopic(
+        title=title,
+        summary="Summary.",
+        novelty="Novel.",
+        technical_potential=2,
+        uncertainties=(),
+        relevance_reasons=(),
+        actors=(),
+        campaigns=(),
+        malware=(),
+        cves=(),
+        victims=(),
+        sectors=(),
+        countries=(),
+        likely_artifacts=(),
+        sources=[
+            SourceCandidate(
+                url="https://vendor.example/canonical",
+                title="Report",
+                publisher="Vendor",
+                role=SourceRole.PRIMARY,
+                tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=True,
+            )
+        ],
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        local_ref="S1",
+    )
+
+
+def _canonical_batch(
+    edition_id: UUID,
+    discovery_run_id: UUID,
+    model_run_id: UUID,
+    titles: tuple[str, ...],
+    hash_char: str,
+) -> DiscoveryBatch:
+    return DiscoveryBatch(
+        edition_id=edition_id,
+        discovery_run_id=discovery_run_id,
+        request_hash=hash_char * 64,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        candidates=[_canonical_topic(title) for title in titles],
+        discovery_model_run_id=model_run_id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="v1",
+    )
+
+
 def _run(template: str, hash_prefix: str) -> ModelRun:
     return ModelRun(
         provider=ModelProvider.FAKE,

@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.discovery.cumulative.apply import apply_discovery_merge_plan
-from cti_app.application.discovery.cumulative.context import (
-    build_discovery_delta,
-    build_merge_handles,
+from cti_app.application.discovery.cumulative.apply import (
+    apply_discovery_merge_plan as _apply_discovery_merge_plan,
 )
+from cti_app.application.discovery.cumulative.context import (
+    build_discovery_delta as _build_discovery_delta,
+)
+from cti_app.application.discovery.cumulative.context import build_merge_handles
 from cti_app.application.discovery.cumulative.merge_runs import make_merge_run
 from cti_app.application.discovery.cumulative.planners import HeuristicMergePlanner
+from cti_app.application.discovery.cumulative.types import AppliedDiscoveryMerge, DiscoveryDelta
 from cti_app.application.discovery.cumulative.validation import validate_merge_plan
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     SourceCandidate,
@@ -31,8 +37,63 @@ from cti_app.domain.discovery_cumulative import (
     MergeConfidence,
     MergeDisposition,
     MergeEvidence,
-    discovery_candidate_key,
 )
+
+
+def _canonical_candidates(batch: DiscoveryBatch) -> tuple[DiscoveryCandidate, ...]:
+    return tuple(
+        DiscoveryCandidate.from_candidate_topic(
+            candidate,
+            discovery_run_id=batch.discovery_run_id,
+            discovery_batch_id=batch.id,
+            position=index,
+        )
+        for index, candidate in enumerate(batch.candidates)
+    )
+
+
+def build_discovery_delta(intake: DiscoveryIntake, batch: DiscoveryBatch) -> DiscoveryDelta:
+    return _build_discovery_delta(intake, _canonical_candidates(batch))
+
+
+def apply_discovery_merge_plan(
+    parent: DiscoverySnapshot | None,
+    delta: DiscoveryDelta,
+    plan: DiscoveryMergePlanV1,
+    **kwargs: Any,
+) -> AppliedDiscoveryMerge:
+    """Test adapter: materialize the canonical candidates the service would load."""
+    candidates: list[DiscoveryCandidate] = []
+    for item in delta.candidates:
+        topic = deepcopy(item.candidate)
+        topic.id = item.candidate_id
+        candidates.append(
+            DiscoveryCandidate.from_candidate_topic(
+                topic,
+                discovery_run_id=uuid4(),
+                discovery_batch_id=uuid4(),
+                position=len(candidates),
+            )
+        )
+    if parent is not None:
+        known = {candidate.id for candidate in candidates}
+        for subject in parent.subjects:
+            for reference in subject.member_references:
+                if reference.candidate_id in known:
+                    continue
+                topic = deepcopy(subject.candidate)
+                topic.id = reference.candidate_id
+                candidates.append(
+                    DiscoveryCandidate.from_candidate_topic(
+                        topic,
+                        discovery_run_id=uuid4(),
+                        discovery_batch_id=uuid4(),
+                        position=len(candidates),
+                    )
+                )
+    return _apply_discovery_merge_plan(
+        parent, delta, plan, candidates, **kwargs
+    )
 
 
 @pytest.mark.asyncio
@@ -76,7 +137,7 @@ async def test_bootstrap_uses_same_applier_and_local_stable_ids() -> None:
     assert applied.snapshot.version == 1
     assert applied.snapshot.subjects[0].subject_id == applied.identities[0].id
     assert applied.contributions[0].subject_id == applied.identities[0].id
-    assert applied.contributions[0].candidate_key == discovery_candidate_key(intake.id, "S1")
+    assert applied.contributions[0].candidate_id == batch.candidates[0].id
 
 
 @pytest.mark.asyncio

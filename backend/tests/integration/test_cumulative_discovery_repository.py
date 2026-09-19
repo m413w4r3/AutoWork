@@ -17,7 +17,10 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
-from tests.discovery_support import make_discovery_run_for_edition
+from tests.discovery_support import (
+    make_discovery_run_for_edition,
+    persist_batch_with_candidates,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -67,8 +70,8 @@ async def test_cumulative_snapshot_identity_and_contribution_round_trip(
         second_batch.candidates[0].malware = ("Distinct Malware",)
         async with uow_factory() as uow:
             await uow.model_runs.add(run)
-            assert await uow.discovery_batches.add_if_absent(batch)
-            assert await uow.discovery_batches.add_if_absent(second_batch)
+            await persist_batch_with_candidates(uow, batch)
+            await persist_batch_with_candidates(uow, second_batch)
             await uow.commit()
 
         service = CumulativeDiscoveryService(uow_factory)

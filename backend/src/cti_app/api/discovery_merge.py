@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, Field
 
-from cti_app.api.discovery_errors import _raise_api_error
-from cti_app.application.discovery.cumulative.errors import DiscoveryMergeNeedsReview
-from cti_app.application.discovery.cumulative.planners import HumanMergeDecision
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
-from cti_app.application.identity import IdentityProvider
 from cti_app.domain.discovery_cumulative import DiscoveryMergeRun
 
 merge_runs_router = APIRouter(
@@ -30,7 +25,7 @@ class MergeRunView(BaseModel):
     id: UUID
     edition_id: UUID
     parent_snapshot_id: UUID | None
-    intake_id: UUID
+    intake_id: UUID | None
     planner_kind: str
     validation_status: str
     review_reasons: list[str]
@@ -41,25 +36,6 @@ class MergeRunView(BaseModel):
     handle_labels: dict[str, MergeHandleLabelView] = Field(default_factory=dict)
     supersedes_merge_run_id: UUID | None
     created_at: datetime
-
-
-class MergeGroupDecisionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    group_index: int = Field(ge=0)
-    action: Literal["accept", "create_new", "attach_to", "merge_existing", "defer"]
-    target_subject_handle: str | None = Field(default=None, pattern=r"^X[1-9][0-9]*$")
-
-
-class MergeRunResolutionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    group_decisions: list[MergeGroupDecisionRequest] = Field(min_length=1)
-
-
-class MergeRunResolutionView(BaseModel):
-    snapshot_id: UUID
-    snapshot_version: int
 
 
 @merge_runs_router.get("", response_model=list[MergeRunView])
@@ -88,52 +64,6 @@ async def read_merge_run(edition_id: UUID, run_id: UUID, request: Request) -> Me
         raise HTTPException(
             status_code=404, detail={"code": "merge_run_not_found", "message": str(exc)}
         ) from exc
-
-
-@merge_runs_router.post("/{run_id}/resolve", response_model=MergeRunResolutionView)
-async def resolve_merge_run(
-    edition_id: UUID,
-    run_id: UUID,
-    payload: MergeRunResolutionRequest,
-    request: Request,
-) -> MergeRunResolutionView:
-    service: CumulativeDiscoveryService = request.app.state.cumulative_discovery_service
-    identity: IdentityProvider = request.app.state.identity_provider
-    try:
-        actor = await identity.current()
-        snapshot = await service.resolve_merge_run(
-            edition_id,
-            run_id,
-            [
-                HumanMergeDecision(
-                    group_index=item.group_index,
-                    action=item.action,
-                    target_subject_handle=item.target_subject_handle,
-                )
-                for item in payload.group_decisions
-            ],
-            actor_id=actor.actor_id,
-        )
-        return MergeRunResolutionView(snapshot_id=snapshot.id, snapshot_version=snapshot.version)
-    except LookupError as exc:
-        raise HTTPException(
-            status_code=404, detail={"code": "merge_run_not_found", "message": str(exc)}
-        ) from exc
-    except DiscoveryMergeNeedsReview as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "merge_still_needs_review",
-                "message": (
-                    "Des groupes sont restés sans décision : "
-                    "une nouvelle proposition de fusion les reprend."
-                ),
-                "merge_run_id": str(exc.run_id),
-                "reasons": list(exc.reasons),
-            },
-        ) from exc
-    except Exception as exc:
-        _raise_api_error(exc)
 
 
 def _merge_run_view(run: DiscoveryMergeRun) -> MergeRunView:

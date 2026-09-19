@@ -319,8 +319,7 @@ class SqlAlchemySubjectContributionRepository:
                 .values(**_subject_contribution_values(contribution))
                 .on_conflict_do_nothing(
                     index_elements=[
-                        SubjectContributionRow.intake_id,
-                        SubjectContributionRow.candidate_key,
+                        SubjectContributionRow.candidate_id,
                     ]
                 )
             )
@@ -463,7 +462,7 @@ def _discovery_snapshot_values(snapshot: DiscoverySnapshot) -> dict[str, object]
                 "subject_id": str(subject.subject_id),
                 "candidate": _candidate_payload(subject.candidate),
                 "member_references": [
-                    {"batch_id": str(ref.batch_id), "candidate_id": str(ref.candidate_id)}
+                    {"candidate_id": str(ref.candidate_id)}
                     for ref in subject.member_references
                 ],
                 "created_at": subject.created_at.isoformat(),
@@ -490,10 +489,7 @@ def _discovery_snapshot_from_row(row: DiscoverySnapshotRow) -> DiscoverySnapshot
                 subject_id=UUID(value["subject_id"]),
                 candidate=_candidate_from_payload(value["candidate"]),
                 member_references=tuple(
-                    DiscoveryMemberReference(
-                        batch_id=UUID(reference["batch_id"]),
-                        candidate_id=UUID(reference["candidate_id"]),
-                    )
+                    DiscoveryMemberReference(candidate_id=UUID(reference["candidate_id"]))
                     for reference in value["member_references"]
                 ),
                 created_at=datetime.fromisoformat(value["created_at"]),
@@ -511,7 +507,6 @@ def _subject_contribution_values(contribution: SubjectContribution) -> dict[str,
         "id": contribution.id,
         "subject_id": contribution.subject_id,
         "intake_id": contribution.intake_id,
-        "candidate_key": contribution.candidate_key,
         "candidate_id": contribution.candidate_id,
         "first_seen_snapshot_id": contribution.first_seen_snapshot_id,
         "first_seen_version": contribution.first_seen_version,
@@ -532,7 +527,6 @@ def _subject_contribution_from_row(row: SubjectContributionRow) -> SubjectContri
         id=row.id,
         subject_id=row.subject_id,
         intake_id=row.intake_id,
-        candidate_key=row.candidate_key,
         candidate_id=row.candidate_id,
         first_seen_snapshot_id=row.first_seen_snapshot_id,
         first_seen_version=row.first_seen_version,

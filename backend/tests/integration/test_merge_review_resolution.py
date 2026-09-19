@@ -1,12 +1,6 @@
-"""What happens to a parked merge once a human decides on it.
+"""PostgreSQL coverage for UUID-based Fusion review resolution."""
 
-The failure these cover is not a wrong merge: it is a merge that applies
-correctly and then leaves the review panel showing the same decision forever,
-because nothing retires the run that was just settled. Clicking again then
-replays a snapshot id derived from (parent, intake, run) and dies on the
-primary key, which reaches the browser as an unexplained server error.
-"""
-
+from collections.abc import Callable
 from datetime import date
 from uuid import UUID
 
@@ -15,14 +9,17 @@ import pytest
 from cti_app.application.discovery.cumulative.contracts import ReconcileDiscoveryParameters
 from cti_app.application.discovery.cumulative.errors import (
     DiscoveryMergeNeedsReview,
-    DiscoverySnapshotStaleError,
 )
-from cti_app.application.discovery.cumulative.planners import HumanMergeDecision
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.cumulative.types import (
     DiscoveryDelta,
     PlannedDiscoveryMerge,
     ResolvedMergeHandles,
+)
+from cti_app.application.discovery.fusion import (
+    FusionReviewDecision,
+    FusionService,
+    FusionSnapshotStaleError,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -38,6 +35,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryMergePlanV1,
     DiscoveryPlannerKind,
     DiscoverySnapshot,
+    FusionReviewAction,
     MergeConfidence,
     MergeDisposition,
     MergeEvidence,
@@ -47,7 +45,10 @@ from cti_app.domain.editions import Edition
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
-from tests.discovery_support import make_discovery_run_for_edition
+from tests.discovery_support import (
+    make_discovery_run_for_edition,
+    persist_batch_with_candidates,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -86,7 +87,7 @@ class ParkingPlanner:
         )
 
 
-async def test_resolving_a_merge_retires_it_and_stays_idempotent(
+async def test_resolving_a_merge_retires_it_and_rejects_a_stale_replay(
     migrated_postgres_url: str,
 ) -> None:
     engine = create_postgres_engine(migrated_postgres_url)
@@ -114,8 +115,8 @@ async def test_resolving_a_merge_retires_it_and_stays_idempotent(
         )
         async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
-            assert await uow.discovery_batches.add_if_absent(first)
-            assert await uow.discovery_batches.add_if_absent(second)
+            await persist_batch_with_candidates(uow, first)
+            await persist_batch_with_candidates(uow, second)
             await uow.commit()
 
         service = CumulativeDiscoveryService(uow_factory, planner=ParkingPlanner())
@@ -131,11 +132,19 @@ async def test_resolving_a_merge_retires_it_and_stays_idempotent(
             )
         run_id = parked.value.run_id
 
-        applied = await service.resolve_merge_run(
-            edition.id, run_id, [HumanMergeDecision(0, "accept")], actor_id="analyst"
+        candidate_id = await _candidate_id_for_batch(uow_factory, second.id)
+        fusion = FusionService(uow_factory)
+        applied = await fusion.resolve_review(
+            edition.id,
+            run_id,
+            snapshot_version=bootstrap.version,
+            decisions=(
+                FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),
+            ),
+            actor_id="analyst",
         )
-        assert applied.version == bootstrap.version + 1
-        assert len(applied.subjects) == 2
+        assert applied.snapshot_version == bootstrap.version + 1
+        assert applied.group_count == 2
 
         async with uow_factory() as uow:
             settled = await uow.discovery_merge_runs.get(run_id)
@@ -143,14 +152,20 @@ async def test_resolving_a_merge_retires_it_and_stays_idempotent(
         assert settled is not None
         # Without this the review panel keeps offering a decision already taken.
         assert settled.validation_status is MergeValidationStatus.RESOLVED
-        assert active is not None and active.id == applied.id
+        assert active is not None and active.id == applied.snapshot_id
 
-        # The second click of an impatient reviewer: same snapshot, no crash.
-        replayed = await service.resolve_merge_run(
-            edition.id, run_id, [HumanMergeDecision(0, "accept")], actor_id="analyst"
-        )
-        assert replayed.id == applied.id
-        assert replayed.version == applied.version
+        # A repeated request was decided against the old board and must not
+        # silently create another snapshot.
+        with pytest.raises(FusionSnapshotStaleError):
+            await fusion.resolve_review(
+                edition.id,
+                run_id,
+                snapshot_version=bootstrap.version,
+                decisions=(
+                    FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),
+                ),
+                actor_id="analyst",
+            )
     finally:
         await engine.dispose()
 
@@ -199,7 +214,7 @@ async def test_a_merge_planned_against_a_superseded_snapshot_is_replanned(
         async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
             for batch in (first, second, third):
-                assert await uow.discovery_batches.add_if_absent(batch)
+                await persist_batch_with_candidates(uow, batch)
             await uow.commit()
 
         service = CumulativeDiscoveryService(
@@ -226,20 +241,35 @@ async def test_a_merge_planned_against_a_superseded_snapshot_is_replanned(
             await service.reconcile_intake(
                 other_intake.id, expected_parent_snapshot_id=bootstrap.id, actor_id="test"
             )
-        moved_on = await service.resolve_merge_run(
-            edition.id, other.value.run_id, [HumanMergeDecision(0, "accept")], actor_id="analyst"
+        fusion = FusionService(uow_factory, replan_intake=replan)
+        third_candidate_id = await _candidate_id_for_batch(uow_factory, third.id)
+        moved_on = await fusion.resolve_review(
+            edition.id,
+            other.value.run_id,
+            snapshot_version=bootstrap.version,
+            decisions=(
+                FusionReviewDecision(FusionReviewAction.ACCEPT, (third_candidate_id,)),
+            ),
+            actor_id="analyst",
         )
 
-        with pytest.raises(DiscoverySnapshotStaleError):
-            await service.resolve_merge_run(
-                edition.id, stale_run_id, [HumanMergeDecision(0, "accept")], actor_id="analyst"
+        second_candidate_id = await _candidate_id_for_batch(uow_factory, second.id)
+        with pytest.raises(FusionSnapshotStaleError):
+            await fusion.resolve_review(
+                edition.id,
+                stale_run_id,
+                snapshot_version=moved_on.snapshot_version or 0,
+                decisions=(
+                    FusionReviewDecision(FusionReviewAction.ACCEPT, (second_candidate_id,)),
+                ),
+                actor_id="analyst",
             )
 
         # The contribution is not dropped: it is queued for a fresh plan against
         # the snapshot that won, and the dead run stops blocking the panel.
         assert len(replanned) == 1
         assert replanned[0].intake_id == parked_intake.id
-        assert replanned[0].expected_parent_snapshot_id == moved_on.id
+        assert replanned[0].expected_parent_snapshot_id == moved_on.snapshot_id
         async with uow_factory() as uow:
             retired = await uow.discovery_merge_runs.get(stale_run_id)
         assert retired is not None
@@ -276,8 +306,8 @@ async def test_a_decision_naming_an_unknown_group_is_refused(
         )
         async with uow_factory() as uow:
             await uow.model_runs.add(model_run)
-            assert await uow.discovery_batches.add_if_absent(first)
-            assert await uow.discovery_batches.add_if_absent(second)
+            await persist_batch_with_candidates(uow, first)
+            await persist_batch_with_candidates(uow, second)
             await uow.commit()
 
         service = CumulativeDiscoveryService(uow_factory, planner=ParkingPlanner())
@@ -292,16 +322,30 @@ async def test_a_decision_naming_an_unknown_group_is_refused(
                 intake.id, expected_parent_snapshot_id=bootstrap.id, actor_id="test"
             )
 
-        # Silently ignoring it would report "applied" for a group nobody decided.
-        with pytest.raises(ValueError, match="n'existe pas"):
-            await service.resolve_merge_run(
+        # UUID sets must match a pending review group exactly.
+        fusion = FusionService(uow_factory)
+        with pytest.raises(ValueError, match="match exactly"):
+            await fusion.resolve_review(
                 edition.id,
                 parked.value.run_id,
-                [HumanMergeDecision(7, "accept")],
+                snapshot_version=bootstrap.version,
+                decisions=(
+                    FusionReviewDecision(FusionReviewAction.ACCEPT, (edition.id,)),
+                ),
                 actor_id="analyst",
             )
     finally:
         await engine.dispose()
+
+
+async def _candidate_id_for_batch(
+    uow_factory: Callable[[], SqlAlchemyUnitOfWork],
+    batch_id: UUID,
+) -> UUID:
+    async with uow_factory() as uow:
+        candidates = await uow.discovery_candidates.list_for_batch(batch_id)
+    assert len(candidates) == 1
+    return candidates[0].id
 
 
 def _edition(country: str, code: str) -> Edition:

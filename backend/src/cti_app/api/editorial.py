@@ -120,18 +120,6 @@ class EditorialBoardView(BaseModel):
     automatic_selection: bool = False
 
 
-class MergeRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    group_ids: list[UUID] = Field(min_length=2, max_length=100)
-
-
-class SplitRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    candidate_ids: list[UUID] = Field(min_length=1, max_length=100)
-
-
 class RejectRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -179,41 +167,6 @@ async def refresh_board(edition_id: UUID, request: Request) -> EditorialBoardVie
     try:
         await _service(request).synchronize(edition_id)
         return _board_view(await _service(request).board(edition_id))
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
-@router.post("/merge", response_model=EditorialBoardView)
-async def merge_groups(
-    edition_id: UUID, payload: MergeRequest, request: Request
-) -> EditorialBoardView:
-    service, actor_id = await _runtime(request)
-    try:
-        await service.merge(
-            edition_id,
-            tuple(payload.group_ids),
-            actor_id=actor_id,
-            correlation_id=get_correlation_id(),
-        )
-        return _board_view(await service.board(edition_id))
-    except Exception as exc:
-        _raise_api_error(exc)
-
-
-@router.post("/{group_id}/split", response_model=EditorialBoardView)
-async def split_group(
-    edition_id: UUID, group_id: UUID, payload: SplitRequest, request: Request
-) -> EditorialBoardView:
-    service, actor_id = await _runtime(request)
-    try:
-        await service.split(
-            edition_id,
-            group_id,
-            tuple(payload.candidate_ids),
-            actor_id=actor_id,
-            correlation_id=get_correlation_id(),
-        )
-        return _board_view(await service.board(edition_id))
     except Exception as exc:
         _raise_api_error(exc)
 

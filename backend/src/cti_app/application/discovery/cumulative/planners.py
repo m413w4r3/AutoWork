@@ -197,14 +197,14 @@ class TargetedMergePlanner:
     def __init__(
         self,
         target_subject_id: UUID,
-        incoming_candidate_key: UUID,
+        incoming_candidate_id: UUID,
         *,
         operation: str = "attach",
     ) -> None:
         if operation not in {"attach", "replace"}:
             raise ValueError("Targeted manual operation must be attach or replace")
         self._target_subject_id = target_subject_id
-        self._incoming_candidate_key = incoming_candidate_key
+        self._incoming_candidate_id = incoming_candidate_id
         self._operation = operation
         self.policy_version = f"targeted-{operation}-v1"
 
@@ -237,13 +237,13 @@ class TargetedMergePlanner:
             (
                 handle
                 for handle, item in handles.incoming.items()
-                if item.candidate_key == self._incoming_candidate_key
+                if item.candidate_id == self._incoming_candidate_id
             ),
             None,
         )
         if incoming_handle is None:
             raise ValueError(
-                f"Incoming candidate {self._incoming_candidate_key} was not found in this delta"
+                f"Incoming candidate {self._incoming_candidate_id} was not found in this delta"
             )
         plan = DiscoveryMergePlanV1(
             groups=[

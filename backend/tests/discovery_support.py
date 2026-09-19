@@ -370,3 +370,22 @@ async def make_discovery_run_for_edition(
         assert await uow.discovery_runs.add_if_absent(run)
         await uow.commit()
     return run
+
+
+def canonical_candidates_for(batch: DiscoveryBatch) -> list[DiscoveryCandidate]:
+    """Canonical rows a successful discovery path persists alongside its batch."""
+    return [
+        DiscoveryCandidate.from_candidate_topic(
+            candidate,
+            discovery_run_id=batch.discovery_run_id,
+            discovery_batch_id=batch.id,
+            position=position,
+            created_at=batch.created_at,
+        )
+        for position, candidate in enumerate(batch.candidates)
+    ]
+
+
+async def persist_batch_with_candidates(uow: Any, batch: DiscoveryBatch) -> None:
+    """Persist a batch through the canonical path, which also writes its candidates."""
+    assert await uow.discovery_batches.add_if_absent(batch)

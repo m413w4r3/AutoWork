@@ -17,9 +17,15 @@ import {
 import { ProductionConsole } from "../edition-workflow/ProductionConsole";
 import { PublicationConsole } from "../edition-workflow/PublicationConsole";
 import { ReviewConsole } from "../edition-workflow/ReviewConsole";
+import { FusionBoard } from "../fusion/FusionBoard";
 
 export type EditionTool =
-  "discovery" | "selection" | "production" | "review" | "publication";
+  | "discovery"
+  | "fusion"
+  | "selection"
+  | "production"
+  | "review"
+  | "publication";
 
 export type EditionSurface = "overview" | EditionTool;
 
@@ -29,6 +35,7 @@ const EDITION_NAVIGATION: ReadonlyArray<{
 }> = [
   { surface: "overview", label: "Vue d’ensemble" },
   { surface: "discovery", label: "Découverte" },
+  { surface: "fusion", label: "Fusion" },
   { surface: "selection", label: "Sélection" },
   { surface: "production", label: "Productions" },
   { surface: "review", label: "Revue" },
@@ -193,6 +200,8 @@ export function EditionToolSurface({
   switch (tool) {
     case "discovery":
       return <DiscoveryPanel editionId={edition.id} readOnly={readOnly} />;
+    case "fusion":
+      return <FusionBoard editionId={edition.id} readOnly={readOnly} />;
     case "selection":
       return <SelectionTool edition={edition} readOnly={readOnly} />;
     case "production":
