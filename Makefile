@@ -349,7 +349,7 @@ test-all: test test-integration ## Lance tests rapides puis tests d'intégration
 # Lint
 # ==============================================================================
 
-lint-backend: backend-sync
+lint-backend: backend-sync ## Ruff backend + vérification du format
 	cd $(BACKEND_DIR) && $(UV_RUN) ruff check .
 	cd $(BACKEND_DIR) && $(UV_RUN) ruff format --check .
 

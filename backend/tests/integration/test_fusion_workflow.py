@@ -468,6 +468,97 @@ async def test_archived_fusion_board_is_readable_but_all_mutations_are_rejected(
         await engine.dispose()
 
 
+async def test_same_local_ref_in_two_runs_keeps_distinct_canonical_identities(
+    migrated_postgres_url: str,
+) -> None:
+    """AW-007: un local_ref identique dans deux DiscoveryRuns ne confond jamais
+    deux candidates. L'identite fonctionnelle reste DiscoveryCandidate.id."""
+    engine, uow_factory = _database(migrated_postgres_url)
+    edition = _edition("Cross Run Iran", "FX")
+    model_run = _model_run("g")
+    try:
+        await _persist_edition_and_run(uow_factory, edition, model_run)
+        run_a = await make_discovery_run_for_edition(uow_factory, edition)
+        run_b = await make_discovery_run_for_edition(
+            uow_factory,
+            edition,
+            complementary_axis="second-wave",
+        )
+        assert run_a.id != run_b.id
+
+        # Meme local_ref "S1" et meme titre, mais deux runs et deux batches distincts.
+        batch_a = _batch(
+            edition.id,
+            model_run.id,
+            run_a.id,
+            title="Shared wave topic",
+            url="https://vendor.example/wave-one",
+            local_ref="S1",
+            request_hash="1" * 64,
+        )
+        batch_b = _batch(
+            edition.id,
+            model_run.id,
+            run_b.id,
+            title="Shared wave topic",
+            url="https://vendor.example/wave-two",
+            local_ref="S1",
+            request_hash="2" * 64,
+        )
+        assert batch_a.id != batch_b.id
+        await _persist_batches(uow_factory, batch_a, batch_b)
+
+        cumulative = CumulativeDiscoveryService(uow_factory, planner=ApplyPlanner())
+        await cumulative.reconcile_batch(
+            batch_a, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+        await cumulative.reconcile_batch(
+            batch_b, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+
+        candidate_a = await _candidate_for_batch(uow_factory, batch_a.id)
+        candidate_b = await _candidate_for_batch(uow_factory, batch_b.id)
+
+        # Provenance distincte, identite canonique distincte, local_ref partage.
+        assert candidate_a.id != candidate_b.id
+        assert candidate_a.discovery_run_id == run_a.id
+        assert candidate_b.discovery_run_id == run_b.id
+        assert candidate_a.discovery_batch_id == batch_a.id
+        assert candidate_b.discovery_batch_id == batch_b.id
+        assert candidate_a.local_ref == candidate_b.local_ref == "S1"
+        assert {c.id for c in await _candidates_for_edition(uow_factory, edition.id)} == {
+            candidate_a.id,
+            candidate_b.id,
+        }
+
+        # Fusion indexe sur les UUID persistants, jamais sur une cle derivee de "S1".
+        snapshot = await _active_snapshot(uow_factory, edition.id)
+        assert snapshot is not None
+        member_ids = [
+            reference.candidate_id
+            for subject in snapshot.subjects
+            for reference in subject.member_references
+        ]
+        assert sorted(member_ids) == sorted([candidate_a.id, candidate_b.id])
+        assert len(member_ids) == len(set(member_ids)) == 2
+
+        board = await FusionService(uow_factory).get_board(edition.id)
+        board_ids = [candidate_id for group in board.groups for candidate_id in group.candidate_ids]
+        assert sorted(board_ids) == sorted([candidate_a.id, candidate_b.id])
+        assert board.candidate_count == 2
+        # Chaque membre du board reste rattache a son run d'origine: aucune
+        # identite derivee de "S1" ne peut collapser les deux candidates, meme
+        # si la Fusion venait a les regrouper sous un meme sujet.
+        board_provenance = {
+            candidate.id: candidate.discovery_run_id
+            for group in board.groups
+            for candidate in group.candidates
+        }
+        assert board_provenance == {candidate_a.id: run_a.id, candidate_b.id: run_b.id}
+    finally:
+        await engine.dispose()
+
+
 def _database(migrated_postgres_url: str):
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)

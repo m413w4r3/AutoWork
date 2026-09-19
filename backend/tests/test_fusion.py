@@ -121,7 +121,9 @@ def test_delta_is_built_from_persisted_candidates_only() -> None:
     same_a = _candidate("Same title", "https://example.test/same")
     same_b = _candidate("Same title", "https://example.test/same")
     batch = _batch(edition_id, [same_a, same_b])
-    # Identical local_ref in two runs never merges identities.
+    # Identical local_ref inside one batch never merges identities. The cross-run
+    # variant lives in tests/integration/test_fusion_workflow.py::
+    # test_same_local_ref_in_two_runs_keeps_distinct_canonical_identities.
     same_a.local_ref = same_b.local_ref = "S1"
     intake = _intake(batch)
     persisted = canonical_candidates_for(batch)

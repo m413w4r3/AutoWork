@@ -1267,9 +1267,7 @@ async def test_standalone_import_rejects_stale_confirmation() -> None:
     assert await service.list_batches(params.edition_id) == []
 
 
-async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_without_model_call() -> (
-    None
-):
+async def test_reprocess_archived_report_revises_same_run_without_model_call() -> None:
     adapter = FakeModelAdapter(research_text=research_markdown_fixture())
     gateway, model_uow, _ = gateway_for_adapter(adapter)
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()

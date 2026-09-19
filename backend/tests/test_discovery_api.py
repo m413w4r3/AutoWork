@@ -38,9 +38,7 @@ from tests.model_support import InMemoryModelRunUnitOfWorkFactory
 from tests.test_discovery import DeferredResearchAdapter, research_markdown_fixture
 
 
-async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeated_configuration() -> (
-    None
-):
+async def test_discovery_run_creation_is_transport_idempotent_with_repeated_config() -> None:
     fake = FakeModelAdapter(
         research_text=research_markdown_fixture(),
     )
