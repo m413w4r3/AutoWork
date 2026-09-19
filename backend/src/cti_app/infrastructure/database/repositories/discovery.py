@@ -204,9 +204,7 @@ class SqlAlchemyDiscoveryBatchRepository:
         )
         result: dict[UUID, list[DiscoveryCandidate]] = {}
         for row in rows:
-            result.setdefault(row.discovery_batch_id, []).append(
-                _discovery_candidate_from_row(row)
-            )
+            result.setdefault(row.discovery_batch_id, []).append(_discovery_candidate_from_row(row))
         return result
 
     async def save(self, batch: DiscoveryBatch) -> None:
@@ -235,9 +233,7 @@ _SUPERSEDER = aliased(DiscoveryCandidateRow, name="superseder")
 # correction manuelle n'a publié de version remplaçante. Les deux conditions
 # sont dérivées de relations : `discovery_candidates` ne porte aucun statut.
 _ACTIVE_CANDIDATE = DiscoveryBatchRow.replaced_by_batch_id.is_(None) & ~exists(
-    select(_SUPERSEDER.id).where(
-        _SUPERSEDER.supersedes_candidate_id == DiscoveryCandidateRow.id
-    )
+    select(_SUPERSEDER.id).where(_SUPERSEDER.supersedes_candidate_id == DiscoveryCandidateRow.id)
 )
 
 
@@ -297,9 +293,9 @@ class SqlAlchemyDiscoveryCandidateRepository:
             statement = statement.where(_ACTIVE_CANDIDATE)
         return await self._ordered(statement)
 
-    async def _ordered(self, statement: Select[tuple[DiscoveryCandidateRow]]) -> list[
-        DiscoveryCandidate
-    ]:
+    async def _ordered(
+        self, statement: Select[tuple[DiscoveryCandidateRow]]
+    ) -> list[DiscoveryCandidate]:
         rows = await self._session.scalars(
             statement.order_by(
                 DiscoveryBatchRow.created_at,

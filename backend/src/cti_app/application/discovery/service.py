@@ -206,9 +206,7 @@ class DiscoveryService:
             if run is None or run.edition_id != parameters.edition_id:
                 raise LookupError(str(parameters.discovery_run_id))
             discover_parameters = discover_parameters_from_run(run)
-            current = await uow.discovery_batches.get(
-                discovery_initial_batch_id(run.id)
-            )
+            current = await uow.discovery_batches.get(discovery_initial_batch_id(run.id))
             if current is None:
                 raise LookupError(str(run.id))
             visited: set[UUID] = set()
@@ -227,8 +225,7 @@ class DiscoveryService:
                     raise RuntimeError("Discovery batch replacement chain is incomplete")
 
         if not any(
-            batch.discovery_model_run_id == parameters.research_model_run_id
-            for batch in chain
+            batch.discovery_model_run_id == parameters.research_model_run_id for batch in chain
         ):
             raise ValueError("Archived report is not part of the discovery run revision chain")
 
@@ -237,9 +234,7 @@ class DiscoveryService:
         # sans créer de N+2 et sans retoucher la chaîne, puis le handoff
         # cumulative est rejoué, car c'est précisément lui qui peut manquer
         # quand le worker meurt juste après le commit du batch.
-        reprocess_batch_id = uuid5(
-            NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}"
-        )
+        reprocess_batch_id = uuid5(NAMESPACE_URL, f"cti-discovery-batch-reprocess:{context.job_id}")
         async with self._uow_factory() as uow:
             adopted = await uow.discovery_batches.get(reprocess_batch_id)
         if adopted is not None:

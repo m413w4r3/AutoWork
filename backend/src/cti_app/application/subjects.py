@@ -29,9 +29,7 @@ class SubjectService:
     def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def materialize_in_uow(
-        self, uow: UnitOfWork, *, edition_id: UUID, title: str
-    ) -> Subject:
+    async def materialize_in_uow(self, uow: UnitOfWork, *, edition_id: UUID, title: str) -> Subject:
         edition = await uow.editions.get_for_update(edition_id)
         if edition is None:
             raise EditionNotFoundError(str(edition_id))

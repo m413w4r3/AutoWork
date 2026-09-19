@@ -1192,9 +1192,7 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     assert uow.batch_status_read_model.calls == 1
 
 
-async def test_subject_status_uses_current_subject_title(
-    api: AsyncClient, uow: _Uow
-) -> None:
+async def test_subject_status_uses_current_subject_title(api: AsyncClient, uow: _Uow) -> None:
     edition_id, subject_id = uuid4(), uuid4()
     uow.editorial_groups._groups.append(_group(edition_id, "Editorial group title", subject_id))
     uow.subjects.items[subject_id].title = "Canonical subject title"

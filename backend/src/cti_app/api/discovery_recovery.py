@@ -342,7 +342,8 @@ async def _recovery_context(
     if (
         job.kind != DISCOVERY_JOB_KIND
         or job.aggregate_type != "discovery_run"
-        or job.status not in {
+        or job.status
+        not in {
             JobStatus.WAITING_HUMAN,
             JobStatus.QUEUED,
             JobStatus.RUNNING,

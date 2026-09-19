@@ -1267,8 +1267,9 @@ async def test_standalone_import_rejects_stale_confirmation() -> None:
     assert await service.list_batches(params.edition_id) == []
 
 
-async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_without_model_call(
-) -> None:
+async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_without_model_call() -> (
+    None
+):
     adapter = FakeModelAdapter(research_text=research_markdown_fixture())
     gateway, model_uow, _ = gateway_for_adapter(adapter)
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
@@ -1341,8 +1342,9 @@ async def test_reprocess_archived_report_creates_revision_on_same_discovery_run_
     assert len(adapter.calls) == research_calls_before
 
 
-async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_new_revision(
-) -> None:
+async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_new_revision() -> (
+    None
+):
     """Le batch déterministe déjà persisté n'autorise pas à sauter le handoff.
 
     Le batch est committé avant le handoff cumulative : si le worker meurt
@@ -1382,9 +1384,7 @@ async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_n
         input_parameters=params.model_dump(mode="json"),
     )
     await dispatcher.dispatch(initial_job.id)
-    initial_batches = await initial_discovery.list_batches(
-        params.edition_id, include_replaced=True
-    )
+    initial_batches = await initial_discovery.list_batches(params.edition_id, include_replaced=True)
     assert len(initial_batches) == 1
     initial_batch = initial_batches[0]
     initial_candidate_ids = {candidate.id for candidate in initial_batch.candidates}
@@ -1457,9 +1457,7 @@ async def test_reprocess_existing_batch_retries_post_persisted_handoff_without_n
     assert revision.discovery_run_id == run.id
     assert handoff_batch_ids == [revision.id]
     assert len(discovery_uow.candidate_state) == 2
-    assert initial_candidate_ids.isdisjoint(
-        {candidate.id for candidate in revision.candidates}
-    )
+    assert initial_candidate_ids.isdisjoint({candidate.id for candidate in revision.candidates})
 
     handoff_fails = False
     replayed = await reprocessing.reprocess_archived_report(

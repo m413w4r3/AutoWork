@@ -60,7 +60,8 @@ class SqlAlchemyPublicationManifestRepository:
         self, edition_id: UUID, edition_version: int
     ) -> PublicationManifestV1 | None:
         return await self._load_manifest(
-            select(PublicationManifestRow).where(
+            select(PublicationManifestRow)
+            .where(
                 PublicationManifestRow.edition_id == edition_id,
                 PublicationManifestRow.edition_version == edition_version,
             )
@@ -72,9 +73,7 @@ class SqlAlchemyPublicationManifestRepository:
         return await self._load_manifest(
             select(PublicationManifestRow)
             .where(PublicationManifestRow.edition_id == edition_id)
-            .order_by(
-                PublicationManifestRow.created_at.desc(), PublicationManifestRow.id.desc()
-            )
+            .order_by(PublicationManifestRow.created_at.desc(), PublicationManifestRow.id.desc())
             .limit(1)
         )
 

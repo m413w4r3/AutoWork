@@ -404,9 +404,7 @@ def _find_incomplete_source(
     return incomplete
 
 
-def _find_source(
-    candidate: DiscoveryCandidate, canonical_url: str
-) -> SourceCandidate:
+def _find_source(candidate: DiscoveryCandidate, canonical_url: str) -> SourceCandidate:
     source = next(
         (item for item in candidate.evidence.sources if item.canonical_url == canonical_url),
         None,
@@ -483,16 +481,12 @@ def _build_manual_edit_batch(
             replaced_canonical_url=replaced_canonical_url,
         )
     ).hexdigest()
-    batch_id = uuid5(
-        NAMESPACE_URL, f"cti-discovery-manual-url-batch:{discovery_run_id}:{digest}"
-    )
+    batch_id = uuid5(NAMESPACE_URL, f"cti-discovery-manual-url-batch:{discovery_run_id}:{digest}")
     manual_run_id = uuid5(
         NAMESPACE_URL, f"cti-discovery-manual-url-run:{discovery_run_id}:{digest}"
     )
     candidate = deepcopy(candidate)
-    candidate.id = uuid5(
-        NAMESPACE_URL, f"cti-discovery-manual-url-candidate:{batch_id}:0"
-    )
+    candidate.id = uuid5(NAMESPACE_URL, f"cti-discovery-manual-url-candidate:{batch_id}:0")
     batch = DiscoveryBatch(
         edition_id=edition_id,
         discovery_run_id=discovery_run_id,

@@ -232,9 +232,7 @@ def test_human_attachments_to_the_same_subject_are_coalesced() -> None:
         flags=["human_decided"],
     )
 
-    coalesced = _coalesce_existing_targets(
-        DiscoveryMergePlanV1(groups=[first, second])
-    )
+    coalesced = _coalesce_existing_targets(DiscoveryMergePlanV1(groups=[first, second]))
 
     assert len(coalesced.groups) == 1
     assert coalesced.groups[0].existing_subject_handles == ["X-target"]

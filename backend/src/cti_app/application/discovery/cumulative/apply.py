@@ -155,12 +155,8 @@ def apply_discovery_merge_plan(
                     )
                 )
         else:
-            active_incoming = [
-                item for item in incoming if item.candidate_id in candidates_by_id
-            ]
-            member_ids = tuple(
-                sorted({item.candidate_id for item in active_incoming}, key=str)
-            )
+            active_incoming = [item for item in incoming if item.candidate_id in candidates_by_id]
+            member_ids = tuple(sorted({item.candidate_id for item in active_incoming}, key=str))
             if not member_ids:
                 continue
             origin_key = discovery_origin_key(member_ids)
@@ -272,11 +268,7 @@ def apply_structural_subject_merge(
     survivor = min(selected, key=lambda item: (item.created_at, str(item.subject_id)))
     candidates_by_id = {candidate.id: candidate for candidate in canonical_candidates}
     member_ids = _active_member_ids(
-        (
-            reference.candidate_id
-            for subject in selected
-            for reference in subject.member_references
-        ),
+        (reference.candidate_id for subject in selected for reference in subject.member_references),
         candidates_by_id,
     )
     if not member_ids:
@@ -692,9 +684,7 @@ def _unique_member_references(
 ) -> tuple[DiscoveryMemberReference, ...]:
     materialized = list(references)
     unique = {item.candidate_id: item for item in materialized}
-    return tuple(
-        unique[key] for key in sorted(unique, key=str)
-    )
+    return tuple(unique[key] for key in sorted(unique, key=str))
 
 
 def _snapshot_hash(subjects: Sequence[DiscoverySubject]) -> str:
@@ -740,9 +730,7 @@ def _assert_non_loss(
             if ref.candidate_id in candidates_by_id
         }
         final_refs = {
-            ref.candidate_id
-            for subject in result.subjects
-            for ref in subject.member_references
+            ref.candidate_id for subject in result.subjects for ref in subject.member_references
         }
         if not parent_refs <= final_refs:
             raise RuntimeError("Discovery merge lost member references")

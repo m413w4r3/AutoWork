@@ -496,9 +496,7 @@ async def test_open_edition_reconciliation_is_allowed_with_publication_manifest(
     )
 
     assert run.status is SubjectProductionStatus.RUNNING
-    assert uow.edition_production_batches.batch.status is (
-        ProductionBatchStatus.RUNNING
-    )
+    assert uow.edition_production_batches.batch.status is (ProductionBatchStatus.RUNNING)
     assert jobs.submissions == 1
 
 

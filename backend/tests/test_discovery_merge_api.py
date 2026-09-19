@@ -54,6 +54,7 @@ class FakeCumulativeDiscoveryService:
             for handle in self.run.handle_map
         }
 
+
 @pytest.mark.asyncio
 async def test_merge_review_api_lists_details_without_human_mutation_endpoint() -> None:
     edition_id = uuid4()
@@ -163,6 +164,7 @@ class FakeManualSourceEditService:
             raise self.error
         assert self.result is not None
         return self.result
+
 
 def _promoted_source(url: str) -> SourceCandidate:
     return SourceCandidate(

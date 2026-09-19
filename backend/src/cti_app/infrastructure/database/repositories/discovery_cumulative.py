@@ -462,8 +462,7 @@ def _discovery_snapshot_values(snapshot: DiscoverySnapshot) -> dict[str, object]
                 "subject_id": str(subject.subject_id),
                 "candidate": _candidate_payload(subject.candidate),
                 "member_references": [
-                    {"candidate_id": str(ref.candidate_id)}
-                    for ref in subject.member_references
+                    {"candidate_id": str(ref.candidate_id)} for ref in subject.member_references
                 ],
                 "created_at": subject.created_at.isoformat(),
             }

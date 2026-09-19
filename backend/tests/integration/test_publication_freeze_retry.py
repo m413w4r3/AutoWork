@@ -198,9 +198,7 @@ async def test_same_version_pending_snapshot_rejects_changed_production_review_i
         run_number=2,
     )
 
-    with pytest.raises(
-        PublicationAssemblyError, match="publication_inputs_changed_after_freeze"
-    ):
+    with pytest.raises(PublicationAssemblyError, match="publication_inputs_changed_after_freeze"):
         await assembly.assemble(accepted_a.manifest.id)
 
     async with uow_factory() as uow:

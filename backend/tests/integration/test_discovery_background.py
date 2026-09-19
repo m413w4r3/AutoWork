@@ -291,6 +291,7 @@ async def test_postgres_concurrent_reprocess_jobs_form_one_linear_revision_chain
     finally:
         await engine.dispose()
 
+
 class _SimulatedWorkerLoss(BaseException):
     """Perte brutale du worker : hors de la hiérarchie `Exception`, donc le
     JobExecutor ne la convertit pas en échec et le Job reste RUNNING, comme
@@ -404,9 +405,7 @@ async def test_postgres_reprocess_worker_loss_replays_cumulative_handoff_after_d
             archive=gateway,
             after_persisted_batch=handoff,
         )
-        registry = create_job_registry(
-            gateway, discovery, cumulative_discovery_service=cumulative
-        )
+        registry = create_job_registry(gateway, discovery, cumulative_discovery_service=cumulative)
         jobs = JobService(uow_factory, registry)
         executor = JobExecutor(uow_factory, registry)
         dispatcher = _WorkerLossDispatcher(executor)
@@ -509,8 +508,7 @@ async def test_postgres_reprocess_worker_loss_replays_cumulative_handoff_after_d
             children = [
                 job
                 for job in await uow.jobs.list_for_aggregate("edition", edition.id)
-                if job.kind == RECONCILE_DISCOVERY_JOB_KIND
-                and job.idempotency_key == child_key
+                if job.kind == RECONCILE_DISCOVERY_JOB_KIND and job.idempotency_key == child_key
             ]
         assert replayed_intake is not None
         assert replayed_intake.id == intake.id
@@ -632,9 +630,7 @@ async def test_postgres_reconciliation_handoff_never_preempts_a_scheduled_retry(
             archive=gateway,
             after_persisted_batch=handoff,
         )
-        registry = create_job_registry(
-            gateway, discovery, cumulative_discovery_service=cumulative
-        )
+        registry = create_job_registry(gateway, discovery, cumulative_discovery_service=cumulative)
         jobs = JobService(uow_factory, registry)
         executor = JobExecutor(uow_factory, registry)
 

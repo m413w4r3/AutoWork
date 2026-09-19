@@ -264,10 +264,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     first_model_ids = {
-        url: call.model_run_id
-        for call in q2_calls
-        for url in call.source_urls
-        if url != urls[-1]
+        url: call.model_run_id for call in q2_calls for url in call.source_urls if url != urls[-1]
     }
     assert set(first_model_ids) == set(urls[:-1])
     assert len(first_model_ids) == 13

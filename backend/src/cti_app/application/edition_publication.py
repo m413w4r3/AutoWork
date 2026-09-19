@@ -351,9 +351,8 @@ class EditionPublicationService:
                     )
                 except PublicationError:
                     current_inputs = None
-                current_inputs_match = (
-                    current_inputs is not None
-                    and _publication_inputs_match(manifest, current_inputs)
+                current_inputs_match = current_inputs is not None and _publication_inputs_match(
+                    manifest, current_inputs
                 )
             can_retry_assembly = (
                 edition.state is EditionStatus.OPEN

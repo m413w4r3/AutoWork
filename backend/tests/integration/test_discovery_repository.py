@@ -1117,12 +1117,12 @@ async def test_same_title_candidates_are_two_independent_raw_candidates(
                 assert fetched.discovery_run_id == discovery_run.id
 
             # Run and edition reads return both, unmerged.
-            assert [item.id for item in await uow.discovery_candidates.list_for_run(
-                discovery_run.id
-            )] == [first.id, second.id]
-            assert [item.id for item in await uow.discovery_candidates.list_for_edition(
-                edition.id
-            )] == [first.id, second.id]
+            assert [
+                item.id for item in await uow.discovery_candidates.list_for_run(discovery_run.id)
+            ] == [first.id, second.id]
+            assert [
+                item.id for item in await uow.discovery_candidates.list_for_edition(edition.id)
+            ] == [first.id, second.id]
 
             reloaded = await uow.discovery_batches.get(batch.id)
             assert reloaded is not None
@@ -1268,9 +1268,7 @@ async def test_manual_correction_replaces_its_candidate_in_the_raw_list(
         async with engine.connect() as connection:
             with pytest.raises(IntegrityError):
                 await connection.execute(
-                    delete(DiscoveryCandidateRow).where(
-                        DiscoveryCandidateRow.id == original.id
-                    )
+                    delete(DiscoveryCandidateRow).where(DiscoveryCandidateRow.id == original.id)
                 )
             await connection.rollback()
     finally:

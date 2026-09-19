@@ -240,9 +240,7 @@ class InMemoryCollectionUnitOfWork:
         self.source_documents = InMemorySourceDocumentRepository(factory.documents)
         self.provenance = InMemoryProvenanceRepository(factory.provenance)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)
-        self.discovery_candidates = BatchProjectedDiscoveryCandidateRepository(
-            factory.batches
-        )
+        self.discovery_candidates = BatchProjectedDiscoveryCandidateRepository(factory.batches)
         self.editorial_groups = InMemoryEditorialGroupRepository(factory.groups, factory.editions)
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.source_collections = InMemorySourceCollectionRepository(factory.collections)

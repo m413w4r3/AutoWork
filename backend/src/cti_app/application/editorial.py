@@ -164,10 +164,7 @@ class EditorialGroupingService:
                 )
                 projected = by_subject.get(subject.subject_id)
                 if not references:
-                    if (
-                        projected is not None
-                        and projected.status is EditorialGroupStatus.PROPOSED
-                    ):
+                    if projected is not None and projected.status is EditorialGroupStatus.PROPOSED:
                         projected.supersede()
                         await uow.editorial_groups.save(projected)
                     continue

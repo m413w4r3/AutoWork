@@ -188,9 +188,7 @@ class DiscoveryRunService:
                 reused = True
                 existing = await uow.jobs.get(exc.existing_job_id)
                 if existing is None:
-                    raise RuntimeError(
-                        "Reprocessing job conflict without canonical job"
-                    ) from exc
+                    raise RuntimeError("Reprocessing job conflict without canonical job") from exc
                 job = existing
             await uow.commit()
         job = await self._jobs.get(job.id)

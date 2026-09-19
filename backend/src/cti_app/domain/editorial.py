@@ -138,9 +138,7 @@ class EditorialGroup:
         if self.source_relationship_status is SourceRelationshipStatus.PROVISIONAL:
             self.needs_source_verification = True
 
-    def synchronize_candidate_references(
-        self, references: tuple[CandidateReference, ...]
-    ) -> None:
+    def synchronize_candidate_references(self, references: tuple[CandidateReference, ...]) -> None:
         """Project canonical Fusion membership onto a live editorial group."""
         if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
             raise ValueError("Only proposed or selected groups can be synchronized")

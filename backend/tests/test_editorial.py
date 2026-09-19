@@ -48,9 +48,7 @@ class _CanonicalCandidateProjection:
                         # Deterministic provenance: repeated reads must project
                         # the same references, as the canonical table would.
                         discovery_run_id=uuid5(NAMESPACE_URL, f"run:{edition_id}"),
-                        discovery_batch_id=uuid5(
-                            NAMESPACE_URL, f"batch:{reference.candidate_id}"
-                        ),
+                        discovery_batch_id=uuid5(NAMESPACE_URL, f"batch:{reference.candidate_id}"),
                         position=index,
                     )
                 )

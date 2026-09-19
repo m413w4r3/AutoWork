@@ -138,9 +138,7 @@ async def test_resolving_a_merge_retires_it_and_rejects_a_stale_replay(
             edition.id,
             run_id,
             snapshot_version=bootstrap.version,
-            decisions=(
-                FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),
-            ),
+            decisions=(FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),),
             actor_id="analyst",
         )
         assert applied.snapshot_version == bootstrap.version + 1
@@ -161,9 +159,7 @@ async def test_resolving_a_merge_retires_it_and_rejects_a_stale_replay(
                 edition.id,
                 run_id,
                 snapshot_version=bootstrap.version,
-                decisions=(
-                    FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),
-                ),
+                decisions=(FusionReviewDecision(FusionReviewAction.ACCEPT, (candidate_id,)),),
                 actor_id="analyst",
             )
     finally:
@@ -247,9 +243,7 @@ async def test_a_merge_planned_against_a_superseded_snapshot_is_replanned(
             edition.id,
             other.value.run_id,
             snapshot_version=bootstrap.version,
-            decisions=(
-                FusionReviewDecision(FusionReviewAction.ACCEPT, (third_candidate_id,)),
-            ),
+            decisions=(FusionReviewDecision(FusionReviewAction.ACCEPT, (third_candidate_id,)),),
             actor_id="analyst",
         )
 
@@ -329,9 +323,7 @@ async def test_a_decision_naming_an_unknown_group_is_refused(
                 edition.id,
                 parked.value.run_id,
                 snapshot_version=bootstrap.version,
-                decisions=(
-                    FusionReviewDecision(FusionReviewAction.ACCEPT, (edition.id,)),
-                ),
+                decisions=(FusionReviewDecision(FusionReviewAction.ACCEPT, (edition.id,)),),
                 actor_id="analyst",
             )
     finally:

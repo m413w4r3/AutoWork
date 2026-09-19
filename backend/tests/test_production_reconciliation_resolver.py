@@ -92,9 +92,7 @@ class _Uow:
         self.subject_production_runs = _Runs(run)
         self.model_runs = _Models(model)
         if with_edition:
-            self.editions = _EditionRepo(
-                SimpleNamespace(id=run.edition_id, state=edition_state)
-            )
+            self.editions = _EditionRepo(SimpleNamespace(id=run.edition_id, state=edition_state))
         self.edition_production_batch_items = _BatchItems()
 
     async def __aenter__(self) -> _Uow:

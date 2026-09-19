@@ -60,9 +60,7 @@ def register_discovery_jobs(registry: JobRegistry, service: DiscoveryService) ->
         resume_after_worker_loss=True,
     )
 
-    async def reprocess_handler(
-        parameters: JobParameters, context: JobExecutionContext
-    ) -> str:
+    async def reprocess_handler(parameters: JobParameters, context: JobExecutionContext) -> str:
         if not isinstance(parameters, ReprocessDiscoveryReportParameters):
             raise TypeError("Invalid discovery report reprocessing parameters")
         try:

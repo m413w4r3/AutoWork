@@ -38,8 +38,9 @@ from tests.model_support import InMemoryModelRunUnitOfWorkFactory
 from tests.test_discovery import DeferredResearchAdapter, research_markdown_fixture
 
 
-async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeated_configuration(
-) -> None:
+async def test_discovery_run_creation_is_transport_idempotent_and_allows_repeated_configuration() -> (
+    None
+):
     fake = FakeModelAdapter(
         research_text=research_markdown_fixture(),
     )
@@ -330,9 +331,7 @@ async def test_raw_candidate_reads_by_edition_run_and_id_ignore_the_snapshot() -
         with_history = await client.get(f"{base}/candidates?include_replaced=true")
         filtered = await client.get(f"{base}/candidates?search=background")
         run_a_active = await client.get(f"{base}/runs/{run_a.id}/candidates")
-        run_a_history = await client.get(
-            f"{base}/runs/{run_a.id}/candidates?include_replaced=true"
-        )
+        run_a_history = await client.get(f"{base}/runs/{run_a.id}/candidates?include_replaced=true")
         foreign = await client.get(f"{base}/runs/{foreign_run.id}/candidates")
         by_id = await client.get(f"/api/discovery/candidates/{historical.id}")
         missing = await client.get(f"/api/discovery/candidates/{uuid4()}")
@@ -471,9 +470,7 @@ async def test_discovery_request_snapshot_keyword_and_exclusion_boundaries() -> 
             )
             assert response.status_code == 202
             run_id = response.json()["run_id"]
-            persisted = await client.get(
-                f"/api/editions/{edition.id}/discovery/runs/{run_id}"
-            )
+            persisted = await client.get(f"/api/editions/{edition.id}/discovery/runs/{run_id}")
             assert persisted.status_code == 200
             snapshot = persisted.json()["request_snapshot"]
             assert snapshot["keywords"] == keywords
@@ -535,9 +532,7 @@ async def test_discovery_run_listing_is_newest_first_and_uses_job_projection() -
     application.include_router(discovery_router)
     application.state.edition_service = edition_service
     application.state.discovery_service = discovery
-    application.state.discovery_run_service = DiscoveryRunService(
-        shared_uow, jobs, dispatcher
-    )
+    application.state.discovery_run_service = DiscoveryRunService(shared_uow, jobs, dispatcher)
     application.state.job_service = jobs
     application.state.job_dispatcher = dispatcher
     application.state.identity_provider = LocalIdentityProvider()
@@ -892,9 +887,7 @@ async def test_archived_edition_rejects_launch_and_import() -> None:
         )
         # Read-only depuis AW-002/AW-004 : l'historique reste consultable.
         listed = await client.get(f"/api/editions/{edition.id}/discovery/runs")
-        detail = await client.get(
-            f"/api/editions/{edition.id}/discovery/runs/{archived_run_id}"
-        )
+        detail = await client.get(f"/api/editions/{edition.id}/discovery/runs/{archived_run_id}")
 
     for response in (launched, preview, confirmed):
         assert response.status_code == 422

@@ -712,9 +712,7 @@ async def test_changed_review_input_supersedes_pending_snapshot_without_version_
         document_artifact_id=ARTIFACT_B,
     )
 
-    with pytest.raises(
-        PublicationAssemblyError, match="publication_inputs_changed_after_freeze"
-    ):
+    with pytest.raises(PublicationAssemblyError, match="publication_inputs_changed_after_freeze"):
         await assembly.assemble(first.manifest_id)
     assert uow.edition_releases.release is None
     assert (await publication.release_status(EDITION_ID)).can_retry_assembly is False

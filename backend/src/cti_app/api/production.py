@@ -932,9 +932,7 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
         "Une tentative est déjà en cours pour cet article. Attendez qu'elle se termine."
     ),
     "retry_stage_not_in_pipeline": "Cette étape ne fait pas partie du pipeline de production.",
-    "edition_archived": (
-        "L'édition est archivée : plus aucune production ne peut être modifiée."
-    ),
+    "edition_archived": ("L'édition est archivée : plus aucune production ne peut être modifiée."),
     "edition_not_found": "L'édition de cet article est introuvable.",
     "production_run_edition_changed": (
         "Cet article a changé d'édition depuis l'ouverture de la revue. Rechargez la page."

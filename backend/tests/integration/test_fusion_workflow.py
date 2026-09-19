@@ -207,9 +207,7 @@ async def test_fusion_board_uses_canonical_candidate_ids_and_resolves_review(
 
         assert resolved.snapshot_version == (board.snapshot_version or 0) + 1
         resolved_candidate_ids = {
-            candidate_id
-            for group in resolved.groups
-            for candidate_id in group.candidate_ids
+            candidate_id for group in resolved.groups for candidate_id in group.candidate_ids
         }
         assert resolved_candidate_ids == {
             persisted[0].id,
@@ -347,8 +345,7 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
             second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
         )
         candidate_ids = [
-            candidate.id
-            for candidate in await _candidates_for_edition(uow_factory, edition.id)
+            candidate.id for candidate in await _candidates_for_edition(uow_factory, edition.id)
         ]
         fusion = FusionService(uow_factory)
         merged = await fusion.merge(
@@ -365,9 +362,7 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         assert merged.groups[0].confidence is None
         assert merged.groups[0].model_suggestion is None
         assert [
-            entry.actor_id
-            for entry in merged.groups[0].history
-            if entry.action == "merged"
+            entry.actor_id for entry in merged.groups[0].history if entry.action == "merged"
         ] == ["analyst"]
         merged_snapshot = await _active_snapshot(uow_factory, edition.id)
         assert merged_snapshot is not None
@@ -537,12 +532,8 @@ def _model_run(suffix: str) -> ModelRun:
         requested_model="fake",
         prompt_template_id="fusion-integration",
         prompt_template_version="1",
-        authorized_input_hash=hashlib.sha256(
-            f"fusion-authorized:{suffix}".encode()
-        ).hexdigest(),
-        evidence_pack_hash=hashlib.sha256(
-            f"fusion-evidence:{suffix}".encode()
-        ).hexdigest(),
+        authorized_input_hash=hashlib.sha256(f"fusion-authorized:{suffix}".encode()).hexdigest(),
+        evidence_pack_hash=hashlib.sha256(f"fusion-evidence:{suffix}".encode()).hexdigest(),
         parameters={},
     )
 

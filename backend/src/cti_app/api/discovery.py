@@ -301,9 +301,7 @@ async def list_discovery_runs(edition_id: UUID, request: Request) -> list[Discov
 
 
 @router.get("/runs/{run_id}", response_model=DiscoveryRunView)
-async def read_discovery_run(
-    edition_id: UUID, run_id: UUID, request: Request
-) -> DiscoveryRunView:
+async def read_discovery_run(edition_id: UUID, run_id: UUID, request: Request) -> DiscoveryRunView:
     service: DiscoveryRunService = request.app.state.discovery_run_service
     try:
         projection = await service.get(run_id)
@@ -311,9 +309,7 @@ async def read_discovery_run(
             raise DiscoveryRunNotFoundError(str(run_id))
         return _discovery_run_view(projection)
     except DiscoveryRunNotFoundError as exc:
-        raise HTTPException(
-            status_code=404, detail={"code": "discovery_run_not_found"}
-        ) from exc
+        raise HTTPException(status_code=404, detail={"code": "discovery_run_not_found"}) from exc
     except Exception as exc:
         _raise_api_error(exc)
 
@@ -349,8 +345,7 @@ async def read_candidates(
 
         if source_status is not None:
             if not any(
-                source.verification_status is source_status
-                for source in candidate.evidence.sources
+                source.verification_status is source_status for source in candidate.evidence.sources
             ):
                 continue
 
@@ -436,9 +431,7 @@ async def reprocess_archived_report(
             reused=reused,
         )
     except DiscoveryRunNotFoundError as exc:
-        raise HTTPException(
-            status_code=404, detail={"code": "discovery_run_not_found"}
-        ) from exc
+        raise HTTPException(status_code=404, detail={"code": "discovery_run_not_found"}) from exc
     except Exception as exc:
         _raise_api_error(exc)
 

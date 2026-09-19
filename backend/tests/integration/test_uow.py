@@ -155,9 +155,7 @@ async def test_database_prevents_tlp_downgrade(migrated_postgres_url: str) -> No
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
     edition = _new_edition()
-    subject = Subject(
-        edition_id=edition.id, title="TLP guard", slug="tlp-guard", tlp=TLP.RED
-    )
+    subject = Subject(edition_id=edition.id, title="TLP guard", slug="tlp-guard", tlp=TLP.RED)
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:
             assert await uow.editions.add_if_absent(edition)
@@ -184,9 +182,7 @@ async def test_provenance_events_are_append_only(migrated_postgres_url: str) -> 
     engine = create_postgres_engine(migrated_postgres_url)
     session_factory = create_session_factory(engine)
     edition = _new_edition()
-    subject = Subject(
-        edition_id=edition.id, title="Provenance", slug="provenance", tlp=TLP.AMBER
-    )
+    subject = Subject(edition_id=edition.id, title="Provenance", slug="provenance", tlp=TLP.AMBER)
     event = ProvenanceEvent(
         subject_id=subject.id,
         aggregate_type="subject",

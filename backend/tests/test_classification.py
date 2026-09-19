@@ -8,9 +8,7 @@ from cti_app.domain.errors import TlpDowngradeError
 
 
 def test_tlp_can_only_stay_equal_or_become_more_restrictive() -> None:
-    subject = Subject(
-        edition_id=uuid4(), title="Test subject", slug="test-subject", tlp=TLP.AMBER
-    )
+    subject = Subject(edition_id=uuid4(), title="Test subject", slug="test-subject", tlp=TLP.AMBER)
 
     subject.update_metadata(title="Test subject", tlp=TLP.RED)
 

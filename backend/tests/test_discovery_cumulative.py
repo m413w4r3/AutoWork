@@ -91,9 +91,7 @@ def apply_discovery_merge_plan(
                         position=len(candidates),
                     )
                 )
-    return _apply_discovery_merge_plan(
-        parent, delta, plan, candidates, **kwargs
-    )
+    return _apply_discovery_merge_plan(parent, delta, plan, candidates, **kwargs)
 
 
 @pytest.mark.asyncio

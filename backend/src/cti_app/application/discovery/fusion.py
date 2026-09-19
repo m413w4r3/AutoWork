@@ -423,9 +423,7 @@ class FusionService:
         if edition is None:
             raise LookupError(f"Unknown edition {edition_id}")
         snapshot = await uow.discovery_snapshots.get_active(edition_id)
-        active = await uow.discovery_candidates.list_for_edition(
-            edition_id, include_replaced=False
-        )
+        active = await uow.discovery_candidates.list_for_edition(edition_id, include_replaced=False)
         historical = await uow.discovery_candidates.list_for_edition(
             edition_id, include_replaced=True
         )
@@ -670,12 +668,7 @@ def _coalesce_existing_targets(plan: DiscoveryMergePlanV1) -> DiscoveryMergePlan
         matching = [
             index
             for index, component in enumerate(grouped)
-            if handles
-            & {
-                handle
-                for item in component
-                for handle in item.existing_subject_handles
-            }
+            if handles & {handle for item in component for handle in item.existing_subject_handles}
         ]
         if not matching:
             grouped.append([group])
@@ -706,9 +699,7 @@ def _combine_groups(groups: Sequence[DiscoveryMergeGroup]) -> DiscoveryMergeGrou
         {
             field_name: list(
                 dict.fromkeys(
-                    value
-                    for group in groups
-                    for value in getattr(group.evidence, field_name)
+                    value for group in groups for value in getattr(group.evidence, field_name)
                 )
             )
             for field_name in evidence_fields
@@ -738,9 +729,7 @@ def _combine_groups(groups: Sequence[DiscoveryMergeGroup]) -> DiscoveryMergeGrou
                 dict.fromkeys(group.rationale for group in groups if group.rationale)
             ),
             "evidence": evidence,
-            "flags": list(
-                dict.fromkeys(flag for group in groups for flag in group.flags)
-            ),
+            "flags": list(dict.fromkeys(flag for group in groups for flag in group.flags)),
         }
     )
 
@@ -856,9 +845,7 @@ def _history(
     if identity is not None:
         entries.append(
             FusionHistoryEntry(
-                action="split_created"
-                if identity.origin_key.startswith("split:")
-                else "created",
+                action="split_created" if identity.origin_key.startswith("split:") else "created",
                 merge_run_id=identity.created_by_merge_run_id,
                 planner_kind=kind(identity.created_by_merge_run_id),
                 actor_id=None,
@@ -906,9 +893,7 @@ def _history(
                     merge_run_id=run.id,
                     planner_kind=run.planner_kind.value,
                     actor_id=actor if isinstance(actor, str) else None,
-                    candidate_ids=tuple(
-                        UUID(value) for value in raw_ids if isinstance(value, str)
-                    )
+                    candidate_ids=tuple(UUID(value) for value in raw_ids if isinstance(value, str))
                     if isinstance(raw_ids, list)
                     else (),
                     created_at=run.created_at,
@@ -1103,9 +1088,7 @@ def _signals(
 
     best_ratio, best_pair = 0.0, (candidates[0].id, candidates[1].id)
     for left, right in combinations(candidates, 2):
-        ratio = SequenceMatcher(
-            None, left.title.casefold(), right.title.casefold()
-        ).ratio()
+        ratio = SequenceMatcher(None, left.title.casefold(), right.title.casefold()).ratio()
         if ratio > best_ratio:
             best_ratio, best_pair = ratio, (left.id, right.id)
     if best_ratio >= _TITLE_SIMILARITY_THRESHOLD:
@@ -1129,9 +1112,7 @@ def _signals(
             differences.append(f"Les dates diffèrent de {gap} jour(s)")
 
     for field_name, label in _DIFFERENCE_LABELS.items():
-        values = {
-            item.id: _normalized(getattr(item.evidence, field_name)) for item in candidates
-        }
+        values = {item.id: _normalized(getattr(item.evidence, field_name)) for item in candidates}
         for item in candidates:
             for key, display in values[item.id].items():
                 holders = [other for other in candidates if key in values[other.id]]
@@ -1148,9 +1129,7 @@ def _signals(
     if len(set(ioc_counts.values())) > 1:
         differences.append(
             "IOC visibles : "
-            + ", ".join(
-                f"« {item.title} » {ioc_counts[item.id]}" for item in candidates
-            )
+            + ", ".join(f"« {item.title} » {ioc_counts[item.id]}" for item in candidates)
         )
     return tuple(signals), tuple(dict.fromkeys(differences))
 
@@ -1172,9 +1151,7 @@ def _ioc_values(candidate: DiscoveryCandidate) -> tuple[str, ...]:
 
 
 def _urls(candidate: DiscoveryCandidate) -> dict[str, str]:
-    return {
-        source.canonical_url: source.canonical_url for source in candidate.evidence.sources
-    }
+    return {source.canonical_url: source.canonical_url for source in candidate.evidence.sources}
 
 
 def _domains(candidate: DiscoveryCandidate) -> dict[str, str]:

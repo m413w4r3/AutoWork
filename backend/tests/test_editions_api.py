@@ -76,9 +76,7 @@ async def test_list_filters_by_state_without_status_alias() -> None:
         created = await client.post("/api/editions", json=EDITION_PAYLOAD)
         await client.post("/api/editions", json=second_payload)
         edition_id = created.json()["id"]
-        archived = await client.post(
-            f"/api/editions/{edition_id}/archive", json={"version": 1}
-        )
+        archived = await client.post(f"/api/editions/{edition_id}/archive", json={"version": 1})
         open_editions = await client.get("/api/editions?state=open")
         archived_editions = await client.get("/api/editions?state=archived")
         legacy_filter = await client.get("/api/editions?status=archived")
@@ -127,9 +125,7 @@ async def test_archive_is_explicit_and_archived_is_terminal() -> None:
     ) as client:
         created = await client.post("/api/editions", json=EDITION_PAYLOAD)
         edition_id = created.json()["id"]
-        archived = await client.post(
-            f"/api/editions/{edition_id}/archive", json={"version": 1}
-        )
+        archived = await client.post(f"/api/editions/{edition_id}/archive", json={"version": 1})
         archived_again = await client.post(
             f"/api/editions/{edition_id}/archive", json={"version": 2}
         )

@@ -303,9 +303,7 @@ def _board_view(board: FusionBoard) -> FusionBoardView:
                     FusionReviewGroupView(
                         candidate_ids=list(group.candidate_ids),
                         candidates=[_candidate_view(item) for item in group.candidates],
-                        proposed_discovery_subject_ids=list(
-                            group.proposed_discovery_subject_ids
-                        ),
+                        proposed_discovery_subject_ids=list(group.proposed_discovery_subject_ids),
                         confidence=group.confidence,
                         requires_decision=group.requires_decision,
                         deterministic_signals=_signal_views(group.deterministic_signals),

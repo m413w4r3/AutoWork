@@ -446,6 +446,7 @@ async def _edition_schema(database_url: str) -> tuple[set[str], dict[str, str], 
     engine = create_async_engine(database_url)
     try:
         async with engine.connect() as connection:
+
             def inspect_edition(
                 sync_connection: Connection,
             ) -> tuple[set[str], dict[str, str], set[str]]:
@@ -530,9 +531,7 @@ def test_fusion_schema_uses_canonical_candidate_identity(
     contributions = schema_snapshot["subject_contributions"]
     assert "candidate_key" not in contributions["columns"]
     assert frozenset({"candidate_id"}) in contributions["uniques"]
-    assert (("candidate_id",), "discovery_candidates", ("id",), "RESTRICT") in contributions[
-        "fks"
-    ]
+    assert (("candidate_id",), "discovery_candidates", ("id",), "RESTRICT") in contributions["fks"]
     # Structural human decisions (merge/split) have no intake.
     assert schema_snapshot["discovery_snapshots"]["columns"]["intake_id"][1] is True
     assert schema_snapshot["discovery_merge_runs"]["columns"]["intake_id"][1] is True
@@ -724,9 +723,9 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert repair_triggers == {(_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"}
     schema_definitions = asyncio.run(_database_snapshot(temporary_postgres_url))
     publication_manifest_schema = schema_definitions["publication_manifests"]
-    assert frozenset({"edition_id", "edition_version"}) not in publication_manifest_schema[
-        "uniques"
-    ]
+    assert (
+        frozenset({"edition_id", "edition_version"}) not in publication_manifest_schema["uniques"]
+    )
     assert "ck_publication_manifest_edition_version" in publication_manifest_schema["checks"]
     assert "ix_publication_manifests_edition_created" in {
         index[0] for index in publication_manifest_schema["indexes"]
