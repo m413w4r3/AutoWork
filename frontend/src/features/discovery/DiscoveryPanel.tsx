@@ -213,8 +213,13 @@ export function DiscoveryPanel({
       void queryClient.invalidateQueries({
         queryKey: ["discovery-runs", editionId],
       });
+      // A discovery wave moves the active snapshot, so both boards rebuilt
+      // from it go stale (AW-008: Selection replaced the editorial board).
       void queryClient.invalidateQueries({
-        queryKey: ["editorial-board", editionId],
+        queryKey: ["fusion", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["selection-board", editionId],
       });
     }
   }, [editionId, queryClient, reconciliationJob.data]);
@@ -234,8 +239,13 @@ export function DiscoveryPanel({
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
+      // A discovery wave moves the active snapshot, so both boards rebuilt
+      // from it go stale (AW-008: Selection replaced the editorial board).
       void queryClient.invalidateQueries({
-        queryKey: ["editorial-board", editionId],
+        queryKey: ["fusion", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["selection-board", editionId],
       });
     },
   });
@@ -392,8 +402,13 @@ export function DiscoveryPanel({
       void queryClient.invalidateQueries({
         queryKey: ["discovery", editionId],
       });
+      // A discovery wave moves the active snapshot, so both boards rebuilt
+      // from it go stale (AW-008: Selection replaced the editorial board).
       void queryClient.invalidateQueries({
-        queryKey: ["editorial-board", editionId],
+        queryKey: ["fusion", editionId],
+      });
+      void queryClient.invalidateQueries({
+        queryKey: ["selection-board", editionId],
       });
     },
   });
@@ -423,7 +438,10 @@ export function DiscoveryPanel({
       queryKey: ["discovery", editionId],
     });
     void queryClient.invalidateQueries({
-      queryKey: ["editorial-board", editionId],
+      queryKey: ["fusion", editionId],
+    });
+    void queryClient.invalidateQueries({
+      queryKey: ["selection-board", editionId],
     });
   }, [editionId, queryClient]);
 

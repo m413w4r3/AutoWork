@@ -33,14 +33,6 @@ const discoveryEdition: Edition = {
   ...iranEdition,
 };
 
-const emptyEditorialBoard = {
-  groups: [],
-  selected_articles: 0,
-  ignored: 0,
-  undecided: 0,
-  automatic_selection: false,
-};
-
 /** Backend minimal pour une édition sans découverte ni job en cours. */
 function discoveryFetchMock() {
   return vi.fn(
@@ -82,8 +74,6 @@ function discoveryFetchMock() {
           warning: "",
         });
       }
-      if (url.includes("/editorial-groups"))
-        return Response.json(emptyEditorialBoard);
       if (url.endsWith(iranEdition.id)) return Response.json(discoveryEdition);
       void init;
       return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
@@ -166,8 +156,6 @@ describe("App éditions", () => {
           }
           if (url.endsWith(`/api/editions/${iranEdition.id}/subjects`))
             return Response.json([]);
-          if (url.includes("/editorial-groups"))
-            return Response.json(emptyEditorialBoard);
           if (url.endsWith(iranEdition.id)) return Response.json(iranEdition);
           return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
         },
@@ -311,8 +299,6 @@ describe("App éditions", () => {
             total: 0,
             warning: "",
           });
-        if (url.includes("/editorial-groups"))
-          return Response.json(emptyEditorialBoard);
         if (url.endsWith(iranEdition.id))
           return Response.json(discoveryEdition);
         return Response.json({ items: [], total: 0, page: 1, page_size: 20 });
@@ -479,8 +465,6 @@ describe("App éditions", () => {
             return Response.json(candidateResult);
           if (url.includes("/discovery/runs/run-launched/candidates"))
             return Response.json(candidateResult.candidates);
-          if (url.includes("/editorial-groups"))
-            return Response.json(emptyEditorialBoard);
           const launchedRun = {
             run_id: "run-launched",
             edition_id: iranEdition.id,
@@ -814,8 +798,6 @@ describe("App éditions", () => {
             warning: "",
           });
         }
-        if (url.includes("/editorial-groups"))
-          return Response.json(emptyEditorialBoard);
         if (url.endsWith(iranEdition.id))
           return Response.json(discoveryEdition);
         return Response.json({ items: [], total: 0, page: 1, page_size: 20 });

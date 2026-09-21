@@ -160,8 +160,6 @@ describe("DiscoveryPanel durable run history", () => {
               warning: "",
             }),
           );
-        if (url.includes("/editorial-groups"))
-          return Promise.resolve(Response.json({ groups: [] }));
         return Promise.resolve(Response.json([]));
       }),
     );
@@ -193,8 +191,6 @@ describe("DiscoveryPanel durable run history", () => {
         return Promise.resolve(
           Response.json({ batches: [], candidates: [], total: 0, warning: "" }),
         );
-      if (url.includes("/editorial-groups"))
-        return Promise.resolve(Response.json({ groups: [] }));
       return Promise.resolve(Response.json([]));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -282,16 +278,6 @@ describe("DiscoveryPanel durable run history", () => {
             warning: "",
           }),
         );
-      if (url.includes("/editorial-groups"))
-        return Promise.resolve(
-          Response.json({
-            groups: [],
-            selected_articles: 0,
-            ignored: 0,
-            undecided: 0,
-            automatic_selection: false,
-          }),
-        );
       return Promise.resolve(Response.json([]));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -354,8 +340,6 @@ describe("DiscoveryPanel durable run history", () => {
         return Promise.resolve(
           Response.json({ batches: [], candidates: [], total: 0, warning: "" }),
         );
-      if (url.includes("/editorial-groups"))
-        return Promise.resolve(Response.json({ groups: [] }));
       return Promise.resolve(Response.json([]));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -413,8 +397,6 @@ describe("DiscoveryPanel durable run history", () => {
           }),
         );
       }
-      if (url.includes("/editorial-groups"))
-        return Promise.resolve(Response.json({ groups: [] }));
       return Promise.resolve(Response.json([]));
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -472,8 +454,6 @@ describe("DiscoveryPanel durable run history", () => {
               warning: "",
             }),
           );
-        if (url.includes("/editorial-groups"))
-          return Promise.resolve(Response.json({ groups: [] }));
         return Promise.resolve(Response.json([]));
       }),
     );

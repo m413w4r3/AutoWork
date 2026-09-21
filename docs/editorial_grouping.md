@@ -15,6 +15,13 @@ structurelles `merge` et `split` restent celles de Fusion ; les décisions `SELE
 restent celles de Selection. Une suggestion de modèle ou un score de compatibilité n’est jamais
 une sélection automatique.
 
+La projection est reconstruite par un seul point d’entrée,
+`LegacyEditorialProjectionService.synchronize`, déclenché après chaque activation d’un
+`DiscoverySnapshot` (nouvelle vague Discovery, `merge` ou `split` Fusion) et après chaque lot de
+décisions Selection. Ni Fusion ni la couche Discovery cumulative n’écrivent `EditorialGroup`
+directement : elles ne connaissent la matérialisation éditoriale d’une identité que par
+`SubjectDiscoveryOrigin`.
+
 `EditorialGroup` n’a pas d’API utilisateur et n’est consommé que par `production legacy` et
 `collection legacy`. Il n’est pas une source de vérité, ne lance pas la production et ne décide
 pas du `subject_id` du prochain batch. La frontière canonique est : Fusion décide la structure ;

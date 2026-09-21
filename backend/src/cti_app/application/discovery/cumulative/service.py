@@ -43,7 +43,6 @@ from cti_app.domain.discovery_cumulative import (
     MergeValidationStatus,
     canonical_sha256,
 )
-from cti_app.domain.editorial import CandidateReference, EditorialGroupStatus
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
@@ -191,11 +190,14 @@ class CumulativeDiscoveryService:
                 rebase_count += 1
 
             delta = build_discovery_delta(intake, candidates)
-            groups = await uow.editorial_groups.list_for_edition(intake.edition_id)
-            editorial_subject_ids = {
-                group.discovery_subject_id
-                for group in groups
-                if group.discovery_subject_id is not None
+            # AW-008 S38: the canonical signal that an identity already carries an
+            # editorial dossier is SubjectDiscoveryOrigin, never EditorialGroup.
+            origins = await uow.subject_discovery_origins.list_for_edition(intake.edition_id)
+            materialized_subject_ids = {
+                await uow.discovery_subject_identities.resolve_canonical_subject(
+                    origin.discovery_subject_id
+                )
+                for origin in origins
             }
             recent_subject_ids = set(
                 await uow.subject_contributions.list_recent_subject_ids(
@@ -206,7 +208,7 @@ class CumulativeDiscoveryService:
             included = self._blocking.select(
                 parent,
                 delta,
-                editorial_subject_ids=editorial_subject_ids,
+                materialized_subject_ids=materialized_subject_ids,
                 recent_subject_ids=recent_subject_ids,
             )
             handles = build_merge_handles(parent, delta, included_subjects=included)
@@ -321,7 +323,7 @@ class CumulativeDiscoveryService:
                 outcome.plan,
                 handles,
                 parent,
-                editorial_subject_ids=editorial_subject_ids,
+                materialized_subject_ids=materialized_subject_ids,
             )
             outcome = replace(
                 outcome,
@@ -411,7 +413,6 @@ class CumulativeDiscoveryService:
                 await uow.discovery_snapshots.deactivate(parent.id)
             await uow.discovery_snapshots.append(applied.snapshot)
             await uow.subject_contributions.append_many(applied.contributions)
-            await self._link_editorial_groups(uow, applied.snapshot)
             await uow.commit()
             self._diagnostics.record(
                 event="merge.applied",
@@ -505,62 +506,12 @@ class CumulativeDiscoveryService:
             return labels
 
     async def _after_snapshot_activation(self, snapshot: DiscoverySnapshot) -> None:
+        """Notify derived projections that a new snapshot became active.
+
+        AW-008 S37: the discovery/fusion path never reads or writes
+        ``EditorialGroup`` itself. Rebuilding the legacy projection is the
+        injected callback's business, not this service's.
+        """
         if self._after_activation is None:
             return
         await self._after_activation(snapshot.edition_id)
-        # The synchronizer may have created new groups, so bind them after it
-        # completes as well as inside the activation transaction.
-        async with self._uow_factory() as uow:
-            await self._link_editorial_groups(uow, snapshot)
-            await uow.commit()
-
-    @staticmethod
-    async def _link_editorial_groups(uow: object, snapshot: DiscoverySnapshot) -> None:
-        groups = await uow.editorial_groups.list_for_edition(snapshot.edition_id)  # type: ignore[attr-defined]
-        candidates = await uow.discovery_candidates.list_for_edition(  # type: ignore[attr-defined]
-            snapshot.edition_id, include_replaced=False
-        )
-        candidates_by_id = {candidate.id: candidate for candidate in candidates}
-        active_subject_ids = {subject.subject_id for subject in snapshot.subjects}
-        for group in groups:
-            if (
-                group.status is EditorialGroupStatus.PROPOSED
-                and group.discovery_subject_id is not None
-                and group.discovery_subject_id not in active_subject_ids
-            ):
-                group.supersede()
-                await uow.editorial_groups.save(group)  # type: ignore[attr-defined]
-                continue
-            if group.discovery_subject_id is None:
-                continue
-            subject = next(
-                (
-                    item
-                    for item in snapshot.subjects
-                    if item.subject_id == group.discovery_subject_id
-                ),
-                None,
-            )
-            if subject is None or group.status not in {
-                EditorialGroupStatus.PROPOSED,
-                EditorialGroupStatus.SELECTED,
-            }:
-                continue
-            references = tuple(
-                CandidateReference(
-                    candidates_by_id[reference.candidate_id].discovery_batch_id,
-                    reference.candidate_id,
-                )
-                for reference in subject.member_references
-                if reference.candidate_id in candidates_by_id
-            )
-            if not references:
-                if group.status is EditorialGroupStatus.PROPOSED:
-                    group.supersede()
-                    await uow.editorial_groups.save(group)  # type: ignore[attr-defined]
-                continue
-            if references != group.candidate_references:
-                group.synchronize_candidate_references(references)
-                group.needs_source_expansion = True
-                group.needs_source_verification = True
-                await uow.editorial_groups.save(group)  # type: ignore[attr-defined]

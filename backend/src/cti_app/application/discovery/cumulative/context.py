@@ -57,18 +57,18 @@ class DiscoveryBlockingStrategy:
         *,
         full_context_threshold: int = 30,
         top_n_lexical: int = 10,
-        top_n_editorial_neighbors: int = 5,
+        top_n_materialized_neighbors: int = 5,
     ) -> None:
         self.full_context_threshold = full_context_threshold
         self.top_n_lexical = top_n_lexical
-        self.top_n_editorial_neighbors = top_n_editorial_neighbors
+        self.top_n_materialized_neighbors = top_n_materialized_neighbors
 
     def select(
         self,
         parent_snapshot: DiscoverySnapshot | None,
         delta: DiscoveryDelta,
         *,
-        editorial_subject_ids: set[UUID] | None = None,
+        materialized_subject_ids: set[UUID] | None = None,
         recent_subject_ids: set[UUID] | None = None,
     ) -> tuple[DiscoverySubject, ...]:
         if parent_snapshot is None:
@@ -77,7 +77,7 @@ class DiscoveryBlockingStrategy:
         if len(subjects) <= self.full_context_threshold:
             return tuple(sorted(subjects, key=lambda item: str(item.subject_id)))
 
-        editorial_ids = editorial_subject_ids or set()
+        materialized_ids = materialized_subject_ids or set()
         selected = set(recent_subject_ids or set())
         incoming = tuple(item.candidate for item in delta.candidates)
         for subject in subjects:
@@ -95,9 +95,12 @@ class DiscoveryBlockingStrategy:
             for subject in subjects
         )
         selected.update(subject_id for _, subject_id in scored[-self.top_n_lexical :])
-        editorial_scored = [item for item in scored if item[1] in editorial_ids and item[0] >= 0.08]
+        materialized_scored = [
+            item for item in scored if item[1] in materialized_ids and item[0] >= 0.08
+        ]
         selected.update(
-            subject_id for _, subject_id in editorial_scored[-self.top_n_editorial_neighbors :]
+            subject_id
+            for _, subject_id in materialized_scored[-self.top_n_materialized_neighbors :]
         )
         return tuple(
             sorted(

@@ -12,6 +12,7 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.selection import selection_router
 from cti_app.api.subjects import router as subjects_router
+from cti_app.application.discovery.cumulative.errors import DiscoveryMergeNeedsReview
 from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
 from cti_app.application.discovery.cumulative.types import (
     DiscoveryDelta,
@@ -125,7 +126,11 @@ def _batch(
     url: str,
     local_ref: str,
     request_hash: str,
+    identity_key: str = "Campaign",
 ) -> DiscoveryBatch:
+    # `identity_key` drives the strict identity key (campaign/malware) used by
+    # the duplicate guard: a follow-up batch meant to land as its own subject
+    # must not collide with an already materialized one.
     candidate = CandidateTopic(
         title=title,
         summary=f"Summary for {title}",
@@ -134,8 +139,8 @@ def _batch(
         uncertainties=("Attribution pending",),
         relevance_reasons=("Technical source",),
         actors=("Actor",),
-        campaigns=("Campaign",),
-        malware=("Malware",),
+        campaigns=(identity_key,),
+        malware=(f"Malware {identity_key}",),
         cves=(),
         victims=(),
         sectors=("government",),
@@ -394,6 +399,7 @@ async def test_selected_subject_survives_enrichment_in_a_later_snapshot(
         url="https://vendor.example/selection-b",
         local_ref="B",
         request_hash="b" * 64,
+        identity_key="Enrichment campaign",
     )
     async with uow_factory() as uow:
         await persist_batch_with_candidates(uow, second_batch)
@@ -624,4 +630,148 @@ async def test_selection_survives_a_failing_workspace_projection(uow_factory: An
 
     retried = await service.decide_many(edition.id, [command], snapshot_version=snapshot.version)
     assert retried.items[0].effective_state == "selected"
+    assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_split_after_selection_keeps_the_subject_on_the_historical_identity(
+    uow_factory: Any,
+) -> None:
+    """AW-008 S9/S51: a split never duplicates nor moves an existing Subject.
+
+    The historical identity keeps the materialized `Subject`; the branch
+    carved out of it comes back as a plain undecided selection item.
+    """
+    edition, model_run, snapshot, _ = await _seed(uow_factory, "SR")
+    application = _application(uow_factory)
+    identity = await _selection_identity(uow_factory, edition.id)
+
+    async with _client(application) as client:
+        selected = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "split-select"},
+            json={
+                "snapshot_version": snapshot.version,
+                "decisions": [{"discovery_subject_id": str(identity), "action": "select"}],
+            },
+        )
+    assert selected.status_code == 200
+    subject_id = selected.json()["items"][0]["subject_id"]
+
+    # Grow the selected identity with a second candidate, then split it back out.
+    async with uow_factory() as uow:
+        runs = list(await uow.discovery_runs.list_for_edition(edition.id))
+    second_batch = _batch(
+        edition.id,
+        model_run.id,
+        runs[0].id,
+        title="Split candidate",
+        url="https://vendor.example/selection-split",
+        local_ref="S",
+        request_hash="c" * 64,
+        identity_key="Split campaign",
+    )
+    async with uow_factory() as uow:
+        await persist_batch_with_candidates(uow, second_batch)
+        await uow.commit()
+    _, grown = await CumulativeDiscoveryService(
+        uow_factory, planner=ApplyPlanner()
+    ).reconcile_batch(
+        second_batch,
+        input_mode=DiscoveryInputMode.BRIDGE_RESEARCH,
+        actor_id="selection-analyst",
+    )
+    second_identity = next(
+        item.subject_id for item in grown.subjects if item.subject_id != identity
+    )
+    split_candidate_id = next(
+        reference.candidate_id
+        for item in grown.subjects
+        if item.subject_id == second_identity
+        for reference in item.member_references
+    )
+    fusion = FusionService(uow_factory)
+    merged = await fusion.merge(
+        edition.id,
+        snapshot_version=grown.version,
+        discovery_subject_ids=(identity, second_identity),
+        actor_id="selection-analyst",
+    )
+    canonical_id = merged.groups[0].discovery_subject_id
+    await fusion.split(
+        edition.id,
+        snapshot_version=merged.snapshot_version,
+        discovery_subject_id=canonical_id,
+        candidate_ids=(split_candidate_id,),
+        actor_id="selection-analyst",
+    )
+
+    async with _client(application) as client:
+        board = await client.get(f"/api/editions/{edition.id}/selection")
+    assert board.status_code == 200
+    items = board.json()["items"]
+    assert len(items) == 2
+    kept = next(item for item in items if item["effective_state"] == "selected")
+    carved = next(item for item in items if item["effective_state"] == "undecided")
+    assert kept["subject_id"] == subject_id
+    assert carved["subject_id"] is None
+    assert carved["last_decision"] is None
+    assert str(split_candidate_id) in carved["member_candidate_ids"]
+    # Exactly one Subject and one origin survive the structural change.
+    assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_materialized_subject_duplicate_guard_reads_origins_not_editorial_groups(
+    uow_factory: Any,
+) -> None:
+    """AW-008 S38: Fusion learns about materialized Subjects from origins.
+
+    A later wave whose candidate strictly matches an already materialized
+    identity must land in Fusion review instead of silently creating a rival
+    discovery subject. The only signal feeding that guard is
+    `SubjectDiscoveryOrigin`; no `EditorialGroup` is involved.
+    """
+    edition, model_run, snapshot, _ = await _seed(uow_factory, "ST")
+    identity = await _selection_identity(uow_factory, edition.id)
+    service = SelectionService(uow_factory)
+    await service.decide_many(
+        edition.id,
+        [
+            SelectionDecisionCommand(
+                discovery_subject_id=identity,
+                action=SelectionAction.SELECT,
+                expected_decision_id=None,
+                actor_id="selection-analyst",
+                correlation_id="guard-correlation",
+                idempotency_key="guard-key",
+            )
+        ],
+        snapshot_version=snapshot.version,
+    )
+
+    async with uow_factory() as uow:
+        runs = list(await uow.discovery_runs.list_for_edition(edition.id))
+        assert not list(await uow.editorial_groups.list_for_edition(edition.id))
+    duplicate = _batch(
+        edition.id,
+        model_run.id,
+        runs[0].id,
+        title="Rival report on the same campaign",
+        url="https://vendor.example/selection-duplicate",
+        local_ref="D",
+        request_hash="d" * 64,
+    )
+    async with uow_factory() as uow:
+        await persist_batch_with_candidates(uow, duplicate)
+        await uow.commit()
+
+    with pytest.raises(DiscoveryMergeNeedsReview) as raised:
+        await CumulativeDiscoveryService(uow_factory, planner=ApplyPlanner()).reconcile_batch(
+            duplicate,
+            input_mode=DiscoveryInputMode.BRIDGE_RESEARCH,
+            actor_id="selection-analyst",
+        )
+    assert "possible_duplicate_of_editorial_subject" in raised.value.reasons
+    # The guard parks the wave: no rival Subject is created behind the operator.
     assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)

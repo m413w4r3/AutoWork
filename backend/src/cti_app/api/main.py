@@ -1,6 +1,7 @@
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from fastapi import FastAPI, Request
 from minio import Minio
@@ -98,6 +99,9 @@ settings = get_settings()
 configure_logging(settings.log_level)
 
 
+logger = logging.getLogger(__name__)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     readiness = InfrastructureReadinessChecker(settings)
@@ -120,8 +124,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     legacy_editorial_projection_service = LegacyEditorialProjectionService(uow_factory)
 
+    async def rebuild_legacy_editorial_projection(edition_id: UUID) -> object:
+        """TODO AW-009: delete with LegacyEditorialProjection.
+
+        Every activation of a new snapshot and every selection batch moves the
+        canonical state the legacy production/collection engine reads through
+        `EditorialGroup`. Rebuilding here keeps that projection derived rather
+        than letting Fusion or Selection write it themselves.
+
+        It runs after the canonical commit, so a failure is logged and
+        swallowed: it can never turn a committed merge, split or selection
+        into an error. The projection is rebuildable and is resynchronized
+        before a production batch is created.
+        """
+        try:
+            return await legacy_editorial_projection_service.synchronize(edition_id)
+        except Exception:
+            logger.exception(
+                "legacy_editorial_projection_failed",
+                extra={"edition_id": str(edition_id)},
+            )
+            return None
+
     async def project_selection_board(board: SelectionBoard) -> object:
-        return await legacy_editorial_projection_service.synchronize(board.edition_id)
+        return await rebuild_legacy_editorial_projection(board.edition_id)
 
     selection_service = SelectionService(
         uow_factory,
@@ -142,6 +168,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             bridge_capabilities_provider=bridge_provider,
         ),
         diagnostics=production_diagnostics,
+        after_activation=rebuild_legacy_editorial_projection,
     )
     job_service: JobService
     job_dispatcher: DramatiqJobDispatcher
@@ -189,6 +216,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     fusion_service = FusionService(
         uow_factory,
         replan_intake=replan_discovery_intake,
+        after_activation=rebuild_legacy_editorial_projection,
     )
 
     discovery_service = DiscoveryService(
