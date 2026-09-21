@@ -15,10 +15,54 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   let batchStarted = false;
   let selectionFetches = 0;
   const subjects = [
-    { subject_id: subjectA, title: "Article A", can_start: true },
-    { subject_id: subjectB, title: "Article B", can_start: true },
-    { subject_id: subjectC, title: "Article C", can_start: true },
-    { subject_id: subjectD, title: "Article D", can_start: true },
+    {
+      subject_id: subjectA,
+      title: "Article A",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectB,
+      title: "Article B",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectC,
+      title: "Article C",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectD,
+      title: "Article D",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
   ];
 
   const edition = () => ({
@@ -95,7 +139,13 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
       return route.fulfill({
         json: {
           edition_id: editionId,
-          subjects,
+          subjects: batchStarted
+            ? subjects.map((subject) => ({
+                ...subject,
+                can_start: false,
+                blocking_reason: "production_batch_active",
+              }))
+            : subjects,
           active_batch: batchStarted ? batchStatus() : null,
           recent_batches: [],
         },
@@ -184,7 +234,7 @@ test("Production : board vide retourné en 200", async ({ page }) => {
   });
 
   await page.goto(`/editions/${editionId}/production`);
-  expect(boardStatus).toBe(200);
+  await expect.poll(() => boardStatus).toBe(200);
   await expect(
     page.getByRole("region", { name: "Sélecteur du lot de production" }),
   ).toBeVisible();
@@ -311,7 +361,14 @@ test("Production : édition archivée en lecture seule", async ({ page }) => {
             {
               subject_id: "a1111111-1111-4111-8111-111111111111",
               title: "Article archivé",
+              tlp: "GREEN",
+              latest_run_id: null,
+              latest_run_number: null,
+              latest_status: null,
+              latest_stage: null,
+              active_run_id: null,
               can_start: false,
+              blocking_reason: "production_edition_archived",
             },
           ],
           active_batch: null,

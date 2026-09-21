@@ -105,6 +105,33 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     finished_at: null,
   };
 
+  const productionBoard = (
+    activeBatch: typeof runningBatch | null,
+    recentBatches: readonly (typeof batch)[],
+  ) => {
+    const active = activeBatch !== null;
+    const completed = recentBatches.length > 0;
+    return {
+      edition_id: editionId,
+      subjects: [
+        {
+          subject_id: subjectId,
+          title: "Campagne Iranian Proxy",
+          tlp: "AMBER",
+          latest_run_id: active || completed ? runId : null,
+          latest_run_number: active || completed ? 1 : null,
+          latest_status: active ? "running" : completed ? "ready" : null,
+          latest_stage: active ? "sources" : completed ? "assembly" : null,
+          active_run_id: active ? runId : null,
+          can_start: !active,
+          blocking_reason: active ? "production_batch_active" : null,
+        },
+      ],
+      active_batch: activeBatch,
+      recent_batches: recentBatches,
+    };
+  };
+
   const review = {
     edition_id: editionId,
     items: [
@@ -191,11 +218,16 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     }
     if (path === `/api/editions/${editionId}/production`) {
       if (!batchStarted) {
-        await route.fulfill({ status: 404, json: {} });
+        await route.fulfill({ json: productionBoard(null, []) });
         return;
       }
       batchReads += 1;
-      await route.fulfill({ json: batchReads === 1 ? runningBatch : batch });
+      await route.fulfill({
+        json:
+          batchReads === 1
+            ? productionBoard(runningBatch, [])
+            : productionBoard(null, [batch]),
+      });
       return;
     }
     if (path === `/api/editions/${editionId}/review`) {

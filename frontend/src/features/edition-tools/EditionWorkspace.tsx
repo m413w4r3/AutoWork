@@ -174,11 +174,12 @@ function ProductionTool({
           La sélection est inaccessible.
         </p>
       ) : null}
-      {!readOnly && board.data ? (
+      {board.data ? (
         <>
           <ProductionBatchSelector
             subjects={subjects}
             selected={selectedSubjectIds}
+            readOnly={readOnly}
             onToggle={(subjectId, checked) =>
               updateSelection((current) => {
                 const next = new Set(current);
@@ -199,21 +200,23 @@ function ProductionTool({
             }
             onSelectNone={() => updateSelection(() => new Set())}
           />
-          {start.error ? (
+          {!readOnly && start.error ? (
             <p className="error-message" role="alert">
               {start.error instanceof Error
                 ? start.error.message
                 : "Le lot de production n’a pas pu être démarré."}
             </p>
           ) : null}
-          <button
-            type="button"
-            className="button"
-            disabled={selectedSubjectIds.size === 0 || start.isPending}
-            onClick={submitBatch}
-          >
-            {start.isPending ? "Démarrage…" : "Démarrer le lot de production"}
-          </button>
+          {!readOnly ? (
+            <button
+              type="button"
+              className="button"
+              disabled={selectedSubjectIds.size === 0 || start.isPending}
+              onClick={submitBatch}
+            >
+              {start.isPending ? "Démarrage…" : "Démarrer le lot de production"}
+            </button>
+          ) : null}
         </>
       ) : null}
       <ProductionConsole editionId={edition.id} readOnly={readOnly} />

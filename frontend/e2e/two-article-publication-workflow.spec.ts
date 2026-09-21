@@ -126,6 +126,36 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     finished_at: status === "completed" ? "2026-08-29T00:10:00Z" : null,
   });
 
+  const productionBoard = (
+    activeBatch: ReturnType<typeof batchState> | null,
+    recentBatches: readonly ReturnType<typeof batchState>[],
+  ) => {
+    const active = activeBatch !== null;
+    const completed = recentBatches.length > 0;
+    const subject = (subjectId: string, title: string) => ({
+      subject_id: subjectId,
+      title,
+      tlp: "AMBER",
+      latest_run_id:
+        active || completed ? (subjectId === subjectA ? runA : runB) : null,
+      latest_run_number: active || completed ? 1 : null,
+      latest_status: active ? "running" : completed ? "ready" : null,
+      latest_stage: active ? "sources" : completed ? "assembly" : null,
+      active_run_id: active ? (subjectId === subjectA ? runA : runB) : null,
+      can_start: !active,
+      blocking_reason: active ? "production_batch_active" : null,
+    });
+    return {
+      edition_id: editionId,
+      subjects: [
+        subject(subjectA, "Article A"),
+        subject(subjectB, "Article B"),
+      ],
+      active_batch: activeBatch,
+      recent_batches: recentBatches,
+    };
+  };
+
   const review = {
     edition_id: editionId,
     items: [
@@ -306,21 +336,28 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     }
     if (path === `/api/editions/${editionId}/production`) {
       if (!batchStarted) {
-        await route.fulfill({ status: 404, json: {} });
+        await route.fulfill({ json: productionBoard(null, []) });
         return;
       }
       batchReads += 1;
       if (batchReads === 1) {
         await route.fulfill({
-          json: batchState("running", "queued", 0, "running"),
+          json: productionBoard(
+            batchState("running", "queued", 0, "running"),
+            [],
+          ),
         });
       } else if (batchReads === 2) {
         await route.fulfill({
-          json: batchState("ready", "running", 1, "running"),
+          json: productionBoard(
+            batchState("ready", "running", 1, "running"),
+            [],
+          ),
         });
       } else {
+        const completedBatch = batchState("ready", "ready", 2, "completed");
         await route.fulfill({
-          json: batchState("ready", "ready", 2, "completed"),
+          json: productionBoard(null, [completedBatch]),
         });
       }
       return;

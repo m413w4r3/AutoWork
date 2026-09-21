@@ -13,12 +13,14 @@ export function ProductionBatchSelector({
   onToggle,
   onSelectAll,
   onSelectNone,
+  readOnly = false,
 }: {
   subjects: readonly EligibleSubject[];
   selected: ReadonlySet<string>;
   onToggle: (subjectId: string, checked: boolean) => void;
   onSelectAll: () => void;
   onSelectNone: () => void;
+  readOnly?: boolean;
 }) {
   const startableSubjects = subjects.filter((subject) => subject.can_start);
   return (
@@ -35,6 +37,7 @@ export function ProductionBatchSelector({
             type="button"
             className="button button--secondary"
             disabled={
+              readOnly ||
               startableSubjects.length === 0 ||
               selected.size === startableSubjects.length
             }
@@ -45,7 +48,7 @@ export function ProductionBatchSelector({
           <button
             type="button"
             className="button button--secondary"
-            disabled={selected.size === 0}
+            disabled={readOnly || selected.size === 0}
             onClick={onSelectNone}
           >
             Tout désélectionner
@@ -58,7 +61,18 @@ export function ProductionBatchSelector({
         <ul className="production-batch-selector__list">
           {subjects.map((subject) => (
             <li key={subject.subject_id}>
-              {subject.can_start ? (
+              {readOnly ? (
+                <label className="production-batch-selector__choice">
+                  <input
+                    type="checkbox"
+                    checked={false}
+                    disabled
+                    aria-label={subject.title}
+                    readOnly
+                  />
+                  {subject.title}
+                </label>
+              ) : subject.can_start ? (
                 <label className="production-batch-selector__choice">
                   <input
                     type="checkbox"

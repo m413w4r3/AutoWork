@@ -228,8 +228,14 @@ export interface BatchItemDetail {
 export interface ProductionSubject {
   subject_id: string;
   title: string;
+  tlp: string;
+  latest_run_id: string | null;
+  latest_run_number: number | null;
+  latest_status: ProductionRunStatus | null;
+  latest_stage: ProductionStage | null;
+  active_run_id: string | null;
   can_start: boolean;
-  blocking_reason?: string | null;
+  blocking_reason: string | null;
 }
 
 export interface ProductionRunSummary {
@@ -683,9 +689,10 @@ export async function startProductionBatch(
 }
 
 /**
- * Get batch production status.
+ * Get the edition production board.
  *
- * Returns null when no batch has been started yet.
+ * Existing editions always return a board, including an empty board when no
+ * subject or batch exists yet.
  */
 export async function getEditionProduction(
   editionId: string,
