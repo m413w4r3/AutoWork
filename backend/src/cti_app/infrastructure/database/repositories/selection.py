@@ -4,9 +4,15 @@ from uuid import UUID
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
+from cti_app.domain.selection import (
+    SelectionAction,
+    SelectionDecision,
+    SelectionIdempotencyRecord,
+    SubjectDiscoveryOrigin,
+)
 from cti_app.infrastructure.database.models.selection import (
     SelectionDecisionRow,
+    SelectionIdempotencyRecordRow,
     SubjectDiscoveryOriginRow,
 )
 
@@ -52,6 +58,38 @@ class SqlAlchemySelectionDecisionRepository:
             )
         )
         return _selection_decision_from_row(row) if row else None
+
+
+class SqlAlchemySelectionIdempotencyRepository:
+    def __init__(self, session: AsyncSession) -> None:
+        self._session = session
+
+    async def get_for_update(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> SelectionIdempotencyRecord | None:
+        row = await self._session.scalar(
+            select(SelectionIdempotencyRecordRow)
+            .where(
+                SelectionIdempotencyRecordRow.edition_id == edition_id,
+                SelectionIdempotencyRecordRow.idempotency_key == idempotency_key,
+            )
+            .with_for_update()
+        )
+        return _selection_idempotency_from_row(row) if row else None
+
+    async def add(self, record: SelectionIdempotencyRecord) -> None:
+        self._session.add(
+            SelectionIdempotencyRecordRow(
+                id=record.id,
+                edition_id=record.edition_id,
+                idempotency_key=record.idempotency_key,
+                request_fingerprint=record.request_fingerprint,
+                actor_id=record.actor_id,
+                correlation_id=record.correlation_id,
+                created_at=record.created_at,
+            )
+        )
+        await self._session.flush()
 
 
 class SqlAlchemySubjectDiscoveryOriginRepository:
@@ -109,5 +147,19 @@ def _subject_discovery_origin_from_row(row: SubjectDiscoveryOriginRow) -> Subjec
         selection_decision_id=row.selection_decision_id,
         selected_snapshot_id=row.selected_snapshot_id,
         selected_snapshot_version=row.selected_snapshot_version,
+        created_at=row.created_at,
+    )
+
+
+def _selection_idempotency_from_row(
+    row: SelectionIdempotencyRecordRow,
+) -> SelectionIdempotencyRecord:
+    return SelectionIdempotencyRecord(
+        id=row.id,
+        edition_id=row.edition_id,
+        idempotency_key=row.idempotency_key,
+        request_fingerprint=row.request_fingerprint,
+        actor_id=row.actor_id,
+        correlation_id=row.correlation_id,
         created_at=row.created_at,
     )

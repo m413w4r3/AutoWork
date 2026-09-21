@@ -48,13 +48,18 @@ corriger l’historique.
 
 ## Idempotence et concurrence optimiste
 
-Chaque commande porte une `Idempotency-Key` liée à l’édition, au groupe, à l’action et à la
-version du snapshot. Rejouer une commande identique retourne le même résultat canonique sans
-nouvelle matérialisation. Une même clé avec un contenu différent est refusée.
+L’`Idempotency-Key` identifie une requête, pas une décision : elle couvre le lot entier confirmé
+par l’opérateur. Le service enregistre, sous `(edition_id, Idempotency-Key)`, l’empreinte
+canonique du snapshot et de l’ensemble des décisions. Rejouer exactement le même lot retourne le
+même résultat canonique sans nouvelle matérialisation ; la même clé avec un sous-ensemble, un
+sur-ensemble, une autre action ou un autre snapshot répond `409 selection_idempotency_conflict`
+avant toute écriture.
 
 La commande doit aussi fournir `snapshot_version`. Si le snapshot actif a changé, l’API répond
 `409 selection_snapshot_stale` et le client recharge le board Fusion. Si l’état effectif ou la
 décision a changé entre la lecture et l’écriture, l’API répond `409 selection_decision_stale`.
+`expected_decision_id: null` est une attente explicite — « aucune décision » — et non l’absence
+d’attente : si une décision est apparue entre-temps, la commande est refusée comme périmée.
 Ces erreurs ne sont pas résolues par un écrasement client : il faut relire puis soumettre une
 nouvelle décision avec une nouvelle clé.
 

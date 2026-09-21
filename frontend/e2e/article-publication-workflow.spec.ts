@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Sujet : sélection, production, revue et publication DOCX", async ({
   page,
 }) => {
@@ -33,47 +39,27 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     updated_at: "2026-08-29T00:00:00Z",
   });
 
-  const selectionBoard = () => ({
-    edition_id: editionId,
-    snapshot_id: "88888888-8888-4888-8888-888888888888",
-    snapshot_version: 1,
-    counts: {
-      undecided: selectionConfirmed ? 0 : 1,
-      ignored: 0,
-      selected: selectionConfirmed ? 1 : 0,
-      total: 1,
-    },
-    items: [
-      {
-        discovery_subject_id: discoverySubjectId,
-        title: "Campagne Iranian Proxy",
-        summary: "Présentation neutre de la campagne.",
-        presentation: "Présentation neutre de la campagne.",
-        actor_or_campaign: "Iranian Proxy",
-        publications: [],
-        candidate_count: 1,
-        technical_potential: 4,
-        technical_potential_reason: "Artefacts techniques annoncés.",
-        announced_artifacts: ["ioc"],
-        publisher_ioc_count_total: null,
-        publisher_ioc_counts: [],
-        provisional_ioc_count: 0,
-        provisional_ioc_type_counts: {},
-        provisional_iocs: [],
-        uncertainties: [],
-        recommendation: null,
-        state: selectionConfirmed ? "selected" : "undecided",
-        subject_id: selectionConfirmed ? subjectId : null,
-        last_decision: selectionConfirmed
-          ? { id: "decision-1", decision: "select", actor_id: "analyst" }
-          : null,
-        updated_since_decision: false,
-        selectable: true,
-        blocking_reason: null,
-      },
-    ],
-    recommendation: null,
-  });
+  const selectionBoard = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: "88888888-8888-4888-8888-888888888888",
+      items: [
+        selectionWireItem({
+          discovery_subject_id: discoverySubjectId,
+          title: "Campagne Iranian Proxy",
+          summary: "Présentation neutre de la campagne.",
+          actor_or_campaign: "Iranian Proxy",
+          effective_state: selectionConfirmed ? "selected" : "undecided",
+          subject_id: selectionConfirmed ? subjectId : null,
+          last_decision: selectionConfirmed
+            ? selectionWireLastDecision({
+                id: "decision-1",
+                subject_id: subjectId,
+              })
+            : null,
+        }),
+      ],
+    });
 
   const batch = {
     batch_id: batchId,

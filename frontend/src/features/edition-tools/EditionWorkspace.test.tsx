@@ -126,6 +126,7 @@ const selectionBoard = {
   snapshot_version: 1,
   counts: { undecided: 0, ignored: 1, selected: 3 },
   recommendation: null,
+  fusion_review_count: 0,
   items: [
     {
       title: "Sujet A",

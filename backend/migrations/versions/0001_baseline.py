@@ -353,6 +353,12 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "append_only",
     ),
     (
+        "selection_idempotency_records",
+        "trg_selection_idempotency_records_append_only",
+        "reject_selection_mutation",
+        "append_only",
+    ),
+    (
         "reference_members",
         "reference_members_immutable",
         "forbid_reference_mutation",

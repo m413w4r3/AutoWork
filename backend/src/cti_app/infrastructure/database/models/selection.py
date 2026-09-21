@@ -112,3 +112,48 @@ class SubjectDiscoveryOriginRow(Base):
     )
     selected_snapshot_version: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class SelectionIdempotencyRecordRow(Base):
+    """Request-scoped idempotency ledger for selection batches.
+
+    The uniqueness is ``(edition_id, idempotency_key)``: one key covers one
+    confirmed batch. ``request_fingerprint`` pins the snapshot and the exact
+    set of decisions, so replaying the key with a different payload is
+    rejected instead of applying a new mutation.
+    """
+
+    __tablename__ = "selection_idempotency_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "edition_id",
+            "idempotency_key",
+            name="uq_selection_idempotency_records_key",
+        ),
+        CheckConstraint(
+            "char_length(btrim(idempotency_key)) > 0",
+            name="ck_selection_idempotency_records_key",
+        ),
+        CheckConstraint(
+            "char_length(request_fingerprint) = 64",
+            name="ck_selection_idempotency_records_fingerprint",
+        ),
+        CheckConstraint(
+            "char_length(btrim(actor_id)) > 0",
+            name="ck_selection_idempotency_records_actor",
+        ),
+        CheckConstraint(
+            "char_length(btrim(correlation_id)) > 0",
+            name="ck_selection_idempotency_records_correlation",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
+    edition_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

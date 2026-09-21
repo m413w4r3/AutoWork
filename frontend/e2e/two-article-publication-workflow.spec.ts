@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Édition : production séquentielle de deux sujets, revue et DOCX", async ({
   page,
 }) => {
@@ -47,54 +53,30 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     discoverySubjectId: string,
     title: string,
     subjectId: string,
-  ) => ({
-    discovery_subject_id: discoverySubjectId,
-    title,
-    summary: `Présentation neutre de ${title}.`,
-    presentation: `Présentation neutre de ${title}.`,
-    actor_or_campaign: "Acteur à confirmer",
-    publications: [],
-    candidate_count: 1,
-    technical_potential: 4,
-    technical_potential_reason: "Artefacts techniques annoncés.",
-    announced_artifacts: ["ioc"],
-    publisher_ioc_count_total: null,
-    publisher_ioc_counts: [],
-    provisional_ioc_count: 0,
-    provisional_ioc_type_counts: {},
-    provisional_iocs: [],
-    uncertainties: [],
-    recommendation: null,
-    state: selectionConfirmed ? "selected" : "undecided",
-    subject_id: selectionConfirmed ? subjectId : null,
-    last_decision: selectionConfirmed
-      ? {
-          id: `decision-${subjectId.slice(0, 4)}`,
-          decision: "select",
-          actor_id: "analyst",
-        }
-      : null,
-    updated_since_decision: false,
-    selectable: true,
-    blocking_reason: null,
-  });
+  ) =>
+    selectionWireItem({
+      discovery_subject_id: discoverySubjectId,
+      title,
+      summary: `Présentation neutre de ${title}.`,
+      effective_state: selectionConfirmed ? "selected" : "undecided",
+      subject_id: selectionConfirmed ? subjectId : null,
+      last_decision: selectionConfirmed
+        ? selectionWireLastDecision({
+            id: `decision-${subjectId.slice(0, 4)}`,
+            subject_id: subjectId,
+          })
+        : null,
+    });
 
-  const selectionBoard = () => ({
-    edition_id: editionId,
-    snapshot_id: "88888888-8888-4888-8888-888888888888",
-    snapshot_version: 1,
-    counts: {
-      undecided: selectionConfirmed ? 0 : 2,
-      ignored: 0,
-      selected: selectionConfirmed ? 2 : 0,
-      total: 2,
-    },
-    items: [
-      selectionItem(discoveryA, "Article A", subjectA),
-      selectionItem(discoveryB, "Article B", subjectB),
-    ],
-    recommendation: null,
-  });
+  const selectionBoard = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: "88888888-8888-4888-8888-888888888888",
+      items: [
+        selectionItem(discoveryA, "Article A", subjectA),
+        selectionItem(discoveryB, "Article B", subjectB),
+      ],
+    });
 
   const batchState = (
     firstStatus: "running" | "ready",

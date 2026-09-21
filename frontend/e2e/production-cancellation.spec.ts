@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Édition : arrêter la production conserve l’édition ouverte", async ({
   page,
 }) => {
@@ -27,44 +33,25 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
 
   // Selection already materialized exactly one Subject: that is what makes it
   // eligible for a production batch, nothing editorial.
-  const selection = {
+  const selection = selectionWireBoard({
     edition_id: editionId,
     snapshot_id: "99999999-9999-4999-8999-999999999999",
-    snapshot_version: 1,
-    counts: { undecided: 0, ignored: 0, selected: 1, total: 1 },
     items: [
-      {
+      selectionWireItem({
         discovery_subject_id: "d1111111-1111-4111-8111-111111111111",
         title: "Article à arrêter",
         summary: "Résumé de l’article à arrêter.",
-        presentation: "Résumé de l’article à arrêter.",
-        actor_or_campaign: null,
-        publications: [],
-        candidate_count: 1,
         technical_potential: 3,
         technical_potential_reason: "Artefacts annoncés.",
-        announced_artifacts: ["ioc"],
-        publisher_ioc_count_total: null,
-        publisher_ioc_counts: [],
-        provisional_ioc_count: 0,
-        provisional_ioc_type_counts: {},
-        provisional_iocs: [],
-        uncertainties: [],
-        recommendation: null,
-        state: "selected",
+        effective_state: "selected",
         subject_id: subjectId,
-        last_decision: {
+        last_decision: selectionWireLastDecision({
           id: "decision-1111",
-          decision: "select",
-          actor_id: "analyst",
-        },
-        updated_since_decision: false,
-        selectable: true,
-        blocking_reason: null,
-      },
+          subject_id: subjectId,
+        }),
+      }),
     ],
-    recommendation: null,
-  };
+  });
 
   const batch = () => ({
     batch_id: batchId,

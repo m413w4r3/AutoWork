@@ -20,7 +20,7 @@ from cti_app.application.discovery.cumulative.types import (
 )
 from cti_app.application.discovery.fusion import FusionService
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.selection import SelectionService
+from cti_app.application.selection import SelectionDecisionCommand, SelectionService
 from cti_app.application.subjects import SubjectService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -211,6 +211,16 @@ def _client(application: FastAPI) -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
 
 
+async def _selection_identity_named(uow_factory: Any, edition_id: UUID, title: str) -> UUID:
+    async with uow_factory() as uow:
+        snapshot = await uow.discovery_snapshots.get_active(edition_id)
+    assert snapshot is not None
+    identity_id: UUID = next(
+        item.subject_id for item in snapshot.subjects if item.candidate.title == title
+    )
+    return identity_id
+
+
 async def _selection_identity(uow_factory: Any, edition_id: UUID) -> UUID:
     async with uow_factory() as uow:
         snapshot = await uow.discovery_snapshots.get_active(edition_id)
@@ -286,12 +296,21 @@ async def test_ignore_then_select_keeps_append_only_ignore_history(uow_factory: 
                 "decisions": [{"discovery_subject_id": str(identity), "action": "ignore"}],
             },
         )
+        # Reversing an IGNORE is decided against the state the operator read:
+        # the command therefore carries the IGNORE it supersedes.
+        ignore_decision_id = ignored.json()["items"][0]["last_decision"]["id"]
         selected = await client.post(
             f"/api/editions/{edition.id}/selection/decisions",
             headers={"Idempotency-Key": "select-a-after-ignore"},
             json={
                 "snapshot_version": snapshot.version,
-                "decisions": [{"discovery_subject_id": str(identity), "action": "select"}],
+                "decisions": [
+                    {
+                        "discovery_subject_id": str(identity),
+                        "action": "select",
+                        "expected_decision_id": ignore_decision_id,
+                    }
+                ],
             },
         )
     assert ignored.status_code == selected.status_code == 200
@@ -415,3 +434,194 @@ async def test_selected_subject_survives_enrichment_in_a_later_snapshot(
     }
     async with uow_factory() as uow:
         assert len(await uow.subjects.list_for_edition(edition.id)) == 1
+
+
+async def _seed_second_subject(uow_factory: Any, edition: Edition, model_run: ModelRun) -> UUID:
+    """Add a second, independent discovery identity to the active snapshot."""
+
+    async with uow_factory() as uow:
+        runs = list(await uow.discovery_runs.list_for_edition(edition.id))
+    second_batch = _batch(
+        edition.id,
+        model_run.id,
+        runs[0].id,
+        title="Second selection subject",
+        url="https://vendor.example/selection-second",
+        local_ref="C",
+        request_hash="c" * 64,
+    )
+    async with uow_factory() as uow:
+        await persist_batch_with_candidates(uow, second_batch)
+        await uow.commit()
+    _, snapshot = await CumulativeDiscoveryService(
+        uow_factory, planner=ApplyPlanner()
+    ).reconcile_batch(
+        second_batch,
+        input_mode=DiscoveryInputMode.BRIDGE_RESEARCH,
+        actor_id="selection-analyst",
+    )
+    identity_id: UUID = next(
+        item.subject_id
+        for item in snapshot.subjects
+        if item.candidate.title == "Second selection subject"
+    )
+    return identity_id
+
+
+async def _selection_state(uow_factory: Any, edition_id: UUID) -> tuple[int, int, int]:
+    async with uow_factory() as uow:
+        decisions = list(await uow.selection_decisions.list_for_edition(edition_id))
+        origins = list(await uow.subject_discovery_origins.list_for_edition(edition_id))
+        subjects = list(await uow.subjects.list_for_edition(edition_id))
+    return len(decisions), len(origins), len(subjects)
+
+
+@pytest.mark.asyncio
+async def test_one_idempotency_key_binds_one_batch_payload(uow_factory: Any) -> None:
+    edition, model_run, _, _ = await _seed(uow_factory, "SN")
+    first = await _selection_identity_named(uow_factory, edition.id, "Canonical selection subject")
+    second = await _seed_second_subject(uow_factory, edition, model_run)
+    async with uow_factory() as uow:
+        active = await uow.discovery_snapshots.get_active(edition.id)
+    assert active is not None
+    application = _application(uow_factory)
+
+    async with _client(application) as client:
+        applied = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "batch-key"},
+            json={
+                "snapshot_version": active.version,
+                "decisions": [{"discovery_subject_id": str(first), "action": "select"}],
+            },
+        )
+        superset = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "batch-key"},
+            json={
+                "snapshot_version": active.version,
+                "decisions": [
+                    {"discovery_subject_id": str(first), "action": "select"},
+                    {"discovery_subject_id": str(second), "action": "ignore"},
+                ],
+            },
+        )
+    assert applied.status_code == 200
+    assert superset.status_code == 409
+    assert superset.json()["detail"]["code"] == "selection_idempotency_conflict"
+    assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)
+
+    async with _client(application) as client:
+        board = await client.get(f"/api/editions/{edition.id}/selection")
+        expected = {
+            item["discovery_subject_id"]: (item["last_decision"] or {}).get("id")
+            for item in board.json()["items"]
+        }
+        pair = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "pair-key"},
+            json={
+                "snapshot_version": active.version,
+                "decisions": [
+                    {
+                        "discovery_subject_id": str(first),
+                        "action": "select",
+                        "expected_decision_id": expected[str(first)],
+                    },
+                    {
+                        "discovery_subject_id": str(second),
+                        "action": "ignore",
+                        "expected_decision_id": expected[str(second)],
+                    },
+                ],
+            },
+        )
+        subset = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "pair-key"},
+            json={
+                "snapshot_version": active.version,
+                "decisions": [{"discovery_subject_id": str(second), "action": "ignore"}],
+            },
+        )
+    assert pair.status_code == 200
+    assert subset.status_code == 409
+    assert subset.json()["detail"]["code"] == "selection_idempotency_conflict"
+    assert await _selection_state(uow_factory, edition.id) == (2, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_absent_expectation_is_stale_after_a_concurrent_decision(uow_factory: Any) -> None:
+    edition, _, snapshot, _ = await _seed(uow_factory, "SP")
+    application = _application(uow_factory)
+    identity = await _selection_identity(uow_factory, edition.id)
+
+    async with _client(application) as client:
+        # The board was read undecided, so the SELECT below carries no
+        # expectation; meanwhile another operator ignored the same subject.
+        concurrent = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "concurrent-ignore"},
+            json={
+                "snapshot_version": snapshot.version,
+                "decisions": [{"discovery_subject_id": str(identity), "action": "ignore"}],
+            },
+        )
+        stale = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "stale-select"},
+            json={
+                "snapshot_version": snapshot.version,
+                "decisions": [
+                    {
+                        "discovery_subject_id": str(identity),
+                        "action": "select",
+                        "expected_decision_id": None,
+                    }
+                ],
+            },
+        )
+    assert concurrent.status_code == 200
+    assert stale.status_code == 409
+    assert stale.json()["detail"]["code"] == "selection_decision_stale"
+    assert await _selection_state(uow_factory, edition.id) == (1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_selection_survives_a_failing_workspace_projection(uow_factory: Any) -> None:
+    class FailingWorkspace:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def materialize(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            raise OSError("workspace unavailable")
+
+    edition, _, snapshot, _ = await _seed(uow_factory, "SQ")
+    identity = await _selection_identity(uow_factory, edition.id)
+    workspace = FailingWorkspace()
+    service = SelectionService(uow_factory, materializer=workspace)
+    command = SelectionDecisionCommand(
+        discovery_subject_id=identity,
+        action=SelectionAction.SELECT,
+        expected_decision_id=None,
+        actor_id="selection-analyst",
+        correlation_id="workspace-correlation",
+        idempotency_key="workspace-key",
+    )
+
+    board = await service.decide_many(edition.id, [command], snapshot_version=snapshot.version)
+
+    # The workspace is a projection: it runs after the commit and its failure
+    # can never roll back the canonical Subject.
+    assert workspace.calls == 1
+    assert board.items[0].effective_state == "selected"
+    assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)
+    async with uow_factory() as uow:
+        subjects = list(await uow.subjects.list_for_edition(edition.id))
+        events = list(await uow.provenance.list_for_aggregate("subject", subjects[0].id))
+    assert any(event.event_type == "subject.created_from_selection" for event in events)
+
+    retried = await service.decide_many(edition.id, [command], snapshot_version=snapshot.version)
+    assert retried.items[0].effective_state == "selected"
+    assert await _selection_state(uow_factory, edition.id) == (1, 1, 1)

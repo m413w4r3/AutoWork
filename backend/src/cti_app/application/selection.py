@@ -24,7 +24,13 @@ from cti_app.domain.discovery_cumulative import (
 )
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import ProvenanceEvent, Subject
-from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
+from cti_app.domain.selection import (
+    SelectionAction,
+    SelectionDecision,
+    SelectionIdempotencyRecord,
+    SubjectDiscoveryOrigin,
+    selection_request_fingerprint,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +243,10 @@ class SelectionService:
         ids = [command.discovery_subject_id for command in commands]
         if len(ids) != len(set(ids)):
             raise SelectionInvalidCommandError("A discovery subject can only be decided once")
+        keys = {command.idempotency_key for command in commands}
+        if len(keys) != 1:
+            raise SelectionInvalidCommandError("A batch carries exactly one idempotency key")
+        idempotency_key = keys.pop()
         if snapshot_version is not None and expected_snapshot_version is not None:
             if snapshot_version != expected_snapshot_version:
                 raise SelectionSnapshotStaleError()
@@ -257,152 +267,33 @@ class SelectionService:
             if expected_version is not None and expected_version != snapshot.version:
                 raise SelectionSnapshotStaleError()
 
-            identities = list(await uow.discovery_subject_identities.list_for_edition(edition_id))
-            identity_map = {identity.id: identity for identity in identities}
-            decisions = list(await uow.selection_decisions.list_for_edition(edition_id))
-            origins = list(await uow.subject_discovery_origins.list_for_edition(edition_id))
-            merge_runs = list(await uow.discovery_merge_runs.list_for_edition(edition_id))
-            active_by_id = {item.subject_id: item for item in snapshot.subjects}
-            canonical = self._canonical_resolver(identity_map)
-            blocked = self._blocked_ids(snapshot, merge_runs)
-
-            locked: list[
-                tuple[SelectionDecisionCommand, DiscoverySubject, UUID, tuple[UUID, ...]]
-            ] = []
-            for command in commands:
-                active_subject = active_by_id.get(command.discovery_subject_id)
-                if active_subject is None or command.discovery_subject_id not in identity_map:
-                    raise SelectionInvalidCommandError("Target is not an active snapshot identity")
-                if command.discovery_subject_id in blocked:
-                    raise SelectionInvalidCommandError("Target is awaiting fusion review")
-                closure = tuple(
-                    identity.id
-                    for identity in identities
-                    if canonical(identity.id) == canonical(command.discovery_subject_id)
-                )
-                # Locking all target identities is done before any append. The
-                # list was loaded once, so canonical resolution remains in-memory.
-                for identity_id in sorted(closure, key=lambda value: value.hex):
-                    if await uow.discovery_subject_identities.get_for_update(identity_id) is None:
-                        raise SelectionInvalidCommandError("Target identity disappeared")
-                locked.append(
-                    (command, active_subject, canonical(command.discovery_subject_id), closure)
-                )
-
-            candidate_rows = await uow.discovery_candidates.list_for_edition(
-                edition_id, include_replaced=False
+            fingerprint = selection_request_fingerprint(
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                decisions=[(command.discovery_subject_id, command.action) for command in commands],
             )
-            candidates_by_id = {candidate.id: candidate for candidate in candidate_rows}
-            validated: list[
-                tuple[
-                    SelectionDecisionCommand,
-                    DiscoverySubject,
-                    tuple[UUID, ...],
-                    SelectionDecision | None,
-                    SubjectDiscoveryOrigin | None,
-                ]
-            ] = []
-            for command, active_subject, _, closure in locked:
-                existing = [
-                    decision
-                    for decision in decisions
-                    if decision.discovery_subject_id in closure
-                    and decision.idempotency_key == command.idempotency_key
-                ]
-                if existing:
-                    if any(
-                        decision.action is not command.action
-                        or decision.snapshot_id != snapshot.id
-                        or decision.snapshot_version != snapshot.version
-                        for decision in existing
-                    ):
-                        raise SelectionIdempotencyConflictError()
-                newest = self._newest_decision(decisions, closure)
-                if command.expected_decision_id is not None and (
-                    newest is None or newest.id != command.expected_decision_id
-                ):
-                    raise SelectionDecisionStaleError()
-                if existing:
-                    continue
-                origin = self._origin_for_closure(origins, closure)
-                if command.action is SelectionAction.IGNORE and origin is not None:
-                    raise SelectionSubjectAlreadyMaterializedError()
-                validated.append(
-                    (
-                        command,
-                        active_subject,
-                        closure,
-                        existing[0] if existing else None,
-                        origin,
+            recorded = await uow.selection_idempotency.get_for_update(edition_id, idempotency_key)
+            if recorded is not None and recorded.request_fingerprint != fingerprint:
+                # Same key, other snapshot or other set of decisions: the key
+                # is already spent, so nothing may be applied under it.
+                raise SelectionIdempotencyConflictError()
+            replay = recorded is not None
+            if replay:
+                # Exact replay of an already applied batch: release the locks
+                # and answer with the canonical board, without appending.
+                await uow.rollback()
+            else:
+                await uow.selection_idempotency.add(
+                    SelectionIdempotencyRecord(
+                        edition_id=edition_id,
+                        idempotency_key=idempotency_key,
+                        request_fingerprint=fingerprint,
+                        actor_id=commands[0].actor_id,
+                        correlation_id=commands[0].correlation_id,
                     )
                 )
-
-            for command, active_subject, _closure, replayed, origin in validated:
-                if replayed is not None:
-                    continue
-                if command.action is SelectionAction.SELECT and origin is not None:
-                    continue
-
-                subject: Subject | None = None
-                if command.action is SelectionAction.SELECT:
-                    members = [
-                        candidates_by_id[reference.candidate_id]
-                        for reference in active_subject.member_references
-                        if reference.candidate_id in candidates_by_id
-                    ]
-                    subject_tlp = self._most_restrictive_tlp(edition, members)
-                    subject = await self._subjects.materialize_in_uow(
-                        uow,
-                        edition_id=edition_id,
-                        title=active_subject.canonical_title,
-                        initial_tlp=subject_tlp,
-                    )
-                decision = SelectionDecision(
-                    edition_id=edition_id,
-                    discovery_subject_id=command.discovery_subject_id,
-                    snapshot_id=snapshot.id,
-                    snapshot_version=snapshot.version,
-                    action=command.action,
-                    subject_id=subject.id if subject else None,
-                    actor_id=command.actor_id,
-                    correlation_id=command.correlation_id,
-                    idempotency_key=command.idempotency_key,
-                )
-                await uow.selection_decisions.append(decision)
-                decisions.append(decision)
-                if subject is not None:
-                    origin_record = SubjectDiscoveryOrigin(
-                        subject_id=subject.id,
-                        edition_id=edition_id,
-                        discovery_subject_id=command.discovery_subject_id,
-                        selection_decision_id=decision.id,
-                        selected_snapshot_id=snapshot.id,
-                        selected_snapshot_version=snapshot.version,
-                    )
-                    await uow.subject_discovery_origins.add(origin_record)
-                    origins.append(origin_record)
-                    await uow.provenance.append(
-                        ProvenanceEvent(
-                            subject_id=subject.id,
-                            aggregate_type="subject",
-                            aggregate_id=subject.id,
-                            event_type="subject.created_from_selection",
-                            payload={
-                                "discovery_subject_id": str(command.discovery_subject_id),
-                                "selection_decision_id": str(decision.id),
-                                "snapshot_id": str(snapshot.id),
-                                "snapshot_version": snapshot.version,
-                                "candidate_ids": [
-                                    str(reference.candidate_id)
-                                    for reference in active_subject.member_references
-                                ],
-                            },
-                            tlp=subject.tlp,
-                            actor_id=command.actor_id,
-                        )
-                    )
-                    created.append(subject)
-            await uow.commit()
+                created = await self._apply_decisions(uow, edition, snapshot, commands)
+                await uow.commit()
 
         for subject in created:
             await self._materialize_after_commit(subject, edition_id)
@@ -415,6 +306,137 @@ class SelectionService:
             except Exception:
                 logger.exception("selection_post_commit_projection_failed")
         return result
+
+    async def _apply_decisions(
+        self,
+        uow: UnitOfWork,
+        edition: Edition,
+        snapshot: DiscoverySnapshot,
+        commands: Sequence[SelectionDecisionCommand],
+    ) -> list[Subject]:
+        """Validate the whole batch, then append it inside the caller's transaction."""
+
+        edition_id = edition.id
+        created: list[Subject] = []
+        identities = list(await uow.discovery_subject_identities.list_for_edition(edition_id))
+        identity_map = {identity.id: identity for identity in identities}
+        decisions = list(await uow.selection_decisions.list_for_edition(edition_id))
+        origins = list(await uow.subject_discovery_origins.list_for_edition(edition_id))
+        merge_runs = list(await uow.discovery_merge_runs.list_for_edition(edition_id))
+        active_by_id = {item.subject_id: item for item in snapshot.subjects}
+        canonical = self._canonical_resolver(identity_map)
+        blocked = self._blocked_ids(snapshot, merge_runs)
+
+        locked: list[tuple[SelectionDecisionCommand, DiscoverySubject, UUID, tuple[UUID, ...]]] = []
+        for command in commands:
+            active_subject = active_by_id.get(command.discovery_subject_id)
+            if active_subject is None or command.discovery_subject_id not in identity_map:
+                raise SelectionInvalidCommandError("Target is not an active snapshot identity")
+            if command.discovery_subject_id in blocked:
+                raise SelectionInvalidCommandError("Target is awaiting fusion review")
+            closure = tuple(
+                identity.id
+                for identity in identities
+                if canonical(identity.id) == canonical(command.discovery_subject_id)
+            )
+            # Locking all target identities is done before any append. The
+            # list was loaded once, so canonical resolution remains in-memory.
+            for identity_id in sorted(closure, key=lambda value: value.hex):
+                if await uow.discovery_subject_identities.get_for_update(identity_id) is None:
+                    raise SelectionInvalidCommandError("Target identity disappeared")
+            locked.append(
+                (command, active_subject, canonical(command.discovery_subject_id), closure)
+            )
+
+        candidate_rows = await uow.discovery_candidates.list_for_edition(
+            edition_id, include_replaced=False
+        )
+        candidates_by_id = {candidate.id: candidate for candidate in candidate_rows}
+        validated: list[
+            tuple[
+                SelectionDecisionCommand,
+                DiscoverySubject,
+                tuple[UUID, ...],
+                SubjectDiscoveryOrigin | None,
+            ]
+        ] = []
+        for command, active_subject, _, closure in locked:
+            origin = self._origin_for_closure(origins, closure)
+            if command.action is SelectionAction.IGNORE and origin is not None:
+                raise SelectionSubjectAlreadyMaterializedError()
+            newest = self._newest_decision(decisions, closure)
+            newest_id = newest.id if newest is not None else None
+            # An absent expectation is an expectation: the operator read an
+            # undecided subject, so a decision appended in the meantime must
+            # make the command stale instead of silently applying.
+            if newest_id != command.expected_decision_id:
+                raise SelectionDecisionStaleError()
+            validated.append((command, active_subject, closure, origin))
+
+        for command, active_subject, _closure, origin in validated:
+            if command.action is SelectionAction.SELECT and origin is not None:
+                continue
+
+            subject: Subject | None = None
+            if command.action is SelectionAction.SELECT:
+                members = [
+                    candidates_by_id[reference.candidate_id]
+                    for reference in active_subject.member_references
+                    if reference.candidate_id in candidates_by_id
+                ]
+                subject_tlp = self._most_restrictive_tlp(edition, members)
+                subject = await self._subjects.materialize_in_uow(
+                    uow,
+                    edition_id=edition_id,
+                    title=active_subject.canonical_title,
+                    initial_tlp=subject_tlp,
+                )
+            decision = SelectionDecision(
+                edition_id=edition_id,
+                discovery_subject_id=command.discovery_subject_id,
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                action=command.action,
+                subject_id=subject.id if subject else None,
+                actor_id=command.actor_id,
+                correlation_id=command.correlation_id,
+                idempotency_key=command.idempotency_key,
+            )
+            await uow.selection_decisions.append(decision)
+            decisions.append(decision)
+            if subject is not None:
+                origin_record = SubjectDiscoveryOrigin(
+                    subject_id=subject.id,
+                    edition_id=edition_id,
+                    discovery_subject_id=command.discovery_subject_id,
+                    selection_decision_id=decision.id,
+                    selected_snapshot_id=snapshot.id,
+                    selected_snapshot_version=snapshot.version,
+                )
+                await uow.subject_discovery_origins.add(origin_record)
+                origins.append(origin_record)
+                await uow.provenance.append(
+                    ProvenanceEvent(
+                        subject_id=subject.id,
+                        aggregate_type="subject",
+                        aggregate_id=subject.id,
+                        event_type="subject.created_from_selection",
+                        payload={
+                            "discovery_subject_id": str(command.discovery_subject_id),
+                            "selection_decision_id": str(decision.id),
+                            "snapshot_id": str(snapshot.id),
+                            "snapshot_version": snapshot.version,
+                            "candidate_ids": [
+                                str(reference.candidate_id)
+                                for reference in active_subject.member_references
+                            ],
+                        },
+                        tlp=subject.tlp,
+                        actor_id=command.actor_id,
+                    )
+                )
+                created.append(subject)
+        return created
 
     async def _materialize_after_commit(self, subject: Subject, edition_id: UUID) -> None:
         if self._materializer is None:

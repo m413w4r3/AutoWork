@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce sous-ensemble", async ({
   page,
 }) => {
@@ -14,51 +20,32 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   let productionPostBody: unknown = null;
   let batchStarted = false;
 
-  const itemFor = (title: string, subjectId: string) => ({
-    discovery_subject_id: subjectId,
-    title,
-    summary: `Résumé de ${title}`,
-    presentation: `Résumé de ${title}`,
-    actor_or_campaign: "Groupe de menace",
-    publications: [],
-    candidate_count: 1,
-    technical_potential: 4,
-    technical_potential_reason: "Artefacts techniques annoncés.",
-    announced_artifacts: ["ioc", "configurations"],
-    publisher_ioc_count_total: null,
-    publisher_ioc_counts: [],
-    provisional_ioc_count: 0,
-    provisional_ioc_type_counts: {},
-    provisional_iocs: [],
-    uncertainties: [],
-    recommendation: null,
-    // Only `state === "selected"` with a non-null `subject_id` is eligible
-    // for a production batch — Selection already materialized the Subject.
-    state: "selected",
-    subject_id: subjectId,
-    last_decision: {
-      id: `decision-${subjectId.slice(0, 4)}`,
-      decision: "select",
-      actor_id: "analyst",
-    },
-    updated_since_decision: false,
-    selectable: true,
-    blocking_reason: null,
-  });
+  const itemFor = (title: string, subjectId: string) =>
+    selectionWireItem({
+      discovery_subject_id: subjectId,
+      title,
+      summary: `Résumé de ${title}`,
+      artifacts: ["ioc", "configurations"],
+      // Only `selected` with a non-null `subject_id` is eligible for a
+      // production batch — Selection already materialized the Subject.
+      effective_state: "selected",
+      subject_id: subjectId,
+      last_decision: selectionWireLastDecision({
+        id: `decision-${subjectId.slice(0, 4)}`,
+        subject_id: subjectId,
+      }),
+    });
 
-  const selection = {
+  const selection = selectionWireBoard({
     edition_id: editionId,
     snapshot_id: "99999999-9999-4999-8999-999999999999",
-    snapshot_version: 1,
-    counts: { undecided: 0, ignored: 0, selected: 4, total: 4 },
     items: [
       itemFor("Article A", subjectA),
       itemFor("Article B", subjectB),
       itemFor("Article C", subjectC),
       itemFor("Article D", subjectD),
     ],
-    recommendation: null,
-  };
+  });
 
   const edition = () => ({
     id: editionId,

@@ -54,6 +54,7 @@ from cti_app.application.persistence import (
     SampleFeatureSetRepository,
     SampleRepository,
     SelectionDecisionRepository,
+    SelectionIdempotencyRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
     SourceExtractionRepository,
@@ -154,6 +155,7 @@ from cti_app.infrastructure.database.repositories.publication_review import (
 )
 from cti_app.infrastructure.database.repositories.selection import (
     SqlAlchemySelectionDecisionRepository,
+    SqlAlchemySelectionIdempotencyRepository,
     SqlAlchemySubjectDiscoveryOriginRepository,
 )
 
@@ -168,6 +170,7 @@ class SqlAlchemyUnitOfWork:
     invariants: InvariantRepository
     subjects: SubjectRepository
     selection_decisions: SelectionDecisionRepository
+    selection_idempotency: SelectionIdempotencyRepository
     subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
@@ -240,6 +243,7 @@ class SqlAlchemyUnitOfWork:
         self.invariants = SqlAlchemyInvariantRepository(self._session)
         self.subjects = SqlAlchemySubjectRepository(self._session)
         self.selection_decisions = SqlAlchemySelectionDecisionRepository(self._session)
+        self.selection_idempotency = SqlAlchemySelectionIdempotencyRepository(self._session)
         self.subject_discovery_origins = SqlAlchemySubjectDiscoveryOriginRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)

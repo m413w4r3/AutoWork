@@ -197,6 +197,10 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "subject_discovery_origins",
         "trg_subject_discovery_origins_append_only",
     ): "reject_selection_mutation",
+    (
+        "selection_idempotency_records",
+        "trg_selection_idempotency_records_append_only",
+    ): "reject_selection_mutation",
     ("reference_members", "reference_members_immutable"): "forbid_reference_mutation",
     (
         "reference_member_disputes",

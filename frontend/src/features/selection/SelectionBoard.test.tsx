@@ -3,84 +3,121 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import type {
-  SelectionBoard as SelectionBoardData,
-  SelectionItem,
-} from "../../api/selection";
 import { SelectionBoard } from "./SelectionBoard";
 
 const EDITION_ID = "edition-1";
 
-function item(
+/*
+ * Fixtures are the payload `backend/src/cti_app/api/selection.py` really
+ * serializes — `effective_state`, `member_candidate_ids`, an object
+ * recommendation and top-level counters. Anything the UI needs is derived
+ * from it by the normalizer, never by the test.
+ */
+
+type WireItem = Record<string, unknown>;
+
+function wireItem(
   id: string,
-  state: SelectionItem["state"],
-  overrides: Partial<SelectionItem> = {},
-): SelectionItem {
+  effectiveState: "undecided" | "ignored" | "selected",
+  overrides: WireItem = {},
+): WireItem {
   return {
     discovery_subject_id: id,
+    canonical_discovery_subject_id: id,
     title: `Sujet ${id}`,
     summary: "Présentation du sujet.",
-    presentation: null,
     actor_or_campaign: "Campagne Orion",
-    publications: [
-      {
-        title: "Publication source",
-        url: `https://example.test/${id}`,
-        publisher: "Source",
-        role: "primary",
-        published_at: "2026-09-01T00:00:00Z",
-      },
-    ],
-    candidate_count: 2,
     technical_potential: 3,
     technical_potential_reason: "Chaîne exploitable",
-    announced_artifacts: ["loader"],
-    publisher_ioc_count_total: 4,
-    publisher_ioc_counts: [4],
-    provisional_ioc_count: 1,
-    provisional_ioc_type_counts: { domain: 1 },
+    artifacts: ["loader"],
+    publications: [
+      {
+        url: `https://example.test/${id}`,
+        title: "Publication source",
+        publisher: "Source",
+        role: "primary",
+        tlp: "AMBER",
+        sensitivity: "internal",
+        external_llm_allowed: true,
+        published_at: "2026-09-01",
+        event_date: null,
+        citation: null,
+        local_ref: null,
+        source_ref: `source-${id}`,
+        raw_url: `https://example.test/${id}`,
+        period_relation: "unknown",
+        ioc_presence: "declared",
+        ioc_declared_count: 4,
+        ioc_visible_count: null,
+        parsing_warnings: [],
+        markdown_block: null,
+        id: `publication-${id}`,
+        verification_status: "unverified",
+        relationship_status: "provisional",
+        verification_changed_at: null,
+        verification_changed_by: null,
+        canonical_url: `https://example.test/${id}`,
+        title_fingerprint: null,
+      },
+    ],
     provisional_iocs: [
       {
         raw_value: "example.test",
         normalized_value: "example.test",
+        declared_type: "domain",
         proposed_type: "domain",
-        declared_type: null,
+        publication_relations: [],
+        model_run_id: null,
+        markdown_block: "block",
         warnings: [],
+        status: "provisional_visible",
+        id: `ioc-${id}`,
       },
     ],
     uncertainties: ["Date à confirmer"],
-    recommendation: "Traiter après validation.",
-    state,
-    subject_id: state === "selected" ? `subject-${id}` : null,
-    last_decision: state === "undecided" ? null : lastDecision(id, state),
-    updated_since_decision: false,
-    selectable: state === "undecided",
+    selectable: effectiveState === "undecided",
     blocking_reason: null,
+    effective_state: effectiveState,
+    subject_id: effectiveState === "selected" ? `subject-${id}` : null,
+    recommendation:
+      effectiveState === "undecided"
+        ? { recommended: true, reason: "ioc_signal" }
+        : { recommended: false, reason: null },
+    last_decision:
+      effectiveState === "undecided"
+        ? null
+        : wireLastDecision(id, effectiveState),
+    updated_since_decision: false,
+    member_candidate_ids: [`candidate-${id}-1`, `candidate-${id}-2`],
     ...overrides,
   };
 }
 
-function lastDecision(
-  id: string,
-  state: SelectionItem["state"],
-): SelectionItem["last_decision"] {
+function wireLastDecision(id: string, state: "ignored" | "selected"): WireItem {
   return {
     id: `decision-${id}`,
-    decision: state === "selected" ? "select" : "ignore",
+    action: state === "selected" ? "select" : "ignore",
+    snapshot_id: "snapshot-7",
+    snapshot_version: 7,
+    subject_id: state === "selected" ? `subject-${id}` : null,
+    actor_id: "analyst-1",
+    occurred_at: "2026-09-02T10:00:00Z",
   };
 }
 
-const board: SelectionBoardData = {
+const board = {
   edition_id: EDITION_ID,
   snapshot_id: "snapshot-7",
   snapshot_version: 7,
-  counts: { undecided: 2, ignored: 1, selected: 1, total: 4 },
-  recommendation: "Traiter les sujets sélectionnables.",
+  fusion_review_count: 1,
+  selected: 1,
+  ignored: 1,
+  undecided: 2,
   items: [
-    item("undecided", "undecided", { updated_since_decision: true }),
-    item("ignored", "ignored"),
-    item("selected", "selected"),
-    item("blocked", "undecided", {
+    wireItem("undecided", "undecided", { updated_since_decision: true }),
+    wireItem("ignored", "ignored"),
+    wireItem("selected", "selected"),
+    wireItem("blocked", "undecided", {
       selectable: false,
       blocking_reason: "Fusion doit être résolue.",
     }),
@@ -122,8 +159,13 @@ describe("SelectionBoard", () => {
       screen.getByRole("link", { name: "Ouvrir Fusion" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText("Traiter les sujets sélectionnables."),
+      screen.getByText("1 fusion(s) à résoudre avant de décider."),
     ).toBeInTheDocument();
+    // Derived from the real wire payload, not sent by the API.
+    expect(screen.getAllByText("2").length).toBeGreaterThan(0);
+    expect(
+      screen.getAllByText("4 annoncés · 1 provisoire").length,
+    ).toBeGreaterThan(0);
     expect(
       screen.getByText("Mis à jour depuis la décision"),
     ).toBeInTheDocument();
@@ -157,10 +199,7 @@ describe("SelectionBoard", () => {
   });
 
   it("confirme toutes les décisions en un seul lot avec snapshot, attentes et clé", async () => {
-    const updated = {
-      ...board,
-      counts: { ...board.counts, undecided: 1, selected: 2 },
-    };
+    const updated = { ...board, undecided: 1, selected: 2 };
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(Response.json(board))
@@ -194,12 +233,12 @@ describe("SelectionBoard", () => {
         decisions: [
           {
             discovery_subject_id: "undecided",
-            decision: "select",
+            action: "select",
             expected_decision_id: null,
           },
           {
             discovery_subject_id: "ignored",
-            decision: "select",
+            action: "select",
             expected_decision_id: "decision-ignored",
           },
         ],

@@ -21,7 +21,11 @@ from cti_app.domain.discovery_cumulative import (
 )
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import ProvenanceEvent, Subject
-from cti_app.domain.selection import SelectionDecision, SubjectDiscoveryOrigin
+from cti_app.domain.selection import (
+    SelectionDecision,
+    SelectionIdempotencyRecord,
+    SubjectDiscoveryOrigin,
+)
 
 
 class _EditionRepository:
@@ -55,6 +59,26 @@ class _DecisionRepository:
 
     async def list_for_edition(self, edition_id: UUID) -> list[SelectionDecision]:
         return [decision for decision in self.state if decision.edition_id == edition_id]
+
+
+class _IdempotencyRepository:
+    def __init__(self, state: list[SelectionIdempotencyRecord]) -> None:
+        self.state = state
+
+    async def get_for_update(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> SelectionIdempotencyRecord | None:
+        return next(
+            (
+                record
+                for record in self.state
+                if record.edition_id == edition_id and record.idempotency_key == idempotency_key
+            ),
+            None,
+        )
+
+    async def add(self, record: SelectionIdempotencyRecord) -> None:
+        self.state.append(record)
 
 
 class _OriginRepository:
@@ -131,6 +155,7 @@ class InMemorySelectionUnitOfWork:
         self.editions = _EditionRepository(factory.editions)
         self.subjects = _SubjectRepository(factory.subjects)
         self.selection_decisions = _DecisionRepository(factory.decisions)
+        self.selection_idempotency = _IdempotencyRepository(factory.idempotency_records)
         self.subject_discovery_origins = _OriginRepository(factory.origins)
         self.discovery_subject_identities = _IdentityRepository(factory.identities)
         self.discovery_candidates = _CandidateRepository(factory.candidates)
@@ -162,6 +187,7 @@ class InMemorySelectionUnitOfWorkFactory:
         self.editions: dict[UUID, Edition] = {}
         self.subjects: dict[UUID, Subject] = {}
         self.decisions: list[SelectionDecision] = []
+        self.idempotency_records: list[SelectionIdempotencyRecord] = []
         self.origins: list[SubjectDiscoveryOrigin] = []
         self.identities: dict[UUID, DiscoverySubjectIdentity] = {}
         self.candidates: list[DiscoveryCandidate] = []
@@ -177,6 +203,19 @@ class InMemorySelectionUnitOfWorkFactory:
 def make_selection_fixture(
     *, tlp: TLP = TLP.GREEN, candidate_tlp: TLP = TLP.GREEN, with_ioc: bool = False
 ) -> tuple[InMemorySelectionUnitOfWorkFactory, Edition, DiscoverySnapshot, UUID]:
+    factory, edition, snapshot, identity_ids = make_selection_fixture_with_subjects(
+        tlp=tlp, candidate_tlp=candidate_tlp, with_ioc=with_ioc
+    )
+    return factory, edition, snapshot, identity_ids[0]
+
+
+def make_selection_fixture_with_subjects(
+    *,
+    count: int = 1,
+    tlp: TLP = TLP.GREEN,
+    candidate_tlp: TLP = TLP.GREEN,
+    with_ioc: bool = False,
+) -> tuple[InMemorySelectionUnitOfWorkFactory, Edition, DiscoverySnapshot, tuple[UUID, ...]]:
     factory = InMemorySelectionUnitOfWorkFactory()
     edition = Edition(
         country="France",
@@ -187,59 +226,68 @@ def make_selection_fixture(
         languages=("fr",),
     )
     merge_run_id = uuid4()
-    candidate = DiscoveryCandidate(
-        discovery_run_id=uuid4(),
-        discovery_batch_id=uuid4(),
-        position=0,
-        title="Canonical topic",
-        summary="A discovery summary",
-        novelty="A novel finding",
-        technical_potential=3,
-        technical_potential_reason="Useful for hunting",
-        event_date=None,
-        actor_or_campaign="Actor",
-        context_only=False,
-        tlp=candidate_tlp,
-        sensitivity="normal",
-        external_llm_allowed=True,
-        evidence=DiscoveryCandidateEvidence(iocs=("1.2.3.4",) if with_ioc else ()),
-    )
-    identity = DiscoverySubjectIdentity(
-        edition_id=edition.id,
-        origin_key="topic-1",
-        created_by_merge_run_id=merge_run_id,
-        id=uuid4(),
-    )
-    topic = CandidateTopic(
-        title=candidate.title,
-        summary=candidate.summary,
-        novelty=candidate.novelty,
-        technical_potential=candidate.technical_potential,
-        uncertainties=("Needs verification",),
-        relevance_reasons=("Relevant",),
-        actors=("Actor",),
-        campaigns=(),
-        malware=(),
-        cves=(),
-        victims=(),
-        sectors=(),
-        countries=("FR",),
-        likely_artifacts=("mutex",),
-        sources=[],
-        tlp=candidate_tlp,
-        sensitivity="normal",
-        external_llm_allowed=True,
-        iocs=("1.2.3.4",) if with_ioc else (),
-        actor_or_campaign="Actor",
-        technical_potential_reason=candidate.technical_potential_reason,
-        id=identity.id,
-    )
-    discovery_subject = DiscoverySubject(
-        subject_id=identity.id,
-        candidate=topic,
-        member_references=(DiscoveryMemberReference(candidate.id),),
-        created_at=topic.sources[0].id if topic.sources else candidate.created_at,
-    )
+    discovery_subjects: list[DiscoverySubject] = []
+    identity_ids: list[UUID] = []
+    for position in range(count):
+        candidate = DiscoveryCandidate(
+            discovery_run_id=uuid4(),
+            discovery_batch_id=uuid4(),
+            position=position,
+            title=f"Canonical topic {position}",
+            summary="A discovery summary",
+            novelty="A novel finding",
+            technical_potential=3,
+            technical_potential_reason="Useful for hunting",
+            event_date=None,
+            actor_or_campaign="Actor",
+            context_only=False,
+            tlp=candidate_tlp,
+            sensitivity="normal",
+            external_llm_allowed=True,
+            evidence=DiscoveryCandidateEvidence(iocs=("1.2.3.4",) if with_ioc else ()),
+        )
+        identity = DiscoverySubjectIdentity(
+            edition_id=edition.id,
+            origin_key=f"topic-{position}",
+            created_by_merge_run_id=merge_run_id,
+            id=uuid4(),
+        )
+        topic = CandidateTopic(
+            title=candidate.title,
+            summary=candidate.summary,
+            novelty=candidate.novelty,
+            technical_potential=candidate.technical_potential,
+            uncertainties=("Needs verification",),
+            relevance_reasons=("Relevant",),
+            actors=("Actor",),
+            campaigns=(),
+            malware=(),
+            cves=(),
+            victims=(),
+            sectors=(),
+            countries=("FR",),
+            likely_artifacts=("mutex",),
+            sources=[],
+            tlp=candidate_tlp,
+            sensitivity="normal",
+            external_llm_allowed=True,
+            iocs=("1.2.3.4",) if with_ioc else (),
+            actor_or_campaign="Actor",
+            technical_potential_reason=candidate.technical_potential_reason,
+            id=identity.id,
+        )
+        discovery_subjects.append(
+            DiscoverySubject(
+                subject_id=identity.id,
+                candidate=topic,
+                member_references=(DiscoveryMemberReference(candidate.id),),
+                created_at=candidate.created_at,
+            )
+        )
+        identity_ids.append(identity.id)
+        factory.identities[identity.id] = identity
+        factory.candidates.append(candidate)
+
     snapshot = DiscoverySnapshot(
         edition_id=edition.id,
         version=1,
@@ -247,13 +295,11 @@ def make_selection_fixture(
         intake_id=None,
         merge_run_id=merge_run_id,
         planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
-        subjects=(discovery_subject,),
+        subjects=tuple(discovery_subjects),
         snapshot_hash="0" * 64,
         is_active=True,
     )
     factory.editions[edition.id] = edition
-    factory.identities[identity.id] = identity
-    factory.candidates.append(candidate)
     factory.snapshots[snapshot.id] = snapshot
     factory.merge_runs.append(
         DiscoveryMergeRun(
@@ -266,10 +312,10 @@ def make_selection_fixture(
             blocking_version="1",
             merge_input_hash="1" * 64,
             handle_map={},
-            included_subject_ids=(identity.id,),
+            included_subject_ids=tuple(identity_ids),
             excluded_subject_count=0,
             validation_status=MergeValidationStatus.VALID,
             id=merge_run_id,
         )
     )
-    return factory, edition, snapshot, identity.id
+    return factory, edition, snapshot, tuple(identity_ids)

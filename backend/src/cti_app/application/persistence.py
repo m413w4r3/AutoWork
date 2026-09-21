@@ -80,7 +80,11 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
-from cti_app.domain.selection import SelectionDecision, SubjectDiscoveryOrigin
+from cti_app.domain.selection import (
+    SelectionDecision,
+    SelectionIdempotencyRecord,
+    SubjectDiscoveryOrigin,
+)
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 
@@ -274,6 +278,14 @@ class SelectionDecisionRepository(Protocol):
     async def get_by_idempotency_key(
         self, edition_id: UUID, discovery_subject_id: UUID, idempotency_key: str
     ) -> SelectionDecision | None: ...
+
+
+class SelectionIdempotencyRepository(Protocol):
+    async def get_for_update(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> SelectionIdempotencyRecord | None: ...
+
+    async def add(self, record: SelectionIdempotencyRecord) -> None: ...
 
 
 class SubjectDiscoveryOriginRepository(Protocol):
@@ -674,6 +686,7 @@ class UnitOfWork(Protocol):
     invariants: InvariantRepository
     subjects: SubjectRepository
     selection_decisions: SelectionDecisionRepository
+    selection_idempotency: SelectionIdempotencyRepository
     subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository

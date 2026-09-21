@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Sélection canonique : confirme, rejoue et reflète l'enrichissement", async ({
   page,
 }) => {
@@ -22,71 +28,51 @@ test("Sélection canonique : confirme, rejoue et reflète l'enrichissement", asy
     state: "undecided" | "ignored" | "selected",
     subjectId: string | null,
     decisionId: string,
-  ) => ({
-    discovery_subject_id: id,
-    title,
-    summary: `Présentation neutre de ${title}.`,
-    presentation: `Présentation neutre de ${title}.`,
-    actor_or_campaign: "Acteur à confirmer",
-    publications: [],
-    candidate_count: candidateIds.length,
-    technical_potential: 4,
-    technical_potential_reason: "Artefacts techniques annoncés.",
-    announced_artifacts: ["ioc"],
-    publisher_ioc_count_total: 0,
-    publisher_ioc_counts: [],
-    provisional_ioc_count: 0,
-    provisional_ioc_type_counts: {},
-    provisional_iocs: [],
-    uncertainties: [],
-    recommendation: null,
-    state,
-    subject_id: subjectId,
-    last_decision:
-      state === "undecided"
-        ? null
-        : {
-            id: decisionId,
-            decision: state === "selected" ? "select" : "ignore",
-            actor_id: "analyst",
-          },
-    updated_since_decision: state === "selected" && laterSnapshot,
-    selectable: true,
-    blocking_reason: null,
-  });
+  ) =>
+    selectionWireItem({
+      discovery_subject_id: id,
+      title,
+      summary: `Présentation neutre de ${title}.`,
+      member_candidate_ids: candidateIds,
+      effective_state: state,
+      subject_id: subjectId,
+      last_decision:
+        state === "undecided"
+          ? null
+          : selectionWireLastDecision({
+              id: decisionId,
+              action: state === "selected" ? "select" : "ignore",
+              subject_id: subjectId,
+            }),
+      updated_since_decision: state === "selected" && laterSnapshot,
+    });
 
-  const board = () => ({
-    edition_id: editionId,
-    snapshot_id: laterSnapshot
-      ? "66666666-6666-4666-8666-666666666662"
-      : "66666666-6666-4666-8666-666666666661",
-    snapshot_version: laterSnapshot ? 2 : 1,
-    counts: {
-      undecided: 0,
-      ignored: confirmed ? 1 : 0,
-      selected: confirmed ? 1 : 0,
-      total: 2,
-    },
-    items: [
-      itemFor(
-        subjectA,
-        "Article A",
-        laterSnapshot ? [candidateA1, candidateA2] : [candidateA1],
-        confirmed ? "selected" : "undecided",
-        confirmed ? selectedSubject : null,
-        decisionA,
-      ),
-      itemFor(
-        subjectB,
-        "Article B",
-        ["77777777-7777-4777-8777-777777777777"],
-        confirmed ? "ignored" : "undecided",
-        null,
-        decisionB,
-      ),
-    ],
-    recommendation: null,
-  });
+  const board = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: laterSnapshot
+        ? "66666666-6666-4666-8666-666666666662"
+        : "66666666-6666-4666-8666-666666666661",
+      snapshot_version: laterSnapshot ? 2 : 1,
+      items: [
+        itemFor(
+          subjectA,
+          "Article A",
+          laterSnapshot ? [candidateA1, candidateA2] : [candidateA1],
+          confirmed ? "selected" : "undecided",
+          confirmed ? selectedSubject : null,
+          decisionA,
+        ),
+        itemFor(
+          subjectB,
+          "Article B",
+          ["77777777-7777-4777-8777-777777777777"],
+          confirmed ? "ignored" : "undecided",
+          null,
+          decisionB,
+        ),
+      ],
+    });
 
   await page.route("/api/**", async (route) => {
     const request = route.request();
@@ -164,12 +150,12 @@ test("Sélection canonique : confirme, rejoue et reflète l'enrichissement", asy
     decisions: [
       {
         discovery_subject_id: subjectA,
-        decision: "select",
+        action: "select",
         expected_decision_id: null,
       },
       {
         discovery_subject_id: subjectB,
-        decision: "ignore",
+        action: "ignore",
         expected_decision_id: null,
       },
     ],

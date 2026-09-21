@@ -49,12 +49,13 @@ export function SelectionBoard({
   const confirmation = useMutation({
     mutationFn: (payload: {
       board: SelectionBoardData;
+      snapshotVersion: number;
       decisions: Array<[string, SelectionDecision]>;
     }) =>
       confirmSelectionDecisions(
         editionId,
         {
-          snapshot_version: payload.board.snapshot_version,
+          snapshot_version: payload.snapshotVersion,
           decisions: payload.decisions.map(([discoverySubjectId, decision]) => {
             const item = payload.board.items.find(
               (candidate) =>
@@ -100,6 +101,7 @@ export function SelectionBoard({
   }
 
   const data = board.data;
+  const snapshotVersion = data.snapshot_version;
   const draftEntries = Object.entries(drafts);
   const counts = {
     undecided: data.counts.undecided,
@@ -195,9 +197,19 @@ export function SelectionBoard({
       {!readOnly ? (
         <button
           className="button selection-board__confirm"
-          disabled={draftEntries.length === 0 || confirmation.isPending}
+          disabled={
+            draftEntries.length === 0 ||
+            confirmation.isPending ||
+            snapshotVersion === null
+          }
           onClick={() =>
-            confirmation.mutate({ board: data, decisions: draftEntries })
+            snapshotVersion === null
+              ? undefined
+              : confirmation.mutate({
+                  board: data,
+                  snapshotVersion,
+                  decisions: draftEntries,
+                })
           }
         >
           {confirmation.isPending

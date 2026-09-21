@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -59,4 +61,46 @@ class SubjectDiscoveryOrigin:
     def __post_init__(self) -> None:
         if self.selected_snapshot_version <= 0:
             raise ValueError("selected_snapshot_version must be positive")
+        _require_aware(self.created_at, "created_at")
+
+
+def selection_request_fingerprint(
+    *,
+    snapshot_id: UUID,
+    snapshot_version: int,
+    decisions: Iterable[tuple[UUID, SelectionAction]],
+) -> str:
+    """Canonical fingerprint of a whole selection request.
+
+    An ``Idempotency-Key`` identifies one HTTP request, not one decision:
+    the fingerprint therefore covers the snapshot the operator read and the
+    complete, order-independent set of decisions they confirmed. Replaying
+    the same key with a subset, a superset or a different action yields a
+    different fingerprint and must be rejected.
+    """
+
+    body = "|".join(sorted(f"{subject_id.hex}:{action.value}" for subject_id, action in decisions))
+    material = f"{snapshot_id.hex}:{snapshot_version}:{body}"
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class SelectionIdempotencyRecord:
+    edition_id: UUID
+    idempotency_key: str
+    request_fingerprint: str
+    actor_id: str
+    correlation_id: str
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    id: UUID = field(default_factory=uuid4)
+
+    def __post_init__(self) -> None:
+        if not self.idempotency_key.strip():
+            raise ValueError("idempotency_key must not be blank")
+        if len(self.request_fingerprint) != 64:
+            raise ValueError("request_fingerprint must be a sha256 hex digest")
+        if not self.actor_id.strip():
+            raise ValueError("actor_id must not be blank")
+        if not self.correlation_id.strip():
+            raise ValueError("correlation_id must not be blank")
         _require_aware(self.created_at, "created_at")

@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un article", async ({
   page,
 }) => {
@@ -177,51 +183,39 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     pending_reviews: [],
     unstabilized_candidates: [],
   });
-  const selectionBoard = () => ({
-    edition_id: editionId,
-    snapshot_id: "77777777-7777-4777-8777-777777777777",
-    snapshot_version: 2,
-    counts: {
-      undecided: selected ? 0 : 1,
-      ignored: 0,
-      selected: selected ? 1 : 0,
-      total: 1,
-    },
-    items: [
-      {
-        discovery_subject_id: cyfirmaSubject,
-        title: cyfirma.title,
-        summary: cyfirma.summary,
-        presentation: cyfirma.summary,
-        actor_or_campaign: "unknown",
-        publications: [],
-        candidate_count: fusionMerged ? 2 : 1,
-        technical_potential: 3,
-        technical_potential_reason: "Potentiel déclaré",
-        announced_artifacts: ["ioc"],
-        publisher_ioc_count_total: 20,
-        publisher_ioc_counts: [20],
-        provisional_ioc_count: 0,
-        provisional_ioc_type_counts: {},
-        provisional_iocs: [],
-        uncertainties: ["Métadonnées non vérifiées"],
-        recommendation: null,
-        state: selected ? "selected" : "undecided",
-        subject_id: selected ? subjectId : null,
-        last_decision: selected
-          ? {
-              id: "selection-decision",
-              decision: "select",
-              actor_id: "analyst",
-            }
-          : null,
-        updated_since_decision: false,
-        selectable: true,
-        blocking_reason: null,
-      },
-    ],
-    recommendation: null,
-  });
+  const selectionBoard = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: "77777777-7777-4777-8777-777777777777",
+      snapshot_version: 2,
+      items: [
+        selectionWireItem({
+          discovery_subject_id: cyfirmaSubject,
+          title: cyfirma.title,
+          summary: cyfirma.summary,
+          actor_or_campaign: "unknown",
+          technical_potential: 3,
+          technical_potential_reason: "Potentiel déclaré",
+          // The 20 announced IOC come from the publication itself; the board
+          // derives its counters from `publications`, as the API does.
+          publications: [...cyfirma.sources],
+          uncertainties: ["Métadonnées non vérifiées"],
+          member_candidate_ids: fusionMerged
+            ? [cyfirma.id, ncc.id]
+            : [cyfirma.id],
+          effective_state: selected ? "selected" : "undecided",
+          subject_id: selected ? subjectId : null,
+          last_decision: selected
+            ? selectionWireLastDecision({
+                id: "selection-decision",
+                snapshot_id: "77777777-7777-4777-8777-777777777777",
+                snapshot_version: 2,
+                subject_id: subjectId,
+              })
+            : null,
+        }),
+      ],
+    });
 
   await page.route("/api/**", async (route) => {
     const request = route.request();
@@ -504,7 +498,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
         decisions: [
           {
             discovery_subject_id: cyfirmaSubject,
-            decision: "select",
+            action: "select",
             expected_decision_id: null,
           },
         ],
