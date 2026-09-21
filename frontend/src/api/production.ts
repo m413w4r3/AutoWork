@@ -607,10 +607,10 @@ export async function getPublicationArtifact(
  * Start batch production for an edition, for exactly the given subjects.
  *
  * `subjectIds` must be the operator's explicit production-batch selection —
- * a subset of the editorially eligible subjects, in editorial board order.
- * Editorial eligibility (`EditorialGroup.status === "selected"`) is a
- * separate notion from this batch selection: subjects left unchecked are
- * never sent here and keep whatever editorial decision they already have.
+ * a subset of the already-materialized Subjects, in selection board order.
+ * Selection eligibility (a board item in state `selected` with a
+ * `subject_id`) is a separate notion from this batch selection: subjects
+ * left unchecked are never sent here and keep their Selection decision.
  * An empty selection is refused client-side rather than silently falling
  * back to "every eligible subject" — the caller must ask the operator to
  * choose at least one subject.

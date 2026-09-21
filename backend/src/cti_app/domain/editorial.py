@@ -18,10 +18,15 @@ class GroupingOutcome(StrEnum):
 
 
 class EditorialGroupStatus(StrEnum):
+    """Statuses of the legacy editorial projection.
+
+    TODO AW-009: delete with LegacyEditorialProjection. Since AW-008 no human
+    decision is taken here: a group is created PROPOSED and immediately moved
+    to SELECTED by the projection of an existing `SubjectDiscoveryOrigin`.
+    """
+
     PROPOSED = "proposed"
-    REJECTED = "rejected"
     SELECTED = "selected"
-    SUPERSEDED = "superseded"
 
 
 class GroupingConfidence(StrEnum):
@@ -31,10 +36,6 @@ class GroupingConfidence(StrEnum):
 
 
 class HumanDecisionType(StrEnum):
-    MERGE = "merge"
-    SPLIT = "split"
-    REJECT = "reject"
-    SELECT = "select"
     CLAIM_VALIDATE = "claim_validate"
     CLAIM_CORRECT = "claim_correct"
     CLAIM_REJECT = "claim_reject"
@@ -148,18 +149,6 @@ class EditorialGroup:
         if updated != self.candidate_references:
             self.candidate_references = updated
             self._bump()
-
-    def supersede(self) -> None:
-        if self.status is not EditorialGroupStatus.PROPOSED:
-            raise ValueError("Only proposed groups can be merged")
-        self.status = EditorialGroupStatus.SUPERSEDED
-        self._bump()
-
-    def reject(self) -> None:
-        if self.status is not EditorialGroupStatus.PROPOSED:
-            raise ValueError("Only proposed groups can be rejected")
-        self.status = EditorialGroupStatus.REJECTED
-        self._bump()
 
     def select(self, subject_id: UUID) -> None:
         if self.status is not EditorialGroupStatus.PROPOSED:

@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un article", async ({
   page,
 }) => {
@@ -112,23 +118,6 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       "NCC Group",
     ),
   );
-  const score = {
-    impact: 2,
-    novelty: 2,
-    technical_depth: 3,
-    hunting_potential: 2,
-    actionability: 2,
-    source_quality: 2,
-    total: 13,
-    justifications: {
-      impact: "À vérifier",
-      novelty: "À vérifier",
-      technical_depth: "Potentiel déclaré",
-      hunting_potential: "IOC annoncés",
-      actionability: "À vérifier",
-      source_quality: "Source provisoire",
-    },
-  };
   const cyfirmaSubject = "33333333-3333-4333-8333-333333333331";
   const nccSubject = "33333333-3333-4333-8333-333333333332";
   const fusionCandidate = (topic: ReturnType<typeof candidate>) => ({
@@ -194,44 +183,39 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
     pending_reviews: [],
     unstabilized_candidates: [],
   });
-  const groups = () => [
-    {
-      id: "11111111-1111-4111-8111-111111111111",
+  const selectionBoard = () =>
+    selectionWireBoard({
       edition_id: editionId,
-      title: cyfirma.title,
-      outcome: "new_subject",
-      status: selected ? "selected" : "proposed",
-      subject_id: selected ? "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" : null,
-      candidates: fusionMerged ? [cyfirma, ncc] : [cyfirma],
-      score,
-      source_relationship_status: "provisional",
-      needs_source_verification: true,
-      needs_source_expansion: true,
-      grouping_confidence: "high",
-      grouping_justification: fusionMerged
-        ? "Fusion décidée par l'analyste."
-        : "Bloc ChatGPT S1",
-      historical_comparison: null,
-      version: fusionMerged || selected ? 2 : 1,
-    },
-    {
-      id: "22222222-2222-4222-8222-222222222222",
-      edition_id: editionId,
-      title: ncc.title,
-      outcome: "new_subject",
-      status: fusionMerged ? "superseded" : "proposed",
-      subject_id: null,
-      candidates: [ncc],
-      score,
-      source_relationship_status: "provisional",
-      needs_source_verification: true,
-      needs_source_expansion: true,
-      grouping_confidence: "high",
-      grouping_justification: "Bloc ChatGPT S2",
-      historical_comparison: null,
-      version: fusionMerged ? 2 : 1,
-    },
-  ];
+      snapshot_id: "77777777-7777-4777-8777-777777777777",
+      snapshot_version: 2,
+      items: [
+        selectionWireItem({
+          discovery_subject_id: cyfirmaSubject,
+          title: cyfirma.title,
+          summary: cyfirma.summary,
+          actor_or_campaign: "unknown",
+          technical_potential: 3,
+          technical_potential_reason: "Potentiel déclaré",
+          // The 20 announced IOC come from the publication itself; the board
+          // derives its counters from `publications`, as the API does.
+          publications: [...cyfirma.sources],
+          uncertainties: ["Métadonnées non vérifiées"],
+          member_candidate_ids: fusionMerged
+            ? [cyfirma.id, ncc.id]
+            : [cyfirma.id],
+          effective_state: selected ? "selected" : "undecided",
+          subject_id: selected ? subjectId : null,
+          last_decision: selected
+            ? selectionWireLastDecision({
+                id: "selection-decision",
+                snapshot_id: "77777777-7777-4777-8777-777777777777",
+                snapshot_version: 2,
+                subject_id: subjectId,
+              })
+            : null,
+        }),
+      ],
+    });
 
   await page.route("/api/**", async (route) => {
     const request = route.request();
@@ -500,18 +484,27 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
       fusionMerged = true;
       return route.fulfill({ json: fusionBoard() });
     }
-    if (path.includes("/editorial-groups")) {
-      if (request.method() === "POST" && path.endsWith("/decisions"))
-        selected = true;
-      return route.fulfill({
-        json: {
-          groups: groups(),
-          selected_articles: selected ? 1 : 0,
-          ignored: 0,
-          undecided: selected ? 0 : fusionMerged ? 1 : 2,
-          automatic_selection: false,
-        },
+    if (
+      path === `/api/editions/${editionId}/selection` &&
+      request.method() === "GET"
+    )
+      return route.fulfill({ json: selectionBoard() });
+    if (
+      path === `/api/editions/${editionId}/selection/decisions` &&
+      request.method() === "POST"
+    ) {
+      expect(request.postDataJSON()).toMatchObject({
+        snapshot_version: 2,
+        decisions: [
+          {
+            discovery_subject_id: cyfirmaSubject,
+            action: "select",
+            expected_decision_id: null,
+          },
+        ],
       });
+      selected = true;
+      return route.fulfill({ json: selectionBoard() });
     }
     return route.fulfill({ status: 404, body: "{}" });
   });
@@ -576,16 +569,23 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   await expect(
     page.getByRole("heading", { name: "Sélection des sujets" }),
   ).toBeVisible();
-  await expect(page.locator(".editorial-group-card")).toHaveCount(1);
-  await page
-    .locator(".editorial-group-card")
-    .getByRole("radio", { name: "Article" })
-    .check();
-  await page
-    .getByRole("button", { name: "Confirmer la sélection (1)" })
+  // Scope the decision to the card of the DiscoverySubject under test rather
+  // than to a DOM index: Selection exposes explicit "Traiter"/"Ignorer"
+  // actions, not radios.
+  const cyfirmaCard = page.getByRole("article").filter({
+    has: page.getByRole("heading", { name: cyfirma.title, exact: true }),
+  });
+  await expect(cyfirmaCard).toHaveCount(1);
+  await cyfirmaCard
+    .getByRole("button", { name: "Traiter", exact: true })
     .click();
-  // Libellé rendu par EditorialBoard, hors périmètre d’AW-004.
-  await expect(page.getByText("1 article prêt")).toBeVisible();
+  await page
+    .getByRole("button", { name: "Confirmer les décisions (1)" })
+    .click();
+  await expect(page.getByRole("link", { name: "Sujet créé" })).toHaveCount(1);
+  await expect(
+    cyfirmaCard.getByRole("link", { name: "Sujet créé" }),
+  ).toHaveAttribute("href", `/subjects/${subjectId}`);
 
   await page.goto(`/subjects/${subjectId}`);
   await expect(

@@ -1,8 +1,11 @@
 import { expect, test } from "@playwright/test";
 
-// Reproduces the real bug: a board with more editorially eligible articles
-// than the operator wants to produce right now. Only the explicitly checked
-// subset must reach the backend and the production console — nothing else.
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce sous-ensemble", async ({
   page,
 }) => {
@@ -14,48 +17,35 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   const batchId = "e5555555-5555-4555-8555-555555555555";
   const runB = "f6666666-6666-4666-8666-666666666666";
   const runD = "f6666666-6666-4666-8666-666666666667";
-
   let productionPostBody: unknown = null;
+  let batchStarted = false;
 
-  const groupFor = (title: string, subjectId: string, id: string) => ({
-    id,
+  const itemFor = (title: string, subjectId: string) =>
+    selectionWireItem({
+      discovery_subject_id: subjectId,
+      title,
+      summary: `Résumé de ${title}`,
+      artifacts: ["ioc", "configurations"],
+      // Only `selected` with a non-null `subject_id` is eligible for a
+      // production batch — Selection already materialized the Subject.
+      effective_state: "selected",
+      subject_id: subjectId,
+      last_decision: selectionWireLastDecision({
+        id: `decision-${subjectId.slice(0, 4)}`,
+        subject_id: subjectId,
+      }),
+    });
+
+  const selection = selectionWireBoard({
     edition_id: editionId,
-    title,
-    outcome: "new_subject",
-    status: "selected",
-    subject_id: subjectId,
-    candidates: [],
-    score: {
-      impact: 3,
-      novelty: 3,
-      technical_depth: 3,
-      hunting_potential: 3,
-      actionability: 3,
-      source_quality: 3,
-      total: 18,
-      justifications: {},
-    },
-    source_relationship_status: "verified",
-    needs_source_verification: false,
-    needs_source_expansion: false,
-    grouping_confidence: "high",
-    grouping_justification: "Sélection canonique.",
-    historical_comparison: null,
-    version: 1,
-  });
-
-  const board = {
-    groups: [
-      groupFor("Article A", subjectA, "g-a"),
-      groupFor("Article B", subjectB, "g-b"),
-      groupFor("Article C", subjectC, "g-c"),
-      groupFor("Article D", subjectD, "g-d"),
+    snapshot_id: "99999999-9999-4999-8999-999999999999",
+    items: [
+      itemFor("Article A", subjectA),
+      itemFor("Article B", subjectB),
+      itemFor("Article C", subjectC),
+      itemFor("Article D", subjectD),
     ],
-    selected_articles: 4,
-    ignored: 0,
-    undecided: 0,
-    automatic_selection: false,
-  };
+  });
 
   const edition = () => ({
     id: editionId,
@@ -115,53 +105,49 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
 
   await page.route("/api/**", async (route) => {
     const request = route.request();
-    const url = new URL(request.url());
-    const path = url.pathname;
-
-    if (path === `/api/editions/${editionId}`) {
-      await route.fulfill({ json: edition() });
-      return;
-    }
-    if (path === `/api/editions/${editionId}/editorial-groups`) {
-      await route.fulfill({ json: board });
-      return;
-    }
+    const path = new URL(request.url()).pathname;
+    if (path === `/api/editions/${editionId}`)
+      return route.fulfill({ json: edition() });
+    if (path === `/api/editions/${editionId}/selection`)
+      return route.fulfill({ json: selection });
     if (
       path === `/api/editions/${editionId}/production` &&
       request.method() === "POST"
     ) {
       productionPostBody = request.postDataJSON();
-      await route.fulfill({ status: 202, json: batchStatus() });
-      return;
+      batchStarted = true;
+      return route.fulfill({ status: 202, json: batchStatus() });
     }
-    if (path === `/api/editions/${editionId}/production`) {
-      await route.fulfill({ json: batchStatus() });
-      return;
-    }
-    await route.fulfill({ status: 404, json: {} });
+    if (path === `/api/editions/${editionId}/production`)
+      return batchStarted
+        ? route.fulfill({ json: batchStatus() })
+        : route.fulfill({ status: 404, json: {} });
+    return route.fulfill({ status: 404, json: {} });
   });
 
-  await page.goto(`/editions/${editionId}/selection`);
-  await expect(
-    page.getByRole("heading", { name: "4 sujets éligibles" }),
-  ).toBeVisible();
-  await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
+  await page.goto(`/editions/${editionId}/production`);
 
-  await page.getByRole("checkbox", { name: "Article B" }).check();
-  await page.getByRole("checkbox", { name: "Article D" }).check();
-  await expect(page.getByText("2 sélectionnés pour ce lot")).toBeVisible();
+  // The next-batch selector lives on /production, never on /selection.
+  const selector = page.getByRole("region", {
+    name: "Sélecteur du lot de production",
+  });
+  await expect(selector).toBeVisible();
+  await expect(selector.getByRole("checkbox")).toHaveCount(4);
+
+  await selector.getByRole("checkbox", { name: "Article B" }).check();
+  await selector.getByRole("checkbox", { name: "Article D" }).check();
   await expect(
-    page.getByRole("checkbox", { name: "Article A" }),
+    selector.getByRole("checkbox", { name: "Article A" }),
   ).not.toBeChecked();
   await expect(
-    page.getByRole("checkbox", { name: "Article C" }),
+    selector.getByRole("checkbox", { name: "Article C" }),
   ).not.toBeChecked();
 
   await page
-    .getByRole("button", { name: "Lancer la production de 2 sujets" })
+    .getByRole("button", { name: "Démarrer le lot de production" })
     .click();
-
   await expect(page).toHaveURL(`/editions/${editionId}/production`);
+  // Canonical board order, not click order.
   await expect
     .poll(() => productionPostBody)
     .toEqual({ subject_ids: [subjectB, subjectD] });
@@ -169,8 +155,9 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   await expect(
     page.getByRole("heading", { name: "0 / 2 sujets traités" }),
   ).toBeVisible();
-  await expect(page.getByText("Article B")).toBeVisible();
-  await expect(page.getByText("Article D")).toBeVisible();
-  await expect(page.getByText("Article A")).toHaveCount(0);
-  await expect(page.getByText("Article C")).toHaveCount(0);
+  const tracked = page.getByRole("list", { name: "Suivi des articles" });
+  await expect(tracked).toContainText("Article B");
+  await expect(tracked).toContainText("Article D");
+  await expect(tracked).not.toContainText("Article A");
+  await expect(tracked).not.toContainText("Article C");
 });

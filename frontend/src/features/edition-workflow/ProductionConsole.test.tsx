@@ -436,7 +436,9 @@ describe("ProductionConsole", () => {
       expect(invalidate).toHaveBeenCalledWith({
         queryKey: ["edition-review", EDITION_ID],
       });
-      expect(invalidate).toHaveBeenCalledWith({
+      // Cancelling a production batch does not alter Selection: the obsolete
+      // editorial board invalidation must stay gone (AW-008 S08).
+      expect(invalidate).not.toHaveBeenCalledWith({
         queryKey: ["editorial-board", EDITION_ID],
       });
       const cached = client.getQueryData<Edition>(["edition", EDITION_ID]);

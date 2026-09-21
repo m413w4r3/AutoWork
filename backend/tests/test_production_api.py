@@ -64,6 +64,7 @@ from cti_app.domain.production import (
     SubjectProductionStage,
     SubjectProductionStatus,
 )
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
 
@@ -97,9 +98,45 @@ def _group(edition_id: UUID, title: str, subject_id: UUID) -> EditorialGroup:
     return group
 
 
+def _origin(edition_id: UUID, subject_id: UUID) -> SubjectDiscoveryOrigin:
+    return SubjectDiscoveryOrigin(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        discovery_subject_id=uuid4(),
+        selection_decision_id=uuid4(),
+        selected_snapshot_id=uuid4(),
+        selected_snapshot_version=1,
+    )
+
+
+class _Origins:
+    def __init__(self) -> None:
+        self.items: list[SubjectDiscoveryOrigin] = []
+
+    def ensure_for_group(self, group: EditorialGroup) -> None:
+        if group.subject_id is not None and not any(
+            origin.subject_id == group.subject_id for origin in self.items
+        ):
+            self.items.append(_origin(group.edition_id, group.subject_id))
+
+    async def add(self, origin: SubjectDiscoveryOrigin) -> None:
+        self.items.append(origin)
+
+    async def get_by_subject(self, subject_id: UUID) -> SubjectDiscoveryOrigin | None:
+        return next((origin for origin in self.items if origin.subject_id == subject_id), None)
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectDiscoveryOrigin]:
+        return [origin for origin in self.items if origin.edition_id == edition_id]
+
+
 class _Groups:
-    def __init__(self, groups: list[EditorialGroup], subjects: _Subjects) -> None:
-        self._groups = _GroupList(groups, subjects)
+    def __init__(
+        self,
+        groups: list[EditorialGroup],
+        subjects: _Subjects,
+        origins: _Origins,
+    ) -> None:
+        self._groups = _GroupList(groups, subjects, origins)
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[EditorialGroup]:
         return [g for g in self._groups if g.edition_id == edition_id]
@@ -128,15 +165,23 @@ class _Subjects:
 
 
 class _GroupList(list[EditorialGroup]):
-    def __init__(self, groups: list[EditorialGroup], subjects: _Subjects) -> None:
+    def __init__(
+        self,
+        groups: list[EditorialGroup],
+        subjects: _Subjects,
+        origins: _Origins,
+    ) -> None:
         super().__init__(groups)
         self._subjects = subjects
+        self._origins = origins
         for group in groups:
             subjects.add_for_group(group)
+            origins.ensure_for_group(group)
 
     def append(self, group: EditorialGroup) -> None:
         super().append(group)
         self._subjects.add_for_group(group)
+        self._origins.ensure_for_group(group)
 
     def extend(self, groups: Iterable[EditorialGroup]) -> None:
         for group in groups:
@@ -458,7 +503,8 @@ class _Uow:
 
     def __init__(self, groups: list[EditorialGroup]) -> None:
         self.subjects = _Subjects()
-        self.editorial_groups = _Groups(groups, self.subjects)
+        self.subject_discovery_origins = _Origins()
+        self.editorial_groups = _Groups(groups, self.subjects, self.subject_discovery_origins)
         self.editions = _Editions()
         self.discovery_batches = _DiscoveryBatches(self.editorial_groups._groups)
         self.subject_production_runs = _Runs()
@@ -558,6 +604,15 @@ class _FailingModel:
         raise AssertionError(f"model must not be called during state import: {name}")
 
 
+class _LegacyEditorialProjection:
+    def __init__(self) -> None:
+        self.editions: list[UUID] = []
+
+    async def synchronize(self, edition_id: UUID) -> list[EditorialGroup]:
+        self.editions.append(edition_id)
+        return []
+
+
 class _Bridge404:
     async def retrieve(self, response_id: str) -> dict[str, Any]:
         del response_id
@@ -623,6 +678,7 @@ def production_app(uow: _Uow) -> FastAPI:
     application.state.production_artifact_store = _ArtifactStore()
     application.state.model_service = _FailingModel()
     application.state.model_gateway = _FailingModel()
+    application.state.legacy_editorial_projection_service = _LegacyEditorialProjection()
     return application
 
 
@@ -733,6 +789,9 @@ async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uo
     uow.editorial_groups._groups.append(_group(group_edition_id, "TAG-182", subject_id))
     uow.subjects.items[subject_id] = dataclasses.replace(
         uow.subjects.items[subject_id], edition_id=subject_edition_id
+    )
+    uow.subject_discovery_origins.items[0] = dataclasses.replace(
+        uow.subject_discovery_origins.items[0], edition_id=subject_edition_id
     )
     uow.discovery_batches.groups = [
         SimpleNamespace(
@@ -885,7 +944,7 @@ async def test_standalone_cancellation_exposes_archived_conflict_without_mutatio
     assert len(production_app.state.job_service.submitted) == 1
 
 
-async def test_start_subject_production_rejects_non_selected_subject(
+async def test_start_subject_production_ignores_legacy_group_status(
     api: AsyncClient, uow: _Uow
 ) -> None:
     edition_id = uuid4()
@@ -896,14 +955,18 @@ async def test_start_subject_production_rejects_non_selected_subject(
 
     response = await api.post(f"/api/subjects/{subject_id}/production", json={})
 
-    assert response.status_code == 409
+    assert response.status_code == 200, response.text
 
 
-async def test_start_edition_produces_every_selected_article(api: AsyncClient, uow: _Uow) -> None:
+async def test_start_edition_uses_subject_origins_for_eligibility(
+    api: AsyncClient, uow: _Uow
+) -> None:
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        group = _group(edition_id, name, subject_id)
+        group.status = EditorialGroupStatus.PROPOSED
+        uow.editorial_groups._groups.append(group)
 
     response = await api.post(f"/api/editions/{edition_id}/production", json={})
 
@@ -912,6 +975,20 @@ async def test_start_edition_produces_every_selected_article(api: AsyncClient, u
     edition = await uow.editions.get(edition_id)
     assert edition.state is EditionStatus.OPEN
     assert edition.version == 1
+
+
+async def test_selected_legacy_group_without_origin_is_not_eligible(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Legacy only", subject_id))
+    uow.subject_discovery_origins.items.clear()
+
+    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "No selected Subjects found for edition"
 
 
 async def test_start_edition_rejects_an_archived_edition(api: AsyncClient, uow: _Uow) -> None:
@@ -935,6 +1012,11 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
         uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+    uow.subject_discovery_origins.items[:] = [
+        uow.subject_discovery_origins.items[2],
+        uow.subject_discovery_origins.items[0],
+        uow.subject_discovery_origins.items[1],
+    ]
 
     response = await api.post(
         f"/api/editions/{edition_id}/production",
@@ -944,8 +1026,11 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 2
 
-    produced = {item.subject_id for item in uow.edition_production_batch_items.items}
-    assert produced == {subjects[0], subjects[2]}
+    produced = [
+        item.subject_id
+        for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
+    ]
+    assert produced == [subjects[2], subjects[0]]
 
 
 async def test_start_edition_rejects_explicit_empty_subject_selection(
@@ -963,6 +1048,18 @@ async def test_start_edition_rejects_explicit_empty_subject_selection(
     assert response.status_code == 400
     assert not uow.edition_production_batches.items
     assert (await uow.editions.get(edition_id)).state is EditionStatus.OPEN
+
+
+async def test_start_subject_requires_subject_discovery_origin(api: AsyncClient, uow: _Uow) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    uow.editorial_groups._groups.append(_group(edition_id, "Legacy only", subject_id))
+    uow.subject_discovery_origins.items.clear()
+
+    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Subject has no discovery origin"
 
 
 async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chosen_subset(
@@ -1490,6 +1587,12 @@ async def test_production_state_export_import_is_transparent(
     imported_edition_id = uuid4()
     uow.subjects.items[imported_subject] = dataclasses.replace(
         uow.subjects.items[imported_subject], edition_id=imported_edition_id
+    )
+    imported_origin = await uow.subject_discovery_origins.get_by_subject(imported_subject)
+    assert imported_origin is not None
+    imported_origin_index = uow.subject_discovery_origins.items.index(imported_origin)
+    uow.subject_discovery_origins.items[imported_origin_index] = dataclasses.replace(
+        imported_origin, edition_id=imported_edition_id
     )
     uow.discovery_batches.groups = [
         SimpleNamespace(

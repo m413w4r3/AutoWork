@@ -6,6 +6,10 @@ Le domaine (`cti_app.domain`) ne dépend ni de SQLAlchemy ni de MinIO. Les ports
 
 PostgreSQL est la source canonique des identités, métadonnées, relations et événements. Aucun corps de document, binaire, archive ou contenu volumineux n'est stocké dans une colonne SQL.
 
+Dans cet inventaire, `selection_decisions` et `subject_discovery_origins` sont les tables
+canoniques PostgreSQL de la frontière Selection–Subject. `EditorialGroup` reste une projection de
+compatibilité dérivée AW-009.
+
 ## Tables
 
 | Table | Rôle | Invariants principaux |
@@ -22,11 +26,13 @@ PostgreSQL est la source canonique des identités, métadonnées, relations et �
 | `discovery_runs` | Vagues de recherche de découverte | rattachement immuable à l'édition, intention et configuration de la vague |
 | `discovery_batches` | Révisions parsées d'une vague, provenance et audit | rattachement au run et au `ModelRun`, rapport archivé, version de parseur et avertissements |
 | `discovery_candidates` | Identités fonctionnelles canoniques découvertes | UUID métier unique, provenance de batch, contenu sémantique non génériquement éditable, `supersedes_candidate_id` |
-| `editorial_groups` | Projection de compatibilité pour Selection | références de candidats par UUID, score explicable, rapprochement historique, version et état |
+| `selection_decisions` | Décisions canoniques `SELECT` ou `IGNORE` de Selection | acteur, `discovery_subject_id`, snapshot/version attendus, idempotency key, état append-only et provenance |
+| `subject_discovery_origins` | Origine canonique d’un `Subject` matérialisé par Selection | `subject_id`, `discovery_subject_id`, candidates du snapshot, snapshot/version, provenance et unicité d’origine |
+| `editorial_groups` | Projection de compatibilité dérivée, legacy AW-009 uniquement | reconstructible depuis `SubjectDiscoveryOrigin`, snapshot actif, `DiscoveryCandidate` et `Subject`; aucune décision de Selection |
 | `discovery_snapshots` | État versionné de la fusion (`DiscoverySnapshot`) | `version`, parent, sujets de découverte et membres par `candidate_id` ; `intake_id` nul pour une fusion/séparation humaine |
 | `discovery_merge_runs` | Trace auditable de chaque proposition ou décision de fusion (`DiscoveryMergeRun`) | planner, snapshot parent, plan, correspondance interne handle ↔ UUID, statut de revue ; `intake_id` nul pour une opération structurelle humaine |
 | `subject_contributions` | Apport d'une candidate à un sujet de découverte | unique par `candidate_id` (FK `discovery_candidates`) ; append-only |
-| `human_decisions` | Décisions de sélection et de rejet | acteur, corrélation et payload ; append-only |
+| `human_decisions` | Décisions humaines historiques hors de l’état canonique AW-008 | acteur, corrélation et payload ; append-only |
 
 Il n'existe aucune table `fusion_groups` ni `candidate_groups` : un groupe de Fusion est un
 sujet d'un `DiscoverySnapshot` et ses membres sont toujours référencés par l'UUID métier du
@@ -65,11 +71,14 @@ historique via `discovery_candidates.supersedes_candidate_id` ; le candidat hist
 jamais modifié et reste lisible avec `include_replaced`. L'activité d'un candidat reste dérivée
 de ces relations : `discovery_candidates` ne porte aucune colonne de statut.
 
-`CandidateTopic`, `DiscoverySnapshot` et `CandidateReference` peuvent servir de structures de
-parsing, de cumul ou de Selection, mais ne sont pas des magasins canoniques concurrents. Les
+`CandidateTopic`, `CandidateReference` et `EditorialGroup` peuvent servir de structures de
+parsing, de cumul ou de compatibilité legacy, mais ne sont pas des magasins canoniques
+concurrents. Les
 annotations de vérification des sources peuvent évoluer ; la provenance sémantique et le contenu
 d'un candidat ne sont pas modifiables génériquement. La fusion en `DiscoverySubject` appartient à
-AW-007 et la matérialisation/sélection de `Subject` à AW-008.
+AW-007 et la matérialisation/sélection atomique de `Subject` à AW-008. Fusion décide la structure ;
+Selection décide s’il faut matérialiser un `Subject` ; `Subject` est stable ; Production décide
+quand produire ce `Subject`.
 
 `source_documents` et `samples` conservent séparément : nom d'origine, origine, date d'acquisition, licence ou restriction, TLP, `do_not_submit` et `external_llm_allowed`. Partager les mêmes octets ne leur donne donc jamais la même sémantique.
 

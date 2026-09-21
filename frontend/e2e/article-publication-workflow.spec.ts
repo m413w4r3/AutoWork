@@ -1,5 +1,11 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Sujet : sélection, production, revue et publication DOCX", async ({
   page,
 }) => {
@@ -10,7 +16,10 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   const artifactId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
   const manifestId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const hash = "a".repeat(64);
+  const discoverySubjectId = "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a";
   let batchReads = 0;
+  let batchStarted = false;
+  let selectionConfirmed = false;
   let publicationAccepted = false;
   let releasePublished = false;
   let releaseReads = 0;
@@ -30,40 +39,27 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     updated_at: "2026-08-29T00:00:00Z",
   });
 
-  const board = {
-    groups: [
-      {
-        id: "11111111-1111-4111-8111-111111111111",
-        edition_id: editionId,
-        title: "Campagne Iranian Proxy",
-        outcome: "new_subject",
-        status: "selected",
-        subject_id: subjectId,
-        candidates: [],
-        score: {
-          impact: 3,
-          novelty: 3,
-          technical_depth: 4,
-          hunting_potential: 3,
-          actionability: 3,
-          source_quality: 3,
-          total: 19,
-          justifications: {},
-        },
-        source_relationship_status: "verified",
-        needs_source_verification: false,
-        needs_source_expansion: false,
-        grouping_confidence: "high",
-        grouping_justification: "Sélection canonique.",
-        historical_comparison: null,
-        version: 2,
-      },
-    ],
-    selected_articles: 1,
-    ignored: 0,
-    undecided: 0,
-    automatic_selection: false,
-  };
+  const selectionBoard = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: "88888888-8888-4888-8888-888888888888",
+      items: [
+        selectionWireItem({
+          discovery_subject_id: discoverySubjectId,
+          title: "Campagne Iranian Proxy",
+          summary: "Présentation neutre de la campagne.",
+          actor_or_campaign: "Iranian Proxy",
+          effective_state: selectionConfirmed ? "selected" : "undecided",
+          subject_id: selectionConfirmed ? subjectId : null,
+          last_decision: selectionConfirmed
+            ? selectionWireLastDecision({
+                id: "decision-1",
+                subject_id: subjectId,
+              })
+            : null,
+        }),
+      ],
+    });
 
   const batch = {
     batch_id: batchId,
@@ -160,18 +156,31 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       await route.fulfill({ json: edition() });
       return;
     }
-    if (path === `/api/editions/${editionId}/editorial-groups`) {
-      await route.fulfill({ json: board });
+    if (
+      path === `/api/editions/${editionId}/selection/decisions` &&
+      request.method() === "POST"
+    ) {
+      selectionConfirmed = true;
+      await route.fulfill({ json: selectionBoard() });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/selection`) {
+      await route.fulfill({ json: selectionBoard() });
       return;
     }
     if (
       path === `/api/editions/${editionId}/production` &&
       request.method() === "POST"
     ) {
+      batchStarted = true;
       await route.fulfill({ status: 202, json: runningBatch });
       return;
     }
     if (path === `/api/editions/${editionId}/production`) {
+      if (!batchStarted) {
+        await route.fulfill({ status: 404, json: {} });
+        return;
+      }
       batchReads += 1;
       await route.fulfill({ json: batchReads === 1 ? runningBatch : batch });
       return;
@@ -247,14 +256,33 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     await route.fulfill({ status: 404, json: {} });
   });
 
+  // 1. Selection materializes the Subject.
   await page.goto(`/editions/${editionId}/selection`);
-  await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
-  await page.getByRole("checkbox", { name: "Campagne Iranian Proxy" }).check();
-  await expect(
-    page.getByRole("button", { name: "Lancer la production de 1 sujet" }),
-  ).toBeEnabled();
+  const card = page.getByRole("article").filter({
+    has: page.getByRole("heading", {
+      name: "Campagne Iranian Proxy",
+      exact: true,
+    }),
+  });
+  await card.getByRole("button", { name: "Traiter", exact: true }).click();
   await page
-    .getByRole("button", { name: "Lancer la production de 1 sujet" })
+    .getByRole("button", { name: "Confirmer les décisions (1)" })
+    .click();
+  await expect(card.getByRole("link", { name: "Sujet créé" })).toHaveAttribute(
+    "href",
+    `/subjects/${subjectId}`,
+  );
+
+  // 2. The next-batch choice lives on /production, never on /selection.
+  await page.goto(`/editions/${editionId}/production`);
+  const selector = page.getByRole("region", {
+    name: "Sélecteur du lot de production",
+  });
+  await selector
+    .getByRole("checkbox", { name: "Campagne Iranian Proxy" })
+    .check();
+  await page
+    .getByRole("button", { name: "Démarrer le lot de production" })
     .click();
 
   await expect(page).toHaveURL(`/editions/${editionId}/production`);

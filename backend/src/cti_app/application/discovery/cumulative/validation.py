@@ -115,15 +115,15 @@ def apply_editorial_duplicate_guard(
     handles: ResolvedMergeHandles,
     parent_snapshot: DiscoverySnapshot | None,
     *,
-    editorial_subject_ids: set[UUID],
+    materialized_subject_ids: set[UUID],
 ) -> tuple[DiscoveryMergePlanV1, tuple[str, ...]]:
     guarded = plan.model_copy(deep=True)
-    if parent_snapshot is None or not editorial_subject_ids:
+    if parent_snapshot is None or not materialized_subject_ids:
         return guarded, ()
-    editorial_subjects = [
+    materialized_subjects = [
         subject
         for subject in parent_snapshot.subjects
-        if subject.subject_id in editorial_subject_ids
+        if subject.subject_id in materialized_subject_ids
     ]
     warnings: list[str] = []
     for group_index, group in enumerate(guarded.groups):
@@ -134,7 +134,7 @@ def apply_editorial_duplicate_guard(
         ]
         duplicates = {
             subject.subject_id
-            for subject in editorial_subjects
+            for subject in materialized_subjects
             if any(
                 _shares_strict_identity_key(subject.candidate, candidate) for candidate in incoming
             )

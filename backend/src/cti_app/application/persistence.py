@@ -80,6 +80,11 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
+from cti_app.domain.selection import (
+    SelectionDecision,
+    SelectionIdempotencyRecord,
+    SubjectDiscoveryOrigin,
+)
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 
@@ -263,6 +268,32 @@ class SubjectRepository(Protocol):
     async def list_for_edition(self, edition_id: UUID) -> Sequence[Subject]: ...
 
     async def update(self, subject: Subject, *, expected_version: int) -> bool: ...
+
+
+class SelectionDecisionRepository(Protocol):
+    async def append(self, decision: SelectionDecision) -> None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SelectionDecision]: ...
+
+    async def get_by_idempotency_key(
+        self, edition_id: UUID, discovery_subject_id: UUID, idempotency_key: str
+    ) -> SelectionDecision | None: ...
+
+
+class SelectionIdempotencyRepository(Protocol):
+    async def get_for_update(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> SelectionIdempotencyRecord | None: ...
+
+    async def add(self, record: SelectionIdempotencyRecord) -> None: ...
+
+
+class SubjectDiscoveryOriginRepository(Protocol):
+    async def add(self, origin: SubjectDiscoveryOrigin) -> None: ...
+
+    async def get_by_subject(self, subject_id: UUID) -> SubjectDiscoveryOrigin | None: ...
+
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectDiscoveryOrigin]: ...
 
 
 class SourceDocumentRepository(Protocol):
@@ -510,6 +541,8 @@ class DiscoverySubjectIdentityRepository(Protocol):
 
     async def get(self, subject_id: UUID) -> DiscoverySubjectIdentity | None: ...
 
+    async def get_for_update(self, subject_id: UUID) -> DiscoverySubjectIdentity | None: ...
+
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoverySubjectIdentity]: ...
 
     async def resolve_canonical_subject(self, subject_id: UUID) -> UUID: ...
@@ -652,6 +685,9 @@ class UnitOfWork(Protocol):
     code_feature_sets: CodeFeatureSetRepository
     invariants: InvariantRepository
     subjects: SubjectRepository
+    selection_decisions: SelectionDecisionRepository
+    selection_idempotency: SelectionIdempotencyRepository
+    subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
     sample_feature_sets: SampleFeatureSetRepository

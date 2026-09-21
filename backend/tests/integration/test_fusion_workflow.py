@@ -1,7 +1,7 @@
 import hashlib
 from collections.abc import Callable
 from datetime import date
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -14,6 +14,7 @@ from cti_app.application.discovery.cumulative.types import (
 )
 from cti_app.application.discovery.fusion import (
     FusionReviewDecision,
+    FusionSelectedSubjectConflictError,
     FusionService,
     FusionSnapshotStaleError,
 )
@@ -38,7 +39,13 @@ from cti_app.domain.discovery_cumulative import (
     MergeValidationStatus,
 )
 from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.entities import Subject
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.selection import (
+    SelectionAction,
+    SelectionDecision,
+    SubjectDiscoveryOrigin,
+)
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from tests.discovery_support import (
@@ -47,6 +54,40 @@ from tests.discovery_support import (
 )
 
 pytestmark = pytest.mark.integration
+
+
+async def _add_selected_origin(uow_factory, edition, snapshot, discovery_subject_id):
+    subject = Subject(
+        edition_id=edition.id,
+        title="Selected subject",
+        slug=f"selected-{uuid4().hex}",
+        tlp=edition.tlp,
+    )
+    decision = SelectionDecision(
+        edition_id=edition.id,
+        discovery_subject_id=discovery_subject_id,
+        snapshot_id=snapshot.id,
+        snapshot_version=snapshot.version,
+        action=SelectionAction.SELECT,
+        subject_id=subject.id,
+        actor_id="analyst",
+        correlation_id=str(uuid4()),
+        idempotency_key=str(uuid4()),
+    )
+    origin = SubjectDiscoveryOrigin(
+        subject_id=subject.id,
+        edition_id=edition.id,
+        discovery_subject_id=discovery_subject_id,
+        selection_decision_id=decision.id,
+        selected_snapshot_id=snapshot.id,
+        selected_snapshot_version=snapshot.version,
+    )
+    async with uow_factory() as uow:
+        await uow.subjects.add(subject)
+        await uow.selection_decisions.append(decision)
+        await uow.subject_discovery_origins.add(origin)
+        await uow.commit()
+    return subject, origin
 
 
 class ApplyPlanner:
@@ -268,6 +309,111 @@ async def test_fusion_stale_version_is_non_mutating(
         await engine.dispose()
 
 
+async def test_selected_subject_conflict_leaves_active_snapshot_unchanged(
+    migrated_postgres_url: str,
+) -> None:
+    engine, uow_factory = _database(migrated_postgres_url)
+    edition = _edition("Selected Conflict Fusion Iran", "FK")
+    model_run = _model_run("conflict")
+    try:
+        await _persist_edition_and_run(uow_factory, edition, model_run)
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        first = _batch(edition.id, model_run.id, discovery_run.id, local_ref="C1")
+        second = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Second selected subject",
+            url="https://vendor.example/selected-2",
+            local_ref="C2",
+            request_hash="c" * 64,
+        )
+        await _persist_batches(uow_factory, first, second)
+        cumulative = CumulativeDiscoveryService(uow_factory, planner=ApplyPlanner())
+        await cumulative.reconcile_batch(
+            first, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+        _, snapshot = await cumulative.reconcile_batch(
+            second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+        subject_ids = tuple(subject.subject_id for subject in snapshot.subjects)
+        await _add_selected_origin(uow_factory, edition, snapshot, subject_ids[0])
+        await _add_selected_origin(uow_factory, edition, snapshot, subject_ids[1])
+        before = await _active_snapshot(uow_factory, edition.id)
+        runs_before = await _merge_runs(uow_factory, edition.id)
+
+        with pytest.raises(FusionSelectedSubjectConflictError):
+            await FusionService(uow_factory).merge(
+                edition.id,
+                snapshot_version=snapshot.version,
+                discovery_subject_ids=subject_ids,
+                actor_id="analyst",
+            )
+
+        after = await _active_snapshot(uow_factory, edition.id)
+        assert before is not None and after is not None
+        assert (after.id, after.version) == (before.id, before.version)
+        assert await _merge_runs(uow_factory, edition.id) == runs_before
+    finally:
+        await engine.dispose()
+
+
+async def test_selected_and_undecided_merge_resolves_to_existing_subject(
+    migrated_postgres_url: str,
+) -> None:
+    engine, uow_factory = _database(migrated_postgres_url)
+    edition = _edition("Selected Existing Fusion Iran", "FE")
+    model_run = _model_run("existing")
+    try:
+        await _persist_edition_and_run(uow_factory, edition, model_run)
+        discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+        first = _batch(edition.id, model_run.id, discovery_run.id, local_ref="C1")
+        second = _batch(
+            edition.id,
+            model_run.id,
+            discovery_run.id,
+            title="Undecided subject",
+            url="https://vendor.example/undecided",
+            local_ref="C2",
+            request_hash="e" * 64,
+        )
+        await _persist_batches(uow_factory, first, second)
+        cumulative = CumulativeDiscoveryService(uow_factory, planner=ApplyPlanner())
+        _, first_snapshot = await cumulative.reconcile_batch(
+            first, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+        _, snapshot = await cumulative.reconcile_batch(
+            second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
+        )
+        first_identity = first_snapshot.subjects[0].subject_id
+        second_identity = next(
+            subject.subject_id
+            for subject in snapshot.subjects
+            if subject.subject_id != first_identity
+        )
+        selected_subject, origin = await _add_selected_origin(
+            uow_factory, edition, snapshot, first_identity
+        )
+
+        merged = await FusionService(uow_factory).merge(
+            edition.id,
+            snapshot_version=snapshot.version,
+            discovery_subject_ids=(first_identity, second_identity),
+            actor_id="analyst",
+        )
+
+        async with uow_factory() as uow:
+            assert (
+                await uow.discovery_subject_identities.resolve_canonical_subject(second_identity)
+            ) == first_identity
+            origins = await uow.subject_discovery_origins.list_for_edition(edition.id)
+        assert merged.group_count == 1
+        assert origins == [origin]
+        assert origins[0].subject_id == selected_subject.id
+    finally:
+        await engine.dispose()
+
+
 async def test_manual_replacement_keeps_history_and_only_new_candidate_active(
     migrated_postgres_url: str,
 ) -> None:
@@ -344,9 +490,13 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         _, second_snapshot = await cumulative.reconcile_batch(
             second, input_mode=DiscoveryInputMode.BRIDGE_RESEARCH, actor_id="analyst"
         )
-        candidate_ids = [
-            candidate.id for candidate in await _candidates_for_edition(uow_factory, edition.id)
-        ]
+        first_candidate = await _candidate_for_batch(uow_factory, first.id)
+        second_candidate = await _candidate_for_batch(uow_factory, second.id)
+        candidate_ids = [first_candidate.id, second_candidate.id]
+        first_identity = first_snapshot.subjects[0].subject_id
+        selected_subject, origin = await _add_selected_origin(
+            uow_factory, edition, second_snapshot, first_identity
+        )
         fusion = FusionService(uow_factory)
         merged = await fusion.merge(
             edition.id,
@@ -371,7 +521,7 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
             edition.id,
             snapshot_version=merged.snapshot_version or 0,
             discovery_subject_id=merged.groups[0].discovery_subject_id,
-            candidate_ids=(candidate_ids[0],),
+            candidate_ids=(candidate_ids[1],),
             actor_id="analyst",
         )
         assert split.snapshot_version == merged.snapshot_version + 1
@@ -390,9 +540,18 @@ async def test_manual_merge_and_split_are_versioned_and_non_destructive(
         async with uow_factory() as uow:
             historical_merge = await uow.discovery_snapshots.get(merged_snapshot.id)
             runs = await uow.discovery_merge_runs.list_for_edition(edition.id)
+            origins = await uow.subject_discovery_origins.list_for_edition(edition.id)
+            identities = await uow.discovery_subject_identities.list_for_edition(edition.id)
         assert historical_merge is not None
         assert len(runs) >= 2
         assert first_snapshot.id != split.snapshot_id
+        split_identity = next(
+            identity for identity in identities if identity.origin_key.startswith("split:")
+        )
+        assert origins == [origin]
+        assert origins[0].subject_id == selected_subject.id
+        assert origins[0].discovery_subject_id == first_identity
+        assert origins[0].discovery_subject_id != split_identity.id
     finally:
         await engine.dispose()
 

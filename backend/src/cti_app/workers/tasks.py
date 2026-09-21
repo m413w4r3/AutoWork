@@ -28,7 +28,6 @@ from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
 )
-from cti_app.application.editorial import EditorialGroupingService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -181,7 +180,6 @@ async def _execute_job(job_id: UUID) -> int | None:
         )
         production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
         model_gateway = create_model_gateway(settings, uow_factory)
-        editorial_service = EditorialGroupingService(uow_factory)
         # Exactly one bridge capabilities provider for this worker execution
         # context; it also doubles as the ConversationSessionCloser that
         # closes the exact live Temporary Chat browser session.
@@ -192,7 +190,6 @@ async def _execute_job(job_id: UUID) -> int | None:
                 model_gateway,
                 bridge_capabilities_provider=bridge_provider,
             ),
-            after_activation=editorial_service.synchronize,
             diagnostics=production_diagnostics,
         )
         job_service: JobService

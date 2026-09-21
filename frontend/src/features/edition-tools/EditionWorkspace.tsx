@@ -1,23 +1,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 
-import { fetchEditorialBoard } from "../../api/editorial";
-import type { Edition } from "../../api/editions";
 import { startEditionProduction } from "../../api/production";
-import { EditorialBoard } from "../../components/EditorialBoard";
+import { fetchSelectionBoard } from "../../api/selection";
+import type { Edition } from "../../api/editions";
 import { navigate } from "../../routing";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { EditionDashboard } from "../edition-dashboard/EditionDashboard";
 import { ProductionBatchSelector } from "../edition-workflow/ProductionBatchSelector";
+import { ProductionConsole } from "../edition-workflow/ProductionConsole";
 import {
   isEligibleSubject,
   orderedSelection,
   pruneToEligible,
 } from "../edition-workflow/productionBatchSelection";
-import { ProductionConsole } from "../edition-workflow/ProductionConsole";
 import { PublicationConsole } from "../edition-workflow/PublicationConsole";
 import { ReviewConsole } from "../edition-workflow/ReviewConsole";
 import { FusionBoard } from "../fusion/FusionBoard";
+import { SelectionBoard } from "../selection/SelectionBoard";
 
 export type EditionTool =
   | "discovery"
@@ -90,100 +90,98 @@ function SelectionTool({
   edition: Edition;
   readOnly: boolean;
 }) {
+  return <SelectionBoard editionId={edition.id} readOnly={readOnly} />;
+}
+
+function ProductionTool({
+  edition,
+  readOnly,
+}: {
+  edition: Edition;
+  readOnly: boolean;
+}) {
   const queryClient = useQueryClient();
-  const board = useQuery({
-    queryKey: ["editorial-board", edition.id],
-    queryFn: () => fetchEditorialBoard(edition.id),
-    enabled: !readOnly,
-  });
-  const [selected, setSelected] = useState<ReadonlySet<string>>(
+  const [selectedSubjectIds, setSelectedSubjectIds] = useState<Set<string>>(
     () => new Set(),
   );
-
-  const eligibleGroups = useMemo(
-    () => board.data?.groups.filter(isEligibleSubject) ?? [],
+  const board = useQuery({
+    queryKey: ["selection-board", edition.id],
+    queryFn: () => fetchSelectionBoard(edition.id),
+    refetchInterval: false,
+  });
+  const subjects = useMemo(
+    () => board.data?.items.filter(isEligibleSubject) ?? [],
     [board.data],
   );
   const eligibleIds = useMemo(
-    () => new Set(eligibleGroups.map((group) => group.subject_id)),
-    [eligibleGroups],
+    () => new Set(subjects.map((subject) => subject.subject_id)),
+    [subjects],
   );
 
   useEffect(() => {
-    setSelected((current) => {
-      const next = pruneToEligible(current, eligibleIds);
-      return next.size === current.size ? current : next;
-    });
+    setSelectedSubjectIds((selected) => pruneToEligible(selected, eligibleIds));
   }, [eligibleIds]);
 
-  const selectedSubjectIds = useMemo(
-    () => orderedSelection(eligibleGroups, selected),
-    [eligibleGroups, selected],
-  );
-
   const start = useMutation({
-    mutationFn: () => startEditionProduction(edition.id, selectedSubjectIds),
+    mutationFn: () =>
+      startEditionProduction(
+        edition.id,
+        orderedSelection(subjects, selectedSubjectIds),
+      ),
     onSuccess: (batch) => {
+      setSelectedSubjectIds(new Set());
       queryClient.setQueryData(["batch", edition.id], batch);
-      void queryClient.invalidateQueries({ queryKey: ["batch", edition.id] });
-      void queryClient.invalidateQueries({ queryKey: ["edition", edition.id] });
-      navigate(`/editions/${edition.id}/production`);
     },
   });
 
-  const eligibleCount = eligibleGroups.length;
-  const selectedCount = selectedSubjectIds.length;
-
   return (
     <>
-      <EditorialBoard editionId={edition.id} readOnly={readOnly} />
-      {!readOnly ? (
+      {!readOnly && board.isPending ? (
+        <p role="status">Chargement des sujets sélectionnés…</p>
+      ) : null}
+      {!readOnly && board.isError ? (
+        <p className="error-message" role="alert">
+          La sélection est inaccessible.
+        </p>
+      ) : null}
+      {!readOnly && board.data ? (
         <>
           <ProductionBatchSelector
-            groups={eligibleGroups}
-            selected={selected}
+            subjects={subjects}
+            selected={selectedSubjectIds}
             onToggle={(subjectId, checked) =>
-              setSelected((current) => {
+              setSelectedSubjectIds((current) => {
                 const next = new Set(current);
                 if (checked) next.add(subjectId);
                 else next.delete(subjectId);
                 return next;
               })
             }
-            onSelectAll={() => setSelected(new Set(eligibleIds))}
-            onSelectNone={() => setSelected(new Set())}
+            onSelectAll={() =>
+              setSelectedSubjectIds(
+                new Set(subjects.map((subject) => subject.subject_id)),
+              )
+            }
+            onSelectNone={() => setSelectedSubjectIds(new Set())}
           />
-          <section
-            className="production-start-panel"
-            aria-labelledby="production-start-heading"
-          >
-            <p className="eyebrow">Production</p>
-            <h2 id="production-start-heading">
-              {eligibleCount} sujet{eligibleCount > 1 ? "s" : ""} éligible
-              {eligibleCount > 1 ? "s" : ""}
-            </h2>
-            <p className="production-batch-count" aria-live="polite">
-              {`${selectedCount} sélectionné${selectedCount > 1 ? "s" : ""} pour ce lot`}
+          {start.error ? (
+            <p className="error-message" role="alert">
+              {start.error instanceof Error
+                ? start.error.message
+                : "Le lot de production n’a pas pu être démarré."}
             </p>
-            {start.error ? (
-              <p className="error-message" role="alert">
-                Le lancement de la production a échoué : {String(start.error)}
-              </p>
-            ) : null}
-            <button
-              className="button"
-              disabled={start.isPending || selectedCount === 0}
-              onClick={() => start.mutate()}
-            >
-              {start.isPending
-                ? "Lancement…"
-                : selectedCount > 0
-                  ? `Lancer la production de ${selectedCount} sujet${selectedCount > 1 ? "s" : ""}`
-                  : "Sélectionnez au moins un sujet"}
-            </button>
-          </section>
+          ) : null}
+          <button
+            type="button"
+            className="button"
+            disabled={selectedSubjectIds.size === 0 || start.isPending}
+            onClick={() => start.mutate()}
+          >
+            {start.isPending ? "Démarrage…" : "Démarrer le lot de production"}
+          </button>
         </>
       ) : null}
+      <ProductionConsole editionId={edition.id} readOnly={readOnly} />
     </>
   );
 }
@@ -205,7 +203,7 @@ export function EditionToolSurface({
     case "selection":
       return <SelectionTool edition={edition} readOnly={readOnly} />;
     case "production":
-      return <ProductionConsole editionId={edition.id} readOnly={readOnly} />;
+      return <ProductionTool edition={edition} readOnly={readOnly} />;
     case "review":
       return <ReviewConsole editionId={edition.id} readOnly={readOnly} />;
     case "publication":

@@ -11,6 +11,7 @@ from cti_app.api.fusion import fusion_router
 from cti_app.application.discovery.fusion import (
     FusionBoard,
     FusionEditionArchivedError,
+    FusionSelectedSubjectConflictError,
     FusionSnapshotStaleError,
 )
 from cti_app.application.identity import LocalIdentityProvider
@@ -113,6 +114,11 @@ async def test_fusion_mutations_transmit_business_uuids_and_snapshot_version() -
     [
         (FusionSnapshotStaleError("stale"), 409, "fusion_snapshot_stale"),
         (FusionEditionArchivedError("Archived"), 409, "fusion_edition_archived"),
+        (
+            FusionSelectedSubjectConflictError("selected subjects conflict"),
+            409,
+            "fusion_selected_subject_conflict",
+        ),
         (ValueError("bad"), 422, "invalid_fusion_decision"),
         (LookupError("missing"), 404, "fusion_not_found"),
     ],

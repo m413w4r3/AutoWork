@@ -31,7 +31,10 @@ from cti_app.application.discovery.cumulative.merge_runs import (
     make_human_merge_run,
     make_structural_merge_run,
 )
-from cti_app.application.discovery.cumulative.types import ResolvedMergeHandles
+from cti_app.application.discovery.cumulative.types import (
+    AppliedDiscoveryMerge,
+    ResolvedMergeHandles,
+)
 from cti_app.application.discovery.cumulative.validation import (
     requires_review,
     validate_candidate_coverage,
@@ -69,6 +72,10 @@ class FusionSnapshotStaleError(RuntimeError):
 
 class FusionEditionArchivedError(ValueError):
     code = "fusion_edition_archived"
+
+
+class FusionSelectedSubjectConflictError(ValueError):
+    code = "fusion_selected_subject_conflict"
 
 
 @dataclass(frozen=True, slots=True)
@@ -304,6 +311,7 @@ class FusionService:
                         merge_run_id=human_run.id,
                         actor_id=actor_id,
                     )
+                    await self._ensure_selected_subjects_are_not_merged(uow, edition_id, applied)
                     await self._validate_activation(
                         uow, edition_id, run.intake_id, active_candidates, applied.snapshot
                     )
@@ -364,6 +372,7 @@ class FusionService:
                 merge_run_id=run.id,
                 actor_id=actor_id,
             )
+            await self._ensure_selected_subjects_are_not_merged(uow, edition_id, applied)
             await self._validate_activation(uow, edition_id, None, candidates, applied.snapshot)
             await uow.discovery_merge_runs.add_if_absent(run)
             await uow.discovery_subject_identities.add_many_if_absent(applied.identities)
@@ -513,6 +522,47 @@ class FusionService:
         current = snapshot.version if snapshot is not None else 0
         if current != version:
             raise FusionSnapshotStaleError("The active fusion snapshot is stale")
+
+    @staticmethod
+    async def _ensure_selected_subjects_are_not_merged(
+        uow: UnitOfWork,
+        edition_id: UUID,
+        applied: AppliedDiscoveryMerge,
+    ) -> None:
+        identities = list(await uow.discovery_subject_identities.list_for_edition(edition_id))
+        identities.extend(applied.identities)
+        identity_by_id = {identity.id: identity for identity in identities}
+        origins = await uow.subject_discovery_origins.list_for_edition(edition_id)
+
+        parent: dict[UUID, UUID] = {
+            identity.id: identity.merged_into_id
+            for identity in identities
+            if identity.merged_into_id is not None
+        }
+        parent.update(
+            {event.from_subject_id: event.into_subject_id for event in applied.merge_events}
+        )
+
+        def canonical(identity_id: UUID) -> UUID:
+            visited: set[UUID] = set()
+            current = identity_id
+            while current in parent:
+                if current in visited:
+                    raise RuntimeError("Cycle in discovery subject identity projection")
+                visited.add(current)
+                current = parent[current]
+            if current not in identity_by_id:
+                raise LookupError(f"Unknown discovery subject {current}")
+            return current
+
+        origins_by_canonical: dict[UUID, set[UUID]] = {}
+        for origin in origins:
+            canonical_id = canonical(origin.discovery_subject_id)
+            origins_by_canonical.setdefault(canonical_id, set()).add(origin.subject_id)
+        if any(len(subject_ids) > 1 for subject_ids in origins_by_canonical.values()):
+            raise FusionSelectedSubjectConflictError(
+                "A fusion operation cannot merge discovery subjects selected into distinct Subjects"
+            )
 
     @staticmethod
     def _validate_decisions(

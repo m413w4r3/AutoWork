@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, NoReturn, cast
 from uuid import UUID
@@ -83,7 +83,7 @@ from cti_app.application.subject_production import (
     SubjectProductionService,
 )
 from cti_app.domain.editions import EditionStatus
-from cti_app.domain.editorial import EditorialGroup, EditorialGroupStatus
+from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStage,
@@ -100,6 +100,7 @@ from cti_app.domain.production import (
     SubjectProductionStatus,
 )
 from cti_app.domain.publication import is_publication_ioc_artifact_type
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["production"])
@@ -115,7 +116,7 @@ class StartSubjectProductionRequest(BaseModel):
 class StartEditionProductionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # subject_ids omitted -> every selected article of the edition is produced.
+    # subject_ids omitted -> every selected Subject of the edition is produced.
     subject_ids: list[UUID] | None = None
 
 
@@ -312,20 +313,27 @@ def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispat
     )
 
 
-async def _selected_article_group(request: Request, subject_id: UUID) -> EditorialGroup:
+async def _selected_subject(
+    request: Request, subject_id: UUID
+) -> tuple[Subject, SubjectDiscoveryOrigin]:
     async with request.app.state.uow_factory() as uow:
-        group = cast(EditorialGroup | None, await uow.editorial_groups.get_by_subject(subject_id))
-        if group is None:
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No editorial group found for subject {subject_id}",
+                detail=f"No subject found for {subject_id}",
             )
-        if group.status != EditorialGroupStatus.SELECTED:
+        origin = await uow.subject_discovery_origins.get_by_subject(subject_id)
+        if (
+            origin is None
+            or origin.subject_id != subject_id
+            or origin.edition_id != subject.edition_id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Subject is not selected",
+                detail="Subject has no discovery origin",
             )
-        return group
+        return subject, origin
 
 
 async def _actor_id(request: Request) -> str:
@@ -588,15 +596,6 @@ def _reconciliation_error(exc: ProductionReconciliationError) -> HTTPException:
 
 def _production_pacing(request: Request) -> ProductionPacingPolicy:
     return getattr(request.app.state, "production_pacing", ProductionPacingPolicy.zero())
-
-
-def _eligible_article_subject_ids(groups: Iterable[EditorialGroup]) -> list[UUID]:
-    """Subjects of an edition that are selected articles, in board order."""
-    return [
-        group.subject_id
-        for group in groups
-        if group.subject_id is not None and group.status == EditorialGroupStatus.SELECTED
-    ]
 
 
 def _collect_warnings(artifacts: Sequence[Any]) -> list[str]:
@@ -1254,22 +1253,21 @@ async def start_subject_production(
     uow_factory, jobs, dispatcher = _runtime(request)
 
     async with uow_factory() as uow:
-        group = await uow.editorial_groups.get_by_subject(subject_id)
-        if group is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No editorial group found for subject {subject_id}",
-            )
-        if group.status != EditorialGroupStatus.SELECTED:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Subject is not selected",
-            )
         subject = await uow.subjects.get(subject_id)
         if subject is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No subject found for {subject_id}",
+            )
+        origin = await uow.subject_discovery_origins.get_by_subject(subject_id)
+        if (
+            origin is None
+            or origin.subject_id != subject_id
+            or origin.edition_id != subject.edition_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Subject has no discovery origin",
             )
         edition_id = subject.edition_id
 
@@ -1289,6 +1287,8 @@ async def start_subject_production(
                     status_code=status.HTTP_409_CONFLICT,
                     detail={"code": "production_run_batch_owned"},
                 )
+
+    await request.app.state.legacy_editorial_projection_service.synchronize(edition_id)
 
     try:
         run, job_id = await _create_and_start_run(
@@ -1414,7 +1414,7 @@ async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
 ) -> ProductionStateSnapshotV3:
-    await _selected_article_group(request, subject_id)
+    await _selected_subject(request, subject_id)
     async with request.app.state.uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
     if subject is None:
@@ -1435,7 +1435,7 @@ async def import_subject_production_state(
     request: Request,
     payload: dict[str, Any],
 ) -> ProductionStateImportResult:
-    await _selected_article_group(request, subject_id)
+    await _selected_subject(request, subject_id)
     async with request.app.state.uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
     if subject is None:
@@ -2350,13 +2350,19 @@ async def start_edition_production(
         if active_batch:
             return await _batch_status_view(uow, active_batch)
 
-        groups = await uow.editorial_groups.list_for_edition(edition_id)
-        eligible_order = _eligible_article_subject_ids(groups)
+        origins = await uow.subject_discovery_origins.list_for_edition(edition_id)
+        eligible_order: list[UUID] = []
+        for origin in origins:
+            if origin.edition_id != edition_id:
+                continue
+            subject = await uow.subjects.get(origin.subject_id)
+            if subject is not None and subject.edition_id == edition_id:
+                eligible_order.append(subject.id)
 
     if not eligible_order:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No selected articles found for edition",
+            detail="No selected Subjects found for edition",
         )
 
     if payload.subject_ids is not None:
@@ -2365,11 +2371,13 @@ async def start_edition_production(
         if unknown:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Some requested subjects are not selected articles",
+                detail="Some requested Subjects are not selected Subjects",
             )
         subject_ids = [sid for sid in eligible_order if sid in requested]
     else:
         subject_ids = list(eligible_order)
+
+    await request.app.state.legacy_editorial_projection_service.synchronize(edition_id)
 
     try:
         actor_id = await _actor_id(request)

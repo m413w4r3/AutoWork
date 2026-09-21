@@ -1,28 +1,27 @@
-import type { EditorialGroup } from "../../api/editorial";
+import type { SelectionItem } from "../../api/selection";
 
-/** An editorial group that is eligible for the production batch: it carries
- * a resolved subject. `EditorialGroup.status === "selected"` is the
- * editorial-eligibility notion; it is distinct from whether the operator has
- * checked this subject for the *next* batch. */
-export type EligibleGroup = EditorialGroup & { subject_id: string };
+/** A selected board item with a resolved subject identity. */
+export type EligibleSubject = Pick<SelectionItem, "title" | "subject_id"> & {
+  subject_id: string;
+};
 
 export function isEligibleSubject(
-  group: EditorialGroup,
-): group is EligibleGroup {
-  return group.status === "selected" && group.subject_id !== null;
+  item: SelectionItem,
+): item is SelectionItem & EligibleSubject {
+  return item.state === "selected" && item.subject_id !== null;
 }
 
 /**
- * Build the `subject_ids` payload in current editorial board order, not in
+ * Build the `subject_ids` payload in current selection board order, not in
  * click order or Set insertion order — the sequential batch must preserve
- * the editorial order regardless of the order the operator checked boxes.
+ * the board order regardless of the order the operator checked boxes.
  */
 export function orderedSelection(
-  eligibleGroups: readonly EligibleGroup[],
+  eligibleSubjects: readonly EligibleSubject[],
   selected: ReadonlySet<string>,
 ): string[] {
-  return eligibleGroups
-    .map((group) => group.subject_id)
+  return eligibleSubjects
+    .map((subject) => subject.subject_id)
     .filter((subjectId) => selected.has(subjectId));
 }
 

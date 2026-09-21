@@ -53,10 +53,13 @@ from cti_app.application.persistence import (
     SampleAcquisitionAttemptRepository,
     SampleFeatureSetRepository,
     SampleRepository,
+    SelectionDecisionRepository,
+    SelectionIdempotencyRepository,
     SourceCollectionRepository,
     SourceDocumentRepository,
     SourceExtractionRepository,
     SubjectContributionRepository,
+    SubjectDiscoveryOriginRepository,
     SubjectMergeEventRepository,
     SubjectProductionRunRepository,
     SubjectRepository,
@@ -150,6 +153,11 @@ from cti_app.infrastructure.database.repositories.publication_review import (
     SqlAlchemyEditionReviewReadRepository,
     SqlAlchemyPublicationReviewDecisionRepository,
 )
+from cti_app.infrastructure.database.repositories.selection import (
+    SqlAlchemySelectionDecisionRepository,
+    SqlAlchemySelectionIdempotencyRepository,
+    SqlAlchemySubjectDiscoveryOriginRepository,
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -161,6 +169,9 @@ class SqlAlchemyUnitOfWork:
     code_feature_sets: CodeFeatureSetRepository
     invariants: InvariantRepository
     subjects: SubjectRepository
+    selection_decisions: SelectionDecisionRepository
+    selection_idempotency: SelectionIdempotencyRepository
+    subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
     samples: SampleRepository
     sample_feature_sets: SampleFeatureSetRepository
@@ -231,6 +242,9 @@ class SqlAlchemyUnitOfWork:
         self.code_feature_sets = SqlAlchemyCodeFeatureSetRepository(self._session)
         self.invariants = SqlAlchemyInvariantRepository(self._session)
         self.subjects = SqlAlchemySubjectRepository(self._session)
+        self.selection_decisions = SqlAlchemySelectionDecisionRepository(self._session)
+        self.selection_idempotency = SqlAlchemySelectionIdempotencyRepository(self._session)
+        self.subject_discovery_origins = SqlAlchemySubjectDiscoveryOriginRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)
         self.sample_feature_sets = SqlAlchemySampleFeatureSetRepository(self._session)

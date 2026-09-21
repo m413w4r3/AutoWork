@@ -1,8 +1,18 @@
 import { expect, test } from "@playwright/test";
 
+import {
+  selectionWireBoard,
+  selectionWireItem,
+  selectionWireLastDecision,
+} from "./support/selectionWire";
+
 test("Édition : production séquentielle de deux sujets, revue et DOCX", async ({
   page,
 }) => {
+  // The longest journey in the suite: Selection of two subjects, sequential
+  // production polling, review then publication. It sits just above the
+  // default 10s budget.
+  test.slow();
   const editionId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const subjectA = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
   const subjectB = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbc";
@@ -13,7 +23,11 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   const artifactB = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeef";
   const manifestId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const hash = "a".repeat(64);
+  const discoveryA = "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a";
+  const discoveryB = "9b9b9b9b-9b9b-4b9b-8b9b-9b9b9b9b9b9b";
   let batchReads = 0;
+  let batchStarted = false;
+  let selectionConfirmed = false;
   let publicationAccepted = false;
   let releasePublished = false;
   let releaseReads = 0;
@@ -35,66 +49,34 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     updated_at: "2026-08-29T00:00:00Z",
   });
 
-  const board = {
-    groups: [
-      {
-        id: "11111111-1111-4111-8111-111111111111",
-        edition_id: editionId,
-        title: "Article A",
-        outcome: "new_subject",
-        status: "selected",
-        subject_id: subjectA,
-        candidates: [],
-        score: {
-          impact: 3,
-          novelty: 3,
-          technical_depth: 4,
-          hunting_potential: 3,
-          actionability: 3,
-          source_quality: 3,
-          total: 19,
-          justifications: {},
-        },
-        source_relationship_status: "verified",
-        needs_source_verification: false,
-        needs_source_expansion: false,
-        grouping_confidence: "high",
-        grouping_justification: "Sélection canonique.",
-        historical_comparison: null,
-        version: 2,
-      },
-      {
-        id: "11111111-1111-4111-8111-111111111112",
-        edition_id: editionId,
-        title: "Article B",
-        outcome: "new_subject",
-        status: "selected",
-        subject_id: subjectB,
-        candidates: [],
-        score: {
-          impact: 3,
-          novelty: 3,
-          technical_depth: 4,
-          hunting_potential: 3,
-          actionability: 3,
-          source_quality: 3,
-          total: 19,
-          justifications: {},
-        },
-        source_relationship_status: "verified",
-        needs_source_verification: false,
-        needs_source_expansion: false,
-        grouping_confidence: "high",
-        grouping_justification: "Sélection canonique.",
-        historical_comparison: null,
-        version: 2,
-      },
-    ],
-    selected_articles: 2,
-    ignored: 0,
-    undecided: 0,
-    automatic_selection: false,
-  };
+  const selectionItem = (
+    discoverySubjectId: string,
+    title: string,
+    subjectId: string,
+  ) =>
+    selectionWireItem({
+      discovery_subject_id: discoverySubjectId,
+      title,
+      summary: `Présentation neutre de ${title}.`,
+      effective_state: selectionConfirmed ? "selected" : "undecided",
+      subject_id: selectionConfirmed ? subjectId : null,
+      last_decision: selectionConfirmed
+        ? selectionWireLastDecision({
+            id: `decision-${subjectId.slice(0, 4)}`,
+            subject_id: subjectId,
+          })
+        : null,
+    });
+
+  const selectionBoard = () =>
+    selectionWireBoard({
+      edition_id: editionId,
+      snapshot_id: "88888888-8888-4888-8888-888888888888",
+      items: [
+        selectionItem(discoveryA, "Article A", subjectA),
+        selectionItem(discoveryB, "Article B", subjectB),
+      ],
+    });
 
   const batchState = (
     firstStatus: "running" | "ready",
@@ -287,8 +269,16 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       await route.fulfill({ json: edition() });
       return;
     }
-    if (path === `/api/editions/${editionId}/editorial-groups`) {
-      await route.fulfill({ json: board });
+    if (
+      path === `/api/editions/${editionId}/selection/decisions` &&
+      request.method() === "POST"
+    ) {
+      selectionConfirmed = true;
+      await route.fulfill({ json: selectionBoard() });
+      return;
+    }
+    if (path === `/api/editions/${editionId}/selection`) {
+      await route.fulfill({ json: selectionBoard() });
       return;
     }
     if (
@@ -296,6 +286,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       request.method() === "POST"
     ) {
       productionPostBody = request.postDataJSON();
+      batchStarted = true;
       await route.fulfill({
         status: 202,
         json: batchState("running", "queued", 0, "running"),
@@ -303,6 +294,10 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       return;
     }
     if (path === `/api/editions/${editionId}/production`) {
+      if (!batchStarted) {
+        await route.fulfill({ status: 404, json: {} });
+        return;
+      }
       batchReads += 1;
       if (batchReads === 1) {
         await route.fulfill({
@@ -413,26 +408,39 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     await route.fulfill({ status: 404, json: {} });
   });
 
+  // 1. Selection materializes both Subjects, in one batch confirmation.
   await page.goto(`/editions/${editionId}/selection`);
+  const cardFor = (title: string) =>
+    page
+      .getByRole("article")
+      .filter({ has: page.getByRole("heading", { name: title, exact: true }) });
+  await cardFor("Article A")
+    .getByRole("button", { name: "Traiter", exact: true })
+    .click();
+  await cardFor("Article B")
+    .getByRole("button", { name: "Traiter", exact: true })
+    .click();
+  await page
+    .getByRole("button", { name: "Confirmer les décisions (2)" })
+    .click();
+  await expect(page.getByRole("link", { name: "Sujet créé" })).toHaveCount(2);
+
+  // 2. The batch composition is chosen on /production only.
+  await page.goto(`/editions/${editionId}/production`);
+  const selector = page.getByRole("region", {
+    name: "Sélecteur du lot de production",
+  });
   await expect(
-    page.getByRole("heading", { name: "2 sujets éligibles" }),
-  ).toBeVisible();
-  await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
-  await expect(
-    page.getByRole("button", { name: "Sélectionnez au moins un sujet" }),
+    page.getByRole("button", { name: "Démarrer le lot de production" }),
   ).toBeDisabled();
 
   // The real operator gesture: check A and B explicitly. Nothing is
   // pre-armed by loading or reloading the page.
-  await page.getByRole("checkbox", { name: "Article A" }).check();
-  await page.getByRole("checkbox", { name: "Article B" }).check();
-  await expect(page.getByText("2 sélectionnés pour ce lot")).toBeVisible();
+  await selector.getByRole("checkbox", { name: "Article A" }).check();
+  await selector.getByRole("checkbox", { name: "Article B" }).check();
 
-  await expect(
-    page.getByRole("button", { name: "Lancer la production de 2 sujets" }),
-  ).toBeEnabled();
   await page
-    .getByRole("button", { name: "Lancer la production de 2 sujets" })
+    .getByRole("button", { name: "Démarrer le lot de production" })
     .click();
 
   await expect(page).toHaveURL(`/editions/${editionId}/production`);
@@ -445,8 +453,9 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await expect(
     page.getByRole("heading", { name: "0 / 2 sujets traités" }),
   ).toBeVisible();
-  await expect(page.getByText("Article A")).toBeVisible();
-  await expect(page.getByText("Article B")).toBeVisible();
+  const tracked = page.getByRole("list", { name: "Suivi des articles" });
+  await expect(tracked).toContainText("Article A");
+  await expect(tracked).toContainText("Article B");
   await expect(page.getByText("En cours").first()).toBeVisible();
   await expect(page.getByText("En attente")).toBeVisible();
 

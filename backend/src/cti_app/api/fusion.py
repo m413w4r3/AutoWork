@@ -14,6 +14,7 @@ from cti_app.application.discovery.fusion import (
     FusionEditionArchivedError,
     FusionModelSuggestion,
     FusionReviewDecision,
+    FusionSelectedSubjectConflictError,
     FusionService,
     FusionSnapshotStaleError,
 )
@@ -244,6 +245,11 @@ def _raise_fusion_error(exc: Exception) -> NoReturn:
         raise HTTPException(
             status_code=409,
             detail={"code": exc.code, "message": "Une édition archivée n'est pas modifiable."},
+        ) from exc
+    if isinstance(exc, FusionSelectedSubjectConflictError):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": str(exc)},
         ) from exc
     if isinstance(exc, LookupError):
         raise HTTPException(
