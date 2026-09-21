@@ -75,7 +75,7 @@ class CollectionReviewService:
             decision = HumanDecision(
                 edition_id=claim.edition_id,
                 decision_type=decision_type,
-                group_ids=(claim.group_id,),
+                subject_ids=(claim.subject_id,),
                 actor_id=actor_id,
                 correlation_id=correlation_id,
                 payload={
@@ -115,7 +115,7 @@ class CollectionReviewService:
             decision = HumanDecision(
                 edition_id=indicator.edition_id,
                 decision_type=decision_type,
-                group_ids=(indicator.group_id,),
+                subject_ids=(indicator.subject_id,),
                 actor_id=actor_id,
                 correlation_id=correlation_id,
                 payload={
@@ -151,7 +151,7 @@ class CollectionReviewService:
                         if previous_role is role
                         else HumanDecisionType.SOURCE_RELATIONSHIP_CORRECT
                     ),
-                    group_ids=(collection.group_id,),
+                    subject_ids=(collection.subject_id,),
                     actor_id=actor_id,
                     correlation_id=correlation_id,
                     payload={

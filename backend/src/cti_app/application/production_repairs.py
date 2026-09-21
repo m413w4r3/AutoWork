@@ -91,12 +91,12 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionRepairVerificationState,
+    ProductionRunStatus,
+    ProductionStage,
     RepairApplicationStage,
     RepairDecisionApplicationState,
     RepairIssueExecutionState,
     RepairRemediation,
-    SubjectProductionStage,
-    SubjectProductionStatus,
     SupplementalSourceRepairState,
 )
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
@@ -808,7 +808,7 @@ class ProductionRepairDecisionService:
                 expected_effective_decision_id=expected_effective_decision_id,
             )
 
-            run_repository = uow.subject_production_runs
+            run_repository = uow.production_runs
             run = await _get_for_update(run_repository, production_run_id)
             if (
                 run is None
@@ -819,17 +819,17 @@ class ProductionRepairDecisionService:
                 raise ProductionRepairStaleError(ProductionRepairStaleError.code)
             run_status = _enum_value(getattr(run, "status", None))
             if run_status in {
-                SubjectProductionStatus.QUEUED.value,
-                SubjectProductionStatus.RUNNING.value,
-                SubjectProductionStatus.CANCELLED.value,
+                ProductionRunStatus.QUEUED.value,
+                ProductionRunStatus.RUNNING.value,
+                ProductionRunStatus.CANCELLED.value,
             }:
                 raise ProductionRepairStatusError("production_repair_run_not_reviewable")
             if getattr(run, "requires_reconciliation", False):
                 raise ProductionRepairStatusError("production_reconciliation_required")
             if run_status is not None and run_status not in {
-                SubjectProductionStatus.READY.value,
-                SubjectProductionStatus.NEEDS_REVIEW.value,
-                SubjectProductionStatus.FAILED.value,
+                ProductionRunStatus.READY.value,
+                ProductionRunStatus.NEEDS_REVIEW.value,
+                ProductionRunStatus.FAILED.value,
             }:
                 raise ProductionRepairStatusError("production_repair_run_not_reviewable")
 
@@ -942,7 +942,7 @@ class ProductionRepairDecisionService:
                     repair_key=item.repair_key,
                     expected_effective_decision_id=item.expected_effective_decision_id,
                 )
-                run = await _get_for_update(uow.subject_production_runs, item.production_run_id)
+                run = await _get_for_update(uow.production_runs, item.production_run_id)
                 if (
                     run is None
                     or run.edition_id != edition_id
@@ -952,17 +952,17 @@ class ProductionRepairDecisionService:
                     raise ProductionRepairStaleError(ProductionRepairStaleError.code)
                 run_status = _enum_value(getattr(run, "status", None))
                 if run_status in {
-                    SubjectProductionStatus.QUEUED.value,
-                    SubjectProductionStatus.RUNNING.value,
-                    SubjectProductionStatus.CANCELLED.value,
+                    ProductionRunStatus.QUEUED.value,
+                    ProductionRunStatus.RUNNING.value,
+                    ProductionRunStatus.CANCELLED.value,
                 }:
                     raise ProductionRepairStatusError("production_repair_run_not_reviewable")
                 if getattr(run, "requires_reconciliation", False):
                     raise ProductionRepairStatusError("production_reconciliation_required")
                 if run_status is not None and run_status not in {
-                    SubjectProductionStatus.READY.value,
-                    SubjectProductionStatus.NEEDS_REVIEW.value,
-                    SubjectProductionStatus.FAILED.value,
+                    ProductionRunStatus.READY.value,
+                    ProductionRunStatus.NEEDS_REVIEW.value,
+                    ProductionRunStatus.FAILED.value,
                 }:
                     raise ProductionRepairStatusError("production_repair_run_not_reviewable")
 
@@ -1699,7 +1699,7 @@ class ProductionRepairIssueService:
             return ()
 
         async with self._uow_factory() as uow:
-            runs = await uow.subject_production_runs.list_for_edition(edition_id)
+            runs = await uow.production_runs.list_for_edition(edition_id)
             references_by_run = await _current_artifacts_by_run(
                 uow,
                 edition_id,
@@ -1892,7 +1892,7 @@ class ProductionRepairIssueService:
         load_payload: bool = True,
     ) -> list[tuple[ProductionRepairIssueView, str | None, Mapping[str, Any]]]:
         async with self._uow_factory() as uow:
-            runs = await uow.subject_production_runs.list_for_edition(edition_id)
+            runs = await uow.production_runs.list_for_edition(edition_id)
             artifacts_by_run = await _current_artifacts_by_run(
                 uow,
                 edition_id,
@@ -2941,7 +2941,7 @@ class ProductionRepairProjectionService:
         async with self._uow_factory() as uow:
             # Discover the owner first, then acquire Edition and Run locks in
             # the same order as the other production repair services.
-            initial_run = await uow.subject_production_runs.get(run_id)
+            initial_run = await uow.production_runs.get(run_id)
             if initial_run is None:
                 raise ProductionRepairProjectionError("production_run_not_found")
 
@@ -2953,7 +2953,7 @@ class ProductionRepairProjectionService:
                 if edition.state is not EditionStatus.OPEN:
                     raise ProductionRepairProjectionError("edition_archived")
 
-            run = await _get_for_update(uow.subject_production_runs, run_id)
+            run = await _get_for_update(uow.production_runs, run_id)
             if run is None:
                 raise ProductionRepairProjectionError("production_run_not_found")
             if run.edition_id != initial_run.edition_id:
@@ -2986,15 +2986,15 @@ class ProductionRepairProjectionService:
             raise ProductionRepairProjectionError("production_run_not_found")
 
         if _enum_value(run.status) in {
-            SubjectProductionStatus.QUEUED.value,
-            SubjectProductionStatus.RUNNING.value,
-            SubjectProductionStatus.CANCELLED.value,
+            ProductionRunStatus.QUEUED.value,
+            ProductionRunStatus.RUNNING.value,
+            ProductionRunStatus.CANCELLED.value,
         }:
             raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
         if _enum_value(run.status) not in {
-            SubjectProductionStatus.READY.value,
-            SubjectProductionStatus.NEEDS_REVIEW.value,
-            SubjectProductionStatus.FAILED.value,
+            ProductionRunStatus.READY.value,
+            ProductionRunStatus.NEEDS_REVIEW.value,
+            ProductionRunStatus.FAILED.value,
         }:
             raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
         if getattr(run, "requires_reconciliation", False):
@@ -3789,7 +3789,7 @@ class ProductionRepairMaterializationService:
                 return ProductionRepairMaterializationResult(
                     projection=projection,
                     action="retry_required",
-                    retry_stage=SubjectProductionStage.REFERENCES.value,
+                    retry_stage=ProductionStage.REFERENCES.value,
                     full_chain=True,
                     repair_materialization=repair_audit,
                 )
@@ -3837,7 +3837,7 @@ class ProductionRepairMaterializationService:
                 # READY in the same transaction as the stale, so no reader ever
                 # observes a READY run without a current PUBLICATION.
                 await _require_publication_rebuild(
-                    uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+                    uow, run, retry_stage=ProductionStage.SYNTHESIS.value
                 )
                 # The stale is committed with the new Extraction, so no reader
                 # ever sees the repaired content beside the old narrative.
@@ -3845,7 +3845,7 @@ class ProductionRepairMaterializationService:
                 return ProductionRepairMaterializationResult(
                     projection=projection,
                     action="retry_required",
-                    retry_stage=SubjectProductionStage.SYNTHESIS.value,
+                    retry_stage=ProductionStage.SYNTHESIS.value,
                     repair_materialization=repair_audit,
                 )
 
@@ -3959,7 +3959,7 @@ class ProductionRepairMaterializationService:
         locked: releasing that lock before the writes would make the check
         worthless.
         """
-        runs = uow.subject_production_runs
+        runs = uow.production_runs
         initial = (
             await runs.get(observed_run_id)
             if observed_run_id is not None
@@ -4002,9 +4002,9 @@ class ProductionRepairMaterializationService:
         if run.edition_id != edition_id or run.subject_id != subject_id:
             raise ProductionRepairProjectionError("production_run_edition_changed")
         if _enum_value(getattr(run, "status", None)) not in {
-            SubjectProductionStatus.READY.value,
-            SubjectProductionStatus.NEEDS_REVIEW.value,
-            SubjectProductionStatus.FAILED.value,
+            ProductionRunStatus.READY.value,
+            ProductionRunStatus.NEEDS_REVIEW.value,
+            ProductionRunStatus.FAILED.value,
         }:
             raise ProductionRepairProjectionError("production_repair_run_not_reviewable")
         if getattr(run, "requires_reconciliation", False):
@@ -4786,7 +4786,7 @@ async def _require_publication_rebuild(uow: Any, run: Any, *, retry_stage: str) 
 
     Returns whether the run actually changed.
     """
-    if _enum_value(getattr(run, "status", None)) != SubjectProductionStatus.READY.value:
+    if _enum_value(getattr(run, "status", None)) != ProductionRunStatus.READY.value:
         return False
     mark = getattr(run, "mark_needs_review", None)
     if not callable(mark):
@@ -4799,7 +4799,7 @@ async def _require_publication_rebuild(uow: Any, run: Any, *, retry_stage: str) 
         ),
         details={"retry_stage": retry_stage},
     )
-    runs = getattr(uow, "subject_production_runs", None)
+    runs = getattr(uow, "production_runs", None)
     save = getattr(runs, "save", None) if runs is not None else None
     if callable(save):
         await save(run)
@@ -5017,7 +5017,7 @@ class ProductionReferenceRepairService:
 
         async with self._uow_factory() as uow:
             # Discover first, then acquire Edition and Run locks in that order.
-            initial_run = await uow.subject_production_runs.get(run_id)
+            initial_run = await uow.production_runs.get(run_id)
             if initial_run is None:
                 raise ProductionReferenceRepairError("production_run_not_found")
 
@@ -5034,7 +5034,7 @@ class ProductionReferenceRepairService:
                 if edition.state is not EditionStatus.OPEN:
                     raise ProductionReferenceRepairError("edition_archived")
 
-            run = await uow.subject_production_runs.get_for_update(run_id)
+            run = await uow.production_runs.get_for_update(run_id)
             if run is None:
                 raise ProductionReferenceRepairError("production_run_not_found")
             if run.edition_id != initial_run.edition_id:
@@ -5042,15 +5042,15 @@ class ProductionReferenceRepairService:
 
             run_status = _enum_value(run.status)
             if run_status in {
-                SubjectProductionStatus.QUEUED.value,
-                SubjectProductionStatus.RUNNING.value,
-                SubjectProductionStatus.CANCELLED.value,
+                ProductionRunStatus.QUEUED.value,
+                ProductionRunStatus.RUNNING.value,
+                ProductionRunStatus.CANCELLED.value,
             }:
                 raise ProductionReferenceRepairError("production_repair_run_not_reviewable")
             if run_status not in {
-                SubjectProductionStatus.READY.value,
-                SubjectProductionStatus.NEEDS_REVIEW.value,
-                SubjectProductionStatus.FAILED.value,
+                ProductionRunStatus.READY.value,
+                ProductionRunStatus.NEEDS_REVIEW.value,
+                ProductionRunStatus.FAILED.value,
             }:
                 raise ProductionReferenceRepairError("production_repair_run_not_reviewable")
             if run.requires_reconciliation:
@@ -5211,7 +5211,7 @@ class ProductionReferenceRepairService:
             # published is gone, so the run cannot keep claiming READY. The
             # transition rides the stale's transaction.
             await _require_publication_rebuild(
-                uow, run, retry_stage=SubjectProductionStage.EXTRACTION.value
+                uow, run, retry_stage=ProductionStage.EXTRACTION.value
             )
             await uow.commit()
             return ProductionReferenceRepairResult(

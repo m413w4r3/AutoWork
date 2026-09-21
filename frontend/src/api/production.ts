@@ -1,9 +1,9 @@
 import { ApiError, type EditionStatus } from "./editions";
 
-export type SubjectProductionStatus =
+export type ProductionRunStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
-export type SubjectProductionStage =
+export type ProductionStage =
   "sources" | "references" | "extraction" | "synthesis" | "assembly";
 
 export type ProductionBatchPhase = "initial" | "recovery" | "review";
@@ -97,7 +97,7 @@ export interface ExtractionRejections {
   q2_source_evidence_rejections: ExtractionRejection[];
 }
 
-type ProductionBatchStatus =
+export type ProductionBatchStatus =
   "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
 
 export interface StageStatus {
@@ -122,8 +122,8 @@ export interface StageStatus {
 }
 
 export interface ProductionResumePlan {
-  previous_status: SubjectProductionStatus;
-  resume_from_stage: SubjectProductionStage;
+  previous_status: ProductionRunStatus;
+  resume_from_stage: ProductionStage;
   /** Stages whose artifact the resume keeps instead of recomputing. */
   reused_artifacts: string[];
   /** Upper bound: a stage that runs may still hit a reusable checkpoint. */
@@ -134,8 +134,8 @@ export interface ProductionStatus {
   subject_id: string;
   edition_id: string;
   title: string;
-  status: SubjectProductionStatus;
-  current_stage: SubjectProductionStage;
+  status: ProductionRunStatus;
+  current_stage: ProductionStage;
   progress_current: number;
   progress_total: number;
   references_conversation_id: string | null;
@@ -173,7 +173,7 @@ export interface ProductionReconciliation {
   bridge_response_id: string | null;
   submission_state: string;
   phase: string;
-  stage: SubjectProductionStage;
+  stage: ProductionStage;
   pipeline_generation: number;
   output_sha256: string | null;
   provenance: string | null;
@@ -215,8 +215,8 @@ export interface BatchItemDetail {
   subject_id: string;
   title: string;
   run_id: string;
-  status: SubjectProductionStatus;
-  current_stage: SubjectProductionStage;
+  status: ProductionRunStatus;
+  current_stage: ProductionStage;
   pipeline_generation: number;
   auto_recovery_count: number;
   error_code: string | null;
@@ -225,7 +225,36 @@ export interface BatchItemDetail {
   reconciliation?: ProductionReconciliation | null;
 }
 
-export interface BatchStatus {
+export interface ProductionSubject {
+  subject_id: string;
+  title: string;
+  tlp: string;
+  latest_run_id: string | null;
+  latest_run_number: number | null;
+  latest_status: ProductionRunStatus | null;
+  latest_stage: ProductionStage | null;
+  active_run_id: string | null;
+  can_start: boolean;
+  blocking_reason: string | null;
+}
+
+export interface ProductionRunSummary {
+  run_id: string;
+  edition_id: string;
+  subject_id: string;
+  run_number: number;
+  status: ProductionRunStatus;
+  current_stage: ProductionStage;
+  pipeline_generation: number;
+  research_date: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+export interface ProductionBatch {
   batch_id: string;
   edition_id: string;
   status: ProductionBatchStatus;
@@ -240,6 +269,19 @@ export interface BatchStatus {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+}
+
+export type BatchStatus = ProductionBatch;
+
+export type ProductionBatchSummary = Omit<ProductionBatch, "item_details"> & {
+  item_details?: BatchItemDetail[];
+};
+
+export interface ProductionBoard {
+  edition_id: string;
+  subjects: ProductionSubject[];
+  active_batch: ProductionBatch | null;
+  recent_batches: ProductionBatchSummary[];
 }
 
 export interface CancelProductionBatchResponse {
@@ -288,15 +330,38 @@ export interface ExtractionDocumentV2 {
   uncertainties: string[];
 }
 
-export interface ProductionStateSnapshotV1 {
+export interface ProductionStateRepairDecision {
+  repair_key: string;
+  decision_id: string | null;
+  issue_kind: string;
+  action: string;
+  actor_id: string;
+  decided_at: string;
+  reason: string | null;
+}
+
+export interface ProductionStateRepair {
+  projection_version: string;
+  base_extraction_artifact_id: string;
+  actor_id: string | null;
+  included_repair_keys: string[];
+  excluded_repair_keys: string[];
+  unresolved_repair_keys: string[];
+  decisions: ProductionStateRepairDecision[];
+  materialization: Record<string, unknown> | null;
+}
+
+export interface ProductionStateSnapshotV4 {
   format: "autowork.production-state";
-  schema_version: 1;
+  schema_version: 4;
   exported_at: string;
   origin: {
     subject_title: string;
-    editorial_type: "brief";
-    profile: "brief_auto";
-    research_date: string | null;
+    subject_id: string;
+    production_run_id: string;
+    research_date: string;
+    discovery_snapshot_id: string;
+    discovery_snapshot_version: number;
   };
   artifacts: {
     references: {
@@ -312,30 +377,18 @@ export interface ProductionStateSnapshotV1 {
       rendered_content: string;
     };
   };
+  repair?: ProductionStateRepair | null;
   content_sha256: string;
 }
 
-export interface ProductionStateSnapshotV2 {
-  format: "autowork.production-state";
-  schema_version: 2;
-  exported_at: string;
-  origin: {
-    subject_title: string;
-    research_date: string | null;
-  };
-  artifacts: ProductionStateSnapshotV1["artifacts"];
-  content_sha256: string;
-}
-
-export type ProductionStateSnapshot =
-  ProductionStateSnapshotV1 | ProductionStateSnapshotV2;
+export type ProductionStateSnapshot = ProductionStateSnapshotV4;
 
 export interface ProductionStateImportResult {
   run_id: string;
   status: "needs_review";
   current_stage: "assembly";
   imported_stages: ["references", "extraction", "synthesis"];
-  schema_version: 1 | 2;
+  schema_version: 4;
   content_sha256: string;
 }
 
@@ -398,20 +451,6 @@ export interface PublicationDocumentV2 extends Omit<
 
 export type PublicationDocument = BriefDocumentV1 | PublicationDocumentV2;
 
-/**
- * Start production of a subject.
- *
- * The edition is resolved server-side from the subject's editorial group, so
- * the subject page only needs the subject id.
- */
-export async function startSubjectProduction(
-  subjectId: string,
-): Promise<{ run_id: string; status: string }> {
-  return request(`/api/subjects/${subjectId}/production`, {
-    method: "POST",
-  });
-}
-
 export async function restartProductionWithNewSources(
   subjectId: string,
 ): Promise<{ run_id: string; replaced_run_id: string }> {
@@ -433,9 +472,15 @@ export async function getSubjectProduction(
   return requestOrNull(`/api/subjects/${subjectId}/production`);
 }
 
+export async function getSubjectProductionRuns(
+  subjectId: string,
+): Promise<ProductionRunSummary[]> {
+  return request(`/api/subjects/${subjectId}/production/runs`);
+}
+
 export async function exportProductionState(
   subjectId: string,
-): Promise<ProductionStateSnapshotV2> {
+): Promise<ProductionStateSnapshotV4> {
   return request(`/api/subjects/${subjectId}/production/state/export`);
 }
 
@@ -615,31 +660,36 @@ export async function getPublicationArtifact(
  * back to "every eligible subject" — the caller must ask the operator to
  * choose at least one subject.
  */
-export async function startEditionProduction(
+export async function startProductionBatch(
   editionId: string,
   subjectIds: readonly string[],
+  idempotencyKey: string,
 ): Promise<BatchStatus> {
   if (subjectIds.length === 0) {
     throw new Error(
-      "startEditionProduction requires at least one selected subject",
+      "startProductionBatch requires at least one selected subject",
     );
   }
-  return request(`/api/editions/${editionId}/production`, {
+  return request(`/api/editions/${editionId}/production/batches`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": idempotencyKey,
+    },
     body: JSON.stringify({ subject_ids: subjectIds }),
   });
 }
 
 /**
- * Get batch production status.
+ * Get the edition production board.
  *
- * Returns null when no batch has been started yet.
+ * Existing editions always return a board, including an empty board when no
+ * subject or batch exists yet.
  */
 export async function getEditionProduction(
   editionId: string,
-): Promise<BatchStatus | null> {
-  return requestOrNull(`/api/editions/${editionId}/production`);
+): Promise<ProductionBoard> {
+  return request(`/api/editions/${editionId}/production`);
 }
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {

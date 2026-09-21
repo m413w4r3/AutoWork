@@ -1,5 +1,6 @@
 """Tests for production workflow domain and services."""
 
+from datetime import datetime
 from uuid import uuid4
 
 import pytest
@@ -11,56 +12,94 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 
-class TestSubjectProductionRun:
+class TestProductionRun:
     def test_create_run(self) -> None:
         subject_id = uuid4()
         edition_id = uuid4()
 
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
         )
 
-        assert run.status == SubjectProductionStatus.QUEUED
-        assert run.current_stage is SubjectProductionStage.SOURCES
+        assert run.status == ProductionRunStatus.QUEUED
+        assert run.current_stage is ProductionStage.SOURCES
         assert run.run_number == 1
+        assert run.version == 1
+        assert isinstance(run.status, ProductionRunStatus)
+        assert isinstance(run.current_stage, ProductionStage)
+        assert run.created_at.tzinfo is not None
+        assert run.updated_at.tzinfo is not None
         assert run.references_conversation_id is None
         assert run.synthesis_conversation_id is None
+
+    @pytest.mark.parametrize("field", ["run_number", "version"])
+    def test_run_number_and_version_must_be_positive(self, field: str) -> None:
+        with pytest.raises(ValueError, match="must be >= 1"):
+            ProductionRun(
+                subject_id=uuid4(),
+                edition_id=uuid4(),
+                **{field: 0},
+            )
+
+    def test_status_and_stage_must_use_control_types(self) -> None:
+        with pytest.raises(ValueError, match="status must be a ProductionRunStatus"):
+            ProductionRun(
+                subject_id=uuid4(),
+                edition_id=uuid4(),
+                status="queued",  # type: ignore[arg-type]
+            )
+
+        with pytest.raises(ValueError, match="current_stage must be a ProductionStage"):
+            ProductionRun(
+                subject_id=uuid4(),
+                edition_id=uuid4(),
+                current_stage="sources",  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize("field", ["created_at", "updated_at"])
+    def test_run_timestamps_must_be_timezone_aware(self, field: str) -> None:
+        with pytest.raises(ValueError, match=f"{field} must be timezone-aware"):
+            ProductionRun(
+                subject_id=uuid4(),
+                edition_id=uuid4(),
+                **{field: datetime(2026, 1, 1)},
+            )
 
     def test_run_state_transitions(self) -> None:
         subject_id = uuid4()
         edition_id = uuid4()
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
         )
 
         run.start_running()
-        assert run.status == SubjectProductionStatus.RUNNING
+        assert run.status == ProductionRunStatus.RUNNING
 
         run.advance_stage()
-        assert run.current_stage is SubjectProductionStage.REFERENCES
+        assert run.current_stage is ProductionStage.REFERENCES
 
         run.advance_stage()
-        assert run.current_stage is SubjectProductionStage.EXTRACTION  # type: ignore[comparison-overlap]
+        assert run.current_stage is ProductionStage.EXTRACTION  # type: ignore[comparison-overlap]
 
         run.advance_stage()
-        assert run.current_stage is SubjectProductionStage.SYNTHESIS
+        assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage()
-        assert run.current_stage is SubjectProductionStage.ASSEMBLY
+        assert run.current_stage is ProductionStage.ASSEMBLY
 
         run.mark_ready()
-        assert run.status == SubjectProductionStatus.READY
+        assert run.status == ProductionRunStatus.READY
 
     def test_run_cannot_start_from_non_queued(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -70,7 +109,7 @@ class TestSubjectProductionRun:
             run.start_running()
 
     def test_run_mark_needs_review(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -81,13 +120,13 @@ class TestSubjectProductionRun:
             message="QA checks did not pass",
         )
 
-        assert run.status == SubjectProductionStatus.NEEDS_REVIEW
+        assert run.status == ProductionRunStatus.NEEDS_REVIEW
         assert run.error_code == "qa_failed"
         assert run.error_message is not None
         assert "QA" in run.error_message
 
     def test_run_mark_failed(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -98,7 +137,7 @@ class TestSubjectProductionRun:
             message="An unrecoverable error occurred",
         )
 
-        assert run.status == SubjectProductionStatus.FAILED
+        assert run.status == ProductionRunStatus.FAILED
         assert run.error_code == "critical_error"
 
 
@@ -252,19 +291,19 @@ class TestProductionWorkflow:
         subject_id = uuid4()
         edition_id = uuid4()
 
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=subject_id,
             edition_id=edition_id,
         )
 
-        assert run.current_stage is SubjectProductionStage.SOURCES
+        assert run.current_stage is ProductionStage.SOURCES
 
         stages = [
-            SubjectProductionStage.SOURCES,
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.EXTRACTION,
-            SubjectProductionStage.SYNTHESIS,
-            SubjectProductionStage.ASSEMBLY,
+            ProductionStage.SOURCES,
+            ProductionStage.REFERENCES,
+            ProductionStage.EXTRACTION,
+            ProductionStage.SYNTHESIS,
+            ProductionStage.ASSEMBLY,
         ]
 
         for stage in stages:
@@ -272,7 +311,7 @@ class TestProductionWorkflow:
             run.advance_stage()
 
         # advance_stage() is a no-op past the last stage
-        assert run.current_stage is SubjectProductionStage.ASSEMBLY  # type: ignore[comparison-overlap]
+        assert run.current_stage is ProductionStage.ASSEMBLY  # type: ignore[comparison-overlap]
 
     def test_batch_sequential_execution(self) -> None:
         edition_id = uuid4()

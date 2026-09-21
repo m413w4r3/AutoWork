@@ -22,7 +22,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.domain.jobs import Job, JobStatus
-from cti_app.domain.production import SubjectProductionStage
+from cti_app.domain.production import ProductionStage
 from tests.job_support import InMemoryJobUnitOfWork, InMemoryJobUnitOfWorkFactory
 
 
@@ -338,7 +338,7 @@ async def test_durable_kind_recovery_resumes_same_attempt_without_registry_looku
 async def test_production_recovery_resumes_the_same_business_attempt() -> None:
     factory = InMemoryJobUnitOfWorkFactory()
     service = JobService(factory, create_job_registry())
-    kind = stage_job_kind(SubjectProductionStage.SOURCES)
+    kind = stage_job_kind(ProductionStage.SOURCES)
     job = Job(
         kind=kind,
         aggregate_type="subject",
@@ -347,7 +347,7 @@ async def test_production_recovery_resumes_the_same_business_attempt() -> None:
         correlation_id="test",
         input_parameters={
             "run_id": str(uuid4()),
-            "expected_stage": SubjectProductionStage.SOURCES.value,
+            "expected_stage": ProductionStage.SOURCES.value,
             "pipeline_generation": 0,
         },
         max_attempts=3,

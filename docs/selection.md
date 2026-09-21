@@ -98,6 +98,16 @@ La réponse contient la `SelectionDecision`, l’état effectif et, pour `SELECT
 stable ainsi que le `SubjectDiscoveryOrigin`. Les routes de Selection n’exposent aucune action
 de merge, split, composition de lot ou lancement de production.
 
-La route `/api/editions/{edition_id}/production` choisit le `subject_id` du prochain batch parmi
-les `Subject` matérialisés et applique ses propres règles de cadence. Ce choix appartient à
-Production, pas à Selection.
+Selection ne choisit jamais le prochain lot et ne lance aucune production. La surface Production
+lit séparément son `ProductionBoard` via `GET /api/editions/{edition_id}/production`, puis envoie
+explicitement les identifiants canoniques :
+
+```text
+POST /api/editions/{edition_id}/production/batches
+Idempotency-Key: <clé du lot>
+{"subject_ids": ["<subject-a>", "<subject-b>"]}
+```
+
+Production ne rappelle donc aucune route Selection. Le board retourne `200` même sans sujet et une
+édition `ARCHIVED` reste en lecture seule. Le batch conserve l’ordre du payload, rejoue exactement
+le même résultat sous la même clé et refuse une clé/empreinte incompatible avec un batch actif.

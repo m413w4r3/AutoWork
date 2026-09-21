@@ -34,6 +34,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   const openedSubjects: string[] = [];
   const seenPaths: string[] = [];
   let productionPostBody: unknown = null;
+  let productionSurfaceVisited = false;
 
   const edition = () => ({
     id: editionId,
@@ -124,6 +125,36 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     started_at: "2026-08-29T00:02:00Z",
     finished_at: status === "completed" ? "2026-08-29T00:10:00Z" : null,
   });
+
+  const productionBoard = (
+    activeBatch: ReturnType<typeof batchState> | null,
+    recentBatches: readonly ReturnType<typeof batchState>[],
+  ) => {
+    const active = activeBatch !== null;
+    const completed = recentBatches.length > 0;
+    const subject = (subjectId: string, title: string) => ({
+      subject_id: subjectId,
+      title,
+      tlp: "AMBER",
+      latest_run_id:
+        active || completed ? (subjectId === subjectA ? runA : runB) : null,
+      latest_run_number: active || completed ? 1 : null,
+      latest_status: active ? "running" : completed ? "ready" : null,
+      latest_stage: active ? "sources" : completed ? "assembly" : null,
+      active_run_id: active ? (subjectId === subjectA ? runA : runB) : null,
+      can_start: !active,
+      blocking_reason: active ? "production_batch_active" : null,
+    });
+    return {
+      edition_id: editionId,
+      subjects: [
+        subject(subjectA, "Article A"),
+        subject(subjectB, "Article B"),
+      ],
+      active_batch: activeBatch,
+      recent_batches: recentBatches,
+    };
+  };
 
   const review = {
     edition_id: editionId,
@@ -264,6 +295,12 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     const url = new URL(request.url());
     const path = url.pathname;
     seenPaths.push(`${request.method()} ${path}`);
+    if (
+      productionSurfaceVisited &&
+      path.startsWith(`/api/editions/${editionId}/selection`)
+    ) {
+      throw new Error("Production surface called the Selection API");
+    }
 
     if (path === `/api/editions/${editionId}`) {
       await route.fulfill({ json: edition() });
@@ -278,13 +315,17 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       return;
     }
     if (path === `/api/editions/${editionId}/selection`) {
+      if (productionSurfaceVisited) {
+        throw new Error("Production surface called the Selection API");
+      }
       await route.fulfill({ json: selectionBoard() });
       return;
     }
     if (
-      path === `/api/editions/${editionId}/production` &&
+      path === `/api/editions/${editionId}/production/batches` &&
       request.method() === "POST"
     ) {
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
       productionPostBody = request.postDataJSON();
       batchStarted = true;
       await route.fulfill({
@@ -295,21 +336,28 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     }
     if (path === `/api/editions/${editionId}/production`) {
       if (!batchStarted) {
-        await route.fulfill({ status: 404, json: {} });
+        await route.fulfill({ json: productionBoard(null, []) });
         return;
       }
       batchReads += 1;
       if (batchReads === 1) {
         await route.fulfill({
-          json: batchState("running", "queued", 0, "running"),
+          json: productionBoard(
+            batchState("running", "queued", 0, "running"),
+            [],
+          ),
         });
       } else if (batchReads === 2) {
         await route.fulfill({
-          json: batchState("ready", "running", 1, "running"),
+          json: productionBoard(
+            batchState("ready", "running", 1, "running"),
+            [],
+          ),
         });
       } else {
+        const completedBatch = batchState("ready", "ready", 2, "completed");
         await route.fulfill({
-          json: batchState("ready", "ready", 2, "completed"),
+          json: productionBoard(null, [completedBatch]),
         });
       }
       return;
@@ -402,7 +450,15 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       /^\/api\/subjects\/([^/]+)\/production$/,
     );
     if (productionMatch) {
-      await route.fulfill({ json: productionStatus(productionMatch[1]) });
+      const status = productionStatus(productionMatch[1]);
+      expect(Object.keys(status.stages)).toEqual([
+        "sources",
+        "references",
+        "extraction",
+        "synthesis",
+        "assembly",
+      ]);
+      await route.fulfill({ json: status });
       return;
     }
     await route.fulfill({ status: 404, json: {} });
@@ -426,6 +482,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await expect(page.getByRole("link", { name: "Sujet créé" })).toHaveCount(2);
 
   // 2. The batch composition is chosen on /production only.
+  productionSurfaceVisited = true;
   await page.goto(`/editions/${editionId}/production`);
   const selector = page.getByRole("region", {
     name: "Sélecteur du lot de production",
@@ -511,7 +568,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
 
   expect(seenPaths).toEqual(
     expect.arrayContaining([
-      `POST /api/editions/${editionId}/production`,
+      `POST /api/editions/${editionId}/production/batches`,
       `GET /api/editions/${editionId}/production`,
       `GET /api/editions/${editionId}/review`,
       `POST /api/editions/${editionId}/publication/accept`,
@@ -521,4 +578,6 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       `GET /api/subjects/${subjectA}/production`,
     ]),
   );
+  expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
+  expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

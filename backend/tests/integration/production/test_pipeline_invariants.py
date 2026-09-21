@@ -22,7 +22,6 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from cti_app.api.production import _create_and_start_run
 from cti_app.api.production import router as production_router
 from cti_app.application.model_gateway import (
     ModelGatewayError,
@@ -54,9 +53,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionReconciliationRequiredError,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
@@ -274,7 +273,7 @@ def _configure_prince_topology(
 async def _state(scenario: ProductionScenario) -> tuple[Any, list[Any], Any, Any]:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(scenario.run_id)
+        run = await uow.production_runs.get(scenario.run_id)
         artifacts = list(await uow.production_artifacts.list_for_run(scenario.run_id))
         item = await uow.edition_production_batch_items.get_by_run(scenario.run_id)
         batch = await uow.edition_production_batches.get(item.batch_id) if item else None
@@ -327,10 +326,16 @@ async def _production_api_views(
         transport=ASGITransport(app=app), base_url="http://production.test"
     ) as client:
         subject_response = await client.get(f"/api/subjects/{scenario.subject.id}/production")
-        batch_response = await client.get(f"/api/editions/{scenario.edition.id}/production")
+        board_response = await client.get(f"/api/editions/{scenario.edition.id}/production")
     assert subject_response.status_code == 200, subject_response.text
-    assert batch_response.status_code == 200, batch_response.text
-    return subject_response.json(), batch_response.json()
+    assert board_response.status_code == 200, board_response.text
+    board_view = board_response.json()
+    batch_view = board_view["active_batch"]
+    if batch_view is None:
+        recent_batches = board_view["recent_batches"]
+        assert recent_batches
+        batch_view = recent_batches[0]
+    return subject_response.json(), batch_view
 
 
 async def _assert_no_automatic_recovery(
@@ -418,11 +423,11 @@ async def test_pipeline_advances_only_after_verified_upstream_stage(
     await scenario.start()
 
     expected = (
-        (SubjectProductionStage.REFERENCES, None),
-        (SubjectProductionStage.EXTRACTION, ProductionArtifactStage.REFERENCES),
-        (SubjectProductionStage.SYNTHESIS, ProductionArtifactStage.EXTRACTION),
-        (SubjectProductionStage.ASSEMBLY, ProductionArtifactStage.SYNTHESIS),
-        (SubjectProductionStage.ASSEMBLY, ProductionArtifactStage.PUBLICATION),
+        (ProductionStage.REFERENCES, None),
+        (ProductionStage.EXTRACTION, ProductionArtifactStage.REFERENCES),
+        (ProductionStage.SYNTHESIS, ProductionArtifactStage.EXTRACTION),
+        (ProductionStage.ASSEMBLY, ProductionArtifactStage.SYNTHESIS),
+        (ProductionStage.ASSEMBLY, ProductionArtifactStage.PUBLICATION),
     )
     for next_stage, artifact_stage in expected:
         assert await scenario.runner.run_next()
@@ -445,7 +450,7 @@ async def test_pipeline_advances_only_after_verified_upstream_stage(
                 raise AssertionError(f"downstream artifact appeared before {artifact_stage.value}")
 
     run, artifacts, _, _ = await _state(scenario)
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     assert artifacts
     _assert_one_active_verified_per_stage(artifacts)
 
@@ -456,12 +461,12 @@ async def test_ready_requires_verified_publication_and_all_upstream_artifacts(
 ) -> None:
     scenario, urls = _configure(production_scenario_factory, 2)
     started = await scenario.start()
-    assert started.current_stage is SubjectProductionStage.SOURCES
+    assert started.current_stage is ProductionStage.SOURCES
     run = await scenario.run_until_terminal()
     persisted, artifacts, _, _ = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.status is ProductionRunStatus.READY
     by_stage = {artifact.stage: artifact for artifact in artifacts}
     assert {
         ProductionArtifactStage.REFERENCES,
@@ -494,9 +499,9 @@ async def test_archived_source_unavailable_live_does_not_block_publication(
     run = await scenario.run_until_terminal()
     persisted, artifacts, item, batch = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.status is SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.status is ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.ASSEMBLY
     assert persisted.error_code is None
     assert "q2_source_coverage_failed" not in str(persisted.error_details)
     assert not (persisted.error_details or {}).get("source_failures")
@@ -655,13 +660,13 @@ async def test_unavailable_source_without_archive_is_warning_not_pipeline_failur
         archive_s14=False,
     )
     started = await scenario.start()
-    assert started.current_stage is SubjectProductionStage.SOURCES
+    assert started.current_stage is ProductionStage.SOURCES
     run = await scenario.run_until_terminal()
     persisted, artifacts, item, batch = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.status is SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.status is ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.ASSEMBLY
     assert persisted.error_code is None
     assert "q2_source_coverage_failed" not in str(persisted.error_details)
     assert not (persisted.error_details or {}).get("source_failures")
@@ -753,11 +758,11 @@ async def test_unavailable_source_without_archive_is_warning_not_pipeline_failur
 @pytest.mark.parametrize("retryable", [False, None, True])
 def test_blocking_failure_controls_auto_recovery(retryable: bool | None) -> None:
     """A single non-affirmative blocking failure dominates aggregate recovery."""
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=UUID("00000000-0000-0000-0000-000000000001"),
         edition_id=UUID("00000000-0000-0000-0000-000000000002"),
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.EXTRACTION,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.EXTRACTION,
         error_code=ProductionRecoveryPolicyV1.Q2_SOURCE_COVERAGE_ERROR_CODE,
         error_details={
             "source_failures": {
@@ -814,8 +819,8 @@ async def test_source_skips_are_local_and_do_not_create_global_q2_failure(
     run = await scenario.run_until_terminal()
     persisted, artifacts, _, _ = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.ASSEMBLY
     assert persisted.error_code is None
     assert "q2_source_coverage_failed" not in str(persisted.error_details)
     progress = persisted.extraction_progress
@@ -856,8 +861,8 @@ async def test_reconciliation_is_exclusive_until_explicit_adoption(
     before_calls = len(_q2_calls(scenario))
     _, artifacts, item, batch = await _state(scenario)
 
-    assert review.status is SubjectProductionStatus.NEEDS_REVIEW
-    assert review.current_stage is SubjectProductionStage.EXTRACTION
+    assert review.status is ProductionRunStatus.NEEDS_REVIEW
+    assert review.current_stage is ProductionStage.EXTRACTION
     assert review.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
     assert review.requires_reconciliation
     assert item is not None and item.auto_recovery_count == 0
@@ -874,13 +879,13 @@ async def test_reconciliation_is_exclusive_until_explicit_adoption(
 
     service = SubjectProductionService(scenario.uow_factory)
     with pytest.raises(ProductionReconciliationRequiredError):
-        await service.retry_from_stage(review.id, SubjectProductionStage.EXTRACTION)
+        await service.retry_from_stage(review.id, ProductionStage.EXTRACTION)
     chain = ProductionStageChain()
     chain.bind(scenario.jobs, scenario.runner)
     with pytest.raises(ProductionReconciliationRequiredError):
         await chain.submit(
             run=review,
-            stage=SubjectProductionStage.EXTRACTION,
+            stage=ProductionStage.EXTRACTION,
             correlation_id="invariant-test",
         )
     assert len(_q2_calls(scenario)) == before_calls
@@ -948,7 +953,7 @@ async def test_archive_fallback_requires_one_prior_live_unavailable_attempt(
     await scenario.start()
     run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     q2_calls = _q2_calls(scenario)
     assert len(q2_calls) == 2
     live_call, fallback_call = q2_calls
@@ -1144,7 +1149,7 @@ async def test_retry_from_stage_stales_downstream_and_keeps_versions_monotonic(
 
     service = SubjectProductionService(scenario.uow_factory)
     await service.mark_failed(first.id, "operator_retry", "business retry")
-    retry = await service.retry_from_stage(first.id, SubjectProductionStage.EXTRACTION)
+    retry = await service.retry_from_stage(first.id, ProductionStage.EXTRACTION)
     assert retry.staled_artifacts == ["extraction", "synthesis", "publication"]
     _, stale_artifacts, _, _ = await _state(scenario)
     assert {
@@ -1169,13 +1174,13 @@ async def test_retry_from_stage_stales_downstream_and_keeps_versions_monotonic(
     chain.bind(scenario.jobs, scenario.runner)
     job_id = await chain.submit(
         run=retry.run,
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         correlation_id="invariant-retry",
     )
     assert job_id is not None
     await scenario.runner.run_until_idle()
     final, artifacts, _, _ = await _state(scenario)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert final.pipeline_generation == 1
     _assert_one_active_verified_per_stage(artifacts)
     active = {
@@ -1213,8 +1218,8 @@ async def test_cleanup_outcome_does_not_change_stage_business_status(
         run = await scenario.run_until_terminal()
     _, artifacts, _, _ = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert run.current_stage is ProductionStage.ASSEMBLY
     assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
     assert {artifact.stage for artifact in artifacts} == set(ProductionArtifactStage)
 
@@ -1260,11 +1265,11 @@ async def test_restart_reconstructs_the_same_business_decision_from_postgres_and
         restarted_final = await restarted.run_until_terminal()
         _, restarted_artifacts, _, _ = await _state(restarted)
 
-    assert uninterrupted_final.status is restarted_final.status is SubjectProductionStatus.READY
+    assert uninterrupted_final.status is restarted_final.status is ProductionRunStatus.READY
     assert (
         uninterrupted_final.current_stage
         is restarted_final.current_stage
-        is SubjectProductionStage.ASSEMBLY
+        is ProductionStage.ASSEMBLY
     )
     assert _artifact_stage_projection(uninterrupted_artifacts) == _artifact_stage_projection(
         restarted_artifacts
@@ -1303,14 +1308,12 @@ async def test_duplicate_posts_deliveries_and_worker_retries_have_one_logical_ef
 ) -> None:
     scenario, _ = _configure(production_scenario_factory, 1)
     await scenario.seed()
+    # One Idempotency-Key replayed concurrently: the batch primitive must
+    # settle on a single run and a single SOURCES job.
     results = await asyncio.gather(
         *(
-            _create_and_start_run(
-                scenario.uow_factory,
-                scenario.jobs,
-                scenario.runner,
-                subject_id=scenario.subject.id,
-                edition_id=scenario.edition.id,
+            scenario.start_run_idempotently(
+                idempotency_key=f"invariant-test-{scenario.subject.id}",
                 actor_id="invariant-test",
             )
             for _ in range(3)
@@ -1319,10 +1322,7 @@ async def test_duplicate_posts_deliveries_and_worker_retries_have_one_logical_ef
     scenario.run_id = results[0][0].id
     assert {result[0].id for result in results} == {scenario.run_id}
     jobs = await scenario.jobs.list_for_aggregate("subject", scenario.subject.id)
-    assert (
-        len([job for job in jobs if job.kind == stage_job_kind(SubjectProductionStage.SOURCES)])
-        == 1
-    )
+    assert len([job for job in jobs if job.kind == stage_job_kind(ProductionStage.SOURCES)]) == 1
 
     await scenario.runner.run_until_idle()
     before_run, before_artifacts, _, _ = await _state(scenario)
@@ -1330,18 +1330,18 @@ async def test_duplicate_posts_deliveries_and_worker_retries_have_one_logical_ef
     extraction_job = next(
         job
         for job in await scenario.jobs.list_for_aggregate("subject", scenario.subject.id)
-        if job.kind == stage_job_kind(SubjectProductionStage.EXTRACTION)
+        if job.kind == stage_job_kind(ProductionStage.EXTRACTION)
     )
     await scenario.runner.dispatch(extraction_job.id)
     await scenario.runner.dispatch(extraction_job.id)
     await scenario.runner.run_until_idle()
     after_run, after_artifacts, _, _ = await _state(scenario)
 
-    assert after_run.status is before_run.status is SubjectProductionStatus.READY
+    assert after_run.status is before_run.status is ProductionRunStatus.READY
     assert _artifact_projection(after_artifacts) == _artifact_projection(before_artifacts)
     assert scenario.model.calls == before_calls
     assert (
-        production_stage_idempotency_key(before_run, SubjectProductionStage.EXTRACTION)
+        production_stage_idempotency_key(before_run, ProductionStage.EXTRACTION)
         == extraction_job.idempotency_key
     )
 
@@ -1372,7 +1372,7 @@ async def test_compatible_success_checkpoint_adds_zero_provider_calls_for_source
         await scenario.start()
         run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     assert crashed_after_persist
     q2_logical_calls = [call for call in _q2_calls(scenario) if call.source_url == urls[0]]
     q2_provider_calls = [
@@ -1400,8 +1400,8 @@ async def test_no_q1_source_disappears_from_terminal_q2_progress(
     run = await scenario.run_until_terminal()
     persisted, _, _, _ = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
-    assert persisted.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
+    assert persisted.current_stage is ProductionStage.EXTRACTION
     _assert_terminal_source_categories(persisted, {f"S{index}" for index in range(1, 5)})
     progress = persisted.extraction_progress
     assert progress is not None

@@ -1,13 +1,16 @@
 import { useQuery, useMutation } from "@tanstack/react-query";
+import { useState } from "react";
 import {
+  getSubjectProductionRuns,
   resumeProduction,
   retryProductionStage,
-  startSubjectProduction,
+  startProductionBatch,
 } from "../api/production";
 import { cancelProductionRun } from "../api/publication";
 import type {
   ExtractionRejection,
   ExtractionRejections,
+  ProductionRunSummary,
   StageStatus,
 } from "../api/production";
 import {
@@ -20,28 +23,18 @@ import { subjectProductionQuery } from "../features/production/subjectProduction
 import { ExtractionProgressView } from "./ExtractionProgress";
 import { ProductionStageCard } from "./ProductionStageCard";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
+import {
+  STAGE_LABELS,
+  STATUS_LABELS,
+  productionErrorMessage,
+  retryTransientProductionFailure,
+} from "../features/production/productionLabels";
 
 interface SubjectProductionProps {
   subjectId: string;
+  editionId: string;
   onClose?: () => void;
 }
-
-const STATUS_LABELS: Record<string, string> = {
-  queued: "en attente",
-  running: "en cours",
-  ready: "prête",
-  needs_review: "à vérifier",
-  failed: "en échec",
-  cancelled: "annulée",
-};
-
-const STAGE_LABELS: Record<string, string> = {
-  sources: "Sources",
-  references: "Références",
-  extraction: "Extraction",
-  synthesis: "Synthèse",
-  assembly: "Assemblage",
-};
 
 // Resume plans name artifact stages, whose vocabulary differs from the
 // pipeline's on the last stage only: the assembly stage produces "publication".
@@ -161,8 +154,41 @@ function issueCopy(
     : "Échec de l’étape — consultez ses détails.";
 }
 
+function ProductionRunHistory({
+  runs,
+  isLoading,
+}: {
+  runs: ProductionRunSummary[] | undefined;
+  isLoading: boolean;
+}) {
+  const entries = Array.isArray(runs) ? runs : [];
+  return (
+    <section
+      className="production-run-history"
+      aria-labelledby="production-run-history-heading"
+    >
+      <h3 id="production-run-history-heading">Historique des runs</h3>
+      {isLoading ? <p role="status">Chargement de l’historique…</p> : null}
+      {!isLoading && entries.length === 0 ? (
+        <p className="empty-state">Aucun run de production.</p>
+      ) : null}
+      {entries.length > 0 ? (
+        <ol>
+          {entries.map((run) => (
+            <li key={run.run_id}>
+              Run {run.run_number} — {STATUS_LABELS[run.status]} —{" "}
+              {STAGE_LABELS[run.current_stage]}
+            </li>
+          ))}
+        </ol>
+      ) : null}
+    </section>
+  );
+}
+
 export function SubjectProduction({
   subjectId,
+  editionId,
   onClose,
 }: SubjectProductionProps) {
   const {
@@ -171,6 +197,13 @@ export function SubjectProduction({
     error,
     refetch,
   } = useQuery(subjectProductionQuery(subjectId));
+  const runs = useQuery({
+    queryKey: ["production-runs", subjectId],
+    queryFn: () => getSubjectProductionRuns(subjectId),
+  });
+  const [startIdempotencyKey, setStartIdempotencyKey] = useState<string | null>(
+    null,
+  );
 
   const retryStageMutation = useMutation({
     mutationFn: (stage: RetryStage) => retryProductionStage(subjectId, stage),
@@ -191,8 +224,13 @@ export function SubjectProduction({
   });
 
   const startMutation = useMutation({
-    mutationFn: () => startSubjectProduction(subjectId),
-    onSuccess: () => void refetch(),
+    mutationFn: (idempotencyKey: string) =>
+      startProductionBatch(editionId, [subjectId], idempotencyKey),
+    retry: retryTransientProductionFailure,
+    onSuccess: () => {
+      setStartIdempotencyKey(null);
+      void refetch();
+    },
   });
 
   if (isLoading)
@@ -206,9 +244,9 @@ export function SubjectProduction({
 
   // A failed run remains visible: its failed stage and recovery path matter.
   const restartable = !status || status.status === "cancelled";
-  // A run owned by an edition batch is repaired through that batch. Starting a
-  // standalone run here would create an article the batch never sees, so the
-  // backend refuses it and the page must not offer it either.
+  // A run owned by an edition batch is repaired through that batch's review.
+  // A new one-subject batch started here would not repair the batch item the
+  // review reads, so the page does not offer it.
   const batchOwned = Boolean(status?.batch_id);
   // Cancellation stops the pipeline without deleting anything, so a cancelled
   // run is continued from its first incomplete stage — inside its batch when
@@ -248,7 +286,10 @@ export function SubjectProduction({
         ) : null}
         {startMutation.error ? (
           <p className="error-message" role="alert">
-            {String(startMutation.error)}
+            {productionErrorMessage(
+              startMutation.error,
+              "La production n’a pas pu être démarrée.",
+            )}
           </p>
         ) : null}
         {resumeMutation.error ? (
@@ -274,7 +315,11 @@ export function SubjectProduction({
           <button
             className="button"
             disabled={startMutation.isPending}
-            onClick={() => startMutation.mutate()}
+            onClick={() => {
+              const idempotencyKey = startIdempotencyKey ?? crypto.randomUUID();
+              setStartIdempotencyKey(idempotencyKey);
+              startMutation.mutate(idempotencyKey);
+            }}
           >
             {startMutation.isPending
               ? "Démarrage…"
@@ -287,6 +332,7 @@ export function SubjectProduction({
           subjectId={subjectId}
           productionStatus={status ?? null}
         />
+        <ProductionRunHistory runs={runs.data} isLoading={runs.isPending} />
       </section>
     );
   }
@@ -579,6 +625,8 @@ export function SubjectProduction({
         subjectId={subjectId}
         productionStatus={status}
       />
+
+      <ProductionRunHistory runs={runs.data} isLoading={runs.isPending} />
 
       {presentedWarnings.length > 0 && (
         <section

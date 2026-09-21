@@ -25,12 +25,10 @@ async def test_database_rejects_verified_relationship_without_qualified_evidence
     edition.country = "Invariant Test"
     edition.country_code = "IV"
     batch = next(iter(fixture.batches.values()))
-    group = next(iter(fixture.groups.values()))
     source = batch.candidates[0].sources[0]
     collection = SourceCollection(
         subject_id=subject.id,
         edition_id=edition.id,
-        group_id=group.id,
         batch_id=batch.id,
         source_candidate_id=source.id,
         requested_url=source.canonical_url,
@@ -65,7 +63,6 @@ async def test_database_rejects_verified_relationship_without_qualified_evidence
             for run in model_runs:
                 await uow.model_runs.add(run)
             assert await uow.discovery_batches.add_if_absent(batch)
-            await uow.editorial_groups.add(group)
             assert await uow.source_collections.add_if_absent(collection)
             await uow.commit()
 

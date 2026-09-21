@@ -1,11 +1,5 @@
 import { expect, test } from "@playwright/test";
 
-import {
-  selectionWireBoard,
-  selectionWireItem,
-  selectionWireLastDecision,
-} from "./support/selectionWire";
-
 test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce sous-ensemble", async ({
   page,
 }) => {
@@ -19,33 +13,57 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   const runD = "f6666666-6666-4666-8666-666666666667";
   let productionPostBody: unknown = null;
   let batchStarted = false;
-
-  const itemFor = (title: string, subjectId: string) =>
-    selectionWireItem({
-      discovery_subject_id: subjectId,
-      title,
-      summary: `Résumé de ${title}`,
-      artifacts: ["ioc", "configurations"],
-      // Only `selected` with a non-null `subject_id` is eligible for a
-      // production batch — Selection already materialized the Subject.
-      effective_state: "selected",
-      subject_id: subjectId,
-      last_decision: selectionWireLastDecision({
-        id: `decision-${subjectId.slice(0, 4)}`,
-        subject_id: subjectId,
-      }),
-    });
-
-  const selection = selectionWireBoard({
-    edition_id: editionId,
-    snapshot_id: "99999999-9999-4999-8999-999999999999",
-    items: [
-      itemFor("Article A", subjectA),
-      itemFor("Article B", subjectB),
-      itemFor("Article C", subjectC),
-      itemFor("Article D", subjectD),
-    ],
-  });
+  let selectionFetches = 0;
+  const subjects = [
+    {
+      subject_id: subjectA,
+      title: "Article A",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectB,
+      title: "Article B",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectC,
+      title: "Article C",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+    {
+      subject_id: subjectD,
+      title: "Article D",
+      tlp: "AMBER",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
+    },
+  ];
 
   const edition = () => ({
     id: editionId,
@@ -108,24 +126,39 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
     const path = new URL(request.url()).pathname;
     if (path === `/api/editions/${editionId}`)
       return route.fulfill({ json: edition() });
-    if (path === `/api/editions/${editionId}/selection`)
-      return route.fulfill({ json: selection });
     if (
-      path === `/api/editions/${editionId}/production` &&
+      path === `/api/editions/${editionId}/production/batches` &&
       request.method() === "POST"
     ) {
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
       productionPostBody = request.postDataJSON();
       batchStarted = true;
       return route.fulfill({ status: 202, json: batchStatus() });
     }
     if (path === `/api/editions/${editionId}/production`)
-      return batchStarted
-        ? route.fulfill({ json: batchStatus() })
-        : route.fulfill({ status: 404, json: {} });
+      return route.fulfill({
+        json: {
+          edition_id: editionId,
+          subjects: batchStarted
+            ? subjects.map((subject) => ({
+                ...subject,
+                can_start: false,
+                blocking_reason: "production_batch_active",
+              }))
+            : subjects,
+          active_batch: batchStarted ? batchStatus() : null,
+          recent_batches: [],
+        },
+      });
+    if (path === `/api/editions/${editionId}/selection`) {
+      selectionFetches += 1;
+      return route.fulfill({ status: 404, json: {} });
+    }
     return route.fulfill({ status: 404, json: {} });
   });
 
   await page.goto(`/editions/${editionId}/production`);
+  expect(selectionFetches).toBe(0);
 
   // The next-batch selector lives on /production, never on /selection.
   const selector = page.getByRole("region", {
@@ -160,4 +193,240 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
   await expect(tracked).toContainText("Article D");
   await expect(tracked).not.toContainText("Article A");
   await expect(tracked).not.toContainText("Article C");
+});
+
+test("Production : board vide retourné en 200", async ({ page }) => {
+  const editionId = "23232323-2323-4232-8232-232323232323";
+  let boardStatus = 0;
+  const requestedPaths: string[] = [];
+
+  await page.route("/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    requestedPaths.push(path);
+    if (path === `/api/editions/${editionId}`)
+      return route.fulfill({
+        status: 200,
+        json: {
+          id: editionId,
+          country: "France",
+          country_code: "FR",
+          period_start: "2026-08-01",
+          period_end: "2026-08-31",
+          tlp: "GREEN",
+          languages: ["fr"],
+          state: "open",
+          version: 1,
+          created_at: "2026-08-29T00:00:00Z",
+          updated_at: "2026-08-29T00:00:00Z",
+        },
+      });
+    if (path === `/api/editions/${editionId}/production`) {
+      boardStatus = 200;
+      return route.fulfill({
+        status: boardStatus,
+        json: {
+          edition_id: editionId,
+          subjects: [],
+          active_batch: null,
+          recent_batches: [],
+        },
+      });
+    }
+    return route.fulfill({ status: 404, json: {} });
+  });
+
+  await page.goto(`/editions/${editionId}/production`);
+  await expect.poll(() => boardStatus).toBe(200);
+  await expect(
+    page.getByRole("region", { name: "Sélecteur du lot de production" }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "Démarrer le lot de production" }),
+  ).toBeDisabled();
+  // The Production surface only knows the Production API.
+  expect(requestedPaths).toContain(`/api/editions/${editionId}/production`);
+  expect(requestedPaths.filter((path) => path.includes("/selection"))).toEqual(
+    [],
+  );
+});
+
+test("Production : replay exact, payload différent et nouvelle clé pendant un batch actif", async ({
+  page,
+}) => {
+  const editionId = "34343434-3434-4343-8343-343434343434";
+  const batchId = "e5555555-5555-4555-8555-555555555555";
+  const body = { subject_ids: ["a1111111-1111-4111-8111-111111111111"] };
+  const conflictingBody = {
+    subject_ids: ["b2222222-2222-4222-8222-222222222222"],
+  };
+  const firstKey = "aw009-replay-run";
+  const secondKey = "aw009-conflicting-run";
+  let calls = 0;
+
+  await page.route("/api/**", async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (
+      path === `/api/editions/${editionId}/production/batches` &&
+      request.method() === "POST"
+    ) {
+      calls += 1;
+      const key = request.headers()["idempotency-key"];
+      const payload = request.postDataJSON() as { subject_ids: string[] };
+      if (key === firstKey && calls <= 2) {
+        expect(payload).toEqual(body);
+        return route.fulfill({
+          status: calls === 1 ? 202 : 200,
+          json: {
+            batch_id: batchId,
+            status: "running",
+            subject_ids: body.subject_ids,
+          },
+        });
+      }
+      if (key === firstKey) {
+        expect(payload).toEqual(conflictingBody);
+        return route.fulfill({
+          status: 409,
+          json: {
+            detail: {
+              code: "production_idempotency_conflict",
+              subject_ids: [],
+            },
+          },
+        });
+      }
+      expect(key).toBe(secondKey);
+      expect(payload).toEqual(body);
+      return route.fulfill({
+        status: 409,
+        json: { detail: { code: "production_batch_active", subject_ids: [] } },
+      });
+    }
+    return route.fulfill({ status: 404, json: {} });
+  });
+
+  await page.goto("/");
+  const result = await page.evaluate(
+    async ({ url, payload, conflictingPayload, first, second }) => {
+      const post = (key: string) =>
+        fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": key,
+          },
+          body: JSON.stringify(payload),
+        }).then(async (response) => ({
+          status: response.status,
+          body: await response.json(),
+        }));
+      return {
+        first: await post(first),
+        replay: await post(first),
+        conflict: await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": first,
+          },
+          body: JSON.stringify(conflictingPayload),
+        }).then(async (response) => ({
+          status: response.status,
+          body: await response.json(),
+        })),
+        active: await post(second),
+      };
+    },
+    {
+      url: `/api/editions/${editionId}/production/batches`,
+      payload: body,
+      conflictingPayload: conflictingBody,
+      first: firstKey,
+      second: secondKey,
+    },
+  );
+
+  expect(result.first).toEqual({
+    status: 202,
+    body: {
+      batch_id: batchId,
+      status: "running",
+      subject_ids: body.subject_ids,
+    },
+  });
+  expect(result.replay).toEqual({
+    status: 200,
+    body: {
+      batch_id: batchId,
+      status: "running",
+      subject_ids: body.subject_ids,
+    },
+  });
+  expect(result.conflict).toEqual({
+    status: 409,
+    body: {
+      detail: { code: "production_idempotency_conflict", subject_ids: [] },
+    },
+  });
+  expect(result.active).toEqual({
+    status: 409,
+    body: { detail: { code: "production_batch_active", subject_ids: [] } },
+  });
+  expect(calls).toBe(4);
+});
+
+test("Production : édition archivée en lecture seule", async ({ page }) => {
+  const editionId = "45454545-4545-4454-8454-454545454545";
+
+  await page.route("/api/**", async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    if (path === `/api/editions/${editionId}`)
+      return route.fulfill({
+        json: {
+          id: editionId,
+          country: "France",
+          country_code: "FR",
+          period_start: "2026-08-01",
+          period_end: "2026-08-31",
+          tlp: "GREEN",
+          languages: ["fr"],
+          state: "archived",
+          version: 4,
+          created_at: "2026-08-29T00:00:00Z",
+          updated_at: "2026-08-29T00:00:00Z",
+        },
+      });
+    if (path === `/api/editions/${editionId}/production`)
+      return route.fulfill({
+        json: {
+          edition_id: editionId,
+          subjects: [
+            {
+              subject_id: "a1111111-1111-4111-8111-111111111111",
+              title: "Article archivé",
+              tlp: "GREEN",
+              latest_run_id: null,
+              latest_run_number: null,
+              latest_status: null,
+              latest_stage: null,
+              active_run_id: null,
+              can_start: false,
+              blocking_reason: "production_edition_archived",
+            },
+          ],
+          active_batch: null,
+          recent_batches: [],
+        },
+      });
+    return route.fulfill({ status: 404, json: {} });
+  });
+
+  await page.goto(`/editions/${editionId}/production`);
+  await expect(
+    page.getByRole("button", { name: "Démarrer le lot de production" }),
+  ).toHaveCount(0);
+  await expect(
+    page.getByRole("checkbox", { name: "Article archivé" }),
+  ).toBeDisabled();
 });

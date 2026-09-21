@@ -50,7 +50,7 @@ from cti_app.application.production_workflow import (
     _synthesis_input_hash,
 )
 from cti_app.application.subject_production import (
-    EditionProductionService,
+    ProductionBatchService,
     SubjectProductionService,
 )
 from cti_app.domain.classification import TLP
@@ -58,19 +58,21 @@ from cti_app.domain.collection import CollectionState, SourceCollection, SourceO
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     SourceCandidate,
-    SourceRelationshipStatus,
     SourceRole,
 )
-from cti_app.domain.editions import Edition, EditionStatus
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryMergeRun,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
+    DiscoverySubjectIdentity,
+    MergeValidationStatus,
 )
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import SourceDocument, Subject
 from cti_app.domain.model_runs import (
     ModelBackend,
@@ -88,9 +90,14 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionReuseInvalidation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
+)
+from cti_app.domain.selection import (
+    SelectionAction,
+    SelectionDecision,
+    SubjectDiscoveryOrigin,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore
@@ -183,7 +190,7 @@ def _production_context_entities(
     subject: Subject,
     discovery_run_id: UUID,
     title: str = "Production subject",
-) -> tuple[DiscoveryBatch, EditorialGroup, SourceCandidate]:
+) -> tuple[DiscoveryBatch, SourceCandidate]:
     source = SourceCandidate(
         url=f"https://example.test/{subject.slug}",
         title=f"{title} source",
@@ -231,28 +238,109 @@ def _production_context_entities(
         source_coverage_complete=True,
         source_coverage_incomplete_reason=None,
     )
-    group = EditorialGroup(
-        edition_id=edition.id,
-        title=title,
-        candidate_references=(CandidateReference(batch.id, candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=EditorialScore(
-            impact=3,
-            novelty=3,
-            technical_depth=3,
-            hunting_potential=3,
-            actionability=3,
-            source_quality=3,
-            justifications={},
-        ),
-        source_relationship_status=SourceRelationshipStatus.VERIFIED,
-        needs_source_verification=False,
-        needs_source_expansion=False,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="A stable functional subject for reuse.",
-    )
-    group.select(subject.id)
-    return batch, group, source
+    return batch, source
+
+
+async def _seed_subject_discovery_lineage(
+    uow_factory: UnitOfWorkFactory,
+    *,
+    edition: Edition,
+    subject_batches: tuple[tuple[Subject, DiscoveryBatch], ...],
+) -> None:
+    """Persist the lineage Production resolves to freeze a run's input.
+
+    Production reads Subject → SubjectDiscoveryOrigin → canonical identity →
+    active DiscoverySnapshot → DiscoveryCandidate, so every one of those rows
+    must really exist here, with its foreign keys satisfied.
+
+    The snapshot is intentionally shared by every subject passed in. This
+    mirrors the Fusion projection for an edition and keeps all source runs
+    anchored to the same active discovery identity.
+    """
+    assert subject_batches
+    async with uow_factory() as uow:
+        persisted_candidates: list[tuple[Subject, DiscoveryBatch, DiscoveryCandidate]] = []
+        for subject, batch in subject_batches:
+            candidates = await uow.discovery_candidates.list_for_batch(batch.id)
+            assert len(candidates) == 1
+            persisted_candidates.append((subject, batch, candidates[0]))
+
+        merge_run = DiscoveryMergeRun(
+            edition_id=edition.id,
+            parent_snapshot_id=None,
+            intake_id=None,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            prompt_version="1",
+            policy_version="1",
+            blocking_version="1",
+            merge_input_hash=hashlib.sha256(
+                b"".join(
+                    subject.id.bytes + batch.id.bytes for subject, batch, _ in persisted_candidates
+                )
+            ).hexdigest(),
+            handle_map={},
+            included_subject_ids=tuple(subject.id for subject, _, _ in persisted_candidates),
+            excluded_subject_count=0,
+            validation_status=MergeValidationStatus.VALID,
+        )
+        assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+        await uow.discovery_subject_identities.add_many_if_absent(
+            [
+                DiscoverySubjectIdentity(
+                    edition_id=edition.id,
+                    origin_key=f"subject:{subject.id}",
+                    created_by_merge_run_id=merge_run.id,
+                    id=subject.id,
+                )
+                for subject, _, _ in persisted_candidates
+            ]
+        )
+        snapshot = DiscoverySnapshot(
+            edition_id=edition.id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=None,
+            merge_run_id=merge_run.id,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            subjects=tuple(
+                DiscoverySubject(
+                    subject_id=subject.id,
+                    candidate=discovery_candidate.to_candidate_topic(),
+                    member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                    created_at=discovery_candidate.created_at,
+                )
+                for subject, _, discovery_candidate in persisted_candidates
+            ),
+            snapshot_hash=hashlib.sha256(
+                b"".join(batch.id.bytes for _, batch, _ in persisted_candidates)
+            ).hexdigest(),
+            is_active=True,
+        )
+        await uow.discovery_snapshots.append(snapshot)
+        for subject, _, _ in persisted_candidates:
+            decision = SelectionDecision(
+                edition_id=edition.id,
+                discovery_subject_id=subject.id,
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                action=SelectionAction.SELECT,
+                subject_id=subject.id,
+                actor_id="reuse-integration",
+                correlation_id="reuse-integration",
+                idempotency_key=f"reuse-integration-{subject.id}",
+            )
+            await uow.selection_decisions.append(decision)
+            await uow.subject_discovery_origins.add(
+                SubjectDiscoveryOrigin(
+                    subject_id=subject.id,
+                    edition_id=edition.id,
+                    discovery_subject_id=subject.id,
+                    selection_decision_id=decision.id,
+                    selected_snapshot_id=snapshot.id,
+                    selected_snapshot_version=snapshot.version,
+                )
+            )
+        await uow.commit()
 
 
 async def _seed_computed_run(
@@ -262,7 +350,7 @@ async def _seed_computed_run(
     edition: Edition,
     subject: Subject,
     created_at: datetime,
-) -> tuple[SubjectProductionRun, dict[ProductionArtifactStage, ProductionArtifact]]:
+) -> tuple[ProductionRun, dict[ProductionArtifactStage, ProductionArtifact]]:
     # The logical edition repository may replace a freshly generated ID with
     # an existing edition's ID, so persist these parents before constructing
     # the run that references the final edition ID.
@@ -271,11 +359,11 @@ async def _seed_computed_run(
         await uow.subjects.add(subject)
         await uow.commit()
 
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         created_at=created_at,
         updated_at=created_at,
     )
@@ -317,30 +405,25 @@ async def _seed_computed_run(
         for stage, payloads in blobs.items()
     }
     async with uow_factory() as uow:
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         for artifact in artifacts.values():
             await uow.production_artifacts.append(artifact)
         await uow.commit()
     return run, artifacts
 
 
-async def _seed_reusable_article(
+async def _prepare_reusable_article(
     uow_factory: UnitOfWorkFactory,
-    store: ProductionArtifactStore,
     *,
     edition: Edition,
     subject: Subject,
     title: str,
-) -> tuple[
-    SubjectProductionRun,
-    dict[ProductionArtifactStage, ProductionArtifact],
-    ProductionArtifact,
-]:
-    """Create one complete first pass whose costly inputs can be reused."""
+) -> tuple[DiscoveryBatch, SourceCandidate]:
+    """Persist the discovery and archived-source context for one article."""
     discovery_run = await make_discovery_run_for_edition(
         uow_factory, edition, complementary_axis="reuse integration"
     )
-    batch, group, source = _production_context_entities(
+    batch, source = _production_context_entities(
         edition=edition,
         subject=subject,
         discovery_run_id=discovery_run.id,
@@ -360,7 +443,6 @@ async def _seed_reusable_article(
     collection = SourceCollection(
         subject_id=subject.id,
         edition_id=edition.id,
-        group_id=group.id,
         batch_id=batch.id,
         source_candidate_id=source.id,
         requested_url=source.url,
@@ -378,20 +460,36 @@ async def _seed_reusable_article(
     async with uow_factory() as uow:
         await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
-        await uow.editorial_groups.add(group)
         assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
+    return batch, source
 
+
+async def _seed_reusable_article(
+    uow_factory: UnitOfWorkFactory,
+    store: ProductionArtifactStore,
+    *,
+    edition: Edition,
+    subject: Subject,
+    title: str,
+    batch: DiscoveryBatch,
+    source: SourceCandidate,
+) -> tuple[
+    ProductionRun,
+    dict[ProductionArtifactStage, ProductionArtifact],
+    ProductionArtifact,
+]:
+    """Create one complete first pass whose costly inputs can be reused."""
     production = SubjectProductionService(uow_factory)
     source_run, created = await production.create_run(subject.id, edition.id)
     assert created
     source_run = await production.start_run(source_run.id)
     async with uow_factory() as uow:
-        persisted = await uow.subject_production_runs.get_for_update(source_run.id)
+        persisted = await uow.production_runs.get_for_update(source_run.id)
         assert persisted is not None
-        persisted.current_stage = SubjectProductionStage.ASSEMBLY
+        persisted.current_stage = ProductionStage.ASSEMBLY
         persisted.mark_ready()
-        await uow.subject_production_runs.save(persisted)
+        await uow.production_runs.save(persisted)
         await uow.commit()
         snapshot = await uow.production_input_snapshots.get_by_run(source_run.id)
     assert snapshot is not None
@@ -529,15 +627,15 @@ async def test_postgres_run_b_reuses_all_costly_artifacts_from_run_a(
         subject=subject,
         created_at=created_at,
     )
-    target_run = SubjectProductionRun(
+    target_run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
         run_number=2,
-        status=SubjectProductionStatus.RUNNING,
-        current_stage=SubjectProductionStage.REFERENCES,
+        status=ProductionRunStatus.RUNNING,
+        current_stage=ProductionStage.REFERENCES,
     )
     async with uow_factory() as uow:
-        await uow.subject_production_runs.add(target_run)
+        await uow.production_runs.add(target_run)
         await uow.commit()
 
     service = ProductionArtifactReuseService(uow_factory, store)
@@ -570,15 +668,15 @@ async def test_postgres_run_b_reuses_all_costly_artifacts_from_run_a(
 @pytest.mark.parametrize(
     ("from_stage", "references_allowed", "extraction_allowed"),
     (
-        (SubjectProductionStage.REFERENCES, False, False),
-        (SubjectProductionStage.EXTRACTION, True, False),
-        (SubjectProductionStage.SYNTHESIS, True, True),
+        (ProductionStage.REFERENCES, False, False),
+        (ProductionStage.EXTRACTION, True, False),
+        (ProductionStage.SYNTHESIS, True, True),
     ),
 )
 async def test_postgres_invalidation_blocks_only_downstream_stages(
     uow_factory: UnitOfWorkFactory,
     tmp_path: Path,
-    from_stage: SubjectProductionStage,
+    from_stage: ProductionStage,
     references_allowed: bool,
     extraction_allowed: bool,
 ) -> None:
@@ -612,14 +710,14 @@ async def test_postgres_invalidation_blocks_only_downstream_stages(
                 occurred_at=occurred_at,
             )
         )
-        target_run = SubjectProductionRun(
+        target_run = ProductionRun(
             subject_id=subject.id,
             edition_id=edition.id,
             run_number=2,
-            status=SubjectProductionStatus.RUNNING,
-            current_stage=SubjectProductionStage.REFERENCES,
+            status=ProductionRunStatus.RUNNING,
+            current_stage=ProductionStage.REFERENCES,
         )
-        await uow.subject_production_runs.add(target_run)
+        await uow.production_runs.add(target_run)
         await uow.commit()
 
     service = ProductionArtifactReuseService(uow_factory, store)
@@ -672,7 +770,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     discovery_run = await make_discovery_run_for_edition(
         uow_factory, edition, complementary_axis="reuse integration"
     )
-    batch, group, source = _production_context_entities(
+    batch, source = _production_context_entities(
         edition=edition,
         subject=subject,
         discovery_run_id=discovery_run.id,
@@ -691,7 +789,6 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     collection = SourceCollection(
         subject_id=subject.id,
         edition_id=edition.id,
-        group_id=group.id,
         batch_id=batch.id,
         source_candidate_id=source.id,
         requested_url=source.url,
@@ -750,21 +847,25 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     async with uow_factory() as uow:
         await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
-        await uow.editorial_groups.add(group)
         await uow.source_documents.add(source_document)
         assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
 
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subject_batches=((subject, batch),),
+    )
     production = SubjectProductionService(uow_factory)
     run_a, created_a = await production.create_run(subject.id, edition.id)
     assert created_a
     run_a = await production.start_run(run_a.id)
     async with uow_factory() as uow:
-        persisted_a = await uow.subject_production_runs.get_for_update(run_a.id)
+        persisted_a = await uow.production_runs.get_for_update(run_a.id)
         assert persisted_a is not None
-        persisted_a.current_stage = SubjectProductionStage.ASSEMBLY
+        persisted_a.current_stage = ProductionStage.ASSEMBLY
         persisted_a.mark_ready()
-        await uow.subject_production_runs.save(persisted_a)
+        await uow.production_runs.save(persisted_a)
         await uow.commit()
         snapshot_a = await uow.production_input_snapshots.get_by_run(run_a.id)
     assert snapshot_a is not None
@@ -900,17 +1001,17 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         artifact_store=store,
     )
     for stage in (
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
+        ProductionStage.REFERENCES,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
     ):
         result = await orchestrator.execute_stage(run_b.id, stage)
         assert result["status"] == "reused"
-        if stage is not SubjectProductionStage.SYNTHESIS:
+        if stage is not ProductionStage.SYNTHESIS:
             await production.advance_stage(run_b.id)
 
     await production.advance_stage(run_b.id)
-    assembly_result = await orchestrator.execute_stage(run_b.id, SubjectProductionStage.ASSEMBLY)
+    assembly_result = await orchestrator.execute_stage(run_b.id, ProductionStage.ASSEMBLY)
     assert assembly_result["status"] == "success"
 
     async with uow_factory() as uow:
@@ -918,9 +1019,9 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             artifact.stage: artifact
             for artifact in await uow.production_artifacts.list_for_run(run_b.id)
         }
-        persisted_b = await uow.subject_production_runs.get(run_b.id)
+        persisted_b = await uow.production_runs.get(run_b.id)
     assert persisted_b is not None
-    assert persisted_b.status is SubjectProductionStatus.READY
+    assert persisted_b.status is ProductionRunStatus.READY
     for stage, source_artifact in source_artifacts.items():
         reused = artifacts_b[stage]
         assert reused.id != source_artifact.id
@@ -934,12 +1035,12 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert publication_b.reused_from_artifact_id is None
     assert publication_b.id != publication_a.id
 
-    retry = await production.retry_from_stage(run_b.id, SubjectProductionStage.EXTRACTION)
-    assert retry.previous_status is SubjectProductionStatus.READY
-    assert retry.run.status is SubjectProductionStatus.RUNNING
-    assert retry.run.current_stage is SubjectProductionStage.EXTRACTION
+    retry = await production.retry_from_stage(run_b.id, ProductionStage.EXTRACTION)
+    assert retry.previous_status is ProductionRunStatus.READY
+    assert retry.run.status is ProductionRunStatus.RUNNING
+    assert retry.run.current_stage is ProductionStage.EXTRACTION
     assert retry.run.pipeline_generation == persisted_b.pipeline_generation + 1
-    assert retry.run.force_recompute_from_stage is SubjectProductionStage.EXTRACTION
+    assert retry.run.force_recompute_from_stage is ProductionStage.EXTRACTION
     assert retry.staled_artifacts == ["extraction", "synthesis", "publication"]
 
     async with uow_factory() as uow:
@@ -983,30 +1084,24 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         artifact_store=store,
     )
 
-    extraction_retry = await retry_orchestrator.execute_stage(
-        run_b.id, SubjectProductionStage.EXTRACTION
-    )
+    extraction_retry = await retry_orchestrator.execute_stage(run_b.id, ProductionStage.EXTRACTION)
     assert extraction_retry["status"] == "success"
     extraction_technical_replay = await retry_orchestrator.execute_stage(
-        run_b.id, SubjectProductionStage.EXTRACTION
+        run_b.id, ProductionStage.EXTRACTION
     )
     assert extraction_technical_replay["status"] == "cached"
     assert len(retry_adapter.calls) == 1
     await production.advance_stage(run_b.id)
 
-    synthesis_retry = await retry_orchestrator.execute_stage(
-        run_b.id, SubjectProductionStage.SYNTHESIS
-    )
+    synthesis_retry = await retry_orchestrator.execute_stage(run_b.id, ProductionStage.SYNTHESIS)
     assert synthesis_retry["status"] == "success"
     synthesis_technical_replay = await retry_orchestrator.execute_stage(
-        run_b.id, SubjectProductionStage.SYNTHESIS
+        run_b.id, ProductionStage.SYNTHESIS
     )
     assert synthesis_technical_replay["status"] == "cached"
     assert len(retry_adapter.calls) == 2
     await production.advance_stage(run_b.id)
-    retry_assembly = await retry_orchestrator.execute_stage(
-        run_b.id, SubjectProductionStage.ASSEMBLY
-    )
+    retry_assembly = await retry_orchestrator.execute_stage(run_b.id, ProductionStage.ASSEMBLY)
     assert retry_assembly["status"] == "success"
 
     async with uow_factory() as uow:
@@ -1014,9 +1109,9 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             artifact.stage: artifact
             for artifact in await uow.production_artifacts.list_for_run(run_b.id)
         }
-        persisted_b = await uow.subject_production_runs.get(run_b.id)
+        persisted_b = await uow.production_runs.get(run_b.id)
     assert persisted_b is not None
-    assert persisted_b.status is SubjectProductionStatus.READY
+    assert persisted_b.status is ProductionRunStatus.READY
     assert artifacts_b[ProductionArtifactStage.REFERENCES].id == (
         stale_artifacts[ProductionArtifactStage.REFERENCES].id
     )
@@ -1094,18 +1189,47 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         await uow.commit()
 
     source_publications: list[ProductionArtifact] = []
+    prepared_articles: list[tuple[DiscoveryBatch, SourceCandidate]] = []
     for subject, title in zip(subjects, ("Article A", "Article B"), strict=True):
+        prepared_articles.append(
+            await _prepare_reusable_article(
+                uow_factory,
+                edition=edition,
+                subject=subject,
+                title=title,
+            )
+        )
+
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subject_batches=tuple(
+            (subject, batch)
+            for subject, (batch, _) in zip(subjects, prepared_articles, strict=True)
+        ),
+    )
+
+    for subject, title, (article_batch, source) in zip(
+        subjects, ("Article A", "Article B"), prepared_articles, strict=True
+    ):
         _source_run, _, source_publication = await _seed_reusable_article(
             uow_factory,
             store,
             edition=edition,
             subject=subject,
             title=title,
+            batch=article_batch,
+            source=source,
         )
         source_publications.append(source_publication)
 
-    batch_service = EditionProductionService(uow_factory)
-    batch = await batch_service.create_batch(edition.id, [subject.id for subject in subjects])
+    batch_service = ProductionBatchService(uow_factory)
+    created = await batch_service.create(
+        edition.id,
+        [subject.id for subject in subjects],
+        idempotency_key=f"reuse-postgres-{edition.id.hex}",
+    )
+    batch = created.batch
     first = await batch_service.start_next(batch.id)
     assert first is not None
     assert first.subject_id == subjects[0].id
@@ -1113,11 +1237,11 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     async with uow_factory() as uow:
         batch_items = await uow.edition_production_batch_items.list_for_batch(batch.id)
         queued_runs = [
-            await uow.subject_production_runs.get(item.production_run_id) for item in batch_items
+            await uow.production_runs.get(item.production_run_id) for item in batch_items
         ]
     assert [run.status for run in queued_runs if run is not None] == [
-        SubjectProductionStatus.RUNNING,
-        SubjectProductionStatus.QUEUED,
+        ProductionRunStatus.RUNNING,
+        ProductionRunStatus.QUEUED,
     ]
     second_id = batch_items[1].production_run_id
 
@@ -1141,24 +1265,24 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     async def execute_cached(run_id: UUID) -> None:
         await SubjectProductionService(uow_factory).advance_stage(run_id)
         for stage in (
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.EXTRACTION,
-            SubjectProductionStage.SYNTHESIS,
+            ProductionStage.REFERENCES,
+            ProductionStage.EXTRACTION,
+            ProductionStage.SYNTHESIS,
         ):
             result = await orchestrator.execute_stage(run_id, stage)
             cached_results.append(result)
             assert result["status"] == "reused"
-            if stage is not SubjectProductionStage.SYNTHESIS:
+            if stage is not ProductionStage.SYNTHESIS:
                 await SubjectProductionService(uow_factory).advance_stage(run_id)
         await SubjectProductionService(uow_factory).advance_stage(run_id)
-        assembly_result = await orchestrator.execute_stage(run_id, SubjectProductionStage.ASSEMBLY)
+        assembly_result = await orchestrator.execute_stage(run_id, ProductionStage.ASSEMBLY)
         assert assembly_result["status"] == "success"
 
     await execute_cached(first.id)
     second = await batch_service.on_subject_terminal(batch.id, first.id)
     assert second is not None
     assert second.id == second_id
-    assert second.status is SubjectProductionStatus.RUNNING
+    assert second.status is ProductionRunStatus.RUNNING
     await execute_cached(second.id)
     assert await batch_service.on_subject_terminal(batch.id, second.id) is None
     assert len(cached_results) == 6

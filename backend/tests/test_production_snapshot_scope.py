@@ -21,8 +21,8 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
-    SubjectProductionRun,
-    SubjectProductionStage,
+    ProductionRun,
+    ProductionStage,
 )
 
 
@@ -43,9 +43,7 @@ class _Uow:
         items: Sequence[SourceCollection],
         *,
         subject: object | None = None,
-        group: object | None = None,
         edition: object | None = None,
-        batches: Sequence[object] = (),
     ) -> None:
         self.source_collections = _Collections(items)
         self.subjects = SimpleNamespace(
@@ -55,11 +53,7 @@ class _Uow:
                 else SimpleNamespace(title="Subject", edition_id=uuid4())
             )
         )
-        self.editorial_groups = SimpleNamespace(get_by_subject=AsyncMock(return_value=group))
         self.editions = SimpleNamespace(get=AsyncMock(return_value=edition))
-        self.discovery_batches = SimpleNamespace(
-            list_for_edition=AsyncMock(return_value=list(batches))
-        )
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -91,7 +85,6 @@ def _source(subject_id: UUID, url: str, *, origin: SourceOriginKind) -> SourceCo
     return SourceCollection(
         subject_id=subject_id,
         edition_id=uuid4(),
-        group_id=uuid4(),
         requested_url=url,
         proposed_role=SourceRole.PRIMARY,
         origin_kind=origin,
@@ -100,22 +93,28 @@ def _source(subject_id: UUID, url: str, *, origin: SourceOriginKind) -> SourceCo
 
 
 def _snapshot(subject_id: UUID, url: str, *, allowed: bool = True) -> ProductionInputSnapshot:
+    candidate_id = uuid4()
     return ProductionInputSnapshot(
         production_run_id=uuid4(),
         subject_id=subject_id,
         edition_id=uuid4(),
-        editorial_group_id=uuid4(),
-        editorial_group_version=1,
+        subject_version=1,
         subject_title="Subject",
-        subject_description="Description",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(candidate_id,),
+        discovery_summary="Description",
         actor_or_campaign="Actor",
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
         research_date=date(2026, 8, 28),
         core_sources=(
             ProductionInputSource(
-                batch_id=uuid4(),
-                candidate_id=uuid4(),
+                discovery_candidate_id=candidate_id,
                 source_candidate_id=uuid4(),
                 canonical_url=url,
                 role=SourceRole.PRIMARY,
@@ -130,15 +129,45 @@ def _snapshot(subject_id: UUID, url: str, *, allowed: bool = True) -> Production
     )
 
 
+class _LineageUow:
+    """Only the repositories the discovery lineage resolution really reads."""
+
+    def __init__(
+        self,
+        *,
+        subject: object,
+        origin: object,
+        canonical_id: UUID,
+        snapshot: object,
+        candidates: Sequence[object],
+        edition: object,
+    ) -> None:
+        self.subjects = SimpleNamespace(get=AsyncMock(return_value=subject))
+        self.subject_discovery_origins = SimpleNamespace(
+            get_by_subject=AsyncMock(return_value=origin)
+        )
+        self.discovery_subject_identities = SimpleNamespace(
+            resolve_canonical_subject=AsyncMock(return_value=canonical_id)
+        )
+        self.discovery_snapshots = SimpleNamespace(get_active=AsyncMock(return_value=snapshot))
+        self.discovery_candidates = SimpleNamespace(
+            list_for_edition=AsyncMock(return_value=list(candidates))
+        )
+        self.editions = SimpleNamespace(get=AsyncMock(return_value=edition))
+
+
 @pytest.mark.asyncio
-async def test_new_snapshot_uses_subject_title_and_edition_with_editorial_provenance() -> None:
+async def test_new_snapshot_freezes_the_active_discovery_lineage() -> None:
     subject_id = uuid4()
     edition_id = uuid4()
-    batch_id = uuid4()
+    origin_discovery_subject_id = uuid4()
+    canonical_discovery_subject_id = uuid4()
     candidate_id = uuid4()
+    selection_decision_id = uuid4()
+    discovery_snapshot_id = uuid4()
     source = SimpleNamespace(
         id=uuid4(),
-        canonical_url="https://example.test/editorial-source",
+        canonical_url="https://example.test/candidate-source",
         role=SourceRole.PRIMARY,
         title="Candidate source",
         publisher="Publisher",
@@ -149,31 +178,40 @@ async def test_new_snapshot_uses_subject_title_and_edition_with_editorial_proven
     )
     candidate = SimpleNamespace(
         id=candidate_id,
-        sources=(source,),
+        discovery_batch_id=uuid4(),
         actor_or_campaign="Campaign X",
-        actors=("Actor Y",),
-        campaigns=(),
+        evidence=SimpleNamespace(actors=("Actor Y",), campaigns=(), sources=(source,)),
     )
-    group = SimpleNamespace(
-        id=uuid4(),
+    discovery_snapshot = SimpleNamespace(
+        id=discovery_snapshot_id,
         version=7,
-        title="Titre historique du groupe",
-        grouping_justification="Provenance éditoriale conservée",
-        candidate_references=(SimpleNamespace(batch_id=batch_id, candidate_id=candidate_id),),
+        subjects=(
+            SimpleNamespace(
+                subject_id=canonical_discovery_subject_id,
+                member_references=(SimpleNamespace(candidate_id=candidate_id),),
+                candidate=SimpleNamespace(summary="Résumé Discovery canonique"),
+            ),
+        ),
     )
-    edition = SimpleNamespace(
-        period_start=date(2026, 8, 1),
-        period_end=date(2026, 8, 31),
-    )
-    uow = _Uow(
-        [],
+    edition = SimpleNamespace(period_start=date(2026, 8, 1), period_end=date(2026, 8, 31))
+    uow = _LineageUow(
         subject=SimpleNamespace(
+            id=subject_id,
             title="Titre canonique du Subject",
             edition_id=edition_id,
+            version=3,
+            tlp=TLP.AMBER,
         ),
-        group=group,
+        origin=SimpleNamespace(
+            subject_id=subject_id,
+            edition_id=edition_id,
+            discovery_subject_id=origin_discovery_subject_id,
+            selection_decision_id=selection_decision_id,
+        ),
+        canonical_id=canonical_discovery_subject_id,
+        snapshot=discovery_snapshot,
+        candidates=[candidate],
         edition=edition,
-        batches=[SimpleNamespace(id=batch_id, candidates=(candidate,))],
     )
 
     snapshot = await capture_production_input_snapshot(
@@ -186,13 +224,21 @@ async def test_new_snapshot_uses_subject_title_and_edition_with_editorial_proven
     )
 
     assert snapshot.subject_title == "Titre canonique du Subject"
+    assert snapshot.subject_version == 3
+    assert snapshot.subject_tlp is TLP.AMBER
     assert snapshot.edition_id == edition_id
     assert snapshot.period_start == edition.period_start
     assert snapshot.period_end == edition.period_end
-    assert snapshot.editorial_group_id == group.id
-    assert snapshot.editorial_group_version == 7
-    assert snapshot.subject_description == "Provenance éditoriale conservée"
-    assert snapshot.actor_or_campaign == "Actor Y · Campaign X"
+    assert snapshot.selection_decision_id == selection_decision_id
+    assert snapshot.origin_discovery_subject_id == origin_discovery_subject_id
+    assert snapshot.canonical_discovery_subject_id == canonical_discovery_subject_id
+    assert snapshot.discovery_snapshot_id == discovery_snapshot_id
+    assert snapshot.discovery_snapshot_version == 7
+    assert snapshot.member_candidate_ids == (candidate_id,)
+    assert snapshot.discovery_summary == "Résumé Discovery canonique"
+    assert snapshot.actor_or_campaign == "Campaign X · Actor Y"
+    assert [item.canonical_url for item in snapshot.core_sources] == [source.canonical_url]
+    assert snapshot.core_sources[0].discovery_candidate_id == candidate_id
 
 
 @pytest.mark.asyncio
@@ -285,9 +331,6 @@ async def test_snapshot_context_excludes_out_of_scope_policy_and_supporting_sour
             current_reference,
         ]
     )
-    uow.editorial_groups.get_by_subject = AsyncMock(
-        return_value=SimpleNamespace(title="Subject", grouping_justification="Description")
-    )
     q1 = await build_subject_production_context(
         cast(Any, uow),
         subject_id,
@@ -326,10 +369,10 @@ async def test_sources_stage_counts_only_snapshot_sources() -> None:
     )
     orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
     orchestrator._collection_service = cast(Any, collection_service)
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.SOURCES,
+        current_stage=ProductionStage.SOURCES,
     )
 
     result = await orchestrator._execute_sources_stage(run, cast(Any, _Context()), snapshot)
@@ -357,7 +400,7 @@ async def test_sources_stage_preserves_retryable_collection_failure() -> None:
 
     orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
     orchestrator._collection_service = cast(Any, CollectionService())
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=uuid4())
+    run = ProductionRun(subject_id=subject_id, edition_id=uuid4())
 
     result = await orchestrator._execute_sources_stage(run, cast(Any, _Context()))
 
@@ -377,7 +420,7 @@ async def test_archived_source_outside_snapshot_cannot_make_sources_succeed() ->
     )
     orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
     orchestrator._collection_service = cast(Any, collection_service)
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
     )
@@ -444,7 +487,7 @@ async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
             ),
         ),
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject_id,
         edition_id=uuid4(),
     )
@@ -555,7 +598,7 @@ async def test_supplemental_failure_drops_only_unbacked_events_and_keeps_shared_
             ),
         ),
     )
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=uuid4())
+    run = ProductionRun(subject_id=subject_id, edition_id=uuid4())
 
     result = await orchestrator._integrate_reference_sources(run, report, _Context())
 

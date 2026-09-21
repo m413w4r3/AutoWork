@@ -1,4 +1,5 @@
 import type { EligibleSubject } from "./productionBatchSelection";
+import { blockingReasonLabel } from "../production/productionLabels";
 import { Link } from "../../routing";
 
 /**
@@ -13,13 +14,16 @@ export function ProductionBatchSelector({
   onToggle,
   onSelectAll,
   onSelectNone,
+  readOnly = false,
 }: {
   subjects: readonly EligibleSubject[];
   selected: ReadonlySet<string>;
   onToggle: (subjectId: string, checked: boolean) => void;
   onSelectAll: () => void;
   onSelectNone: () => void;
+  readOnly?: boolean;
 }) {
+  const startableSubjects = subjects.filter((subject) => subject.can_start);
   return (
     <section
       className="production-batch-selector"
@@ -34,7 +38,9 @@ export function ProductionBatchSelector({
             type="button"
             className="button button--secondary"
             disabled={
-              subjects.length === 0 || selected.size === subjects.length
+              readOnly ||
+              startableSubjects.length === 0 ||
+              selected.size === startableSubjects.length
             }
             onClick={onSelectAll}
           >
@@ -43,7 +49,7 @@ export function ProductionBatchSelector({
           <button
             type="button"
             className="button button--secondary"
-            disabled={selected.size === 0}
+            disabled={readOnly || selected.size === 0}
             onClick={onSelectNone}
           >
             Tout désélectionner
@@ -56,16 +62,38 @@ export function ProductionBatchSelector({
         <ul className="production-batch-selector__list">
           {subjects.map((subject) => (
             <li key={subject.subject_id}>
-              <label className="production-batch-selector__choice">
-                <input
-                  type="checkbox"
-                  checked={selected.has(subject.subject_id)}
-                  onChange={(event) =>
-                    onToggle(subject.subject_id, event.target.checked)
-                  }
-                />
-                {subject.title}
-              </label>
+              {readOnly ? (
+                <label className="production-batch-selector__choice">
+                  <input
+                    type="checkbox"
+                    checked={false}
+                    disabled
+                    aria-label={subject.title}
+                    readOnly
+                  />
+                  {subject.title}
+                </label>
+              ) : subject.can_start ? (
+                <label className="production-batch-selector__choice">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(subject.subject_id)}
+                    onChange={(event) =>
+                      onToggle(subject.subject_id, event.target.checked)
+                    }
+                  />
+                  {subject.title}
+                </label>
+              ) : (
+                <span className="production-batch-selector__choice">
+                  {subject.title}
+                </span>
+              )}
+              {!subject.can_start && subject.blocking_reason ? (
+                <span className="production-batch-selector__blocking-reason">
+                  {blockingReasonLabel(subject.blocking_reason)}
+                </span>
+              ) : null}
               <Link to={`/subjects/${subject.subject_id}`}>
                 Ouvrir le sujet
               </Link>

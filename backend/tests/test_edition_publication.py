@@ -47,10 +47,10 @@ from cti_app.domain.production import (
     ProductionBatchPhase,
     ProductionRepairAction,
     ProductionRepairIssueKind,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     RepairDecisionApplicationState,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.publication import PublicationDocumentV2
 from cti_app.domain.publication_review import PublicationDecision
@@ -82,13 +82,13 @@ def _edition() -> Edition:
     )
 
 
-def _run(run_id: UUID, subject_id: UUID) -> SubjectProductionRun:
-    return SubjectProductionRun(
+def _run(run_id: UUID, subject_id: UUID) -> ProductionRun:
+    return ProductionRun(
         id=run_id,
         subject_id=subject_id,
         edition_id=EDITION_ID,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         pipeline_generation=2,
     )
 
@@ -288,13 +288,13 @@ class _Editions:
 
 
 class _Runs:
-    def __init__(self, runs: dict[UUID, SubjectProductionRun]) -> None:
+    def __init__(self, runs: dict[UUID, ProductionRun]) -> None:
         self.runs = runs
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.runs.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return await self.get(run_id)
 
 
@@ -378,7 +378,7 @@ class _Uow:
             status="running",
             phase=ProductionBatchPhase.REVIEW,
         )
-        self.subject_production_runs = _Runs(
+        self.production_runs = _Runs(
             {
                 RUN_A: _run(RUN_A, SUBJECT_A),
                 RUN_B: _run(RUN_B, SUBJECT_B),
@@ -543,7 +543,7 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
             title="Alpha",
             run_id=RUN_A,
             pipeline_generation=2,
-            run_status=SubjectProductionStatus.READY,
+            run_status=ProductionRunStatus.READY,
             document_artifact_id=ARTIFACT_A,
             document_artifact_version=1,
             document_input_hash="a" * 64,
@@ -558,7 +558,7 @@ async def test_accept_freezes_order_exclusion_and_same_manifest_on_retry() -> No
             title="Bravo",
             run_id=RUN_B,
             pipeline_generation=2,
-            run_status=SubjectProductionStatus.FAILED,
+            run_status=ProductionRunStatus.FAILED,
             document_artifact_id=None,
             document_artifact_version=None,
             document_input_hash=None,
@@ -598,7 +598,7 @@ async def test_completed_release_allows_a_new_snapshot_on_the_same_open_edition(
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -652,7 +652,7 @@ async def test_metadata_change_makes_pending_snapshot_stale_and_creates_current_
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -690,7 +690,7 @@ async def test_changed_review_input_supersedes_pending_snapshot_without_version_
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -732,7 +732,7 @@ async def test_archived_edition_blocks_accept_and_pending_snapshot_retry() -> No
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -764,7 +764,7 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -819,7 +819,7 @@ async def test_preview_is_read_only_and_uses_the_same_edition_document_as_final(
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -856,7 +856,7 @@ async def test_preview_becomes_stale_when_the_current_publication_artifact_chang
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -922,9 +922,7 @@ async def test_accept_and_docx_preserve_editorial_positions_with_exclusions(
                 title=title,
                 run_id=run_id,
                 pipeline_generation=2,
-                run_status=(
-                    SubjectProductionStatus.FAILED if excluded else SubjectProductionStatus.READY
-                ),
+                run_status=(ProductionRunStatus.FAILED if excluded else ProductionRunStatus.READY),
                 document_artifact_id=None if excluded else artifact_id,
                 document_artifact_version=None if excluded else 1,
                 document_input_hash=None if excluded else "a" * 64,
@@ -1004,7 +1002,7 @@ async def test_dispatch_failure_keeps_freeze_and_retry_reuses_job() -> None:
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1036,7 +1034,7 @@ async def test_accept_in_assembling_repairs_failed_job_without_new_manifest() ->
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1076,7 +1074,7 @@ async def test_job_creation_failure_keeps_freeze_for_a_later_retry() -> None:
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1123,7 +1121,7 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1176,7 +1174,7 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
             title=title,
             run_id=run_id,
             pipeline_generation=2,
-            run_status=SubjectProductionStatus.READY,
+            run_status=ProductionRunStatus.READY,
             document_artifact_id=artifact_id,
             document_artifact_version=1,
             document_input_hash="a" * 64,
@@ -1255,7 +1253,7 @@ async def test_assembly_filesystem_failure_keeps_canonical_release_published() -
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1289,7 +1287,7 @@ async def test_assembly_rejects_an_edition_changed_after_freeze() -> None:
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -1432,7 +1430,7 @@ async def test_release_endpoint_exposes_public_assembly_failure_state() -> None:
         title="Alpha",
         run_id=RUN_A,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=ARTIFACT_A,
         document_artifact_version=1,
         document_input_hash="a" * 64,

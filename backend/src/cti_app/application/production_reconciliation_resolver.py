@@ -15,8 +15,8 @@ from cti_app.application.production_review_recovery import prepare_batch_for_rec
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
-    SubjectProductionRun,
-    SubjectProductionStage,
+    ProductionRun,
+    ProductionStage,
 )
 from cti_app.integrations.models import BridgeTransportError
 
@@ -107,14 +107,14 @@ class ProductionReconciliationResolver:
         finally:
             self._last_bridge_status = bridge_status
 
-    async def _get_run(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def _get_run(self, run_id: UUID) -> ProductionRun | None:
         async with self._uow_factory() as uow:
-            return await uow.subject_production_runs.get(run_id)
+            return await uow.production_runs.get(run_id)
 
     async def _adopt_and_resume(
         self,
         run_id: UUID,
-        original: SubjectProductionRun,
+        original: ProductionRun,
         payload: dict[str, Any],
         text: str,
     ) -> ReconciliationOutcome:
@@ -145,11 +145,11 @@ class ProductionReconciliationResolver:
 
         try:
             async with self._uow_factory() as uow:
-                probe = await uow.subject_production_runs.get(run_id)
+                probe = await uow.production_runs.get(run_id)
                 if probe is None or not probe.requires_reconciliation:
                     return ReconciliationOutcome.UNDECIDED
                 await self._prepare_resume_batch(uow, probe)
-                run = await uow.subject_production_runs.get_for_update(run_id)
+                run = await uow.production_runs.get_for_update(run_id)
                 if run is None or not run.requires_reconciliation:
                     return ReconciliationOutcome.UNDECIDED
                 current = run.reconciliation
@@ -164,7 +164,7 @@ class ProductionReconciliationResolver:
                     provenance="automatic_bridge_retrieval",
                 )
                 run.resume_reconciled(expected_stage=current.stage)
-                await uow.subject_production_runs.save(run)
+                await uow.production_runs.save(run)
                 await uow.commit()
         except ValueError:
             # Batch/edition fences are not provider evidence. Keep the run
@@ -175,7 +175,7 @@ class ProductionReconciliationResolver:
     async def _release(
         self,
         run_id: UUID,
-        original: SubjectProductionRun,
+        original: ProductionRun,
         *,
         reason: str = "bridge_run_unavailable",
         audit_reason: str | None = None,
@@ -184,13 +184,13 @@ class ProductionReconciliationResolver:
         bridge_run_id = _bridge_run_id(original)
         await self._reconcile_conversation(original, available=False)
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_for_update(run_id)
+            run = await uow.production_runs.get_for_update(run_id)
             if run is None or not run.requires_reconciliation:
                 return ReconciliationOutcome.UNDECIDED
             if run.reconciliation is None or run.current_stage is not original.current_stage:
                 return ReconciliationOutcome.UNDECIDED
             run.release_reconciliation(expected_stage=run.current_stage, reason=reason)
-            await uow.subject_production_runs.save(run)
+            await uow.production_runs.save(run)
             await uow.commit()
         if audit_reason is not None:
             self._diagnostics.record(
@@ -219,7 +219,7 @@ class ProductionReconciliationResolver:
             actor_id=actor_id,
         )
 
-    async def _reconcile_conversation(self, run: SubjectProductionRun, *, available: bool) -> None:
+    async def _reconcile_conversation(self, run: ProductionRun, *, available: bool) -> None:
         if self._model_conversation_service is None:
             return
         conversation_id = _conversation_id(run)
@@ -232,7 +232,7 @@ class ProductionReconciliationResolver:
         )
 
     @staticmethod
-    async def _prepare_resume_batch(uow: Any, run: SubjectProductionRun) -> None:
+    async def _prepare_resume_batch(uow: Any, run: ProductionRun) -> None:
         editions = getattr(uow, "editions", None)
         if editions is not None:
             get_for_update = getattr(editions, "get_for_update", None)
@@ -290,7 +290,7 @@ def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
     return None
 
 
-def _bridge_run_id(run: SubjectProductionRun) -> str | None:
+def _bridge_run_id(run: ProductionRun) -> str | None:
     details = run.error_details if isinstance(run.error_details, dict) else {}
     nested = details.get("details")
     sources = (details, nested) if isinstance(nested, dict) else (details,)
@@ -339,10 +339,10 @@ def _verified_external_turn_id(payload: dict[str, Any]) -> str | None:
     return None
 
 
-def _conversation_id(run: SubjectProductionRun) -> UUID | None:
-    if run.current_stage is SubjectProductionStage.REFERENCES:
+def _conversation_id(run: ProductionRun) -> UUID | None:
+    if run.current_stage is ProductionStage.REFERENCES:
         return run.references_conversation_id
-    if run.current_stage is SubjectProductionStage.SYNTHESIS:
+    if run.current_stage is ProductionStage.SYNTHESIS:
         return run.synthesis_conversation_id
     return None
 

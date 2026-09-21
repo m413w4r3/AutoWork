@@ -5,7 +5,8 @@ import {
   getEditionProduction,
   cancelProductionBatch,
   type BatchItemDetail,
-  type BatchStatus,
+  type ProductionBatch,
+  type ProductionBatchSummary,
 } from "../../api/production";
 import { ExtractionProgressView } from "../../components/ExtractionProgress";
 import { Link } from "../../routing";
@@ -47,13 +48,19 @@ function useDispatchCountdown(nextDispatchAt: string | null): number | null {
   return Math.ceil((dispatchTime - now) / 1_000);
 }
 
-function processedCount(batch: BatchStatus): number {
+function processedCount(
+  batch: ProductionBatch | ProductionBatchSummary,
+): number {
   // Cancellation is a separate outcome, not produced work.  It must not
   // make a stopped batch look fully processed.
   return batch.completed + batch.needs_review + batch.failed;
 }
 
-function BatchCounters({ batch }: { batch: BatchStatus }) {
+function BatchCounters({
+  batch,
+}: {
+  batch: ProductionBatch | ProductionBatchSummary;
+}) {
   return (
     <div className="production-counters" aria-label="Compteurs de production">
       <span>
@@ -185,22 +192,28 @@ export function ProductionConsole({
 }) {
   const queryClient = useQueryClient();
   const editionInvalidated = useRef(false);
-  const batch = useQuery({
-    queryKey: ["batch", editionId],
+  const board = useQuery({
+    queryKey: ["production-board", editionId],
     queryFn: () => getEditionProduction(editionId),
     refetchInterval: (query) => {
-      const status = query.state.data?.status;
+      const currentBatch =
+        query.state.data?.active_batch ?? query.state.data?.recent_batches[0];
+      const status = currentBatch?.status;
       return productionBatchPollingInterval(status);
     },
   });
+  const currentBatch =
+    board.data?.active_batch ?? board.data?.recent_batches[0] ?? null;
   const cancel = useMutation({
     mutationFn: () =>
-      batch.data
-        ? cancelProductionBatch(editionId, batch.data.batch_id)
+      currentBatch
+        ? cancelProductionBatch(editionId, currentBatch.batch_id)
         : Promise.reject(new Error("Aucun lot de production actif.")),
     retry: false,
     onSuccess: () => {
-      void queryClient.invalidateQueries({ queryKey: ["batch", editionId] });
+      void queryClient.invalidateQueries({
+        queryKey: ["production-board", editionId],
+      });
       void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
       void queryClient.invalidateQueries({
         queryKey: ["edition-review", editionId],
@@ -210,26 +223,28 @@ export function ProductionConsole({
 
   useEffect(() => {
     if (
-      batch.data &&
-      TERMINAL_BATCH_STATUSES.has(batch.data.status) &&
+      currentBatch &&
+      TERMINAL_BATCH_STATUSES.has(currentBatch.status) &&
       !editionInvalidated.current
     ) {
       editionInvalidated.current = true;
       void queryClient.invalidateQueries({ queryKey: ["edition", editionId] });
     }
-  }, [batch.data, editionId, queryClient]);
+  }, [currentBatch, editionId, queryClient]);
 
-  const countdown = useDispatchCountdown(batch.data?.next_dispatch_at ?? null);
+  const countdown = useDispatchCountdown(
+    currentBatch?.next_dispatch_at ?? null,
+  );
 
-  if (batch.isPending) return <p role="status">Chargement de la production…</p>;
-  if (batch.isError) {
+  if (board.isPending) return <p role="status">Chargement de la production…</p>;
+  if (board.isError) {
     return (
       <p className="error-message" role="alert">
-        La supervision de production est inaccessible : {String(batch.error)}
+        La supervision de production est inaccessible : {String(board.error)}
       </p>
     );
   }
-  if (!batch.data) {
+  if (!currentBatch) {
     return (
       <section className="production-panel">
         <p className="empty-state">
@@ -241,7 +256,6 @@ export function ProductionConsole({
     );
   }
 
-  const currentBatch = batch.data;
   const processed = processedCount(currentBatch);
   const progress =
     currentBatch.items > 0
@@ -305,7 +319,7 @@ export function ProductionConsole({
           édition.
         </p>
       ) : null}
-      {currentBatch.item_details.length > 0 ? (
+      {currentBatch.item_details && currentBatch.item_details.length > 0 ? (
         <ol className="production-item-list" aria-label="Suivi des articles">
           {currentBatch.item_details.map((item) => (
             <ProductionItem
@@ -316,7 +330,7 @@ export function ProductionConsole({
               readOnly={readOnly}
               onRecovered={() => {
                 void queryClient.invalidateQueries({
-                  queryKey: ["batch", editionId],
+                  queryKey: ["production-board", editionId],
                 });
               }}
             />

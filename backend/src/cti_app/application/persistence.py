@@ -41,7 +41,7 @@ from cti_app.domain.edition_publication import (
     PublicationManifestV1,
 )
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
-from cti_app.domain.editorial import AnalystDecision, EditorialGroup, HumanDecision
+from cti_app.domain.editorial import AnalystDecision, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
 from cti_app.domain.goodware import GoodwareBaseline, GoodwareIndexArtifact, GoodwareSource
 from cti_app.domain.invariants import (
@@ -74,9 +74,9 @@ from cti_app.domain.production import (
     ProductionRepairCorrection,
     ProductionRepairDecision,
     ProductionReuseInvalidation,
+    ProductionRun,
     SampleAcquisitionAttempt,
     SourceExtraction,
-    SubjectProductionRun,
 )
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
@@ -592,22 +592,6 @@ class SubjectContributionRepository(Protocol):
     ) -> Sequence[UUID]: ...
 
 
-class EditorialGroupRepository(Protocol):
-    async def add(self, group: EditorialGroup) -> None: ...
-
-    async def get(self, group_id: UUID) -> EditorialGroup | None: ...
-
-    async def get_for_update(self, group_id: UUID) -> EditorialGroup | None: ...
-
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditorialGroup]: ...
-
-    async def list_historical(self, edition_id: UUID) -> Sequence[EditorialGroup]: ...
-
-    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None: ...
-
-    async def save(self, group: EditorialGroup) -> None: ...
-
-
 class HumanDecisionRepository(Protocol):
     async def append(self, decision: HumanDecision) -> None: ...
 
@@ -715,7 +699,6 @@ class UnitOfWork(Protocol):
     discovery_snapshots: DiscoverySnapshotRepository
     discovery_merge_runs: DiscoveryMergeRunRepository
     subject_contributions: SubjectContributionRepository
-    editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository
     collection_attempts: CollectionAttemptRepository
@@ -725,7 +708,7 @@ class UnitOfWork(Protocol):
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
     # Defined further down in this module.
-    subject_production_runs: SubjectProductionRunRepository
+    production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
@@ -853,24 +836,26 @@ class DiscoveryRunUnitOfWorkFactory(Protocol):
     def __call__(self) -> DiscoveryRunUnitOfWork: ...
 
 
-class SubjectProductionRunRepository(Protocol):
-    async def add(self, run: SubjectProductionRun) -> None: ...
+class ProductionRunRepository(Protocol):
+    async def add(self, run: ProductionRun) -> None: ...
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None: ...
+    async def get(self, run_id: UUID) -> ProductionRun | None: ...
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None: ...
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None: ...
 
-    async def save(self, run: SubjectProductionRun) -> None: ...
+    async def save(self, run: ProductionRun) -> None: ...
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None: ...
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None: ...
 
     async def get_latest_terminal_for_edition_subject(
         self, edition_id: UUID, subject_id: UUID
-    ) -> SubjectProductionRun | None: ...
+    ) -> ProductionRun | None: ...
 
     async def lock_creation_for_subject(self, subject_id: UUID) -> None: ...
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]: ...
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[ProductionRun]: ...
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[ProductionRun]: ...
 
     async def allocate_next_run_number(self, subject_id: UUID) -> int: ...
 
@@ -994,6 +979,14 @@ class EditionProductionBatchRepository(Protocol):
 
     async def get_latest_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None: ...
 
+    async def get_by_idempotency_key(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> EditionProductionBatch | None: ...
+
+    async def list_recent_for_edition(
+        self, edition_id: UUID, limit: int = 10
+    ) -> Sequence[EditionProductionBatch]: ...
+
 
 class EditionProductionBatchItemRepository(Protocol):
     async def append_many(self, items: Sequence[EditionProductionBatchItem]) -> None: ...
@@ -1010,8 +1003,15 @@ class ProductionUnitOfWork(Protocol):
     model_runs: ModelRunRepository
     editions: EditionRepository
     subjects: SubjectRepository
+    # Production freezes its inputs from the Subject discovery lineage, so the
+    # origin, the canonical identity and the active snapshot are part of this
+    # contract.
+    subject_discovery_origins: SubjectDiscoveryOriginRepository
+    discovery_subject_identities: DiscoverySubjectIdentityRepository
+    discovery_snapshots: DiscoverySnapshotRepository
+    discovery_candidates: DiscoveryCandidateRepository
     edition_audit: EditionAuditRepository
-    subject_production_runs: SubjectProductionRunRepository
+    production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     source_extractions: SourceExtractionRepository
@@ -1021,7 +1021,6 @@ class ProductionUnitOfWork(Protocol):
     analyst_decisions: AnalystDecisionRepository
     analyst_input_packs: AnalystInputPackRepository
     discovery_batches: DiscoveryBatchRepository
-    editorial_groups: EditorialGroupRepository
     source_collections: SourceCollectionRepository
     edition_production_batches: EditionProductionBatchRepository
     edition_production_batch_items: EditionProductionBatchItemRepository

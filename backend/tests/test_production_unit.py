@@ -21,57 +21,57 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 
-class TestSubjectProductionRunStates:
+class TestProductionRunStates:
     def test_create_run_initial_state(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
 
-        assert run.status == SubjectProductionStatus.QUEUED
-        assert run.current_stage is SubjectProductionStage.SOURCES
+        assert run.status == ProductionRunStatus.QUEUED
+        assert run.current_stage is ProductionStage.SOURCES
         assert run.started_at is None
         assert run.finished_at is None
 
     def test_start_run_transitions_to_running(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
 
         run.start_running(now=datetime.now(UTC))
 
-        assert run.status == SubjectProductionStatus.RUNNING
+        assert run.status == ProductionRunStatus.RUNNING
         assert run.started_at is not None
 
     def test_advance_stage_moves_through_pipeline(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
 
-        assert run.current_stage is SubjectProductionStage.SOURCES
+        assert run.current_stage is ProductionStage.SOURCES
 
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage is SubjectProductionStage.REFERENCES  # type: ignore[comparison-overlap]
+        assert run.current_stage is ProductionStage.REFERENCES  # type: ignore[comparison-overlap]
 
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage is SubjectProductionStage.EXTRACTION
+        assert run.current_stage is ProductionStage.EXTRACTION
 
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage is SubjectProductionStage.SYNTHESIS
+        assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage(now=datetime.now(UTC))
-        assert run.current_stage is SubjectProductionStage.ASSEMBLY
+        assert run.current_stage is ProductionStage.ASSEMBLY
 
     def test_mark_ready_terminates_run(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -79,11 +79,11 @@ class TestSubjectProductionRunStates:
         run.start_running(now=datetime.now(UTC))
         run.mark_ready(now=datetime.now(UTC))
 
-        assert run.status == SubjectProductionStatus.READY
+        assert run.status == ProductionRunStatus.READY
         assert run.finished_at is not None
 
     def test_mark_needs_review_allows_recovery(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -95,14 +95,14 @@ class TestSubjectProductionRunStates:
             now=datetime.now(UTC),
         )
 
-        assert run.status == SubjectProductionStatus.NEEDS_REVIEW
+        assert run.status == ProductionRunStatus.NEEDS_REVIEW
         assert run.error_code == "qa_check_failed"
         assert run.error_message is not None
         assert "QA validation failed" in run.error_message
         assert run.finished_at is not None
 
     def test_mark_failed_terminal_state(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -114,12 +114,12 @@ class TestSubjectProductionRunStates:
             now=datetime.now(UTC),
         )
 
-        assert run.status == SubjectProductionStatus.FAILED
+        assert run.status == ProductionRunStatus.FAILED
         assert run.error_code == "conversation_error"
         assert run.finished_at is not None
 
     def test_mark_cancelled_by_user(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -127,11 +127,11 @@ class TestSubjectProductionRunStates:
         run.start_running(now=datetime.now(UTC))
         run.mark_cancelled(now=datetime.now(UTC))
 
-        assert run.status == SubjectProductionStatus.CANCELLED
+        assert run.status == ProductionRunStatus.CANCELLED
         assert run.finished_at is not None
 
     def test_mark_cancelled_is_idempotent_and_terminal(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -145,12 +145,12 @@ class TestSubjectProductionRunStates:
         assert run.finished_at == finished_at
         assert run.version == version
         with pytest.raises(ValueError, match="production_run_cancelled"):
-            run.retry_from_stage(SubjectProductionStage.REFERENCES)
+            run.retry_from_stage(ProductionStage.REFERENCES)
         with pytest.raises(ValueError, match="production_run_cancelled"):
             run.mark_ready()
 
     def test_cannot_transition_from_terminal_state(self) -> None:
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=uuid4(),
             edition_id=uuid4(),
         )
@@ -286,10 +286,10 @@ class TestProductionArtifactValidation:
 
 @pytest.mark.asyncio
 async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        current_stage=ProductionStage.ASSEMBLY,
     )
     run.start_running()
     run.mark_ready()
@@ -310,13 +310,13 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
     ]
 
     class Runs:
-        async def get(self, run_id: object) -> SubjectProductionRun | None:
+        async def get(self, run_id: object) -> ProductionRun | None:
             return run if run_id == run.id else None
 
-        async def get_for_update(self, run_id: object) -> SubjectProductionRun | None:
+        async def get_for_update(self, run_id: object) -> ProductionRun | None:
             return await self.get(run_id)
 
-        async def save(self, saved: SubjectProductionRun) -> None:
+        async def save(self, saved: ProductionRun) -> None:
             assert saved is run
 
     class Artifacts:
@@ -335,7 +335,7 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
 
         async def mark_from_stage_stale(self, run_id: object, stage: str) -> list[str]:
             assert run_id == run.id
-            assert stage == SubjectProductionStage.EXTRACTION.value
+            assert stage == ProductionStage.EXTRACTION.value
             affected = ["extraction", "synthesis", "publication"]
             for artifact in artifacts:
                 if artifact.stage.value in affected:
@@ -343,7 +343,7 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
             return affected
 
     class Uow:
-        subject_production_runs = Runs()
+        production_runs = Runs()
         production_artifacts = Artifacts()
 
         async def __aenter__(self) -> Uow:
@@ -360,11 +360,11 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
     )
     artifact_ids = {artifact.stage: artifact.id for artifact in artifacts}
     result = await SubjectProductionService(lambda: Uow()).retry_from_stage(
-        run.id, SubjectProductionStage.EXTRACTION
+        run.id, ProductionStage.EXTRACTION
     )
 
     assert result.staled_artifacts == ["extraction", "synthesis", "publication"]
-    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.current_stage is ProductionStage.EXTRACTION
     assert run.pipeline_generation == 1
     assert references.status is ProductionArtifactStatus.VERIFIED
     assert references.id == artifact_ids[ProductionArtifactStage.REFERENCES]

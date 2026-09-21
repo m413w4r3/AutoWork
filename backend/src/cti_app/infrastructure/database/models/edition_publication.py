@@ -80,7 +80,7 @@ class PublicationManifestEntryRow(Base):
     )
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        ForeignKey("production_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
     pipeline_generation: Mapped[int] = mapped_column(nullable=False)

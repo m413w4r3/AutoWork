@@ -12,7 +12,7 @@ Database ORM model organization by bounded context.
 | **core.py** | Core domain entities | Blobs, Subjects, Documents, Samples, Provenance |
 | **editions.py** | Versioned editions & audit | Edition, AuditLog |
 | **discovery.py** | Discovery batch processing | DiscoveryBatch, CumulativeIdentity, Snapshots |
-| **editorial.py** | Editorial decisions | EditorialGroups, HumanDecisions |
+| **editorial.py** | Editorial decisions | HumanDecisions |
 | **collection.py** | Collections & evidence | Collection, Artifacts, Claims, Indicators |
 | **model_execution.py** | Model lifecycle | ModelRuns, Conversations, Execution lifecycle |
 | **production.py** | Production runs | ProductionRuns, Artifacts, Batches |

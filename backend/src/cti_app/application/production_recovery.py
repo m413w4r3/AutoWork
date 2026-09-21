@@ -7,8 +7,8 @@ from enum import StrEnum
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     EditionProductionBatchItem,
-    SubjectProductionRun,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
 )
 
 
@@ -74,7 +74,7 @@ class ProductionRecoveryPolicyV1:
         return cls.disposition(error_code) is cls.AUTO
 
     @classmethod
-    def disposition_for_run(cls, run: SubjectProductionRun) -> ProductionRecoveryDisposition:
+    def disposition_for_run(cls, run: ProductionRun) -> ProductionRecoveryDisposition:
         """Return the recovery disposition without losing run-local details."""
         if run.error_code == cls.Q2_SOURCE_COVERAGE_ERROR_CODE:
             if run.reconciliation is not None:
@@ -97,20 +97,20 @@ class ProductionRecoveryPolicyV1:
         return cls.disposition(run.error_code)
 
     @classmethod
-    def current_stage_retry_recommended(cls, run: SubjectProductionRun) -> bool:
+    def current_stage_retry_recommended(cls, run: ProductionRun) -> bool:
         """Whether replaying the stage that stopped the run is recommended."""
         return (
             run.status
             in {
-                SubjectProductionStatus.FAILED,
-                SubjectProductionStatus.NEEDS_REVIEW,
+                ProductionRunStatus.FAILED,
+                ProductionRunStatus.NEEDS_REVIEW,
             }
             and run.current_stage is not None
             and cls.disposition_for_run(run) is cls.AUTO
         )
 
     @classmethod
-    def _all_q2_blocking_failures_retryable(cls, run: SubjectProductionRun) -> bool:
+    def _all_q2_blocking_failures_retryable(cls, run: ProductionRun) -> bool:
         details = run.error_details
         if not isinstance(details, dict):
             return False
@@ -153,18 +153,18 @@ class ProductionRecoveryPolicyV1:
         return all(failure.get("retryable") is True for failure in blocking)
 
     @classmethod
-    def eligible(cls, item: EditionProductionBatchItem, run: SubjectProductionRun) -> bool:
+    def eligible(cls, item: EditionProductionBatchItem, run: ProductionRun) -> bool:
         # Cancellation is an absolute terminal decision.  Keep this explicit
         # even though CANCELLED is not one of the allow-listed statuses: it is
         # a fence against future policy additions accidentally reviving a run.
-        if run.status is SubjectProductionStatus.CANCELLED:
+        if run.status is ProductionRunStatus.CANCELLED:
             return False
         return (
             item.auto_recovery_count == 0
             and run.status
             in {
-                SubjectProductionStatus.FAILED,
-                SubjectProductionStatus.NEEDS_REVIEW,
+                ProductionRunStatus.FAILED,
+                ProductionRunStatus.NEEDS_REVIEW,
             }
             and run.current_stage is not None
             and cls.disposition_for_run(run) is cls.AUTO

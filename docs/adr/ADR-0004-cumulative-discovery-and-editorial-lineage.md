@@ -87,6 +87,10 @@ références de candidates (`candidate_id`) présentes dans chaque snapshot, le 
 d'origine étant retrouvé via `DiscoveryCandidate.discovery_batch_id`. Une migration future ne
 pourra supprimer l'ancien lien qu'après migration de tous ses consommateurs.
 
+> Legacy — AW-009 : ce pont a été supprimé avec la table `editorial_groups` et la projection
+> `EditorialGroup`. Production et Collection lisent désormais `SubjectDiscoveryOrigin`, l'identité
+> Discovery canonique et le snapshot Fusion actif (voir `docs/production.md`).
+
 ## Conséquences et invariants
 
 - `DiscoveryBatch`, intake, contribution, événement de fusion et contenu d'un

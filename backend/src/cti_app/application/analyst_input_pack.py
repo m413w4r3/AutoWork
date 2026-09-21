@@ -19,7 +19,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 ANALYST_INPUT_PACK_SCHEMA_VERSION = "analyst-input-pack-v1"
@@ -102,7 +102,7 @@ def _accepted_file_indicators(items: Iterable[dict[str, Any]]) -> list[dict[str,
 
 def build_analyst_input_pack_v1(
     *,
-    run: SubjectProductionRun,
+    run: ProductionRun,
     investigation: AnalystInvestigation,
     synthesis: ProductionArtifact,
     extraction_artifacts: Iterable[ProductionArtifact],

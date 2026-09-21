@@ -16,6 +16,7 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
   let currentBatchStatus: "running" | "cancelled" = "running";
   let batchStarted = false;
   let productionPostBody: unknown = null;
+  let selectionFetches = 0;
 
   const edition = () => ({
     id: editionId,
@@ -93,6 +94,7 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
       return;
     }
     if (path === `/api/editions/${editionId}/selection`) {
+      selectionFetches += 1;
       await route.fulfill({ json: selection });
       return;
     }
@@ -113,18 +115,30 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
       return;
     }
     if (
-      path === `/api/editions/${editionId}/production` &&
+      path === `/api/editions/${editionId}/production/batches` &&
       request.method() === "POST"
     ) {
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
       productionPostBody = request.postDataJSON();
       batchStarted = true;
       await route.fulfill({ status: 202, json: batch() });
       return;
     }
     if (path === `/api/editions/${editionId}/production`) {
-      await route.fulfill(
-        batchStarted ? { json: batch() } : { status: 404, json: {} },
-      );
+      await route.fulfill({
+        json: {
+          edition_id: editionId,
+          subjects: [
+            {
+              subject_id: subjectId,
+              title: "Article à arrêter",
+              can_start: true,
+            },
+          ],
+          active_batch: batchStarted ? batch() : null,
+          recent_batches: [],
+        },
+      });
       return;
     }
     await route.fulfill({ status: 404, json: {} });
@@ -132,6 +146,7 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
 
   // Batch start lives on /production.
   await page.goto(`/editions/${editionId}/production`);
+  expect(selectionFetches).toBe(0);
   const selector = page.getByRole("region", {
     name: "Sélecteur du lot de production",
   });

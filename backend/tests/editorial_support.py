@@ -9,59 +9,10 @@ from cti_app.application.persistence import UnitOfWork
 from cti_app.domain.discovery import DiscoveryBatch
 from cti_app.domain.discovery_cumulative import DiscoverySnapshot
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import EditorialGroup, HumanDecision
+from cti_app.domain.editorial import HumanDecision
 from cti_app.domain.entities import Subject
 from tests.discovery_support import InMemoryDiscoveryBatchRepository
 from tests.edition_support import InMemoryEditionRepository
-
-
-class InMemoryEditorialGroupRepository:
-    def __init__(self, groups: dict[UUID, EditorialGroup], editions: dict[UUID, Edition]) -> None:
-        self._groups = groups
-        self._editions = editions
-
-    async def add(self, group: EditorialGroup) -> None:
-        self._groups[group.id] = deepcopy(group)
-
-    async def get(self, group_id: UUID) -> EditorialGroup | None:
-        value = self._groups.get(group_id)
-        return deepcopy(value) if value else None
-
-    async def get_for_update(self, group_id: UUID) -> EditorialGroup | None:
-        return await self.get(group_id)
-
-    async def list_for_edition(self, edition_id: UUID) -> list[EditorialGroup]:
-        return [
-            deepcopy(group) for group in self._groups.values() if group.edition_id == edition_id
-        ]
-
-    async def list_historical(self, edition_id: UUID) -> list[EditorialGroup]:
-        edition = self._editions.get(edition_id)
-        if edition is None:
-            return []
-        historical_ids = {
-            item.id
-            for item in self._editions.values()
-            if item.country_code == edition.country_code
-            and item.period_start < edition.period_start
-        }
-        return [
-            deepcopy(group)
-            for group in self._groups.values()
-            if group.edition_id in historical_ids and group.status.value == "selected"
-        ]
-
-    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
-        value = next(
-            (group for group in self._groups.values() if group.subject_id == subject_id),
-            None,
-        )
-        return deepcopy(value) if value else None
-
-    async def save(self, group: EditorialGroup) -> None:
-        if group.id not in self._groups:
-            raise LookupError(group.id)
-        self._groups[group.id] = deepcopy(group)
 
 
 class InMemoryHumanDecisionRepository:
@@ -122,7 +73,6 @@ class InMemoryEditorialUnitOfWork:
         self.editions = InMemoryEditionRepository(factory.editions)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)
         self.discovery_snapshots = InMemoryDiscoverySnapshotRepository(factory.snapshots)
-        self.editorial_groups = InMemoryEditorialGroupRepository(factory.groups, factory.editions)
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.subjects = InMemorySubjectRepository(factory.subjects)
         self.source_documents = EmptySourceDocumentRepository()
@@ -149,7 +99,6 @@ class InMemoryEditorialUnitOfWorkFactory:
     def __init__(self) -> None:
         self.editions: dict[UUID, Edition] = {}
         self.batches: dict[UUID, DiscoveryBatch] = {}
-        self.groups: dict[UUID, EditorialGroup] = {}
         self.decisions: list[HumanDecision] = []
         self.subjects: dict[UUID, Subject] = {}
         self.snapshots: dict[UUID, DiscoverySnapshot] = {}

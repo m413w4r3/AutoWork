@@ -18,7 +18,7 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
 )
 from cti_app.application.production_q2_batch import q2_batch_output_marker
-from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
+from cti_app.domain.production import ProductionRun, ProductionStage
 from tests.test_production_extraction_profiles import (
     _archived_document,
     _cached_orchestrator,
@@ -87,7 +87,7 @@ def _workflow(
     monkeypatch: pytest.MonkeyPatch,
     archives: list[bytes],
     response: str | list[str],
-) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _ArchiveReader]:
+) -> tuple[object, ProductionRun, _CacheState, _ExtractionSink, _ArchiveReader]:
     subject = uuid4()
     documents: dict[UUID, SimpleNamespace] = {}
     collections: dict[UUID, SimpleNamespace] = {}
@@ -125,10 +125,10 @@ def _workflow(
         return report
 
     orchestrator._load_reference_report = load_report
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[run.id] = run
     return orchestrator, run, state, sink, reader

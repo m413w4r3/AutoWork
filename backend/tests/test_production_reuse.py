@@ -30,9 +30,9 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionReuseInvalidation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 
@@ -136,8 +136,8 @@ class _UnavailableStore:
 
 
 class _WorkflowUow:
-    def __init__(self, run: SubjectProductionRun) -> None:
-        self.subject_production_runs = self
+    def __init__(self, run: ProductionRun) -> None:
+        self.production_runs = self
         self.run = run
         self.production_input_snapshots = self
 
@@ -147,17 +147,15 @@ class _WorkflowUow:
     async def __aexit__(self, *args: object) -> None:
         return None
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.run if run_id == self.run.id else None
 
     async def get_by_run(self, run_id: UUID) -> object | None:
         return object() if run_id == self.run.id else None
 
 
-def _run(
-    *, edition_id: UUID, subject_id: UUID, status: SubjectProductionStatus
-) -> SubjectProductionRun:
-    return SubjectProductionRun(
+def _run(*, edition_id: UUID, subject_id: UUID, status: ProductionRunStatus) -> ProductionRun:
+    return ProductionRun(
         id=uuid4(),
         edition_id=edition_id,
         subject_id=subject_id,
@@ -166,7 +164,7 @@ def _run(
 
 
 def _artifact(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     *,
     stage: ProductionArtifactStage = ProductionArtifactStage.REFERENCES,
     version: int = 1,
@@ -198,12 +196,12 @@ async def test_cross_run_hit_clones_identity_and_reuses_every_blob() -> None:
     source_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
     )
     target_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.RUNNING,
+        status=ProductionRunStatus.RUNNING,
     )
     source = _artifact(source_run)
     artifacts = _Artifacts([source])
@@ -234,12 +232,12 @@ async def test_missing_required_blob_is_a_miss_and_does_not_append() -> None:
     source_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
     )
     target_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.RUNNING,
+        status=ProductionRunStatus.RUNNING,
     )
     source = _artifact(source_run)
     artifacts = _Artifacts([source])
@@ -260,7 +258,7 @@ async def test_missing_required_blob_is_a_miss_and_does_not_append() -> None:
 @pytest.mark.asyncio
 async def test_same_run_needs_review_is_not_a_cache_hit() -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = _run(edition_id=edition_id, subject_id=subject_id, status=SubjectProductionStatus.RUNNING)
+    run = _run(edition_id=edition_id, subject_id=subject_id, status=ProductionRunStatus.RUNNING)
     current = _artifact(run, status=ProductionArtifactStatus.NEEDS_REVIEW)
     artifacts = _Artifacts([current])
     uow = _Uow(artifacts, _Invalidations())
@@ -282,7 +280,7 @@ async def test_same_run_needs_review_is_not_a_cache_hit() -> None:
 @pytest.mark.asyncio
 async def test_same_run_verified_artifact_without_required_blob_is_a_miss() -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = _run(edition_id=edition_id, subject_id=subject_id, status=SubjectProductionStatus.RUNNING)
+    run = _run(edition_id=edition_id, subject_id=subject_id, status=ProductionRunStatus.RUNNING)
     current = _artifact(run)
     current.canonical_blob_id = None
     artifacts = _Artifacts([current])
@@ -307,12 +305,12 @@ async def test_storage_outage_is_retryable_and_not_a_cache_miss() -> None:
     source_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
     )
     target_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.RUNNING,
+        status=ProductionRunStatus.RUNNING,
     )
     source = _artifact(source_run)
     artifacts = _Artifacts([source])
@@ -336,8 +334,8 @@ async def test_storage_outage_is_retryable_and_not_a_cache_miss() -> None:
 async def test_storage_outage_stage_is_transient_without_model_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = _run(edition_id=uuid4(), subject_id=uuid4(), status=SubjectProductionStatus.RUNNING)
-    run.current_stage = SubjectProductionStage.REFERENCES
+    run = _run(edition_id=uuid4(), subject_id=uuid4(), status=ProductionRunStatus.RUNNING)
+    run.current_stage = ProductionStage.REFERENCES
     uow = _WorkflowUow(run)
 
     class SentinelModel:
@@ -358,7 +356,7 @@ async def test_storage_outage_stage_is_transient_without_model_call(
         raise ProductionReuseStorageUnavailableError("temporary storage outage")
 
     monkeypatch.setattr(orchestrator, "_execute_references_stage", unavailable)
-    result = await orchestrator.execute_stage(run.id, SubjectProductionStage.REFERENCES)
+    result = await orchestrator.execute_stage(run.id, ProductionStage.REFERENCES)
 
     assert result["status"] == "transient_error"
     assert result["error_code"] == "production_reuse_storage_unavailable"
@@ -371,18 +369,18 @@ async def test_invalidation_cutoff_excludes_old_candidate() -> None:
     source_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
     )
     target_run = _run(
         edition_id=edition_id,
         subject_id=subject_id,
-        status=SubjectProductionStatus.RUNNING,
+        status=ProductionRunStatus.RUNNING,
     )
     source = _artifact(source_run, created_at=datetime.now(UTC) - timedelta(minutes=2))
     invalidation = ProductionReuseInvalidation(
         edition_id=edition_id,
         subject_id=subject_id,
-        from_stage=SubjectProductionStage.EXTRACTION,
+        from_stage=ProductionStage.EXTRACTION,
         actor_id="operator",
         correlation_id="corr",
         occurred_at=datetime.now(UTC) - timedelta(minutes=1),
@@ -405,8 +403,8 @@ async def test_invalidation_cutoff_excludes_old_candidate() -> None:
 
 def test_same_run_cache_has_priority_and_force_only_disables_cross_run() -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = _run(edition_id=edition_id, subject_id=subject_id, status=SubjectProductionStatus.RUNNING)
-    run.force_recompute_from_stage = SubjectProductionStage.EXTRACTION
+    run = _run(edition_id=edition_id, subject_id=subject_id, status=ProductionRunStatus.RUNNING)
+    run.force_recompute_from_stage = ProductionStage.EXTRACTION
 
     assert cross_run_reuse_allowed(run, ProductionArtifactStage.REFERENCES)
     assert not cross_run_reuse_allowed(run, ProductionArtifactStage.EXTRACTION)
@@ -430,10 +428,16 @@ def test_snapshot_reuse_basis_excludes_research_date() -> None:
         "production_run_id": uuid4(),
         "subject_id": uuid4(),
         "edition_id": uuid4(),
-        "editorial_group_id": uuid4(),
-        "editorial_group_version": 1,
+        "subject_version": 1,
         "subject_title": "Subject",
-        "subject_description": "Description",
+        "subject_tlp": TLP.CLEAR,
+        "selection_decision_id": uuid4(),
+        "origin_discovery_subject_id": uuid4(),
+        "canonical_discovery_subject_id": uuid4(),
+        "discovery_snapshot_id": uuid4(),
+        "discovery_snapshot_version": 1,
+        "member_candidate_ids": (),
+        "discovery_summary": "Description",
         "actor_or_campaign": "Actor",
         "period_start": date(2026, 8, 1),
         "period_end": date(2026, 8, 31),
@@ -452,9 +456,9 @@ def test_snapshot_reuse_basis_excludes_research_date() -> None:
 
 
 def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity() -> None:
+    candidate_id = uuid4()
     source = ProductionInputSource(
-        batch_id=uuid4(),
-        candidate_id=uuid4(),
+        discovery_candidate_id=candidate_id,
         source_candidate_id=uuid4(),
         canonical_url="https://example.test/article",
         role=SourceRole.PRIMARY,
@@ -469,10 +473,16 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity() -
         production_run_id=uuid4(),
         subject_id=uuid4(),
         edition_id=uuid4(),
-        editorial_group_id=uuid4(),
-        editorial_group_version=1,
+        subject_version=1,
         subject_title="Subject",
-        subject_description="Description",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(candidate_id,),
+        discovery_summary="Description",
         actor_or_campaign="Actor",
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
@@ -484,19 +494,19 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity() -
         subject_id=snapshot.subject_id,
         snapshot=snapshot,
         subject_title=snapshot.subject_title,
-        subject_description=snapshot.subject_description,
+        subject_description=snapshot.discovery_summary,
         research_date=snapshot.research_date,
     )
     assert base == _references_input_hash(
         subject_id=snapshot.subject_id,
         snapshot=replace(snapshot, production_run_id=uuid4(), input_hash="", reuse_basis_hash=""),
         subject_title=snapshot.subject_title,
-        subject_description=snapshot.subject_description,
+        subject_description=snapshot.discovery_summary,
         research_date=snapshot.research_date,
     )
     for changed in (
-        replace(snapshot, editorial_group_version=2, input_hash="", reuse_basis_hash=""),
-        replace(snapshot, subject_description="Changed", input_hash="", reuse_basis_hash=""),
+        replace(snapshot, discovery_snapshot_version=2, input_hash="", reuse_basis_hash=""),
+        replace(snapshot, discovery_summary="Changed", input_hash="", reuse_basis_hash=""),
         replace(
             snapshot,
             core_sources=(replace(source, canonical_url="https://other.test"),),
@@ -515,7 +525,7 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity() -
                 subject_id=changed.subject_id,
                 snapshot=changed,
                 subject_title=changed.subject_title,
-                subject_description=changed.subject_description,
+                subject_description=changed.discovery_summary,
                 research_date=changed.research_date,
             )
             != base

@@ -724,7 +724,7 @@ async def _get_edition_for_update(uow: Any, edition_id: UUID) -> Edition | None:
 
 
 async def _get_run_for_update(uow: Any, run_id: UUID) -> Any:
-    repository = uow.subject_production_runs
+    repository = uow.production_runs
     getter = getattr(repository, "get_for_update", None)
     return await getter(run_id) if getter is not None else await repository.get(run_id)
 

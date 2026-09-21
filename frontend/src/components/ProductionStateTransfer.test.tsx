@@ -5,22 +5,23 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ProductionStatus,
-  ProductionStateSnapshotV2,
-  ProductionStateSnapshotV1,
+  ProductionStateSnapshotV4,
 } from "../api/production";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-const snapshot: ProductionStateSnapshotV1 = {
+const snapshot: ProductionStateSnapshotV4 = {
   format: "autowork.production-state",
-  schema_version: 1,
+  schema_version: 4,
   exported_at: "2026-08-20T12:34:56Z",
   origin: {
     subject_title: "Campagne d’Iran",
-    editorial_type: "brief",
-    profile: "brief_auto",
-    research_date: null,
+    subject_id: SUBJECT_ID,
+    production_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    research_date: "2026-08-20",
+    discovery_snapshot_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    discovery_snapshot_version: 3,
   },
   artifacts: {
     references: { input_hash: "a", canonical_content: {} },
@@ -36,15 +37,6 @@ const snapshot: ProductionStateSnapshotV1 = {
     synthesis: { input_hash: "c", rendered_content: "Synthèse" },
   },
   content_sha256: "d",
-};
-
-const snapshotV2: ProductionStateSnapshotV2 = {
-  ...snapshot,
-  schema_version: 2,
-  origin: {
-    subject_title: "Campagne d’Iran",
-    research_date: null,
-  },
 };
 
 function productionStatus(
@@ -96,14 +88,14 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit): Response {
       : input instanceof URL
         ? input.href
         : input.url;
-  if (url.endsWith("/state/export")) return Response.json(snapshotV2);
+  if (url.endsWith("/state/export")) return Response.json(snapshot);
   if (url.endsWith("/state/import") && init?.method === "POST") {
     return Response.json({
       run_id: "run-imported",
       status: "needs_review",
       current_stage: "assembly",
       imported_stages: ["references", "extraction", "synthesis"],
-      schema_version: 2,
+      schema_version: 4,
       content_sha256: "d",
     });
   }
@@ -163,7 +155,7 @@ describe("ProductionStateTransfer", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("recharge immédiatement le V2 produit par l’export et l’importe", async () => {
+  it("recharge immédiatement le V4 produit par l’export et l’importe", async () => {
     const fetchMock = vi.fn(responseFor);
     vi.stubGlobal("fetch", fetchMock);
     let exportedBlob: Blob | undefined;
@@ -207,7 +199,7 @@ describe("ProductionStateTransfer", () => {
     await userEvent.upload(screen.getByLabelText("Importer un état"), file);
 
     expect(
-      await screen.findByText("Format : AutoWork production-state v2"),
+      await screen.findByText("Format : AutoWork production-state v4"),
     ).toBeInTheDocument();
     await userEvent.click(
       await screen.findByRole("button", { name: "Importer" }),
@@ -217,8 +209,15 @@ describe("ProductionStateTransfer", () => {
     if (typeof body !== "string")
       throw new Error("Import request has no JSON body");
     expect(JSON.parse(body)).toMatchObject({
-      schema_version: 2,
-      origin: { subject_title: "Campagne d’Iran", research_date: null },
+      schema_version: 4,
+      origin: {
+        subject_title: "Campagne d’Iran",
+        subject_id: SUBJECT_ID,
+        production_run_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        research_date: "2026-08-20",
+        discovery_snapshot_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        discovery_snapshot_version: 3,
+      },
     });
   });
 
@@ -301,7 +300,7 @@ describe("ProductionStateTransfer", () => {
     );
     await waitFor(() => expect(click).toHaveBeenCalled());
     expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-    expect(downloadedName).toContain("production-state-v2");
+    expect(downloadedName).toContain("production-state-v4");
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:test");
   });
 

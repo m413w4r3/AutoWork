@@ -13,12 +13,12 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
     safe_slug,
 )
-from cti_app.application.production_state import ProductionStateError, ProductionStateSnapshotV1
+from cti_app.application.production_state import ProductionStateError, ProductionStateSnapshotV4
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     EditionProductionBatchItem,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 
@@ -27,17 +27,19 @@ def _state(
     reference_hash: str = "a" * 64,
     extraction_hash: str = "b" * 64,
     synthesis_hash: str = "c" * 64,
-) -> ProductionStateSnapshotV1:
-    return ProductionStateSnapshotV1.model_validate(
+) -> ProductionStateSnapshotV4:
+    return ProductionStateSnapshotV4.model_validate(
         {
             "format": "autowork.production-state",
-            "schema_version": 1,
+            "schema_version": 4,
             "exported_at": "2026-08-29T10:00:00Z",
             "origin": {
                 "subject_title": "Sujet / à vérifier",
-                "editorial_type": "brief",
-                "profile": "brief_auto",
+                "subject_id": "11111111-1111-4111-8111-111111111111",
+                "production_run_id": "22222222-2222-4222-8222-222222222222",
                 "research_date": "2026-08-01",
+                "discovery_snapshot_id": "33333333-3333-4333-8333-333333333333",
+                "discovery_snapshot_version": 7,
             },
             "artifacts": {
                 "references": {"input_hash": reference_hash, "canonical_content": {"items": []}},
@@ -136,10 +138,10 @@ class _Artifacts:
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
+    def __init__(self, run: ProductionRun) -> None:
         self.run = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.run if run_id == self.run.id else None
 
 
@@ -172,9 +174,9 @@ class _Snapshots:
 
 class _Uow:
     def __init__(
-        self, run: SubjectProductionRun, edition: Edition, item: EditionProductionBatchItem
+        self, run: ProductionRun, edition: Edition, item: EditionProductionBatchItem
     ) -> None:
-        self.subject_production_runs = _Runs(run)
+        self.production_runs = _Runs(run)
         self.edition_production_batch_items = _Items(item)
         self.editions = _Editions(edition)
         self.production_input_snapshots = _Snapshots("Sujet", run.id)
@@ -191,29 +193,23 @@ class _State:
     def __init__(
         self,
         *,
-        exact_state: ProductionStateSnapshotV1 | None = None,
-        current_state: ProductionStateSnapshotV1 | None = None,
+        exact_state: ProductionStateSnapshotV4 | None = None,
+        current_state: ProductionStateSnapshotV4 | None = None,
     ) -> None:
         self.exact_run_ids: list[UUID] = []
         self.exact_state = exact_state or _state()
         self.current_state = current_state or _state()
 
-    async def export_state(
-        self, *, subject_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV1:
+    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV4:
         return self.current_state
 
-    async def export_run_state(
-        self, run_id: UUID, *, subject_title: str
-    ) -> ProductionStateSnapshotV1:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
         self.exact_run_ids.append(run_id)
         return self.exact_state
 
 
 class _IncompleteState(_State):
-    async def export_run_state(
-        self, run_id: UUID, *, subject_title: str
-    ) -> ProductionStateSnapshotV1:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
         raise ProductionStateError(
             code="production_state_incomplete", message="Artifacts are not complete"
         )
@@ -226,7 +222,7 @@ class _BrokenMaterializer:
 
 @pytest.mark.asyncio
 async def test_filesystem_error_is_best_effort_and_returns_no_failure(tmp_path: Path) -> None:
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
@@ -256,7 +252,7 @@ async def test_filesystem_error_is_best_effort_and_returns_no_failure(tmp_path: 
 
 @pytest.mark.asyncio
 async def test_checkpoint_exports_the_requested_run_exactly(tmp_path: Path) -> None:
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
         created_at=datetime(2026, 8, 1, tzinfo=UTC),
@@ -296,7 +292,7 @@ async def test_checkpoint_exports_the_requested_run_exactly(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_non_exportable_checkpoint_has_no_failure_diagnostic(tmp_path: Path) -> None:
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
         created_at=datetime(2026, 8, 1, tzinfo=UTC),

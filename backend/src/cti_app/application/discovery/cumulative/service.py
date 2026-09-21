@@ -66,14 +66,12 @@ class CumulativeDiscoveryService:
         uow_factory: UnitOfWorkFactory,
         planner: DiscoveryMergePlanner | None = None,
         blocking_strategy: DiscoveryBlockingStrategy | None = None,
-        after_activation: Callable[[UUID], Awaitable[object]] | None = None,
         diagnostics: DiagnosticsLog | None = None,
         replan_intake: Callable[[ReconcileDiscoveryParameters], Awaitable[object]] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._planner = planner or HeuristicMergePlanner()
         self._blocking = blocking_strategy or DiscoveryBlockingStrategy()
-        self._after_activation = after_activation
         self._diagnostics = diagnostics or DiagnosticsLog(None)
         # Replanning calls the merge model, so it cannot run inside the request
         # that discovered the staleness; the host hands over a way to queue it.
@@ -191,7 +189,7 @@ class CumulativeDiscoveryService:
 
             delta = build_discovery_delta(intake, candidates)
             # AW-008 S38: the canonical signal that an identity already carries an
-            # editorial dossier is SubjectDiscoveryOrigin, never EditorialGroup.
+            # editorial dossier is SubjectDiscoveryOrigin.
             origins = await uow.subject_discovery_origins.list_for_edition(intake.edition_id)
             materialized_subject_ids = {
                 await uow.discovery_subject_identities.resolve_canonical_subject(
@@ -429,7 +427,6 @@ class CumulativeDiscoveryService:
                 merge_event_count=len(applied.merge_events),
                 warnings=list(applied.warnings),
             )
-            await self._after_snapshot_activation(applied.snapshot)
             return applied.snapshot
 
     async def reconcile_batch(
@@ -504,14 +501,3 @@ class CumulativeDiscoveryService:
                 for item in build_discovery_delta(intake, candidates).candidates:
                     labels[item.handle] = _handle_label(item.handle, item.candidate)
             return labels
-
-    async def _after_snapshot_activation(self, snapshot: DiscoverySnapshot) -> None:
-        """Notify derived projections that a new snapshot became active.
-
-        AW-008 S37: the discovery/fusion path never reads or writes
-        ``EditorialGroup`` itself. Rebuilding the legacy projection is the
-        injected callback's business, not this service's.
-        """
-        if self._after_activation is None:
-            return
-        await self._after_activation(snapshot.edition_id)

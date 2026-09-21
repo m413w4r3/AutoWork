@@ -23,7 +23,7 @@ from cti_app.domain.production import (
     ProductionDerivedOutput,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
-    SubjectProductionStatus,
+    ProductionRunStatus,
 )
 
 
@@ -146,11 +146,11 @@ class _Uow:
             edition_id=EDITION_ID,
             subject_id=SUBJECT_ID,
             pipeline_generation=4,
-            status=SubjectProductionStatus.READY,
+            status=ProductionRunStatus.READY,
             requires_reconciliation=False,
             research_date=None,
         )
-        self.subject_production_runs = SimpleNamespace(
+        self.production_runs = SimpleNamespace(
             get=lambda _run_id: self._run(),
             get_current_for_subject=lambda _subject_id: self._run(),
             get_for_update=lambda _run_id: self._run(),

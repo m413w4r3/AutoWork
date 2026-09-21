@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.persistence import ActiveSubjectProductionRunConflictError
 from cti_app.application.production_read_model import BatchStatusItem
+from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.production import (
     AnalystInputPack,
@@ -28,15 +29,15 @@ from cti_app.domain.production import (
     ProductionRepairDecision,
     ProductionRepairIssueKind,
     ProductionReuseInvalidation,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
     SampleAcquisitionAttempt,
     SampleAcquisitionOutcome,
     SampleAcquisitionReason,
     SourceExtraction,
     SourceExtractionStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.production import (
@@ -50,9 +51,9 @@ from cti_app.infrastructure.database.models.production import (
     ProductionRepairCorrectionRow,
     ProductionRepairDecisionRow,
     ProductionReuseInvalidationRow,
+    ProductionRunRow,
     SampleAcquisitionAttemptRow,
     SourceExtractionRow,
-    SubjectProductionRunRow,
 )
 
 
@@ -195,12 +196,12 @@ def _sample_acquisition_attempt_from_row(
     )
 
 
-class SqlAlchemySubjectProductionRunRepository:
+class SqlAlchemyProductionRunRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
-    async def add(self, run: SubjectProductionRun) -> None:
-        row = SubjectProductionRunRow(
+    async def add(self, run: ProductionRun) -> None:
+        row = ProductionRunRow(
             id=run.id,
             subject_id=run.subject_id,
             edition_id=run.edition_id,
@@ -261,24 +262,20 @@ class SqlAlchemySubjectProductionRunRepository:
                 raise ActiveSubjectProductionRunConflictError from exc
             raise
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
-        row = await self._session.get(SubjectProductionRunRow, run_id)
-        return _subject_production_run_from_row(row) if row else None
+    async def get(self, run_id: UUID) -> ProductionRun | None:
+        row = await self._session.get(ProductionRunRow, run_id)
+        return _production_run_from_row(row) if row else None
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
-        query = (
-            select(SubjectProductionRunRow)
-            .where(SubjectProductionRunRow.id == run_id)
-            .with_for_update()
-        )
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
+        query = select(ProductionRunRow).where(ProductionRunRow.id == run_id).with_for_update()
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
-        return _subject_production_run_from_row(row) if row else None
+        return _production_run_from_row(row) if row else None
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         stmt = (
-            update(SubjectProductionRunRow)
-            .where(SubjectProductionRunRow.id == run.id)
+            update(ProductionRunRow)
+            .where(ProductionRunRow.id == run.id)
             .values(
                 status=run.status.value,
                 current_stage=run.current_stage.value,
@@ -328,49 +325,58 @@ class SqlAlchemySubjectProductionRunRepository:
         )
         await self._session.execute(stmt)
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         query = (
-            select(SubjectProductionRunRow)
-            .where(SubjectProductionRunRow.subject_id == subject_id)
-            .order_by(SubjectProductionRunRow.created_at.desc(), SubjectProductionRunRow.id.desc())
+            select(ProductionRunRow)
+            .where(ProductionRunRow.subject_id == subject_id)
+            .order_by(ProductionRunRow.run_number.desc())
             .limit(1)
         )
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
-        return _subject_production_run_from_row(row) if row else None
+        return _production_run_from_row(row) if row else None
 
     async def get_latest_terminal_for_edition_subject(
         self, edition_id: UUID, subject_id: UUID
-    ) -> SubjectProductionRun | None:
+    ) -> ProductionRun | None:
         query = (
-            select(SubjectProductionRunRow)
+            select(ProductionRunRow)
             .where(
-                (SubjectProductionRunRow.edition_id == edition_id)
-                & (SubjectProductionRunRow.subject_id == subject_id)
-                & SubjectProductionRunRow.status.in_(
+                (ProductionRunRow.edition_id == edition_id)
+                & (ProductionRunRow.subject_id == subject_id)
+                & ProductionRunRow.status.in_(
                     [
-                        SubjectProductionStatus.READY.value,
-                        SubjectProductionStatus.NEEDS_REVIEW.value,
-                        SubjectProductionStatus.FAILED.value,
-                        SubjectProductionStatus.CANCELLED.value,
+                        ProductionRunStatus.READY.value,
+                        ProductionRunStatus.NEEDS_REVIEW.value,
+                        ProductionRunStatus.FAILED.value,
+                        ProductionRunStatus.CANCELLED.value,
                     ]
                 )
             )
-            .order_by(SubjectProductionRunRow.created_at.desc(), SubjectProductionRunRow.id.desc())
+            .order_by(ProductionRunRow.run_number.desc())
             .limit(1)
         )
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
-        return _subject_production_run_from_row(row) if row else None
+        return _production_run_from_row(row) if row else None
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]:
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[ProductionRun]:
         query = (
-            select(SubjectProductionRunRow)
-            .where(SubjectProductionRunRow.edition_id == edition_id)
-            .order_by(SubjectProductionRunRow.created_at)
+            select(ProductionRunRow)
+            .where(ProductionRunRow.edition_id == edition_id)
+            .order_by(ProductionRunRow.created_at)
         )
         result = await self._session.execute(query)
-        return [_subject_production_run_from_row(row) for row in result.scalars()]
+        return [_production_run_from_row(row) for row in result.scalars()]
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[ProductionRun]:
+        query = (
+            select(ProductionRunRow)
+            .where(ProductionRunRow.subject_id == subject_id)
+            .order_by(ProductionRunRow.run_number.desc(), ProductionRunRow.id.desc())
+        )
+        result = await self._session.execute(query)
+        return [_production_run_from_row(row) for row in result.scalars()]
 
     async def lock_creation_for_subject(self, subject_id: UUID) -> None:
         """Serialize run creation for one subject until this transaction ends."""
@@ -381,8 +387,8 @@ class SqlAlchemySubjectProductionRunRepository:
     async def allocate_next_run_number(self, subject_id: UUID) -> int:
         """Return the next subject-local number after the creation lock is held."""
         maximum = await self._session.scalar(
-            select(func.max(SubjectProductionRunRow.run_number)).where(
-                SubjectProductionRunRow.subject_id == subject_id
+            select(func.max(ProductionRunRow.run_number)).where(
+                ProductionRunRow.subject_id == subject_id
             )
         )
         return int(maximum or 0) + 1
@@ -399,10 +405,18 @@ class SqlAlchemyProductionInputSnapshotRepository:
                 production_run_id=snapshot.production_run_id,
                 subject_id=snapshot.subject_id,
                 edition_id=snapshot.edition_id,
-                editorial_group_id=snapshot.editorial_group_id,
-                editorial_group_version=snapshot.editorial_group_version,
+                subject_version=snapshot.subject_version,
                 subject_title=snapshot.subject_title,
-                subject_description=snapshot.subject_description,
+                subject_tlp=snapshot.subject_tlp.value,
+                selection_decision_id=snapshot.selection_decision_id,
+                origin_discovery_subject_id=snapshot.origin_discovery_subject_id,
+                canonical_discovery_subject_id=snapshot.canonical_discovery_subject_id,
+                discovery_snapshot_id=snapshot.discovery_snapshot_id,
+                discovery_snapshot_version=snapshot.discovery_snapshot_version,
+                member_candidate_ids=[
+                    str(candidate_id) for candidate_id in snapshot.member_candidate_ids
+                ],
+                discovery_summary=snapshot.discovery_summary,
                 actor_or_campaign=snapshot.actor_or_campaign,
                 period_start=snapshot.period_start,
                 period_end=snapshot.period_end,
@@ -491,11 +505,11 @@ class SqlAlchemyProductionArtifactRepository:
                 .label("artifact_rank"),
             )
             .join(
-                SubjectProductionRunRow,
-                SubjectProductionRunRow.id == ProductionArtifactRow.production_run_id,
+                ProductionRunRow,
+                ProductionRunRow.id == ProductionArtifactRow.production_run_id,
             )
             .where(
-                SubjectProductionRunRow.edition_id == edition_id,
+                ProductionRunRow.edition_id == edition_id,
                 ProductionArtifactRow.stage == stage,
                 ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value,
             )
@@ -529,19 +543,19 @@ class SqlAlchemyProductionArtifactRepository:
         query = (
             select(ProductionArtifactRow)
             .join(
-                SubjectProductionRunRow,
-                SubjectProductionRunRow.id == ProductionArtifactRow.production_run_id,
+                ProductionRunRow,
+                ProductionRunRow.id == ProductionArtifactRow.production_run_id,
             )
             .where(
-                (SubjectProductionRunRow.edition_id == edition_id)
-                & (SubjectProductionRunRow.subject_id == subject_id)
+                (ProductionRunRow.edition_id == edition_id)
+                & (ProductionRunRow.subject_id == subject_id)
                 & (ProductionArtifactRow.subject_id == subject_id)
-                & SubjectProductionRunRow.status.in_(
+                & ProductionRunRow.status.in_(
                     [
-                        SubjectProductionStatus.READY.value,
-                        SubjectProductionStatus.NEEDS_REVIEW.value,
-                        SubjectProductionStatus.FAILED.value,
-                        SubjectProductionStatus.CANCELLED.value,
+                        ProductionRunStatus.READY.value,
+                        ProductionRunStatus.NEEDS_REVIEW.value,
+                        ProductionRunStatus.FAILED.value,
+                        ProductionRunStatus.CANCELLED.value,
                     ]
                 )
                 & (ProductionArtifactRow.stage == stage)
@@ -879,6 +893,10 @@ class SqlAlchemyEditionProductionBatchRepository:
         row = EditionProductionBatchRow(
             id=batch.id,
             edition_id=batch.edition_id,
+            idempotency_key=batch.idempotency_key,
+            request_fingerprint=batch.request_fingerprint,
+            actor_id=batch.actor_id,
+            correlation_id=batch.correlation_id,
             status=batch.status.value,
             phase=batch.phase.value,
             next_dispatch_at=batch.next_dispatch_at,
@@ -897,6 +915,21 @@ class SqlAlchemyEditionProductionBatchRepository:
         query = (
             select(EditionProductionBatchRow)
             .where(EditionProductionBatchRow.id == batch_id)
+            .with_for_update()
+        )
+        result = await self._session.execute(query)
+        row = result.scalar_one_or_none()
+        return _edition_production_batch_from_row(row) if row else None
+
+    async def get_by_idempotency_key(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> EditionProductionBatch | None:
+        query = (
+            select(EditionProductionBatchRow)
+            .where(
+                EditionProductionBatchRow.edition_id == edition_id,
+                EditionProductionBatchRow.idempotency_key == idempotency_key,
+            )
             .with_for_update()
         )
         result = await self._session.execute(query)
@@ -923,6 +956,10 @@ class SqlAlchemyEditionProductionBatchRepository:
             .where(EditionProductionBatchRow.id == batch.id)
             .values(
                 status=batch.status.value,
+                idempotency_key=batch.idempotency_key,
+                request_fingerprint=batch.request_fingerprint,
+                actor_id=batch.actor_id,
+                correlation_id=batch.correlation_id,
                 phase=batch.phase.value,
                 next_dispatch_at=batch.next_dispatch_at,
                 started_at=batch.started_at,
@@ -952,6 +989,26 @@ class SqlAlchemyEditionProductionBatchRepository:
         result = await self._session.execute(query)
         row = result.scalar_one_or_none()
         return _edition_production_batch_from_row(row) if row else None
+
+    async def list_recent_for_edition(
+        self, edition_id: UUID, limit: int = 10
+    ) -> Sequence[EditionProductionBatch]:
+        query = (
+            select(EditionProductionBatchRow)
+            .where(
+                EditionProductionBatchRow.edition_id == edition_id,
+                EditionProductionBatchRow.status.not_in(
+                    (ProductionBatchStatus.QUEUED.value, ProductionBatchStatus.RUNNING.value)
+                ),
+            )
+            .order_by(
+                EditionProductionBatchRow.created_at.desc(),
+                EditionProductionBatchRow.id.desc(),
+            )
+            .limit(limit)
+        )
+        result = await self._session.execute(query)
+        return [_edition_production_batch_from_row(row) for row in result.scalars()]
 
 
 class SqlAlchemyEditionProductionBatchItemRepository:
@@ -1021,35 +1078,29 @@ class SqlAlchemyBatchStatusReadRepository:
                     subject_title,
                 ).label("title"),
                 EditionProductionBatchItemRow.production_run_id.label("run_id"),
-                SubjectProductionRunRow.status.label("status"),
-                SubjectProductionRunRow.current_stage.label("current_stage"),
-                SubjectProductionRunRow.pipeline_generation.label("pipeline_generation"),
+                ProductionRunRow.status.label("status"),
+                ProductionRunRow.current_stage.label("current_stage"),
+                ProductionRunRow.pipeline_generation.label("pipeline_generation"),
                 EditionProductionBatchItemRow.auto_recovery_count.label("auto_recovery_count"),
-                SubjectProductionRunRow.error_code.label("error_code"),
-                SubjectProductionRunRow.error_message.label("error_message"),
-                SubjectProductionRunRow.extraction_progress.label("extraction_progress"),
-                SubjectProductionRunRow.reconciliation_model_run_id.label(
-                    "reconciliation_model_run_id"
-                ),
-                SubjectProductionRunRow.reconciliation_bridge_response_id.label(
+                ProductionRunRow.error_code.label("error_code"),
+                ProductionRunRow.error_message.label("error_message"),
+                ProductionRunRow.extraction_progress.label("extraction_progress"),
+                ProductionRunRow.reconciliation_model_run_id.label("reconciliation_model_run_id"),
+                ProductionRunRow.reconciliation_bridge_response_id.label(
                     "reconciliation_bridge_response_id"
                 ),
-                SubjectProductionRunRow.reconciliation_submission_state.label(
+                ProductionRunRow.reconciliation_submission_state.label(
                     "reconciliation_submission_state"
                 ),
-                SubjectProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
-                SubjectProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
-                SubjectProductionRunRow.reconciliation_output_sha256.label(
-                    "reconciliation_output_sha256"
-                ),
-                SubjectProductionRunRow.reconciliation_provenance.label(
-                    "reconciliation_provenance"
-                ),
+                ProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
+                ProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
+                ProductionRunRow.reconciliation_output_sha256.label("reconciliation_output_sha256"),
+                ProductionRunRow.reconciliation_provenance.label("reconciliation_provenance"),
             )
             .select_from(EditionProductionBatchItemRow)
             .join(
-                SubjectProductionRunRow,
-                SubjectProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
+                ProductionRunRow,
+                ProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
             )
             .outerjoin(
                 ProductionInputSnapshotRow,
@@ -1066,8 +1117,8 @@ class SqlAlchemyBatchStatusReadRepository:
                 subject_id=row["subject_id"],
                 title=(row["title"] if row["title"] is not None else str(row["subject_id"])),
                 run_id=row["run_id"],
-                status=SubjectProductionStatus(row["status"]),
-                current_stage=SubjectProductionStage(row["current_stage"]),
+                status=ProductionRunStatus(row["status"]),
+                current_stage=ProductionStage(row["current_stage"]),
                 pipeline_generation=row["pipeline_generation"],
                 auto_recovery_count=row["auto_recovery_count"],
                 error_code=row["error_code"],
@@ -1088,20 +1139,20 @@ class SqlAlchemyBatchStatusReadRepository:
         ]
 
 
-def _subject_production_run_from_row(row: SubjectProductionRunRow) -> SubjectProductionRun:
-    return SubjectProductionRun(
+def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
+    return ProductionRun(
         id=row.id,
         subject_id=row.subject_id,
         edition_id=row.edition_id,
-        status=SubjectProductionStatus(row.status),
-        current_stage=SubjectProductionStage(row.current_stage),
+        status=ProductionRunStatus(row.status),
+        current_stage=ProductionStage(row.current_stage),
         references_conversation_id=row.references_conversation_id,
         synthesis_conversation_id=row.synthesis_conversation_id,
         run_number=row.run_number,
         pipeline_generation=row.pipeline_generation,
         research_date=row.research_date,
         force_recompute_from_stage=(
-            SubjectProductionStage(row.force_recompute_from_stage)
+            ProductionStage(row.force_recompute_from_stage)
             if row.force_recompute_from_stage is not None
             else None
         ),
@@ -1152,7 +1203,7 @@ def _reconciliation_from_values(
     return ProductionSubmissionReconciliation(
         production_run_id=production_run_id,
         model_run_id=model_run_id,
-        stage=SubjectProductionStage(stage),
+        stage=ProductionStage(stage),
         bridge_response_id=bridge_response_id,
         submission_state=ModelSubmissionState(submission_state),
         phase=phase,
@@ -1332,6 +1383,10 @@ def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> Editio
         id=row.id,
         edition_id=row.edition_id,
         status=ProductionBatchStatus(row.status),
+        idempotency_key=row.idempotency_key,
+        request_fingerprint=row.request_fingerprint,
+        actor_id=row.actor_id,
+        correlation_id=row.correlation_id,
         phase=ProductionBatchPhase(row.phase),
         next_dispatch_at=row.next_dispatch_at,
         created_at=row.created_at,
@@ -1363,12 +1418,18 @@ def _production_input_snapshot_from_row(
     return ProductionInputSnapshot(
         id=row.id,
         production_run_id=row.production_run_id,
-        subject_id=row.subject_id,
         edition_id=row.edition_id,
-        editorial_group_id=row.editorial_group_id,
-        editorial_group_version=row.editorial_group_version,
+        subject_id=row.subject_id,
+        subject_version=row.subject_version,
         subject_title=row.subject_title,
-        subject_description=row.subject_description,
+        subject_tlp=TLP(row.subject_tlp),
+        selection_decision_id=row.selection_decision_id,
+        origin_discovery_subject_id=row.origin_discovery_subject_id,
+        canonical_discovery_subject_id=row.canonical_discovery_subject_id,
+        discovery_snapshot_id=row.discovery_snapshot_id,
+        discovery_snapshot_version=row.discovery_snapshot_version,
+        member_candidate_ids=tuple(UUID(str(value)) for value in row.member_candidate_ids),
+        discovery_summary=row.discovery_summary,
         actor_or_campaign=row.actor_or_campaign,
         period_start=row.period_start,
         period_end=row.period_end,
@@ -1387,7 +1448,7 @@ def _production_reuse_invalidation_from_row(
         id=row.id,
         edition_id=row.edition_id,
         subject_id=row.subject_id,
-        from_stage=SubjectProductionStage(row.from_stage),
+        from_stage=ProductionStage(row.from_stage),
         actor_id=row.actor_id,
         correlation_id=row.correlation_id,
         occurred_at=row.occurred_at,

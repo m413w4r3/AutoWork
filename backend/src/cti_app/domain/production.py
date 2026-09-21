@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
@@ -16,7 +17,7 @@ from cti_app.domain.discovery import SourceCandidate, SourceRole
 from cti_app.domain.model_runs import ModelSubmissionState
 
 
-class SubjectProductionStatus(StrEnum):
+class ProductionRunStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
     READY = "ready"
@@ -25,7 +26,7 @@ class SubjectProductionStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-class SubjectProductionStage(StrEnum):
+class ProductionStage(StrEnum):
     SOURCES = "sources"
     REFERENCES = "references"
     EXTRACTION = "extraction"
@@ -350,7 +351,7 @@ class ProductionSubmissionReconciliation:
 
     production_run_id: UUID
     model_run_id: UUID
-    stage: SubjectProductionStage
+    stage: ProductionStage
     bridge_response_id: str | None
     submission_state: ModelSubmissionState
     phase: str
@@ -383,13 +384,13 @@ class ProductionReconciliationRequiredError(ValueError):
 
 
 def requires_submission_reconciliation(
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
     error_code: str | None,
     reconciliation: ProductionSubmissionReconciliation | None,
 ) -> bool:
     """The single definition of "this run waits for a provider reconciliation"."""
     return (
-        status is SubjectProductionStatus.NEEDS_REVIEW
+        status is ProductionRunStatus.NEEDS_REVIEW
         and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
         and reconciliation is not None
     )
@@ -559,12 +560,38 @@ class SourceExtractionStatus(StrEnum):
     FAILED = "failed"
 
 
+_SOURCE_ROLE_ORDER = {
+    SourceRole.PRIMARY: 0,
+    SourceRole.INDEPENDENT: 1,
+    SourceRole.RELAY: 2,
+    SourceRole.AGGREGATOR: 3,
+    SourceRole.SOCIAL: 4,
+    SourceRole.UNKNOWN: 9,
+}
+
+
+def source_role_rank(role: SourceRole) -> int:
+    """Deterministic editorial precedence of a source role (lower is stronger)."""
+    return _SOURCE_ROLE_ORDER.get(role, 9)
+
+
+def _production_input_source_sort_key(source: ProductionInputSource) -> tuple[object, ...]:
+    return (
+        source.canonical_url,
+        source_role_rank(source.role),
+        source.title.casefold(),
+        source.publisher.casefold(),
+        source.published_at or date.max,
+        str(source.discovery_candidate_id),
+        str(source.source_candidate_id),
+    )
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionInputSource:
     """The source-candidate metadata captured for a production run."""
 
-    batch_id: UUID
-    candidate_id: UUID
+    discovery_candidate_id: UUID
     source_candidate_id: UUID
     canonical_url: str
     role: SourceRole
@@ -574,6 +601,7 @@ class ProductionInputSource:
     tlp: TLP
     sensitivity: str
     external_llm_allowed: bool
+    discovery_batch_id: UUID | None = None
 
     def __post_init__(self) -> None:
         if not self.canonical_url.strip():
@@ -585,8 +613,10 @@ class ProductionInputSource:
 
     def payload(self) -> dict[str, object]:
         return {
-            "batch_id": str(self.batch_id),
-            "candidate_id": str(self.candidate_id),
+            "discovery_batch_id": (
+                str(self.discovery_batch_id) if self.discovery_batch_id is not None else None
+            ),
+            "discovery_candidate_id": str(self.discovery_candidate_id),
             "source_candidate_id": str(self.source_candidate_id),
             "canonical_url": self.canonical_url,
             "role": self.role.value,
@@ -602,8 +632,12 @@ class ProductionInputSource:
     def from_payload(cls, payload: dict[str, object]) -> ProductionInputSource:
         published_at = payload.get("published_at")
         return cls(
-            batch_id=UUID(str(payload["batch_id"])),
-            candidate_id=UUID(str(payload["candidate_id"])),
+            discovery_batch_id=(
+                UUID(str(payload["discovery_batch_id"]))
+                if payload.get("discovery_batch_id")
+                else None
+            ),
+            discovery_candidate_id=UUID(str(payload["discovery_candidate_id"])),
             source_candidate_id=UUID(str(payload["source_candidate_id"])),
             canonical_url=str(payload["canonical_url"]),
             role=SourceRole(str(payload["role"])),
@@ -629,18 +663,34 @@ class ProductionInputSource:
             external_llm_allowed=self.external_llm_allowed,
         )
 
+    def functional_payload(self) -> dict[str, object]:
+        """Return source data that participates in snapshot identity.
+
+        The discovery batch is retained as frozen provenance for collection,
+        but it is deliberately excluded from both snapshot hashes.
+        """
+        payload = self.payload()
+        payload.pop("discovery_batch_id", None)
+        return payload
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionInputSnapshot:
     """Immutable functional input captured exactly once for a production run."""
 
     production_run_id: UUID
-    subject_id: UUID
     edition_id: UUID
-    editorial_group_id: UUID
-    editorial_group_version: int
+    subject_id: UUID
+    subject_version: int
     subject_title: str
-    subject_description: str
+    subject_tlp: TLP
+    selection_decision_id: UUID
+    origin_discovery_subject_id: UUID
+    canonical_discovery_subject_id: UUID
+    discovery_snapshot_id: UUID
+    discovery_snapshot_version: int
+    member_candidate_ids: tuple[UUID, ...]
+    discovery_summary: str
     actor_or_campaign: str
     period_start: date
     period_end: date
@@ -652,23 +702,39 @@ class ProductionInputSnapshot:
     captured_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
+        member_ids = tuple(sorted(self.member_candidate_ids, key=str))
+        if len(member_ids) != len(set(member_ids)):
+            raise ValueError("member_candidate_ids must not contain duplicates")
+        object.__setattr__(self, "member_candidate_ids", member_ids)
+        member_id_set = set(member_ids)
+
+        source_keys = [
+            (source.discovery_candidate_id, source.source_candidate_id)
+            for source in self.core_sources
+        ]
+        if any(source.discovery_candidate_id not in member_id_set for source in self.core_sources):
+            raise ValueError("core_sources must belong to member_candidate_ids")
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError("core_sources must not contain duplicate candidate identities")
+        source_urls = [source.canonical_url for source in self.core_sources]
+        if len(source_urls) != len(set(source_urls)):
+            raise ValueError("core_sources must not contain duplicate URLs")
         object.__setattr__(
             self,
             "core_sources",
             tuple(
                 sorted(
                     self.core_sources,
-                    key=lambda source: (
-                        source.canonical_url,
-                        str(source.batch_id),
-                        str(source.candidate_id),
-                        str(source.source_candidate_id),
-                    ),
+                    key=_production_input_source_sort_key,
                 )
             ),
         )
-        if self.editorial_group_version < 1:
-            raise ValueError("editorial_group_version must be >= 1")
+        if self.subject_version < 1:
+            raise ValueError("subject_version must be >= 1")
+        if self.discovery_snapshot_version < 1:
+            raise ValueError("discovery_snapshot_version must be >= 1")
+        if not isinstance(self.subject_tlp, TLP):
+            raise ValueError("subject_tlp must be a valid TLP")
         if self.period_start > self.period_end:
             raise ValueError("Production input period must be ordered")
         if not self.subject_title.strip():
@@ -685,23 +751,46 @@ class ProductionInputSnapshot:
         object.__setattr__(self, "input_hash", computed)
 
     def reuse_basis_payload(self) -> dict[str, object]:
+        """Functional inputs whose equality allows reusing a costly stage.
+
+        It is the whole functional snapshot except ``research_date``: two runs
+        of the same Subject version, discovery snapshot, members and frozen
+        sources may share expensive stage outputs even when started on
+        different days.  Technical identities (run, snapshot and job IDs,
+        timestamps, conversations) never participate.  Stage-specific reuse
+        rules refine this basis in AW-010 to AW-013.
+        """
         return {
             "subject_id": str(self.subject_id),
             "edition_id": str(self.edition_id),
-            "editorial_group_id": str(self.editorial_group_id),
-            "editorial_group_version": self.editorial_group_version,
+            "subject_version": self.subject_version,
             "subject_title": self.subject_title,
-            "subject_description": self.subject_description,
+            "subject_tlp": self.subject_tlp.value,
+            "selection_decision_id": str(self.selection_decision_id),
+            "origin_discovery_subject_id": str(self.origin_discovery_subject_id),
+            "canonical_discovery_subject_id": str(self.canonical_discovery_subject_id),
+            "discovery_snapshot_id": str(self.discovery_snapshot_id),
+            "discovery_snapshot_version": self.discovery_snapshot_version,
+            "member_candidate_ids": [
+                str(candidate_id) for candidate_id in self.member_candidate_ids
+            ],
+            "discovery_summary": self.discovery_summary,
             "actor_or_campaign": self.actor_or_campaign,
             "period_start": self.period_start.isoformat(),
             "period_end": self.period_end.isoformat(),
-            "core_sources": [source.payload() for source in self.core_sources],
+            "core_sources": [source.functional_payload() for source in self.core_sources],
         }
 
     def functional_payload(self) -> dict[str, object]:
+        """Complete deterministic identity of the run input (``input_hash``)."""
         payload = self.reuse_basis_payload()
         payload["research_date"] = self.research_date.isoformat()
         return payload
+
+    @property
+    def subject_description(self) -> str:
+        """Expose the prompt-facing name for the frozen discovery summary."""
+        return self.discovery_summary
 
     def compute_reuse_basis_hash(self) -> str:
         encoded = json.dumps(
@@ -722,21 +811,21 @@ class ProductionInputSnapshot:
         return hashlib.sha256(encoded).hexdigest()
 
 
-def production_stages() -> tuple[SubjectProductionStage, ...]:
+def production_stages() -> tuple[ProductionStage, ...]:
     """Return the one executable publication pipeline."""
     return (
-        SubjectProductionStage.SOURCES,
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.SOURCES,
+        ProductionStage.REFERENCES,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     )
 
 
-def next_stage(stage: SubjectProductionStage) -> SubjectProductionStage | None:
+def next_stage(stage: ProductionStage) -> ProductionStage | None:
     """Return the successor in the unified pipeline."""
-    if not isinstance(stage, SubjectProductionStage):
-        raise TypeError("next_stage requires a SubjectProductionStage")
+    if not isinstance(stage, ProductionStage):
+        raise TypeError("next_stage requires a ProductionStage")
     stages = production_stages()
     try:
         index = stages.index(stage)
@@ -873,11 +962,11 @@ class LoopBudget:
 
 
 @dataclass(slots=True, kw_only=True)
-class SubjectProductionRun:
+class ProductionRun:
     subject_id: UUID
     edition_id: UUID
-    status: SubjectProductionStatus = SubjectProductionStatus.QUEUED
-    current_stage: SubjectProductionStage = SubjectProductionStage.SOURCES
+    status: ProductionRunStatus = ProductionRunStatus.QUEUED
+    current_stage: ProductionStage = ProductionStage.SOURCES
     references_conversation_id: UUID | None = None
     synthesis_conversation_id: UUID | None = None
     run_number: int = 1
@@ -890,7 +979,7 @@ class SubjectProductionRun:
     # A deliberate user retry bypasses cross-run reuse for this stage and all
     # downstream costly stages.  Technical retries of the same job keep using
     # the persisted artifact of the same run.
-    force_recompute_from_stage: SubjectProductionStage | None = None
+    force_recompute_from_stage: ProductionStage | None = None
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
@@ -904,32 +993,53 @@ class SubjectProductionRun:
     version: int = 1
 
     def __post_init__(self) -> None:
+        if not isinstance(self.status, ProductionRunStatus):
+            raise ValueError("status must be a ProductionRunStatus")
+        if not isinstance(self.current_stage, ProductionStage):
+            raise ValueError("current_stage must be a ProductionStage")
         if self.run_number < 1 or self.version < 1:
             raise ValueError("run_number and version must be >= 1")
         if self.pipeline_generation < 0:
             raise ValueError("pipeline_generation must be >= 0")
+        for field_name, timestamp in (
+            ("created_at", self.created_at),
+            ("updated_at", self.updated_at),
+            ("started_at", self.started_at),
+            ("finished_at", self.finished_at),
+        ):
+            if timestamp is not None and (
+                timestamp.tzinfo is None or timestamp.utcoffset() is None
+            ):
+                raise ValueError(f"{field_name} must be timezone-aware")
         if self.research_date is None:
             # The boundary is frozen at run creation.  In particular, a queued
             # run must not choose a different date when a worker starts it.
             self.research_date = self.created_at.date()
 
+    @staticmethod
+    def _timestamp(value: datetime | None, field_name: str) -> datetime:
+        timestamp = value or datetime.now(UTC)
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError(f"{field_name} must be timezone-aware")
+        return timestamp
+
     def start_running(self, *, now: datetime | None = None) -> None:
-        if self.status is not SubjectProductionStatus.QUEUED:
+        if self.status is not ProductionRunStatus.QUEUED:
             raise ValueError("Can only start from QUEUED status")
-        self.status = SubjectProductionStatus.RUNNING
-        self.started_at = now or datetime.now(UTC)
+        self.status = ProductionRunStatus.RUNNING
+        self.started_at = self._timestamp(now, "started_at")
         if self.research_date is None:
             raise ValueError("research_date must be frozen before a run starts")
         self.updated_at = self.started_at
         self.version += 1
 
     def advance_stage(self, *, now: datetime | None = None) -> None:
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         successor = next_stage(self.current_stage)
         if successor is not None:
             self.current_stage = successor
-        self.updated_at = now or datetime.now(UTC)
+        self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
 
     def set_extraction_progress(
@@ -940,17 +1050,17 @@ class SubjectProductionRun:
     ) -> None:
         """Persist the current compact Q2 source-progress snapshot."""
         self.extraction_progress = progress
-        self.updated_at = now or datetime.now(UTC)
+        self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
 
     def mark_ready(self, *, now: datetime | None = None) -> None:
         """READY implies assembly complete and QA passed."""
-        if self.status is SubjectProductionStatus.READY:
+        if self.status is ProductionRunStatus.READY:
             return
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
-        self.status = SubjectProductionStatus.READY
-        self.finished_at = now or datetime.now(UTC)
+        self.status = ProductionRunStatus.READY
+        self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
 
@@ -963,9 +1073,9 @@ class SubjectProductionRun:
         reconciliation: ProductionSubmissionReconciliation | None = None,
         now: datetime | None = None,
     ) -> None:
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
-        self.status = SubjectProductionStatus.NEEDS_REVIEW
+        self.status = ProductionRunStatus.NEEDS_REVIEW
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
@@ -973,7 +1083,7 @@ class SubjectProductionRun:
             self.reconciliation = reconciliation
         else:
             self.reconciliation = None
-        self.finished_at = now or datetime.now(UTC)
+        self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
 
@@ -985,26 +1095,26 @@ class SubjectProductionRun:
         details: dict[str, Any] | None = None,
         now: datetime | None = None,
     ) -> None:
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
-        self.status = SubjectProductionStatus.FAILED
+        self.status = ProductionRunStatus.FAILED
         self.error_code = code[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = details
-        self.finished_at = now or datetime.now(UTC)
+        self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
 
     def mark_cancelled(self, *, now: datetime | None = None) -> None:
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             return
         if self.status not in {
-            SubjectProductionStatus.QUEUED,
-            SubjectProductionStatus.RUNNING,
+            ProductionRunStatus.QUEUED,
+            ProductionRunStatus.RUNNING,
         }:
             raise ValueError("production_run_not_cancellable")
-        self.status = SubjectProductionStatus.CANCELLED
-        self.finished_at = now or datetime.now(UTC)
+        self.status = ProductionRunStatus.CANCELLED
+        self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
 
@@ -1015,7 +1125,7 @@ class SubjectProductionRun:
 
     def retry_from_stage(
         self,
-        stage: SubjectProductionStage,
+        stage: ProductionStage,
         *,
         now: datetime | None = None,
         force_recompute: bool = True,
@@ -1025,25 +1135,25 @@ class SubjectProductionRun:
         Unlike a worker retry, this invalidates the selected stage and its
         downstream outputs.  Callers must validate prerequisites first.
         """
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         # The last fence under the run lock: no retry — of this stage or of an
         # earlier one — may open a new generation while the provider
         # submission of this generation is still unresolved.
         if self.requires_reconciliation:
             raise ProductionReconciliationRequiredError
-        if self.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
+        if self.status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
             raise ValueError("Cannot retry a queued or running production")
-        self.status = SubjectProductionStatus.RUNNING
+        self.status = ProductionRunStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
         if force_recompute:
             self.force_recompute_from_stage = {
-                SubjectProductionStage.SOURCES: SubjectProductionStage.REFERENCES,
-                SubjectProductionStage.REFERENCES: SubjectProductionStage.REFERENCES,
-                SubjectProductionStage.EXTRACTION: SubjectProductionStage.EXTRACTION,
-                SubjectProductionStage.SYNTHESIS: SubjectProductionStage.SYNTHESIS,
-                SubjectProductionStage.ASSEMBLY: None,
+                ProductionStage.SOURCES: ProductionStage.REFERENCES,
+                ProductionStage.REFERENCES: ProductionStage.REFERENCES,
+                ProductionStage.EXTRACTION: ProductionStage.EXTRACTION,
+                ProductionStage.SYNTHESIS: ProductionStage.SYNTHESIS,
+                ProductionStage.ASSEMBLY: None,
             }[stage]
         else:
             self.force_recompute_from_stage = None
@@ -1053,20 +1163,20 @@ class SubjectProductionRun:
         self.error_details = None
         self.reconciliation = None
         self.finished_at = None
-        self.updated_at = now or datetime.now(UTC)
+        self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
 
-    def _reset_conversations_from(self, stage: SubjectProductionStage) -> None:
+    def _reset_conversations_from(self, stage: ProductionStage) -> None:
         """Drop the model conversations the stages from ``stage`` on will rebuild."""
-        if stage in (SubjectProductionStage.SOURCES, SubjectProductionStage.REFERENCES):
+        if stage in (ProductionStage.SOURCES, ProductionStage.REFERENCES):
             self.references_conversation_id = None
             self.synthesis_conversation_id = None
-        elif stage in (SubjectProductionStage.EXTRACTION, SubjectProductionStage.SYNTHESIS):
+        elif stage in (ProductionStage.EXTRACTION, ProductionStage.SYNTHESIS):
             self.synthesis_conversation_id = None
 
     def resume_after_cancellation(
         self,
-        stage: SubjectProductionStage,
+        stage: ProductionStage,
         *,
         now: datetime | None = None,
     ) -> None:
@@ -1083,7 +1193,7 @@ class SubjectProductionRun:
         Callers pick ``stage`` from the artifacts that really exist; the domain
         only guarantees the transition itself.
         """
-        if self.status is not SubjectProductionStatus.CANCELLED:
+        if self.status is not ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_not_resumable")
         # A cancelled run cannot carry an unresolved submission today — the
         # NEEDS_REVIEW transition that records one refuses a cancelled run.
@@ -1091,7 +1201,7 @@ class SubjectProductionRun:
         # resume duplicate a provider request.
         if self.reconciliation is not None:
             raise ProductionReconciliationRequiredError
-        self.status = SubjectProductionStatus.RUNNING
+        self.status = ProductionRunStatus.RUNNING
         self.current_stage = stage
         self.pipeline_generation += 1
         self.force_recompute_from_stage = None
@@ -1100,7 +1210,7 @@ class SubjectProductionRun:
         self.error_message = None
         self.error_details = None
         self.finished_at = None
-        self.updated_at = now or datetime.now(UTC)
+        self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
 
     def adopt_reconciliation_output(self, *, output_sha256: str, provenance: str) -> None:
@@ -1118,9 +1228,9 @@ class SubjectProductionRun:
             provenance=provenance,
         )
 
-    def resume_reconciled(self, *, expected_stage: SubjectProductionStage) -> None:
+    def resume_reconciled(self, *, expected_stage: ProductionStage) -> None:
         """Resume this exact generation after its archived ModelRun was adopted."""
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         if self.current_stage is not expected_stage:
             raise ValueError("production_reconciliation_stage_changed")
@@ -1128,13 +1238,13 @@ class SubjectProductionRun:
             raise ValueError("production_reconciliation_identity_mismatch")
         if self.reconciliation.output_sha256 is None:
             raise ValueError("production_reconciliation_output_missing")
-        if self.status is SubjectProductionStatus.RUNNING and self.error_code is None:
+        if self.status is ProductionRunStatus.RUNNING and self.error_code is None:
             return
-        if self.status is not SubjectProductionStatus.NEEDS_REVIEW:
+        if self.status is not ProductionRunStatus.NEEDS_REVIEW:
             raise ValueError("production_reconciliation_run_not_reviewable")
         if self.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE:
             raise ValueError("production_reconciliation_error_changed")
-        self.status = SubjectProductionStatus.RUNNING
+        self.status = ProductionRunStatus.RUNNING
         self.error_code = None
         self.error_message = None
         self.error_details = None
@@ -1145,7 +1255,7 @@ class SubjectProductionRun:
     def release_reconciliation(
         self,
         *,
-        expected_stage: SubjectProductionStage,
+        expected_stage: ProductionStage,
         reason: str = "bridge_run_unavailable",
         message: str = "Le bridge n'a produit aucune réponse récupérable.",
         now: datetime | None = None,
@@ -1157,18 +1267,18 @@ class SubjectProductionRun:
         decision.  Callers must invoke this transition first, then use the
         ordinary retry path to allocate the next pipeline generation.
         """
-        if self.status is SubjectProductionStatus.CANCELLED:
+        if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         if self.current_stage is not expected_stage:
             raise ValueError("production_reconciliation_stage_changed")
         if not self.requires_reconciliation:
             return
-        self.status = SubjectProductionStatus.NEEDS_REVIEW
+        self.status = ProductionRunStatus.NEEDS_REVIEW
         self.error_code = reason[:64]
         self.error_message = " ".join(message.replace("\x00", "").split())[:500]
         self.error_details = None
         self.reconciliation = None
-        self.finished_at = now or datetime.now(UTC)
+        self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
 
@@ -1322,7 +1432,7 @@ class ProductionReuseInvalidation:
 
     edition_id: UUID
     subject_id: UUID
-    from_stage: SubjectProductionStage
+    from_stage: ProductionStage
     actor_id: str
     correlation_id: str
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -1330,9 +1440,9 @@ class ProductionReuseInvalidation:
 
     def __post_init__(self) -> None:
         if self.from_stage not in {
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.EXTRACTION,
-            SubjectProductionStage.SYNTHESIS,
+            ProductionStage.REFERENCES,
+            ProductionStage.EXTRACTION,
+            ProductionStage.SYNTHESIS,
         }:
             raise ValueError("Production reuse invalidation must start at a costly stage")
         if not self.actor_id.strip():
@@ -1566,10 +1676,25 @@ class ProductionBatchRecoveryConflictError(ValueError):
         super().__init__(f"Production batch in {status.value} status cannot be reopened")
 
 
+def production_batch_request_fingerprint(
+    edition_id: UUID, ordered_subject_ids: Sequence[UUID]
+) -> str:
+    """Fingerprint the exact ordered batch request payload."""
+    material = f"{edition_id.hex}|" + "|".join(subject_id.hex for subject_id in ordered_subject_ids)
+    return hashlib.sha256(material.encode("ascii")).hexdigest()
+
+
+_PRODUCTION_BATCH_FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 @dataclass(slots=True, kw_only=True)
 class EditionProductionBatch:
     edition_id: UUID
     status: ProductionBatchStatus
+    idempotency_key: str = "legacy"
+    request_fingerprint: str = "0" * 64
+    actor_id: str = "system"
+    correlation_id: str = "-"
     phase: ProductionBatchPhase = ProductionBatchPhase.INITIAL
     next_dispatch_at: datetime | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -1583,6 +1708,14 @@ class EditionProductionBatch:
             self.status = ProductionBatchStatus(str(self.status))
         if not isinstance(self.phase, ProductionBatchPhase):
             self.phase = ProductionBatchPhase(str(self.phase))
+        if not self.idempotency_key.strip() or len(self.idempotency_key) > 255:
+            raise ValueError("idempotency_key must be non-empty and at most 255 characters")
+        if not _PRODUCTION_BATCH_FINGERPRINT_RE.fullmatch(self.request_fingerprint):
+            raise ValueError("request_fingerprint must be 64 lowercase hexadecimal characters")
+        if not self.actor_id.strip() or len(self.actor_id) > 255:
+            raise ValueError("actor_id must be non-empty and at most 255 characters")
+        if not self.correlation_id.strip() or len(self.correlation_id) > 128:
+            raise ValueError("correlation_id must be non-empty and at most 128 characters")
 
     def start(self, *, now: datetime | None = None) -> None:
         if self.status is not ProductionBatchStatus.QUEUED:

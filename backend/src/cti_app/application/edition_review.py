@@ -24,11 +24,11 @@ from cti_app.domain.production import (
     ProductionRepairImpact,
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
     RepairDecisionApplicationState,
     RepairExecutionPlan,
-    SubjectProductionStage,
-    SubjectProductionStatus,
     requires_submission_reconciliation,
 )
 from cti_app.domain.publication_review import (
@@ -46,7 +46,7 @@ class EditionReviewReadItem:
     title: str
     run_id: UUID
     pipeline_generation: int
-    run_status: SubjectProductionStatus
+    run_status: ProductionRunStatus
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
@@ -55,7 +55,7 @@ class EditionReviewReadItem:
     error_message: str | None
     effective_decision: PublicationDecision | None
     effective_decision_id: UUID | None = None
-    retry_stage: SubjectProductionStage | None = None
+    retry_stage: ProductionStage | None = None
     reconciliation: ProductionSubmissionReconciliation | None = None
     rejected_indicator_count: int = 0
     rejected_ioc_count: int = 0
@@ -90,8 +90,8 @@ class EditionReviewReadItem:
         have its outputs yet, and the pipeline itself owns that.
         """
         if self.run_status in {
-            SubjectProductionStatus.QUEUED,
-            SubjectProductionStatus.RUNNING,
+            ProductionRunStatus.QUEUED,
+            ProductionRunStatus.RUNNING,
         }:
             return False
         return (
@@ -100,7 +100,7 @@ class EditionReviewReadItem:
         )
 
     @property
-    def rebuild_stage(self) -> SubjectProductionStage | None:
+    def rebuild_stage(self) -> ProductionStage | None:
         """The stage the rebuild must start from, read off the artifacts.
 
         ``None`` when the artifact inventory was not supplied: naming a stage
@@ -111,7 +111,7 @@ class EditionReviewReadItem:
             return None
         return resolve_retry_stage(
             self.live_artifact_stages,
-            current_stage=SubjectProductionStage.ASSEMBLY,
+            current_stage=ProductionStage.ASSEMBLY,
         )
 
 
@@ -120,7 +120,7 @@ class EditionReviewReadRepository(Protocol):
 
 
 def requires_reconciliation(
-    run_status: SubjectProductionStatus,
+    run_status: ProductionRunStatus,
     error_code: str | None,
     reconciliation: ProductionSubmissionReconciliation | None,
 ) -> bool:
@@ -131,14 +131,14 @@ def requires_reconciliation(
     is not retryable until the operator adopts or abandons the exact answer.
 
     The rule itself lives in the domain, next to the fence that refuses
-    ``SubjectProductionRun.retry_from_stage``: the read model and the write
+    ``ProductionRun.retry_from_stage``: the read model and the write
     barrier must never diverge.
     """
     return requires_submission_reconciliation(run_status, error_code, reconciliation)
 
 
 def review_item_can_retry(
-    run_status: SubjectProductionStatus,
+    run_status: ProductionRunStatus,
     *,
     artifact_verified: bool,
     reconciliation_required: bool,
@@ -146,20 +146,20 @@ def review_item_can_retry(
     """The single Review retry policy, shared by the read model and the API.
 
     ``CANCELLED`` is deliberately absent: the domain refuses
-    ``SubjectProductionRun.retry_from_stage`` on a cancelled run, so offering a
+    ``ProductionRun.retry_from_stage`` on a cancelled run, so offering a
     retry would only produce a conflict.  A cancelled article owns its own
     gesture instead — see :func:`review_item_can_resume`.
     """
     if reconciliation_required:
         return False
     return run_status in {
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
-    } or (run_status is SubjectProductionStatus.READY and not artifact_verified)
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
+    } or (run_status is ProductionRunStatus.READY and not artifact_verified)
 
 
 def review_item_can_resume(
-    run_status: SubjectProductionStatus,
+    run_status: ProductionRunStatus,
     *,
     reconciliation_required: bool,
 ) -> bool:
@@ -172,7 +172,7 @@ def review_item_can_resume(
     """
     if reconciliation_required:
         return False
-    return run_status is SubjectProductionStatus.CANCELLED
+    return run_status is ProductionRunStatus.CANCELLED
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,7 +182,7 @@ class EditionReviewItem:
     title: str
     run_id: UUID
     pipeline_generation: int
-    run_status: SubjectProductionStatus
+    run_status: ProductionRunStatus
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
@@ -193,7 +193,7 @@ class EditionReviewItem:
     blocking: bool
     can_retry: bool
     effective_decision_id: UUID | None = None
-    retry_stage: SubjectProductionStage | None = None
+    retry_stage: ProductionStage | None = None
     can_resume: bool = False
     requires_reconciliation: bool = False
     reconciliation: ProductionSubmissionReconciliation | None = None
@@ -539,7 +539,7 @@ def _issue_subject(issue: Any) -> UUID | None:
 def _row_in_publication_scope(row: EditionReviewReadItem) -> bool:
     """Mirror ``_build_item``: READY without a decision is implicitly included."""
     decision = row.effective_decision
-    if decision is None and row.run_status is SubjectProductionStatus.READY:
+    if decision is None and row.run_status is ProductionRunStatus.READY:
         decision = PublicationDecision.INCLUDE
     return decision is not PublicationDecision.EXCLUDE
 
@@ -662,7 +662,7 @@ def _repair_articles(
     return tuple(item for _position, item in sorted(articles, key=lambda pair: pair[0]))
 
 
-def _rebuild_only_execution_plan(stage: SubjectProductionStage) -> RepairExecutionPlan:
+def _rebuild_only_execution_plan(stage: ProductionStage) -> RepairExecutionPlan:
     """The plan for an article that owes only a rebuild, with no arbitration.
 
     Nothing is pending an analyst decision here: the deliverable was destroyed
@@ -670,8 +670,8 @@ def _rebuild_only_execution_plan(stage: SubjectProductionStage) -> RepairExecuti
     set that owes a provider call; the rest is deterministic.
     """
     model_call_required = stage in {
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.SYNTHESIS,
+        ProductionStage.REFERENCES,
+        ProductionStage.SYNTHESIS,
     }
     return RepairExecutionPlan(
         impact_kind=ProductionRepairImpactKind.NARRATIVE,
@@ -855,7 +855,7 @@ class EditionReviewService:
 
             # The run lock serializes this comparison with the existing retry
             # use case, which changes generation and stales its artifacts.
-            runs_repository = uow.subject_production_runs
+            runs_repository = uow.production_runs
             get_run_for_update = getattr(runs_repository, "get_for_update", None)
             run = (
                 await get_run_for_update(row.run_id)
@@ -876,9 +876,9 @@ class EditionReviewService:
                     decision is not PublicationDecision.EXCLUDE
                     or run.status
                     not in {
-                        SubjectProductionStatus.FAILED,
-                        SubjectProductionStatus.NEEDS_REVIEW,
-                        SubjectProductionStatus.CANCELLED,
+                        ProductionRunStatus.FAILED,
+                        ProductionRunStatus.NEEDS_REVIEW,
+                        ProductionRunStatus.CANCELLED,
                     }
                     or any(
                         value is not None
@@ -941,15 +941,15 @@ def _build_item(row: EditionReviewReadItem, repair_issues: Sequence[Any] = ()) -
         and row.document_artifact_status is ProductionArtifactStatus.VERIFIED
     )
     decision = row.effective_decision
-    if decision is None and row.run_status is SubjectProductionStatus.READY:
+    if decision is None and row.run_status is ProductionRunStatus.READY:
         decision = PublicationDecision.INCLUDE
 
-    if row.run_status is SubjectProductionStatus.READY:
+    if row.run_status is ProductionRunStatus.READY:
         blocking = decision is not PublicationDecision.EXCLUDE and not artifact_verified
     elif row.run_status in {
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
-        SubjectProductionStatus.CANCELLED,
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
+        ProductionRunStatus.CANCELLED,
     }:
         blocking = decision is not PublicationDecision.EXCLUDE
     else:

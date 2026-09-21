@@ -23,6 +23,8 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   let publicationAccepted = false;
   let releasePublished = false;
   let releaseReads = 0;
+  let productionSurfaceVisited = false;
+  let productionPostBody: unknown = null;
   const seenPaths: string[] = [];
 
   const edition = () => ({
@@ -103,6 +105,33 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     finished_at: null,
   };
 
+  const productionBoard = (
+    activeBatch: typeof runningBatch | null,
+    recentBatches: readonly (typeof batch)[],
+  ) => {
+    const active = activeBatch !== null;
+    const completed = recentBatches.length > 0;
+    return {
+      edition_id: editionId,
+      subjects: [
+        {
+          subject_id: subjectId,
+          title: "Campagne Iranian Proxy",
+          tlp: "AMBER",
+          latest_run_id: active || completed ? runId : null,
+          latest_run_number: active || completed ? 1 : null,
+          latest_status: active ? "running" : completed ? "ready" : null,
+          latest_stage: active ? "sources" : completed ? "assembly" : null,
+          active_run_id: active ? runId : null,
+          can_start: !active,
+          blocking_reason: active ? "production_batch_active" : null,
+        },
+      ],
+      active_batch: activeBatch,
+      recent_batches: recentBatches,
+    };
+  };
+
   const review = {
     edition_id: editionId,
     items: [
@@ -151,6 +180,12 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     const url = new URL(request.url());
     const path = url.pathname;
     seenPaths.push(`${request.method()} ${path}`);
+    if (
+      productionSurfaceVisited &&
+      path.startsWith(`/api/editions/${editionId}/selection`)
+    ) {
+      throw new Error("Production surface called the Selection API");
+    }
 
     if (path === `/api/editions/${editionId}`) {
       await route.fulfill({ json: edition() });
@@ -165,24 +200,34 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       return;
     }
     if (path === `/api/editions/${editionId}/selection`) {
+      if (productionSurfaceVisited) {
+        throw new Error("Production surface called the Selection API");
+      }
       await route.fulfill({ json: selectionBoard() });
       return;
     }
     if (
-      path === `/api/editions/${editionId}/production` &&
+      path === `/api/editions/${editionId}/production/batches` &&
       request.method() === "POST"
     ) {
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
+      productionPostBody = request.postDataJSON();
       batchStarted = true;
       await route.fulfill({ status: 202, json: runningBatch });
       return;
     }
     if (path === `/api/editions/${editionId}/production`) {
       if (!batchStarted) {
-        await route.fulfill({ status: 404, json: {} });
+        await route.fulfill({ json: productionBoard(null, []) });
         return;
       }
       batchReads += 1;
-      await route.fulfill({ json: batchReads === 1 ? runningBatch : batch });
+      await route.fulfill({
+        json:
+          batchReads === 1
+            ? productionBoard(runningBatch, [])
+            : productionBoard(null, [batch]),
+      });
       return;
     }
     if (path === `/api/editions/${editionId}/review`) {
@@ -274,6 +319,7 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   );
 
   // 2. The next-batch choice lives on /production, never on /selection.
+  productionSurfaceVisited = true;
   await page.goto(`/editions/${editionId}/production`);
   const selector = page.getByRole("region", {
     name: "Sélecteur du lot de production",
@@ -286,6 +332,11 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     .click();
 
   await expect(page).toHaveURL(`/editions/${editionId}/production`);
+  await expect
+    .poll(() => productionPostBody)
+    .toEqual({
+      subject_ids: [subjectId],
+    });
   await expect(
     page.getByRole("heading", { name: "1 / 1 sujets traités" }),
   ).toBeVisible();
@@ -331,7 +382,7 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
 
   expect(seenPaths).toEqual(
     expect.arrayContaining([
-      `POST /api/editions/${editionId}/production`,
+      `POST /api/editions/${editionId}/production/batches`,
       `GET /api/editions/${editionId}/production`,
       `GET /api/editions/${editionId}/review`,
       `POST /api/editions/${editionId}/publication/accept`,
@@ -339,4 +390,6 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       `GET /api/subjects/${subjectId}/content`,
     ]),
   );
+  expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
+  expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

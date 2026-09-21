@@ -88,9 +88,6 @@ class SourceCollectionRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    group_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
-    )
     batch_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("discovery_batches.id", ondelete="RESTRICT")
     )
@@ -277,9 +274,6 @@ class ClaimRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    group_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
-    )
     source_document_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT"), nullable=False
     )
@@ -344,9 +338,6 @@ class IndicatorRow(Base):
     )
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
-    )
-    group_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
     )
     source_document_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("source_documents.id", ondelete="RESTRICT"), nullable=False

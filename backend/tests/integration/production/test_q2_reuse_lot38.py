@@ -17,8 +17,8 @@ from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 from .support import ProductionScenario
@@ -78,20 +78,18 @@ def _q2(index: int) -> str:
 async def _retry_extraction(scenario: ProductionScenario) -> None:
     assert scenario.run_id is not None
     retry = await SubjectProductionService(scenario.uow_factory).retry_from_stage(
-        scenario.run_id, SubjectProductionStage.EXTRACTION
+        scenario.run_id, ProductionStage.EXTRACTION
     )
     parameters = ProductionStageParameters(
         run_id=retry.run.id,
-        expected_stage=SubjectProductionStage.EXTRACTION.value,
+        expected_stage=ProductionStage.EXTRACTION.value,
         pipeline_generation=retry.run.pipeline_generation,
     )
     job = await scenario.jobs.submit(
-        kind=stage_job_kind(SubjectProductionStage.EXTRACTION),
+        kind=stage_job_kind(ProductionStage.EXTRACTION),
         aggregate_type="subject",
         aggregate_id=retry.run.subject_id,
-        idempotency_key=production_stage_idempotency_key(
-            retry.run, SubjectProductionStage.EXTRACTION
-        ),
+        idempotency_key=production_stage_idempotency_key(retry.run, ProductionStage.EXTRACTION),
         correlation_id="lot38-rebuild",
         input_parameters=parameters.model_dump(mode="json"),
         max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
@@ -114,7 +112,7 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
 
     await scenario.start()
     initial = await scenario.run_until_terminal()
-    assert initial.status is SubjectProductionStatus.READY
+    assert initial.status is ProductionRunStatus.READY
     initial_q2 = [call for call in scenario.model.calls if call.stage == "extraction"]
     initial_covered_urls = {url for call in initial_q2 for url in call.source_urls}
     assert initial_covered_urls == set(URLS[:5])
@@ -147,7 +145,7 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
     call_count_before_retry = len(scenario.model.calls)
     await _retry_extraction(scenario)
     retry = await scenario.run_until_terminal()
-    assert retry.status is SubjectProductionStatus.READY
+    assert retry.status is ProductionRunStatus.READY
 
     retry_calls = scenario.model.calls[call_count_before_retry:]
     retry_q2 = [call for call in retry_calls if call.stage == "extraction"]

@@ -18,7 +18,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 pytestmark = pytest.mark.integration
@@ -43,7 +43,7 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         slug=f"lot33-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
-    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
+    run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
 
     def artifact(
         stage: ProductionArtifactStage, version: int, **metadata: object
@@ -60,7 +60,7 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         for stage in ProductionArtifactStage:
             await uow.production_artifacts.append(artifact(stage, 1))
         await uow.commit()

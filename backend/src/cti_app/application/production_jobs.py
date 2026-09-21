@@ -35,17 +35,17 @@ from cti_app.application.production_reconciliation_resolver import (
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import (
-    EditionProductionService,
+    ProductionBatchService,
     SubjectProductionService,
 )
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionBatchStatus,
     ProductionReconciliationRequiredError,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
     model_run_awaits_reconciliation,
     production_stages,
 )
@@ -58,10 +58,10 @@ PRODUCTION_RECONCILIATION_RESUME_JOB_KIND = "production.subject.reconciliation_r
 PRODUCTION_RECONCILIATION_PROBE_JOB_KIND = "production.subject.reconciliation_probe"
 
 _TERMINAL_STATUSES = {
-    SubjectProductionStatus.READY,
-    SubjectProductionStatus.NEEDS_REVIEW,
-    SubjectProductionStatus.FAILED,
-    SubjectProductionStatus.CANCELLED,
+    ProductionRunStatus.READY,
+    ProductionRunStatus.NEEDS_REVIEW,
+    ProductionRunStatus.FAILED,
+    ProductionRunStatus.CANCELLED,
 }
 
 
@@ -95,15 +95,13 @@ class ProductionReconciliationProbeParameters(JobParameters):
     attempt: int = Field(0, ge=0, description="Reconciliation probe attempt")
 
 
-def stage_job_kind(stage: SubjectProductionStage) -> str:
-    if stage is SubjectProductionStage.ASSEMBLY:
+def stage_job_kind(stage: ProductionStage) -> str:
+    if stage is ProductionStage.ASSEMBLY:
         return "production.subject.assemble"
     return f"production.subject.{stage.value}"
 
 
-def production_stage_idempotency_key(
-    run: SubjectProductionRun, stage: SubjectProductionStage
-) -> str:
+def production_stage_idempotency_key(run: ProductionRun, stage: ProductionStage) -> str:
     return f"production-{stage.value}-{run.id}-g{run.pipeline_generation}"
 
 
@@ -117,7 +115,7 @@ def production_reconciliation_probe_job_kind() -> str:
 
 def production_reconciliation_resume_idempotency_key(
     run_id: UUID,
-    stage: SubjectProductionStage,
+    stage: ProductionStage,
     pipeline_generation: int,
     model_run_id: UUID,
     output_sha256: str,
@@ -164,8 +162,8 @@ def _reconciliation_model_run_id(value: object, inherited_exact: bool = False) -
 
 async def _reconciliation_identity(
     uow: Any,
-    run: SubjectProductionRun,
-    stage: SubjectProductionStage,
+    run: ProductionRun,
+    stage: ProductionStage,
     result: dict[str, object],
 ) -> ProductionSubmissionReconciliation | None:
     if result.get("error_code") != PRODUCTION_RECONCILIATION_ERROR_CODE:
@@ -216,8 +214,8 @@ class ProductionStageChain:
     async def submit(
         self,
         *,
-        run: SubjectProductionRun,
-        stage: SubjectProductionStage,
+        run: ProductionRun,
+        stage: ProductionStage,
         correlation_id: str,
         actor_id: str = "system",
         delay_ms: int | None = None,
@@ -226,7 +224,7 @@ class ProductionStageChain:
         """Worker attempts share a generation; manual retries get a new one."""
         if self._jobs is None or self._dispatcher is None:
             return None
-        if run.status is SubjectProductionStatus.CANCELLED:
+        if run.status is ProductionRunStatus.CANCELLED:
             raise JobCancelledError
         if run.requires_reconciliation:
             raise ProductionReconciliationRequiredError
@@ -259,7 +257,7 @@ class ProductionStageChain:
     async def submit_reconciliation_probe(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         attempt: int,
         correlation_id: str,
         delay_ms: int = 0,
@@ -290,7 +288,7 @@ class ProductionStageChain:
     async def submit_reconciliation_resume(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         correlation_id: str,
         delay_ms: int | None = None,
         actor_id: str = "system",
@@ -378,7 +376,7 @@ def register_production_jobs(
             return
         await context.check_cancelled()
         async with uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
         if run is None or not run.requires_reconciliation:
             return
         await stage_chain.submit_reconciliation_probe(
@@ -391,7 +389,7 @@ def register_production_jobs(
         )
 
     async def dispatch_reconciled_stage(
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext,
         *,
         resume: bool,
@@ -401,7 +399,7 @@ def register_production_jobs(
         async with uow_factory() as uow:
             item = await uow.edition_production_batch_items.get_by_run(run.id)
             if item is not None:
-                batch_delay = await EditionProductionService(uow_factory).next_dispatch_delay_ms(
+                batch_delay = await ProductionBatchService(uow_factory).next_dispatch_delay_ms(
                     item.batch_id
                 )
         stage = run.current_stage
@@ -434,7 +432,7 @@ def register_production_jobs(
         await context.check_cancelled()
         outcome = await resolver.resolve(parameters.run_id)
         async with uow_factory() as uow:
-            run = await uow.subject_production_runs.get(parameters.run_id)
+            run = await uow.production_runs.get(parameters.run_id)
         diagnostics_to_use = diagnostics
         if diagnostics_to_use is not None:
             diagnostics_to_use.record(
@@ -446,7 +444,7 @@ def register_production_jobs(
                 outcome=outcome.value,
                 bridge_status=getattr(resolver, "_last_bridge_status", None),
             )
-        if run is None or run.status is SubjectProductionStatus.CANCELLED:
+        if run is None or run.status is ProductionRunStatus.CANCELLED:
             return f"production-reconciliation://{parameters.run_id}#superseded"
         if outcome is ReconciliationOutcome.RESUMED:
             await dispatch_reconciled_stage(run, context, resume=True)
@@ -483,8 +481,8 @@ def register_production_jobs(
         """Re-read the run and its batch immediately before dispatch."""
         await context.check_cancelled()
         async with uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
-            if run is None or run.status is not SubjectProductionStatus.RUNNING:
+            run = await uow.production_runs.get(run_id)
+            if run is None or run.status is not ProductionRunStatus.RUNNING:
                 return False
             item = await uow.edition_production_batch_items.get_by_run(run_id)
             if item is None:
@@ -505,11 +503,11 @@ def register_production_jobs(
         A subject that ends in needs_review or failed must not block the queue,
         so this runs on every terminal outcome, not only on success.
         """
-        batches = EditionProductionService(uow_factory, production_pacing)
+        batches = ProductionBatchService(uow_factory, production_pacing)
         await context.check_cancelled()
         async with uow_factory() as uow:
-            current = await uow.subject_production_runs.get(run_id)
-        if current is None or current.status is SubjectProductionStatus.CANCELLED:
+            current = await uow.production_runs.get(run_id)
+        if current is None or current.status is ProductionRunStatus.CANCELLED:
             return
         if checkpoint is not None:
             # The projection is deliberately outside the batch transaction and
@@ -538,13 +536,13 @@ def register_production_jobs(
             return
         await context.check_cancelled()
         async with uow_factory() as uow:
-            latest = await uow.subject_production_runs.get(started.id)
-        if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+            latest = await uow.production_runs.get(started.id)
+        if latest is None or latest.status is ProductionRunStatus.CANCELLED:
             return
         subject_delay_ms = await batches.next_dispatch_delay_ms(batch_id)
         if latest.current_stage in {
-            SubjectProductionStage.REFERENCES,
-            SubjectProductionStage.SYNTHESIS,
+            ProductionStage.REFERENCES,
+            ProductionStage.SYNTHESIS,
         }:
             subject_delay_ms += production_pacing.model_delay_ms(latest.current_stage)
         try:
@@ -570,13 +568,13 @@ def register_production_jobs(
             raise TypeError("Invalid production stage parameters")
 
         reconciliation_resume = isinstance(parameters, ProductionReconciliationResumeParameters)
-        stage = SubjectProductionStage(parameters.expected_stage)
+        stage = ProductionStage(parameters.expected_stage)
         await context.check_cancelled()
         async with uow_factory() as uow:
-            current = await uow.subject_production_runs.get(parameters.run_id)
+            current = await uow.production_runs.get(parameters.run_id)
         if current is None or current.pipeline_generation != parameters.pipeline_generation:
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
-        if current.status is SubjectProductionStatus.CANCELLED:
+        if current.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         if current.requires_reconciliation and not reconciliation_resume:
             return f"production-stage://{parameters.run_id}/{stage.value}#reconciliation_required"
@@ -588,7 +586,7 @@ def register_production_jobs(
                     reconciliation_parameters.reconciliation_model_run_id
                 )
             if (
-                current.status is not SubjectProductionStatus.RUNNING
+                current.status is not ProductionRunStatus.RUNNING
                 or identity is None
                 or identity.stage is not stage
                 or identity.model_run_id != reconciliation_parameters.reconciliation_model_run_id
@@ -600,13 +598,13 @@ def register_production_jobs(
                 return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         if current.current_stage is not stage:
             if (
-                current.status is SubjectProductionStatus.RUNNING
+                current.status is ProductionRunStatus.RUNNING
                 and current.current_stage in production_stages()
             ):
                 await context.check_cancelled()
                 async with uow_factory() as uow:
-                    current = await uow.subject_production_runs.get(parameters.run_id)
-                if current is None or current.status is SubjectProductionStatus.CANCELLED:
+                    current = await uow.production_runs.get(parameters.run_id)
+                if current is None or current.status is ProductionRunStatus.CANCELLED:
                     return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
                 try:
                     await stage_chain.submit(
@@ -620,10 +618,10 @@ def register_production_jobs(
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         await context.check_cancelled()
         async with uow_factory() as uow:
-            current = await uow.subject_production_runs.get(parameters.run_id)
-        if current is None or current.status is SubjectProductionStatus.CANCELLED:
+            current = await uow.production_runs.get(parameters.run_id)
+        if current is None or current.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
-        await EditionProductionService(uow_factory).clear_next_dispatch(parameters.run_id)
+        await ProductionBatchService(uow_factory).clear_next_dispatch(parameters.run_id)
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
             model_service=model_service,
@@ -655,14 +653,14 @@ def register_production_jobs(
         )
 
         async with uow_factory() as uow:
-            run = await uow.subject_production_runs.get(parameters.run_id)
+            run = await uow.production_runs.get(parameters.run_id)
         if run is None:
             raise JobHandlerError(
                 code="production_run_missing",
                 public_message="Le run de production est introuvable.",
                 transient=False,
             )
-        if run.status is SubjectProductionStatus.CANCELLED:
+        if run.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         outcome = str(result.get("status", "success"))
         error_code = str(result.get("error_code") or f"{stage.value}_error")
@@ -675,8 +673,8 @@ def register_production_jobs(
         if outcome == "transient_error":
             await context.check_cancelled()
             async with uow_factory() as uow:
-                current = await uow.subject_production_runs.get(parameters.run_id)
-            if current is None or current.status is SubjectProductionStatus.CANCELLED:
+                current = await uow.production_runs.get(parameters.run_id)
+            if current is None or current.status is ProductionRunStatus.CANCELLED:
                 return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
             # The generic job service exhausts retries only after the handler
             # returns. Finish the production aggregate here on its last
@@ -686,7 +684,7 @@ def register_production_jobs(
             exhausted = job is not None and job.attempt >= job.max_attempts
             if exhausted:
                 async with uow_factory() as uow:
-                    ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
+                    ending = await uow.production_runs.get_for_update(parameters.run_id)
                     if ending is not None and ending.status not in _TERMINAL_STATUSES:
                         reconciliation = await _reconciliation_identity(uow, ending, stage, result)
                         ending.mark_needs_review(
@@ -695,7 +693,7 @@ def register_production_jobs(
                             details=error_details,
                             reconciliation=reconciliation,
                         )
-                        await uow.subject_production_runs.save(ending)
+                        await uow.production_runs.save(ending)
                         await uow.commit()
                 await schedule_reconciliation_probe(parameters.run_id, context)
                 await advance_batch(parameters.run_id, correlation_id, context)
@@ -712,7 +710,7 @@ def register_production_jobs(
         if outcome in {"needs_review", "terminal_error", "error"}:
             await context.check_cancelled()
             async with uow_factory() as uow:
-                ending = await uow.subject_production_runs.get_for_update(parameters.run_id)
+                ending = await uow.production_runs.get_for_update(parameters.run_id)
                 if ending is not None and ending.status not in _TERMINAL_STATUSES:
                     if outcome == "needs_review":
                         reconciliation = await _reconciliation_identity(uow, ending, stage, result)
@@ -726,7 +724,7 @@ def register_production_jobs(
                         ending.mark_failed(
                             code=error_code, message=error_message, details=error_details
                         )
-                    await uow.subject_production_runs.save(ending)
+                    await uow.production_runs.save(ending)
                     await uow.commit()
             if outcome == "needs_review" and error_code == PRODUCTION_RECONCILIATION_ERROR_CODE:
                 await schedule_reconciliation_probe(parameters.run_id, context)
@@ -741,24 +739,24 @@ def register_production_jobs(
 
         # Assembly is the last stage: it already marked the run ready or
         # needs_review, so the batch moves to the next subject.
-        if stage is SubjectProductionStage.ASSEMBLY:
+        if stage is ProductionStage.ASSEMBLY:
             await advance_batch(parameters.run_id, correlation_id, context)
             return f"production-stage://{parameters.run_id}/{stage.value}"
 
         await context.check_cancelled()
         async with uow_factory() as uow:
-            advancing = await uow.subject_production_runs.get_for_update(parameters.run_id)
-            if advancing is None or advancing.status is not SubjectProductionStatus.RUNNING:
+            advancing = await uow.production_runs.get_for_update(parameters.run_id)
+            if advancing is None or advancing.status is not ProductionRunStatus.RUNNING:
                 return f"production-stage://{parameters.run_id}/{stage.value}"
             advancing.advance_stage()
-            await uow.subject_production_runs.save(advancing)
+            await uow.production_runs.save(advancing)
             await uow.commit()
             next_stage = advancing.current_stage
 
         await context.check_cancelled()
         async with uow_factory() as uow:
-            latest = await uow.subject_production_runs.get(parameters.run_id)
-        if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+            latest = await uow.production_runs.get(parameters.run_id)
+        if latest is None or latest.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
         job_id = await stage_chain.submit(
             run=latest,

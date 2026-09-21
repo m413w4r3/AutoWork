@@ -45,10 +45,10 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionBatchPhase,
     ProductionBatchStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -56,15 +56,15 @@ pytestmark = pytest.mark.asyncio
 
 class _Runs:
     def __init__(self) -> None:
-        self.items: dict[UUID, SubjectProductionRun] = {}
+        self.items: dict[UUID, ProductionRun] = {}
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
 
@@ -186,7 +186,7 @@ class _ModelRuns:
 
 class _Uow:
     def __init__(self, edition: Edition) -> None:
-        self.subject_production_runs = _Runs()
+        self.production_runs = _Runs()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.editions = _Editions(edition)
@@ -272,18 +272,18 @@ class _Orchestrator:
     """Every stage succeeds; only the dispatch backbone is under test."""
 
     def __init__(self, runs: _Runs) -> None:
-        self.calls: list[SubjectProductionStage] = []
+        self.calls: list[ProductionStage] = []
         self._runs = runs
 
     async def execute_stage(
         self,
         run_id: UUID,
-        expected_stage: SubjectProductionStage,
+        expected_stage: ProductionStage,
         context: object | None = None,
         correlation_id: str = "-",
     ) -> dict[str, Any]:
         self.calls.append(expected_stage)
-        if expected_stage is SubjectProductionStage.ASSEMBLY:
+        if expected_stage is ProductionStage.ASSEMBLY:
             # Assembly is the stage that ends the run, exactly as in production.
             run = self._runs.items[run_id]
             run.mark_ready()
@@ -311,8 +311,8 @@ class _World:
         edition_state: EditionStatus = EditionStatus.OPEN,
         batch_status: ProductionBatchStatus = ProductionBatchStatus.COMPLETED_WITH_ISSUES,
         batch_phase: ProductionBatchPhase = ProductionBatchPhase.REVIEW,
-        stage: SubjectProductionStage = SubjectProductionStage.EXTRACTION,
-        run_status: SubjectProductionStatus = SubjectProductionStatus.NEEDS_REVIEW,
+        stage: ProductionStage = ProductionStage.EXTRACTION,
+        run_status: ProductionRunStatus = ProductionRunStatus.NEEDS_REVIEW,
     ) -> None:
         self.edition = _edition(edition_state)
         self.uow = _Uow(self.edition)
@@ -323,7 +323,7 @@ class _World:
                 phase=batch_phase,
             )
         )
-        self.run = SubjectProductionRun(
+        self.run = ProductionRun(
             subject_id=uuid4(),
             edition_id=self.edition.id,
             status=run_status,
@@ -332,14 +332,14 @@ class _World:
             error_code="synthesis_error",
             error_message="stopped",
         )
-        self.uow.subject_production_runs.items[self.run.id] = self.run
-        self.sibling = SubjectProductionRun(
+        self.uow.production_runs.items[self.run.id] = self.run
+        self.sibling = ProductionRun(
             subject_id=uuid4(),
             edition_id=self.edition.id,
-            status=SubjectProductionStatus.READY,
-            current_stage=SubjectProductionStage.ASSEMBLY,
+            status=ProductionRunStatus.READY,
+            current_stage=ProductionStage.ASSEMBLY,
         )
-        self.uow.subject_production_runs.items[self.sibling.id] = self.sibling
+        self.uow.production_runs.items[self.sibling.id] = self.sibling
         for position, run in enumerate((self.run, self.sibling), start=1):
             self.uow.edition_production_batch_items.items.append(
                 EditionProductionBatchItem(
@@ -357,7 +357,7 @@ class _World:
 def _register(
     world: _World, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[JobRegistry, _Jobs, _Orchestrator]:
-    orchestrator = _Orchestrator(world.uow.subject_production_runs)
+    orchestrator = _Orchestrator(world.uow.production_runs)
     monkeypatch.setattr(
         "cti_app.application.production_jobs.ProductionWorkflowOrchestrator",
         lambda *a, **k: orchestrator,
@@ -398,7 +398,7 @@ async def handler_call(registry: JobRegistry, job: _Job, model: Any) -> None:
     await registry.handler(job.kind)(model(**job.parameters), cast(Any, _Context()))
 
 
-async def _retry(world: _World, stage: SubjectProductionStage) -> Any:
+async def _retry(world: _World, stage: ProductionStage) -> Any:
     return await SubjectProductionService(cast(Any, world.factory)).retry_from_stage(
         world.run.id, stage
     )
@@ -410,16 +410,16 @@ async def test_review_retry_reopens_the_finished_batch_and_reaches_assembly(
     world = _World()
     registry, jobs, orchestrator = _register(world, monkeypatch)
 
-    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+    result = await _retry(world, ProductionStage.EXTRACTION)
 
     assert world.batch.status is ProductionBatchStatus.RUNNING
     assert world.batch.phase is ProductionBatchPhase.REVIEW
-    assert result.run.status is SubjectProductionStatus.RUNNING
+    assert result.run.status is ProductionRunStatus.RUNNING
     assert result.run.pipeline_generation == 2
 
     # The API dispatches the first stage itself; the chain must carry the rest.
     await jobs.submit(
-        kind=stage_job_kind(SubjectProductionStage.EXTRACTION),
+        kind=stage_job_kind(ProductionStage.EXTRACTION),
         idempotency_key=f"production-extraction-{world.run.id}-g2",
         input_parameters={
             "run_id": str(world.run.id),
@@ -430,12 +430,12 @@ async def test_review_retry_reopens_the_finished_batch_and_reaches_assembly(
     await _drain(registry, jobs)
 
     assert orchestrator.calls == [
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     ]
     assert jobs.cancelled == []
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
     # The batch closes itself again once the corrected article is terminal —
     # cleanly this time, since every article of the batch is now ready.
     assert world.batch.status is ProductionBatchStatus.COMPLETED
@@ -455,7 +455,7 @@ async def test_a_still_running_batch_keeps_its_own_phase_on_retry(
     )
     _register(world, monkeypatch)
 
-    await _retry(world, SubjectProductionStage.EXTRACTION)
+    await _retry(world, ProductionStage.EXTRACTION)
 
     assert world.batch.status is ProductionBatchStatus.RUNNING
     assert world.batch.phase is ProductionBatchPhase.INITIAL
@@ -467,11 +467,11 @@ async def test_cancelled_batch_blocks_a_review_retry(monkeypatch: pytest.MonkeyP
     world.batch.status = ProductionBatchStatus.CANCELLED
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_batch_cancelled"
     assert world.batch.status is ProductionBatchStatus.CANCELLED
-    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert world.run.status is ProductionRunStatus.NEEDS_REVIEW
     assert world.run.pipeline_generation == 1
 
 
@@ -482,7 +482,7 @@ async def test_a_publication_manifest_does_not_block_an_open_edition_retry(
     _register(world, monkeypatch)
     world.uow.publication_manifests.frozen = True
 
-    await _retry(world, SubjectProductionStage.EXTRACTION)
+    await _retry(world, ProductionStage.EXTRACTION)
 
     assert world.batch.status is ProductionBatchStatus.RUNNING
 
@@ -492,9 +492,9 @@ async def test_archived_edition_blocks_a_review_retry(monkeypatch: pytest.Monkey
     _register(world, monkeypatch)
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
-    assert str(error.value) == "edition_archived"
+    assert str(error.value) == "production_edition_archived"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
 
 
@@ -503,10 +503,10 @@ async def test_a_running_sibling_forbids_reopening_a_finished_batch(
 ) -> None:
     world = _World()
     _register(world, monkeypatch)
-    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.sibling.status = ProductionRunStatus.RUNNING
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_active_sibling"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
@@ -518,9 +518,9 @@ async def test_a_second_retry_click_neither_restarts_nor_duplicates(
     world = _World()
     _register(world, monkeypatch)
 
-    first = await _retry(world, SubjectProductionStage.EXTRACTION)
+    first = await _retry(world, ProductionStage.EXTRACTION)
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "retry_not_allowed_while_running"
     assert world.run.pipeline_generation == first.run.pipeline_generation == 2
@@ -529,14 +529,14 @@ async def test_a_second_retry_click_neither_restarts_nor_duplicates(
 async def test_a_cancelled_run_is_never_retried_from_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    world = _World(run_status=SubjectProductionStatus.CANCELLED)
+    world = _World(run_status=ProductionRunStatus.CANCELLED)
     _register(world, monkeypatch)
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_run_cancelled"
-    assert world.run.status is SubjectProductionStatus.CANCELLED
+    assert world.run.status is ProductionRunStatus.CANCELLED
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
 
 
@@ -554,7 +554,7 @@ async def test_an_old_batch_is_never_reopened_behind_a_newer_one(
     )
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_batch_superseded"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
@@ -591,7 +591,7 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
     world.run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=world.run.id,
         model_run_id=model_run_id,
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-1",
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -605,13 +605,13 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
     # What the reconciliation service does under the Edition lock.
     async with world.uow as uow:
         await prepare_batch_for_recovery(cast(Any, uow), world.run, reopen=True)
-    world.run.resume_reconciled(expected_stage=SubjectProductionStage.EXTRACTION)
+    world.run.resume_reconciled(expected_stage=ProductionStage.EXTRACTION)
 
     await jobs.submit(
         kind=production_reconciliation_resume_job_kind(),
         idempotency_key=production_reconciliation_resume_idempotency_key(
             world.run.id,
-            SubjectProductionStage.EXTRACTION,
+            ProductionStage.EXTRACTION,
             world.run.pipeline_generation,
             model_run_id,
             output_sha256,
@@ -627,18 +627,18 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
     await _drain(registry, jobs)
 
     assert orchestrator.calls == [
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     ]
     # Adoption never opens a new pipeline generation.
     assert world.run.pipeline_generation == 1
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
     assert jobs.cancelled == []
 
 
 def _reconciliation_identity(
-    run: SubjectProductionRun, stage: SubjectProductionStage
+    run: ProductionRun, stage: ProductionStage
 ) -> ProductionSubmissionReconciliation:
     return ProductionSubmissionReconciliation(
         production_run_id=run.id,
@@ -652,25 +652,23 @@ def _reconciliation_identity(
 
 @pytest.mark.parametrize(
     "stage",
-    (SubjectProductionStage.EXTRACTION, SubjectProductionStage.REFERENCES),
+    (ProductionStage.EXTRACTION, ProductionStage.REFERENCES),
 )
 async def test_an_unresolved_reconciliation_forbids_every_retry(
-    monkeypatch: pytest.MonkeyPatch, stage: SubjectProductionStage
+    monkeypatch: pytest.MonkeyPatch, stage: ProductionStage
 ) -> None:
     """The current stage and any earlier one are refused identically."""
     world = _World()
     _register(world, monkeypatch)
     world.run.error_code = PRODUCTION_RECONCILIATION_ERROR_CODE
-    world.run.reconciliation = _reconciliation_identity(
-        world.run, SubjectProductionStage.EXTRACTION
-    )
+    world.run.reconciliation = _reconciliation_identity(world.run, ProductionStage.EXTRACTION)
 
     with pytest.raises(ValueError) as error:
         await _retry(world, stage)
 
     assert str(error.value) == "production_reconciliation_required"
     assert world.run.pipeline_generation == 1
-    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert world.run.status is ProductionRunStatus.NEEDS_REVIEW
     assert world.run.reconciliation is not None
     # The refusal happens before the batch is touched: no reopening side effect.
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
@@ -679,20 +677,20 @@ async def test_an_unresolved_reconciliation_forbids_every_retry(
 
 
 async def test_the_domain_itself_refuses_a_retry_awaiting_reconciliation() -> None:
-    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
     run.start_running()
-    run.current_stage = SubjectProductionStage.EXTRACTION
+    run.current_stage = ProductionStage.EXTRACTION
     run.mark_needs_review(
         code=PRODUCTION_RECONCILIATION_ERROR_CODE,
         message="unknown submission",
-        reconciliation=_reconciliation_identity(run, SubjectProductionStage.EXTRACTION),
+        reconciliation=_reconciliation_identity(run, ProductionStage.EXTRACTION),
     )
 
     with pytest.raises(ValueError, match="production_reconciliation_required"):
-        run.retry_from_stage(SubjectProductionStage.REFERENCES)
+        run.retry_from_stage(ProductionStage.REFERENCES)
 
     assert run.pipeline_generation == 0
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
 
 
 @pytest.mark.parametrize(
@@ -719,7 +717,7 @@ async def test_only_the_latest_batch_of_an_edition_may_be_reopened(
     newer_version = newer.version
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_batch_superseded"
     # Neither batch is mutated by the refusal.
@@ -729,7 +727,7 @@ async def test_only_the_latest_batch_of_an_edition_may_be_reopened(
     assert newer.phase is ProductionBatchPhase.INITIAL
     assert newer.version == newer_version
     assert world.run.pipeline_generation == 1
-    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert world.run.status is ProductionRunStatus.NEEDS_REVIEW
 
 
 async def test_the_exact_latest_terminal_batch_still_reopens(
@@ -738,7 +736,7 @@ async def test_the_exact_latest_terminal_batch_still_reopens(
     world = _World()
     _register(world, monkeypatch)
 
-    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+    result = await _retry(world, ProductionStage.EXTRACTION)
 
     assert world.batch.status is ProductionBatchStatus.RUNNING
     assert world.batch.phase is ProductionBatchPhase.REVIEW
@@ -755,14 +753,14 @@ async def test_a_running_sibling_blocks_a_retry_inside_a_running_batch(
         batch_phase=ProductionBatchPhase.INITIAL,
     )
     _, jobs, _ = _register(world, monkeypatch)
-    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.sibling.status = ProductionRunStatus.RUNNING
 
     with pytest.raises(ValueError) as error:
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
     assert str(error.value) == "production_active_sibling"
     assert world.run.pipeline_generation == 1
-    assert world.run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert world.run.status is ProductionRunStatus.NEEDS_REVIEW
     assert jobs.submitted == []
     assert world.batch.status is ProductionBatchStatus.RUNNING
     assert world.batch.phase is ProductionBatchPhase.INITIAL
@@ -777,16 +775,16 @@ async def test_the_same_retry_succeeds_once_the_sibling_is_terminal(
         batch_phase=ProductionBatchPhase.INITIAL,
     )
     _register(world, monkeypatch)
-    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.sibling.status = ProductionRunStatus.RUNNING
 
     with pytest.raises(ValueError):
-        await _retry(world, SubjectProductionStage.EXTRACTION)
+        await _retry(world, ProductionStage.EXTRACTION)
 
-    world.sibling.status = SubjectProductionStatus.READY
-    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+    world.sibling.status = ProductionRunStatus.READY
+    result = await _retry(world, ProductionStage.EXTRACTION)
 
     assert result.run.pipeline_generation == 2
-    assert result.run.status is SubjectProductionStatus.RUNNING
+    assert result.run.status is ProductionRunStatus.RUNNING
 
 
 async def test_a_queued_sibling_never_blocks_a_retry(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -796,20 +794,18 @@ async def test_a_queued_sibling_never_blocks_a_retry(monkeypatch: pytest.MonkeyP
         batch_phase=ProductionBatchPhase.INITIAL,
     )
     _register(world, monkeypatch)
-    world.sibling.status = SubjectProductionStatus.QUEUED
+    world.sibling.status = ProductionRunStatus.QUEUED
 
-    result = await _retry(world, SubjectProductionStage.EXTRACTION)
+    result = await _retry(world, ProductionStage.EXTRACTION)
 
     assert result.run.pipeline_generation == 2
 
 
 async def test_reconciliation_keeps_the_same_running_sibling_fence() -> None:
     world = _World()
-    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.sibling.status = ProductionRunStatus.RUNNING
     world.run.error_code = PRODUCTION_RECONCILIATION_ERROR_CODE
-    world.run.reconciliation = _reconciliation_identity(
-        world.run, SubjectProductionStage.EXTRACTION
-    )
+    world.run.reconciliation = _reconciliation_identity(world.run, ProductionStage.EXTRACTION)
 
     async with world.uow as uow:
         with pytest.raises(ReviewRecoveryConflictError) as error:

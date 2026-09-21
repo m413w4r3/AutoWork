@@ -50,17 +50,17 @@ from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     SourceCandidate,
     SourceRole,
 )
-from cti_app.domain.editions import Edition, EditionStatus
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
 )
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
     EditionProductionBatch,
@@ -69,11 +69,12 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 
@@ -212,23 +213,23 @@ class _Artifacts:
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
-        self.items: dict[UUID, SubjectProductionRun] = {run.id: run}
+    def __init__(self, run: ProductionRun) -> None:
+        self.items: dict[UUID, ProductionRun] = {run.id: run}
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         matches = [run for run in self.items.values() if run.subject_id == subject_id]
         return matches[-1] if matches else None
 
-    async def list_for_edition(self, edition_id: UUID) -> list[SubjectProductionRun]:
+    async def list_for_edition(self, edition_id: UUID) -> list[ProductionRun]:
         return [run for run in self.items.values() if run.edition_id == edition_id]
 
 
@@ -248,7 +249,7 @@ class _ProductionUow:
 
     def __init__(self, world: _World) -> None:
         self._world = world
-        self.subject_production_runs = world.runs
+        self.production_runs = world.runs
         self.production_artifacts = world.artifacts
         self.production_repair_decisions = world.decisions
         self.publication_manifests = world.manifests
@@ -337,7 +338,7 @@ class _World:
         *,
         edition: Edition,
         subject_id: UUID,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         collections: dict[UUID, Any],
         documents: dict[UUID, Any],
     ) -> None:
@@ -490,28 +491,48 @@ def _selected_subject(
         slug=f"subject-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
-    group = EditorialGroup(
-        edition_id=edition.id,
-        title=candidate.title,
-        candidate_references=(CandidateReference(batch.id, candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=EditorialScore(2, 2, 2, 2, 2, 2, {"impact": "test"}),
-        source_relationship_status=sources[0].relationship_status,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject.id)
     factory.editions[edition.id] = edition
     factory.subjects[subject.id] = subject
     factory.batches[batch.id] = batch
-    factory.groups[group.id] = group
+    discovery_candidate = DiscoveryCandidate.from_candidate_topic(
+        candidate,
+        discovery_run_id=batch.discovery_run_id,
+        discovery_batch_id=batch.id,
+        position=0,
+    )
+    factory.candidates[discovery_candidate.id] = discovery_candidate
+    snapshot = DiscoverySnapshot(
+        edition_id=edition.id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=None,
+        merge_run_id=uuid4(),
+        planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+        subjects=(
+            DiscoverySubject(
+                subject_id=subject.id,
+                candidate=candidate,
+                member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                created_at=discovery_candidate.created_at,
+            ),
+        ),
+        snapshot_hash="a" * 64,
+        is_active=True,
+    )
+    factory.discovery_snapshots[edition.id] = snapshot
+    factory.subject_discovery_origins[subject.id] = SubjectDiscoveryOrigin(
+        subject_id=subject.id,
+        edition_id=edition.id,
+        discovery_subject_id=subject.id,
+        selection_decision_id=uuid4(),
+        selected_snapshot_id=snapshot.id,
+        selected_snapshot_version=1,
+    )
     return subject, edition
 
 
 def _stage_artifact(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     stage: ProductionArtifactStage,
     version: int,
     *,
@@ -584,11 +605,11 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     collection_factory.collections[first.id].origin_kind = SourceOriginKind.DISCOVERY
     collection_factory.collections[second.id].state = CollectionState.FAILED_TERMINAL
 
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         research_date=date(2026, 8, 15),
     )
     world = _World(
@@ -697,7 +718,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         rebuilt = await client.post(f"/api/editions/{edition.id}/review/items/{subject.id}/rebuild")
     assert rebuilt.status_code == 200, rebuilt.text
     assert rebuilt.json()["action"] == "rebuild_references_and_retry"
-    assert rebuilt.json()["stage"] == SubjectProductionStage.EXTRACTION.value
+    assert rebuilt.json()["stage"] == ProductionStage.EXTRACTION.value
     assert world.gateway.calls == 0
 
     references_v2 = await world.artifacts.get_current(
@@ -738,7 +759,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
         (ProductionArtifactStage.PUBLICATION, "0"),
     ):
         await world.artifacts.append(_stage_artifact(replayed, stage, 2, input_hash=digest * 64))
-    assert replayed.status is SubjectProductionStatus.RUNNING
+    assert replayed.status is ProductionRunStatus.RUNNING
     replayed.mark_ready()
 
     # --- 8/9. The issue is gone and the edition can be accepted again. ------
@@ -774,11 +795,11 @@ async def test_audit4_source_without_collection_is_visible_and_preparable(
     first = (await collection_service.initialize(subject.id))[0]
     collection_factory.collections[first.id].state = CollectionState.ARCHIVED
 
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         research_date=date(2026, 8, 15),
     )
     world = _World(

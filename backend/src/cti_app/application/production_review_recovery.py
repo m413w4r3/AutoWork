@@ -18,8 +18,8 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     ProductionBatchRecoveryConflictError,
     ProductionBatchStatus,
-    SubjectProductionRun,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
 )
 
 # Reasons are stable business identities: callers map them to their own typed
@@ -40,7 +40,7 @@ class ReviewRecoveryConflictError(ValueError):
 
 async def prepare_batch_for_recovery(
     uow: Any,
-    run: SubjectProductionRun,
+    run: ProductionRun,
     *,
     reopen: bool,
 ) -> EditionProductionBatch | None:
@@ -136,8 +136,8 @@ async def _ensure_no_active_sibling(uow: Any, items: Any, batch_id: UUID, run_id
     for sibling in await list_for_batch(batch_id):
         if sibling.production_run_id == run_id:
             continue
-        sibling_run = await uow.subject_production_runs.get(sibling.production_run_id)
-        if sibling_run is not None and sibling_run.status is SubjectProductionStatus.RUNNING:
+        sibling_run = await uow.production_runs.get(sibling.production_run_id)
+        if sibling_run is not None and sibling_run.status is ProductionRunStatus.RUNNING:
             raise ReviewRecoveryConflictError(ACTIVE_SIBLING)
 
 

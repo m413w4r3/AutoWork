@@ -1,6 +1,7 @@
 """PostgreSQL regression coverage for production artifact version allocation."""
 
 import asyncio
+import hashlib
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -24,19 +25,21 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     SourceCandidate,
-    SourceRelationshipStatus,
     SourceRole,
 )
-from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryMergeRun,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
+    DiscoverySubjectIdentity,
+    MergeValidationStatus,
 )
+from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
 from cti_app.domain.production import (
@@ -46,10 +49,11 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
+from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
@@ -59,7 +63,7 @@ pytestmark = pytest.mark.integration
 
 
 def _artifact(
-    run: SubjectProductionRun, stage: ProductionArtifactStage, version: int
+    run: ProductionRun, stage: ProductionArtifactStage, version: int
 ) -> ProductionArtifact:
     return ProductionArtifact(
         production_run_id=run.id,
@@ -68,6 +72,161 @@ def _artifact(
         version=version,
         input_hash=f"{version:x}" * 64,
     )
+
+
+async def _seed_subject_discovery_lineage(
+    uow_factory: UnitOfWorkFactory,
+    *,
+    edition: Edition,
+    subjects: tuple[Subject, ...],
+    complementary_axis: str,
+) -> None:
+    """Persist one active discovery/fusion/selection projection for subjects."""
+    discovery_parent = await make_discovery_run_for_edition(
+        lambda: uow_factory(),
+        edition,
+        complementary_axis=complementary_axis,
+    )
+    async with uow_factory() as uow:
+        batches: list[tuple[Subject, DiscoveryBatch, DiscoveryCandidate]] = []
+        for subject in subjects:
+            discovery_model_run = ModelRun(
+                provider=ModelProvider.FAKE,
+                model_role=ModelRole.RESEARCH,
+                requested_model="test",
+                prompt_template_id="test",
+                prompt_template_version="1",
+                authorized_input_hash="0" * 64,
+                evidence_pack_hash="0" * 64,
+                parameters={},
+            )
+            source = SourceCandidate(
+                url=f"https://example.test/{subject.slug}",
+                title=f"{subject.title} source",
+                publisher="Example publisher",
+                role=SourceRole.PRIMARY,
+                tlp=TLP.AMBER,
+                sensitivity="public",
+                external_llm_allowed=True,
+            )
+            candidate = CandidateTopic(
+                title=subject.title,
+                summary=f"A selected subject for {subject.title}.",
+                novelty="new",
+                technical_potential=3,
+                uncertainties=(),
+                relevance_reasons=("test",),
+                actors=("Example actor",),
+                campaigns=(),
+                malware=(),
+                cves=(),
+                victims=(),
+                sectors=(),
+                countries=(),
+                likely_artifacts=(),
+                sources=[source],
+                tlp=TLP.AMBER,
+                sensitivity="public",
+                external_llm_allowed=True,
+                actor_or_campaign="Example actor",
+            )
+            batch = DiscoveryBatch(
+                edition_id=edition.id,
+                discovery_run_id=discovery_parent.id,
+                request_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+                complementary_axis=complementary_axis,
+                queries=(),
+                citations=(),
+                discovery_model_run_id=discovery_model_run.id,
+                tlp=TLP.AMBER,
+                sensitivity="public",
+                external_llm_allowed=True,
+                parser_version="test",
+                candidates=[candidate],
+                source_mode=DiscoverySourceMode.NATIVE_COMPLETE,
+                source_coverage_complete=True,
+                source_coverage_incomplete_reason=None,
+            )
+            await uow.model_runs.add(discovery_model_run)
+            await uow.discovery_batches.add_if_absent(batch)
+            persisted_candidates = await uow.discovery_candidates.list_for_batch(batch.id)
+            assert len(persisted_candidates) == 1
+            batches.append((subject, batch, persisted_candidates[0]))
+
+        merge_run = DiscoveryMergeRun(
+            edition_id=edition.id,
+            parent_snapshot_id=None,
+            intake_id=None,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            prompt_version="1",
+            policy_version="1",
+            blocking_version="1",
+            merge_input_hash=hashlib.sha256(
+                b"".join(subject.id.bytes for subject, _, _ in batches)
+            ).hexdigest(),
+            handle_map={},
+            included_subject_ids=tuple(subject.id for subject, _, _ in batches),
+            excluded_subject_count=0,
+            validation_status=MergeValidationStatus.VALID,
+        )
+        assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+        await uow.discovery_subject_identities.add_many_if_absent(
+            [
+                DiscoverySubjectIdentity(
+                    edition_id=edition.id,
+                    origin_key=f"subject:{subject.id}",
+                    created_by_merge_run_id=merge_run.id,
+                    id=subject.id,
+                )
+                for subject, _, _ in batches
+            ]
+        )
+        snapshot = DiscoverySnapshot(
+            edition_id=edition.id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=None,
+            merge_run_id=merge_run.id,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            subjects=tuple(
+                DiscoverySubject(
+                    subject_id=subject.id,
+                    candidate=discovery_candidate.to_candidate_topic(),
+                    member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                    created_at=discovery_candidate.created_at,
+                )
+                for subject, _, discovery_candidate in batches
+            ),
+            snapshot_hash=hashlib.sha256(
+                b"".join(batch.id.bytes for _, batch, _ in batches)
+            ).hexdigest(),
+            is_active=True,
+        )
+        await uow.discovery_snapshots.append(snapshot)
+        for subject, _, _ in batches:
+            decision = SelectionDecision(
+                edition_id=edition.id,
+                discovery_subject_id=subject.id,
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                action=SelectionAction.SELECT,
+                subject_id=subject.id,
+                actor_id="production-artifact-test",
+                correlation_id=f"production-artifact-test-{subject.id}",
+                idempotency_key=f"production-artifact-test-{subject.id}",
+            )
+            await uow.selection_decisions.append(decision)
+            await uow.subject_discovery_origins.add(
+                SubjectDiscoveryOrigin(
+                    subject_id=subject.id,
+                    edition_id=edition.id,
+                    discovery_subject_id=subject.id,
+                    selection_decision_id=decision.id,
+                    selected_snapshot_id=snapshot.id,
+                    selected_snapshot_version=snapshot.version,
+                )
+            )
+        await uow.commit()
 
 
 @pytest.mark.asyncio
@@ -96,8 +255,8 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
             tlp=TLP.AMBER,
         )
         await uow.subjects.add(subject)
-        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
-        await uow.subject_production_runs.add(run)
+        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+        await uow.production_runs.add(run)
         for stage in (ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION):
             await uow.production_artifacts.append(_artifact(run, stage, 1))
         await uow.commit()
@@ -159,8 +318,8 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
             tlp=TLP.AMBER,
         )
         await uow.subjects.add(subject)
-        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
-        await uow.subject_production_runs.add(run)
+        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
+        await uow.production_runs.add(run)
         for stage in ProductionArtifactStage:
             await uow.production_artifacts.append(_artifact(run, stage, 1))
         await uow.commit()
@@ -217,7 +376,7 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
             slug="analyst-fk",
             tlp=TLP.AMBER,
         )
-        run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
+        run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
         run.start_running()
         synthesis = ProductionArtifact(
             production_run_id=run.id,
@@ -227,7 +386,7 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
             input_hash="a" * 64,
         )
         await uow.subjects.add(subject)
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         await uow.production_artifacts.append(synthesis)
         investigation = AnalystInvestigation.from_verified_synthesis(
             synthesis=synthesis,
@@ -246,7 +405,7 @@ async def test_analyst_investigation_and_input_pack_commit_in_one_postgres_uow(
         await uow.commit()
 
     async with uow_factory() as uow:
-        persisted_run = await uow.subject_production_runs.get(run.id)
+        persisted_run = await uow.production_runs.get(run.id)
         persisted_synthesis = await uow.production_artifacts.get(synthesis.id)
         persisted = await uow.analyst_investigations.get(investigation.id)
         persisted_pack = await uow.analyst_input_packs.get_for_investigation(investigation.id)
@@ -298,7 +457,7 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
     async with uow_factory() as uow:
         # add_if_absent rebinds `edition.id` to the row an earlier test in this
         # session-scoped database already created for the same period, so the
-        # run may only be built once that identity is settled.
+        # subjects may only be built once that identity is settled.
         await uow.editions.add_if_absent(edition)
         source = Subject(
             edition_id=edition.id,
@@ -314,15 +473,28 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         )
         await uow.subjects.add(source)
         await uow.subjects.add(target)
-        run = SubjectProductionRun(subject_id=source.id, edition_id=edition.id)
-        run.start_running()
-        run.current_stage = SubjectProductionStage.ASSEMBLY
-        run.mark_needs_review(code="seed", message="seed")
-        await uow.subject_production_runs.add(run)
+        await uow.commit()
+
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subjects=(source, target),
+        complementary_axis="production-state-round-trip",
+    )
+    production = SubjectProductionService(uow_factory)
+    run, created = await production.create_run(source.id, edition.id)
+    assert created
+    run = await production.start_run(run.id)
+    async with uow_factory() as uow:
+        persisted_run = await uow.production_runs.get_for_update(run.id)
+        assert persisted_run is not None
+        persisted_run.current_stage = ProductionStage.ASSEMBLY
+        persisted_run.mark_needs_review(code="seed", message="seed")
+        await uow.production_runs.save(persisted_run)
         for stage, canonical_blob_id, rendered_blob_id in artifacts:
             await uow.production_artifacts.append(
                 ProductionArtifact(
-                    production_run_id=run.id,
+                    production_run_id=persisted_run.id,
                     subject_id=source.id,
                     stage=stage,
                     version=1,
@@ -333,18 +505,21 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
                 )
             )
         await uow.commit()
+    async with uow_factory() as uow:
+        input_snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+    assert input_snapshot is not None
 
     service = ProductionStateService(uow_factory, store)
-    snapshot = await service.export_state(subject_id=source.id, subject_title="Source")
+    snapshot = await service.export_state(subject_id=source.id)
     result = await service.import_state(
         subject_id=target.id, edition_id=edition.id, payload=snapshot.model_dump(mode="json")
     )
 
     async with uow_factory() as uow:
-        imported = await uow.subject_production_runs.get(result.run_id)
+        imported = await uow.production_runs.get(result.run_id)
         assert imported is not None
-        assert imported.status is SubjectProductionStatus.NEEDS_REVIEW
-        assert imported.current_stage is SubjectProductionStage.ASSEMBLY
+        assert imported.status is ProductionRunStatus.NEEDS_REVIEW
+        assert imported.current_stage is ProductionStage.ASSEMBLY
         assert imported.started_at is not None
         assert imported.finished_at is not None
         assert imported.error_code == "imported_production_state"
@@ -427,20 +602,29 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
             slug="major-import-target",
             tlp=TLP.AMBER,
         )
-        run = SubjectProductionRun(
-            subject_id=source.id,
-            edition_id=edition.id,
-            research_date=date(2026, 11, 12),
-        )
-        run.start_running()
-        run.current_stage = SubjectProductionStage.ASSEMBLY
-        run.mark_needs_review(code="seed", message="seed")
         await uow.subjects.add(source)
         await uow.subjects.add(target)
-        await uow.subject_production_runs.add(run)
+        await uow.commit()
+
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subjects=(source, target),
+        complementary_axis="unified-import",
+    )
+    production = SubjectProductionService(uow_factory)
+    run, created = await production.create_run(source.id, edition.id)
+    assert created
+    run = await production.start_run(run.id)
+    async with uow_factory() as uow:
+        persisted_run = await uow.production_runs.get_for_update(run.id)
+        assert persisted_run is not None
+        persisted_run.current_stage = ProductionStage.ASSEMBLY
+        persisted_run.mark_needs_review(code="seed", message="seed")
+        await uow.production_runs.save(persisted_run)
         await uow.production_artifacts.append(
             ProductionArtifact(
-                production_run_id=run.id,
+                production_run_id=persisted_run.id,
                 subject_id=source.id,
                 stage=ProductionArtifactStage.REFERENCES,
                 version=1,
@@ -451,7 +635,7 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         )
         await uow.production_artifacts.append(
             ProductionArtifact(
-                production_run_id=run.id,
+                production_run_id=persisted_run.id,
                 subject_id=source.id,
                 stage=ProductionArtifactStage.EXTRACTION,
                 version=1,
@@ -462,7 +646,7 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
         )
         await uow.production_artifacts.append(
             ProductionArtifact(
-                production_run_id=run.id,
+                production_run_id=persisted_run.id,
                 subject_id=source.id,
                 stage=ProductionArtifactStage.SYNTHESIS,
                 version=1,
@@ -472,9 +656,12 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
             )
         )
         await uow.commit()
+    async with uow_factory() as uow:
+        input_snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+    assert input_snapshot is not None
 
     service = ProductionStateService(uow_factory, store)
-    snapshot = await service.export_state(subject_id=source.id, subject_title="Source")
+    snapshot = await service.export_state(subject_id=source.id)
     result = await service.import_state(
         subject_id=target.id,
         edition_id=edition.id,
@@ -484,12 +671,12 @@ async def test_unified_import_does_not_create_analyst_handoff_on_real_postgres(
     assert result.status == "needs_review"
     assert result.current_stage == "assembly"
     async with uow_factory() as uow:
-        imported_run = await uow.subject_production_runs.get(result.run_id)
+        imported_run = await uow.production_runs.get(result.run_id)
         assert imported_run is not None
         imported_artifacts = await uow.production_artifacts.list_for_run(imported_run.id)
         imported_investigation = await uow.analyst_investigations.get_for_run(imported_run.id)
-    assert imported_run.status is SubjectProductionStatus.NEEDS_REVIEW
-    assert imported_run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert imported_run.status is ProductionRunStatus.NEEDS_REVIEW
+    assert imported_run.current_stage is ProductionStage.ASSEMBLY
     assert imported_run.started_at is not None
     assert imported_run.finished_at is not None
     assert len(imported_artifacts) == 3
@@ -521,14 +708,14 @@ async def test_run_number_allocation_is_serialized_in_postgres(
 
     async def create_run() -> int:
         async with uow_factory() as uow:
-            await uow.subject_production_runs.lock_creation_for_subject(subject.id)
-            number = await uow.subject_production_runs.allocate_next_run_number(subject.id)
-            await uow.subject_production_runs.add(
-                SubjectProductionRun(
+            await uow.production_runs.lock_creation_for_subject(subject.id)
+            number = await uow.production_runs.allocate_next_run_number(subject.id)
+            await uow.production_runs.add(
+                ProductionRun(
                     subject_id=subject.id,
                     edition_id=edition.id,
                     run_number=number,
-                    status=SubjectProductionStatus.CANCELLED,
+                    status=ProductionRunStatus.CANCELLED,
                 )
             )
             await uow.commit()
@@ -612,27 +799,6 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
             source_coverage_complete=True,
             source_coverage_incomplete_reason=None,
         )
-        group = EditorialGroup(
-            edition_id=edition.id,
-            title="Concurrent subject",
-            candidate_references=(CandidateReference(discovery_batch.id, candidate.id),),
-            outcome=GroupingOutcome.NEW_SUBJECT,
-            score=EditorialScore(
-                impact=3,
-                novelty=3,
-                technical_depth=3,
-                hunting_potential=3,
-                actionability=3,
-                source_quality=3,
-                justifications={},
-            ),
-            source_relationship_status=SourceRelationshipStatus.VERIFIED,
-            needs_source_verification=False,
-            needs_source_expansion=False,
-            grouping_confidence=GroupingConfidence.HIGH,
-            grouping_justification="A stable test subject.",
-        )
-        group.select(subject.id)
         discovery_model_run = ModelRun(
             provider=ModelProvider.FAKE,
             model_role=ModelRole.RESEARCH,
@@ -647,7 +813,72 @@ async def test_concurrent_subject_run_creation_converges_on_one_postgres_run(
         await uow.subjects.add(subject)
         await uow.model_runs.add(discovery_model_run)
         await uow.discovery_batches.add_if_absent(discovery_batch)
-        await uow.editorial_groups.add(group)
+        merge_run = DiscoveryMergeRun(
+            edition_id=edition.id,
+            parent_snapshot_id=None,
+            intake_id=None,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            prompt_version="1",
+            policy_version="1",
+            blocking_version="1",
+            merge_input_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+            handle_map={},
+            included_subject_ids=(subject.id,),
+            excluded_subject_count=0,
+            validation_status=MergeValidationStatus.VALID,
+        )
+        assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+        snapshot = DiscoverySnapshot(
+            edition_id=edition.id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=None,
+            merge_run_id=merge_run.id,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            subjects=(
+                DiscoverySubject(
+                    subject_id=subject.id,
+                    candidate=candidate,
+                    member_references=(DiscoveryMemberReference(candidate.id),),
+                    created_at=discovery_batch.created_at,
+                ),
+            ),
+            snapshot_hash="a" * 64,
+            is_active=True,
+        )
+        await uow.discovery_subject_identities.add_many_if_absent(
+            [
+                DiscoverySubjectIdentity(
+                    edition_id=edition.id,
+                    origin_key=f"subject:{subject.id}",
+                    created_by_merge_run_id=merge_run.id,
+                    id=subject.id,
+                )
+            ]
+        )
+        await uow.discovery_snapshots.append(snapshot)
+        decision = SelectionDecision(
+            edition_id=edition.id,
+            discovery_subject_id=subject.id,
+            snapshot_id=snapshot.id,
+            snapshot_version=snapshot.version,
+            action=SelectionAction.SELECT,
+            subject_id=subject.id,
+            actor_id="concurrency-test",
+            correlation_id="concurrency-test",
+            idempotency_key=f"concurrency-test-{subject.id}",
+        )
+        await uow.selection_decisions.append(decision)
+        await uow.subject_discovery_origins.add(
+            SubjectDiscoveryOrigin(
+                subject_id=subject.id,
+                edition_id=edition.id,
+                discovery_subject_id=subject.id,
+                selection_decision_id=decision.id,
+                selected_snapshot_id=snapshot.id,
+                selected_snapshot_version=1,
+            )
+        )
         await uow.commit()
 
     class RunCreationUnitOfWork:

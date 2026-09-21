@@ -371,7 +371,6 @@ class SourceEvidenceProcessingService:
             parsed.text,
             subject_id=collection.subject_id,
             edition_id=collection.edition_id,
-            group_id=collection.group_id,
             source_document_id=source_document.id,
             artifact_id=artifact.id,
         )

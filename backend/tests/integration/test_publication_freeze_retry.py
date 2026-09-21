@@ -29,9 +29,11 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionBatchStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
+    production_batch_request_fingerprint,
 )
 from cti_app.domain.publication import PublicationDocumentV2
 from tests.integration.production.support import ProductionScenario
@@ -48,7 +50,7 @@ async def _seed_review_snapshot(
     title: str,
     input_hash: str,
     run_number: int,
-) -> tuple[EditionProductionBatch, SubjectProductionRun, ProductionArtifact]:
+) -> tuple[EditionProductionBatch, ProductionRun, ProductionArtifact]:
     document = PublicationDocumentV2(
         schema_version="2",
         title=title,
@@ -61,11 +63,11 @@ async def _seed_review_snapshot(
     document_blob_id, _ = await store.put_canonical_json(
         document.to_json(), bucket="test-publication"
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=scenario.subject.id,
         edition_id=scenario.edition.id,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         run_number=run_number,
         pipeline_generation=1,
         created_at=created_at,
@@ -83,8 +85,15 @@ async def _seed_review_snapshot(
     )
     batch = EditionProductionBatch(
         edition_id=scenario.edition.id,
-        status="running",
+        status=ProductionBatchStatus.RUNNING,
         phase=ProductionBatchPhase.REVIEW,
+        idempotency_key=(f"publication-freeze:{scenario.edition.id}:{run_number}"),
+        request_fingerprint=production_batch_request_fingerprint(
+            scenario.edition.id,
+            [scenario.subject.id],
+        ),
+        actor_id="publication-freeze-test",
+        correlation_id=f"publication-freeze:{run_number}",
         created_at=created_at,
     )
     item = EditionProductionBatchItem(
@@ -95,7 +104,7 @@ async def _seed_review_snapshot(
         created_at=created_at,
     )
     async with uow_factory() as uow:
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         await uow.production_artifacts.append(artifact)
         await uow.edition_production_batches.add(batch)
         await uow.commit()
@@ -232,11 +241,11 @@ async def test_publication_lock_keeps_the_edition_open_for_a_concurrent_retry(
         created_at=subject_created_at,
         updated_at=subject_created_at,
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.FAILED,
-        current_stage=SubjectProductionStage.SOURCES,
+        status=ProductionRunStatus.FAILED,
+        current_stage=ProductionStage.SOURCES,
         error_code="production_failed",
         error_message="production failed",
     )
@@ -283,7 +292,7 @@ async def test_publication_lock_keeps_the_edition_open_for_a_concurrent_retry(
         await uow.blobs.add(artifact_blob)
         await uow.blobs.add(manifest_blob)
         await uow.edition_production_batches.add(batch)
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         await uow.production_artifacts.append(artifact)
         await uow.edition_production_batch_items.append_many((item,))
         await uow.commit()
@@ -341,7 +350,7 @@ async def test_publication_lock_keeps_the_edition_open_for_a_concurrent_retry(
 
     async with uow_factory() as uow:
         persisted_edition = await uow.editions.get(edition.id)
-        persisted_run = await uow.subject_production_runs.get(run.id)
+        persisted_run = await uow.production_runs.get(run.id)
         persisted_artifact = await uow.production_artifacts.get(artifact.id)
         persisted_manifest = await uow.publication_manifests.get(manifest.id)
 

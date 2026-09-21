@@ -41,9 +41,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionBatchStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -53,19 +53,19 @@ SOURCE_IDS = ("S1", "S2", "S3")
 
 class _Runs:
     def __init__(self) -> None:
-        self.items: dict[UUID, SubjectProductionRun] = {}
+        self.items: dict[UUID, ProductionRun] = {}
         self.saves = 0
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def add(self, run: SubjectProductionRun) -> None:
+    async def add(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.saves += 1
         self.items[run.id] = run
 
@@ -142,7 +142,7 @@ class _Artifacts:
         self.items: list[ProductionArtifact] = []
         self.staled: list[str] = []
 
-    def add(self, run: SubjectProductionRun, stage: ProductionArtifactStage) -> ProductionArtifact:
+    def add(self, run: ProductionRun, stage: ProductionArtifactStage) -> ProductionArtifact:
         artifact = ProductionArtifact(
             production_run_id=run.id,
             subject_id=run.subject_id,
@@ -203,7 +203,7 @@ class _ModelRuns:
 
 class _Uow:
     def __init__(self, edition: Edition, *, archived_sources: int) -> None:
-        self.subject_production_runs = _Runs()
+        self.production_runs = _Runs()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.editions = _Editions(edition)
@@ -291,33 +291,33 @@ class _Orchestrator:
     """
 
     def __init__(self, uow: _Uow) -> None:
-        self.calls: list[SubjectProductionStage] = []
+        self.calls: list[ProductionStage] = []
         self.model_calls: list[str] = []
         self._uow = uow
 
     async def execute_stage(
         self,
         run_id: UUID,
-        expected_stage: SubjectProductionStage,
+        expected_stage: ProductionStage,
         context: object | None = None,
         correlation_id: str = "-",
     ) -> dict[str, Any]:
         self.calls.append(expected_stage)
-        run = self._uow.subject_production_runs.items[run_id]
+        run = self._uow.production_runs.items[run_id]
         artifacts = self._uow.production_artifacts
-        if expected_stage is SubjectProductionStage.REFERENCES:
+        if expected_stage is ProductionStage.REFERENCES:
             self.model_calls.append("q1")
             artifacts.add(run, ProductionArtifactStage.REFERENCES)
-        elif expected_stage is SubjectProductionStage.EXTRACTION:
+        elif expected_stage is ProductionStage.EXTRACTION:
             for entry in (run.extraction_progress or {}).get("sources", []):
                 if entry["status"] not in {"cached", "succeeded"}:
                     self.model_calls.append(f"q2:{entry['source_id']}")
                     entry["status"] = "succeeded"
             artifacts.add(run, ProductionArtifactStage.EXTRACTION)
-        elif expected_stage is SubjectProductionStage.SYNTHESIS:
+        elif expected_stage is ProductionStage.SYNTHESIS:
             self.model_calls.append("q4")
             artifacts.add(run, ProductionArtifactStage.SYNTHESIS)
-        elif expected_stage is SubjectProductionStage.ASSEMBLY:
+        elif expected_stage is ProductionStage.ASSEMBLY:
             artifacts.add(run, ProductionArtifactStage.PUBLICATION)
             run.mark_ready()
         return {"stage": expected_stage.value, "status": "success"}
@@ -354,7 +354,7 @@ class _World:
     def __init__(
         self,
         *,
-        stage: SubjectProductionStage,
+        stage: ProductionStage,
         produced: Sequence[ProductionArtifactStage] = (),
         progress: dict[str, Any] | None = None,
         archived_sources: int = len(SOURCE_IDS),
@@ -372,7 +372,7 @@ class _World:
                 phase=batch_phase,
             )
         )
-        self.run = SubjectProductionRun(
+        self.run = ProductionRun(
             subject_id=uuid4(),
             edition_id=self.edition.id,
             current_stage=stage,
@@ -380,19 +380,19 @@ class _World:
             extraction_progress=progress,
         )
         self.run.start_running()
-        self.uow.subject_production_runs.items[self.run.id] = self.run
+        self.uow.production_runs.items[self.run.id] = self.run
         for artifact_stage in produced:
             self.uow.production_artifacts.add(self.run, artifact_stage)
 
         runs = [self.run]
         if with_sibling:
-            self.sibling = SubjectProductionRun(
+            self.sibling = ProductionRun(
                 subject_id=uuid4(),
                 edition_id=self.edition.id,
-                status=SubjectProductionStatus.READY,
-                current_stage=SubjectProductionStage.ASSEMBLY,
+                status=ProductionRunStatus.READY,
+                current_stage=ProductionStage.ASSEMBLY,
             )
-            self.uow.subject_production_runs.items[self.sibling.id] = self.sibling
+            self.uow.production_runs.items[self.sibling.id] = self.sibling
             self.uow.production_artifacts.add(self.sibling, ProductionArtifactStage.PUBLICATION)
             runs.append(self.sibling)
         for position, run in enumerate(runs, start=1):
@@ -476,8 +476,8 @@ async def _resume_and_drain(
 # --- The domain transition -------------------------------------------------
 
 
-def _cancelled_run(stage: SubjectProductionStage) -> SubjectProductionRun:
-    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4(), current_stage=stage)
+def _cancelled_run(stage: ProductionStage) -> ProductionRun:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4(), current_stage=stage)
     run.start_running()
     run.mark_cancelled()
     return run
@@ -486,7 +486,7 @@ def _cancelled_run(stage: SubjectProductionStage) -> SubjectProductionRun:
 async def test_cancellation_only_writes_a_status() -> None:
     """Nothing the run produced is touched: cancellation is not a rollback."""
     world = _World(
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         produced=(ProductionArtifactStage.REFERENCES,),
         progress=_progress("S1"),
     )
@@ -494,7 +494,7 @@ async def test_cancellation_only_writes_a_status() -> None:
 
     await world.service().cancel_run_with_result(world.run.id)
 
-    assert world.run.status is SubjectProductionStatus.CANCELLED
+    assert world.run.status is ProductionRunStatus.CANCELLED
     assert world.artifact_identities() == before
     assert world.uow.production_artifacts.staled == []
     assert world.run.extraction_progress == _progress("S1")
@@ -503,13 +503,13 @@ async def test_cancellation_only_writes_a_status() -> None:
 
 
 async def test_resume_opens_a_new_generation_without_invalidating_anything() -> None:
-    run = _cancelled_run(SubjectProductionStage.EXTRACTION)
-    run.force_recompute_from_stage = SubjectProductionStage.EXTRACTION
+    run = _cancelled_run(ProductionStage.EXTRACTION)
+    run.force_recompute_from_stage = ProductionStage.EXTRACTION
 
-    run.resume_after_cancellation(SubjectProductionStage.EXTRACTION)
+    run.resume_after_cancellation(ProductionStage.EXTRACTION)
 
-    assert run.status is SubjectProductionStatus.RUNNING
-    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.status is ProductionRunStatus.RUNNING
+    assert run.current_stage is ProductionStage.EXTRACTION
     assert run.pipeline_generation == 1
     # A resume reuses; only a retry invalidates.
     assert run.force_recompute_from_stage is None
@@ -519,26 +519,24 @@ async def test_resume_opens_a_new_generation_without_invalidating_anything() -> 
 @pytest.mark.parametrize(
     "status",
     (
-        SubjectProductionStatus.RUNNING,
-        SubjectProductionStatus.READY,
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
+        ProductionRunStatus.RUNNING,
+        ProductionRunStatus.READY,
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
     ),
 )
-async def test_only_a_cancelled_run_is_resumable(status: SubjectProductionStatus) -> None:
-    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
+async def test_only_a_cancelled_run_is_resumable(status: ProductionRunStatus) -> None:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
     run.start_running()
-    if status is not SubjectProductionStatus.RUNNING:
+    if status is not ProductionRunStatus.RUNNING:
         {
-            SubjectProductionStatus.READY: lambda: run.mark_ready(),
-            SubjectProductionStatus.FAILED: lambda: run.mark_failed(code="x", message="y"),
-            SubjectProductionStatus.NEEDS_REVIEW: lambda: run.mark_needs_review(
-                code="x", message="y"
-            ),
+            ProductionRunStatus.READY: lambda: run.mark_ready(),
+            ProductionRunStatus.FAILED: lambda: run.mark_failed(code="x", message="y"),
+            ProductionRunStatus.NEEDS_REVIEW: lambda: run.mark_needs_review(code="x", message="y"),
         }[status]()
 
     with pytest.raises(ValueError, match="production_run_not_resumable"):
-        run.resume_after_cancellation(SubjectProductionStage.SYNTHESIS)
+        run.resume_after_cancellation(ProductionStage.SYNTHESIS)
 
 
 # --- The four cancellation points ------------------------------------------
@@ -548,7 +546,7 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World(
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         produced=(ProductionArtifactStage.REFERENCES,),
         progress=_progress("S1"),
     )
@@ -559,15 +557,15 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     resumed = await _resume_and_drain(world, registry, jobs)
 
     plan = resumed.plan
-    assert plan.previous_status is SubjectProductionStatus.CANCELLED
-    assert plan.resume_from_stage is SubjectProductionStage.EXTRACTION
+    assert plan.previous_status is ProductionRunStatus.CANCELLED
+    assert plan.resume_from_stage is ProductionStage.EXTRACTION
     assert plan.reused_artifacts == ("references",)
     # Two sources still owe a Q2 answer, and Q4 owes one call.
     assert plan.model_calls_expected == 3
     assert orchestrator.calls == [
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     ]
     assert orchestrator.model_calls == ["q2:S2", "q2:S3", "q4"]
     # The archived sources and the reference report are the same rows as before.
@@ -575,14 +573,14 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
         await world.uow.production_artifacts.get_current(world.run.id, "references")
     ) is references
     assert world.uow.production_artifacts.staled == []
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
 
 
 async def test_cancel_after_extraction_never_replays_extraction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World(
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         progress=_progress(*SOURCE_IDS),
     )
@@ -591,20 +589,20 @@ async def test_cancel_after_extraction_never_replays_extraction(
 
     resumed = await _resume_and_drain(world, registry, jobs)
 
-    assert resumed.plan.resume_from_stage is SubjectProductionStage.SYNTHESIS
+    assert resumed.plan.resume_from_stage is ProductionStage.SYNTHESIS
     assert resumed.plan.reused_artifacts == ("references", "extraction")
     assert resumed.plan.model_calls_expected == 1
     assert orchestrator.calls == [
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     ]
     assert orchestrator.model_calls == ["q4"]
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
 
 
 async def test_cancel_after_synthesis_only_assembles(monkeypatch: pytest.MonkeyPatch) -> None:
     world = _World(
-        stage=SubjectProductionStage.ASSEMBLY,
+        stage=ProductionStage.ASSEMBLY,
         produced=(
             ProductionArtifactStage.REFERENCES,
             ProductionArtifactStage.EXTRACTION,
@@ -617,38 +615,38 @@ async def test_cancel_after_synthesis_only_assembles(monkeypatch: pytest.MonkeyP
 
     resumed = await _resume_and_drain(world, registry, jobs)
 
-    assert resumed.plan.resume_from_stage is SubjectProductionStage.ASSEMBLY
+    assert resumed.plan.resume_from_stage is ProductionStage.ASSEMBLY
     assert resumed.plan.reused_artifacts == ("references", "extraction", "synthesis")
     assert resumed.plan.model_calls_expected == 0
-    assert orchestrator.calls == [SubjectProductionStage.ASSEMBLY]
+    assert orchestrator.calls == [ProductionStage.ASSEMBLY]
     assert orchestrator.model_calls == []
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
 
 
 async def test_cancel_before_references_resumes_the_first_model_stage(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    world = _World(stage=SubjectProductionStage.REFERENCES)
+    world = _World(stage=ProductionStage.REFERENCES)
     registry, jobs, orchestrator = _register(world, monkeypatch)
     await world.service().cancel_run_with_result(world.run.id)
 
     resumed = await _resume_and_drain(world, registry, jobs)
 
-    assert resumed.plan.resume_from_stage is SubjectProductionStage.REFERENCES
+    assert resumed.plan.resume_from_stage is ProductionStage.REFERENCES
     assert resumed.plan.reused_artifacts == ()
     # Q1, then one Q2 call per archived source, then Q4.
     assert resumed.plan.model_calls_expected == 1 + len(SOURCE_IDS) + 1
-    assert orchestrator.calls[0] is SubjectProductionStage.REFERENCES
-    assert world.run.status is SubjectProductionStatus.READY
+    assert orchestrator.calls[0] is ProductionStage.REFERENCES
+    assert world.run.status is ProductionRunStatus.READY
 
 
 async def test_cancel_without_any_archived_source_resumes_collection() -> None:
-    world = _World(stage=SubjectProductionStage.SOURCES, archived_sources=0)
+    world = _World(stage=ProductionStage.SOURCES, archived_sources=0)
     await world.service().cancel_run_with_result(world.run.id)
 
     resumed = await world.service().resume_cancelled_run(world.run.id)
 
-    assert resumed.plan.resume_from_stage is SubjectProductionStage.SOURCES
+    assert resumed.plan.resume_from_stage is ProductionStage.SOURCES
     assert resumed.plan.reused_artifacts == ()
 
 
@@ -659,20 +657,20 @@ async def test_resume_keeps_one_run_one_edition_entry_and_no_orphan_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     world = _World(
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         produced=(ProductionArtifactStage.REFERENCES,),
         progress=_progress("S1"),
     )
     registry, jobs, _ = _register(world, monkeypatch)
     await world.service().cancel_run_with_result(world.run.id)
-    run_ids = set(world.uow.subject_production_runs.items)
+    run_ids = set(world.uow.production_runs.items)
     kept = world.artifact_identities()
 
     resumed = await _resume_and_drain(world, registry, jobs)
 
     # The same run continues: no rival run, no second entry in the edition.
     assert resumed.run.id == world.run.id
-    assert set(world.uow.subject_production_runs.items) == run_ids
+    assert set(world.uow.production_runs.items) == run_ids
     assert len(await world.uow.edition_production_batch_items.list_for_batch(world.batch.id)) == 1
     # Every artifact belongs to the resumed run, and each stage keeps exactly
     # one current row.
@@ -689,7 +687,7 @@ async def test_a_cancelled_article_of_an_edition_resumes_alone(
 ) -> None:
     """Case 4: one article of a finished batch, resumed from batch Review."""
     world = _World(
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         progress=_progress(*SOURCE_IDS),
         edition_state=EditionStatus.OPEN,
@@ -706,9 +704,9 @@ async def test_a_cancelled_article_of_an_edition_resumes_alone(
     assert resumed.batch_id == world.batch.id
     assert world.batch.phase is ProductionBatchPhase.REVIEW
     assert orchestrator.model_calls == ["q4"]
-    assert world.run.status is SubjectProductionStatus.READY
+    assert world.run.status is ProductionRunStatus.READY
     # The neighbour is untouched: resuming is an article-local gesture.
-    assert world.sibling.status is SubjectProductionStatus.READY
+    assert world.sibling.status is ProductionRunStatus.READY
     assert world.sibling.pipeline_generation == sibling_generation
     # Review-time recovery never changes the edition state or version.
     assert world.uow.editions.edition.state is EditionStatus.OPEN
@@ -717,32 +715,32 @@ async def test_a_cancelled_article_of_an_edition_resumes_alone(
 
 async def test_resume_is_refused_when_a_sibling_is_still_running() -> None:
     world = _World(
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         with_sibling=True,
     )
     await world.service().cancel_run_with_result(world.run.id)
-    world.sibling.status = SubjectProductionStatus.RUNNING
+    world.sibling.status = ProductionRunStatus.RUNNING
 
     with pytest.raises(ValueError, match="active_sibling"):
         await world.service().resume_cancelled_run(world.run.id)
 
-    assert world.run.status is SubjectProductionStatus.CANCELLED
+    assert world.run.status is ProductionRunStatus.CANCELLED
 
 
 async def test_resume_is_refused_on_a_cancelled_batch() -> None:
-    world = _World(stage=SubjectProductionStage.SYNTHESIS)
+    world = _World(stage=ProductionStage.SYNTHESIS)
     await world.service().cancel_run_with_result(world.run.id)
     world.batch.status = ProductionBatchStatus.CANCELLED
 
     with pytest.raises(ValueError, match="batch_cancelled"):
         await world.service().resume_cancelled_run(world.run.id)
 
-    assert world.run.status is SubjectProductionStatus.CANCELLED
+    assert world.run.status is ProductionRunStatus.CANCELLED
 
 
 async def test_resume_is_refused_once_the_edition_is_archived() -> None:
-    world = _World(stage=SubjectProductionStage.SYNTHESIS, edition_state=EditionStatus.OPEN)
+    world = _World(stage=ProductionStage.SYNTHESIS, edition_state=EditionStatus.OPEN)
     await world.service().cancel_run_with_result(world.run.id)
     world.uow.editions.edition.state = EditionStatus.ARCHIVED
 
@@ -751,20 +749,20 @@ async def test_resume_is_refused_once_the_edition_is_archived() -> None:
 
 
 async def test_standalone_cancellation_is_refused_once_the_edition_is_archived() -> None:
-    world = _World(stage=SubjectProductionStage.SOURCES, edition_state=EditionStatus.ARCHIVED)
+    world = _World(stage=ProductionStage.SOURCES, edition_state=EditionStatus.ARCHIVED)
     world.uow.edition_production_batch_items.items.clear()
 
     with pytest.raises(ValueError, match="edition_archived"):
         await world.service().cancel_run_with_result(world.run.id)
 
-    assert world.run.status is SubjectProductionStatus.RUNNING
-    assert world.uow.subject_production_runs.saves == 0
+    assert world.run.status is ProductionRunStatus.RUNNING
+    assert world.uow.production_runs.saves == 0
     assert world.uow.editions.edition.state is EditionStatus.ARCHIVED
     assert world.uow.editions.edition.version == 1
 
 
 async def test_resume_is_refused_on_a_run_that_was_not_cancelled() -> None:
-    world = _World(stage=SubjectProductionStage.SYNTHESIS)
+    world = _World(stage=ProductionStage.SYNTHESIS)
 
     with pytest.raises(ValueError, match="production_run_not_resumable"):
         await world.service().resume_cancelled_run(world.run.id)
@@ -775,7 +773,7 @@ async def test_resume_is_refused_on_a_run_that_was_not_cancelled() -> None:
 
 async def test_a_stale_artifact_is_not_evidence_of_a_complete_stage() -> None:
     world = _World(
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         progress=_progress(*SOURCE_IDS),
     )
@@ -784,13 +782,13 @@ async def test_a_stale_artifact_is_not_evidence_of_a_complete_stage() -> None:
 
     resumed = await world.service().resume_cancelled_run(world.run.id)
 
-    assert resumed.plan.resume_from_stage is SubjectProductionStage.EXTRACTION
+    assert resumed.plan.resume_from_stage is ProductionStage.EXTRACTION
     assert resumed.plan.reused_artifacts == ("references",)
 
 
 async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
     world = _World(
-        stage=SubjectProductionStage.ASSEMBLY,
+        stage=ProductionStage.ASSEMBLY,
         produced=tuple(ProductionArtifactStage),
         progress=_progress(*SOURCE_IDS),
     )
@@ -805,14 +803,14 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
         archived_source_count=len(SOURCE_IDS),
     )
 
-    assert plan.resume_from_stage is SubjectProductionStage.ASSEMBLY
+    assert plan.resume_from_stage is ProductionStage.ASSEMBLY
     assert plan.model_calls_expected == 0
     assert plan.reused_artifacts == ("references", "extraction", "synthesis")
 
 
 async def test_the_log_payload_names_exactly_the_documented_fields() -> None:
     world = _World(
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
         progress=_progress(*SOURCE_IDS),
     )
@@ -834,14 +832,14 @@ async def test_the_log_payload_names_exactly_the_documented_fields() -> None:
 async def test_review_offers_resume_and_not_retry_on_a_cancelled_article() -> None:
     assert (
         review_item_can_resume(
-            SubjectProductionStatus.CANCELLED,
+            ProductionRunStatus.CANCELLED,
             reconciliation_required=False,
         )
         is True
     )
     assert (
         review_item_can_retry(
-            SubjectProductionStatus.CANCELLED,
+            ProductionRunStatus.CANCELLED,
             artifact_verified=False,
             reconciliation_required=False,
         )
@@ -852,13 +850,13 @@ async def test_review_offers_resume_and_not_retry_on_a_cancelled_article() -> No
 @pytest.mark.parametrize(
     "status",
     (
-        SubjectProductionStatus.READY,
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
-        SubjectProductionStatus.RUNNING,
+        ProductionRunStatus.READY,
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
+        ProductionRunStatus.RUNNING,
     ),
 )
 async def test_only_a_cancelled_article_is_offered_a_resume(
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
 ) -> None:
     assert review_item_can_resume(status, reconciliation_required=False) is False

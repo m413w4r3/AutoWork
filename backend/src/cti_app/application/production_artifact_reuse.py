@@ -18,7 +18,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 _COSTLY_STAGES = (
@@ -50,7 +50,7 @@ class ProductionArtifactReuseService:
     async def find_or_reuse(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         stage: ProductionArtifactStage,
         input_hash: str,
         allow_cross_run: bool = True,
@@ -61,7 +61,7 @@ class ProductionArtifactReuseService:
 
         async with self._uow_factory() as uow:
             target_run = run
-            runs = getattr(uow, "subject_production_runs", None)
+            runs = getattr(uow, "production_runs", None)
             get_for_update = getattr(runs, "get_for_update", None)
             if get_for_update is not None:
                 persisted_run = await get_for_update(run.id)
@@ -187,7 +187,7 @@ class ProductionArtifactReuseService:
 
     def _record_invalid_candidate(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         stage: ProductionArtifactStage,
         candidate: ProductionArtifact,
         error: Exception,
@@ -206,7 +206,7 @@ class ProductionArtifactReuseService:
     async def _invalidation_cutoff(
         self,
         uow: ProductionUnitOfWork,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         stage: ProductionArtifactStage,
     ) -> datetime | None:
         repository = getattr(uow, "production_reuse_invalidations", None)
@@ -223,7 +223,7 @@ class ProductionArtifactReuseService:
         return max(applicable) if applicable else None
 
 
-def cross_run_reuse_allowed(run: SubjectProductionRun, stage: ProductionArtifactStage) -> bool:
+def cross_run_reuse_allowed(run: ProductionRun, stage: ProductionArtifactStage) -> bool:
     """Apply a persisted FORCE marker while keeping same-run idempotency intact."""
     forced_from = run.force_recompute_from_stage
     if forced_from is None:

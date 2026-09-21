@@ -28,13 +28,18 @@ const MANUAL_SOURCE_STATES = new Set([
   "failed_terminal",
 ]);
 
-export function PipelineTab({ subjectId }: { subjectId: string }) {
+export function PipelineTab({
+  subjectId,
+  editionId,
+}: {
+  subjectId: string;
+  editionId: string;
+}) {
   const production = useQuery({
     queryKey: ["production", subjectId],
     queryFn: () => getSubjectProduction(subjectId),
   });
   const sourceFailure = isSourceCollectionFailure(production.data);
-  const editionId = production.data?.edition_id;
   const workbench = useQuery({
     queryKey: ["subject-workbench", subjectId],
     queryFn: () => getSubjectWorkbench(subjectId),
@@ -43,8 +48,8 @@ export function PipelineTab({ subjectId }: { subjectId: string }) {
 
   return (
     <>
-      <SubjectProduction subjectId={subjectId} />
-      {sourceFailure && editionId ? (
+      <SubjectProduction subjectId={subjectId} editionId={editionId} />
+      {sourceFailure ? (
         <SourceContentPanel
           subjectId={subjectId}
           editionId={editionId}

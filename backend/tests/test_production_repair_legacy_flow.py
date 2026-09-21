@@ -39,7 +39,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionStatus,
+    ProductionRunStatus,
 )
 from tests.test_production_recovery_support import (
     DOMAIN,
@@ -101,7 +101,7 @@ class _LegacyIssueUow:
         async def list_runs(_edition_id: UUID) -> list[Any]:
             return [SimpleNamespace(id=RUN_ID, subject_id=SUBJECT_ID, pipeline_generation=2)]
 
-        self.subject_production_runs = SimpleNamespace(list_for_edition=list_runs)
+        self.production_runs = SimpleNamespace(list_for_edition=list_runs)
         self.production_artifacts = _LegacyArtifacts(artifact)
         self.production_repair_decisions = decisions or _DecisionRepository()
 
@@ -217,7 +217,7 @@ async def test_projection_materializes_exactly_the_recovered_legacy_values() -> 
         id=RUN_ID,
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
         requires_reconciliation=False,
         pipeline_generation=2,
     )
@@ -258,7 +258,7 @@ async def test_projection_refuses_to_materialize_an_unrecoverable_include() -> N
         id=RUN_ID,
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
         requires_reconciliation=False,
         pipeline_generation=2,
     )

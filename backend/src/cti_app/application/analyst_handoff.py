@@ -21,7 +21,7 @@ from cti_app.domain.production import (
     AnalystInvestigation,
     LoopBudget,
     ProductionArtifact,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 
@@ -118,7 +118,7 @@ class AnalystPostSynthesisService:
     async def ensure_for_verified_synthesis(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         synthesis: ProductionArtifact,
         extraction_artifacts: Iterable[ProductionArtifact],
         extraction_items: Iterable[Any],
@@ -154,7 +154,7 @@ class AnalystPostSynthesisService:
         self,
         *,
         uow: ProductionUnitOfWork,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         synthesis: ProductionArtifact,
         extraction_artifacts: tuple[ProductionArtifact, ...],
         extraction_items: list[dict[str, Any]],

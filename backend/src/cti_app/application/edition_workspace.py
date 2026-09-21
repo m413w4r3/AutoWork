@@ -22,7 +22,7 @@ from cti_app.application.production_parsers import technical_extraction_from_jso
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
-    ProductionStateSnapshot,
+    ProductionStateSnapshotV4,
 )
 from cti_app.domain.production import DetectionRule, DetectionRuleType
 
@@ -93,7 +93,7 @@ class EditionWorkspaceMaterializer:
         position: int,
         subject_id: UUID,
         subject_title: str,
-        production_state: ProductionStateSnapshot,
+        production_state: ProductionStateSnapshotV4,
         publication: Mapping[str, Any] | None = None,
         rendered_content: str | None = None,
         sources: Sequence[Mapping[str, Any]] = (),
@@ -366,10 +366,7 @@ class EditionProductionCheckpointService:
             if context is None:
                 return None
             try:
-                state = await self._state.export_run_state(
-                    context.run_id,
-                    subject_title=context.subject_title,
-                )
+                state = await self._state.export_run_state(context.run_id)
             except ProductionStateError as exc:
                 if exc.code in {
                     "production_state_not_found",
@@ -425,7 +422,7 @@ class EditionProductionCheckpointService:
 
     async def _resolve_context(self, run_id: UUID) -> _CheckpointContext | None:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
             if run is None:
                 return None
             item = await uow.edition_production_batch_items.get_by_run(run_id)

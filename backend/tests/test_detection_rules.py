@@ -33,7 +33,7 @@ from cti_app.application.production_rendering import (
     collect_indicators,
     render_publication_markdown,
 )
-from cti_app.application.production_state import ProductionStateSnapshotV1
+from cti_app.application.production_state import ProductionStateSnapshotV4
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
 from cti_app.domain.publication import ArtifactType
@@ -250,17 +250,19 @@ def test_rules_are_not_iocs_or_publication_body() -> None:
     assert rule.body not in publication
 
 
-def _state() -> ProductionStateSnapshotV1:
-    return ProductionStateSnapshotV1.model_validate(
+def _state() -> ProductionStateSnapshotV4:
+    return ProductionStateSnapshotV4.model_validate(
         {
             "format": "autowork.production-state",
-            "schema_version": 1,
+            "schema_version": 4,
             "exported_at": "2026-08-29T10:00:00Z",
             "origin": {
                 "subject_title": "Sujet",
-                "editorial_type": "brief",
-                "profile": "brief_auto",
+                "subject_id": "11111111-1111-4111-8111-111111111111",
+                "production_run_id": "22222222-2222-4222-8222-222222222222",
                 "research_date": "2026-08-01",
+                "discovery_snapshot_id": "33333333-3333-4333-8333-333333333333",
+                "discovery_snapshot_version": 7,
             },
             "artifacts": {
                 "references": {"input_hash": "a" * 64, "canonical_content": {"items": []}},

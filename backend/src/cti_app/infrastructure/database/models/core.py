@@ -221,6 +221,9 @@ class SubjectRow(Base):
     __tablename__ = "subjects"
     __table_args__ = (
         UniqueConstraint("edition_id", "slug", name="uq_subjects_edition_slug"),
+        # Target of composite foreign keys that pin a production run to the
+        # Subject's own edition.
+        UniqueConstraint("id", "edition_id", name="uq_subjects_id_edition"),
         Index("ix_subjects_edition_id", "edition_id"),
         CheckConstraint(f"tlp IN ({TLP_VALUES_SQL})", name="ck_subjects_tlp"),
         CheckConstraint("slug ~ '^[a-z0-9]+(-[a-z0-9]+)*$'", name="ck_subjects_slug_format"),

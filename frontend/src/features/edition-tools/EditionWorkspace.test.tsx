@@ -3,8 +3,11 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Edition } from "../../api/editions";
-import { startEditionProduction } from "../../api/production";
-import { fetchSelectionBoard, type SelectionBoard } from "../../api/selection";
+import {
+  getEditionProduction,
+  startProductionBatch,
+  type ProductionBoard,
+} from "../../api/production";
 import {
   EditionNavigation,
   EditionToolSurface,
@@ -13,11 +16,8 @@ import {
 } from "./EditionWorkspace";
 
 vi.mock("../../api/production", () => ({
-  startEditionProduction: vi.fn(),
-}));
-
-vi.mock("../../api/selection", () => ({
-  fetchSelectionBoard: vi.fn(),
+  getEditionProduction: vi.fn(),
+  startProductionBatch: vi.fn(),
 }));
 
 vi.mock("../discovery/DiscoveryPanel", () => ({
@@ -120,40 +120,53 @@ const edition: Edition = {
   updated_at: "2026-08-29T10:00:00Z",
 };
 
-const selectionBoard = {
+const productionBoard: ProductionBoard = {
   edition_id: EDITION_ID,
-  snapshot_id: "snapshot-1",
-  snapshot_version: 1,
-  counts: { undecided: 0, ignored: 1, selected: 3 },
-  recommendation: null,
-  fusion_review_count: 0,
-  items: [
+  subjects: [
     {
       title: "Sujet A",
-      state: "selected",
       subject_id: "subject-a",
-      discovery_subject_id: "discovery-a",
+      tlp: "GREEN",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
     },
     {
       title: "Sujet B",
-      state: "selected",
       subject_id: "subject-b",
-      discovery_subject_id: "discovery-b",
+      tlp: "GREEN",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: true,
+      blocking_reason: null,
     },
     {
       title: "Sujet ignoré",
-      state: "ignored",
       subject_id: "subject-ignored",
-      discovery_subject_id: "discovery-ignored",
+      tlp: "GREEN",
+      latest_run_id: null,
+      latest_run_number: null,
+      latest_status: null,
+      latest_stage: null,
+      active_run_id: null,
+      can_start: false,
+      blocking_reason: "Sujet déjà en production",
     },
   ],
-} as SelectionBoard;
+  active_batch: null,
+  recent_batches: [],
+};
 
 beforeEach(() => {
-  vi.mocked(fetchSelectionBoard).mockResolvedValue(selectionBoard);
-  vi.mocked(startEditionProduction).mockReturnValue(
-    new Promise<never>(() => {}),
-  );
+  vi.mocked(getEditionProduction).mockResolvedValue(productionBoard);
+  vi.mocked(startProductionBatch).mockReturnValue(new Promise<never>(() => {}));
 });
 
 function renderSurface(tool: EditionTool, value = edition) {
@@ -286,6 +299,7 @@ describe("EditionToolSurface", () => {
       screen.getByRole("checkbox", { name: "Sujet B" }),
     ).toBeInTheDocument();
     expect(screen.queryByLabelText("Sujet ignoré")).not.toBeInTheDocument();
+    expect(screen.getByText("Sujet déjà en production")).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Sujet B" }));
     fireEvent.click(screen.getByRole("checkbox", { name: "Sujet A" }));
@@ -299,11 +313,12 @@ describe("EditionToolSurface", () => {
       .click();
 
     await waitFor(() => {
-      expect(startEditionProduction).toHaveBeenCalledTimes(1);
-      expect(startEditionProduction).toHaveBeenCalledWith(EDITION_ID, [
-        "subject-a",
-        "subject-b",
-      ]);
+      expect(startProductionBatch).toHaveBeenCalledTimes(1);
+      expect(startProductionBatch).toHaveBeenCalledWith(
+        EDITION_ID,
+        ["subject-a", "subject-b"],
+        expect.any(String),
+      );
     });
   });
 

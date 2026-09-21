@@ -27,7 +27,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionRun,
+    ProductionRun,
 )
 from cti_app.domain.publication import ArtifactType
 
@@ -256,7 +256,7 @@ class _Uow:
 
 @pytest.mark.asyncio
 async def test_post_q2_replay_is_one_derived_artifact_with_sidecar_and_provenance() -> None:
-    run = SubjectProductionRun(subject_id=SUBJECT_ID, edition_id=EDITION_ID)
+    run = ProductionRun(subject_id=SUBJECT_ID, edition_id=EDITION_ID)
     run.start_running()
     value = "replayed.security-lab.io"
     entry = _entry(value)
@@ -296,7 +296,7 @@ async def test_post_q2_replay_is_one_derived_artifact_with_sidecar_and_provenanc
 
 @pytest.mark.asyncio
 async def test_post_q2_replay_audits_a_disappeared_decision_without_blocking_debt() -> None:
-    run = SubjectProductionRun(subject_id=SUBJECT_ID, edition_id=EDITION_ID)
+    run = ProductionRun(subject_id=SUBJECT_ID, edition_id=EDITION_ID)
     run.start_running()
     canonical_blob_id = uuid4()
     store = _Store()

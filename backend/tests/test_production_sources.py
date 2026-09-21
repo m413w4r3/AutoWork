@@ -9,8 +9,9 @@ actually archived.
 from __future__ import annotations
 
 from datetime import date
-from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
+
+import pytest
 
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.domain.classification import TLP
@@ -20,13 +21,13 @@ from cti_app.domain.collection import (
     SourceOriginKind,
 )
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production import ProductionInputSnapshot, ProductionInputSource
 
 
 def _collection(url: str, state: CollectionState = CollectionState.ARCHIVED) -> SourceCollection:
     return SourceCollection(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        group_id=uuid4(),
         requested_url=url,
         proposed_role=SourceRole.PRIMARY,
         state=state,
@@ -62,7 +63,6 @@ def test_reference_research_source_needs_no_discovery_batch() -> None:
     collection = SourceCollection(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        group_id=uuid4(),
         requested_url="https://newly.example/found",
         proposed_role=SourceRole.INDEPENDENT,
         origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
@@ -81,7 +81,6 @@ def test_collection_carries_its_own_diffusion_policy() -> None:
     collection = SourceCollection(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        group_id=uuid4(),
         requested_url="https://restricted.example/report",
         proposed_role=SourceRole.PRIMARY,
         origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
@@ -97,47 +96,6 @@ def test_collection_carries_its_own_diffusion_policy() -> None:
 # --- Production context ----------------------------------------------------
 
 
-class _Groups:
-    def __init__(self, edition_id: object) -> None:
-        self._edition_id = edition_id
-
-    async def get_by_subject(self, subject_id: object) -> object:
-        return type(
-            "Group",
-            (),
-            {
-                "title": "Titre historique du groupe",
-                "grouping_justification": "Campagne contre la diaspora",
-                "edition_id": self._edition_id,
-                "actor_or_campaign": "TAG-182",
-            },
-        )()
-
-
-class _Editions:
-    def __init__(self, edition_id: object) -> None:
-        self._edition_id = edition_id
-        self.requested_ids: list[object] = []
-
-    async def get(self, edition_id: object) -> object:
-        self.requested_ids.append(edition_id)
-        if edition_id != self._edition_id:
-            return None
-        return type(
-            "Edition",
-            (),
-            {"period_start": date(2026, 7, 1), "period_end": date(2026, 7, 31)},
-        )()
-
-
-class _Subjects:
-    def __init__(self, edition_id: object) -> None:
-        self._edition_id = edition_id
-
-    async def get(self, subject_id: object) -> object:
-        return SimpleNamespace(title="Titre canonique du Subject", edition_id=self._edition_id)
-
-
 class _Collections:
     def __init__(self, items: list[SourceCollection]) -> None:
         self._items = items
@@ -148,22 +106,58 @@ class _Collections:
 
 class _Uow:
     def __init__(self, collections: list[SourceCollection]) -> None:
-        edition_id = uuid4()
-        self.subject_edition_id = edition_id
-        self.editorial_groups = _Groups(uuid4())
-        self.subjects = _Subjects(edition_id)
-        self.editions = _Editions(edition_id)
         self.source_collections = _Collections(collections)
 
 
-async def test_context_carries_the_real_editorial_anchors() -> None:
-    """The prompt slots were being filled with empty strings."""
-    uow = _Uow([_collection("https://research.example/rapport")])
+def _input_source(url: str, candidate_id: UUID, *, allowed: bool = True) -> ProductionInputSource:
+    return ProductionInputSource(
+        discovery_candidate_id=candidate_id,
+        source_candidate_id=uuid4(),
+        canonical_url=url,
+        role=SourceRole.PRIMARY,
+        title="Publication",
+        publisher="Publisher",
+        published_at=date(2026, 7, 10),
+        tlp=TLP.CLEAR,
+        sensitivity="public",
+        external_llm_allowed=allowed,
+    )
+
+
+def _snapshot(subject_id: UUID, urls: tuple[str, ...]) -> ProductionInputSnapshot:
+    candidate_id = uuid4()
+    return ProductionInputSnapshot(
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        edition_id=uuid4(),
+        subject_version=1,
+        subject_title="Titre canonique du Subject",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=4,
+        member_candidate_ids=(candidate_id,),
+        discovery_summary="Campagne contre la diaspora",
+        actor_or_campaign="TAG-182",
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        research_date=date(2026, 8, 1),
+        core_sources=tuple(_input_source(url, candidate_id) for url in urls),
+    )
+
+
+async def test_context_carries_the_frozen_snapshot_anchors() -> None:
+    """The prompt slots come from the run's immutable input, never from a group."""
+    subject_id = uuid4()
+    url = "https://research.example/rapport"
+    uow = _Uow([_collection(url)])
 
     ctx = await build_subject_production_context(
         uow,  # type: ignore[arg-type]
-        uuid4(),
-        date(2026, 8, 1),
+        subject_id,
+        snapshot=_snapshot(subject_id, (url,)),
     )
 
     assert ctx.subject_title == "Titre canonique du Subject"
@@ -171,22 +165,33 @@ async def test_context_carries_the_real_editorial_anchors() -> None:
     assert ctx.actor_info == "TAG-182"
     assert ctx.period_start == "2026-07-01"
     assert ctx.period_end == "2026-07-31"
-    assert uow.editions.requested_ids == [uow.subject_edition_id]
     assert ctx.research_date == date(2026, 8, 1)
-    assert "https://research.example/rapport" in ctx.core_sources_text
+    assert url in ctx.core_sources_text
     assert ctx.supporting_sources_text == ""
     assert "1 publication(s)" in ctx.technical_summary
 
 
+async def test_context_refuses_to_build_without_a_production_input_snapshot() -> None:
+    with pytest.raises(ValueError, match="production_input_snapshot_missing"):
+        await build_subject_production_context(
+            _Uow([]),  # type: ignore[arg-type]
+            uuid4(),
+            snapshot=None,
+        )
+
+
 async def test_context_blocks_external_model_when_a_source_forbids_it() -> None:
+    subject_id = uuid4()
     restricted = _collection("https://restricted.example/report")
     restricted.do_not_submit = True
     uow = _Uow([_collection("https://research.example/ok"), restricted])
 
     ctx = await build_subject_production_context(
         uow,  # type: ignore[arg-type]
-        uuid4(),
-        date(2026, 8, 1),
+        subject_id,
+        snapshot=_snapshot(
+            subject_id, ("https://research.example/ok", "https://restricted.example/report")
+        ),
     )
 
     assert ctx.external_llm_allowed is False
@@ -194,12 +199,13 @@ async def test_context_blocks_external_model_when_a_source_forbids_it() -> None:
 
 
 async def test_context_allows_external_model_when_every_source_permits_it() -> None:
+    subject_id = uuid4()
     uow = _Uow([_collection("https://a.example/x"), _collection("https://b.example/y")])
 
     ctx = await build_subject_production_context(
         uow,  # type: ignore[arg-type]
-        uuid4(),
-        date(2026, 8, 1),
+        subject_id,
+        snapshot=_snapshot(subject_id, ("https://a.example/x", "https://b.example/y")),
     )
 
     assert ctx.external_llm_allowed is True
@@ -207,6 +213,7 @@ async def test_context_allows_external_model_when_every_source_permits_it() -> N
 
 
 async def test_context_separates_core_and_supporting_publications() -> None:
+    subject_id = uuid4()
     discovery = _collection("https://research.example/discovery")
     manual = _collection("https://research.example/manual")
     manual.origin_kind = SourceOriginKind.MANUAL
@@ -215,11 +222,12 @@ async def test_context_separates_core_and_supporting_publications() -> None:
 
     ctx = await build_subject_production_context(
         _Uow([discovery, manual, supporting]),  # type: ignore[arg-type]
-        uuid4(),
-        date(2026, 8, 1),
+        subject_id,
+        snapshot=_snapshot(subject_id, ("https://research.example/discovery",)),
+        relevant_source_urls={supporting.canonical_url},
     )
 
     assert "discovery" in ctx.core_sources_text
-    assert "manual" in ctx.core_sources_text
+    assert "manual" not in ctx.core_sources_text
     assert "supporting" not in ctx.core_sources_text
     assert "supporting" in ctx.supporting_sources_text

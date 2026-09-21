@@ -28,11 +28,11 @@ from cti_app.domain.production import (
     ProductionInputSource,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
+    ProductionRun,
+    ProductionStage,
     Q2SourceDisposition,
     Q2SourceImpact,
     RepairImpactInvariantError,
-    SubjectProductionRun,
-    SubjectProductionStage,
 )
 from tests.test_production_extraction_profiles import (
     _archived_document,
@@ -160,11 +160,11 @@ class _Corpus:
         orchestrator._load_reference_report = load_report
         return orchestrator
 
-    def run(self) -> SubjectProductionRun:
-        run = SubjectProductionRun(
+    def run(self) -> ProductionRun:
+        run = ProductionRun(
             subject_id=self.subject,
             edition_id=uuid4(),
-            current_stage=SubjectProductionStage.EXTRACTION,
+            current_stage=ProductionStage.EXTRACTION,
         )
         self.state._runs[run.id] = run
         return run
@@ -488,8 +488,7 @@ def test_a_rule_bundle_repair_can_never_stale_extraction_or_synthesis() -> None:
 
 def _snapshot_source(url: str, role: SourceRole) -> ProductionInputSource:
     return ProductionInputSource(
-        batch_id=uuid4(),
-        candidate_id=uuid4(),
+        discovery_candidate_id=uuid4(),
         source_candidate_id=uuid4(),
         canonical_url=url,
         role=role,

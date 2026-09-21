@@ -16,6 +16,7 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   let fusionMerged = false;
   let fusionBoardGets = 0;
   let selected = false;
+  let productionBatchPosts = 0;
   const subjectId = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
   const selectedCandidateId = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1";
   const edition = {
@@ -220,6 +221,13 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   await page.route("/api/**", async (route) => {
     const request = route.request();
     const path = new URL(request.url()).pathname;
+    if (
+      path === `/api/editions/${editionId}/production/batches` &&
+      request.method() === "POST"
+    ) {
+      productionBatchPosts += 1;
+      throw new Error("Selection boundary called Production batch creation");
+    }
     if (path === `/api/editions/${editionId}`)
       return route.fulfill({ json: edition });
     if (path === `/api/subjects/${subjectId}`)
@@ -602,4 +610,5 @@ test("Iran : recherche ChatGPT, parsing local, regroupement et sélection d'un a
   await expect(
     page.getByText("Le contenu ou la source de remplacement est enregistré."),
   ).toBeVisible();
+  expect(productionBatchPosts).toBe(0);
 });

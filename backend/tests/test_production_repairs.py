@@ -36,7 +36,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionStatus,
+    ProductionRunStatus,
 )
 
 EDITION_ID = uuid4()
@@ -276,7 +276,7 @@ class _DecisionUow:
             )
 
         self.editions = SimpleNamespace(get_for_update=get_edition)
-        self.subject_production_runs = SimpleNamespace(get_for_update=get_run)
+        self.production_runs = SimpleNamespace(get_for_update=get_run)
         self.production_artifacts = SimpleNamespace(get=get_artifact)
         self.production_repair_decisions = _DecisionRepository()
         self.committed = False
@@ -394,7 +394,7 @@ class _IssueUow:
                 )
             ]
 
-        self.subject_production_runs = SimpleNamespace(list_for_edition=list_runs)
+        self.production_runs = SimpleNamespace(list_for_edition=list_runs)
         self.production_artifacts = _IssueArtifacts()
         self.production_repair_decisions = _DecisionRepository()
         self.pack = pack
@@ -508,7 +508,7 @@ class _ProjectionUow:
         artifact: ProductionArtifact,
         decisions: list[ProductionRepairDecision],
     ) -> None:
-        self.subject_production_runs = SimpleNamespace(
+        self.production_runs = SimpleNamespace(
             get=lambda _run_id: _async_value(run),
             get_for_update=lambda _run_id: _async_value(run),
         )
@@ -616,7 +616,7 @@ async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutatin
         id=RUN_ID,
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
         requires_reconciliation=False,
         pipeline_generation=2,
     )

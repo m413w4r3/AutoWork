@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useState } from "react";
 
-import { startEditionProduction } from "../../api/production";
-import { fetchSelectionBoard } from "../../api/selection";
+import {
+  getEditionProduction,
+  startProductionBatch,
+} from "../../api/production";
 import type { Edition } from "../../api/editions";
 import { navigate } from "../../routing";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
@@ -10,7 +12,10 @@ import { EditionDashboard } from "../edition-dashboard/EditionDashboard";
 import { ProductionBatchSelector } from "../edition-workflow/ProductionBatchSelector";
 import { ProductionConsole } from "../edition-workflow/ProductionConsole";
 import {
-  isEligibleSubject,
+  productionErrorMessage,
+  retryTransientProductionFailure,
+} from "../production/productionLabels";
+import {
   orderedSelection,
   pruneToEligible,
 } from "../edition-workflow/productionBatchSelection";
@@ -104,53 +109,85 @@ function ProductionTool({
   const [selectedSubjectIds, setSelectedSubjectIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const [startRequest, setStartRequest] = useState<{
+    subjectIds: string[];
+    idempotencyKey: string;
+  } | null>(null);
   const board = useQuery({
-    queryKey: ["selection-board", edition.id],
-    queryFn: () => fetchSelectionBoard(edition.id),
+    queryKey: ["production-board", edition.id],
+    queryFn: () => getEditionProduction(edition.id),
     refetchInterval: false,
   });
-  const subjects = useMemo(
-    () => board.data?.items.filter(isEligibleSubject) ?? [],
-    [board.data],
-  );
+  const subjects = useMemo(() => board.data?.subjects ?? [], [board.data]);
   const eligibleIds = useMemo(
-    () => new Set(subjects.map((subject) => subject.subject_id)),
+    () =>
+      new Set(
+        subjects
+          .filter((subject) => subject.can_start)
+          .map((subject) => subject.subject_id),
+      ),
     [subjects],
   );
 
   useEffect(() => {
-    setSelectedSubjectIds((selected) => pruneToEligible(selected, eligibleIds));
-  }, [eligibleIds]);
+    const pruned = pruneToEligible(selectedSubjectIds, eligibleIds);
+    if (pruned.size !== selectedSubjectIds.size) {
+      setStartRequest(null);
+      setSelectedSubjectIds(pruned);
+    }
+  }, [eligibleIds, selectedSubjectIds]);
 
   const start = useMutation({
-    mutationFn: () =>
-      startEditionProduction(
+    mutationFn: (request: { subjectIds: string[]; idempotencyKey: string }) =>
+      startProductionBatch(
         edition.id,
-        orderedSelection(subjects, selectedSubjectIds),
+        request.subjectIds,
+        request.idempotencyKey,
       ),
-    onSuccess: (batch) => {
+    // A replay keeps the same Idempotency-Key, so a transport retry can never
+    // create a second batch.
+    retry: retryTransientProductionFailure,
+    onSuccess: () => {
       setSelectedSubjectIds(new Set());
-      queryClient.setQueryData(["batch", edition.id], batch);
+      setStartRequest(null);
+      void queryClient.invalidateQueries({
+        queryKey: ["production-board", edition.id],
+      });
     },
   });
+
+  const updateSelection = (update: (current: Set<string>) => Set<string>) => {
+    setStartRequest(null);
+    setSelectedSubjectIds(update);
+  };
+
+  const submitBatch = () => {
+    const request = startRequest ?? {
+      subjectIds: orderedSelection(subjects, selectedSubjectIds),
+      idempotencyKey: crypto.randomUUID(),
+    };
+    setStartRequest(request);
+    start.mutate(request);
+  };
 
   return (
     <>
       {!readOnly && board.isPending ? (
-        <p role="status">Chargement des sujets sélectionnés…</p>
+        <p role="status">Chargement des sujets disponibles…</p>
       ) : null}
       {!readOnly && board.isError ? (
         <p className="error-message" role="alert">
-          La sélection est inaccessible.
+          Le tableau de production est inaccessible.
         </p>
       ) : null}
-      {!readOnly && board.data ? (
+      {board.data ? (
         <>
           <ProductionBatchSelector
             subjects={subjects}
             selected={selectedSubjectIds}
+            readOnly={readOnly}
             onToggle={(subjectId, checked) =>
-              setSelectedSubjectIds((current) => {
+              updateSelection((current) => {
                 const next = new Set(current);
                 if (checked) next.add(subjectId);
                 else next.delete(subjectId);
@@ -158,27 +195,35 @@ function ProductionTool({
               })
             }
             onSelectAll={() =>
-              setSelectedSubjectIds(
-                new Set(subjects.map((subject) => subject.subject_id)),
+              updateSelection(
+                () =>
+                  new Set(
+                    subjects
+                      .filter((subject) => subject.can_start)
+                      .map((subject) => subject.subject_id),
+                  ),
               )
             }
-            onSelectNone={() => setSelectedSubjectIds(new Set())}
+            onSelectNone={() => updateSelection(() => new Set())}
           />
-          {start.error ? (
+          {!readOnly && start.error ? (
             <p className="error-message" role="alert">
-              {start.error instanceof Error
-                ? start.error.message
-                : "Le lot de production n’a pas pu être démarré."}
+              {productionErrorMessage(
+                start.error,
+                "Le lot de production n’a pas pu être démarré.",
+              )}
             </p>
           ) : null}
-          <button
-            type="button"
-            className="button"
-            disabled={selectedSubjectIds.size === 0 || start.isPending}
-            onClick={() => start.mutate()}
-          >
-            {start.isPending ? "Démarrage…" : "Démarrer le lot de production"}
-          </button>
+          {!readOnly ? (
+            <button
+              type="button"
+              className="button"
+              disabled={selectedSubjectIds.size === 0 || start.isPending}
+              onClick={submitBatch}
+            >
+              {start.isPending ? "Démarrage…" : "Démarrer le lot de production"}
+            </button>
+          ) : null}
         </>
       ) : null}
       <ProductionConsole editionId={edition.id} readOnly={readOnly} />

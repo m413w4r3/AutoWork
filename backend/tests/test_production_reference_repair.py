@@ -24,7 +24,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 RAW_Q1 = """# REFERENCES
@@ -122,22 +122,22 @@ class _Artifacts:
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
+    def __init__(self, run: ProductionRun) -> None:
         self.run = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.run if run_id == self.run.id else None
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return replace(self.run) if run_id == self.run.id else None
 
-    async def list_for_edition(self, edition_id: UUID) -> list[SubjectProductionRun]:
+    async def list_for_edition(self, edition_id: UUID) -> list[ProductionRun]:
         return [self.run] if edition_id == self.run.edition_id else []
 
 
 class _Uow:
-    def __init__(self, run: SubjectProductionRun, collections: list[object]) -> None:
-        self.subject_production_runs = _Runs(run)
+    def __init__(self, run: ProductionRun, collections: list[object]) -> None:
+        self.production_runs = _Runs(run)
         self.production_artifacts = _Artifacts()
         self.collections = collections
         self.source_collections = SimpleNamespace(list_for_subject=self._list_collections)
@@ -203,7 +203,7 @@ def _collection(
 @pytest.mark.asyncio
 async def test_rebuilds_q1_from_raw_without_model_and_is_idempotent() -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
     run.mark_ready()
     first = _collection(

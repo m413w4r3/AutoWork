@@ -102,7 +102,8 @@ SOURCES
   → REFERENCES
   → EXTRACTION
   → SYNTHESIS
-  → ASSEMBLY / QA
+  → ASSEMBLY
+  → READY
 ```
 
 Cette séquence est déclarée explicitement dans le domaine. AutoWork ne construit pas de graphe de
@@ -113,6 +114,22 @@ et restera une capacité distincte, raccordée après stabilisation de cette pip
 
 Les différences de traitement sont donc déterminées par les données et les capacités disponibles,
 pas par un type éditorial `brief` ou `major`.
+
+La surface canonique est un `ProductionBoard` par édition : `GET
+/api/editions/{edition_id}/production` retourne `200` même lorsque le board est vide. La création
+est un batch explicite et idempotent :
+
+```text
+POST /api/editions/{edition_id}/production/batches
+Idempotency-Key: <clé de commande>
+{"subject_ids": ["<subject-a>", "<subject-b>"]}
+```
+
+`ProductionBatchService.create` ne lit pas Selection. Il valide l’ordre et les sujets canoniques,
+crée un `ProductionRun` par sujet et fige un `ProductionInputSnapshot` immutable contenant
+exactement l’état Discovery/Fusion/Subject observé au démarrage. Un replay exact retourne le même
+batch ; une nouvelle clé incompatible avec un batch actif est refusée. Un nouveau run peut capturer
+un nouvel état sans réécrire les snapshots ou artifacts historiques.
 
 ### 6. Les services spécialisés restent séparés de l'orchestrateur de production
 
@@ -142,7 +159,7 @@ Subject
   │
   ├── SourceDocument ── Blob
   ├── Sample ────────── Blob
-  ├── SubjectProductionRun
+  ├── ProductionRun
   │     └── ProductionArtifact
   │            └── PublicationDocument
   │
@@ -185,7 +202,7 @@ prévisible vis-à-vis des modèles, des conversations, des quotas externes et d
 concurrence entre éditions indépendantes pourra être introduite plus tard sans changer le modèle
 de sujet ou de publication.
 
-## Compatibilité temporaire
+## Compatibilité temporaire et historique legacy
 
 La migration est désormais au cutover de la pipeline article. Les lecteurs historiques restent
 progressifs afin de ne pas réécrire les documents et releases déjà produits.

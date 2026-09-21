@@ -12,12 +12,11 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from cti_app.domain.classification import TLP
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.editions import EditionRow
-from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
 from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionArtifactRow,
-    SubjectProductionRunRow,
+    ProductionRunRow,
 )
 from cti_app.infrastructure.database.models.publication_review import (
     PublicationReviewDecisionRow,
@@ -80,27 +79,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                 )
             )
             session.add(
-                EditorialGroupRow(
-                    id=uuid4(),
-                    edition_id=edition_id,
-                    title="Editorial review title",
-                    outcome="new_subject",
-                    status="selected",
-                    source_relationship_status="provisional",
-                    needs_source_verification=False,
-                    needs_source_expansion=False,
-                    grouping_confidence="high",
-                    grouping_justification="integration test",
-                    subject_id=subject_id,
-                    discovery_subject_id=None,
-                    payload={},
-                    version=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            session.add(
-                SubjectProductionRunRow(
+                ProductionRunRow(
                     id=run_id,
                     subject_id=subject_id,
                     edition_id=edition_id,
@@ -161,27 +140,7 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                 )
             )
             session.add(
-                EditorialGroupRow(
-                    id=uuid4(),
-                    edition_id=edition_id,
-                    title="Editorial without document title",
-                    outcome="new_subject",
-                    status="selected",
-                    source_relationship_status="provisional",
-                    needs_source_verification=False,
-                    needs_source_expansion=False,
-                    grouping_confidence="high",
-                    grouping_justification="integration test",
-                    subject_id=no_document_subject_id,
-                    discovery_subject_id=None,
-                    payload={},
-                    version=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-            )
-            session.add(
-                SubjectProductionRunRow(
+                ProductionRunRow(
                     id=no_document_run_id,
                     subject_id=no_document_subject_id,
                     edition_id=edition_id,
@@ -238,6 +197,10 @@ async def test_publication_review_is_fk_backed_and_append_only(migrated_postgres
                     edition_id=edition_id,
                     status="running",
                     phase="review",
+                    idempotency_key=f"fixture-{batch_id.hex}",
+                    request_fingerprint="0" * 64,
+                    actor_id="fixture",
+                    correlation_id="fixture",
                     version=1,
                     created_at=now,
                 )

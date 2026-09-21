@@ -9,16 +9,21 @@ import pytest
 from sqlalchemy import event
 
 from cti_app.domain.classification import TLP
-from cti_app.domain.production import SubjectProductionStage, SubjectProductionStatus
+from cti_app.domain.production import ProductionRunStatus, ProductionStage
 from cti_app.infrastructure.database.models.core import SubjectRow
+from cti_app.infrastructure.database.models.discovery import (
+    DiscoveryMergeRunRow,
+    DiscoverySnapshotRow,
+    DiscoverySubjectIdentityRow,
+)
 from cti_app.infrastructure.database.models.editions import EditionRow
-from cti_app.infrastructure.database.models.editorial import EditorialGroupRow
 from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchItemRow,
     EditionProductionBatchRow,
     ProductionInputSnapshotRow,
-    SubjectProductionRunRow,
+    ProductionRunRow,
 )
+from cti_app.infrastructure.database.models.selection import SelectionDecisionRow
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyBatchStatusReadRepository,
 )
@@ -36,7 +41,6 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
     now = datetime.now(UTC)
     edition_id = uuid4()
     subject_ids = [uuid4() for _ in range(3)]
-    group_ids = [uuid4() for _ in range(3)]
     run_ids = [uuid4() for _ in range(3)]
     batch_id = uuid4()
 
@@ -66,29 +70,8 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
         )
         for index, subject_id in enumerate(subject_ids, 1)
     ]
-    groups = [
-        EditorialGroupRow(
-            id=group_id,
-            edition_id=edition_id,
-            title=f"Editorial title {index}",
-            outcome="new_subject",
-            status="selected",
-            source_relationship_status="provisional",
-            needs_source_verification=False,
-            needs_source_expansion=False,
-            grouping_confidence="high",
-            grouping_justification="integration test",
-            subject_id=subject_id,
-            discovery_subject_id=None,
-            payload={},
-            version=1,
-            created_at=now,
-            updated_at=now,
-        )
-        for index, (group_id, subject_id) in enumerate(zip(group_ids, subject_ids, strict=True), 1)
-    ]
     runs = [
-        SubjectProductionRunRow(
+        ProductionRunRow(
             id=run_id,
             subject_id=subject_id,
             edition_id=edition_id,
@@ -98,7 +81,7 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             synthesis_conversation_id=None,
             run_number=1,
             pipeline_generation=pipeline_generation,
-            research_date=None,
+            research_date=now.date(),
             error_code=error_code,
             error_message=error_message,
             error_details=None,
@@ -112,8 +95,8 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             (
                 run_ids[0],
                 subject_ids[0],
-                SubjectProductionStatus.READY.value,
-                SubjectProductionStage.SOURCES.value,
+                ProductionRunStatus.READY.value,
+                ProductionStage.SOURCES.value,
                 4,
                 None,
                 None,
@@ -121,8 +104,8 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             (
                 run_ids[1],
                 subject_ids[1],
-                SubjectProductionStatus.NEEDS_REVIEW.value,
-                SubjectProductionStage.REFERENCES.value,
+                ProductionRunStatus.NEEDS_REVIEW.value,
+                ProductionStage.REFERENCES.value,
                 2,
                 "needs_more_context",
                 "Review the source context",
@@ -130,8 +113,8 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             (
                 run_ids[2],
                 subject_ids[2],
-                SubjectProductionStatus.FAILED.value,
-                SubjectProductionStage.ASSEMBLY.value,
+                ProductionRunStatus.FAILED.value,
+                ProductionStage.ASSEMBLY.value,
                 3,
                 "stage_failed",
                 "Assembly failed",
@@ -143,6 +126,10 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
         edition_id=edition_id,
         status="running",
         phase="initial",
+        idempotency_key=f"fixture-{batch_id.hex}",
+        request_fingerprint="0" * 64,
+        actor_id="fixture",
+        correlation_id="fixture",
         next_dispatch_at=None,
         created_at=now,
         started_at=now,
@@ -165,16 +152,95 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             (subject_ids[2], run_ids[2], 3, 0),
         )
     ]
+    # The snapshot is the canonical production input: its discovery lineage
+    # must really exist, so the read model is exercised against enforced FKs.
+    merge_run_id = uuid4()
+    merge_run = DiscoveryMergeRunRow(
+        id=merge_run_id,
+        edition_id=edition_id,
+        parent_snapshot_id=None,
+        intake_id=None,
+        planner_kind="deterministic_bootstrap",
+        merge_model_run_id=None,
+        prompt_version="1",
+        policy_version="1",
+        blocking_version="1",
+        merge_input_hash="c" * 64,
+        handle_map={},
+        included_subject_ids=[],
+        excluded_subject_count=0,
+        raw_output_reference=None,
+        normalized_output_reference=None,
+        validation_status="valid",
+        warnings=[],
+        review_reasons=[],
+        plan_payload=None,
+        supersedes_merge_run_id=None,
+        rebase_count=0,
+        created_at=now,
+    )
+    discovery_snapshot_id = uuid4()
+    discovery_snapshot = DiscoverySnapshotRow(
+        id=discovery_snapshot_id,
+        edition_id=edition_id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=None,
+        merge_run_id=merge_run_id,
+        planner_kind="deterministic_bootstrap",
+        subjects=[],
+        snapshot_hash="d" * 64,
+        is_active=True,
+        created_at=now,
+    )
+    identity_ids = [uuid4() for _ in subject_ids]
+    identities = [
+        DiscoverySubjectIdentityRow(
+            id=identity_id,
+            edition_id=edition_id,
+            origin_key=f"subject:{subject_id}",
+            created_by_merge_run_id=merge_run_id,
+            status="active",
+            merged_into_id=None,
+            created_at=now,
+        )
+        for identity_id, subject_id in zip(identity_ids, subject_ids, strict=True)
+    ]
+    decision_ids = [uuid4() for _ in subject_ids]
+    decisions = [
+        SelectionDecisionRow(
+            id=decision_id,
+            edition_id=edition_id,
+            discovery_subject_id=identity_id,
+            snapshot_id=discovery_snapshot_id,
+            snapshot_version=1,
+            subject_id=subject_id,
+            action="select",
+            actor_id="read-model-test",
+            correlation_id="read-model-test",
+            idempotency_key=f"read-model-{index}",
+            occurred_at=now,
+        )
+        for index, (decision_id, identity_id, subject_id) in enumerate(
+            zip(decision_ids, identity_ids, subject_ids, strict=True)
+        )
+    ]
     snapshots = [
         ProductionInputSnapshotRow(
             id=uuid4(),
             production_run_id=run_id,
             subject_id=subject_id,
             edition_id=edition_id,
-            editorial_group_id=group_id,
-            editorial_group_version=1,
+            subject_version=1,
             subject_title=title,
-            subject_description="Description",
+            subject_tlp=TLP.AMBER.value,
+            selection_decision_id=decision_id,
+            origin_discovery_subject_id=identity_id,
+            canonical_discovery_subject_id=identity_id,
+            discovery_snapshot_id=discovery_snapshot_id,
+            discovery_snapshot_version=1,
+            member_candidate_ids=[],
+            discovery_summary="Description",
             actor_or_campaign="Actor",
             period_start=date(2026, 8, 1),
             period_end=date(2026, 8, 31),
@@ -184,9 +250,21 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             reuse_basis_hash="b" * 64,
             captured_at=now,
         )
-        for run_id, subject_id, group_id, title in (
-            (run_ids[0], subject_ids[0], group_ids[0], "Snapshot title one"),
-            (run_ids[1], subject_ids[1], group_ids[1], "Snapshot title two"),
+        for run_id, subject_id, identity_id, decision_id, title in (
+            (
+                run_ids[0],
+                subject_ids[0],
+                identity_ids[0],
+                decision_ids[0],
+                "Snapshot title one",
+            ),
+            (
+                run_ids[1],
+                subject_ids[1],
+                identity_ids[1],
+                decision_ids[1],
+                "Snapshot title two",
+            ),
         )
     ]
 
@@ -196,7 +274,12 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             await real_async_session.flush()
             real_async_session.add_all(subjects)
             await real_async_session.flush()
-            real_async_session.add_all(groups)
+            real_async_session.add(merge_run)
+            await real_async_session.flush()
+            real_async_session.add(discovery_snapshot)
+            real_async_session.add_all(identities)
+            await real_async_session.flush()
+            real_async_session.add_all(decisions)
             await real_async_session.flush()
             real_async_session.add_all(runs)
             await real_async_session.flush()
@@ -246,14 +329,14 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
     assert [item.pipeline_generation for item in result] == [2, 4, 3]
     assert [item.auto_recovery_count for item in result] == [1, 0, 0]
     assert [item.status for item in result] == [
-        SubjectProductionStatus.NEEDS_REVIEW,
-        SubjectProductionStatus.READY,
-        SubjectProductionStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
+        ProductionRunStatus.READY,
+        ProductionRunStatus.FAILED,
     ]
     assert [item.current_stage for item in result] == [
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.SOURCES,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.REFERENCES,
+        ProductionStage.SOURCES,
+        ProductionStage.ASSEMBLY,
     ]
     assert [item.error_code for item in result] == [
         "needs_more_context",

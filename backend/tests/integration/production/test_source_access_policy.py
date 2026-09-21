@@ -16,8 +16,8 @@ from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.integrations.models import BridgeTransportError
 
@@ -138,7 +138,7 @@ def _configure(
 async def _reload(scenario: ProductionScenario) -> ReloadedProduction:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(scenario.run_id)
+        run = await uow.production_runs.get(scenario.run_id)
         assert run is not None
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
         artifacts = tuple(await uow.production_artifacts.list_for_run(run.id))
@@ -174,8 +174,8 @@ async def _assert_common(
     scenario: ProductionScenario,
     state: ReloadedProduction,
     *,
-    status: SubjectProductionStatus,
-    current_stage: SubjectProductionStage,
+    status: ProductionRunStatus,
+    current_stage: ProductionStage,
     report_source_ids: Sequence[str],
     collection_urls: Sequence[str],
     model_call_count: int,
@@ -295,14 +295,14 @@ async def test_live_success_is_live_first_and_never_inlines_archive(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=3,
         expected_stages=("references", "extraction", "synthesis"),
     )
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     _assert_extraction_stages(
         state,
         {stage.value for stage in ProductionArtifactStage},
@@ -344,8 +344,8 @@ async def test_live_unavailable_uses_one_verified_archive_fallback(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=4,
@@ -406,8 +406,8 @@ async def test_live_unavailable_with_empty_archive_is_non_blocking_skip(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=3,
@@ -462,8 +462,8 @@ async def test_live_unavailable_with_sha_mismatch_skips_without_using_untrusted_
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=3,
@@ -525,8 +525,8 @@ async def test_partial_ioc_rules_batch_falls_back_only_for_unavailable_source(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1", "S2", "S3"),
         collection_urls=(BOOTSTRAP, S1, S2, S3),
         model_call_count=4,
@@ -586,8 +586,8 @@ async def test_partial_ioc_rules_batch_without_archive_skips_only_that_source(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1", "S2", "S3"),
         collection_urls=(BOOTSTRAP, S1, S2, S3),
         model_call_count=3,
@@ -637,8 +637,8 @@ async def test_retryable_bridge_error_stays_infrastructure_and_never_falls_back(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.EXTRACTION,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.EXTRACTION,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=7,
@@ -715,8 +715,8 @@ async def test_reconciliation_required_is_not_replayed_or_fallbacked(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.EXTRACTION,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.EXTRACTION,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=2,
@@ -763,8 +763,8 @@ async def test_invalid_live_q2_output_is_parser_failure_not_source_unavailable(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.EXTRACTION,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.EXTRACTION,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=2,
@@ -823,8 +823,8 @@ async def test_archive_fallback_still_passes_the_source_evidence_gate(
     await _assert_common(
         scenario,
         state,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         report_source_ids=("S1",),
         collection_urls=(S1,),
         model_call_count=4,

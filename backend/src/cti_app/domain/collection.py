@@ -103,7 +103,6 @@ class SourceSpan:
 class SourceCollection:
     subject_id: UUID
     edition_id: UUID
-    group_id: UUID
     requested_url: str
     proposed_role: SourceRole
     # Derived from requested_url when not supplied; this is the key that
@@ -487,7 +486,6 @@ class DerivedArtifact:
 class Claim:
     subject_id: UUID
     edition_id: UUID
-    group_id: UUID
     source_document_id: UUID
     derived_artifact_id: UUID
     kind: ClaimKind
@@ -532,7 +530,6 @@ class RejectedModelProposal:
 class Indicator:
     subject_id: UUID
     edition_id: UUID
-    group_id: UUID
     source_document_id: UUID
     derived_artifact_id: UUID
     kind: IndicatorKind

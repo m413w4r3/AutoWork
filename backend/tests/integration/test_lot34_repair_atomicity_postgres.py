@@ -54,8 +54,8 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionRun,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
@@ -116,7 +116,7 @@ class _PausingAssembly:
 class _Fixture:
     edition: Edition
     subject: Subject
-    run: SubjectProductionRun
+    run: ProductionRun
     batch: EditionProductionBatch
     store: ProductionArtifactStore
     references: ProductionArtifact
@@ -175,10 +175,10 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         slug=f"lot34-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
     )
     batch = EditionProductionBatch(
         edition_id=edition.id,
@@ -259,7 +259,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
         await uow.edition_production_batches.add(batch)
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         await uow.production_artifacts.append(references)
         await uow.production_artifacts.append(extraction)
         await uow.production_artifacts.append(synthesis)
@@ -540,10 +540,10 @@ async def test_a_concurrent_retry_makes_the_plan_stale_without_writing(
     observed_generation = fixture.run.pipeline_generation
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_for_update(fixture.run.id)
+        run = await uow.production_runs.get_for_update(fixture.run.id)
         assert run is not None
         run.pipeline_generation += 1
-        await uow.subject_production_runs.save(run)
+        await uow.production_runs.save(run)
         await uow.commit()
 
     with pytest.raises(ProductionRepairStaleError):
