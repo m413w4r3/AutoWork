@@ -48,10 +48,20 @@ from cti_app.domain.discovery import (
     SourceCandidate,
     SourceRole,
 )
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryMergeRun,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
+    DiscoverySubjectIdentity,
+    MergeValidationStatus,
+)
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import Job
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
@@ -240,6 +250,73 @@ async def _seed_subject(
         await uow.subjects.add(subject)
         await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
+        topic = batch.candidates[0]
+        merge_run = DiscoveryMergeRun(
+            edition_id=edition.id,
+            parent_snapshot_id=None,
+            intake_id=None,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            prompt_version="1",
+            policy_version="1",
+            blocking_version="1",
+            merge_input_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+            handle_map={},
+            included_subject_ids=(subject.id,),
+            excluded_subject_count=0,
+            validation_status=MergeValidationStatus.VALID,
+        )
+        assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+        await uow.discovery_subject_identities.add_many_if_absent(
+            [
+                DiscoverySubjectIdentity(
+                    edition_id=edition.id,
+                    origin_key=f"subject:{subject.id}",
+                    created_by_merge_run_id=merge_run.id,
+                    id=subject.id,
+                )
+            ]
+        )
+        snapshot = DiscoverySnapshot(
+            edition_id=edition.id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=None,
+            merge_run_id=merge_run.id,
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            subjects=(
+                DiscoverySubject(
+                    subject_id=subject.id,
+                    candidate=topic,
+                    member_references=(DiscoveryMemberReference(topic.id),),
+                    created_at=batch.created_at,
+                ),
+            ),
+            snapshot_hash=hashlib.sha256(batch.id.bytes).hexdigest(),
+            is_active=True,
+        )
+        await uow.discovery_snapshots.append(snapshot)
+        decision = SelectionDecision(
+            edition_id=edition.id,
+            discovery_subject_id=subject.id,
+            snapshot_id=snapshot.id,
+            snapshot_version=snapshot.version,
+            action=SelectionAction.SELECT,
+            subject_id=subject.id,
+            actor_id="manual-source-archival",
+            correlation_id="manual-source-archival",
+            idempotency_key=f"manual-source-archival-{subject.id}",
+        )
+        await uow.selection_decisions.append(decision)
+        await uow.subject_discovery_origins.add(
+            SubjectDiscoveryOrigin(
+                subject_id=subject.id,
+                edition_id=edition.id,
+                discovery_subject_id=subject.id,
+                selection_decision_id=decision.id,
+                selected_snapshot_id=snapshot.id,
+                selected_snapshot_version=snapshot.version,
+            )
+        )
         for collection in collections:
             assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
