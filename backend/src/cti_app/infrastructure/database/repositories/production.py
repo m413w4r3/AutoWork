@@ -329,7 +329,7 @@ class SqlAlchemyProductionRunRepository:
         query = (
             select(ProductionRunRow)
             .where(ProductionRunRow.subject_id == subject_id)
-            .order_by(ProductionRunRow.created_at.desc(), ProductionRunRow.id.desc())
+            .order_by(ProductionRunRow.run_number.desc())
             .limit(1)
         )
         result = await self._session.execute(query)
@@ -353,7 +353,7 @@ class SqlAlchemyProductionRunRepository:
                     ]
                 )
             )
-            .order_by(ProductionRunRow.created_at.desc(), ProductionRunRow.id.desc())
+            .order_by(ProductionRunRow.run_number.desc())
             .limit(1)
         )
         result = await self._session.execute(query)

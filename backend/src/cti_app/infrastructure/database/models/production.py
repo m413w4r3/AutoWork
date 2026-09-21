@@ -7,6 +7,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     String,
     Text,
@@ -58,6 +59,14 @@ class ProductionRunRow(Base):
     __tablename__ = "production_runs"
     __table_args__ = (
         UniqueConstraint("subject_id", "run_number", name="uq_subject_run_number"),
+        UniqueConstraint("id", "subject_id", "edition_id", name="uq_production_runs_identity"),
+        # A run can only belong to the edition of its Subject.
+        ForeignKeyConstraint(
+            ["subject_id", "edition_id"],
+            ["subjects.id", "subjects.edition_id"],
+            name="fk_production_runs_subject_edition",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("version >= 1", name="ck_run_version"),
         CheckConstraint("run_number >= 1", name="ck_run_number"),
         CheckConstraint("pipeline_generation >= 0", name="ck_run_pipeline_generation"),
@@ -501,6 +510,13 @@ class ProductionInputSnapshotRow(Base):
     __tablename__ = "production_input_snapshots"
     __table_args__ = (
         UniqueConstraint("production_run_id", name="uq_production_input_snapshots_run"),
+        # The snapshot describes exactly its run's Subject and edition.
+        ForeignKeyConstraint(
+            ["production_run_id", "subject_id", "edition_id"],
+            ["production_runs.id", "production_runs.subject_id", "production_runs.edition_id"],
+            name="fk_production_input_snapshots_run_identity",
+            ondelete="RESTRICT",
+        ),
         CheckConstraint("subject_version >= 1", name="ck_production_input_subject_version"),
         CheckConstraint(
             "discovery_snapshot_version >= 1",

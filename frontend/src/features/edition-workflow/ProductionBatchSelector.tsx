@@ -1,4 +1,5 @@
 import type { EligibleSubject } from "./productionBatchSelection";
+import { blockingReasonLabel } from "../production/productionLabels";
 import { Link } from "../../routing";
 
 /**
@@ -90,7 +91,7 @@ export function ProductionBatchSelector({
               )}
               {!subject.can_start && subject.blocking_reason ? (
                 <span className="production-batch-selector__blocking-reason">
-                  {subject.blocking_reason}
+                  {blockingReasonLabel(subject.blocking_reason)}
                 </span>
               ) : null}
               <Link to={`/subjects/${subject.subject_id}`}>

@@ -8,6 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.collection_errors import CollectionNotAllowedError
 from cti_app.application.persistence import (
     ActiveSubjectProductionRunConflictError,
     ProductionUnitOfWork,
@@ -38,16 +39,8 @@ from cti_app.domain.production import (
     ProductionStage,
     production_batch_request_fingerprint,
     production_stages,
+    source_role_rank,
 )
-
-_SOURCE_ROLE_ORDER = {
-    "primary": 0,
-    "independent": 1,
-    "relay": 2,
-    "aggregator": 3,
-    "social": 4,
-    "unknown": 9,
-}
 
 
 class ProductionRunNotFoundError(LookupError):
@@ -197,7 +190,7 @@ async def capture_production_input_snapshot(
                 discovery_batch_id=candidate.discovery_batch_id,
             )
             rank = (
-                _SOURCE_ROLE_ORDER.get(source.role.value, 9),
+                source_role_rank(source.role),
                 source.title.casefold(),
                 source.publisher.casefold(),
                 source.published_at or date.max,
@@ -251,14 +244,12 @@ async def capture_snapshot_for_new_run(
         captured_at=run.created_at,
     )
 
-    get_latest = getattr(uow.production_runs, "get_latest_terminal_for_edition_subject", None)
-    snapshots = uow.production_input_snapshots
-    if get_latest is None:
-        return current
-    previous_run = await get_latest(run.edition_id, run.subject_id)
+    previous_run = await uow.production_runs.get_latest_terminal_for_edition_subject(
+        run.edition_id, run.subject_id
+    )
     if previous_run is None:
         return current
-    previous = await snapshots.get_by_run(previous_run.id)
+    previous = await uow.production_input_snapshots.get_by_run(previous_run.id)
     if previous is None or previous.reuse_basis_hash != current.reuse_basis_hash:
         return current
 
@@ -271,6 +262,62 @@ async def capture_snapshot_for_new_run(
         research_date=run.research_date,
         captured_at=run.created_at,
     )
+
+
+_ACTIVE_RUN_STATUSES = frozenset({ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING})
+
+
+async def _lock_subject_run_creation(
+    uow: ProductionUnitOfWork, subject_id: UUID
+) -> ProductionRun | None:
+    """Serialize run creation for a subject and return its active run, if any."""
+    await uow.production_runs.lock_creation_for_subject(subject_id)
+    current = await uow.production_runs.get_current_for_subject(subject_id)
+    return current if current is not None and current.status in _ACTIVE_RUN_STATUSES else None
+
+
+async def _prepare_production_run(
+    uow: ProductionUnitOfWork,
+    *,
+    edition_id: UUID,
+    subject_id: UUID,
+    created_at: datetime,
+) -> tuple[ProductionRun, ProductionInputSnapshot]:
+    """Validate eligibility and freeze the input of a new run, without writing.
+
+    A Subject is eligible when it exists in the edition and carries its
+    SubjectDiscoveryOrigin.  The caller holds the Edition lock and the
+    subject creation lock, and persists run and snapshot together.
+    """
+    subject = await uow.subjects.get(subject_id)
+    if subject is None:
+        raise ProductionBatchConflictError(
+            "production_subject_not_found", subject_ids=(subject_id,)
+        )
+    if subject.edition_id != edition_id:
+        raise ProductionBatchConflictError(
+            "production_subject_edition_mismatch", subject_ids=(subject_id,)
+        )
+    origin = await uow.subject_discovery_origins.get_by_subject(subject_id)
+    if origin is None or origin.subject_id != subject_id or origin.edition_id != edition_id:
+        raise ProductionBatchConflictError(
+            "production_subject_discovery_origin_missing", subject_ids=(subject_id,)
+        )
+    run = ProductionRun(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        run_number=await uow.production_runs.allocate_next_run_number(subject_id),
+        research_date=created_at.date(),
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    try:
+        snapshot = await capture_snapshot_for_new_run(uow, run=run)
+    except CollectionNotAllowedError as exc:
+        raise ProductionBatchConflictError(
+            "production_subject_lineage_unavailable", subject_ids=(subject_id,)
+        ) from exc
+    return run, snapshot
 
 
 class SubjectProductionService:
@@ -287,41 +334,26 @@ class SubjectProductionService:
         subject_id: UUID,
         edition_id: UUID,
     ) -> tuple[ProductionRun, bool]:
-        """Create a production run for a subject.
+        """Create one run outside a batch, for the repair restart path only.
 
-        Returns the run and whether it was created by this call, so the caller
-        knows whether to start it and submit a job — two concurrent POSTs must
-        yield one logical run and one logical job.
+        Operator-initiated production always goes through
+        ``ProductionBatchService.create``; both share the same eligibility
+        checks and snapshot capture.  Returns the run and whether this call
+        created it: an already active run is returned unchanged so two
+        concurrent restarts yield one logical run and one logical job.
         """
         try:
             async with self._uow_factory() as uow:
                 await _lock_open_edition(uow, edition_id)
-
-                lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
-                if lock_creation is not None:
-                    await lock_creation(subject_id)
-
-                existing = await uow.production_runs.get_current_for_subject(subject_id)
-                if existing and existing.status in (
-                    ProductionRunStatus.QUEUED,
-                    ProductionRunStatus.RUNNING,
-                ):
+                existing = await _lock_subject_run_creation(uow, subject_id)
+                if existing is not None:
                     return existing, False
-
-                allocator = getattr(uow.production_runs, "allocate_next_run_number", None)
-                if allocator is not None:
-                    next_run_number = await allocator(subject_id)
-                else:
-                    # Lightweight test repositories predating the SQL helper.
-                    all_runs = await uow.production_runs.list_for_edition(edition_id)
-                    next_run_number = 1 + sum(1 for r in all_runs if r.subject_id == subject_id)
-
-                run = ProductionRun(
-                    subject_id=subject_id,
+                run, snapshot = await _prepare_production_run(
+                    uow,
                     edition_id=edition_id,
-                    run_number=next_run_number,
+                    subject_id=subject_id,
+                    created_at=datetime.now(UTC),
                 )
-                snapshot = await capture_snapshot_for_new_run(uow, run=run)
                 await uow.production_runs.add(run)
                 await uow.production_input_snapshots.add(snapshot)
                 await uow.commit()
@@ -331,10 +363,7 @@ class SubjectProductionService:
             # committed winner so an extremely narrow race remains idempotent.
             async with self._uow_factory() as uow:
                 winner = await uow.production_runs.get_current_for_subject(subject_id)
-                if winner and winner.status in (
-                    ProductionRunStatus.QUEUED,
-                    ProductionRunStatus.RUNNING,
-                ):
+                if winner is not None and winner.status in _ACTIVE_RUN_STATUSES:
                     return winner, False
             raise
 
@@ -754,34 +783,44 @@ class ProductionBatchService:
             raise ProductionBatchConflictError("production_subject_ids_duplicate")
         fingerprint = production_batch_request_fingerprint(edition_id, subject_ids)
         async with self._uow_factory() as uow:
-            editions = getattr(uow, "editions", None)
-            edition = None
-            if editions is not None:
-                get_for_update = getattr(editions, "get_for_update", None)
-                edition = await (
-                    get_for_update(edition_id)
-                    if get_for_update is not None
-                    else editions.get(edition_id)
-                )
-                if edition is None:
-                    raise ValueError("edition_not_found")
-                if edition.state is EditionStatus.ARCHIVED:
-                    raise ProductionBatchConflictError("production_edition_archived")
+            edition = await uow.editions.get_for_update(edition_id)
+            if edition is None:
+                raise ProductionBatchConflictError("edition_not_found")
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ProductionBatchConflictError("production_edition_archived")
 
-            get_by_key = getattr(uow.edition_production_batches, "get_by_idempotency_key", None)
-            existing = (
-                await get_by_key(edition_id, idempotency_key) if get_by_key is not None else None
+            existing = await uow.edition_production_batches.get_by_idempotency_key(
+                edition_id, idempotency_key
             )
-            if existing:
+            if existing is not None:
                 if existing.request_fingerprint != fingerprint:
                     raise ProductionBatchConflictError("production_idempotency_conflict")
                 return ProductionBatchCreateResult(existing, False)
 
-            existing = await uow.edition_production_batches.get_active_for_edition(edition_id)
-            if existing:
+            if await uow.edition_production_batches.get_active_for_edition(edition_id):
                 raise ProductionBatchConflictError("production_batch_active")
 
+            # Every validation and snapshot capture happens before the first
+            # business write: one invalid Subject leaves no batch and no run.
             created_at = datetime.now(UTC)
+            prepared: list[tuple[ProductionRun, ProductionInputSnapshot]] = []
+            active_subjects: list[UUID] = []
+            for subject_id in subject_ids:
+                if await _lock_subject_run_creation(uow, subject_id) is not None:
+                    active_subjects.append(subject_id)
+                    continue
+                prepared.append(
+                    await _prepare_production_run(
+                        uow,
+                        edition_id=edition_id,
+                        subject_id=subject_id,
+                        created_at=created_at,
+                    )
+                )
+            if active_subjects:
+                raise ProductionBatchConflictError(
+                    "production_subject_active", subject_ids=active_subjects
+                )
 
             batch = EditionProductionBatch(
                 edition_id=edition_id,
@@ -793,68 +832,15 @@ class ProductionBatchService:
                 phase=ProductionBatchPhase.INITIAL,
                 created_at=created_at,
             )
-
-            prepared: list[tuple[ProductionRun, ProductionInputSnapshot]] = []
-            active_subjects: list[UUID] = []
-            for subject_id in subject_ids:
-                lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
-                if lock_creation is not None:
-                    await lock_creation(subject_id)
-                subject = await uow.subjects.get(subject_id)
-                if subject is None:
-                    raise ProductionBatchConflictError("production_subject_not_found")
-                if subject.edition_id != edition_id:
-                    raise ProductionBatchConflictError("production_subject_edition_mismatch")
-                origins = getattr(uow, "subject_discovery_origins", None)
-                origin = await origins.get_by_subject(subject_id) if origins is not None else None
-                if (
-                    origin is None
-                    or origin.subject_id != subject_id
-                    or origin.edition_id != edition_id
-                ):
-                    raise ProductionBatchConflictError(
-                        "production_subject_discovery_origin_missing"
-                    )
-                get_current = getattr(uow.production_runs, "get_current_for_subject", None)
-                current_run = await get_current(subject_id) if get_current is not None else None
-                if current_run and current_run.status in (
-                    ProductionRunStatus.QUEUED,
-                    ProductionRunStatus.RUNNING,
-                ):
-                    active_subjects.append(subject_id)
-                    continue
-                allocator = getattr(uow.production_runs, "allocate_next_run_number", None)
-                if allocator is not None:
-                    run_number = await allocator(subject_id)
-                else:
-                    all_runs = await uow.production_runs.list_for_edition(edition_id)
-                    run_number = 1 + sum(1 for item in all_runs if item.subject_id == subject_id)
-                run = ProductionRun(
-                    subject_id=subject_id,
-                    edition_id=edition_id,
-                    run_number=run_number,
-                    research_date=created_at.date(),
-                    created_at=created_at,
-                    updated_at=created_at,
-                )
-                snapshot = await capture_snapshot_for_new_run(uow, run=run)
-                prepared.append((run, snapshot))
-
-            if active_subjects:
-                raise ProductionBatchConflictError(
-                    "production_subject_active", subject_ids=active_subjects
-                )
-
+            # The payload order is the dispatch order; it is never re-sorted.
             items = [
                 EditionProductionBatchItem(
                     batch_id=batch.id,
-                    subject_id=subject_id,
+                    subject_id=run.subject_id,
                     production_run_id=run.id,
                     position=position,
                 )
-                for position, (subject_id, (run, _snapshot)) in enumerate(
-                    zip(subject_ids, prepared, strict=True), start=1
-                )
+                for position, (run, _snapshot) in enumerate(prepared, start=1)
             ]
             await uow.edition_production_batches.add(batch)
             for run, snapshot in prepared:
@@ -950,40 +936,6 @@ class ProductionBatchService:
                 batch=batch,
                 cancelled_runs=tuple(cancelled_runs),
                 changed=True,
-            )
-
-    async def cancel_batch(
-        self,
-        edition_id: UUID,
-        batch_id: UUID,
-        *,
-        actor_id: str = "system",
-        correlation_id: str = "-",
-    ) -> EditionProductionCancellationResult:
-        """Alias for the explicit production cancellation use case."""
-        return await self.cancel_batch_with_result(
-            edition_id,
-            batch_id,
-            actor_id=actor_id,
-            correlation_id=correlation_id,
-        )
-
-    async def get_batch(self, batch_id_or_edition_id: UUID) -> EditionProductionBatch | None:
-        """Get a production batch by ID or get active batch for edition."""
-        async with self._uow_factory() as uow:
-            batch = await uow.edition_production_batches.get(batch_id_or_edition_id)
-            if batch:
-                return batch
-
-            # Fall back to the edition's active batch, then its latest one so
-            # the status endpoint keeps working after completion.
-            batch = await uow.edition_production_batches.get_active_for_edition(
-                batch_id_or_edition_id
-            )
-            if batch:
-                return batch
-            return await uow.edition_production_batches.get_latest_for_edition(
-                batch_id_or_edition_id
             )
 
     async def _get_batch_for_update_in_lock_order(
@@ -1198,7 +1150,3 @@ class ProductionBatchService:
         async with self._uow_factory() as uow:
             batch = await uow.edition_production_batches.get(batch_id)
             return self._pacing.delay_until(batch.next_dispatch_at if batch is not None else None)
-
-
-# Kept as an import compatibility alias while callers migrate to the canonical
-# batch service name.  Creation itself is implemented only by ``create``.

@@ -1948,7 +1948,6 @@ class ProductionWorkflowOrchestrator:
             ctx = await build_subject_production_context(
                 uow,
                 run.subject_id,
-                research_date,
                 snapshot=snapshot,
                 relevant_source_urls=None,
             )
@@ -2228,11 +2227,9 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "references_payload_missing",
                     "error": "Reference report content is not readable",
                 }
-            research_date = run.research_date or datetime.now(UTC).date()
             policy = await build_subject_production_context(
                 uow,
                 run.subject_id,
-                research_date,
                 snapshot=snapshot,
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )
@@ -5040,11 +5037,9 @@ class ProductionWorkflowOrchestrator:
                     "error_code": "synthesis_inputs_missing",
                     "error": "Reference or extraction payload is not readable",
                 }
-            synthesis_research_date = run.research_date or datetime.now(UTC).date()
             synthesis_ctx = await build_subject_production_context(
                 uow,
                 run.subject_id,
-                synthesis_research_date,
                 snapshot=snapshot,
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )

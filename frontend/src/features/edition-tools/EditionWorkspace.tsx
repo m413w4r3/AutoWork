@@ -12,6 +12,10 @@ import { EditionDashboard } from "../edition-dashboard/EditionDashboard";
 import { ProductionBatchSelector } from "../edition-workflow/ProductionBatchSelector";
 import { ProductionConsole } from "../edition-workflow/ProductionConsole";
 import {
+  productionErrorMessage,
+  retryTransientProductionFailure,
+} from "../production/productionLabels";
+import {
   orderedSelection,
   pruneToEligible,
 } from "../edition-workflow/productionBatchSelection";
@@ -140,7 +144,9 @@ function ProductionTool({
         request.subjectIds,
         request.idempotencyKey,
       ),
-    retry: 2,
+    // A replay keeps the same Idempotency-Key, so a transport retry can never
+    // create a second batch.
+    retry: retryTransientProductionFailure,
     onSuccess: () => {
       setSelectedSubjectIds(new Set());
       setStartRequest(null);
@@ -167,11 +173,11 @@ function ProductionTool({
   return (
     <>
       {!readOnly && board.isPending ? (
-        <p role="status">Chargement des sujets sélectionnés…</p>
+        <p role="status">Chargement des sujets disponibles…</p>
       ) : null}
       {!readOnly && board.isError ? (
         <p className="error-message" role="alert">
-          La sélection est inaccessible.
+          Le tableau de production est inaccessible.
         </p>
       ) : null}
       {board.data ? (
@@ -202,9 +208,10 @@ function ProductionTool({
           />
           {!readOnly && start.error ? (
             <p className="error-message" role="alert">
-              {start.error instanceof Error
-                ? start.error.message
-                : "Le lot de production n’a pas pu être démarré."}
+              {productionErrorMessage(
+                start.error,
+                "Le lot de production n’a pas pu être démarré.",
+              )}
             </p>
           ) : null}
           {!readOnly ? (

@@ -1428,7 +1428,8 @@ async def get_subject_production(
     subject_id: UUID,
     request: Request,
 ) -> ProductionStatus:
-    # 404 here is the signal the UI uses to offer "start production".
+    # Shortcut to the latest ProductionRun; it never creates anything.  A
+    # Subject without any run answers 404.
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
@@ -1445,8 +1446,7 @@ async def get_subject_production(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No subject found for {subject_id}",
             )
-        get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
-        batch_item = await get_by_run(run.id) if get_by_run is not None else None
+        batch_item = await uow.edition_production_batch_items.get_by_run(run.id)
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
         if snapshot is None:
             raise HTTPException(
@@ -1563,20 +1563,18 @@ async def get_production_run(run_id: UUID, request: Request) -> dict[str, Any]:
 
 
 @router.get("/subjects/{subject_id}/production/runs")
-async def list_subject_production_runs(subject_id: UUID, request: Request) -> list[dict[str, Any]]:
+async def list_production_runs_for_subject(
+    subject_id: UUID, request: Request
+) -> list[dict[str, Any]]:
     async with request.app.state.uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
         if subject is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
-        loader = getattr(uow.production_runs, "list_for_subject", None)
-        runs = (
-            await loader(subject_id)
-            if loader is not None
-            else [
-                run
-                for run in await uow.production_runs.list_for_edition(subject.edition_id)
-                if run.subject_id == subject_id
-            ]
+        # Newest attempt first: run numbers are the subject-local history.
+        runs = sorted(
+            await uow.production_runs.list_for_subject(subject_id),
+            key=lambda run: run.run_number,
+            reverse=True,
         )
         return [_production_run_summary(run) for run in runs]
 
@@ -2174,9 +2172,7 @@ async def invalidate_production_reuse(
     actor_id = await _actor_id(request)
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
-        if lock_creation is not None:
-            await lock_creation(subject_id)
+        await uow.production_runs.lock_creation_for_subject(subject_id)
         run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(status_code=404, detail="No production run found")
@@ -2361,6 +2357,15 @@ async def get_run_publication_artifact(run_id: UUID, request: Request) -> dict[s
     return await _artifact_view_for_run(request, run_id, ProductionArtifactStage.PUBLICATION.value)
 
 
+_BATCH_ERROR_STATUS = {
+    "production_idempotency_key_required": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "production_subject_ids_required": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "production_subject_ids_duplicate": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "edition_not_found": status.HTTP_404_NOT_FOUND,
+    "production_subject_not_found": status.HTTP_404_NOT_FOUND,
+}
+
+
 @router.post("/editions/{edition_id}/production/batches")
 async def start_edition_production(
     edition_id: UUID,
@@ -2370,7 +2375,7 @@ async def start_edition_production(
 ) -> BatchStatus:
     if idempotency_key is None or not idempotency_key.strip():
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"code": "production_idempotency_key_required"},
         )
     uow_factory, jobs, dispatcher = _runtime(request)
@@ -2387,18 +2392,10 @@ async def start_edition_production(
             correlation_id=get_correlation_id(),
         )
     except ProductionBatchConflictError as e:
-        code = e.code
-        http_status = (
-            status.HTTP_422_UNPROCESSABLE_ENTITY
-            if code in {"production_subject_ids_required", "production_subject_ids_duplicate"}
-            else status.HTTP_409_CONFLICT
-        )
         raise HTTPException(
-            status_code=http_status,
-            detail={"code": code, "subject_ids": [str(item) for item in e.subject_ids]},
+            status_code=_BATCH_ERROR_STATUS.get(e.code, status.HTTP_409_CONFLICT),
+            detail={"code": e.code, "subject_ids": [str(item) for item in e.subject_ids]},
         ) from e
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     await ensure_initial_dispatch(request, result.batch.id, actor_id=actor_id)
 
@@ -2422,8 +2419,9 @@ async def get_edition_production(
                 detail=f"No edition found for {edition_id}",
             )
         active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
-        recent_loader = getattr(uow.edition_production_batches, "list_recent_for_edition", None)
-        recent_batches = await recent_loader(edition_id, 10) if recent_loader is not None else []
+        recent_batches = await uow.edition_production_batches.list_recent_for_edition(
+            edition_id, 10
+        )
         origins = await uow.subject_discovery_origins.list_for_edition(edition_id)
         runs = await uow.production_runs.list_for_edition(edition_id)
         runs_by_subject: dict[UUID, list[ProductionRun]] = {}

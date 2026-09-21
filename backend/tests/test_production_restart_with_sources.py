@@ -46,7 +46,19 @@ class _Runs:
 
     async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         matches = [run for run in self.items.values() if run.subject_id == subject_id]
-        return max(matches, key=lambda run: run.created_at) if matches else None
+        return max(matches, key=lambda run: run.run_number) if matches else None
+
+    async def get_latest_terminal_for_edition_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> ProductionRun | None:
+        matches = [
+            run
+            for run in self.items.values()
+            if run.edition_id == edition_id
+            and run.subject_id == subject_id
+            and run.status not in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING)
+        ]
+        return max(matches, key=lambda run: run.run_number) if matches else None
 
     async def allocate_next_run_number(self, subject_id: UUID) -> int:
         return 1 + max(

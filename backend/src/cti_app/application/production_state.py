@@ -529,9 +529,6 @@ class ProductionStateService:
 
         async with self._uow_factory() as uow:
             await _lock_open_edition(uow, edition_id)
-            lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
-            if lock_creation is not None:
-                await lock_creation(subject_id)
             current = await uow.production_runs.get_current_for_subject(subject_id)
             if current and current.status in (
                 ProductionRunStatus.QUEUED,
@@ -594,6 +591,7 @@ class ProductionStateService:
 
         async with self._uow_factory() as uow:
             await _lock_open_edition(uow, edition_id)
+            await uow.production_runs.lock_creation_for_subject(subject_id)
             current = await uow.production_runs.get_current_for_subject(subject_id)
             if current and current.status in (
                 ProductionRunStatus.QUEUED,
@@ -606,12 +604,7 @@ class ProductionStateService:
             # repointage, la revue de publication continue d'afficher l'ancien
             # run en échec et l'état importé reste invisible.
             replaced_run_id = current.id if current is not None else None
-            allocator = getattr(uow.production_runs, "allocate_next_run_number", None)
-            if allocator is not None:
-                next_run_number = await allocator(subject_id)
-            else:
-                runs = await uow.production_runs.list_for_edition(edition_id)
-                next_run_number = 1 + sum(1 for item in runs if item.subject_id == subject_id)
+            next_run_number = await uow.production_runs.allocate_next_run_number(subject_id)
             run = ProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,

@@ -20,7 +20,8 @@ adressés par SHA-256. Un workspace ou une conversation ne peut jamais être une
 | `human_decisions` | Journal append-only ; `subject_ids` conserve les sujets explicitement concernés. |
 | `production_runs` | Tentatives historiques d’un sujet, génération, état, étape et erreurs. |
 | `production_input_snapshots` | Snapshot immutable de l’état Discovery/Fusion/Subject au démarrage d’un run. |
-| `production_batches` | Lot explicite, ordre des sujets, état agrégé, clé d’idempotence et empreinte du payload. |
+| `edition_production_batches` | Lot explicite, état agrégé, clé d’idempotence (`UNIQUE(edition_id, idempotency_key)`) et empreinte du payload. |
+| `edition_production_batch_items` | Position de chaque sujet dans le lot et run exact qu’il pilote. |
 | `production_artifacts` | Résultats versionnés des étapes de production, référencés par hash. |
 | `publication_manifests` | Ordre et artifacts exacts retenus pour une publication, append-only. |
 | `blobs` | Catalogue des objets MinIO, unicité par bucket logique et SHA-256. |
@@ -39,6 +40,18 @@ pas les faits historiques.
 `Subject` est l’identité stable. `ProductionRun` est une tentative historique ; plusieurs runs
 peuvent donc exister pour un même sujet. `ProductionInputSnapshot` fige exactement l’état observé
 au démarrage d’un run, avec les versions et hashes nécessaires à la reprise et à l’audit.
+
+Contraintes structurelles de la baseline :
+
+- `production_runs` : `UNIQUE(subject_id, run_number)`, `run_number >= 1`, `version >= 1`, un seul
+  run `queued`/`running` par sujet (index unique partiel) et une FK composite
+  `(subject_id, edition_id) → subjects(id, edition_id)` qui interdit un run hors de l’édition de
+  son sujet ;
+- `production_input_snapshots` : `UNIQUE(production_run_id)`, FK composite
+  `(production_run_id, subject_id, edition_id) → production_runs`, FK vers la décision Selection,
+  les identités Discovery d’origine et canonique et le snapshot Fusion, versions `>= 1`,
+  période ordonnée, hashes SHA-256 hexadécimaux et trigger append-only (`UPDATE`/`DELETE`
+  interdits).
 
 `ProductionBatchService.create` reçoit seulement un ordre explicite de `subject_ids` via
 `POST /api/editions/{edition_id}/production/batches` et une `Idempotency-Key`. La contrainte

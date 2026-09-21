@@ -58,76 +58,57 @@ def _describe(source: object) -> str:
 async def build_subject_production_context(
     uow: UnitOfWork,
     subject_id: UUID,
-    research_date: date | ProductionInputSnapshot | None = None,
-    snapshot: ProductionInputSnapshot | None = None,
+    *,
+    snapshot: ProductionInputSnapshot | None,
     relevant_source_urls: Collection[str] | None = None,
 ) -> SubjectProductionContext:
-    """Assemble the prompt context from what the editorial phase established."""
-    if isinstance(research_date, ProductionInputSnapshot):
-        snapshot = research_date
-        research_date = snapshot.research_date
-    elif snapshot is not None:
-        research_date = snapshot.research_date
+    """Assemble the prompt context from the run's frozen input snapshot.
+
+    The snapshot is the only authority for the subject, its period and its
+    core sources; live collections only add the reference-research sources
+    explicitly retained for this stage.
+    """
     if snapshot is None:
         raise ValueError("production_input_snapshot_missing")
     if snapshot.subject_id != subject_id:
         raise ValueError("production_input_snapshot_subject_mismatch")
-    if research_date is None:
-        raise ValueError("production_input_snapshot_research_date_missing")
     relevant_urls = frozenset(relevant_source_urls or ())
 
-    title = snapshot.subject_title
-    description = snapshot.discovery_summary
-    period_start = snapshot.period_start.isoformat()
-    period_end = snapshot.period_end.isoformat()
-    actor_info = snapshot.actor_or_campaign
-
     collections = list(await uow.source_collections.list_for_subject(subject_id))
-    if snapshot is not None:
-        core_source_urls = frozenset(source.canonical_url for source in snapshot.core_sources)
-        allowed_urls = core_source_urls | relevant_urls
-        core_sources_text = "\n".join(_describe(source) for source in snapshot.core_sources)
-    else:
-        allowed_urls = None
-        core_sources_text = "\n".join(
-            _describe(item)
-            for item in collections
-            if item.origin_kind in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}
-        )
+    core_source_urls = frozenset(source.canonical_url for source in snapshot.core_sources)
+    allowed_urls = core_source_urls | relevant_urls
+    core_sources_text = "\n".join(_describe(source) for source in snapshot.core_sources)
     supporting_sources_text = "\n".join(
         _describe(item)
         for item in collections
         if item.origin_kind is SourceOriginKind.REFERENCE_RESEARCH
-        and (allowed_urls is None or item.canonical_url in relevant_urls)
+        and item.canonical_url in relevant_urls
     )
 
     # The diffusion policy decides whether this subject may reach an external
     # model at all; it is never a hardcoded True.
     blocking = tuple(
-        item.canonical_url
-        for item in collections
-        if (allowed_urls is None or item.canonical_url in allowed_urls)
-        and (item.do_not_submit or not item.external_llm_allowed)
-    )
-    if snapshot is not None:
-        blocking = tuple(
-            dict.fromkeys(
-                (
-                    *blocking,
-                    *(
-                        source.canonical_url
-                        for source in snapshot.core_sources
-                        if not source.external_llm_allowed
-                    ),
-                )
+        dict.fromkeys(
+            (
+                *(
+                    item.canonical_url
+                    for item in collections
+                    if item.canonical_url in allowed_urls
+                    and (item.do_not_submit or not item.external_llm_allowed)
+                ),
+                *(
+                    source.canonical_url
+                    for source in snapshot.core_sources
+                    if not source.external_llm_allowed
+                ),
             )
         )
+    )
 
     archived = [
         item
         for item in collections
-        if item.state in _ARCHIVED_STATES
-        and (allowed_urls is None or item.canonical_url in allowed_urls)
+        if item.state in _ARCHIVED_STATES and item.canonical_url in allowed_urls
     ]
     technical_summary = (
         f"{len(archived)} publication(s) déjà archivée(s) pour ce sujet."
@@ -136,13 +117,13 @@ async def build_subject_production_context(
     )
 
     return SubjectProductionContext(
-        subject_title=title,
-        subject_description=description,
-        actor_info=actor_info,
+        subject_title=snapshot.subject_title,
+        subject_description=snapshot.discovery_summary,
+        actor_info=snapshot.actor_or_campaign,
         technical_summary=technical_summary,
-        period_start=period_start,
-        period_end=period_end,
-        research_date=research_date,
+        period_start=snapshot.period_start.isoformat(),
+        period_end=snapshot.period_end.isoformat(),
+        research_date=snapshot.research_date,
         core_sources_text=core_sources_text,
         supporting_sources_text=supporting_sources_text,
         external_llm_allowed=not blocking,

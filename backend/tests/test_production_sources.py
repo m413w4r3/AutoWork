@@ -176,7 +176,7 @@ async def test_context_refuses_to_build_without_a_production_input_snapshot() ->
         await build_subject_production_context(
             _Uow([]),  # type: ignore[arg-type]
             uuid4(),
-            date(2026, 8, 1),
+            snapshot=None,
         )
 
 

@@ -198,9 +198,11 @@ test("Édition : sélectionner 2 sujets sur 4 éligibles envoie exactement ce so
 test("Production : board vide retourné en 200", async ({ page }) => {
   const editionId = "23232323-2323-4232-8232-232323232323";
   let boardStatus = 0;
+  const requestedPaths: string[] = [];
 
   await page.route("/api/**", async (route) => {
     const path = new URL(route.request().url()).pathname;
+    requestedPaths.push(path);
     if (path === `/api/editions/${editionId}`)
       return route.fulfill({
         status: 200,
@@ -241,6 +243,11 @@ test("Production : board vide retourné en 200", async ({ page }) => {
   await expect(
     page.getByRole("button", { name: "Démarrer le lot de production" }),
   ).toBeDisabled();
+  // The Production surface only knows the Production API.
+  expect(requestedPaths).toContain(`/api/editions/${editionId}/production`);
+  expect(requestedPaths.filter((path) => path.includes("/selection"))).toEqual(
+    [],
+  );
 });
 
 test("Production : replay exact et nouvelle clé refusée pendant un batch actif", async ({

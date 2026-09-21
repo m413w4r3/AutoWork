@@ -26,6 +26,8 @@ import { ProductionStateTransfer } from "./ProductionStateTransfer";
 import {
   STAGE_LABELS,
   STATUS_LABELS,
+  productionErrorMessage,
+  retryTransientProductionFailure,
 } from "../features/production/productionLabels";
 
 interface SubjectProductionProps {
@@ -224,7 +226,7 @@ export function SubjectProduction({
   const startMutation = useMutation({
     mutationFn: (idempotencyKey: string) =>
       startProductionBatch(editionId, [subjectId], idempotencyKey),
-    retry: 2,
+    retry: retryTransientProductionFailure,
     onSuccess: () => {
       setStartIdempotencyKey(null);
       void refetch();
@@ -242,9 +244,9 @@ export function SubjectProduction({
 
   // A failed run remains visible: its failed stage and recovery path matter.
   const restartable = !status || status.status === "cancelled";
-  // A run owned by an edition batch is repaired through that batch. Starting a
-  // standalone run here would create an article the batch never sees, so the
-  // backend refuses it and the page must not offer it either.
+  // A run owned by an edition batch is repaired through that batch's review.
+  // A new one-subject batch started here would not repair the batch item the
+  // review reads, so the page does not offer it.
   const batchOwned = Boolean(status?.batch_id);
   // Cancellation stops the pipeline without deleting anything, so a cancelled
   // run is continued from its first incomplete stage — inside its batch when
@@ -284,7 +286,10 @@ export function SubjectProduction({
         ) : null}
         {startMutation.error ? (
           <p className="error-message" role="alert">
-            {String(startMutation.error)}
+            {productionErrorMessage(
+              startMutation.error,
+              "La production n’a pas pu être démarrée.",
+            )}
           </p>
         ) : null}
         {resumeMutation.error ? (

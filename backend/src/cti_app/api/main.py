@@ -75,10 +75,6 @@ from cti_app.application.production_repairs import (
 )
 from cti_app.application.selection import SelectionService
 from cti_app.application.subject_content import SubjectContentService
-from cti_app.application.subject_production import (
-    ProductionBatchService,
-    SubjectProductionService,
-)
 from cti_app.application.subjects import SubjectService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
@@ -231,8 +227,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         conversation_session_closer=bridge_provider,
     )
 
-    subject_production_service = SubjectProductionService(uow_factory)
-    edition_production_service = ProductionBatchService(uow_factory, production_pacing)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_checkpoint = EditionProductionCheckpointService(
         uow_factory,
@@ -296,8 +290,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.manual_source_edit_service = manual_source_edit_service
     app.state.collection_service = collection_service
     app.state.collection_review_service = collection_review_service
-    app.state.subject_production_service = subject_production_service
-    app.state.edition_production_service = edition_production_service
     # One resolver for the detail, the adjudication and the projection: an
     # analyst can only include a value the projection will find again.
     repair_payload_resolver = ProductionRepairPayloadResolver(model_gateway)

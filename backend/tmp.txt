@@ -1,0 +1,56 @@
+# audit AW-009
+
+J'ai audité AW-009 et corrigé les écarts trouvés. Toutes les quality gates de la spec passent. Rien n'est commité.
+
+**Déjà en place avant mes changements :**
+- aucune trace d'`EditorialGroup`, `editorial_groups`, `brief_auto` ou `LegacyEditorialProjectionService` dans `backend/src` et `frontend/src` ;
+- une seule baseline, avec la table `production_runs` et un trigger qui interdit de modifier ou supprimer un snapshot ;
+- un seul endpoint de démarrage, `POST /production/batches`, et un board qui répond 200 ;
+- le ProductionState V4 générique ;
+- la page Production ne lit plus la Selection.
+
+**Écarts corrigés**
+
+- **Deux chemins de création différents.** `ProductionBatchService.create` et `create_run` (utilisé par la reprise avec nouvelles sources) ne faisaient pas les mêmes contrôles. `create_run` ne vérifiait pas l'édition du sujet ni son origine Discovery, et rendait silencieusement un run déjà actif. Les deux partagent maintenant la même fonction de validation et de capture du snapshot, dans [subject_production.py](backend/src/cti_app/application/subject_production.py).
+- **Code défensif mort.** J'ai retiré les `getattr(..., None)` qui masquaient des faux repositories incomplets dans les tests : le verrou d'édition pouvait être sauté, le numéro de run était recalculé à la main. Les faux repositories implémentent maintenant le vrai contrat.
+- **Lignée Discovery indisponible.** Elle remontait en 400 avec un message brut ; elle donne maintenant `409 production_subject_lineage_unavailable` avec le sujet concerné.
+- **Codes HTTP.** Un sujet ou une édition inconnus répondent 404, les champs manquants ou vides 422, les conflits 409 avec la liste des `subject_ids`.
+- **Import ProductionState.** Le verrou de création du sujet n'était pas tenu dans la transaction qui crée le run ; c'est corrigé.
+- **Dernier run d'un sujet.** Il est maintenant choisi par `run_number` et non par `created_at`.
+- **Cohérence en base (point 69).** J'ai ajouté des clés étrangères composites : un run ne peut appartenir qu'à l'édition de son sujet, et un snapshot décrit exactement le sujet et l'édition de son run.
+- **Contexte des stages.** `build_subject_production_context` exige le snapshot. J'ai supprimé les branches mortes et le paramètre `research_date` qui était de toute façon ignoré.
+- **Code mort supprimé** : `get_batch`, l'alias `cancel_batch`, un commentaire qui annonçait un alias inexistant, deux services inutilisés dans [main.py](backend/src/cti_app/api/main.py), et des tests en double ou mal nommés. L'un s'appelait `…returns_404` alors qu'il vérifiait un 200.
+- **Frontend.**
+  - Les raisons de blocage et les refus du backend s'affichent en français ; avant, on voyait des codes bruts ou « La production n'a pas pu être effectuée ».
+  - Les refus 4xx ne sont plus réessayés ; les pannes serveur le sont, avec la même clé d'idempotence.
+  - Le message d'erreur « La sélection est inaccessible » affiché sur la page Production est corrigé.
+  - Le stub de test [fetchStubs.ts](frontend/src/test-utils/fetchStubs.ts) renvoyait encore 404 pour le board ; il renvoie maintenant un board vide en 200.
+
+**Tests ajoutés**
+- **PostgreSQL réel**, dans [test_production_run_lineage_postgres.py](backend/tests/integration/test_production_run_lineage_postgres.py), de Discovery jusqu'au lancement de la production, sans aucun `EditorialGroup` (points 71, 72, 73, 74, 77 à 80, 25) :
+  - lancement de production et soumission du job SOURCES ;
+  - le run 1 ne change pas après une nouvelle Fusion et un renommage, et le run 2 capture le nouvel état ;
+  - le trigger refuse les modifications et suppressions de snapshot ;
+  - idempotence, lot actif refusé, atomicité ;
+  - édition archivée ;
+  - un run rattaché à une autre édition que son sujet est refusé.
+- **Domaine** ([test_production_input_snapshot.py](backend/tests/test_production_input_snapshot.py)) : hash déterministe et indépendant des identifiants techniques, tris, validations, dates timezone-aware.
+- **API** : même clé avec un autre payload (y compris l'ordre), lot actif, sujet actif, atomicité `[A, invalide, C]`, ordre du payload conservé, vagues successives, et mono comme multi passant par la même primitive.
+- **Gates d'architecture (point 97)** dans [test_architecture_production_lineage.py](backend/tests/test_architecture_production_lineage.py) : termes interdits, colonnes supprimées, une seule baseline, pas d'appel à la Selection depuis la Production.
+- **Frontend** ([ProductionTool.test.tsx](frontend/src/features/edition-tools/ProductionTool.test.tsx)) : couverture du point 85. Le test E2E vérifie aussi qu'aucune requête `/selection` ne part de la page Production.
+
+**Documentation.** [production.md](docs/production.md) décrit maintenant les points demandés au 92, la construction du snapshot, les deux hashes et le tableau des codes d'erreur. [persistence_and_storage.md](docs/persistence_and_storage.md) liste les contraintes et corrige les noms de tables des lots. ADR-0004 porte une note legacy.
+
+**Vérifications lancées**
+
+| Vérification | Résultat |
+| --- | --- |
+| `make lint-backend`, `make typecheck-backend` | OK |
+| `make test-backend` | 1698 passed |
+| `make test-integration` | 235 passed |
+| `pnpm lint`, `pnpm typecheck` | OK (13 avertissements react-refresh, dans des fichiers que je n'ai pas touchés) |
+| `make test-frontend` | 213 passed, avant l'ajout des 7 tests de [ProductionTool.test.tsx](frontend/src/features/edition-tools/ProductionTool.test.tsx) ; `vitest` sur `src/features/edition-tools` passe ensuite (22/22), la suite complète n'a pas été relancée |
+| `pnpm test:e2e` | 11 passed |
+| `alembic heads` | `0001_baseline (head)` |
+
+**Laissé en place volontairement (Repair Desk, hors périmètre) :** la route `restart-with-new-sources`, dont le chemin contient `/production/` deux fois, et l'import ProductionState. Les deux créent un run hors d'un lot, mais avec les mêmes contrôles d'éligibilité et un snapshot capturé.

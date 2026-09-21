@@ -570,10 +570,15 @@ _SOURCE_ROLE_ORDER = {
 }
 
 
+def source_role_rank(role: SourceRole) -> int:
+    """Deterministic editorial precedence of a source role (lower is stronger)."""
+    return _SOURCE_ROLE_ORDER.get(role, 9)
+
+
 def _production_input_source_sort_key(source: ProductionInputSource) -> tuple[object, ...]:
     return (
         source.canonical_url,
-        _SOURCE_ROLE_ORDER.get(source.role, 9),
+        source_role_rank(source.role),
         source.title.casefold(),
         source.publisher.casefold(),
         source.published_at or date.max,
@@ -746,6 +751,15 @@ class ProductionInputSnapshot:
         object.__setattr__(self, "input_hash", computed)
 
     def reuse_basis_payload(self) -> dict[str, object]:
+        """Functional inputs whose equality allows reusing a costly stage.
+
+        It is the whole functional snapshot except ``research_date``: two runs
+        of the same Subject version, discovery snapshot, members and frozen
+        sources may share expensive stage outputs even when started on
+        different days.  Technical identities (run, snapshot and job IDs,
+        timestamps, conversations) never participate.  Stage-specific reuse
+        rules refine this basis in AW-010 to AW-013.
+        """
         return {
             "subject_id": str(self.subject_id),
             "edition_id": str(self.edition_id),
@@ -768,6 +782,7 @@ class ProductionInputSnapshot:
         }
 
     def functional_payload(self) -> dict[str, object]:
+        """Complete deterministic identity of the run input (``input_hash``)."""
         payload = self.reuse_basis_payload()
         payload["research_date"] = self.research_date.isoformat()
         return payload

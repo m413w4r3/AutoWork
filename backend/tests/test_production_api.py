@@ -258,13 +258,41 @@ class _Runs:
         self.items[run.id] = run
 
     async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
-        # Mirrors the real repository: most recently created run wins, not
-        # insertion order — a retry's new run must shadow the old one.
+        # Mirrors the real repository: the highest subject-local run number
+        # wins, not insertion order — a new run must shadow the old one.
         matches = [r for r in self.items.values() if r.subject_id == subject_id]
-        return max(matches, key=lambda r: r.created_at) if matches else None
+        return max(matches, key=lambda r: r.run_number) if matches else None
+
+    async def get_latest_terminal_for_edition_subject(
+        self, edition_id: UUID, subject_id: UUID
+    ) -> ProductionRun | None:
+        matches = [
+            r
+            for r in self.items.values()
+            if r.edition_id == edition_id
+            and r.subject_id == subject_id
+            and r.status not in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING)
+        ]
+        return max(matches, key=lambda r: r.run_number) if matches else None
+
+    async def lock_creation_for_subject(self, subject_id: UUID) -> None:
+        del subject_id
+
+    async def allocate_next_run_number(self, subject_id: UUID) -> int:
+        return 1 + max(
+            (r.run_number for r in self.items.values() if r.subject_id == subject_id),
+            default=0,
+        )
 
     async def list_for_edition(self, edition_id: UUID) -> Sequence[ProductionRun]:
         return [r for r in self.items.values() if r.edition_id == edition_id]
+
+    async def list_for_subject(self, subject_id: UUID) -> Sequence[ProductionRun]:
+        return sorted(
+            (r for r in self.items.values() if r.subject_id == subject_id),
+            key=lambda r: r.run_number,
+            reverse=True,
+        )
 
 
 class _Batches:
@@ -308,6 +336,17 @@ class _Batches:
             ),
             None,
         )
+
+    async def list_recent_for_edition(
+        self, edition_id: UUID, limit: int
+    ) -> Sequence[EditionProductionBatch]:
+        # Mirrors the SQL repository: finished batches only, newest first.
+        matches = [
+            b
+            for b in self.items.values()
+            if b.edition_id == edition_id and b.status not in ("queued", "running")
+        ]
+        return list(reversed(matches))[:limit]
 
 
 class _BatchItems:
@@ -706,18 +745,26 @@ async def _start_batch(
 
 
 async def test_get_subject_production_without_run_returns_404(api: AsyncClient) -> None:
-    """The UI keys "offer a start button" off this 404 — 422 would break it."""
+    """The latest-run shortcut never creates a run; no run is a plain 404."""
     response = await api.get(f"/api/subjects/{uuid4()}/production")
 
     assert response.status_code == 404
     assert response.status_code != 422
 
 
-async def test_get_edition_production_without_batch_returns_404(api: AsyncClient) -> None:
-    response = await api.get(f"/api/editions/{uuid4()}/production")
+async def test_get_edition_production_without_batch_returns_an_empty_board(
+    api: AsyncClient,
+) -> None:
+    edition_id = uuid4()
+    response = await api.get(f"/api/editions/{edition_id}/production")
 
     assert response.status_code == 200
-    assert response.status_code != 422
+    assert response.json() == {
+        "edition_id": str(edition_id),
+        "active_batch": None,
+        "subjects": [],
+        "recent_batches": [],
+    }
 
 
 async def test_invalidate_reuse_without_run_returns_404(api: AsyncClient) -> None:
@@ -929,18 +976,6 @@ async def test_standalone_cancellation_exposes_archived_conflict_without_mutatio
     assert len(production_app.state.job_service.submitted) == 1
 
 
-async def test_start_subject_production_ignores_legacy_group_status(
-    api: AsyncClient, uow: _Uow
-) -> None:
-    edition_id = uuid4()
-    subject_id = uuid4()
-    _select(uow, edition_id, "Cavern", subject_id)
-
-    response = await _start_batch(api, edition_id, [subject_id])
-
-    assert response.status_code == 200, response.text
-
-
 async def test_start_edition_uses_subject_origins_for_eligibility(
     api: AsyncClient, uow: _Uow
 ) -> None:
@@ -956,20 +991,6 @@ async def test_start_edition_uses_subject_origins_for_eligibility(
     edition = await uow.editions.get(edition_id)
     assert edition.state is EditionStatus.OPEN
     assert edition.version == 1
-
-
-async def test_selected_legacy_group_without_origin_is_not_eligible(
-    api: AsyncClient, uow: _Uow
-) -> None:
-    edition_id = uuid4()
-    subject_id = uuid4()
-    _select(uow, edition_id, "Legacy only", subject_id)
-    uow.subject_discovery_origins.items.clear()
-
-    response = await _start_batch(api, edition_id, [subject_id])
-
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "production_subject_discovery_origin_missing"
 
 
 async def test_start_edition_rejects_an_archived_edition(api: AsyncClient, uow: _Uow) -> None:
@@ -1032,7 +1053,7 @@ async def test_start_edition_rejects_explicit_empty_subject_selection(
 async def test_start_subject_requires_subject_discovery_origin(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    _select(uow, edition_id, "Legacy only", subject_id)
+    _select(uow, edition_id, "Without origin", subject_id)
     uow.subject_discovery_origins.items.clear()
 
     response = await _start_batch(api, edition_id, [subject_id])
@@ -1358,9 +1379,15 @@ async def test_start_edition_rejects_unselected_subject(api: AsyncClient, uow: _
     subject_id = uuid4()
     _select(uow, edition_id, "A", subject_id)
 
-    response = await _start_batch(api, edition_id, [uuid4()])
+    unknown = uuid4()
+    response = await _start_batch(api, edition_id, [unknown])
 
-    assert response.status_code == 409
+    assert response.status_code == 404
+    assert response.json()["detail"] == {
+        "code": "production_subject_not_found",
+        "subject_ids": [str(unknown)],
+    }
+    assert not uow.edition_production_batches.items
 
 
 async def test_batch_creates_exactly_one_run_per_subject(api: AsyncClient, uow: _Uow) -> None:
@@ -1942,7 +1969,9 @@ async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
 ) -> None:
     subject_id = uuid4()
     first = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
-    second = _terminal_run(first.edition_id, subject_id, status=ProductionRunStatus.FAILED)
+    second = _terminal_run(
+        first.edition_id, subject_id, status=ProductionRunStatus.FAILED, run_number=2
+    )
     await uow.production_runs.add(first)
     await uow.production_runs.add(second)
     first_artifact = _artifact(first, ProductionArtifactStage.PUBLICATION)
@@ -1966,7 +1995,9 @@ async def test_retry_by_run_changes_only_the_requested_run(
 ) -> None:
     subject_id = uuid4()
     first = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
-    second = _terminal_run(first.edition_id, subject_id, status=ProductionRunStatus.FAILED)
+    second = _terminal_run(
+        first.edition_id, subject_id, status=ProductionRunStatus.FAILED, run_number=2
+    )
     await uow.production_runs.add(first)
     await uow.production_runs.add(second)
     (await uow.editions.get(first.edition_id)).state = EditionStatus.OPEN
@@ -2714,62 +2745,32 @@ async def test_subject_production_status_exposes_the_owning_batch(
     assert body["recovery_disposition"] == "auto"
 
 
-async def test_a_cancelled_batch_article_is_not_restarted_as_a_standalone_run(
+async def test_a_cancelled_article_restarts_only_through_a_new_batch(
     api: AsyncClient,
     uow: _Uow,
     production_app: FastAPI,
 ) -> None:
-    """A new standalone run would never repair the batch item it seems to replace."""
+    """There is no standalone start: a new run is a new one-subject batch."""
     edition_id, subject_id = uuid4(), uuid4()
     _select(uow, edition_id, "TAG-901", subject_id)
-    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
-    run.start_running()
-    run.mark_cancelled()
-    await uow.production_runs.add(run)
-    batch = EditionProductionBatch(
-        edition_id=edition_id,
-        status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
-        phase=ProductionBatchPhase.REVIEW,
-    )
-    await uow.edition_production_batches.add(batch)
-    await uow.edition_production_batch_items.append_many(
-        [
-            EditionProductionBatchItem(
-                batch_id=batch.id,
-                subject_id=subject_id,
-                production_run_id=run.id,
-                position=1,
-            )
-        ]
-    )
-    jobs = production_app.state.job_service
-    jobs.submitted.clear()
+    first = await _start_batch(api, edition_id, [subject_id], idempotency_key="first")
+    assert first.status_code == 200, first.text
+    run = await uow.production_runs.get_current_for_subject(subject_id)
+    assert run is not None
+    cancelled = await api.post(f"/api/production/runs/{run.id}/cancel")
+    assert cancelled.status_code == 200, cancelled.text
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    standalone = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    restarted = await _start_batch(api, edition_id, [subject_id], idempotency_key="restart")
 
-    assert response.status_code == 405, response.text
-    assert len(uow.production_runs.items) == 1
+    assert standalone.status_code == 405
+    assert restarted.status_code == 200, restarted.text
+    assert restarted.json()["batch_id"] != first.json()["batch_id"]
     assert uow.production_runs.items[run.id].status is ProductionRunStatus.CANCELLED
-    assert jobs.submitted == []
-
-
-async def test_a_subject_outside_any_batch_can_still_be_restarted(
-    api: AsyncClient,
-    uow: _Uow,
-) -> None:
-    edition_id, subject_id = uuid4(), uuid4()
-    _select(uow, edition_id, "TAG-902", subject_id)
-    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
-    run.start_running()
-    run.mark_cancelled()
-    await uow.production_runs.add(run)
-
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
-
-    assert response.status_code == 405, response.text
     current = await uow.production_runs.get_current_for_subject(subject_id)
     assert current is not None
-    assert current.id == run.id
+    assert current.run_number == 2
+    assert current.status is ProductionRunStatus.RUNNING
 
 
 async def _cancelled_batch_run(api: AsyncClient, uow: _Uow) -> tuple[UUID, ProductionRun]:
@@ -2863,3 +2864,253 @@ async def test_resume_is_refused_on_a_run_that_is_not_cancelled(
     assert response.json()["detail"]["code"] == "production_run_not_resumable"
     assert uow.production_runs.items[run.id].pipeline_generation == 0
     assert jobs.submitted == []
+
+
+async def test_exact_batch_replay_returns_the_same_batch_and_runs(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b = uuid4(), uuid4()
+    _select(uow, edition_id, "A", subject_a)
+    _select(uow, edition_id, "B", subject_b)
+
+    first = await _start_batch(api, edition_id, [subject_a, subject_b], idempotency_key="K")
+    replay = await _start_batch(api, edition_id, [subject_a, subject_b], idempotency_key="K")
+
+    assert first.status_code == replay.status_code == 200, replay.text
+    assert replay.json()["batch_id"] == first.json()["batch_id"]
+    assert len(uow.edition_production_batches.items) == 1
+    assert len(uow.production_runs.items) == 2
+    assert len(uow.production_input_snapshots.items) == 2
+    assert len(production_app.state.job_service.submitted) == 1
+
+
+async def test_same_key_with_another_payload_is_an_idempotency_conflict(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b, subject_c = uuid4(), uuid4(), uuid4()
+    for name, subject_id in (("A", subject_a), ("B", subject_b), ("C", subject_c)):
+        _select(uow, edition_id, name, subject_id)
+
+    first = await _start_batch(api, edition_id, [subject_a, subject_b], idempotency_key="K")
+    conflict = await _start_batch(api, edition_id, [subject_a, subject_c], idempotency_key="K")
+    reordered = await _start_batch(api, edition_id, [subject_b, subject_a], idempotency_key="K")
+
+    assert first.status_code == 200, first.text
+    for response in (conflict, reordered):
+        assert response.status_code == 409
+        assert response.json()["detail"]["code"] == "production_idempotency_conflict"
+    assert len(uow.edition_production_batches.items) == 1
+    assert len(uow.production_runs.items) == 2
+
+
+async def test_new_key_while_a_batch_is_active_never_returns_the_old_batch(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b = uuid4(), uuid4()
+    _select(uow, edition_id, "A", subject_a)
+    _select(uow, edition_id, "B", subject_b)
+
+    first = await _start_batch(api, edition_id, [subject_a], idempotency_key="X")
+    second = await _start_batch(api, edition_id, [subject_b], idempotency_key="Y")
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "production_batch_active"
+    assert len(uow.edition_production_batches.items) == 1
+    assert {run.subject_id for run in uow.production_runs.items.values()} == {subject_a}
+
+
+async def test_subject_with_an_active_run_rejects_the_whole_batch(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b = uuid4(), uuid4()
+    _select(uow, edition_id, "A", subject_a)
+    _select(uow, edition_id, "B", subject_b)
+    await uow.production_runs.add(ProductionRun(subject_id=subject_b, edition_id=edition_id))
+
+    response = await _start_batch(api, edition_id, [subject_a, subject_b])
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "production_subject_active",
+        "subject_ids": [str(subject_b)],
+    }
+    assert not uow.edition_production_batches.items
+    assert [run.subject_id for run in uow.production_runs.items.values()] == [subject_b]
+
+
+async def test_one_invalid_subject_creates_no_batch_run_or_snapshot(
+    api: AsyncClient, uow: _Uow, production_app: FastAPI
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b, subject_c = uuid4(), uuid4(), uuid4()
+    _select(uow, edition_id, "A", subject_a)
+    _select(uow, edition_id, "B", subject_b)
+    _select(uow, edition_id, "C", subject_c)
+    uow.subject_discovery_origins.items[:] = [
+        origin for origin in uow.subject_discovery_origins.items if origin.subject_id != subject_b
+    ]
+
+    response = await _start_batch(api, edition_id, [subject_a, subject_b, subject_c])
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "production_subject_discovery_origin_missing",
+        "subject_ids": [str(subject_b)],
+    }
+    assert not uow.edition_production_batches.items
+    assert not uow.edition_production_batch_items.items
+    assert not uow.production_runs.items
+    assert not uow.production_input_snapshots.items
+    assert production_app.state.job_service.submitted == []
+
+
+async def test_subject_of_another_edition_is_rejected(api: AsyncClient, uow: _Uow) -> None:
+    edition_id, other_edition_id = uuid4(), uuid4()
+    subject_id = uuid4()
+    _select(uow, other_edition_id, "Elsewhere", subject_id)
+
+    response = await _start_batch(api, edition_id, [subject_id])
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "production_subject_edition_mismatch"
+    assert not uow.production_runs.items
+
+
+async def test_payload_order_is_the_batch_order(api: AsyncClient, uow: _Uow) -> None:
+    edition_id = uuid4()
+    subjects = sorted((uuid4() for _ in range(3)), key=str)
+    for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
+        _select(uow, edition_id, name, subject_id)
+    requested = [subjects[2], subjects[0], subjects[1]]
+
+    response = await _start_batch(api, edition_id, requested)
+
+    assert response.status_code == 200, response.text
+    items = sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
+    assert [item.subject_id for item in items] == requested
+    assert [item.position for item in items] == [1, 2, 3]
+    running = [r for r in uow.production_runs.items.values() if r.status.value == "running"]
+    assert [run.subject_id for run in running] == [requested[0]]
+
+
+@pytest.mark.parametrize("headers", [{}, {"Idempotency-Key": "  "}])
+async def test_batch_requires_an_idempotency_key(
+    api: AsyncClient, uow: _Uow, headers: dict[str, str]
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "A", subject_id)
+
+    response = await api.post(
+        f"/api/editions/{edition_id}/production/batches",
+        headers=headers,
+        json={"subject_ids": [str(subject_id)]},
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "production_idempotency_key_required"
+    assert not uow.edition_production_batches.items
+
+
+@pytest.mark.parametrize("payload", [{}, {"subject_ids": []}, {"subject_ids": None}])
+async def test_subject_ids_must_be_explicit_and_non_empty(
+    api: AsyncClient, uow: _Uow, payload: dict[str, Any]
+) -> None:
+    """An omitted list never means "every Subject of the edition"."""
+    edition_id = uuid4()
+    _select(uow, edition_id, "A", uuid4())
+
+    response = await api.post(
+        f"/api/editions/{edition_id}/production/batches",
+        headers={"Idempotency-Key": "explicit"},
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    assert not uow.edition_production_batches.items
+    assert not uow.production_runs.items
+
+
+async def test_archived_edition_board_stays_readable(api: AsyncClient, uow: _Uow) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Archived subject", subject_id)
+    (await uow.editions.get(edition_id)).state = EditionStatus.ARCHIVED
+
+    board = await api.get(f"/api/editions/{edition_id}/production")
+    started = await _start_batch(api, edition_id, [subject_id])
+
+    assert board.status_code == 200, board.text
+    subject = board.json()["subjects"][0]
+    assert subject["can_start"] is False
+    assert subject["blocking_reason"] == "production_edition_archived"
+    assert started.status_code == 409
+    assert started.json()["detail"]["code"] == "production_edition_archived"
+
+
+def _finish_current_batch(uow: _Uow) -> None:
+    for run in uow.production_runs.items.values():
+        if run.status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
+            if run.status is ProductionRunStatus.QUEUED:
+                run.start_running()
+            run.mark_ready()
+    for batch in uow.edition_production_batches.items.values():
+        if batch.status in ("queued", "running"):
+            batch.finish()
+
+
+async def test_later_waves_create_new_batches_and_new_run_numbers(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id = uuid4()
+    subject_a, subject_b, subject_c = uuid4(), uuid4(), uuid4()
+    for name, subject_id in (("A", subject_a), ("B", subject_b), ("C", subject_c)):
+        _select(uow, edition_id, name, subject_id)
+
+    first = await _start_batch(api, edition_id, [subject_a, subject_b], idempotency_key="w1")
+    _finish_current_batch(uow)
+    second = await _start_batch(api, edition_id, [subject_c], idempotency_key="w2")
+    _finish_current_batch(uow)
+    third = await _start_batch(api, edition_id, [subject_a], idempotency_key="w3")
+
+    assert [first.status_code, second.status_code, third.status_code] == [200, 200, 200]
+    assert len({first.json()["batch_id"], second.json()["batch_id"], third.json()["batch_id"]}) == 3
+    history = await api.get(f"/api/subjects/{subject_a}/production/runs")
+    assert history.status_code == 200, history.text
+    assert [run["run_number"] for run in history.json()] == [2, 1]
+    assert [run["status"] for run in history.json()] == ["running", "ready"]
+    board = await api.get(f"/api/editions/{edition_id}/production")
+    statuses = {item["subject_id"]: item["latest_status"] for item in board.json()["subjects"]}
+    assert statuses == {
+        str(subject_a): "running",
+        str(subject_b): "ready",
+        str(subject_c): "ready",
+    }
+    assert len(board.json()["recent_batches"]) == 2
+
+
+async def test_single_and_multi_subject_starts_use_the_same_batch_primitive(
+    api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[UUID]] = []
+    original = production_api.ProductionBatchService.create
+
+    async def spy(self: Any, edition_id: UUID, subject_ids: list[UUID], **kwargs: Any) -> Any:
+        calls.append(list(subject_ids))
+        return await original(self, edition_id, subject_ids, **kwargs)
+
+    monkeypatch.setattr(production_api.ProductionBatchService, "create", spy)
+    edition_id = uuid4()
+    subject_a, subject_b, subject_c = uuid4(), uuid4(), uuid4()
+    for name, subject_id in (("A", subject_a), ("B", subject_b), ("C", subject_c)):
+        _select(uow, edition_id, name, subject_id)
+
+    single = await _start_batch(api, edition_id, [subject_a], idempotency_key="mono")
+    _finish_current_batch(uow)
+    multi = await _start_batch(api, edition_id, [subject_b, subject_c], idempotency_key="multi")
+
+    assert single.status_code == multi.status_code == 200
+    assert calls == [[subject_a], [subject_b, subject_c]]
