@@ -29,6 +29,7 @@ from cti_app.application.http_collection import (
     SafeHttpCollector,
 )
 from cti_app.application.jobs import (
+    DuplicateJobError,
     JobDispatcher,
     JobExecutor,
     JobRegistry,
@@ -731,17 +732,21 @@ class ProductionScenario:
             expected_stage=ProductionStage.SOURCES.value,
             pipeline_generation=run.pipeline_generation,
         )
-        job = await self.jobs.submit(
-            kind=stage_job_kind(ProductionStage.SOURCES),
-            aggregate_type="subject",
-            aggregate_id=run.subject_id,
-            idempotency_key=production_stage_idempotency_key(run, ProductionStage.SOURCES),
-            correlation_id=actor_id,
-            input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-            actor_id=actor_id,
-        )
-        await self.runner.dispatch(job.id)
+        try:
+            job = await self.jobs.submit(
+                kind=stage_job_kind(ProductionStage.SOURCES),
+                aggregate_type="subject",
+                aggregate_id=run.subject_id,
+                idempotency_key=production_stage_idempotency_key(run, ProductionStage.SOURCES),
+                correlation_id=actor_id,
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            job = await self.jobs.get(exc.existing_job_id)
+        if job.status is JobStatus.QUEUED:
+            await self.runner.dispatch(job.id)
         return run, job.id
 
     async def start(self) -> ProductionRun:

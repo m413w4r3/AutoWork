@@ -326,10 +326,16 @@ async def _production_api_views(
         transport=ASGITransport(app=app), base_url="http://production.test"
     ) as client:
         subject_response = await client.get(f"/api/subjects/{scenario.subject.id}/production")
-        batch_response = await client.get(f"/api/editions/{scenario.edition.id}/production")
+        board_response = await client.get(f"/api/editions/{scenario.edition.id}/production")
     assert subject_response.status_code == 200, subject_response.text
-    assert batch_response.status_code == 200, batch_response.text
-    return subject_response.json(), batch_response.json()
+    assert board_response.status_code == 200, board_response.text
+    board_view = board_response.json()
+    batch_view = board_view["active_batch"]
+    if batch_view is None:
+        recent_batches = board_view["recent_batches"]
+        assert recent_batches
+        batch_view = recent_batches[0]
+    return subject_response.json(), batch_view
 
 
 async def _assert_no_automatic_recovery(
