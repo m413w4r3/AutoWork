@@ -250,12 +250,15 @@ test("Production : board vide retourné en 200", async ({ page }) => {
   );
 });
 
-test("Production : replay exact et nouvelle clé refusée pendant un batch actif", async ({
+test("Production : replay exact, payload différent et nouvelle clé pendant un batch actif", async ({
   page,
 }) => {
   const editionId = "34343434-3434-4343-8343-343434343434";
   const batchId = "e5555555-5555-4555-8555-555555555555";
   const body = { subject_ids: ["a1111111-1111-4111-8111-111111111111"] };
+  const conflictingBody = {
+    subject_ids: ["b2222222-2222-4222-8222-222222222222"],
+  };
   const firstKey = "aw009-replay-run";
   const secondKey = "aw009-conflicting-run";
   let calls = 0;
@@ -269,8 +272,9 @@ test("Production : replay exact et nouvelle clé refusée pendant un batch actif
     ) {
       calls += 1;
       const key = request.headers()["idempotency-key"];
-      expect(request.postDataJSON()).toEqual(body);
-      if (key === firstKey)
+      const payload = request.postDataJSON() as { subject_ids: string[] };
+      if (key === firstKey && calls <= 2) {
+        expect(payload).toEqual(body);
         return route.fulfill({
           status: calls === 1 ? 202 : 200,
           json: {
@@ -279,9 +283,24 @@ test("Production : replay exact et nouvelle clé refusée pendant un batch actif
             subject_ids: body.subject_ids,
           },
         });
+      }
+      if (key === firstKey) {
+        expect(payload).toEqual(conflictingBody);
+        return route.fulfill({
+          status: 409,
+          json: {
+            detail: {
+              code: "production_idempotency_conflict",
+              subject_ids: [],
+            },
+          },
+        });
+      }
+      expect(key).toBe(secondKey);
+      expect(payload).toEqual(body);
       return route.fulfill({
         status: 409,
-        json: { detail: "production_batch_idempotency_conflict" },
+        json: { detail: { code: "production_batch_active", subject_ids: [] } },
       });
     }
     return route.fulfill({ status: 404, json: {} });
@@ -289,7 +308,7 @@ test("Production : replay exact et nouvelle clé refusée pendant un batch actif
 
   await page.goto("/");
   const result = await page.evaluate(
-    async ({ url, payload, first, second }) => {
+    async ({ url, payload, conflictingPayload, first, second }) => {
       const post = (key: string) =>
         fetch(url, {
           method: "POST",
@@ -305,12 +324,24 @@ test("Production : replay exact et nouvelle clé refusée pendant un batch actif
       return {
         first: await post(first),
         replay: await post(first),
-        conflict: await post(second),
+        conflict: await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": first,
+          },
+          body: JSON.stringify(conflictingPayload),
+        }).then(async (response) => ({
+          status: response.status,
+          body: await response.json(),
+        })),
+        active: await post(second),
       };
     },
     {
       url: `/api/editions/${editionId}/production/batches`,
       payload: body,
+      conflictingPayload: conflictingBody,
       first: firstKey,
       second: secondKey,
     },
@@ -334,9 +365,15 @@ test("Production : replay exact et nouvelle clé refusée pendant un batch actif
   });
   expect(result.conflict).toEqual({
     status: 409,
-    body: { detail: "production_batch_idempotency_conflict" },
+    body: {
+      detail: { code: "production_idempotency_conflict", subject_ids: [] },
+    },
   });
-  expect(calls).toBe(3);
+  expect(result.active).toEqual({
+    status: 409,
+    body: { detail: { code: "production_batch_active", subject_ids: [] } },
+  });
+  expect(calls).toBe(4);
 });
 
 test("Production : édition archivée en lecture seule", async ({ page }) => {

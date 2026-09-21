@@ -451,20 +451,6 @@ export interface PublicationDocumentV2 extends Omit<
 
 export type PublicationDocument = BriefDocumentV1 | PublicationDocumentV2;
 
-/**
- * Start production of a subject.
- *
- * The edition is resolved server-side from the subject's editorial group, so
- * the subject page only needs the subject id.
- */
-export async function startSubjectProduction(
-  subjectId: string,
-): Promise<{ run_id: string; status: string }> {
-  return request(`/api/subjects/${subjectId}/production`, {
-    method: "POST",
-  });
-}
-
 export async function restartProductionWithNewSources(
   subjectId: string,
 ): Promise<{ run_id: string; replaced_run_id: string }> {
