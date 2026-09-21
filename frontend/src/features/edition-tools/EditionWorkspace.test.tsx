@@ -1,16 +1,24 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { EditorialBoardResult, EditorialGroup } from "../../api/editorial";
 import type { Edition } from "../../api/editions";
+import { startEditionProduction } from "../../api/production";
+import { fetchSelectionBoard, type SelectionBoard } from "../../api/selection";
 import {
   EditionNavigation,
   EditionToolSurface,
   EditionWorkspace,
   type EditionTool,
 } from "./EditionWorkspace";
+
+vi.mock("../../api/production", () => ({
+  startEditionProduction: vi.fn(),
+}));
+
+vi.mock("../../api/selection", () => ({
+  fetchSelectionBoard: vi.fn(),
+}));
 
 vi.mock("../discovery/DiscoveryPanel", () => ({
   DiscoveryPanel: ({
@@ -40,8 +48,18 @@ vi.mock("../fusion/FusionBoard", () => ({
   ),
 }));
 
-vi.mock("../../components/EditorialBoard", () => ({
-  EditorialBoard: () => <div data-testid="editorial-board" />,
+vi.mock("../selection/SelectionBoard", () => ({
+  SelectionBoard: ({
+    editionId,
+    readOnly,
+  }: {
+    editionId: string;
+    readOnly?: boolean;
+  }) => (
+    <div data-testid="tool-selection" data-read-only={String(readOnly)}>
+      Selection {editionId}
+    </div>
+  ),
 }));
 
 vi.mock("../edition-workflow/ProductionConsole", () => ({
@@ -102,51 +120,40 @@ const edition: Edition = {
   updated_at: "2026-08-29T10:00:00Z",
 };
 
-function editorialGroup(
-  id: string,
-  title: string,
-  subjectId: string | null,
-  status: EditorialGroup["status"],
-): EditorialGroup {
-  return {
-    id,
-    edition_id: EDITION_ID,
-    title,
-    outcome: "new_subject",
-    status,
-    subject_id: subjectId,
-    candidates: [],
-    score: {
-      impact: 0,
-      novelty: 0,
-      technical_depth: 0,
-      hunting_potential: 0,
-      actionability: 0,
-      source_quality: 0,
-      total: 0,
-      justifications: {},
+const selectionBoard = {
+  edition_id: EDITION_ID,
+  snapshot_id: "snapshot-1",
+  snapshot_version: 1,
+  counts: { undecided: 0, ignored: 1, selected: 3 },
+  recommendation: null,
+  items: [
+    {
+      title: "Sujet A",
+      state: "selected",
+      subject_id: "subject-a",
+      discovery_subject_id: "discovery-a",
     },
-    source_relationship_status: "verified",
-    needs_source_verification: false,
-    needs_source_expansion: false,
-    grouping_confidence: "high",
-    grouping_justification: "Test",
-    historical_comparison: null,
-    version: 1,
-  };
-}
-
-const board: EditorialBoardResult = {
-  groups: [
-    editorialGroup("group-a", "Sujet A", "subject-a", "selected"),
-    editorialGroup("group-b", "Sujet B", "subject-b", "selected"),
-    editorialGroup("group-c", "Sujet C", "subject-c", "rejected"),
+    {
+      title: "Sujet B",
+      state: "selected",
+      subject_id: "subject-b",
+      discovery_subject_id: "discovery-b",
+    },
+    {
+      title: "Sujet ignoré",
+      state: "ignored",
+      subject_id: "subject-ignored",
+      discovery_subject_id: "discovery-ignored",
+    },
   ],
-  selected_articles: 2,
-  ignored: 1,
-  undecided: 0,
-  automatic_selection: false,
-};
+} as SelectionBoard;
+
+beforeEach(() => {
+  vi.mocked(fetchSelectionBoard).mockResolvedValue(selectionBoard);
+  vi.mocked(startEditionProduction).mockReturnValue(
+    new Promise<never>(() => {}),
+  );
+});
 
 function renderSurface(tool: EditionTool, value = edition) {
   const client = new QueryClient({
@@ -230,6 +237,7 @@ describe("EditionToolSurface", () => {
   it.each([
     ["discovery", "tool-discovery"],
     ["fusion", "tool-fusion"],
+    ["selection", "tool-selection"],
     ["production", "tool-production"],
     ["review", "tool-review"],
     ["publication", "tool-publication"],
@@ -249,18 +257,67 @@ describe("EditionToolSurface", () => {
     );
   });
 
-  it("rend la sélection indépendamment des autres capacités", async () => {
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() => Promise.resolve(Response.json(board))),
+  it("rend la sélection indépendamment des autres capacités", () => {
+    renderSurface("selection");
+    expect(screen.getByTestId("tool-selection")).toHaveAttribute(
+      "data-read-only",
+      "false",
     );
+  });
 
+  it("n’expose aucun contrôle de production sur la surface de sélection", () => {
     renderSurface("selection");
 
     expect(
-      await screen.findByRole("heading", { name: "2 sujets éligibles" }),
+      screen.queryByRole("button", { name: /Démarrer le lot de production/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("liste les sujets sélectionnés et soumet un sous-ensemble dans l’ordre canonique", async () => {
+    renderSurface("production");
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("checkbox", { name: "Sujet A" }),
+      ).toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Sujet B" }),
     ).toBeInTheDocument();
-    expect(screen.getByTestId("editorial-board")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Sujet ignoré")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Sujet B" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Sujet A" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Démarrer le lot de production" }),
+      ).not.toBeDisabled(),
+    );
+    screen
+      .getByRole("button", { name: "Démarrer le lot de production" })
+      .click();
+
+    await waitFor(() => {
+      expect(startEditionProduction).toHaveBeenCalledTimes(1);
+      expect(startEditionProduction).toHaveBeenCalledWith(EDITION_ID, [
+        "subject-a",
+        "subject-b",
+      ]);
+    });
+  });
+
+  it("ne propose pas de démarrer une production pour une édition archivée", async () => {
+    renderSurface("production", { ...edition, state: "archived" });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("tool-production")).toHaveAttribute(
+        "data-read-only",
+        "true",
+      ),
+    );
+    expect(
+      screen.queryByRole("button", { name: /Démarrer le lot de production/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("laisse la sélection disponible pendant une découverte active", () => {
@@ -284,63 +341,13 @@ describe("EditionToolSurface", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("transmet uniquement les sujets cochés dans l’ordre éditorial puis ouvre la supervision", async () => {
-    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
-      const url =
-        typeof input === "string"
-          ? input
-          : input instanceof URL
-            ? input.href
-            : input.url;
-      if (init?.method === "POST") {
-        return Promise.resolve(Response.json({ batch_id: "batch-1" }));
-      }
-      if (url.includes("editorial-groups")) {
-        return Promise.resolve(Response.json(board));
-      }
-      return Promise.resolve(Response.json({}));
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    renderSurface("selection");
-    const user = userEvent.setup();
-    await user.click(await screen.findByRole("checkbox", { name: "Sujet B" }));
-    await user.click(screen.getByRole("checkbox", { name: "Sujet A" }));
-    await user.click(
-      screen.getByRole("button", { name: "Lancer la production de 2 sujets" }),
-    );
-
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some(([, init]) => init?.method === "POST"),
-      ).toBe(true),
-    );
-    const post = fetchMock.mock.calls.find(
-      ([, init]) => init?.method === "POST",
-    );
-    expect(post?.[1]?.body).toBe(
-      JSON.stringify({ subject_ids: ["subject-a", "subject-b"] }),
-    );
-    await waitFor(() =>
-      expect(window.location.pathname).toBe(
-        `/editions/${EDITION_ID}/production`,
-      ),
-    );
-  });
-
-  it("ne montre pas les contrôles de lot pour une édition archivée", async () => {
+  it("rend la sélection en lecture seule pour une édition archivée", () => {
     const archived: Edition = { ...edition, state: "archived" };
 
     renderSurface("selection", archived);
-
-    await waitFor(() =>
-      expect(screen.getByTestId("editorial-board")).toBeInTheDocument(),
+    expect(screen.getByTestId("tool-selection")).toHaveAttribute(
+      "data-read-only",
+      "true",
     );
-    expect(
-      screen.queryByRole("heading", { name: /sujet.*éligible/i }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: /production/i }),
-    ).not.toBeInTheDocument();
   });
 });

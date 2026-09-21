@@ -87,17 +87,6 @@ test("une réponse ChatGPT incomplète expose les trois récupérations humaines
         json: { batches: [], candidates: [], total: 0, warning: "provisoire" },
       });
     }
-    if (path.includes("/editorial-groups")) {
-      return route.fulfill({
-        json: {
-          groups: [],
-          selected_articles: 0,
-          ignored: 0,
-          undecided: 0,
-          automatic_selection: false,
-        },
-      });
-    }
     if (path.endsWith("/events")) return route.fulfill({ status: 204 });
     if (path === `/api/jobs/${jobId}`) {
       return route.fulfill({

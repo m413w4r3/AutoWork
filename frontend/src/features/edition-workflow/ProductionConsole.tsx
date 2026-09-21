@@ -205,9 +205,6 @@ export function ProductionConsole({
       void queryClient.invalidateQueries({
         queryKey: ["edition-review", editionId],
       });
-      void queryClient.invalidateQueries({
-        queryKey: ["editorial-board", editionId],
-      });
     },
   });
 

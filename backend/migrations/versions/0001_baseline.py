@@ -23,6 +23,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     model_execution,
     production,
     publication_review,
+    selection,
 )
 from cti_app.infrastructure.database.models.base import Base
 
@@ -141,6 +142,16 @@ _GUARD_FUNCTIONS: tuple[tuple[str, str], ...] = (
         BEGIN
             RAISE EXCEPTION 'subject_contributions is append-only'
                 USING ERRCODE = '55000';
+        END;
+        $$ LANGUAGE plpgsql
+        """,
+    ),
+    (
+        "reject_selection_mutation",
+        """
+        CREATE FUNCTION reject_selection_mutation() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION '% is append-only', TG_TABLE_NAME USING ERRCODE = '55000';
         END;
         $$ LANGUAGE plpgsql
         """,
@@ -327,6 +338,18 @@ _TRIGGERS: tuple[tuple[str, str, str, str], ...] = (
         "subject_contributions",
         "trg_subject_contributions_append_only",
         "reject_subject_contributions_mutation",
+        "append_only",
+    ),
+    (
+        "selection_decisions",
+        "trg_selection_decisions_append_only",
+        "reject_selection_mutation",
+        "append_only",
+    ),
+    (
+        "subject_discovery_origins",
+        "trg_subject_discovery_origins_append_only",
+        "reject_selection_mutation",
         "append_only",
     ),
     (

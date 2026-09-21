@@ -1,5 +1,9 @@
 # Parcours evidence-first d’une brève
 
+> **Document historique / legacy.** Ce parcours et ses endpoints sont hors du workflow cible
+> AW-008. Ils ne décrivent pas la Selection actuelle et ne doivent pas être utilisés pour
+> interpréter les décisions `SELECT` ou `IGNORE` d’un `Subject`.
+
 ## Pack gelé
 
 `POST /api/subjects/{subject_id}/brief/freeze` est une action explicite, réservée à un groupe

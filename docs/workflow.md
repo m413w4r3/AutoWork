@@ -13,9 +13,9 @@ des `ProductionStatus` et des étapes différentes : l’avancement se lit au
 niveau de chaque sujet, sans phase de production portée par l’édition.
 
 Discovery, Fusion et Selection sont des capacités accessibles indépendamment depuis l'édition.
-Discovery produit et versionne les `DiscoveryCandidate`, Fusion propose et enregistre les
-regroupements explicables, et Selection décide quels candidats/projections deviennent des sujets
-éditoriaux. Il n'existe ni nouvelle phase globale obligatoire, ni état `fusion_complete`.
+Discovery produit et versionne les `DiscoveryCandidate`, Fusion décide et versionne les
+regroupements explicables, et Selection décide si un `DiscoverySubject` doit devenir un `Subject`.
+Il n'existe ni nouvelle phase globale obligatoire, ni état `fusion_complete`.
 
 Le Dashboard de l’édition donne la vue d’ensemble et permet d’accéder aux
 capacités indépendantes. Ces destinations de navigation ne représentent ni
@@ -95,7 +95,7 @@ Le résultat affiché est une liste de cartes :
 | Potentiel de chasse      | Élevé                          |
 | Nouveauté                | Nouvelle chaîne d’infection    |
 | Déjà traité              | Non                            |
-| Proposition              | Article principal              |
+| État de Fusion           | Groupe `DiscoverySubject`      |
 
 Les signaux de compatibilité ne reposent pas seulement sur le titre. Ils utilisent les URLs,
 dates, acteurs, familles, hash, IOC et similarité du contenu. Ils n'effacent ni ne fusionnent les
@@ -103,22 +103,29 @@ candidats : un sujet déjà traité peut apparaître comme « mise à jour », p
 
 ### 3. Sélection éditoriale
 
-L’utilisateur peut, dans Selection :
+Fusion décide la structure ; Selection décide s’il faut matérialiser un `Subject` ;
+`Subject` est stable ; Production décide quand produire ce `Subject`.
 
-* sélectionner ou rejeter un sujet ;
-* choisir `article principal` ou `brève` ;
-* ajouter une publication manquante ;
-* modifier le TLP ou la priorité.
+L’utilisateur peut, dans Selection, traiter un groupe du snapshot actif (`SELECT`) ou
+l’ignorer (`IGNORE`). Ces décisions sont les seules écritures de la route `/selection`.
+Selection ne compose pas le lot de production, ne choisit pas `brief` ou `major`, et ne
+lance aucun batch. La matérialisation d’un `Subject` est atomique avec la décision `SELECT`.
+La production reprend ensuite le `subject_id` canonique quand elle constitue son prochain lot.
 
 Les actions `merge` et `split` sont effectuées dans Fusion, sur des UUID métier et un
 `snapshot_version`. La revue Fusion reste lisible pour une édition `ARCHIVED`, mais ses décisions
 et toute autre mutation y sont interdites.
 
-À la validation, l’application crée automatiquement l’arborescence du sujet.
+À la décision `SELECT`, l’application matérialise atomiquement le `Subject` et son
+`SubjectDiscoveryOrigin`. Une décision `IGNORE` conserve l’historique sans créer de `Subject`.
 
-C’est le premier gate humain important : **le modèle propose, l’utilisateur compose l’édition**.
+C’est le gate humain de matérialisation : **le modèle propose, Fusion structure, l’utilisateur
+décide si un Subject doit exister**.
 
-## Parcours d’une brève
+## Production d’un Subject
+
+Les parcours de rédaction et d’analyse ci-dessous décrivent la Production d’un `Subject` déjà
+matérialisé ; ils ne constituent pas des choix `brief`/`major` de Selection.
 
 ### 4A. Constitution du dossier de preuves
 
@@ -145,7 +152,8 @@ La brève est générée à partir du dossier de preuves :
 * sources ;
 * IOC associés.
 
-L’application affiche chaque affirmation avec sa preuve. L’utilisateur peut corriger, valider ou promouvoir le sujet en article principal.
+L’application affiche chaque affirmation avec sa preuve. Les choix de forme et de cadence sont
+des décisions de Production, après matérialisation du `Subject`.
 
 Après validation, le parcours s’arrête. Aucune chasse étendue ni règle YARA n’est lancée par défaut.
 
@@ -337,8 +345,8 @@ Depuis ce Dashboard, les capacités sont indépendantes :
 
 * `/editions/{edition_id}/discovery` — découverte et lecture des candidats.
 * `/editions/{edition_id}/fusion` — revue, résolution, fusion et séparation explicables.
-* `/editions/{edition_id}/selection` — sélection éditoriale et composition du lot.
-* `/editions/{edition_id}/production` — production des sujets et suivi des traitements.
+* `/editions/{edition_id}/selection` — décisions `SELECT` ou `IGNORE` sur le snapshot actif.
+* `/editions/{edition_id}/production` — choix du prochain `subject_id`, production et suivi des traitements.
 * `/editions/{edition_id}/review` — revue des articles et validation éditoriale.
 * `/editions/{edition_id}/publication` — assemblage, publication et téléchargement.
 
@@ -356,7 +364,7 @@ Le workbench pourrait utiliser ces onglets :
 | Discovery et signaux de compatibilité | Oui          | Revue des candidats                   |
 | Fusion (merge/split)      | Proposition              | Décision humaine et résolution         |
 | Extraction technique      | Oui                      | Correction des ambiguïtés importantes |
-| Rédaction d’une brève     | Oui                      | Validation finale                     |
+| Production d’un Subject   | Oui                      | Validation finale                     |
 | Plan de rétroconception   | Proposition              | Réalisation/interprétation            |
 | Pivots                    | Proposition et exécution | Autorisation du plan                  |
 | Regroupement des hits     | Oui                      | Validation du corpus                  |

@@ -176,8 +176,9 @@ Propose tous les sujets significatifs retrouvés. Il n’existe aucune limite ni
 quota de sujets, de brèves ou d’articles approfondis. La sélection finale sera
 effectuée par un analyste humain.
 
-Regroupe dans un même SUBJECT les publications décrivant manifestement la même
-campagne, le même incident ou la même recherche.
+Propose les relations de structure entre publications décrivant manifestement la même
+campagne, le même incident ou la même recherche ; Fusion décide ensuite l’identité du
+`DiscoverySubject`.
 
 Une synthèse mensuelle ou trimestrielle peut être liée à plusieurs SUBJECT.
 Ne fusionne pas des campagnes différentes uniquement parce qu’elles sont
@@ -187,7 +188,7 @@ Chaque SUBJECT doit normalement comporter au moins une publication dans la
 période observable. Les publications antérieures peuvent être ajoutées comme
 rapport original, analyse indépendante ou contexte technique.
 
-Limite cette phase à la sélection éditoriale. N’effectue pas encore l’analyse
+Limite cette phase à la découverte et à la proposition de structure. N’effectue pas encore l’analyse
 exhaustive de la chaîne d’infection, des TTP, des outils ou de la victimologie.
 
 Pour les IOC :
@@ -329,6 +330,9 @@ nouvelles identités.
 
 ## Capacité Fusion
 
+Fusion décide la structure ; Selection décide s’il faut matérialiser un `Subject` ; `Subject` est
+stable ; Production décide quand produire ce `Subject`.
+
 Vocabulaire :
 
 - `DiscoveryCandidate` = proposition brute canonique ;
@@ -337,6 +341,10 @@ Vocabulaire :
 - `Subject` = objet éditorial créé seulement après sélection (AW-008).
 
 La fusion appartient à Discovery/Fusion ; la sélection ne restructure pas les groupes.
+Fusion crée et modifie les identités `DiscoverySubject` ainsi que les `DiscoverySnapshot`, mais
+ne crée et ne modifie jamais un `Subject`. Selection consomme le snapshot actif pour prendre une
+décision `SELECT` ou `IGNORE`. La détection d’un conflit entre un groupe sélectionné et un sujet
+existant s’appuie sur `SubjectDiscoveryOrigin`, jamais sur un titre ou une position d’interface.
 
 Fusion est une capacité indépendante qui lit exclusivement les `DiscoveryCandidate` actifs, le
 snapshot actif et les merge runs, sans modifier l'identité des candidates. La réconciliation

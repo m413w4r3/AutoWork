@@ -11,13 +11,13 @@ from cti_app.api.discovery import router as discovery_router
 from cti_app.api.discovery_merge import merge_runs_router
 from cti_app.api.discovery_recovery import router as discovery_recovery_router
 from cti_app.api.editions import router as editions_router
-from cti_app.api.editorial import router as editorial_router
 from cti_app.api.fusion import fusion_router
 from cti_app.api.health import router as health_router
 from cti_app.api.jobs import router as jobs_router
 from cti_app.api.model_conversations import router as model_conversations_router
 from cti_app.api.production import router as production_router
 from cti_app.api.publication import router as publication_router
+from cti_app.api.selection import selection_router
 from cti_app.api.subject_content import router as subject_content_router
 from cti_app.api.subjects import router as subjects_router
 from cti_app.application.blobs import BlobCatalogService
@@ -50,7 +50,7 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
 )
 from cti_app.application.editions import EditionService
-from cti_app.application.editorial import EditorialGroupingService
+from cti_app.application.editorial import LegacyEditorialProjectionService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -73,6 +73,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionService,
 )
+from cti_app.application.selection import SelectionBoard, SelectionService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subject_production import (
     EditionProductionService,
@@ -117,10 +118,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         physical_bucket=settings.s3_bucket,
     )
-    editorial_service = EditorialGroupingService(
+    legacy_editorial_projection_service = LegacyEditorialProjectionService(uow_factory)
+
+    async def project_selection_board(board: SelectionBoard) -> object:
+        return await legacy_editorial_projection_service.synchronize(board.edition_id)
+
+    selection_service = SelectionService(
         uow_factory,
         materializer=SubjectWorkspaceMaterializer(blob_store),
         workspace_root=settings.subject_workspace_root,
+        post_commit_projection=project_selection_board,
     )
     production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
     # Exactly one bridge capabilities provider for this process: it also
@@ -134,7 +141,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             model_gateway,
             bridge_capabilities_provider=bridge_provider,
         ),
-        after_activation=editorial_service.synchronize,
         diagnostics=production_diagnostics,
     )
     job_service: JobService
@@ -182,7 +188,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     cumulative_discovery_service.set_replan_intake(replan_discovery_intake)
     fusion_service = FusionService(
         uow_factory,
-        after_activation=editorial_service.synchronize,
         replan_intake=replan_discovery_intake,
     )
 
@@ -290,8 +295,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.discovery_run_service = discovery_run_service
     app.state.cumulative_discovery_service = cumulative_discovery_service
     app.state.fusion_service = fusion_service
+    app.state.selection_service = selection_service
     app.state.manual_source_edit_service = manual_source_edit_service
-    app.state.editorial_service = editorial_service
     app.state.collection_service = collection_service
     app.state.collection_review_service = collection_review_service
     app.state.subject_production_service = subject_production_service
@@ -380,12 +385,12 @@ def create_app() -> FastAPI:
     application.include_router(discovery_recovery_router)
     application.include_router(merge_runs_router)
     application.include_router(fusion_router)
-    application.include_router(editorial_router)
     application.include_router(jobs_router)
     application.include_router(collection_router)
     application.include_router(model_conversations_router)
     application.include_router(production_router)
     application.include_router(publication_router)
+    application.include_router(selection_router)
     application.include_router(subjects_router)
     application.include_router(subject_content_router)
     return application

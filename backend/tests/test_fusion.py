@@ -21,6 +21,8 @@ from cti_app.application.discovery.cumulative.planners import HeuristicMergePlan
 from cti_app.application.discovery.cumulative.validation import validate_candidate_coverage
 from cti_app.application.discovery.fusion import (
     FusionReviewAction,
+    FusionSelectedSubjectConflictError,
+    FusionService,
     _coalesce_existing_targets,
     _model_suggestion,
     _signals,
@@ -39,8 +41,77 @@ from cti_app.domain.discovery_cumulative import (
     MergeEvidence,
     MergeValidationStatus,
 )
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 from tests.discovery_support import canonical_candidates_for
 from tests.test_discovery_cumulative import _batch, _candidate, _intake
+
+
+class _FusionOriginGuardUow:
+    def __init__(self, identities, origins) -> None:
+        self._identities = identities
+        self._origins = origins
+
+        class _Identities:
+            async def list_for_edition(inner_self, _edition_id):
+                return self._identities
+
+        class _Origins:
+            async def list_for_edition(inner_self, _edition_id):
+                return self._origins
+
+        self.discovery_subject_identities = _Identities()
+        self.subject_discovery_origins = _Origins()
+
+
+async def _guard_fixture():
+    edition_id = uuid4()
+    batch = _batch(
+        edition_id,
+        [
+            _candidate("First", "https://example.test/one"),
+            _candidate("Second", "https://example.test/two"),
+        ],
+    )
+    intake = _intake(batch)
+    candidates = tuple(
+        DiscoveryCandidate.from_candidate_topic(
+            item,
+            discovery_run_id=batch.discovery_run_id,
+            discovery_batch_id=batch.id,
+            position=index,
+        )
+        for index, item in enumerate(batch.candidates)
+    )
+    delta = build_discovery_delta(intake, candidates)
+    handles = build_merge_handles(None, delta)
+    outcome = await HeuristicMergePlanner().plan(
+        None,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=False,
+        sensitivity="internal",
+    )
+    run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=None,
+        intake=intake,
+        delta=delta,
+        planner=HeuristicMergePlanner(),
+        handles=handles,
+    )
+    applied = apply_plan(
+        None,
+        delta,
+        outcome.plan,
+        candidates,
+        resolved_handles=handles,
+        planner_kind=run.planner_kind,
+        edition_id=edition_id,
+        intake_id=intake.id,
+        merge_run_id=run.id,
+    )
+    return edition_id, candidates, applied
 
 
 @pytest.mark.asyncio
@@ -114,6 +185,61 @@ async def test_structural_merge_and_split_reorganize_memberships_only() -> None:
     assert len(split.snapshot.subjects) == 2
     assert len(split.identities) == 1
     assert not split.contributions
+
+
+def _origin(edition_id, snapshot, discovery_subject_id, subject_id):
+    return SubjectDiscoveryOrigin(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        discovery_subject_id=discovery_subject_id,
+        selection_decision_id=uuid4(),
+        selected_snapshot_id=snapshot.id,
+        selected_snapshot_version=snapshot.version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_selected_origin_and_undecided_subject_can_be_merged() -> None:
+    edition_id, candidates, initial = await _guard_fixture()
+    subjects = initial.snapshot.subjects
+    merged = apply_structural_subject_merge(
+        initial.snapshot,
+        candidates,
+        edition_id=edition_id,
+        subject_ids=tuple(subject.subject_id for subject in subjects),
+        merge_run_id=uuid4(),
+        actor_id="analyst",
+    )
+    uow = _FusionOriginGuardUow(
+        initial.identities,
+        [_origin(edition_id, initial.snapshot, subjects[0].subject_id, uuid4())],
+    )
+
+    await FusionService._ensure_selected_subjects_are_not_merged(uow, edition_id, merged)
+
+
+@pytest.mark.asyncio
+async def test_two_distinct_selected_origins_reject_merge_before_writes() -> None:
+    edition_id, candidates, initial = await _guard_fixture()
+    subjects = initial.snapshot.subjects
+    merged = apply_structural_subject_merge(
+        initial.snapshot,
+        candidates,
+        edition_id=edition_id,
+        subject_ids=tuple(subject.subject_id for subject in subjects),
+        merge_run_id=uuid4(),
+        actor_id="analyst",
+    )
+    uow = _FusionOriginGuardUow(
+        initial.identities,
+        [
+            _origin(edition_id, initial.snapshot, subjects[0].subject_id, uuid4()),
+            _origin(edition_id, initial.snapshot, subjects[1].subject_id, uuid4()),
+        ],
+    )
+
+    with pytest.raises(FusionSelectedSubjectConflictError):
+        await FusionService._ensure_selected_subjects_are_not_merged(uow, edition_id, merged)
 
 
 def test_delta_is_built_from_persisted_candidates_only() -> None:

@@ -1,0 +1,417 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+from datetime import date
+from typing import Any
+from uuid import UUID
+
+import pytest
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+
+from cti_app.api.selection import selection_router
+from cti_app.api.subjects import router as subjects_router
+from cti_app.application.discovery.cumulative.service import CumulativeDiscoveryService
+from cti_app.application.discovery.cumulative.types import (
+    DiscoveryDelta,
+    PlannedDiscoveryMerge,
+    ResolvedMergeHandles,
+)
+from cti_app.application.discovery.fusion import FusionService
+from cti_app.application.identity import LocalIdentityProvider
+from cti_app.application.selection import SelectionService
+from cti_app.application.subjects import SubjectService
+from cti_app.domain.classification import TLP
+from cti_app.domain.discovery import (
+    CandidateTopic,
+    DiscoveryBatch,
+    DiscoverySourceMode,
+    SourceCandidate,
+    SourceRole,
+)
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryInputMode,
+    DiscoveryMergeGroup,
+    DiscoveryMergePlanV1,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    MergeConfidence,
+    MergeDisposition,
+)
+from cti_app.domain.editions import Edition
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
+from cti_app.domain.selection import SelectionAction
+from tests.discovery_support import make_discovery_run_for_edition, persist_batch_with_candidates
+
+pytestmark = pytest.mark.integration
+
+
+class ApplyPlanner:
+    kind = DiscoveryPlannerKind.HEURISTIC
+    policy_version = "selection-integration-apply-v1"
+
+    async def plan(
+        self,
+        parent_snapshot: DiscoverySnapshot | None,
+        delta: DiscoveryDelta,
+        handles: ResolvedMergeHandles,
+        *,
+        edition_id: UUID,
+        external_llm_allowed: bool,
+        sensitivity: str,
+    ) -> PlannedDiscoveryMerge:
+        del parent_snapshot, delta, edition_id, external_llm_allowed, sensitivity
+        return PlannedDiscoveryMerge(
+            DiscoveryMergePlanV1(
+                groups=[
+                    DiscoveryMergeGroup(
+                        existing_subject_handles=[],
+                        incoming_candidate_handles=[handle],
+                        confidence=MergeConfidence.HIGH,
+                        disposition=MergeDisposition.APPLY,
+                        rationale="selection integration test",
+                    )
+                    for handle in sorted(handles.incoming)
+                ]
+            )
+        )
+
+
+def _application(uow_factory: Any) -> FastAPI:
+    application = FastAPI()
+    application.include_router(selection_router)
+    application.include_router(subjects_router)
+    application.state.selection_service = SelectionService(uow_factory)
+    application.state.subject_service = SubjectService(uow_factory)
+    application.state.identity_provider = LocalIdentityProvider("selection-analyst")
+    return application
+
+
+def _edition(country_code: str) -> Edition:
+    # The PostgreSQL database is shared by every integration test of the
+    # session and editions are unique per (country_code, period): each
+    # scenario therefore needs its own alpha-2 code.
+    return Edition(
+        country=f"Selection integration Iran {country_code}",
+        country_code=country_code,
+        period_start=date(2026, 7, 1),
+        period_end=date(2026, 7, 31),
+        tlp=TLP.AMBER,
+        languages=("fr", "en"),
+    )
+
+
+def _model_run() -> ModelRun:
+    suffix = "selection-workflow"
+    return ModelRun(
+        provider=ModelProvider.FAKE,
+        model_role=ModelRole.RESEARCH,
+        requested_model="fake",
+        prompt_template_id="selection-integration",
+        prompt_template_version="1",
+        authorized_input_hash=hashlib.sha256(f"authorized:{suffix}".encode()).hexdigest(),
+        evidence_pack_hash=hashlib.sha256(f"evidence:{suffix}".encode()).hexdigest(),
+        parameters={},
+    )
+
+
+def _batch(
+    edition_id: UUID,
+    model_run_id: UUID,
+    discovery_run_id: UUID,
+    *,
+    title: str,
+    url: str,
+    local_ref: str,
+    request_hash: str,
+) -> DiscoveryBatch:
+    candidate = CandidateTopic(
+        title=title,
+        summary=f"Summary for {title}",
+        novelty="New evidence",
+        technical_potential=4,
+        uncertainties=("Attribution pending",),
+        relevance_reasons=("Technical source",),
+        actors=("Actor",),
+        campaigns=("Campaign",),
+        malware=("Malware",),
+        cves=(),
+        victims=(),
+        sectors=("government",),
+        countries=("Iran",),
+        likely_artifacts=("ioc",),
+        sources=[
+            SourceCandidate(
+                url=url,
+                title=f"Report {local_ref}",
+                publisher="Vendor",
+                role=SourceRole.PRIMARY,
+                tlp=TLP.AMBER,
+                sensitivity="internal",
+                external_llm_allowed=True,
+            )
+        ],
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        local_ref=local_ref,
+    )
+    return DiscoveryBatch(
+        edition_id=edition_id,
+        request_hash=request_hash,
+        complementary_axis="initial",
+        queries=(),
+        citations=(),
+        candidates=[candidate],
+        discovery_run_id=discovery_run_id,
+        discovery_model_run_id=model_run_id,
+        tlp=TLP.AMBER,
+        sensitivity="internal",
+        external_llm_allowed=True,
+        parser_version="selection-integration-v1",
+        report_sha256=request_hash,
+        source_mode=DiscoverySourceMode.MODEL_DECLARED_URLS,
+    )
+
+
+async def _seed(
+    uow_factory: Any, country_code: str
+) -> tuple[Edition, ModelRun, DiscoverySnapshot, UUID]:
+    edition = _edition(country_code)
+    model_run = _model_run()
+    async with uow_factory() as uow:
+        assert await uow.editions.add_if_absent(edition)
+        await uow.model_runs.add(model_run)
+        await uow.commit()
+    discovery_run = await make_discovery_run_for_edition(uow_factory, edition)
+    batch = _batch(
+        edition.id,
+        model_run.id,
+        discovery_run.id,
+        title="Canonical selection subject",
+        url="https://vendor.example/selection-a",
+        local_ref="A",
+        request_hash="a" * 64,
+    )
+    async with uow_factory() as uow:
+        await persist_batch_with_candidates(uow, batch)
+        await uow.commit()
+    _, snapshot = await CumulativeDiscoveryService(
+        uow_factory, planner=ApplyPlanner()
+    ).reconcile_batch(
+        batch,
+        input_mode=DiscoveryInputMode.BRIDGE_RESEARCH,
+        actor_id="selection-analyst",
+    )
+    return edition, model_run, snapshot, snapshot.subjects[0].member_references[0].candidate_id
+
+
+def _client(application: FastAPI) -> AsyncClient:
+    return AsyncClient(transport=ASGITransport(app=application), base_url="http://test")
+
+
+async def _selection_identity(uow_factory: Any, edition_id: UUID) -> UUID:
+    async with uow_factory() as uow:
+        snapshot = await uow.discovery_snapshots.get_active(edition_id)
+    assert snapshot is not None
+    assert len(snapshot.subjects) == 1
+    identity_id: UUID = snapshot.subjects[0].subject_id
+    return identity_id
+
+
+@pytest.mark.asyncio
+async def test_selection_api_materializes_atomically_and_replays_idempotently(
+    uow_factory: Any,
+) -> None:
+    edition, _, snapshot, _ = await _seed(uow_factory, "SI")
+    application = _application(uow_factory)
+    identity = await _selection_identity(uow_factory, edition.id)
+    body = {
+        "snapshot_version": snapshot.version,
+        "decisions": [{"discovery_subject_id": str(identity), "action": "select"}],
+    }
+
+    async with _client(application) as client:
+        initial = await client.get(f"/api/editions/{edition.id}/selection")
+        first = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "select-a"},
+            json=body,
+        )
+        replay = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "select-a"},
+            json=body,
+        )
+        subjects = await client.get(f"/api/editions/{edition.id}/subjects")
+
+    assert initial.status_code == 200
+    assert initial.json()["undecided"] == 1
+    assert first.status_code == replay.status_code == 200
+    assert first.json()["items"][0]["effective_state"] == "selected"
+    assert first.json()["items"][0]["subject_id"] == replay.json()["items"][0]["subject_id"]
+    assert subjects.status_code == 200
+    assert len(subjects.json()) == 1
+    subject_id = subjects.json()[0]["id"]
+    assert first.json()["items"][0]["subject_id"] == subject_id
+
+    async with uow_factory() as uow:
+        decisions = list(await uow.selection_decisions.list_for_edition(edition.id))
+        origins = list(await uow.subject_discovery_origins.list_for_edition(edition.id))
+        stored_subjects = list(await uow.subjects.list_for_edition(edition.id))
+    assert len(decisions) == len(origins) == len(stored_subjects) == 1
+    assert decisions[0].action is SelectionAction.SELECT
+    assert decisions[0].snapshot_id == snapshot.id
+    assert decisions[0].snapshot_version == snapshot.version
+    assert decisions[0].subject_id == stored_subjects[0].id
+    assert origins[0].selection_decision_id == decisions[0].id
+    assert origins[0].subject_id == stored_subjects[0].id
+    assert origins[0].discovery_subject_id == identity
+    assert origins[0].selected_snapshot_id == snapshot.id
+    assert origins[0].selected_snapshot_version == snapshot.version
+
+
+@pytest.mark.asyncio
+async def test_ignore_then_select_keeps_append_only_ignore_history(uow_factory: Any) -> None:
+    edition, _, snapshot, _ = await _seed(uow_factory, "SJ")
+    application = _application(uow_factory)
+    identity = await _selection_identity(uow_factory, edition.id)
+    async with _client(application) as client:
+        ignored = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "ignore-a"},
+            json={
+                "snapshot_version": snapshot.version,
+                "decisions": [{"discovery_subject_id": str(identity), "action": "ignore"}],
+            },
+        )
+        selected = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "select-a-after-ignore"},
+            json={
+                "snapshot_version": snapshot.version,
+                "decisions": [{"discovery_subject_id": str(identity), "action": "select"}],
+            },
+        )
+    assert ignored.status_code == selected.status_code == 200
+    assert selected.json()["selected"] == 1
+    assert selected.json()["items"][0]["subject_id"] is not None
+
+    async with uow_factory() as uow:
+        decisions = list(await uow.selection_decisions.list_for_edition(edition.id))
+        origins = list(await uow.subject_discovery_origins.list_for_edition(edition.id))
+        subjects = list(await uow.subjects.list_for_edition(edition.id))
+    assert [decision.action for decision in decisions] == [
+        SelectionAction.IGNORE,
+        SelectionAction.SELECT,
+    ]
+    assert len(origins) == len(subjects) == 1
+    assert decisions[0].subject_id is None
+    assert decisions[1].subject_id == subjects[0].id
+    assert origins[0].selection_decision_id == decisions[1].id
+
+
+@pytest.mark.asyncio
+async def test_concurrent_selects_materialize_one_subject_and_origin(uow_factory: Any) -> None:
+    edition, _, snapshot, _ = await _seed(uow_factory, "SK")
+    application = _application(uow_factory)
+    identity = await _selection_identity(uow_factory, edition.id)
+    body = {
+        "snapshot_version": snapshot.version,
+        "decisions": [{"discovery_subject_id": str(identity), "action": "select"}],
+    }
+
+    async def submit(key: str) -> int:
+        async with _client(application) as client:
+            response = await client.post(
+                f"/api/editions/{edition.id}/selection/decisions",
+                headers={"Idempotency-Key": key},
+                json=body,
+            )
+            assert response.status_code in {200, 409}
+            return response.status_code
+
+    statuses = await asyncio.gather(submit("concurrent-a"), submit("concurrent-b"))
+    assert all(status in {200, 409} for status in statuses)
+    async with uow_factory() as uow:
+        decisions = list(await uow.selection_decisions.list_for_edition(edition.id))
+        origins = list(await uow.subject_discovery_origins.list_for_edition(edition.id))
+        subjects = list(await uow.subjects.list_for_edition(edition.id))
+    assert len(subjects) == len(origins) == 1
+    assert len(decisions) == 1
+    assert origins[0].subject_id == subjects[0].id == decisions[0].subject_id
+
+
+@pytest.mark.asyncio
+async def test_selected_subject_survives_enrichment_in_a_later_snapshot(
+    uow_factory: Any,
+) -> None:
+    edition, model_run, first_snapshot, _ = await _seed(uow_factory, "SM")
+    application = _application(uow_factory)
+    first_identity = await _selection_identity(uow_factory, edition.id)
+    first_candidate_id = first_snapshot.subjects[0].member_references[0].candidate_id
+
+    async with _client(application) as client:
+        selected = await client.post(
+            f"/api/editions/{edition.id}/selection/decisions",
+            headers={"Idempotency-Key": "enrichment-select"},
+            json={
+                "snapshot_version": first_snapshot.version,
+                "decisions": [{"discovery_subject_id": str(first_identity), "action": "select"}],
+            },
+        )
+    assert selected.status_code == 200
+    subject_id = selected.json()["items"][0]["subject_id"]
+
+    async with uow_factory() as uow:
+        runs = list(await uow.discovery_runs.list_for_edition(edition.id))
+    discovery_run_id = runs[0].id
+    second_batch = _batch(
+        edition.id,
+        model_run.id,
+        discovery_run_id,
+        title="Enrichment candidate",
+        url="https://vendor.example/selection-b",
+        local_ref="B",
+        request_hash="b" * 64,
+    )
+    async with uow_factory() as uow:
+        await persist_batch_with_candidates(uow, second_batch)
+        await uow.commit()
+    _, second_snapshot = await CumulativeDiscoveryService(
+        uow_factory, planner=ApplyPlanner()
+    ).reconcile_batch(
+        second_batch,
+        input_mode=DiscoveryInputMode.BRIDGE_RESEARCH,
+        actor_id="selection-analyst",
+    )
+    second_identity = next(
+        item.subject_id for item in second_snapshot.subjects if item.subject_id != first_identity
+    )
+    second_candidate_id = next(
+        reference.candidate_id
+        for item in second_snapshot.subjects
+        if item.subject_id == second_identity
+        for reference in item.member_references
+    )
+    merged = await FusionService(uow_factory).merge(
+        edition.id,
+        snapshot_version=second_snapshot.version,
+        discovery_subject_ids=(first_identity, second_identity),
+        actor_id="selection-analyst",
+    )
+    assert merged.snapshot_version == second_snapshot.version + 1
+
+    async with _client(application) as client:
+        board = await client.get(f"/api/editions/{edition.id}/selection")
+    assert board.status_code == 200
+    item = next(item for item in board.json()["items"] if item["subject_id"] == subject_id)
+    assert item["effective_state"] == "selected"
+    assert item["updated_since_decision"] is True
+    assert set(item["member_candidate_ids"]) == {
+        str(first_candidate_id),
+        str(second_candidate_id),
+    }
+    async with uow_factory() as uow:
+        assert len(await uow.subjects.list_for_edition(edition.id)) == 1

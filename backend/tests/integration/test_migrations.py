@@ -67,6 +67,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     model_execution,
     production,
     publication_review,
+    selection,
 )
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config
@@ -191,6 +192,11 @@ EXPECTED_TRIGGERS: dict[tuple[str, str], str] = {
         "subject_contributions",
         "trg_subject_contributions_append_only",
     ): "reject_subject_contributions_mutation",
+    ("selection_decisions", "trg_selection_decisions_append_only"): "reject_selection_mutation",
+    (
+        "subject_discovery_origins",
+        "trg_subject_discovery_origins_append_only",
+    ): "reject_selection_mutation",
     ("reference_members", "reference_members_immutable"): "forbid_reference_mutation",
     (
         "reference_member_disputes",

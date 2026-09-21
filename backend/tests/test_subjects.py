@@ -93,6 +93,36 @@ async def test_materialize_inherits_tlp_and_uses_subject_id_in_slug() -> None:
 
 
 @pytest.mark.asyncio
+async def test_materialize_accepts_restrictive_initial_tlp_but_rejects_downgrade() -> None:
+    factory = InMemorySubjectUnitOfWorkFactory()
+    edition = _edition(tlp=TLP.GREEN)
+    factory.state[edition.id] = edition
+    service = SubjectService(factory)
+
+    subject = await service.materialize(
+        edition_id=edition.id,
+        title="Restricted subject",
+    )
+    assert subject.tlp is TLP.GREEN
+
+    async with factory() as uow:
+        restricted = await service.materialize_in_uow(
+            uow,
+            edition_id=edition.id,
+            title="Amber subject",
+            initial_tlp=TLP.AMBER,
+        )
+        assert restricted.tlp is TLP.AMBER
+        with pytest.raises(TlpDowngradeError):
+            await service.materialize_in_uow(
+                uow,
+                edition_id=edition.id,
+                title="Clear subject",
+                initial_tlp=TLP.CLEAR,
+            )
+
+
+@pytest.mark.asyncio
 async def test_materialize_rejects_missing_and_archived_editions() -> None:
     factory = InMemorySubjectUnitOfWorkFactory()
     service = SubjectService(factory)

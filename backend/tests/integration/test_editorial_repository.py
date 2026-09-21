@@ -59,11 +59,13 @@ async def test_editorial_group_round_trip_and_human_decision_is_append_only(
     )
     decision = HumanDecision(
         edition_id=edition.id,
-        decision_type=HumanDecisionType.REJECT,
+        # Selection decisions no longer live here (AW-008): use a decision type
+        # still emitted by application/collection_review.py.
+        decision_type=HumanDecisionType.CLAIM_REJECT,
         group_ids=(group.id,),
         actor_id="dev-analyst",
         correlation_id="editorial-repository-test",
-        payload={"reason": "hors périmètre"},
+        payload={"claim_id": str(uuid4()), "reason": "affirmation non étayée"},
     )
     try:
         async with SqlAlchemyUnitOfWork(session_factory) as uow:

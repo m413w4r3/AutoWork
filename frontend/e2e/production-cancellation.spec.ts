@@ -8,33 +8,8 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
   const batchId = "e5555555-5555-4555-8555-555555555555";
   const runId = "f6666666-6666-4666-8666-666666666666";
   let currentBatchStatus: "running" | "cancelled" = "running";
-
-  const group = {
-    id: "g1111111-1111-4111-8111-111111111111",
-    edition_id: editionId,
-    title: "Article à arrêter",
-    outcome: "new_subject",
-    status: "selected",
-    subject_id: subjectId,
-    candidates: [],
-    score: {
-      impact: 3,
-      novelty: 3,
-      technical_depth: 3,
-      hunting_potential: 3,
-      actionability: 3,
-      source_quality: 3,
-      total: 18,
-      justifications: {},
-    },
-    source_relationship_status: "verified",
-    needs_source_verification: false,
-    needs_source_expansion: false,
-    grouping_confidence: "high",
-    grouping_justification: "Sélection canonique.",
-    historical_comparison: null,
-    version: 1,
-  };
+  let batchStarted = false;
+  let productionPostBody: unknown = null;
 
   const edition = () => ({
     id: editionId,
@@ -50,12 +25,45 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
     updated_at: "2026-08-29T00:00:00Z",
   });
 
-  const board = {
-    groups: [group],
-    selected_articles: 1,
-    ignored: 0,
-    undecided: 0,
-    automatic_selection: false,
+  // Selection already materialized exactly one Subject: that is what makes it
+  // eligible for a production batch, nothing editorial.
+  const selection = {
+    edition_id: editionId,
+    snapshot_id: "99999999-9999-4999-8999-999999999999",
+    snapshot_version: 1,
+    counts: { undecided: 0, ignored: 0, selected: 1, total: 1 },
+    items: [
+      {
+        discovery_subject_id: "d1111111-1111-4111-8111-111111111111",
+        title: "Article à arrêter",
+        summary: "Résumé de l’article à arrêter.",
+        presentation: "Résumé de l’article à arrêter.",
+        actor_or_campaign: null,
+        publications: [],
+        candidate_count: 1,
+        technical_potential: 3,
+        technical_potential_reason: "Artefacts annoncés.",
+        announced_artifacts: ["ioc"],
+        publisher_ioc_count_total: null,
+        publisher_ioc_counts: [],
+        provisional_ioc_count: 0,
+        provisional_ioc_type_counts: {},
+        provisional_iocs: [],
+        uncertainties: [],
+        recommendation: null,
+        state: "selected",
+        subject_id: subjectId,
+        last_decision: {
+          id: "decision-1111",
+          decision: "select",
+          actor_id: "analyst",
+        },
+        updated_since_decision: false,
+        selectable: true,
+        blocking_reason: null,
+      },
+    ],
+    recommendation: null,
   };
 
   const batch = () => ({
@@ -97,8 +105,8 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
       await route.fulfill({ json: edition() });
       return;
     }
-    if (path === `/api/editions/${editionId}/editorial-groups`) {
-      await route.fulfill({ json: board });
+    if (path === `/api/editions/${editionId}/selection`) {
+      await route.fulfill({ json: selection });
       return;
     }
     if (
@@ -117,32 +125,61 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
       });
       return;
     }
+    if (
+      path === `/api/editions/${editionId}/production` &&
+      request.method() === "POST"
+    ) {
+      productionPostBody = request.postDataJSON();
+      batchStarted = true;
+      await route.fulfill({ status: 202, json: batch() });
+      return;
+    }
     if (path === `/api/editions/${editionId}/production`) {
-      await route.fulfill({ json: batch() });
+      await route.fulfill(
+        batchStarted ? { json: batch() } : { status: 404, json: {} },
+      );
       return;
     }
     await route.fulfill({ status: 404, json: {} });
   });
 
+  // Batch start lives on /production.
   await page.goto(`/editions/${editionId}/production`);
+  const selector = page.getByRole("region", {
+    name: "Sélecteur du lot de production",
+  });
+  await selector.getByRole("checkbox", { name: "Article à arrêter" }).check();
+  await page
+    .getByRole("button", { name: "Démarrer le lot de production" })
+    .click();
+  await expect
+    .poll(() => productionPostBody)
+    .toEqual({
+      subject_ids: [subjectId],
+    });
+
+  const stop = page.getByRole("button", {
+    name: "Arrêter le lot de production",
+  });
+  await expect(stop).toBeVisible();
+  await stop.click();
+
+  // Cancelling never closes the edition.
+  await expect(stop).toHaveCount(0);
   await expect(
-    page.getByRole("button", {
-      name: "Arrêter le lot de production",
-    }),
+    page.getByRole("button", { name: "Archiver l’édition" }),
   ).toBeVisible();
 
-  await page
-    .getByRole("button", { name: "Arrêter le lot de production" })
-    .click();
-
+  // Selection carries no production control whatsoever.
   await page.getByRole("link", { name: "Sélection" }).click();
   await expect(page).toHaveURL(`/editions/${editionId}/selection`);
-
   await expect(
-    page.getByRole("heading", { name: "1 sujet éligible" }),
+    page.getByRole("heading", { name: "Sélection des sujets" }),
   ).toBeVisible();
-  await expect(page.getByText("0 sélectionné pour ce lot")).toBeVisible();
   await expect(
-    page.getByRole("button", { name: "Sélectionnez au moins un sujet" }),
-  ).toBeDisabled();
+    page.getByRole("region", { name: "Sélecteur du lot de production" }),
+  ).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /production/i })).toHaveCount(
+    0,
+  );
 });

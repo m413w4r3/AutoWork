@@ -31,10 +31,6 @@ class GroupingConfidence(StrEnum):
 
 
 class HumanDecisionType(StrEnum):
-    MERGE = "merge"
-    SPLIT = "split"
-    REJECT = "reject"
-    SELECT = "select"
     CLAIM_VALIDATE = "claim_validate"
     CLAIM_CORRECT = "claim_correct"
     CLAIM_REJECT = "claim_reject"

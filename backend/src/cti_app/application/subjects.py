@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 from cti_app.application.discovery_identity import normalize
 from cti_app.application.editions import EditionNotFoundError
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
-from cti_app.domain.classification import TLP
+from cti_app.domain.classification import TLP, ensure_tlp_not_downgraded
 from cti_app.domain.editions import EditionImmutableError, EditionStatus
 from cti_app.domain.entities import ProvenanceEvent, Subject
 from cti_app.logging import get_correlation_id
@@ -29,19 +29,28 @@ class SubjectService:
     def __init__(self, uow_factory: UnitOfWorkFactory) -> None:
         self._uow_factory = uow_factory
 
-    async def materialize_in_uow(self, uow: UnitOfWork, *, edition_id: UUID, title: str) -> Subject:
+    async def materialize_in_uow(
+        self,
+        uow: UnitOfWork,
+        *,
+        edition_id: UUID,
+        title: str,
+        initial_tlp: TLP | None = None,
+    ) -> Subject:
         edition = await uow.editions.get_for_update(edition_id)
         if edition is None:
             raise EditionNotFoundError(str(edition_id))
         if edition.state is EditionStatus.ARCHIVED:
             raise EditionImmutableError("Archived editions cannot be modified")
+        if initial_tlp is not None:
+            ensure_tlp_not_downgraded(edition.tlp, initial_tlp)
 
         subject_id = uuid4()
         subject = Subject(
             edition_id=edition.id,
             title=title,
             slug=_subject_slug(title, subject_id),
-            tlp=edition.tlp,
+            tlp=initial_tlp or edition.tlp,
             id=subject_id,
         )
         await uow.subjects.add(subject)

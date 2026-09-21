@@ -1,20 +1,20 @@
-import type { EligibleGroup } from "./productionBatchSelection";
+import type { EligibleSubject } from "./productionBatchSelection";
 import { Link } from "../../routing";
 
 /**
- * Lets the operator hand-pick which editorially eligible subjects go into
- * the next production batch. Editorial eligibility and batch selection are
- * deliberately separate: this component never touches editorial decisions,
- * it only reports which of the already-eligible subjects are checked.
+ * Lets the operator hand-pick which already-materialized Subjects go into
+ * the next production batch. Selection and batch selection are deliberately
+ * separate: this component never takes a Selection decision, it only reports
+ * which of the already-eligible subjects are checked.
  */
 export function ProductionBatchSelector({
-  groups,
+  subjects,
   selected,
   onToggle,
   onSelectAll,
   onSelectNone,
 }: {
-  groups: readonly EligibleGroup[];
+  subjects: readonly EligibleSubject[];
   selected: ReadonlySet<string>;
   onToggle: (subjectId: string, checked: boolean) => void;
   onSelectAll: () => void;
@@ -33,7 +33,9 @@ export function ProductionBatchSelector({
           <button
             type="button"
             className="button button--secondary"
-            disabled={groups.length === 0 || selected.size === groups.length}
+            disabled={
+              subjects.length === 0 || selected.size === subjects.length
+            }
             onClick={onSelectAll}
           >
             Tout sélectionner
@@ -48,23 +50,25 @@ export function ProductionBatchSelector({
           </button>
         </div>
       </div>
-      {groups.length === 0 ? (
+      {subjects.length === 0 ? (
         <p className="empty-state">Aucun sujet éligible pour le moment.</p>
       ) : (
         <ul className="production-batch-selector__list">
-          {groups.map((group) => (
-            <li key={group.id}>
+          {subjects.map((subject) => (
+            <li key={subject.subject_id}>
               <label className="production-batch-selector__choice">
                 <input
                   type="checkbox"
-                  checked={selected.has(group.subject_id)}
+                  checked={selected.has(subject.subject_id)}
                   onChange={(event) =>
-                    onToggle(group.subject_id, event.target.checked)
+                    onToggle(subject.subject_id, event.target.checked)
                   }
                 />
-                {group.title}
+                {subject.title}
               </label>
-              <Link to={`/subjects/${group.subject_id}`}>Ouvrir le sujet</Link>
+              <Link to={`/subjects/${subject.subject_id}`}>
+                Ouvrir le sujet
+              </Link>
             </li>
           ))}
         </ul>

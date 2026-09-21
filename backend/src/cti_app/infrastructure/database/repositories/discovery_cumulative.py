@@ -156,6 +156,14 @@ class SqlAlchemyDiscoverySubjectIdentityRepository:
         row = await self._session.get(DiscoverySubjectIdentityRow, subject_id)
         return _discovery_identity_from_row(row) if row else None
 
+    async def get_for_update(self, subject_id: UUID) -> DiscoverySubjectIdentity | None:
+        row = await self._session.scalar(
+            select(DiscoverySubjectIdentityRow)
+            .where(DiscoverySubjectIdentityRow.id == subject_id)
+            .with_for_update()
+        )
+        return _discovery_identity_from_row(row) if row else None
+
     async def list_for_edition(self, edition_id: UUID) -> Sequence[DiscoverySubjectIdentity]:
         rows = await self._session.scalars(
             select(DiscoverySubjectIdentityRow)
