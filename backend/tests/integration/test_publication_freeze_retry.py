@@ -29,9 +29,11 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    production_batch_request_fingerprint,
 )
 from cti_app.domain.publication import PublicationDocumentV2
 from tests.integration.production.support import ProductionScenario
@@ -83,8 +85,17 @@ async def _seed_review_snapshot(
     )
     batch = EditionProductionBatch(
         edition_id=scenario.edition.id,
-        status="running",
+        status=ProductionBatchStatus.RUNNING,
         phase=ProductionBatchPhase.REVIEW,
+        idempotency_key=(
+            f"publication-freeze:{scenario.edition.id}:{run_number}"
+        ),
+        request_fingerprint=production_batch_request_fingerprint(
+            scenario.edition.id,
+            [scenario.subject.id],
+        ),
+        actor_id="publication-freeze-test",
+        correlation_id=f"publication-freeze:{run_number}",
         created_at=created_at,
     )
     item = EditionProductionBatchItem(
