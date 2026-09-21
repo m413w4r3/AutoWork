@@ -239,13 +239,19 @@ export interface ProductionSubject {
 }
 
 export interface ProductionRunSummary {
-  run_id?: string;
+  run_id: string;
+  edition_id: string;
+  subject_id: string;
   run_number: number;
   status: ProductionRunStatus;
-  stage: ProductionStage;
-  created_at?: string;
-  started_at?: string | null;
-  finished_at?: string | null;
+  current_stage: ProductionStage;
+  pipeline_generation: number;
+  research_date: string;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  error_code: string | null;
+  error_message: string | null;
 }
 
 export interface ProductionBatch {

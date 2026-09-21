@@ -114,7 +114,7 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 class StartEditionProductionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    subject_ids: list[UUID] | None = None
+    subject_ids: list[UUID] = Field(min_length=1)
 
 
 class RetryProductionStageRequest(BaseModel):
@@ -2372,11 +2372,6 @@ async def start_edition_production(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail={"code": "production_idempotency_key_required"},
-        )
-    if body.subject_ids is None or not body.subject_ids:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"code": "production_subject_ids_required"},
         )
     uow_factory, jobs, dispatcher = _runtime(request)
     del jobs, dispatcher

@@ -31,7 +31,9 @@ function isNullableString(value: unknown): value is string | null {
 }
 
 function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === "string");
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === "string")
+  );
 }
 
 function isArtifacts(value: unknown): boolean {
@@ -109,14 +111,15 @@ function isProductionStateSnapshot(
 ): value is ProductionStateSnapshot {
   if (!isRecord(value)) return false;
   if (
-    !(hasExactKeys(value, [
-      "format",
-      "schema_version",
-      "exported_at",
-      "origin",
-      "artifacts",
-      "content_sha256",
-    ]) ||
+    !(
+      hasExactKeys(value, [
+        "format",
+        "schema_version",
+        "exported_at",
+        "origin",
+        "artifacts",
+        "content_sha256",
+      ]) ||
       hasExactKeys(value, [
         "format",
         "schema_version",
@@ -125,7 +128,8 @@ function isProductionStateSnapshot(
         "artifacts",
         "repair",
         "content_sha256",
-      ])) ||
+      ])
+    ) ||
     value.format !== "autowork.production-state" ||
     value.schema_version !== 4 ||
     typeof value.exported_at !== "string" ||

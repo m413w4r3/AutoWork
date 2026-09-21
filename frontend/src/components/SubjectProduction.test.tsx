@@ -184,9 +184,18 @@ describe("SubjectProduction retry from stage", () => {
           Response.json([
             {
               run_id: "run-history",
+              edition_id: EDITION_ID,
+              subject_id: SUBJECT_ID,
               run_number: 4,
               status: "ready",
-              stage: "assembly",
+              current_stage: "assembly",
+              pipeline_generation: 0,
+              research_date: "2026-09-21",
+              created_at: "2026-09-21T10:00:00Z",
+              started_at: "2026-09-21T10:01:00Z",
+              finished_at: "2026-09-21T10:02:00Z",
+              error_code: null,
+              error_message: null,
             },
           ]),
         );

@@ -173,9 +173,9 @@ function ProductionRunHistory({
       {entries.length > 0 ? (
         <ol>
           {entries.map((run) => (
-            <li key={run.run_id ?? run.run_number}>
+            <li key={run.run_id}>
               Run {run.run_number} — {STATUS_LABELS[run.status]} —{" "}
-              {STAGE_LABELS[run.stage]}
+              {STAGE_LABELS[run.current_stage]}
             </li>
           ))}
         </ol>

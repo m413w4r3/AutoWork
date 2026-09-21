@@ -87,9 +87,7 @@ async def _seed_review_snapshot(
         edition_id=scenario.edition.id,
         status=ProductionBatchStatus.RUNNING,
         phase=ProductionBatchPhase.REVIEW,
-        idempotency_key=(
-            f"publication-freeze:{scenario.edition.id}:{run_number}"
-        ),
+        idempotency_key=(f"publication-freeze:{scenario.edition.id}:{run_number}"),
         request_fingerprint=production_batch_request_fingerprint(
             scenario.edition.id,
             [scenario.subject.id],
