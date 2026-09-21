@@ -58,6 +58,7 @@ from cti_app.domain.collection import CollectionState, SourceCollection, SourceO
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     SourceCandidate,
     SourceRole,
@@ -244,17 +245,26 @@ async def _seed_subject_discovery_lineage(
     uow_factory: UnitOfWorkFactory,
     *,
     edition: Edition,
-    subject: Subject,
-    batch: DiscoveryBatch,
+    subject_batches: tuple[tuple[Subject, DiscoveryBatch], ...],
 ) -> None:
     """Persist the lineage Production resolves to freeze a run's input.
 
     Production reads Subject → SubjectDiscoveryOrigin → canonical identity →
     active DiscoverySnapshot → DiscoveryCandidate, so every one of those rows
     must really exist here, with its foreign keys satisfied.
+
+    The snapshot is intentionally shared by every subject passed in. This
+    mirrors the Fusion projection for an edition and keeps all source runs
+    anchored to the same active discovery identity.
     """
-    topic = batch.candidates[0]
+    assert subject_batches
     async with uow_factory() as uow:
+        persisted_candidates: list[tuple[Subject, DiscoveryBatch, DiscoveryCandidate]] = []
+        for subject, batch in subject_batches:
+            candidates = await uow.discovery_candidates.list_for_batch(batch.id)
+            assert len(candidates) == 1
+            persisted_candidates.append((subject, batch, candidates[0]))
+
         merge_run = DiscoveryMergeRun(
             edition_id=edition.id,
             parent_snapshot_id=None,
@@ -263,9 +273,13 @@ async def _seed_subject_discovery_lineage(
             prompt_version="1",
             policy_version="1",
             blocking_version="1",
-            merge_input_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+            merge_input_hash=hashlib.sha256(
+                b"".join(
+                    subject.id.bytes + batch.id.bytes for subject, batch, _ in persisted_candidates
+                )
+            ).hexdigest(),
             handle_map={},
-            included_subject_ids=(subject.id,),
+            included_subject_ids=tuple(subject.id for subject, _, _ in persisted_candidates),
             excluded_subject_count=0,
             validation_status=MergeValidationStatus.VALID,
         )
@@ -278,6 +292,7 @@ async def _seed_subject_discovery_lineage(
                     created_by_merge_run_id=merge_run.id,
                     id=subject.id,
                 )
+                for subject, _, _ in persisted_candidates
             ]
         )
         snapshot = DiscoverySnapshot(
@@ -287,40 +302,44 @@ async def _seed_subject_discovery_lineage(
             intake_id=None,
             merge_run_id=merge_run.id,
             planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
-            subjects=(
+            subjects=tuple(
                 DiscoverySubject(
                     subject_id=subject.id,
-                    candidate=topic,
-                    member_references=(DiscoveryMemberReference(topic.id),),
-                    created_at=batch.created_at,
-                ),
+                    candidate=discovery_candidate.to_candidate_topic(),
+                    member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                    created_at=discovery_candidate.created_at,
+                )
+                for subject, _, discovery_candidate in persisted_candidates
             ),
-            snapshot_hash=hashlib.sha256(batch.id.bytes).hexdigest(),
+            snapshot_hash=hashlib.sha256(
+                b"".join(batch.id.bytes for _, batch, _ in persisted_candidates)
+            ).hexdigest(),
             is_active=True,
         )
         await uow.discovery_snapshots.append(snapshot)
-        decision = SelectionDecision(
-            edition_id=edition.id,
-            discovery_subject_id=subject.id,
-            snapshot_id=snapshot.id,
-            snapshot_version=snapshot.version,
-            action=SelectionAction.SELECT,
-            subject_id=subject.id,
-            actor_id="reuse-integration",
-            correlation_id="reuse-integration",
-            idempotency_key=f"reuse-integration-{subject.id}",
-        )
-        await uow.selection_decisions.append(decision)
-        await uow.subject_discovery_origins.add(
-            SubjectDiscoveryOrigin(
-                subject_id=subject.id,
+        for subject, _, _ in persisted_candidates:
+            decision = SelectionDecision(
                 edition_id=edition.id,
                 discovery_subject_id=subject.id,
-                selection_decision_id=decision.id,
-                selected_snapshot_id=snapshot.id,
-                selected_snapshot_version=snapshot.version,
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                action=SelectionAction.SELECT,
+                subject_id=subject.id,
+                actor_id="reuse-integration",
+                correlation_id="reuse-integration",
+                idempotency_key=f"reuse-integration-{subject.id}",
             )
-        )
+            await uow.selection_decisions.append(decision)
+            await uow.subject_discovery_origins.add(
+                SubjectDiscoveryOrigin(
+                    subject_id=subject.id,
+                    edition_id=edition.id,
+                    discovery_subject_id=subject.id,
+                    selection_decision_id=decision.id,
+                    selected_snapshot_id=snapshot.id,
+                    selected_snapshot_version=snapshot.version,
+                )
+            )
         await uow.commit()
 
 
@@ -393,19 +412,14 @@ async def _seed_computed_run(
     return run, artifacts
 
 
-async def _seed_reusable_article(
+async def _prepare_reusable_article(
     uow_factory: UnitOfWorkFactory,
-    store: ProductionArtifactStore,
     *,
     edition: Edition,
     subject: Subject,
     title: str,
-) -> tuple[
-    ProductionRun,
-    dict[ProductionArtifactStage, ProductionArtifact],
-    ProductionArtifact,
-]:
-    """Create one complete first pass whose costly inputs can be reused."""
+) -> tuple[DiscoveryBatch, SourceCandidate]:
+    """Persist the discovery and archived-source context for one article."""
     discovery_run = await make_discovery_run_for_edition(
         uow_factory, edition, complementary_axis="reuse integration"
     )
@@ -448,7 +462,24 @@ async def _seed_reusable_article(
         assert await uow.discovery_batches.add_if_absent(batch)
         assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
+    return batch, source
 
+
+async def _seed_reusable_article(
+    uow_factory: UnitOfWorkFactory,
+    store: ProductionArtifactStore,
+    *,
+    edition: Edition,
+    subject: Subject,
+    title: str,
+    batch: DiscoveryBatch,
+    source: SourceCandidate,
+) -> tuple[
+    ProductionRun,
+    dict[ProductionArtifactStage, ProductionArtifact],
+    ProductionArtifact,
+]:
+    """Create one complete first pass whose costly inputs can be reused."""
     production = SubjectProductionService(uow_factory)
     source_run, created = await production.create_run(subject.id, edition.id)
     assert created
@@ -820,6 +851,11 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()
 
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subject_batches=((subject, batch),),
+    )
     production = SubjectProductionService(uow_factory)
     run_a, created_a = await production.create_run(subject.id, edition.id)
     assert created_a
@@ -1153,13 +1189,37 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         await uow.commit()
 
     source_publications: list[ProductionArtifact] = []
+    prepared_articles: list[tuple[DiscoveryBatch, SourceCandidate]] = []
     for subject, title in zip(subjects, ("Article A", "Article B"), strict=True):
+        prepared_articles.append(
+            await _prepare_reusable_article(
+                uow_factory,
+                edition=edition,
+                subject=subject,
+                title=title,
+            )
+        )
+
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subject_batches=tuple(
+            (subject, batch)
+            for subject, (batch, _) in zip(subjects, prepared_articles, strict=True)
+        ),
+    )
+
+    for subject, title, (article_batch, source) in zip(
+        subjects, ("Article A", "Article B"), prepared_articles, strict=True
+    ):
         _source_run, _, source_publication = await _seed_reusable_article(
             uow_factory,
             store,
             edition=edition,
             subject=subject,
             title=title,
+            batch=article_batch,
+            source=source,
         )
         source_publications.append(source_publication)
 
