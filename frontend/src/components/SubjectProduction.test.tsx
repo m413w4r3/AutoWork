@@ -8,6 +8,7 @@ import { shouldPollProduction } from "../api/production";
 import { SubjectProduction } from "./SubjectProduction";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const EDITION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const ATTACHMENT_A_URL =
   "https://www.whisper.security/attachment-a-reserve-domains.csv";
 const ATTACHMENT_B_URL =
@@ -48,7 +49,7 @@ function renderProduction() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <SubjectProduction subjectId={SUBJECT_ID} />
+      <SubjectProduction subjectId={SUBJECT_ID} editionId={EDITION_ID} />
     </QueryClientProvider>,
   );
 }
@@ -124,6 +125,82 @@ function status(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectProduction retry from stage", () => {
+  it("démarre un run via le batch et réutilise la même clé après une erreur réseau", async () => {
+    const postCalls: RequestInit[] = [];
+    let attempts = 0;
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.endsWith("/production/runs")) {
+        return Promise.resolve(Response.json([]));
+      }
+      if (init?.method === "POST") {
+        attempts += 1;
+        postCalls.push(init);
+        return attempts === 1
+          ? Promise.reject(new Error("network failure"))
+          : Promise.resolve(Response.json({ status: "queued" }));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderProduction();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Produire cet article" }),
+    );
+    await waitFor(() => expect(attempts).toBe(2));
+
+    expect(postCalls).toHaveLength(2);
+    expect(postCalls[0]?.headers).toEqual(postCalls[1]?.headers);
+    const firstHeaders = postCalls[0]?.headers as Record<string, string>;
+    expect(typeof firstHeaders["Idempotency-Key"]).toBe("string");
+    expect(firstHeaders["Idempotency-Key"]).not.toBe("");
+    expect(postCalls[0]?.body).toBe(
+      JSON.stringify({ subject_ids: [SUBJECT_ID] }),
+    );
+    expect(postCalls[1]?.body).toBe(postCalls[0]?.body);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/editions/${EDITION_ID}/production/batches`,
+      expect.objectContaining({ method: "POST" }),
+    );
+  });
+
+  it("affiche l’historique des runs sans l’ajouter au statut du sujet", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (url.endsWith("/production/runs")) {
+        return Promise.resolve(
+          Response.json([
+            {
+              run_id: "run-history",
+              run_number: 4,
+              status: "ready",
+              stage: "assembly",
+            },
+          ]),
+        );
+      }
+      return Promise.resolve(Response.json(status("running")));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderProduction();
+
+    expect(await screen.findByText(/Run 4/)).toHaveTextContent(
+      "Run 4 — Prêt — Assemblage",
+    );
+  });
+
   it.each(["failed", "needs_review"] as const)(
     "%s extraction affiche l’action prioritaire et appelle le retry générique",
     async (runStatus) => {
@@ -729,7 +806,7 @@ describe("SubjectProduction retry from stage", () => {
       "extraction",
     );
     await waitFor(() =>
-      expect(screen.getByText("en cours")).toBeInTheDocument(),
+      expect(screen.getByText("En cours")).toBeInTheDocument(),
     );
     expect(shouldPollProduction("running")).toBe(true);
   });

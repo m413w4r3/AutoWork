@@ -47,9 +47,9 @@ from cti_app.domain.model_runs import (
 from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionInputSource,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.integrations.models import (
     BridgeTransportError,
@@ -292,9 +292,9 @@ class _Q2Artifacts:
 
 class _Q2Runs:
     def __init__(self) -> None:
-        self.run: SubjectProductionRun | None = None
+        self.run: ProductionRun | None = None
 
-    async def get(self, run_id: object) -> SubjectProductionRun | None:
+    async def get(self, run_id: object) -> ProductionRun | None:
         return self.run if self.run is not None and run_id == self.run.id else None
 
 
@@ -316,7 +316,7 @@ class _Q2UnitOfWork:
         source_contents: dict[str, bytes] | None = None,
     ) -> None:
         self.production_artifacts = _Q2Artifacts()
-        self.subject_production_runs = _Q2Runs()
+        self.production_runs = _Q2Runs()
         self.production_input_snapshots = _Q2Snapshots()
         self.model_runs = InMemoryModelRunRepository(
             model_run_state if model_run_state is not None else {}
@@ -541,22 +541,28 @@ def _q2_report(source_count: int = 5) -> ReferenceReport:
 
 
 def _q2_snapshot() -> ProductionInputSnapshot:
+    candidate_id = uuid4()
     return ProductionInputSnapshot(
         production_run_id=uuid4(),
         subject_id=uuid4(),
         edition_id=uuid4(),
-        editorial_group_id=uuid4(),
-        editorial_group_version=1,
+        subject_version=1,
         subject_title="Article",
-        subject_description="",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(candidate_id,),
+        discovery_summary="",
         actor_or_campaign="",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
         research_date=date(2026, 8, 1),
         core_sources=(
             ProductionInputSource(
-                batch_id=uuid4(),
-                candidate_id=uuid4(),
+                discovery_candidate_id=candidate_id,
                 source_candidate_id=uuid4(),
                 canonical_url="https://example.test/1",
                 role=SourceRole.PRIMARY,
@@ -579,9 +585,7 @@ def _q2_orchestrator(
     *,
     model_run_state: dict[Any, Any] | None = None,
     source_contents: dict[str, bytes] | None = None,
-) -> tuple[
-    production_workflow.ProductionWorkflowOrchestrator, SubjectProductionRun, _Q2Diagnostics
-]:
+) -> tuple[production_workflow.ProductionWorkflowOrchestrator, ProductionRun, _Q2Diagnostics]:
     uow = _Q2UnitOfWork(model_run_state, report, source_contents=source_contents)
     diagnostics = _Q2Diagnostics()
     orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
@@ -617,12 +621,12 @@ def _q2_orchestrator(
     monkeypatch.setattr(orchestrator, "_reuse_artifact", no_reuse)
     monkeypatch.setattr(orchestrator, "_subject_context", subject_context)
     monkeypatch.setattr(production_workflow, "build_subject_production_context", production_context)
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
-    uow.subject_production_runs.run = run
+    uow.production_runs.run = run
     uow.production_input_snapshots.snapshot = _q2_snapshot()
     return orchestrator, run, diagnostics
 
@@ -812,7 +816,7 @@ async def test_q2_pre_submission_retry_reuses_model_run_across_job_attempts(
     )
 
     first = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
 
     assert first["status"] == "transient_error"
@@ -825,7 +829,7 @@ async def test_q2_pre_submission_retry_reuses_model_run_across_job_attempts(
     assert adapter.calls[0].request_id == f"{s1_model_run_id}:a1"
 
     second = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
 
     assert second["status"] == "success"
@@ -876,8 +880,8 @@ async def test_manual_extraction_retry_reuses_successful_batch_members_only(
     assert len(adapter.calls) == 1
 
     adapter._research_text = "UNAVAILABLE"
-    run.status = SubjectProductionStatus.NEEDS_REVIEW
-    run.retry_from_stage(SubjectProductionStage.EXTRACTION)
+    run.status = ProductionRunStatus.NEEDS_REVIEW
+    run.retry_from_stage(ProductionStage.EXTRACTION)
 
     second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
@@ -916,8 +920,8 @@ async def test_manual_extraction_retry_reuses_successful_full_source(
     first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
     assert first["status"] == "success"
-    run.status = SubjectProductionStatus.NEEDS_REVIEW
-    run.retry_from_stage(SubjectProductionStage.EXTRACTION)
+    run.status = ProductionRunStatus.NEEDS_REVIEW
+    run.retry_from_stage(ProductionStage.EXTRACTION)
 
     second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
 
@@ -1147,7 +1151,7 @@ async def test_q2_submission_attempted_requires_reconciliation_and_stops(
     orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
 
     result = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
 
     assert result["status"] == "needs_review"
@@ -1175,7 +1179,7 @@ async def test_q2_needs_review_preserves_active_signal_reason_and_never_calls_s2
     orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
 
     result = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
 
     model_run_id = _q2_source_model_run_id(
@@ -1226,7 +1230,7 @@ async def test_q2_bridge_unreachable_before_submit_is_retryable(
     orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(1))
 
     first = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
     model_run_id = _q2_source_model_run_id(
         production_run_id=run.id,
@@ -1236,7 +1240,7 @@ async def test_q2_bridge_unreachable_before_submit_is_retryable(
     )
     assert model_uow.state[model_run_id].submission_state is ModelSubmissionState.NOT_SUBMITTED
     second = await orchestrator.execute_stage(
-        run.id, SubjectProductionStage.EXTRACTION, correlation_id="test"
+        run.id, ProductionStage.EXTRACTION, correlation_id="test"
     )
 
     assert first["status"] == "transient_error"

@@ -8,15 +8,15 @@ from typing import Any
 from cti_app.application.production_resume import STAGE_ARTIFACT as _STAGE_ARTIFACT
 from cti_app.domain.production import (
     ProductionArtifact,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     production_stages,
 )
 
 
 def build_stage_statuses(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     artifacts: dict[str, ProductionArtifact],
     *,
     archived_sources: int = 0,
@@ -36,19 +36,19 @@ def build_stage_statuses(
         artifact_stage = _STAGE_ARTIFACT[stage]
         artifact = artifacts.get(artifact_stage.value) if artifact_stage else None
 
-        if run.status is SubjectProductionStatus.READY:
+        if run.status is ProductionRunStatus.READY:
             status = "succeeded"
         elif index < current_index:
             status = "succeeded"
         elif index > current_index:
             status = "pending"
-        elif run.status is SubjectProductionStatus.NEEDS_REVIEW:
+        elif run.status is ProductionRunStatus.NEEDS_REVIEW:
             status = "needs_review"
-        elif run.status is SubjectProductionStatus.FAILED:
+        elif run.status is ProductionRunStatus.FAILED:
             status = "failed"
-        elif run.status is SubjectProductionStatus.RUNNING:
+        elif run.status is ProductionRunStatus.RUNNING:
             status = "running"
-        elif run.status is SubjectProductionStatus.CANCELLED:
+        elif run.status is ProductionRunStatus.CANCELLED:
             status = "cancelled"
         else:
             status = "pending"
@@ -70,12 +70,12 @@ def build_stage_statuses(
             "research_date": research_date.isoformat() if research_date else None,
         }
         if index == current_index and run.status in {
-            SubjectProductionStatus.NEEDS_REVIEW,
-            SubjectProductionStatus.FAILED,
+            ProductionRunStatus.NEEDS_REVIEW,
+            ProductionRunStatus.FAILED,
         }:
             entry["error_code"] = run.error_code
             entry["error_message"] = run.error_message
-        if stage is SubjectProductionStage.SOURCES:
+        if stage is ProductionStage.SOURCES:
             entry["archived_sources"] = archived_sources
         statuses[stage.value] = entry
 

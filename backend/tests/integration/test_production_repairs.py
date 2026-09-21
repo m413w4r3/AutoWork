@@ -20,7 +20,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 pytestmark = pytest.mark.integration
@@ -54,7 +54,7 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         created_at=now,
         updated_at=now,
     )
-    run = SubjectProductionRun(subject_id=subject.id, edition_id=edition.id)
+    run = ProductionRun(subject_id=subject.id, edition_id=edition.id)
     artifact = ProductionArtifact(
         production_run_id=run.id,
         subject_id=subject.id,
@@ -101,7 +101,7 @@ async def test_production_repair_decisions_are_fk_backed_append_only_and_effecti
         async with uow_factory() as uow:
             assert await uow.editions.add_if_absent(edition)
             await uow.subjects.add(subject)
-            await uow.subject_production_runs.add(run)
+            await uow.production_runs.add(run)
             await uow.production_artifacts.append(artifact)
             await uow.production_repair_decisions.append(first)
             await uow.production_repair_decisions.append(second)

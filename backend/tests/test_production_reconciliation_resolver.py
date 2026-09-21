@@ -33,25 +33,25 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.integrations.models import BridgeTransportError
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
+    def __init__(self, run: ProductionRun) -> None:
         self.items = {run.id: run}
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
 
@@ -83,13 +83,13 @@ class _EditionRepo:
 class _Uow:
     def __init__(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         model: ModelRun,
         *,
         with_edition: bool = False,
         edition_state: EditionStatus = EditionStatus.OPEN,
     ) -> None:
-        self.subject_production_runs = _Runs(run)
+        self.production_runs = _Runs(run)
         self.model_runs = _Models(model)
         if with_edition:
             self.editions = _EditionRepo(SimpleNamespace(id=run.edition_id, state=edition_state))
@@ -169,7 +169,7 @@ def _fixture(
     edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[
     ProductionReconciliationResolver,
-    SubjectProductionRun,
+    ProductionRun,
     ModelRun,
     _Bridge,
     _ConversationService,
@@ -192,19 +192,19 @@ def _fixture(
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         error_code="active_signal_stalled",
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         id=uuid4(),
         subject_id=subject_id,
         edition_id=uuid4(),
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.REFERENCES,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.REFERENCES,
         references_conversation_id=conversation_id,
         error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
         error_details={"bridge_request_id": "bridge-request:a1"},
         reconciliation=ProductionSubmissionReconciliation(
             production_run_id=uuid4(),
             model_run_id=model_id,
-            stage=SubjectProductionStage.REFERENCES,
+            stage=ProductionStage.REFERENCES,
             bridge_response_id=None,
             submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
             phase="reconciliation",
@@ -213,7 +213,7 @@ def _fixture(
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=model_id,
-        stage=SubjectProductionStage.REFERENCES,
+        stage=ProductionStage.REFERENCES,
         bridge_response_id=None,
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -281,7 +281,7 @@ async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.RESUMED
     assert bridge.calls == ["bridge-request:a1"]
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     assert run.reconciliation is not None
     assert run.reconciliation.output_sha256 == hashlib.sha256(b"# answer").hexdigest()
     assert run.reconciliation.provenance == "automatic_bridge_retrieval"
@@ -422,11 +422,11 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
         ),
         with_conversation=False,
     )
-    run.current_stage = SubjectProductionStage.SOURCES
+    run.current_stage = ProductionStage.SOURCES
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=run.reconciliation.model_run_id,
-        stage=SubjectProductionStage.SOURCES,
+        stage=ProductionStage.SOURCES,
         bridge_response_id=None,
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -451,9 +451,9 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
     )
 
     assert result.endswith("#released")
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     assert run.pipeline_generation == 1
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
     assert bridge.calls == ["bridge-request:a1"]
 
 

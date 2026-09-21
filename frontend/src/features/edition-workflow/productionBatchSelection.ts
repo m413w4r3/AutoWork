@@ -1,15 +1,7 @@
-import type { SelectionItem } from "../../api/selection";
+import type { ProductionSubject } from "../../api/production";
 
-/** A selected board item with a resolved subject identity. */
-export type EligibleSubject = Pick<SelectionItem, "title" | "subject_id"> & {
-  subject_id: string;
-};
-
-export function isEligibleSubject(
-  item: SelectionItem,
-): item is SelectionItem & EligibleSubject {
-  return item.state === "selected" && item.subject_id !== null;
-}
+/** Subjects that the production board explicitly permits starting. */
+export type EligibleSubject = ProductionSubject;
 
 /**
  * Build the `subject_ids` payload in current selection board order, not in
@@ -17,10 +9,11 @@ export function isEligibleSubject(
  * the board order regardless of the order the operator checked boxes.
  */
 export function orderedSelection(
-  eligibleSubjects: readonly EligibleSubject[],
+  eligibleSubjects: readonly ProductionSubject[],
   selected: ReadonlySet<string>,
 ): string[] {
   return eligibleSubjects
+    .filter((subject) => subject.can_start)
     .map((subject) => subject.subject_id)
     .filter((subjectId) => selected.has(subjectId));
 }

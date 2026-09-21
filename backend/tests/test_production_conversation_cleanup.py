@@ -9,17 +9,17 @@ import pytest
 
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.production import (
-    SubjectProductionRun,
-    SubjectProductionStage,
+    ProductionRun,
+    ProductionStage,
 )
 from cti_app.integrations.models import BridgeTransportError
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
+    def __init__(self, run: ProductionRun) -> None:
         self.run = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.run if run_id == self.run.id else None
 
 
@@ -29,8 +29,8 @@ class _Snapshots:
 
 
 class _Uow:
-    def __init__(self, run: SubjectProductionRun) -> None:
-        self.subject_production_runs = _Runs(run)
+    def __init__(self, run: ProductionRun) -> None:
+        self.production_runs = _Runs(run)
         self.production_input_snapshots = _Snapshots()
 
     async def __aenter__(self) -> _Uow:
@@ -70,15 +70,15 @@ class _ModelService:
         self.archived.append(conversation_id)
 
 
-def _run(stage: SubjectProductionStage) -> SubjectProductionRun:
-    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
+def _run(stage: ProductionStage) -> ProductionRun:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
     run.start_running()
     run.current_stage = stage
     return run
 
 
 def _orchestrator(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     model_service: _ModelService,
     diagnostics: _Diagnostics,
 ) -> ProductionWorkflowOrchestrator:
@@ -93,12 +93,12 @@ def _orchestrator(
 @pytest.mark.parametrize(
     ("stage", "conversation_field"),
     [
-        (SubjectProductionStage.REFERENCES, "references_conversation_id"),
-        (SubjectProductionStage.SYNTHESIS, "synthesis_conversation_id"),
+        (ProductionStage.REFERENCES, "references_conversation_id"),
+        (ProductionStage.SYNTHESIS, "synthesis_conversation_id"),
     ],
 )
 async def test_completed_references_and_synthesis_archive_conversation(
-    stage: SubjectProductionStage,
+    stage: ProductionStage,
     conversation_field: str,
 ) -> None:
     run = _run(stage)
@@ -120,7 +120,7 @@ async def test_completed_references_and_synthesis_archive_conversation(
 
 @pytest.mark.asyncio
 async def test_needs_review_keeps_synthesis_conversation_open() -> None:
-    run = _run(SubjectProductionStage.SYNTHESIS)
+    run = _run(ProductionStage.SYNTHESIS)
     run.synthesis_conversation_id = uuid4()
     model_service = _ModelService()
     orchestrator = _orchestrator(run, model_service, _Diagnostics())
@@ -130,7 +130,7 @@ async def test_needs_review_keeps_synthesis_conversation_open() -> None:
 
     orchestrator._execute_synthesis_stage = needs_review  # type: ignore[method-assign]
 
-    await orchestrator.execute_stage(run.id, SubjectProductionStage.SYNTHESIS)
+    await orchestrator.execute_stage(run.id, ProductionStage.SYNTHESIS)
 
     assert model_service.archived == []
 
@@ -139,7 +139,7 @@ async def test_needs_review_keeps_synthesis_conversation_open() -> None:
 async def test_cleanup_failure_does_not_change_success_and_is_diagnosed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = _run(SubjectProductionStage.SYNTHESIS)
+    run = _run(ProductionStage.SYNTHESIS)
     run.synthesis_conversation_id = uuid4()
     diagnostics = _Diagnostics()
     model_service = _ModelService(
@@ -163,7 +163,7 @@ async def test_cleanup_failure_does_not_change_success_and_is_diagnosed(
         lambda _: _completed_sleep(),
     )
 
-    result = await orchestrator.execute_stage(run.id, SubjectProductionStage.SYNTHESIS)
+    result = await orchestrator.execute_stage(run.id, ProductionStage.SYNTHESIS)
 
     assert result["status"] == "success"
     assert model_service.archive_calls == 2
@@ -191,7 +191,7 @@ async def _completed_sleep() -> None:
 async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    run = _run(SubjectProductionStage.SYNTHESIS)
+    run = _run(ProductionStage.SYNTHESIS)
     run.synthesis_conversation_id = uuid4()
     diagnostics = _Diagnostics()
     model_service = _ModelService(
@@ -215,7 +215,7 @@ async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
         lambda _: _completed_sleep(),
     )
 
-    result = await orchestrator.execute_stage(run.id, SubjectProductionStage.SYNTHESIS)
+    result = await orchestrator.execute_stage(run.id, ProductionStage.SYNTHESIS)
 
     assert result["status"] == "success"
     assert model_service.archive_calls == 2
@@ -229,12 +229,12 @@ async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
 @pytest.mark.parametrize(
     "stage",
     [
-        SubjectProductionStage.SOURCES,
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.SOURCES,
+        ProductionStage.EXTRACTION,
+        ProductionStage.ASSEMBLY,
     ],
 )
-async def test_stage_without_conversation_does_not_archive(stage: SubjectProductionStage) -> None:
+async def test_stage_without_conversation_does_not_archive(stage: ProductionStage) -> None:
     run = _run(stage)
     model_service = _ModelService()
     orchestrator = _orchestrator(run, model_service, _Diagnostics())
@@ -254,12 +254,12 @@ async def test_stage_without_conversation_does_not_archive(stage: SubjectProduct
 @pytest.mark.parametrize(
     ("stage", "conversation_field"),
     [
-        (SubjectProductionStage.REFERENCES, "references_conversation_id"),
-        (SubjectProductionStage.SYNTHESIS, "synthesis_conversation_id"),
+        (ProductionStage.REFERENCES, "references_conversation_id"),
+        (ProductionStage.SYNTHESIS, "synthesis_conversation_id"),
     ],
 )
 async def test_cached_and_reused_results_retry_conversation_cleanup(
-    stage: SubjectProductionStage,
+    stage: ProductionStage,
     conversation_field: str,
     status: str,
 ) -> None:

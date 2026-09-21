@@ -32,25 +32,23 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
-from cti_app.application.subject_production import capture_production_input_snapshot
+from cti_app.application.subject_production import (
+    _lock_open_edition,
+    capture_production_input_snapshot,
+)
 from cti_app.domain.errors import EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 PRODUCTION_STATE_FORMAT = "autowork.production-state"
-PRODUCTION_STATE_V1_SCHEMA_VERSION = 1
-PRODUCTION_STATE_V2_SCHEMA_VERSION = 2
-# Version 3 adds the repair audit block: the canonical extraction already is
-# the effective (projected) one, and this block carries the human decisions
-# that produced it so an imported state stays auditable, not just reproducible.
-PRODUCTION_STATE_SCHEMA_VERSION = 3
-PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+PRODUCTION_STATE_SCHEMA_VERSION = 4
+PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
 MAX_PRODUCTION_STATE_BYTES = 16 * 1024 * 1024
 IMPORTED_RUN_ERROR_CODE = "imported_production_state"
 
@@ -64,6 +62,7 @@ _ERROR_CODES = {
     "production_state_invalid",
     "production_state_checksum_mismatch",
     "production_state_too_large",
+    "production_input_snapshot_missing",
 }
 _HASH = r"^[0-9a-f]{64}$"
 
@@ -77,24 +76,15 @@ class ProductionStateError(ValueError):
         super().__init__(message)
 
 
-class ProductionStateOriginV1(BaseModel):
+class ProductionStateOriginV4(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     subject_title: str
-    editorial_type: Literal["brief"]
-    profile: Literal["brief_auto"]
-    research_date: date | None
-
-
-class ProductionStateOriginV2(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    subject_title: str
-    research_date: date | None
-
-
-# Historical import name.
-ProductionStateOrigin = ProductionStateOriginV1
+    subject_id: UUID
+    production_run_id: UUID
+    research_date: date
+    discovery_snapshot_id: UUID
+    discovery_snapshot_version: int = Field(ge=1)
 
 
 class ProductionStateReferences(BaseModel):
@@ -162,49 +152,13 @@ class ProductionStateRepair(BaseModel):
     materialization: dict[str, Any] | None = None
 
 
-class ProductionStateSnapshotV1(BaseModel):
+class ProductionStateSnapshotV4(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     format: Literal["autowork.production-state"]
-    schema_version: Literal[1]
+    schema_version: Literal[4]
     exported_at: datetime
-    origin: ProductionStateOriginV1
-    artifacts: ProductionStateArtifacts
-    content_sha256: str = Field(pattern=_HASH)
-
-    @field_validator("exported_at")
-    @classmethod
-    def exported_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("exported_at must be timezone-aware")
-        return value
-
-
-class ProductionStateSnapshotV2(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    format: Literal["autowork.production-state"]
-    schema_version: Literal[2]
-    exported_at: datetime
-    origin: ProductionStateOriginV2
-    artifacts: ProductionStateArtifacts
-    content_sha256: str = Field(pattern=_HASH)
-
-    @field_validator("exported_at")
-    @classmethod
-    def exported_at_must_be_timezone_aware(cls, value: datetime) -> datetime:
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("exported_at must be timezone-aware")
-        return value
-
-
-class ProductionStateSnapshotV3(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    format: Literal["autowork.production-state"]
-    schema_version: Literal[3]
-    exported_at: datetime
-    origin: ProductionStateOriginV2
+    origin: ProductionStateOriginV4
     artifacts: ProductionStateArtifacts
     # Absent when the run carries no repair projection at all.
     repair: ProductionStateRepair | None = None
@@ -218,11 +172,6 @@ class ProductionStateSnapshotV3(BaseModel):
         return value
 
 
-ProductionStateSnapshot = (
-    ProductionStateSnapshotV1 | ProductionStateSnapshotV2 | ProductionStateSnapshotV3
-)
-
-
 class ProductionStateImportResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -230,7 +179,7 @@ class ProductionStateImportResult(BaseModel):
     status: Literal["needs_review", "running"]
     current_stage: Literal["assembly"]
     imported_stages: tuple[Literal["references"], Literal["extraction"], Literal["synthesis"]]
-    schema_version: Literal[1, 2, 3]
+    schema_version: Literal[4]
     content_sha256: str = Field(pattern=_HASH)
 
 
@@ -244,12 +193,24 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
 
 
 def compute_production_state_checksum(
-    snapshot_without_checksum: (ProductionStateSnapshot | Mapping[str, Any]),
+    snapshot_without_checksum: (ProductionStateSnapshotV4 | Mapping[str, Any]),
 ) -> str:
     if isinstance(snapshot_without_checksum, BaseModel):
-        payload = snapshot_without_checksum.model_dump(mode="json", exclude={"content_sha256"})
+        model: ProductionStateSnapshotV4 | None = snapshot_without_checksum
     else:
-        payload = dict(snapshot_without_checksum)
+        # Import always hashes the validated model, so a raw payload has to be
+        # normalised the same way: a hand-edited file that dropped an optional
+        # field would otherwise get a checksum import then rejects.
+        try:
+            model = ProductionStateSnapshotV4.model_validate(
+                {**snapshot_without_checksum, "content_sha256": "0" * 64}
+            )
+        except ValidationError:
+            model = None
+    if model is not None:
+        payload = model.model_dump(mode="json", exclude={"content_sha256"})
+    else:
+        payload = dict(cast(Mapping[str, Any], snapshot_without_checksum))
         payload.pop("content_sha256", None)
     return hashlib.sha256(_canonical_json(payload)).hexdigest()
 
@@ -266,7 +227,7 @@ def _json_size(payload: dict[str, Any]) -> int:
 
 
 def _validate_parsers(
-    snapshot: ProductionStateSnapshot,
+    snapshot: ProductionStateSnapshotV4,
 ) -> tuple[ReferenceReport, TechnicalExtraction]:
     try:
         report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
@@ -281,7 +242,7 @@ def _validate_parsers(
     return report, extraction
 
 
-def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshot:
+def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV4:
     if payload.get("format") != PRODUCTION_STATE_FORMAT:
         raise ProductionStateError(
             code="production_state_invalid_format", message="Unsupported production state format"
@@ -292,23 +253,8 @@ def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshot:
             code="production_state_version_unsupported",
             message="Unsupported production state schema version",
         )
-    if schema_version != PRODUCTION_STATE_V1_SCHEMA_VERSION and (
-        "editorial_type" in payload.get("origin", {}) or "profile" in payload.get("origin", {})
-    ):
-        raise ProductionStateError(
-            code="production_state_version_unsupported",
-            message="Legacy production state origin cannot be labeled as a post-V1 version",
-        )
-    snapshot_types: dict[int, type[BaseModel]] = {
-        1: ProductionStateSnapshotV1,
-        2: ProductionStateSnapshotV2,
-        3: ProductionStateSnapshotV3,
-    }
     try:
-        snapshot = cast(
-            ProductionStateSnapshot,
-            snapshot_types[int(cast(int, schema_version))].model_validate(payload),
-        )
+        snapshot = ProductionStateSnapshotV4.model_validate(payload)
     except ValidationError as exc:
         raise _invalid("Invalid production state") from exc
 
@@ -332,19 +278,20 @@ def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshot:
     return snapshot
 
 
-def _snapshot_metadata(snapshot: ProductionStateSnapshot, now: datetime) -> dict[str, Any]:
+def _snapshot_metadata(snapshot: ProductionStateSnapshotV4, now: datetime) -> dict[str, Any]:
     return {
         "snapshot_import": {
             "format": PRODUCTION_STATE_FORMAT,
             "schema_version": snapshot.schema_version,
             "exported_at": snapshot.exported_at.isoformat(),
             "content_sha256": snapshot.content_sha256,
+            "origin": snapshot.origin.model_dump(mode="json"),
         },
         "generated_at": now.isoformat(),
     }
 
 
-def _snapshot_repair(snapshot: ProductionStateSnapshot) -> ProductionStateRepair | None:
+def _snapshot_repair(snapshot: ProductionStateSnapshotV4) -> ProductionStateRepair | None:
     return getattr(snapshot, "repair", None)
 
 
@@ -460,30 +407,34 @@ class ProductionStateService:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
 
-    async def export_state(
-        self, *, subject_id: UUID, subject_title: str
-    ) -> ProductionStateSnapshotV3:
-        """Export the latest run for a subject in the current V2 format."""
+    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV4:
+        """Export the latest terminal run for a subject from its input snapshot."""
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 raise ProductionStateError(
                     code="production_state_not_found", message="No production run found"
                 )
 
-        return await self.export_run_state(run.id, subject_title=subject_title)
+        return await self.export_run_state(run.id)
 
-    async def export_run_state(self, run_id: UUID, subject_title: str) -> ProductionStateSnapshotV3:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
         """Export exactly ``run_id`` without resolving another current run."""
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
             if run is None:
                 raise ProductionStateError(
                     code="production_state_not_found", message="No production run found"
                 )
-            if run.status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
+            if run.status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
+                )
+            input_snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+            if input_snapshot is None:
+                raise ProductionStateError(
+                    code="production_input_snapshot_missing",
+                    message="Production input snapshot is missing",
                 )
             refs = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
@@ -531,11 +482,15 @@ class ProductionStateService:
         except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise _invalid("Production artifact content is invalid") from exc
 
-        origin = ProductionStateOriginV2(
-            subject_title=subject_title,
-            research_date=run.research_date,
+        origin = ProductionStateOriginV4(
+            subject_title=input_snapshot.subject_title,
+            subject_id=input_snapshot.subject_id,
+            production_run_id=run.id,
+            research_date=input_snapshot.research_date,
+            discovery_snapshot_id=input_snapshot.discovery_snapshot_id,
+            discovery_snapshot_version=input_snapshot.discovery_snapshot_version,
         )
-        snapshot = ProductionStateSnapshotV3(
+        snapshot = ProductionStateSnapshotV4(
             format=PRODUCTION_STATE_FORMAT,
             schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             exported_at=datetime.now(UTC),
@@ -573,13 +528,14 @@ class ProductionStateService:
         now = datetime.now(UTC)
 
         async with self._uow_factory() as uow:
-            lock_creation = getattr(uow.subject_production_runs, "lock_creation_for_subject", None)
+            await _lock_open_edition(uow, edition_id)
+            lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
             if lock_creation is not None:
                 await lock_creation(subject_id)
-            current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            current = await uow.production_runs.get_current_for_subject(subject_id)
             if current and current.status in (
-                SubjectProductionStatus.QUEUED,
-                SubjectProductionStatus.RUNNING,
+                ProductionRunStatus.QUEUED,
+                ProductionRunStatus.RUNNING,
             ):
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
@@ -637,10 +593,11 @@ class ProductionStateService:
         }
 
         async with self._uow_factory() as uow:
-            current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            await _lock_open_edition(uow, edition_id)
+            current = await uow.production_runs.get_current_for_subject(subject_id)
             if current and current.status in (
-                SubjectProductionStatus.QUEUED,
-                SubjectProductionStatus.RUNNING,
+                ProductionRunStatus.QUEUED,
+                ProductionRunStatus.RUNNING,
             ):
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
@@ -649,17 +606,17 @@ class ProductionStateService:
             # repointage, la revue de publication continue d'afficher l'ancien
             # run en échec et l'état importé reste invisible.
             replaced_run_id = current.id if current is not None else None
-            allocator = getattr(uow.subject_production_runs, "allocate_next_run_number", None)
+            allocator = getattr(uow.production_runs, "allocate_next_run_number", None)
             if allocator is not None:
                 next_run_number = await allocator(subject_id)
             else:
-                runs = await uow.subject_production_runs.list_for_edition(edition_id)
+                runs = await uow.production_runs.list_for_edition(edition_id)
                 next_run_number = 1 + sum(1 for item in runs if item.subject_id == subject_id)
-            run = SubjectProductionRun(
+            run = ProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
-                status=SubjectProductionStatus.NEEDS_REVIEW,
-                current_stage=SubjectProductionStage.ASSEMBLY,
+                status=ProductionRunStatus.NEEDS_REVIEW,
+                current_stage=ProductionStage.ASSEMBLY,
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
@@ -673,22 +630,19 @@ class ProductionStateService:
                 updated_at=now,
                 version=1,
             )
-            await uow.subject_production_runs.add(run)
+            await uow.production_runs.add(run)
             # La décision de publication reste attachée au run remplacé : un
             # état corrigé à la main doit être revu, pas hérité.
             await _repoint_batch_item(uow, replaced_run_id, run.id)
-            editorial_group = await uow.editorial_groups.get_by_subject(subject_id)
-            if editorial_group is not None:
-                assert run.research_date is not None
-                input_snapshot = await capture_production_input_snapshot(
-                    uow,
-                    production_run_id=run.id,
-                    subject_id=subject_id,
-                    edition_id=edition_id,
-                    research_date=run.research_date,
-                    captured_at=now,
-                )
-                await uow.production_input_snapshots.add(input_snapshot)
+            input_snapshot = await capture_production_input_snapshot(
+                uow,
+                production_run_id=run.id,
+                subject_id=subject_id,
+                edition_id=edition_id,
+                research_date=snapshot.origin.research_date,
+                captured_at=now,
+            )
+            await uow.production_input_snapshots.add(input_snapshot)
             refs = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=subject_id,

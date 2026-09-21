@@ -1,10 +1,10 @@
 import type {
   ProductionBatchPhase,
-  SubjectProductionStage,
-  SubjectProductionStatus,
+  ProductionStage,
+  ProductionRunStatus,
 } from "../../api/production";
 
-export const STATUS_LABELS: Record<SubjectProductionStatus, string> = {
+export const STATUS_LABELS: Record<ProductionRunStatus, string> = {
   queued: "En attente",
   running: "En cours",
   ready: "Prêt",
@@ -13,7 +13,7 @@ export const STATUS_LABELS: Record<SubjectProductionStatus, string> = {
   cancelled: "Annulé",
 };
 
-export const STAGE_LABELS: Record<SubjectProductionStage, string> = {
+export const STAGE_LABELS: Record<ProductionStage, string> = {
   sources: "Sources",
   references: "Références",
   extraction: "Extraction",

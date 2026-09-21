@@ -11,7 +11,6 @@ def collection() -> SourceCollection:
     return SourceCollection(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        group_id=uuid4(),
         batch_id=uuid4(),
         source_candidate_id=uuid4(),
         requested_url="https://research.example/report",
@@ -24,7 +23,6 @@ def test_model_proposal_cannot_mark_relationship_verified() -> None:
         SourceCollection(
             subject_id=uuid4(),
             edition_id=uuid4(),
-            group_id=uuid4(),
             batch_id=uuid4(),
             source_candidate_id=uuid4(),
             requested_url="https://research.example/report",

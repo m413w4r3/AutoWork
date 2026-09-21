@@ -4,7 +4,7 @@ import asyncio
 import calendar
 import gzip
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -38,18 +38,19 @@ from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
     DiscoveryCandidate,
+    DiscoveryCandidateEvidence,
     SourceCandidate,
     SourceRole,
 )
-from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
 )
+from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import (
     InMemoryCollectionUnitOfWork,
@@ -122,11 +123,26 @@ class CancelBeforeArchiveContext(NoopContext):
 
 
 class CandidateRepository:
-    def __init__(self, candidates: Sequence[DiscoveryCandidate]) -> None:
+    def __init__(
+        self,
+        candidates: Sequence[DiscoveryCandidate],
+        batches: Mapping[UUID, DiscoveryBatch],
+    ) -> None:
         self.candidates = list(candidates)
+        self.batches = batches
 
     async def list_for_batch(self, batch_id: UUID) -> list[DiscoveryCandidate]:
         return [item for item in self.candidates if item.discovery_batch_id == batch_id]
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        del include_replaced
+        return [
+            item
+            for item in self.candidates
+            if self.batches[item.discovery_batch_id].edition_id == edition_id
+        ]
 
 
 class CandidateAwareCollectionFactory:
@@ -136,7 +152,7 @@ class CandidateAwareCollectionFactory:
         candidates: Sequence[DiscoveryCandidate],
     ) -> None:
         self.base = base
-        self.candidate_repository = CandidateRepository(candidates)
+        self.candidate_repository = CandidateRepository(candidates, base.batches)
 
     def __call__(self) -> object:
         unit_of_work = self.base()
@@ -212,23 +228,56 @@ def selected_subject(
         slug=f"subject-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
-    group = EditorialGroup(
-        edition_id=edition.id,
-        title=candidate.title,
-        candidate_references=(CandidateReference(batch.id, candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=EditorialScore(2, 2, 2, 2, 2, 2, {"impact": "test"}),
-        source_relationship_status=sources[0].relationship_status,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject.id)
     factory.editions[edition.id] = edition
     factory.subjects[subject.id] = subject
     factory.batches[batch.id] = batch
-    factory.groups[group.id] = group
+    factory.candidates[candidate.id] = DiscoveryCandidate(
+        discovery_run_id=batch.discovery_run_id,
+        discovery_batch_id=batch.id,
+        position=0,
+        title=candidate.title,
+        summary=candidate.summary,
+        novelty=candidate.novelty,
+        technical_potential=candidate.technical_potential,
+        technical_potential_reason="fixture",
+        event_date=candidate.event_date,
+        actor_or_campaign=candidate.actor_or_campaign,
+        context_only=candidate.context_only,
+        tlp=candidate.tlp,
+        sensitivity=candidate.sensitivity,
+        external_llm_allowed=candidate.external_llm_allowed,
+        evidence=DiscoveryCandidateEvidence(sources=candidate.sources),
+        id=candidate.id,
+    )
+    discovery_subject_id = subject.id
+    factory.discovery_canonical_ids[discovery_subject_id] = discovery_subject_id
+    discovery_candidate = factory.candidates[candidate.id]
+    factory.discovery_snapshots[edition.id] = DiscoverySnapshot(
+        edition_id=edition.id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=None,
+        merge_run_id=uuid4(),
+        planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+        subjects=(
+            DiscoverySubject(
+                subject_id=discovery_subject_id,
+                candidate=candidate,
+                member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                created_at=discovery_candidate.created_at,
+            ),
+        ),
+        snapshot_hash="a" * 64,
+        is_active=True,
+    )
+    factory.subject_discovery_origins[subject.id] = SubjectDiscoveryOrigin(
+        subject_id=subject.id,
+        edition_id=edition.id,
+        discovery_subject_id=discovery_subject_id,
+        selection_decision_id=uuid4(),
+        selected_snapshot_id=factory.discovery_snapshots[edition.id].id,
+        selected_snapshot_version=1,
+    )
     return subject
 
 
@@ -252,19 +301,12 @@ async def test_collection_operations_use_subject_edition_when_group_differs(
 ) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(factory, ("https://discovery.example/report",))
-    group = next(iter(factory.groups.values()))
-    batch = next(iter(factory.batches.values()))
-    subject_edition_id = uuid4()
-    factory.subjects[subject.id] = replace(subject, edition_id=subject_edition_id)
-    factory.batches[batch.id] = replace(batch, edition_id=subject_edition_id)
-
     app = service(factory, Transport([]), tmp_path / "blobs")
     initialized = await app.initialize(subject.id)
 
     assert [item.requested_url for item in initialized] == ["https://discovery.example/report"]
-    assert initialized[0].edition_id == subject_edition_id
-    assert initialized[0].group_id == group.id
-    assert initialized[0].batch_id == group.candidate_references[0].batch_id
+    assert initialized[0].edition_id == subject.edition_id
+    assert initialized[0].batch_id == next(iter(factory.batches))
 
     supplemental = await app.add_supplemental_sources(
         subject.id,
@@ -272,9 +314,8 @@ async def test_collection_operations_use_subject_edition_when_group_differs(
     )
 
     assert len(supplemental) == 1
-    assert supplemental[0].edition_id == subject_edition_id
-    assert supplemental[0].group_id == group.id
-    assert {item.edition_id for item in factory.collections.values()} == {subject_edition_id}
+    assert supplemental[0].edition_id == subject.edition_id
+    assert {item.edition_id for item in factory.collections.values()} == {subject.edition_id}
 
 
 @pytest.mark.asyncio
@@ -328,7 +369,7 @@ async def test_source_context_does_not_guess_discovery_candidate_from_url(
     _candidate, _document, discovery_candidate_id = await app.source_context(source)
 
     assert source.requested_url == persisted.evidence.sources[0].canonical_url
-    assert discovery_candidate_id is None
+    assert discovery_candidate_id == persisted.id
 
 
 async def test_same_content_from_two_urls_reuses_blob_but_preserves_observations(
@@ -996,7 +1037,6 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
     assert [collection.requested_url for collection in first] == ["https://one.example/report"]
 
     # Deuxième contribution : même publication (nouvel id) + une nouvelle URL.
-    group = next(iter(factory.groups.values()))
     known_batch = next(iter(factory.batches.values()))
     known_candidate = known_batch.candidates[0]
     complement_candidate = CandidateTopic(
@@ -1053,13 +1093,32 @@ async def test_new_contribution_does_not_recollect_an_already_known_url(
         parser_version="test-parser-v1",
     )
     factory.batches[complement.id] = complement
-    # Post-AW-007, a group only ever grows by projecting Fusion's canonical
-    # membership onto it; that is the path this fixture must exercise.
-    group.synchronize_candidate_references(
-        (
-            *group.candidate_references,
-            CandidateReference(complement.id, complement_candidate.id),
-        )
+    complement_discovery_candidate = DiscoveryCandidate.from_candidate_topic(
+        complement_candidate,
+        discovery_run_id=complement.discovery_run_id,
+        discovery_batch_id=complement.id,
+        position=0,
+    )
+    factory.candidates[complement_discovery_candidate.id] = complement_discovery_candidate
+    snapshot = factory.discovery_snapshots[known_batch.edition_id]
+    subject_snapshot = snapshot.subjects[0]
+    factory.discovery_snapshots[known_batch.edition_id] = replace(
+        snapshot,
+        subjects=(
+            replace(
+                subject_snapshot,
+                member_references=(
+                    *subject_snapshot.member_references,
+                    DiscoveryMemberReference(complement_discovery_candidate.id),
+                ),
+            ),
+        ),
+    )
+    factory.candidates[complement_candidate.id] = DiscoveryCandidate.from_candidate_topic(
+        complement_candidate,
+        discovery_run_id=complement.discovery_run_id,
+        discovery_batch_id=complement.id,
+        position=0,
     )
 
     collections = await app.initialize(subject.id)

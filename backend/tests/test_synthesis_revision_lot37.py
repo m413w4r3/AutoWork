@@ -29,8 +29,8 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
+    ProductionRun,
+    ProductionStage,
     SynthesisMode,
 )
 
@@ -196,7 +196,7 @@ class _ArtifactsUow:
 
 def _synthesis_artifact(
     *,
-    run: SubjectProductionRun,
+    run: ProductionRun,
     blob_id: UUID,
     semantic_hash: str,
     source_ids: tuple[str, ...],
@@ -222,11 +222,11 @@ def _synthesis_artifact(
     )
 
 
-def _run() -> SubjectProductionRun:
-    return SubjectProductionRun(
+def _run() -> ProductionRun:
+    return ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.SYNTHESIS,
+        current_stage=ProductionStage.SYNTHESIS,
     )
 
 

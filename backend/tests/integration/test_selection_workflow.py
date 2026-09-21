@@ -722,7 +722,7 @@ async def test_split_after_selection_keeps_the_subject_on_the_historical_identit
 
 
 @pytest.mark.asyncio
-async def test_materialized_subject_duplicate_guard_reads_origins_not_editorial_groups(
+async def test_materialized_subject_duplicate_guard_reads_origins(
     uow_factory: Any,
 ) -> None:
     """AW-008 S38: Fusion learns about materialized Subjects from origins.
@@ -730,7 +730,7 @@ async def test_materialized_subject_duplicate_guard_reads_origins_not_editorial_
     A later wave whose candidate strictly matches an already materialized
     identity must land in Fusion review instead of silently creating a rival
     discovery subject. The only signal feeding that guard is
-    `SubjectDiscoveryOrigin`; no `EditorialGroup` is involved.
+    `SubjectDiscoveryOrigin`; no editorial projection is involved.
     """
     edition, model_run, snapshot, _ = await _seed(uow_factory, "ST")
     identity = await _selection_identity(uow_factory, edition.id)
@@ -752,7 +752,6 @@ async def test_materialized_subject_duplicate_guard_reads_origins_not_editorial_
 
     async with uow_factory() as uow:
         runs = list(await uow.discovery_runs.list_for_edition(edition.id))
-        assert not list(await uow.editorial_groups.list_for_edition(edition.id))
     duplicate = _batch(
         edition.id,
         model_run.id,

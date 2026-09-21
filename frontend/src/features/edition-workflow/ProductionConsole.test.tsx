@@ -45,7 +45,12 @@ function renderConsole(
     if (init?.method === "POST")
       return Promise.resolve(Response.json(cancellation));
     return Promise.resolve(
-      batch ? Response.json(batch) : new Response(null, { status: 404 }),
+      Response.json({
+        edition_id: EDITION_ID,
+        subjects: [],
+        active_batch: batch,
+        recent_batches: [],
+      }),
     );
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -60,6 +65,14 @@ function renderConsole(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("ProductionConsole", () => {
+  it("affiche l’état vide d’un board 200 sans lot", async () => {
+    renderConsole(null);
+
+    expect(
+      await screen.findByText("Aucun lot de production n’est disponible."),
+    ).toBeInTheDocument();
+  });
+
   it("affiche le détail compact de l’extraction de l’article actif", async () => {
     const batch: BatchStatus = {
       batch_id: "batch-extraction",
@@ -428,7 +441,7 @@ describe("ProductionConsole", () => {
     );
     await waitFor(() => {
       expect(invalidate).toHaveBeenCalledWith({
-        queryKey: ["batch", EDITION_ID],
+        queryKey: ["production-board", EDITION_ID],
       });
       expect(invalidate).toHaveBeenCalledWith({
         queryKey: ["edition", EDITION_ID],

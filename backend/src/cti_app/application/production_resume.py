@@ -23,9 +23,9 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     production_stages,
 )
 
@@ -36,21 +36,21 @@ EXTRACTION_PROGRESS_COMPLETED_STATUSES = frozenset({"cached", "succeeded"})
 
 # The artifact that evidences each stage, when there is one.  SOURCES is
 # evidenced by the archived source collections instead.
-STAGE_ARTIFACT: dict[SubjectProductionStage, ProductionArtifactStage | None] = {
-    SubjectProductionStage.SOURCES: None,
-    SubjectProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
-    SubjectProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
-    SubjectProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
-    SubjectProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
+STAGE_ARTIFACT: dict[ProductionStage, ProductionArtifactStage | None] = {
+    ProductionStage.SOURCES: None,
+    ProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
+    ProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
+    ProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
+    ProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
 }
 
 # Model calls a stage still owes when it has to run.  Extraction is variable:
 # it owes one call per source that has no usable answer yet.
-_STAGE_MODEL_CALLS: dict[SubjectProductionStage, int] = {
-    SubjectProductionStage.SOURCES: 0,
-    SubjectProductionStage.REFERENCES: 1,
-    SubjectProductionStage.SYNTHESIS: 1,
-    SubjectProductionStage.ASSEMBLY: 0,
+_STAGE_MODEL_CALLS: dict[ProductionStage, int] = {
+    ProductionStage.SOURCES: 0,
+    ProductionStage.REFERENCES: 1,
+    ProductionStage.SYNTHESIS: 1,
+    ProductionStage.ASSEMBLY: 0,
 }
 
 
@@ -58,9 +58,9 @@ _STAGE_MODEL_CALLS: dict[SubjectProductionStage, int] = {
 class ProductionResumePlan:
     """What a resume will reuse, what it will run, and what it will cost."""
 
-    previous_status: SubjectProductionStatus
-    resume_from_stage: SubjectProductionStage
-    completed_stages: tuple[SubjectProductionStage, ...]
+    previous_status: ProductionRunStatus
+    resume_from_stage: ProductionStage
+    completed_stages: tuple[ProductionStage, ...]
     reused_artifacts: tuple[str, ...]
     model_calls_expected: int
 
@@ -111,8 +111,8 @@ def _artifact_completes_stage(artifact: ProductionArtifact | None) -> bool:
 def resolve_retry_stage(
     live_artifact_stages: Collection[str],
     *,
-    current_stage: SubjectProductionStage,
-) -> SubjectProductionStage:
+    current_stage: ProductionStage,
+) -> ProductionStage:
     """The stage a retry must actually start from.
 
     Same doctrine as :func:`plan_production_resume`, applied to the Review
@@ -143,7 +143,7 @@ def resolve_retry_stage(
 
 
 def plan_production_resume(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     *,
     artifacts: Mapping[str, ProductionArtifact | None],
     archived_source_count: int,
@@ -155,9 +155,9 @@ def plan_production_resume(
     may still find a reusable checkpoint for a source, which costs nothing.
     """
     stages = production_stages()
-    completed: list[SubjectProductionStage] = []
+    completed: list[ProductionStage] = []
     reused: list[str] = []
-    resume_from: SubjectProductionStage | None = None
+    resume_from: ProductionStage | None = None
 
     for stage in stages:
         artifact_stage = STAGE_ARTIFACT[stage]
@@ -176,8 +176,8 @@ def plan_production_resume(
         # Everything is already produced: the run was cancelled after its last
         # stage persisted its artifact.  Replaying assembly is deterministic and
         # free, and it is what brings the run back to READY.
-        resume_from = SubjectProductionStage.ASSEMBLY
-        completed = [stage for stage in stages if stage is not SubjectProductionStage.ASSEMBLY]
+        resume_from = ProductionStage.ASSEMBLY
+        completed = [stage for stage in stages if stage is not ProductionStage.ASSEMBLY]
         reused = [
             artifact_stage.value
             for stage in completed
@@ -187,7 +187,7 @@ def plan_production_resume(
     resume_index = stages.index(resume_from)
     model_calls = 0
     for stage in stages[resume_index:]:
-        if stage is SubjectProductionStage.EXTRACTION:
+        if stage is ProductionStage.EXTRACTION:
             pending = pending_extraction_sources(run.extraction_progress)
             model_calls += pending if pending is not None else archived_source_count
         else:

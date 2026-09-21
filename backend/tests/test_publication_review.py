@@ -24,10 +24,10 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 
@@ -66,28 +66,28 @@ def _edition(state: EditionStatus = EditionStatus.OPEN) -> Edition:
     )
 
 
-def _run(status: SubjectProductionStatus, generation: int = 2) -> SubjectProductionRun:
-    from cti_app.domain.production import SubjectProductionStage
+def _run(status: ProductionRunStatus, generation: int = 2) -> ProductionRun:
+    from cti_app.domain.production import ProductionStage
 
-    return SubjectProductionRun(
+    return ProductionRun(
         id=RUN_ID,
         subject_id=SUBJECT_ID,
         edition_id=EDITION_ID,
         status=status,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        current_stage=ProductionStage.ASSEMBLY,
         pipeline_generation=generation,
     )
 
 
 def _row(
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
     *,
     artifact_status: ProductionArtifactStatus | None = ProductionArtifactStatus.VERIFIED,
     decision: PublicationDecision | None = None,
     effective_decision_id: UUID | None = None,
     generation: int = 2,
     position: int = 1,
-    retry_stage: SubjectProductionStage | None = None,
+    retry_stage: ProductionStage | None = None,
     error_code: str | None = None,
     reconciliation: ProductionSubmissionReconciliation | None = None,
     rejected_indicator_count: int = 0,
@@ -105,8 +105,8 @@ def _row(
         document_artifact_version=1 if artifact_status is not None else None,
         document_input_hash=INPUT_HASH if artifact_status is not None else None,
         document_artifact_status=artifact_status,
-        error_code=error_code or ("failed" if status is SubjectProductionStatus.FAILED else None),
-        error_message="Échec public" if status is SubjectProductionStatus.FAILED else None,
+        error_code=error_code or ("failed" if status is ProductionRunStatus.FAILED else None),
+        error_message="Échec public" if status is ProductionRunStatus.FAILED else None,
         effective_decision=decision,
         effective_decision_id=effective_decision_id,
         retry_stage=retry_stage,
@@ -121,7 +121,7 @@ def _reconciliation() -> ProductionSubmissionReconciliation:
     return ProductionSubmissionReconciliation(
         production_run_id=RUN_ID,
         model_run_id=MODEL_RUN_ID,
-        stage=SubjectProductionStage.SYNTHESIS,
+        stage=ProductionStage.SYNTHESIS,
         bridge_response_id="bridge-1",
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -150,10 +150,10 @@ class _ReadModel:
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun) -> None:
+    def __init__(self, run: ProductionRun) -> None:
         self.run = run
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.run if run_id == self.run.id else None
 
 
@@ -188,7 +188,7 @@ class _Decisions:
 class _Uow:
     def __init__(self, edition: Edition, row: EditionReviewReadItem) -> None:
         self.editions = _Editions(edition)
-        self.subject_production_runs = _Runs(_run(row.run_status, row.pipeline_generation))
+        self.production_runs = _Runs(_run(row.run_status, row.pipeline_generation))
         self.production_artifacts = _Artifacts(row.document_artifact_status)
         self.edition_review_read_model = _ReadModel([row])
         self.publication_review_decisions = _Decisions()
@@ -225,7 +225,7 @@ class _ReleaseRematerializer:
         self.edition_ids.append(edition_id)
 
 
-async def _review(status: SubjectProductionStatus, **kwargs: Any) -> tuple[Any, _Uow]:
+async def _review(status: ProductionRunStatus, **kwargs: Any) -> tuple[Any, _Uow]:
     row = _row(status, **kwargs)
     uow = _Uow(_edition(), row)
     result = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
@@ -234,37 +234,37 @@ async def _review(status: SubjectProductionStatus, **kwargs: Any) -> tuple[Any, 
 
 @pytest.mark.asyncio
 async def test_review_rules_and_exact_acceptance() -> None:
-    item, _ = await _review(SubjectProductionStatus.READY)
+    item, _ = await _review(ProductionRunStatus.READY)
     assert (item.included, item.blocking, item.effective_decision) == (
         True,
         False,
         PublicationDecision.INCLUDE,
     )
 
-    item, _ = await _review(SubjectProductionStatus.READY, decision=PublicationDecision.EXCLUDE)
+    item, _ = await _review(ProductionRunStatus.READY, decision=PublicationDecision.EXCLUDE)
     assert (item.included, item.blocking) == (False, False)
 
     item, _ = await _review(
-        SubjectProductionStatus.READY,
+        ProductionRunStatus.READY,
         artifact_status=ProductionArtifactStatus.NEEDS_REVIEW,
     )
     assert (item.included, item.blocking) == (False, True)
 
-    for status in (SubjectProductionStatus.FAILED, SubjectProductionStatus.NEEDS_REVIEW):
+    for status in (ProductionRunStatus.FAILED, ProductionRunStatus.NEEDS_REVIEW):
         item, _ = await _review(status)
         assert item.blocking is True
         item, _ = await _review(status, decision=PublicationDecision.EXCLUDE)
         assert (item.included, item.blocking) == (False, False)
 
-    for status in (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING):
+    for status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
         item, _ = await _review(status, artifact_status=None)
         assert item.blocking is True
 
 
 def test_loss_counters_are_editorial_signals_only() -> None:
-    ordinary = _row(SubjectProductionStatus.READY)
+    ordinary = _row(ProductionRunStatus.READY)
     signalled = _row(
-        SubjectProductionStatus.READY,
+        ProductionRunStatus.READY,
         rejected_indicator_count=7,
         rejected_rule_count=2,
         published_rule_count=3,
@@ -284,7 +284,7 @@ def test_loss_counters_are_editorial_signals_only() -> None:
 
 @pytest.mark.asyncio
 async def test_read_model_preserves_batch_order_and_has_one_call_for_twenty_items() -> None:
-    rows = [_row(SubjectProductionStatus.READY, position=position) for position in range(20, 0, -1)]
+    rows = [_row(ProductionRunStatus.READY, position=position) for position in range(20, 0, -1)]
     uow = _Uow(_edition(), rows[0])
     uow.edition_review_read_model = _ReadModel(rows)
     result = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
@@ -294,7 +294,7 @@ async def test_read_model_preserves_batch_order_and_has_one_call_for_twenty_item
 
 @pytest.mark.asyncio
 async def test_decision_is_append_only_and_same_request_appends_a_history_event() -> None:
-    row = _row(SubjectProductionStatus.READY)
+    row = _row(ProductionRunStatus.READY)
     uow = _Uow(_edition(), row)
     service = EditionReviewService(cast(Any, _Factory(uow)))
     arguments: _DecisionArguments = {
@@ -316,7 +316,7 @@ async def test_decision_is_append_only_and_same_request_appends_a_history_event(
 
 @pytest.mark.asyncio
 async def test_stale_generation_does_not_append() -> None:
-    row = _row(SubjectProductionStatus.READY)
+    row = _row(ProductionRunStatus.READY)
     uow = _Uow(_edition(), row)
     with pytest.raises(ReviewItemStaleError):
         await EditionReviewService(cast(Any, _Factory(uow))).decide(
@@ -335,7 +335,7 @@ async def test_stale_generation_does_not_append() -> None:
 
 @pytest.mark.asyncio
 async def test_review_requires_an_existing_edition() -> None:
-    row = _row(SubjectProductionStatus.READY)
+    row = _row(ProductionRunStatus.READY)
     edition = _edition()
     edition.id = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
     uow = _Uow(edition, row)
@@ -351,7 +351,7 @@ async def test_review_requires_an_existing_edition() -> None:
 )
 async def test_review_stays_readable_for_open_and_archived(edition_state: EditionStatus) -> None:
     """Review data is readable independently of the edition lifecycle state."""
-    row = _row(SubjectProductionStatus.READY)
+    row = _row(ProductionRunStatus.READY)
     uow = _Uow(_edition(edition_state), row)
     review = await EditionReviewService(cast(Any, _Factory(uow))).get(EDITION_ID)
     assert [item.subject_id for item in review.items] == [SUBJECT_ID]
@@ -359,7 +359,7 @@ async def test_review_stays_readable_for_open_and_archived(edition_state: Editio
 
 @pytest.mark.asyncio
 async def test_archived_edition_still_refuses_a_decision() -> None:
-    row = _row(SubjectProductionStatus.READY)
+    row = _row(ProductionRunStatus.READY)
     uow = _Uow(_edition(EditionStatus.ARCHIVED), row)
     with pytest.raises(ValueError, match="edition_archived"):
         await EditionReviewService(cast(Any, _Factory(uow))).decide(
@@ -386,7 +386,7 @@ def _api(uow: _Uow) -> FastAPI:
 
 @pytest.mark.asyncio
 async def test_api_stale_returns_public_409_and_does_not_append() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.READY))
     async with AsyncClient(
         transport=ASGITransport(app=_api(uow)), base_url="http://test"
     ) as client:
@@ -407,7 +407,7 @@ async def test_api_stale_returns_public_409_and_does_not_append() -> None:
 
 @pytest.mark.asyncio
 async def test_api_rematerializes_release_with_verified_identity() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.READY))
     application = _api(uow)
     rematerializer = _ReleaseRematerializer()
     application.state.edition_release_rematerializer = rematerializer
@@ -423,7 +423,7 @@ async def test_api_rematerializes_release_with_verified_identity() -> None:
 
 @pytest.mark.asyncio
 async def test_api_exclude_requires_a_non_blank_reason_and_review_is_public() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.READY))
     async with AsyncClient(
         transport=ASGITransport(app=_api(uow)), base_url="http://test"
     ) as client:
@@ -456,7 +456,7 @@ async def test_api_exclude_requires_a_non_blank_reason_and_review_is_public() ->
 
 @pytest.mark.asyncio
 async def test_api_exclude_without_document_is_allowed_when_run_has_no_document() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.FAILED, artifact_status=None))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.FAILED, artifact_status=None))
     async with AsyncClient(
         transport=ASGITransport(app=_api(uow)), base_url="http://test"
     ) as client:
@@ -477,7 +477,7 @@ async def test_api_exclude_without_document_is_allowed_when_run_has_no_document(
 
 @pytest.mark.asyncio
 async def test_api_separates_include_and_exclude_document_contracts() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.FAILED, artifact_status=None))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.FAILED, artifact_status=None))
     async with AsyncClient(
         transport=ASGITransport(app=_api(uow)), base_url="http://test"
     ) as client:
@@ -505,10 +505,10 @@ async def test_api_separates_include_and_exclude_document_contracts() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "status",
-    [SubjectProductionStatus.FAILED, SubjectProductionStatus.NEEDS_REVIEW],
+    [ProductionRunStatus.FAILED, ProductionRunStatus.NEEDS_REVIEW],
 )
 async def test_exclude_without_document_is_allowed_for_terminal_failed_runs(
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
 ) -> None:
     row = _row(status, artifact_status=None)
     uow = _Uow(_edition(), row)
@@ -531,7 +531,7 @@ async def test_exclude_without_document_is_allowed_for_terminal_failed_runs(
 
 @pytest.mark.asyncio
 async def test_documentless_exclusion_is_stale_when_a_document_exists() -> None:
-    uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    uow = _Uow(_edition(), _row(ProductionRunStatus.READY))
     with pytest.raises(ReviewItemStaleError):
         await EditionReviewService(cast(Any, _Factory(uow))).decide(
             EDITION_ID,
@@ -550,21 +550,21 @@ async def test_documentless_exclusion_is_stale_when_a_document_exists() -> None:
 
 @pytest.mark.asyncio
 async def test_review_acceptance_requires_an_included_item() -> None:
-    empty_uow = _Uow(_edition(), _row(SubjectProductionStatus.READY))
+    empty_uow = _Uow(_edition(), _row(ProductionRunStatus.READY))
     empty_uow.edition_review_read_model = _ReadModel([])
     empty_review = await EditionReviewService(cast(Any, _Factory(empty_uow))).get(EDITION_ID)
     assert not empty_review.can_accept
 
     all_excluded_uow = _Uow(
-        _edition(), _row(SubjectProductionStatus.READY, decision=PublicationDecision.EXCLUDE)
+        _edition(), _row(ProductionRunStatus.READY, decision=PublicationDecision.EXCLUDE)
     )
     assert not (
         await EditionReviewService(cast(Any, _Factory(all_excluded_uow))).get(EDITION_ID)
     ).can_accept
 
-    included = _row(SubjectProductionStatus.READY)
+    included = _row(ProductionRunStatus.READY)
     failed_excluded = _row(
-        SubjectProductionStatus.FAILED,
+        ProductionRunStatus.FAILED,
         artifact_status=None,
         decision=PublicationDecision.EXCLUDE,
         position=2,
@@ -578,18 +578,16 @@ async def test_review_acceptance_requires_an_included_item() -> None:
 async def test_review_exposes_effective_decision_id_and_backend_retry_stage() -> None:
     explicit_id = UUID("55555555-5555-4555-8555-555555555555")
     item, _ = await _review(
-        SubjectProductionStatus.FAILED,
+        ProductionRunStatus.FAILED,
         artifact_status=None,
         decision=PublicationDecision.EXCLUDE,
         effective_decision_id=explicit_id,
-        retry_stage=SubjectProductionStage.SYNTHESIS,
+        retry_stage=ProductionStage.SYNTHESIS,
     )
     assert item.effective_decision_id == explicit_id
-    assert item.retry_stage is SubjectProductionStage.SYNTHESIS
+    assert item.retry_stage is ProductionStage.SYNTHESIS
 
-    ready_item, _ = await _review(
-        SubjectProductionStatus.READY, retry_stage=SubjectProductionStage.SYNTHESIS
-    )
+    ready_item, _ = await _review(ProductionRunStatus.READY, retry_stage=ProductionStage.SYNTHESIS)
     assert ready_item.retry_stage is None
 
 
@@ -601,9 +599,9 @@ async def test_cancelled_review_item_is_never_offered_a_retry() -> None:
     and the domain now agree: a cancelled article is resolved by excluding it.
     """
     item, _ = await _review(
-        SubjectProductionStatus.CANCELLED,
+        ProductionRunStatus.CANCELLED,
         artifact_status=None,
-        retry_stage=SubjectProductionStage.SYNTHESIS,
+        retry_stage=ProductionStage.SYNTHESIS,
     )
 
     assert item.can_retry is False
@@ -616,9 +614,9 @@ async def test_cancelled_review_item_is_never_offered_a_retry() -> None:
 @pytest.mark.asyncio
 async def test_reconciliation_item_asks_for_recovery_instead_of_a_retry() -> None:
     item, _ = await _review(
-        SubjectProductionStatus.NEEDS_REVIEW,
+        ProductionRunStatus.NEEDS_REVIEW,
         artifact_status=None,
-        retry_stage=SubjectProductionStage.SYNTHESIS,
+        retry_stage=ProductionStage.SYNTHESIS,
         error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
         reconciliation=_reconciliation(),
     )
@@ -635,12 +633,12 @@ async def test_reconciliation_item_asks_for_recovery_instead_of_a_retry() -> Non
 @pytest.mark.asyncio
 async def test_an_ordinary_needs_review_item_stays_retryable() -> None:
     item, _ = await _review(
-        SubjectProductionStatus.NEEDS_REVIEW,
+        ProductionRunStatus.NEEDS_REVIEW,
         artifact_status=None,
-        retry_stage=SubjectProductionStage.SYNTHESIS,
+        retry_stage=ProductionStage.SYNTHESIS,
         error_code="synthesis_error",
     )
 
     assert (item.can_retry, item.requires_reconciliation) == (True, False)
-    assert item.retry_stage is SubjectProductionStage.SYNTHESIS
+    assert item.retry_stage is ProductionStage.SYNTHESIS
     assert item.reconciliation is None

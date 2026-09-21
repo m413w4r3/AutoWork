@@ -34,6 +34,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   const openedSubjects: string[] = [];
   const seenPaths: string[] = [];
   let productionPostBody: unknown = null;
+  let productionSurfaceVisited = false;
 
   const edition = () => ({
     id: editionId,
@@ -264,6 +265,12 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
     const url = new URL(request.url());
     const path = url.pathname;
     seenPaths.push(`${request.method()} ${path}`);
+    if (
+      productionSurfaceVisited &&
+      path.startsWith(`/api/editions/${editionId}/selection`)
+    ) {
+      throw new Error("Production surface called the Selection API");
+    }
 
     if (path === `/api/editions/${editionId}`) {
       await route.fulfill({ json: edition() });
@@ -278,13 +285,17 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       return;
     }
     if (path === `/api/editions/${editionId}/selection`) {
+      if (productionSurfaceVisited) {
+        throw new Error("Production surface called the Selection API");
+      }
       await route.fulfill({ json: selectionBoard() });
       return;
     }
     if (
-      path === `/api/editions/${editionId}/production` &&
+      path === `/api/editions/${editionId}/production/batches` &&
       request.method() === "POST"
     ) {
+      expect(request.headers()["idempotency-key"]).toBeTruthy();
       productionPostBody = request.postDataJSON();
       batchStarted = true;
       await route.fulfill({
@@ -402,7 +413,15 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       /^\/api\/subjects\/([^/]+)\/production$/,
     );
     if (productionMatch) {
-      await route.fulfill({ json: productionStatus(productionMatch[1]) });
+      const status = productionStatus(productionMatch[1]);
+      expect(Object.keys(status.stages)).toEqual([
+        "sources",
+        "references",
+        "extraction",
+        "synthesis",
+        "assembly",
+      ]);
+      await route.fulfill({ json: status });
       return;
     }
     await route.fulfill({ status: 404, json: {} });
@@ -426,6 +445,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await expect(page.getByRole("link", { name: "Sujet créé" })).toHaveCount(2);
 
   // 2. The batch composition is chosen on /production only.
+  productionSurfaceVisited = true;
   await page.goto(`/editions/${editionId}/production`);
   const selector = page.getByRole("region", {
     name: "Sélecteur du lot de production",
@@ -511,7 +531,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
 
   expect(seenPaths).toEqual(
     expect.arrayContaining([
-      `POST /api/editions/${editionId}/production`,
+      `POST /api/editions/${editionId}/production/batches`,
       `GET /api/editions/${editionId}/production`,
       `GET /api/editions/${editionId}/review`,
       `POST /api/editions/${editionId}/publication/accept`,
@@ -521,4 +541,6 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       `GET /api/subjects/${subjectA}/production`,
     ]),
   );
+  expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
+  expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

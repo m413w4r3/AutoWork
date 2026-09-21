@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import inspect
 import logging
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -179,9 +178,6 @@ class SelectionWorkspaceMaterializer(Protocol):
     ) -> object: ...
 
 
-PostCommitProjection = Callable[[SelectionBoard], Awaitable[object] | object]
-
-
 class SelectionService:
     def __init__(
         self,
@@ -190,14 +186,12 @@ class SelectionService:
         materializer: SelectionWorkspaceMaterializer | SubjectWorkspaceMaterializer | None = None,
         workspace_root: Path = Path("work/subjects"),
         recommendation_policy: SelectionRecommendationPolicyV1 | None = None,
-        post_commit_projection: PostCommitProjection | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._subjects = SubjectService(uow_factory)
         self._materializer = materializer
         self._workspace_root = workspace_root
         self._recommendation_policy = recommendation_policy or SelectionRecommendationPolicyV1()
-        self._post_commit_projection = post_commit_projection
 
     async def board(self, edition_id: UUID) -> SelectionBoard:
         async with self._uow_factory() as uow:
@@ -297,15 +291,7 @@ class SelectionService:
 
         for subject in created:
             await self._materialize_after_commit(subject, edition_id)
-        result = await self.board(edition_id)
-        if self._post_commit_projection is not None:
-            try:
-                projection_result = self._post_commit_projection(result)
-                if inspect.isawaitable(projection_result):
-                    await projection_result
-            except Exception:
-                logger.exception("selection_post_commit_projection_failed")
-        return result
+        return await self.board(edition_id)
 
     async def _apply_decisions(
         self,

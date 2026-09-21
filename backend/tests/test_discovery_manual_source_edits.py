@@ -21,7 +21,6 @@ from cti_app.domain.discovery import (
     DiscoverySourceMode,
     IncompleteSourceCandidate,
     SourceCandidate,
-    SourceRelationshipStatus,
     SourceRole,
 )
 from cti_app.domain.discovery_cumulative import (
@@ -31,13 +30,6 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryPlannerKind,
     DiscoverySnapshot,
     DiscoverySubject,
-)
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
 )
 
 
@@ -150,27 +142,14 @@ class _RunRepository:
         return type("Run", (), {"edition_id": self.edition_id})()
 
 
-class _GroupRepository:
-    def __init__(self, groups: list[EditorialGroup]) -> None:
-        self.groups = groups
-
-    async def get_by_subject(self, subject_id: object) -> EditorialGroup | None:
-        return next((group for group in self.groups if group.subject_id == subject_id), None)
-
-    async def save(self, group: EditorialGroup) -> None:
-        del group
-
-
 class _Uow:
     def __init__(
         self,
         batches: _BatchRepository,
-        groups: _GroupRepository,
         candidates: _CandidateRepository,
         runs: _RunRepository,
     ) -> None:
         self.discovery_batches = batches
-        self.editorial_groups = groups
         self.discovery_candidates = candidates
         self.discovery_runs = runs
         batches.candidates = candidates
@@ -260,18 +239,6 @@ class _Factory:
         return self.uow
 
 
-def _score() -> EditorialScore:
-    return EditorialScore(
-        impact=3,
-        novelty=3,
-        technical_depth=3,
-        hunting_potential=3,
-        actionability=3,
-        source_quality=3,
-        justifications={},
-    )
-
-
 def _source(url: str, *, title: str = "Blocked report") -> SourceCandidate:
     return SourceCandidate(
         url=url,
@@ -336,32 +303,6 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
         source_coverage_complete=False,
         source_coverage_incomplete_reason="test",
     )
-    group = EditorialGroup(
-        edition_id=edition_id,
-        title="Candidate",
-        candidate_references=(CandidateReference(old_batch.id, candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=_score(),
-        source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject_id)
-    other_group = EditorialGroup(
-        edition_id=edition_id,
-        title="Other candidate",
-        candidate_references=(CandidateReference(old_batch.id, other_candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=_score(),
-        source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    other_group.select(other_subject_id)
     snapshot = DiscoverySnapshot(
         edition_id=edition_id,
         version=1,
@@ -389,7 +330,6 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     batches = _BatchRepository([old_batch])
     uow = _Uow(
         batches,
-        _GroupRepository([group, other_group]),
         _CandidateRepository(
             [
                 DiscoveryCandidate.from_candidate_topic(
@@ -428,10 +368,6 @@ async def test_replacement_archives_new_candidate_and_repoints_only_target() -> 
     assert manual_candidate.id != candidate.id
     assert manual_batch.discovery_run_id == originating_run_id
     assert old.canonical_url not in {source.canonical_url for source in manual_candidate.sources}
-    assert group.candidate_references == (CandidateReference(old_batch.id, candidate.id),)
-    assert other_group.candidate_references == (
-        CandidateReference(old_batch.id, other_candidate.id),
-    )
     assert other_candidate.sources[0].canonical_url == old.canonical_url
     assert archive.calls[0]["operation"] == "replace"
     assert old.canonical_url.encode() in archive.calls[0]["content"]  # type: ignore[operator]
@@ -505,7 +441,6 @@ async def test_manual_source_edit_batch_keeps_originating_discovery_run() -> Non
     batches = _BatchRepository([unrelated_batch, originating_batch])
     uow = _Uow(
         batches,
-        _GroupRepository([]),
         _CandidateRepository(
             [
                 DiscoveryCandidate.from_candidate_topic(
@@ -606,7 +541,6 @@ async def test_attach_incomplete_source_by_candidate_id_creates_new_candidates()
     batches = _BatchRepository([batch_a, batch_b])
     uow = _Uow(
         batches,
-        _GroupRepository([]),
         _CandidateRepository(
             [
                 DiscoveryCandidate.from_candidate_topic(

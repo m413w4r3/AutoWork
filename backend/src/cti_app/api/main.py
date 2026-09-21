@@ -1,7 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import FastAPI, Request
 from minio import Minio
@@ -51,7 +51,6 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
 )
 from cti_app.application.editions import EditionService
-from cti_app.application.editorial import LegacyEditorialProjectionService
 from cti_app.application.http_collection import (
     CollectionPolicy,
     SafeHttpCollector,
@@ -74,10 +73,10 @@ from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionService,
 )
-from cti_app.application.selection import SelectionBoard, SelectionService
+from cti_app.application.selection import SelectionService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subject_production import (
-    EditionProductionService,
+    ProductionBatchService,
     SubjectProductionService,
 )
 from cti_app.application.subjects import SubjectService
@@ -122,38 +121,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         ),
         physical_bucket=settings.s3_bucket,
     )
-    legacy_editorial_projection_service = LegacyEditorialProjectionService(uow_factory)
-
-    async def rebuild_legacy_editorial_projection(edition_id: UUID) -> object:
-        """TODO AW-009: delete with LegacyEditorialProjection.
-
-        Every activation of a new snapshot and every selection batch moves the
-        canonical state the legacy production/collection engine reads through
-        `EditorialGroup`. Rebuilding here keeps that projection derived rather
-        than letting Fusion or Selection write it themselves.
-
-        It runs after the canonical commit, so a failure is logged and
-        swallowed: it can never turn a committed merge, split or selection
-        into an error. The projection is rebuildable and is resynchronized
-        before a production batch is created.
-        """
-        try:
-            return await legacy_editorial_projection_service.synchronize(edition_id)
-        except Exception:
-            logger.exception(
-                "legacy_editorial_projection_failed",
-                extra={"edition_id": str(edition_id)},
-            )
-            return None
-
-    async def project_selection_board(board: SelectionBoard) -> object:
-        return await rebuild_legacy_editorial_projection(board.edition_id)
-
     selection_service = SelectionService(
         uow_factory,
         materializer=SubjectWorkspaceMaterializer(blob_store),
         workspace_root=settings.subject_workspace_root,
-        post_commit_projection=project_selection_board,
     )
     production_diagnostics = DiagnosticsLog.from_env(settings.diagnostics_log_root)
     # Exactly one bridge capabilities provider for this process: it also
@@ -168,7 +139,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             bridge_capabilities_provider=bridge_provider,
         ),
         diagnostics=production_diagnostics,
-        after_activation=rebuild_legacy_editorial_projection,
     )
     job_service: JobService
     job_dispatcher: DramatiqJobDispatcher
@@ -216,7 +186,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     fusion_service = FusionService(
         uow_factory,
         replan_intake=replan_discovery_intake,
-        after_activation=rebuild_legacy_editorial_projection,
     )
 
     discovery_service = DiscoveryService(
@@ -263,7 +232,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     subject_production_service = SubjectProductionService(uow_factory)
-    edition_production_service = EditionProductionService(uow_factory, production_pacing)
+    edition_production_service = ProductionBatchService(uow_factory, production_pacing)
     production_artifact_store = ProductionArtifactStore(BlobCatalogService(blob_store, uow_factory))
     production_checkpoint = EditionProductionCheckpointService(
         uow_factory,

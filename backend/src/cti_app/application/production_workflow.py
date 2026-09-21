@@ -147,6 +147,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionRepairIssueKind,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     Q2ReuseDecision,
     Q2ReuseReason,
     Q2ReuseStatus,
@@ -154,9 +157,6 @@ from cti_app.domain.production import (
     Q2SourceImpact,
     SourceExtraction,
     SourceExtractionStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
     SynthesisMode,
 )
 from cti_app.domain.publication import is_publication_ioc_artifact_type
@@ -1009,11 +1009,11 @@ class ProductionWorkflowOrchestrator:
         if uow_factory is None:
             return
         async with uow_factory() as uow:
-            runs = getattr(uow, "subject_production_runs", None)
+            runs = getattr(uow, "production_runs", None)
             if runs is None:
                 return
             run = await runs.get(run_id)
-        if run is not None and run.status is SubjectProductionStatus.CANCELLED:
+        if run is not None and run.status is ProductionRunStatus.CANCELLED:
             raise JobCancelledError
 
     async def _persist_extraction_progress(
@@ -1023,7 +1023,7 @@ class ProductionWorkflowOrchestrator:
     ) -> None:
         """Write one compact progress snapshot in its own short transaction."""
         async with self._uow_factory() as uow:
-            runs = getattr(uow, "subject_production_runs", None)
+            runs = getattr(uow, "production_runs", None)
             if runs is None:
                 return
             get_for_update = getattr(runs, "get_for_update", None)
@@ -1043,8 +1043,8 @@ class ProductionWorkflowOrchestrator:
 
     async def _close_completed_stage_conversation_best_effort(
         self,
-        run: SubjectProductionRun,
-        stage: SubjectProductionStage,
+        run: ProductionRun,
+        stage: ProductionStage,
     ) -> None:
         """Archive the model conversation after a durable stage result.
 
@@ -1058,9 +1058,9 @@ class ProductionWorkflowOrchestrator:
             return
 
         conversation_id: UUID | None = None
-        if stage is SubjectProductionStage.REFERENCES:
+        if stage is ProductionStage.REFERENCES:
             conversation_id = run.references_conversation_id
-        elif stage is SubjectProductionStage.SYNTHESIS:
+        elif stage is ProductionStage.SYNTHESIS:
             conversation_id = run.synthesis_conversation_id
 
         if conversation_id is None:
@@ -1117,7 +1117,7 @@ class ProductionWorkflowOrchestrator:
     async def execute_stage(
         self,
         run_id: UUID,
-        expected_stage: SubjectProductionStage,
+        expected_stage: ProductionStage,
         context: JobExecutionContext | None = None,
         correlation_id: str = "-",
     ) -> dict[str, Any]:
@@ -1130,7 +1130,7 @@ class ProductionWorkflowOrchestrator:
         # and blocks the batch besides. State transitions take their own short
         # lock, in the job handler.
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
             snapshot = (
                 await uow.production_input_snapshots.get_by_run(run.id) if run is not None else None
             )
@@ -1147,15 +1147,15 @@ class ProductionWorkflowOrchestrator:
             )
 
         try:
-            if expected_stage == SubjectProductionStage.SOURCES:
+            if expected_stage == ProductionStage.SOURCES:
                 result = await self._execute_sources_stage(run, context, snapshot)
-            elif expected_stage == SubjectProductionStage.REFERENCES:
+            elif expected_stage == ProductionStage.REFERENCES:
                 result = await self._execute_references_stage(run, context, snapshot)
-            elif expected_stage == SubjectProductionStage.EXTRACTION:
+            elif expected_stage == ProductionStage.EXTRACTION:
                 result = await self._execute_extraction_stage(run, context, snapshot)
-            elif expected_stage == SubjectProductionStage.SYNTHESIS:
+            elif expected_stage == ProductionStage.SYNTHESIS:
                 result = await self._execute_synthesis_stage(run, context, snapshot)
-            elif expected_stage == SubjectProductionStage.ASSEMBLY:
+            elif expected_stage == ProductionStage.ASSEMBLY:
                 result = await self._execute_assembly_stage(run, context, snapshot)
             else:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
@@ -1175,7 +1175,7 @@ class ProductionWorkflowOrchestrator:
         return result
 
     def _handle_stage_exception(
-        self, run: SubjectProductionRun, stage: str, exc: Exception
+        self, run: ProductionRun, stage: str, exc: Exception
     ) -> dict[str, Any]:
         """Preserves the original exception's traceback in diagnostics before
         converting it to a safe error result for the caller."""
@@ -1191,7 +1191,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _reuse_artifact(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         stage: str,
         input_hash: str,
     ) -> dict[str, Any] | None:
@@ -1220,7 +1220,7 @@ class ProductionWorkflowOrchestrator:
         self,
         *,
         uow: Any,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         report: ReferenceReport,
         extraction_payload: Any,
         source_tiers_by_url: dict[str, str],
@@ -1372,7 +1372,7 @@ class ProductionWorkflowOrchestrator:
         self,
         *,
         uow: Any,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         report: ReferenceReport,
         extraction_artifact: ProductionArtifact,
         extraction_payload: Any,
@@ -1503,7 +1503,7 @@ class ProductionWorkflowOrchestrator:
     def _record_synthesis_mode(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         mode: SynthesisMode,
         previous_artifact_id: UUID | None,
         previous_word_count: int,
@@ -1545,7 +1545,7 @@ class ProductionWorkflowOrchestrator:
     async def _ask_with_format_repair(
         self,
         *,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         conversation_id: UUID,
         stage: str,
         prompt: str,
@@ -1644,7 +1644,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _integrate_reference_sources(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         report: ReferenceReport,
         context: JobExecutionContext | None,
         snapshot: ProductionInputSnapshot | None = None,
@@ -1811,7 +1811,7 @@ class ProductionWorkflowOrchestrator:
         except (OSError, UnicodeError, ValueError):
             return None
 
-    def _log_parse(self, run: SubjectProductionRun, stage: str, result: ParseResult[Any]) -> None:
+    def _log_parse(self, run: ProductionRun, stage: str, result: ParseResult[Any]) -> None:
         self._diagnostics.record_parse(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -1830,14 +1830,12 @@ class ProductionWorkflowOrchestrator:
         subject_id: UUID,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> tuple[str, str]:
-        """Canonical subject title and editorial context for a subject."""
-        if snapshot is not None:
-            return snapshot.subject_title, snapshot.subject_description
-        subject = await uow.subjects.get(subject_id)
-        if subject is None:
-            raise ValueError("production_subject_missing")
-        group = await uow.editorial_groups.get_by_subject(subject_id)
-        return subject.title, group.grouping_justification if group is not None else ""
+        """Canonical subject title and discovery context from the frozen snapshot."""
+        if snapshot is None:
+            raise ValueError("production_input_snapshot_missing")
+        if snapshot.subject_id != subject_id:
+            raise ValueError("production_input_snapshot_subject_mismatch")
+        return snapshot.subject_title, snapshot.discovery_summary
 
     async def _turn_output_text(self, conversation_id: UUID, turn_id: UUID) -> str | None:
         """Read a turn's output text.
@@ -1852,7 +1850,7 @@ class ProductionWorkflowOrchestrator:
         return None
 
     async def _open_conversation(
-        self, run: SubjectProductionRun, subject_title: str, purpose: ConversationPurpose
+        self, run: ProductionRun, subject_title: str, purpose: ConversationPurpose
     ) -> ModelConversation:
         assert self._model_service is not None
         return await self._model_service.create(
@@ -1872,7 +1870,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_sources_stage(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -1940,7 +1938,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_references_stage(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -1990,10 +1988,10 @@ class ProductionWorkflowOrchestrator:
                     run, subject_title, ConversationPurpose.SUBJECT_RESEARCH
                 )
                 run.references_conversation_id = conversation.id
-                persisted = await uow.subject_production_runs.get_for_update(run.id)
+                persisted = await uow.production_runs.get_for_update(run.id)
                 if persisted is not None:
                     persisted.references_conversation_id = conversation.id
-                    await uow.subject_production_runs.save(persisted)
+                    await uow.production_runs.save(persisted)
                     await uow.commit()
 
             prompt = ProductionPromptTemplates.get_references_prompt(
@@ -2121,7 +2119,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_extraction_stage(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -2201,7 +2199,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_direct_url_extraction(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -4956,7 +4954,7 @@ class ProductionWorkflowOrchestrator:
             and effective_decisions
         ):
             async with self._uow_factory() as replay_uow:
-                replay_run = await replay_uow.subject_production_runs.get(run.id)
+                replay_run = await replay_uow.production_runs.get(run.id)
                 if replay_run is None:
                     replay_run = run
                 effective_artifact = await reconcile_effective_repairs_in_uow(
@@ -5009,7 +5007,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_synthesis_stage(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -5281,10 +5279,10 @@ class ProductionWorkflowOrchestrator:
                     run, subject_title, ConversationPurpose.DRAFTING
                 )
                 run.synthesis_conversation_id = conversation.id
-                persisted = await uow.subject_production_runs.get_for_update(run.id)
+                persisted = await uow.production_runs.get_for_update(run.id)
                 if persisted is not None:
                     persisted.synthesis_conversation_id = conversation.id
-                    await uow.subject_production_runs.save(persisted)
+                    await uow.production_runs.save(persisted)
                     await uow.commit()
             prompt = ProductionPromptTemplates.get_synthesis_prompt(
                 subject_title=subject_title,
@@ -5419,7 +5417,7 @@ class ProductionWorkflowOrchestrator:
 
     async def _execute_assembly_stage(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
@@ -5501,8 +5499,8 @@ class ProductionWorkflowOrchestrator:
             )
 
             await self._check_cancellation(run.id, context)
-            ending = await uow.subject_production_runs.get_for_update(run.id)
-            if ending is None or ending.status is SubjectProductionStatus.CANCELLED:
+            ending = await uow.production_runs.get_for_update(run.id)
+            if ending is None or ending.status is ProductionRunStatus.CANCELLED:
                 return {
                     "stage": "assembly",
                     "status": "cancelled",
@@ -5510,13 +5508,13 @@ class ProductionWorkflowOrchestrator:
 
             if qa_result["passed"]:
                 ending.mark_ready(now=datetime.now(UTC))
-                await uow.subject_production_runs.save(ending)
+                await uow.production_runs.save(ending)
                 await uow.commit()
 
                 return {
                     "stage": "assembly",
                     "status": "success",
-                    "run_status": SubjectProductionStatus.READY.value,
+                    "run_status": ProductionRunStatus.READY.value,
                     "qa": qa_result,
                 }
             else:
@@ -5526,13 +5524,13 @@ class ProductionWorkflowOrchestrator:
                     details=qa_result,
                     now=datetime.now(UTC),
                 )
-                await uow.subject_production_runs.save(ending)
+                await uow.production_runs.save(ending)
                 await uow.commit()
 
                 return {
                     "stage": "assembly",
                     "status": "needs_review",
-                    "run_status": SubjectProductionStatus.NEEDS_REVIEW.value,
+                    "run_status": ProductionRunStatus.NEEDS_REVIEW.value,
                     "qa": qa_result,
                 }
 

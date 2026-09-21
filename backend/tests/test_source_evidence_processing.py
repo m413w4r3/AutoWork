@@ -211,7 +211,6 @@ async def test_referenced_evidence_selection_never_traverses_a_child(tmp_path: P
     child = SourceCollection(
         subject_id=parent.subject_id,
         edition_id=parent.edition_id,
-        group_id=parent.group_id,
         requested_url="https://source-0.example/child.html",
         canonical_url="https://source-0.example/child.html",
         proposed_role=parent.proposed_role,

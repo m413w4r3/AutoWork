@@ -17,9 +17,9 @@ from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
 from cti_app.infrastructure.database.models.core import SubjectRow
@@ -28,7 +28,7 @@ from cti_app.infrastructure.database.models.production import (
     EditionProductionBatchRow,
     ProductionArtifactRow,
     ProductionInputSnapshotRow,
-    SubjectProductionRunRow,
+    ProductionRunRow,
 )
 from cti_app.infrastructure.database.models.publication_review import (
     PublicationReviewDecisionRow,
@@ -211,10 +211,10 @@ class SqlAlchemyEditionReviewReadRepository:
                     subject_title,
                     cast(EditionProductionBatchItemRow.subject_id, String),
                 ).label("title"),
-                SubjectProductionRunRow.id.label("run_id"),
-                SubjectProductionRunRow.pipeline_generation.label("pipeline_generation"),
-                SubjectProductionRunRow.status.label("run_status"),
-                SubjectProductionRunRow.current_stage.label("current_stage"),
+                ProductionRunRow.id.label("run_id"),
+                ProductionRunRow.pipeline_generation.label("pipeline_generation"),
+                ProductionRunRow.status.label("run_status"),
+                ProductionRunRow.current_stage.label("current_stage"),
                 current_artifacts.c.artifact_id,
                 current_artifacts.c.artifact_version,
                 current_artifacts.c.artifact_hash,
@@ -235,25 +235,19 @@ class SqlAlchemyEditionReviewReadRepository:
                 func.coalesce(current_extraction.c.published_rule_count, 0).label(
                     "published_rule_count"
                 ),
-                SubjectProductionRunRow.error_code.label("error_code"),
-                SubjectProductionRunRow.error_message.label("error_message"),
-                SubjectProductionRunRow.reconciliation_model_run_id.label(
-                    "reconciliation_model_run_id"
-                ),
-                SubjectProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
-                SubjectProductionRunRow.reconciliation_bridge_response_id.label(
+                ProductionRunRow.error_code.label("error_code"),
+                ProductionRunRow.error_message.label("error_message"),
+                ProductionRunRow.reconciliation_model_run_id.label("reconciliation_model_run_id"),
+                ProductionRunRow.reconciliation_stage.label("reconciliation_stage"),
+                ProductionRunRow.reconciliation_bridge_response_id.label(
                     "reconciliation_bridge_response_id"
                 ),
-                SubjectProductionRunRow.reconciliation_submission_state.label(
+                ProductionRunRow.reconciliation_submission_state.label(
                     "reconciliation_submission_state"
                 ),
-                SubjectProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
-                SubjectProductionRunRow.reconciliation_output_sha256.label(
-                    "reconciliation_output_sha256"
-                ),
-                SubjectProductionRunRow.reconciliation_provenance.label(
-                    "reconciliation_provenance"
-                ),
+                ProductionRunRow.reconciliation_phase.label("reconciliation_phase"),
+                ProductionRunRow.reconciliation_output_sha256.label("reconciliation_output_sha256"),
+                ProductionRunRow.reconciliation_provenance.label("reconciliation_provenance"),
                 PublicationReviewDecisionRow.id.label("decision_id"),
                 PublicationReviewDecisionRow.decision.label("decision"),
                 func.row_number()
@@ -268,8 +262,8 @@ class SqlAlchemyEditionReviewReadRepository:
             )
             .select_from(EditionProductionBatchItemRow)
             .join(
-                SubjectProductionRunRow,
-                SubjectProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
+                ProductionRunRow,
+                ProductionRunRow.id == EditionProductionBatchItemRow.production_run_id,
             )
             .outerjoin(
                 ProductionInputSnapshotRow,
@@ -300,9 +294,9 @@ class SqlAlchemyEditionReviewReadRepository:
                     PublicationReviewDecisionRow.edition_id == edition_id,
                     PublicationReviewDecisionRow.subject_id
                     == EditionProductionBatchItemRow.subject_id,
-                    PublicationReviewDecisionRow.production_run_id == SubjectProductionRunRow.id,
+                    PublicationReviewDecisionRow.production_run_id == ProductionRunRow.id,
                     PublicationReviewDecisionRow.pipeline_generation
-                    == SubjectProductionRunRow.pipeline_generation,
+                    == ProductionRunRow.pipeline_generation,
                     or_(
                         and_(
                             current_artifacts.c.artifact_id.is_(None),
@@ -357,7 +351,7 @@ def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReco
     return ProductionSubmissionReconciliation(
         production_run_id=run_id,
         model_run_id=model_run_id,
-        stage=SubjectProductionStage(stage),
+        stage=ProductionStage(stage),
         bridge_response_id=row["reconciliation_bridge_response_id"],
         submission_state=ModelSubmissionState(submission_state),
         phase=phase,
@@ -367,7 +361,7 @@ def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReco
 
 
 def _read_item_from_row(row: Any) -> EditionReviewReadItem:
-    run_status = SubjectProductionStatus(row["run_status"])
+    run_status = ProductionRunStatus(row["run_status"])
     live_artifact_stages = frozenset(row["live_artifact_stages"] or ())
     artifact_status = (
         ProductionArtifactStatus(row["artifact_status"])
@@ -404,7 +398,7 @@ def _read_item_from_row(row: Any) -> EditionReviewReadItem:
         retry_stage=(
             resolve_retry_stage(
                 live_artifact_stages,
-                current_stage=SubjectProductionStage(row["current_stage"]),
+                current_stage=ProductionStage(row["current_stage"]),
             )
             if can_retry
             else None

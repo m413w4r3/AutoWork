@@ -25,6 +25,7 @@ PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis',
 PRODUCTION_REUSE_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis'"
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'failed'"
+TLP_VALUES_SQL = "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'"
 EXTRACTION_PROFILE_VALUES_SQL = "'full', 'ioc_rules'"
 PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL = (
     "'rejected_indicator', 'rejected_rule', 'supplemental_source_unarchived'"
@@ -53,8 +54,8 @@ SAMPLE_ACQUISITION_OUTCOME_VALUES_SQL = "'success', 'error'"
 SAMPLE_ACQUISITION_HASH_FAMILY_VALUES_SQL = "'md5', 'sha1', 'sha256'"
 
 
-class SubjectProductionRunRow(Base):
-    __tablename__ = "subject_production_runs"
+class ProductionRunRow(Base):
+    __tablename__ = "production_runs"
     __table_args__ = (
         UniqueConstraint("subject_id", "run_number", name="uq_subject_run_number"),
         CheckConstraint("version >= 1", name="ck_run_version"),
@@ -67,8 +68,8 @@ class SubjectProductionRunRow(Base):
         ),
         CheckConstraint(f"status IN ({PRODUCTION_STATUS_VALUES_SQL})", name="ck_run_status"),
         CheckConstraint(f"current_stage IN ({PRODUCTION_STAGE_VALUES_SQL})", name="ck_run_stage"),
-        Index("ix_subject_production_runs_subject_id_created_at", "subject_id", "created_at"),
-        Index("ix_subject_production_runs_edition_id_status", "edition_id", "status"),
+        Index("ix_production_runs_subject_id_created_at", "subject_id", "created_at"),
+        Index("ix_production_runs_edition_id_status", "edition_id", "status"),
         Index(
             "uq_subject_production_one_active_run",
             "subject_id",
@@ -94,7 +95,7 @@ class SubjectProductionRunRow(Base):
     )
     run_number: Mapped[int] = mapped_column(nullable=False)
     pipeline_generation: Mapped[int] = mapped_column(nullable=False, server_default="0")
-    research_date: Mapped[date | None] = mapped_column(Date)
+    research_date: Mapped[date] = mapped_column(Date, nullable=False)
     force_recompute_from_stage: Mapped[str | None] = mapped_column(String(32))
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(500))
@@ -152,7 +153,7 @@ class ProductionArtifactRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        ForeignKey("production_runs.id", ondelete="CASCADE"),
         nullable=False,
     )
     subject_id: Mapped[UUID] = mapped_column(
@@ -281,7 +282,7 @@ class AnalystInvestigationRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        ForeignKey("production_runs.id", ondelete="CASCADE"),
         nullable=False,
     )
     subject_id: Mapped[UUID] = mapped_column(
@@ -435,6 +436,17 @@ class EditionProductionBatchRow(Base):
             f"status IN ({PRODUCTION_BATCH_STATUS_VALUES_SQL})", name="ck_batch_status"
         ),
         CheckConstraint(f"phase IN ({PRODUCTION_BATCH_PHASE_VALUES_SQL})", name="ck_batch_phase"),
+        CheckConstraint(
+            "length(trim(idempotency_key)) BETWEEN 1 AND 255", name="ck_batch_idempotency_key"
+        ),
+        CheckConstraint("length(trim(actor_id)) BETWEEN 1 AND 255", name="ck_batch_actor_id"),
+        CheckConstraint(
+            "length(trim(correlation_id)) BETWEEN 1 AND 128", name="ck_batch_correlation_id"
+        ),
+        CheckConstraint(
+            "request_fingerprint ~ '^[0-9a-f]{64}$'", name="ck_batch_request_fingerprint"
+        ),
+        UniqueConstraint("edition_id", "idempotency_key", name="uq_batch_edition_idempotency"),
         Index("ix_edition_production_batches_edition_id_status", "edition_id", "status"),
     )
 
@@ -442,6 +454,10 @@ class EditionProductionBatchRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    correlation_id: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     phase: Mapped[str] = mapped_column(String(16), nullable=False, server_default="initial")
     next_dispatch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -473,7 +489,7 @@ class EditionProductionBatchItemRow(Base):
     )
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        ForeignKey("production_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
     position: Mapped[int] = mapped_column(nullable=False)
@@ -485,10 +501,21 @@ class ProductionInputSnapshotRow(Base):
     __tablename__ = "production_input_snapshots"
     __table_args__ = (
         UniqueConstraint("production_run_id", name="uq_production_input_snapshots_run"),
-        CheckConstraint("editorial_group_version >= 1", name="ck_production_input_group_version"),
+        CheckConstraint("subject_version >= 1", name="ck_production_input_subject_version"),
+        CheckConstraint(
+            "discovery_snapshot_version >= 1",
+            name="ck_production_input_discovery_snapshot_version",
+        ),
+        CheckConstraint(
+            f"subject_tlp IN ({TLP_VALUES_SQL})", name="ck_production_input_subject_tlp"
+        ),
         CheckConstraint("period_start <= period_end", name="ck_production_input_period_order"),
         CheckConstraint(
             "jsonb_typeof(core_sources) = 'array'", name="ck_production_input_sources_array"
+        ),
+        CheckConstraint(
+            "jsonb_typeof(member_candidate_ids) = 'array'",
+            name="ck_production_input_member_candidates_array",
         ),
         CheckConstraint(
             "char_length(input_hash) = 64 AND input_hash ~ '^[0-9a-f]{64}$'",
@@ -504,7 +531,7 @@ class ProductionInputSnapshotRow(Base):
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="CASCADE"),
+        ForeignKey("production_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
     subject_id: Mapped[UUID] = mapped_column(
@@ -513,12 +540,32 @@ class ProductionInputSnapshotRow(Base):
     edition_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("editions.id", ondelete="RESTRICT"), nullable=False
     )
-    editorial_group_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("editorial_groups.id", ondelete="RESTRICT"), nullable=False
-    )
-    editorial_group_version: Mapped[int] = mapped_column(nullable=False)
+    subject_version: Mapped[int] = mapped_column(nullable=False)
     subject_title: Mapped[str] = mapped_column(Text, nullable=False)
-    subject_description: Mapped[str] = mapped_column(Text, nullable=False)
+    subject_tlp: Mapped[str] = mapped_column(String(16), nullable=False)
+    selection_decision_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("selection_decisions.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    origin_discovery_subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_subject_identities.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    canonical_discovery_subject_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_subject_identities.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    discovery_snapshot_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("discovery_snapshots.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    discovery_snapshot_version: Mapped[int] = mapped_column(nullable=False)
+    member_candidate_ids: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
+    discovery_summary: Mapped[str] = mapped_column(Text, nullable=False)
     actor_or_campaign: Mapped[str] = mapped_column(Text, nullable=False)
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
@@ -597,7 +644,7 @@ class ProductionRepairCorrectionRow(Base):
     )
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        ForeignKey("production_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
     original_repair_key: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -678,7 +725,7 @@ class ProductionRepairDecisionRow(Base):
     )
     production_run_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
-        ForeignKey("subject_production_runs.id", ondelete="RESTRICT"),
+        ForeignKey("production_runs.id", ondelete="RESTRICT"),
         nullable=False,
     )
     observed_artifact_id: Mapped[UUID] = mapped_column(

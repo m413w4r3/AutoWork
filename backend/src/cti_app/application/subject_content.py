@@ -84,7 +84,7 @@ class SubjectContentService:
 
     async def content(self, subject_id: UUID) -> SubjectContentView | None:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 return None
             artifact = await current_publication_artifact(uow.production_artifacts, run.id)
@@ -113,7 +113,7 @@ class SubjectContentService:
 
     async def indicators(self, subject_id: UUID) -> list[SubjectIndicatorView]:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+            run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 return []
             artifact = await uow.production_artifacts.get_current(

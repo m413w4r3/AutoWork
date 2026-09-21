@@ -30,7 +30,6 @@ async def test_database_rejects_verified_relationship_without_qualified_evidence
     collection = SourceCollection(
         subject_id=subject.id,
         edition_id=edition.id,
-        group_id=group.id,
         batch_id=batch.id,
         source_candidate_id=source.id,
         requested_url=source.canonical_url,

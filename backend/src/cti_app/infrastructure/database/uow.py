@@ -26,7 +26,6 @@ from cti_app.application.persistence import (
     EditionProductionBatchRepository,
     EditionReleaseRepository,
     EditionRepository,
-    EditorialGroupRepository,
     GoodwareBaselineRepository,
     HumanDecisionRepository,
     IndicatorRepository,
@@ -43,6 +42,7 @@ from cti_app.application.persistence import (
     ProductionRepairCorrectionRepository,
     ProductionRepairDecisionRepository,
     ProductionReuseInvalidationRepository,
+    ProductionRunRepository,
     ProvenanceRepository,
     PublicationManifestEntryRepository,
     PublicationManifestExclusionRepository,
@@ -61,7 +61,6 @@ from cti_app.application.persistence import (
     SubjectContributionRepository,
     SubjectDiscoveryOriginRepository,
     SubjectMergeEventRepository,
-    SubjectProductionRunRepository,
     SubjectRepository,
     VirusTotalFileViewRepository,
     VirusTotalObservationRepository,
@@ -114,10 +113,7 @@ from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
 )
-from cti_app.infrastructure.database.repositories.editorial import (
-    SqlAlchemyEditorialGroupRepository,
-    SqlAlchemyHumanDecisionRepository,
-)
+from cti_app.infrastructure.database.repositories.editorial import SqlAlchemyHumanDecisionRepository
 from cti_app.infrastructure.database.repositories.invariants import (
     SqlAlchemyInvariantRepository,
 )
@@ -145,9 +141,9 @@ from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyProductionRepairCorrectionRepository,
     SqlAlchemyProductionRepairDecisionRepository,
     SqlAlchemyProductionReuseInvalidationRepository,
+    SqlAlchemyProductionRunRepository,
     SqlAlchemySampleAcquisitionAttemptRepository,
     SqlAlchemySourceExtractionRepository,
-    SqlAlchemySubjectProductionRunRepository,
 )
 from cti_app.infrastructure.database.repositories.publication_review import (
     SqlAlchemyEditionReviewReadRepository,
@@ -196,7 +192,6 @@ class SqlAlchemyUnitOfWork:
     discovery_snapshots: DiscoverySnapshotRepository
     discovery_merge_runs: DiscoveryMergeRunRepository
     subject_contributions: SubjectContributionRepository
-    editorial_groups: EditorialGroupRepository
     human_decisions: HumanDecisionRepository
     source_collections: SourceCollectionRepository
     collection_attempts: CollectionAttemptRepository
@@ -205,7 +200,7 @@ class SqlAlchemyUnitOfWork:
     claims: ClaimRepository
     indicators: IndicatorRepository
     rejected_model_proposals: RejectedModelProposalRepository
-    subject_production_runs: SubjectProductionRunRepository
+    production_runs: ProductionRunRepository
     production_input_snapshots: ProductionInputSnapshotRepository
     production_artifacts: ProductionArtifactRepository
     production_reuse_invalidations: ProductionReuseInvalidationRepository
@@ -273,7 +268,6 @@ class SqlAlchemyUnitOfWork:
         self.discovery_snapshots = SqlAlchemyDiscoverySnapshotRepository(self._session)
         self.discovery_merge_runs = SqlAlchemyDiscoveryMergeRunRepository(self._session)
         self.subject_contributions = SqlAlchemySubjectContributionRepository(self._session)
-        self.editorial_groups = SqlAlchemyEditorialGroupRepository(self._session)
         self.human_decisions = SqlAlchemyHumanDecisionRepository(self._session)
         self.source_collections = SqlAlchemySourceCollectionRepository(self._session)
         self.collection_attempts = SqlAlchemyCollectionAttemptRepository(self._session)
@@ -284,7 +278,7 @@ class SqlAlchemyUnitOfWork:
         self.claims = SqlAlchemyClaimRepository(self._session)
         self.indicators = SqlAlchemyIndicatorRepository(self._session)
         self.rejected_model_proposals = SqlAlchemyRejectedModelProposalRepository(self._session)
-        self.subject_production_runs = SqlAlchemySubjectProductionRunRepository(self._session)
+        self.production_runs = SqlAlchemyProductionRunRepository(self._session)
         self.production_input_snapshots = SqlAlchemyProductionInputSnapshotRepository(self._session)
         self.production_artifacts = SqlAlchemyProductionArtifactRepository(self._session)
         self.production_repair_decisions = SqlAlchemyProductionRepairDecisionRepository(

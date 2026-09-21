@@ -174,7 +174,6 @@ def extract_indicators(
     *,
     subject_id: UUID,
     edition_id: UUID,
-    group_id: UUID,
     source_document_id: UUID,
     artifact_id: UUID,
 ) -> tuple[Indicator, ...]:
@@ -210,7 +209,6 @@ def extract_indicators(
         Indicator(
             subject_id=subject_id,
             edition_id=edition_id,
-            group_id=group_id,
             source_document_id=source_document_id,
             derived_artifact_id=artifact_id,
             kind=kind,
@@ -253,7 +251,6 @@ class EvidenceExtractionService:
         *,
         subject_id: UUID,
         edition_id: UUID,
-        group_id: UUID,
         source_document_id: UUID,
         artifact_id: UUID,
         external_llm_allowed: bool,
@@ -303,7 +300,6 @@ class EvidenceExtractionService:
                         text,
                         subject_id=subject_id,
                         edition_id=edition_id,
-                        group_id=group_id,
                         source_document_id=source_document_id,
                         artifact_id=artifact_id,
                         model_run_id=model_run_id,
@@ -392,7 +388,6 @@ def _validated_proposal(
     *,
     subject_id: UUID,
     edition_id: UUID,
-    group_id: UUID,
     source_document_id: UUID,
     artifact_id: UUID,
     model_run_id: UUID | None,
@@ -411,7 +406,6 @@ def _validated_proposal(
     claim = Claim(
         subject_id=subject_id,
         edition_id=edition_id,
-        group_id=group_id,
         source_document_id=source_document_id,
         derived_artifact_id=artifact_id,
         kind=proposed.kind,

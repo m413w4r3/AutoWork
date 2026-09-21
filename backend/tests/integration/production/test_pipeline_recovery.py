@@ -12,7 +12,6 @@ from uuid import UUID
 
 import pytest
 
-from cti_app.api.production import _create_and_start_run
 from cti_app.application.jobs import JobRegistry, JobService, JobStatus
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
@@ -41,9 +40,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionBatchStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.integrations.models import BridgeTransportError
 
@@ -139,10 +138,10 @@ def _configured(
 
 async def _state(
     scenario: ProductionScenario,
-) -> tuple[SubjectProductionRun, list[Any], Any, Any]:
+) -> tuple[ProductionRun, list[Any], Any, Any]:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(scenario.run_id)
+        run = await uow.production_runs.get(scenario.run_id)
         artifacts = list(await uow.production_artifacts.list_for_run(scenario.run_id))
         item = await uow.edition_production_batch_items.get_by_run(scenario.run_id)
         batch = await uow.edition_production_batches.get(item.batch_id) if item else None
@@ -158,8 +157,8 @@ async def _jobs_for_run(scenario: ProductionScenario) -> list[Any]:
 
 async def _dispatch_stage(
     scenario: ProductionScenario,
-    run: SubjectProductionRun,
-    stage: SubjectProductionStage,
+    run: ProductionRun,
+    stage: ProductionStage,
 ) -> UUID:
     chain = ProductionStageChain()
     chain.bind(scenario.jobs, scenario.runner)
@@ -258,9 +257,9 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
         await scenario.start()
         run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     assert run.pipeline_generation == 1
-    assert run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.current_stage is ProductionStage.ASSEMBLY
 
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     first_model_ids = {
@@ -310,7 +309,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
             model_run = await uow.model_runs.get(model_run_id)
             assert model_run is not None
             assert model_run.status is ModelRunStatus.SUCCEEDED
-        all_runs = await uow.subject_production_runs.list_for_edition(run.edition_id)
+        all_runs = await uow.production_runs.list_for_edition(run.edition_id)
     assert len(all_runs) == 1
 
 
@@ -328,8 +327,8 @@ async def test_terminal_source_failure_does_not_schedule_a_next_generation(
     await scenario.start()
     run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
-    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
+    assert run.current_stage is ProductionStage.EXTRACTION
     assert run.pipeline_generation == 0
     assert run.error_code == "q2_source_coverage_failed"
     persisted_run, artifacts, item, batch = await _state(scenario)
@@ -380,9 +379,9 @@ async def test_mixed_source_retryability_never_opens_global_recovery(
         await scenario.start()
         run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert run.pipeline_generation == 0
-    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.current_stage is ProductionStage.EXTRACTION
     assert run.error_code == "bridge_unreachable"
     assert run.error_details is not None
     failures = run.error_details["source_failures"]
@@ -409,7 +408,7 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
     scenario, _ = _configured(production_scenario_factory, count=2)
     await scenario.start()
     first = await scenario.run_until_terminal()
-    assert first.status is SubjectProductionStatus.READY
+    assert first.status is ProductionRunStatus.READY
     _, initial_artifacts, item, _ = await _state(scenario)
     assert item is not None and item.auto_recovery_count == 0
     initial_versions = {artifact.stage: artifact.version for artifact in initial_artifacts}
@@ -425,8 +424,8 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
         "operator_review_required",
         "The operator requested a deliberate recomputation.",
     )
-    retry = await service.retry_from_stage(first.id, SubjectProductionStage.EXTRACTION)
-    assert retry.previous_status is SubjectProductionStatus.FAILED
+    retry = await service.retry_from_stage(first.id, ProductionStage.EXTRACTION)
+    assert retry.previous_status is ProductionRunStatus.FAILED
     assert retry.old_generation == 0
     assert retry.run.pipeline_generation == 1
     assert retry.staled_artifacts == ["extraction", "synthesis", "publication"]
@@ -450,10 +449,10 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
         is ProductionArtifactStatus.VERIFIED
     )
 
-    await _dispatch_stage(scenario, retry.run, SubjectProductionStage.EXTRACTION)
+    await _dispatch_stage(scenario, retry.run, ProductionStage.EXTRACTION)
     await scenario.runner.run_until_idle()
     final, artifacts, item, batch = await _state(scenario)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert final.pipeline_generation == 1
     assert item is not None and item.auto_recovery_count == 0
     assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
@@ -487,14 +486,12 @@ async def test_concurrent_start_requests_create_one_run_and_one_job(
 ) -> None:
     scenario, _ = _configured(production_scenario_factory, count=2)
     await scenario.seed()
+    # One Idempotency-Key replayed concurrently: the batch primitive must
+    # settle on a single run and a single SOURCES job.
     results = await asyncio.gather(
         *(
-            _create_and_start_run(
-                scenario.uow_factory,
-                scenario.jobs,
-                scenario.runner,
-                subject_id=scenario.subject.id,
-                edition_id=scenario.edition.id,
+            scenario.start_run_idempotently(
+                idempotency_key=f"operator-test-{scenario.subject.id}",
                 actor_id="operator-test",
             )
             for _ in range(2)
@@ -506,18 +503,18 @@ async def test_concurrent_start_requests_create_one_run_and_one_job(
     job_ids = {job_id for _, job_id in results if job_id is not None}
     assert len(job_ids) == 1
     async with scenario.uow_factory() as uow:
-        runs = await uow.subject_production_runs.list_for_edition(scenario.edition.id)
+        runs = await uow.production_runs.list_for_edition(scenario.edition.id)
     assert len(runs) == 1
     jobs = await _jobs_for_run(scenario)
     assert len(jobs) == 1
     assert jobs[0].id in job_ids
     assert jobs[0].idempotency_key == production_stage_idempotency_key(
-        runs[0], SubjectProductionStage.SOURCES
+        runs[0], ProductionStage.SOURCES
     )
 
     await scenario.runner.run_until_idle()
     final, artifacts, _, _ = await _state(scenario)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert final.pipeline_generation == 0
     assert len(await _jobs_for_run(scenario)) == 5
     await _assert_artifact_invariants(scenario, artifacts)
@@ -535,7 +532,7 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     extraction_job = next(
         job
         for job in await _jobs_for_run(scenario)
-        if job.kind == stage_job_kind(SubjectProductionStage.EXTRACTION)
+        if job.kind == stage_job_kind(ProductionStage.EXTRACTION)
     )
 
     await scenario.runner.dispatch(extraction_job.id)
@@ -543,7 +540,7 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     await scenario.runner.run_until_idle()
 
     after, artifacts, _, _ = await _state(scenario)
-    assert after.status is SubjectProductionStatus.READY
+    assert after.status is ProductionRunStatus.READY
     assert after.pipeline_generation == before.pipeline_generation
     assert [(artifact.id, artifact.version, artifact.status) for artifact in artifacts] == [
         (artifact.id, artifact.version, artifact.status) for artifact in before_artifacts[1]
@@ -582,7 +579,7 @@ async def test_crash_after_durable_model_response_replays_without_resubmission(
         await scenario.start()
         run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     assert len(q2_calls) == 2
     assert q2_calls[0].model_run_id == q2_calls[1].model_run_id
@@ -661,7 +658,7 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
 
     await scenario.start()
     review = await scenario.run_until_terminal()
-    assert review.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert review.status is ProductionRunStatus.NEEDS_REVIEW
     assert review.reconciliation is not None
 
     # The next production generation has a deterministic provider answer. The
@@ -706,7 +703,7 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     await runner.run_until_idle()
 
     final, _, item, batch = await _state(scenario)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert final.error_code is None
     assert final.reconciliation is None
     assert final.pipeline_generation == 1
@@ -743,7 +740,7 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
 
     await scenario.start()
     review = await scenario.run_until_terminal()
-    assert review.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert review.status is ProductionRunStatus.NEEDS_REVIEW
     assert review.reconciliation is not None
     original_model_run_id = review.reconciliation.model_run_id
     assert review.reconciliation.bridge_response_id == "bridge-post-submission-8"
@@ -762,7 +759,7 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
     await scenario.runner.run_until_idle()
 
     final, artifacts, item, batch = await _state(scenario)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert final.error_code is None
     assert final.reconciliation is not None
     assert final.reconciliation.model_run_id == original_model_run_id
@@ -808,7 +805,7 @@ async def test_non_blocking_skipped_source_does_not_trigger_recovery(
     await scenario.start()
     run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     assert run.error_code is None
     assert run.pipeline_generation == 0
     persisted_run, artifacts, item, batch = await _state(scenario)
@@ -842,9 +839,9 @@ async def test_cleanup_failure_after_success_keeps_verified_artifact_and_progres
         await scenario.start()
         run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     persisted_run, artifacts, item, batch = await _state(scenario)
-    assert persisted_run.status is SubjectProductionStatus.READY
+    assert persisted_run.status is ProductionRunStatus.READY
     assert item is not None and item.auto_recovery_count == 0
     assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
     assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)

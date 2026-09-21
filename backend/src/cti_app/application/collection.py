@@ -35,6 +35,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.source_filenames import analyst_filename
+from cti_app.application.subject_lineage import resolve_subject_discovery_lineage
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.domain.collection import (
     AttemptOutcome,
@@ -51,7 +52,6 @@ from cti_app.domain.discovery import (
     SourceRole,
     canonicalize_http_url,
 )
-from cti_app.domain.editorial import EditorialGroupStatus
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument
 from cti_app.domain.production import ProductionInputSnapshot, ProductionInputSource
 from cti_app.logging import get_correlation_id
@@ -260,21 +260,8 @@ class SubjectCollectionService:
 
     async def initialize(self, subject_id: UUID) -> list[SourceCollection]:
         async with self._uow_factory() as uow:
-            group = await uow.editorial_groups.get_by_subject(subject_id)
-            subject = await uow.subjects.get(subject_id)
-            if (
-                group is None
-                or group.status is not EditorialGroupStatus.SELECTED
-                or group.subject_id != subject_id
-                or subject is None
-            ):
-                raise CollectionNotAllowedError(
-                    "Only sources attached to a selected subject can be collected"
-                )
-            batches = {
-                batch.id: batch
-                for batch in await uow.discovery_batches.list_for_edition(subject.edition_id)
-            }
+            lineage = await resolve_subject_discovery_lineage(uow, subject_id)
+            subject = lineage.subject
             # Une nouvelle contribution peut réintroduire une URL déjà rattachée au
             # sujet sous un SourceCandidate.id différent. La clé d'unicité en base
             # étant (subject_id, source_candidate_id), il faut dédupliquer sur
@@ -288,28 +275,16 @@ class SubjectCollectionService:
                 for document in await uow.source_documents.list_for_subject(subject_id)
                 if document.origin
             )
-            for reference in group.candidate_references:
-                batch = batches.get(reference.batch_id)
-                candidate = (
-                    next(
-                        (item for item in batch.candidates if item.id == reference.candidate_id),
-                        None,
-                    )
-                    if batch
-                    else None
-                )
-                if candidate is None:
-                    continue
-                for source in candidate.sources:
+            for candidate in lineage.members:
+                for source in candidate.evidence.sources:
                     if source.canonical_url in seen_urls:
                         continue
                     seen_urls.add(source.canonical_url)
                     await uow.source_collections.add_if_absent(
                         _new_collection(
-                            group.id,
                             subject.edition_id,
                             subject_id,
-                            reference.batch_id,
+                            candidate,
                             source,
                         )
                     )
@@ -351,15 +326,10 @@ class SubjectCollectionService:
         so the normal collection pass picks it up.
         """
         async with self._uow_factory() as uow:
-            group = await uow.editorial_groups.get_by_subject(subject_id)
             subject = await uow.subjects.get(subject_id)
-            if (
-                group is None
-                or group.status is not EditorialGroupStatus.SELECTED
-                or subject is None
-            ):
+            if subject is None:
                 raise CollectionNotAllowedError(
-                    "Only sources attached to a selected subject can be collected"
+                    "Only existing subjects can receive supplemental sources"
                 )
             added: list[SourceCollection] = []
             for candidate in sources:
@@ -373,7 +343,6 @@ class SubjectCollectionService:
                 collection = SourceCollection(
                     subject_id=subject_id,
                     edition_id=subject.edition_id,
-                    group_id=group.id,
                     requested_url=canonical,
                     canonical_url=canonical,
                     origin_kind=SourceOriginKind.REFERENCE_RESEARCH,
@@ -459,7 +428,6 @@ class SubjectCollectionService:
                 child = SourceCollection(
                     subject_id=parent.subject_id,
                     edition_id=parent.edition_id,
-                    group_id=parent.group_id,
                     requested_url=canonical,
                     canonical_url=canonical,
                     origin_kind=SourceOriginKind.REFERENCED_EVIDENCE,
@@ -1374,17 +1342,15 @@ def collection_idempotency_key(
 
 
 def _new_collection(
-    group_id: UUID,
     edition_id: UUID,
     subject_id: UUID,
-    batch_id: UUID,
+    candidate: DiscoveryCandidate,
     source: SourceCandidate,
 ) -> SourceCollection:
     return SourceCollection(
         subject_id=subject_id,
         edition_id=edition_id,
-        group_id=group_id,
-        batch_id=batch_id,
+        batch_id=candidate.discovery_batch_id,
         source_candidate_id=source.id,
         requested_url=source.canonical_url,
         canonical_url=source.canonical_url,
@@ -1407,8 +1373,7 @@ def _new_snapshot_collection(
     return SourceCollection(
         subject_id=subject_id,
         edition_id=snapshot.edition_id,
-        group_id=snapshot.editorial_group_id,
-        batch_id=source.batch_id,
+        batch_id=source.discovery_batch_id,
         source_candidate_id=source.source_candidate_id,
         requested_url=source.canonical_url,
         canonical_url=source.canonical_url,

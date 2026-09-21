@@ -36,9 +36,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRepairImpactKind,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     SupplementalSourceRepairState,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
@@ -161,11 +161,11 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     collection_factory.collections[first.id].origin_kind = SourceOriginKind.DISCOVERY
     collection_factory.collections[second.id].state = CollectionState.FAILED_TERMINAL
 
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject.id,
         edition_id=edition.id,
-        status=SubjectProductionStatus.READY,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
         research_date=date(2026, 8, 15),
     )
     world = _World(

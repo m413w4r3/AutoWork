@@ -61,29 +61,32 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
-from cti_app.application.subject_production import EditionProductionService
+from cti_app.application.subject_production import ProductionBatchService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoveryRun,
     DiscoverySourceMode,
     SourceCandidate,
-    SourceRelationshipStatus,
     SourceRole,
 )
-from cti_app.domain.editions import Edition, EditionStatus
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryMergeRun,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
+    DiscoverySubjectIdentity,
+    MergeValidationStatus,
 )
+from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRun, ModelTransport
-from cti_app.domain.production import SubjectProductionRun, SubjectProductionStage
+from cti_app.domain.production import ProductionRun, ProductionStage
+from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.discovery_support import make_discovery_run_for_edition
 
@@ -411,7 +414,6 @@ class ProductionScenario:
     subject: Subject = field(init=False)
     discovery_run: DiscoveryRun = field(init=False)
     discovery_batch: DiscoveryBatch = field(init=False)
-    editorial_group: EditorialGroup = field(init=False)
     source_candidates: tuple[SourceCandidate, ...] = field(init=False)
     artifact_store: ProductionArtifactStore = field(init=False)
     model_output_store: _CatalogModelOutputStore = field(init=False)
@@ -501,28 +503,6 @@ class ProductionScenario:
             source_coverage_complete=True,
             source_coverage_incomplete_reason=None,
         )
-        self.editorial_group = EditorialGroup(
-            edition_id=self.edition.id,
-            title=candidate.title,
-            candidate_references=(CandidateReference(self.discovery_batch.id, candidate.id),),
-            outcome=GroupingOutcome.NEW_SUBJECT,
-            score=EditorialScore(
-                impact=4,
-                novelty=4,
-                technical_depth=4,
-                hunting_potential=4,
-                actionability=4,
-                source_quality=4,
-                justifications={"business-test": "cross-stage coverage"},
-            ),
-            source_relationship_status=SourceRelationshipStatus.VERIFIED,
-            needs_source_verification=False,
-            needs_source_expansion=False,
-            grouping_confidence=GroupingConfidence.HIGH,
-            grouping_justification="The selected subject is represented by the two core sources.",
-        )
-        self.editorial_group.select(self.subject.id)
-
         blob_store = FilesystemBlobStore(self.blob_root)
         catalog = BlobCatalogService(blob_store, self.uow_factory)
         self.artifact_store = ProductionArtifactStore(catalog)
@@ -643,48 +623,139 @@ class ProductionScenario:
             await uow.subjects.add(self.subject)
             await uow.model_runs.add(discovery_run)
             assert await uow.discovery_batches.add_if_absent(self.discovery_batch)
-            await uow.editorial_groups.add(self.editorial_group)
+            candidate = self.discovery_batch.candidates[0]
+            discovery_candidate = DiscoveryCandidate.from_candidate_topic(
+                candidate,
+                discovery_run_id=self.discovery_batch.discovery_run_id,
+                discovery_batch_id=self.discovery_batch.id,
+                position=0,
+            )
+            # The lineage rows Production resolves are real, FK-checked rows:
+            # the merge run and the selection decision must exist before the
+            # identity, the snapshot and the origin can reference them.
+            merge_run = DiscoveryMergeRun(
+                edition_id=self.edition.id,
+                parent_snapshot_id=None,
+                intake_id=None,
+                planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+                prompt_version="1",
+                policy_version="1",
+                blocking_version="1",
+                merge_input_hash=sha256(self.subject.id.bytes).hexdigest(),
+                handle_map={},
+                included_subject_ids=(self.subject.id,),
+                excluded_subject_count=0,
+                validation_status=MergeValidationStatus.VALID,
+            )
+            assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+            snapshot = DiscoverySnapshot(
+                edition_id=self.edition.id,
+                version=1,
+                parent_snapshot_id=None,
+                intake_id=None,
+                merge_run_id=merge_run.id,
+                planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+                subjects=(
+                    DiscoverySubject(
+                        subject_id=self.subject.id,
+                        candidate=candidate,
+                        member_references=(DiscoveryMemberReference(discovery_candidate.id),),
+                        created_at=discovery_candidate.created_at,
+                    ),
+                ),
+                snapshot_hash=sha256(self.discovery_batch.id.bytes).hexdigest(),
+                is_active=True,
+            )
+            await uow.discovery_subject_identities.add_many_if_absent(
+                [
+                    # The selection identity is canonical and points to itself.
+                    DiscoverySubjectIdentity(
+                        edition_id=self.edition.id,
+                        origin_key=f"subject:{self.subject.id}",
+                        created_by_merge_run_id=snapshot.merge_run_id,
+                        id=self.subject.id,
+                    )
+                ]
+            )
+            await uow.discovery_snapshots.append(snapshot)
+            decision = SelectionDecision(
+                edition_id=self.edition.id,
+                discovery_subject_id=self.subject.id,
+                snapshot_id=snapshot.id,
+                snapshot_version=snapshot.version,
+                action=SelectionAction.SELECT,
+                subject_id=self.subject.id,
+                actor_id="business-test",
+                correlation_id="business-test",
+                idempotency_key=f"business-test-{self.subject.id}",
+            )
+            await uow.selection_decisions.append(decision)
+            await uow.subject_discovery_origins.add(
+                SubjectDiscoveryOrigin(
+                    subject_id=self.subject.id,
+                    edition_id=self.edition.id,
+                    discovery_subject_id=self.subject.id,
+                    selection_decision_id=decision.id,
+                    selected_snapshot_id=snapshot.id,
+                    selected_snapshot_version=snapshot.version,
+                )
+            )
             await uow.commit()
 
-    async def start(self) -> SubjectProductionRun:
-        await self.seed()
-        batch = await EditionProductionService(
-            self.uow_factory, ProductionPacingPolicy.zero()
-        ).create_batch(
+    async def start_run_idempotently(
+        self, *, idempotency_key: str, actor_id: str = "business-test"
+    ) -> tuple[ProductionRun, UUID | None]:
+        """Replay-safe single-subject start, exactly as the batch endpoint does.
+
+        Creating the batch commits before any dispatch, so a replay of the same
+        key repairs a missing first job instead of creating a second run.
+        """
+        batches = ProductionBatchService(self.uow_factory, ProductionPacingPolicy.zero())
+        result = await batches.create(
             self.edition.id,
             [self.subject.id],
-            actor_id="business-test",
-            correlation_id="business-test",
+            idempotency_key=idempotency_key,
+            actor_id=actor_id,
+            correlation_id=actor_id,
         )
-        self.batch_id = batch.id
-        first = await EditionProductionService(
-            self.uow_factory, ProductionPacingPolicy.zero()
-        ).start_next(batch.id)
-        assert first is not None
-        self.run_id = first.id
+        self.batch_id = result.batch.id
+        run = await batches.start_next(result.batch.id)
+        if run is None:
+            async with self.uow_factory() as uow:
+                items = await uow.edition_production_batch_items.list_for_batch(result.batch.id)
+                run = await uow.production_runs.get(items[0].production_run_id)
+        assert run is not None
+        self.run_id = run.id
         parameters = ProductionStageParameters(
-            run_id=first.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
-            pipeline_generation=first.pipeline_generation,
+            run_id=run.id,
+            expected_stage=ProductionStage.SOURCES.value,
+            pipeline_generation=run.pipeline_generation,
         )
         job = await self.jobs.submit(
-            kind=stage_job_kind(SubjectProductionStage.SOURCES),
+            kind=stage_job_kind(ProductionStage.SOURCES),
             aggregate_type="subject",
-            aggregate_id=first.subject_id,
-            idempotency_key=production_stage_idempotency_key(first, SubjectProductionStage.SOURCES),
-            correlation_id="business-test",
+            aggregate_id=run.subject_id,
+            idempotency_key=production_stage_idempotency_key(run, ProductionStage.SOURCES),
+            correlation_id=actor_id,
             input_parameters=parameters.model_dump(mode="json"),
             max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-            actor_id="business-test",
+            actor_id=actor_id,
         )
         await self.runner.dispatch(job.id)
-        return first
+        return run, job.id
 
-    async def run_until_terminal(self) -> SubjectProductionRun:
+    async def start(self) -> ProductionRun:
+        await self.seed()
+        run, _ = await self.start_run_idempotently(
+            idempotency_key=f"business-test-{self.subject.id}"
+        )
+        return run
+
+    async def run_until_terminal(self) -> ProductionRun:
         await self.runner.run_until_idle()
         assert self.run_id is not None
         async with self.uow_factory() as uow:
-            run = await uow.subject_production_runs.get(self.run_id)
+            run = await uow.production_runs.get(self.run_id)
         assert run is not None
         return run
 

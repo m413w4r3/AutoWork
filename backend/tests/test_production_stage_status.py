@@ -13,13 +13,13 @@ from cti_app.application.production_stage_status import (
     completed_stage_count,
 )
 from cti_app.domain.production import (
-    SubjectProductionRun,
-    SubjectProductionStage,
+    ProductionRun,
+    ProductionStage,
 )
 
 
-def _run(stage: SubjectProductionStage) -> SubjectProductionRun:
-    run = SubjectProductionRun(
+def _run(stage: ProductionStage) -> ProductionRun:
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
     )
@@ -29,7 +29,7 @@ def _run(stage: SubjectProductionStage) -> SubjectProductionRun:
 
 
 def test_sources_is_complete_once_the_run_moved_past_it() -> None:
-    run = _run(SubjectProductionStage.REFERENCES)
+    run = _run(ProductionStage.REFERENCES)
 
     stages = build_stage_statuses(run, {}, archived_sources=5)
 
@@ -40,7 +40,7 @@ def test_sources_is_complete_once_the_run_moved_past_it() -> None:
 
 
 def test_ready_run_reports_every_stage_complete() -> None:
-    run = _run(SubjectProductionStage.ASSEMBLY)
+    run = _run(ProductionStage.ASSEMBLY)
     run.mark_ready()
 
     stages = build_stage_statuses(run, {})
@@ -49,7 +49,7 @@ def test_ready_run_reports_every_stage_complete() -> None:
 
 
 def test_needs_review_surfaces_the_reason_on_the_current_stage() -> None:
-    run = _run(SubjectProductionStage.SYNTHESIS)
+    run = _run(ProductionStage.SYNTHESIS)
     run.mark_needs_review(code="unknown_source", message="[S9] inconnu")
 
     stages = build_stage_statuses(run, {})
@@ -63,7 +63,7 @@ def test_needs_review_surfaces_the_reason_on_the_current_stage() -> None:
 
 
 def test_failed_run_marks_the_stage_it_stopped_on() -> None:
-    run = _run(SubjectProductionStage.REFERENCES)
+    run = _run(ProductionStage.REFERENCES)
     run.mark_failed(code="bridge_timeout", message="timeout")
 
     stages = build_stage_statuses(run, {})

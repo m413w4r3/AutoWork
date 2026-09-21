@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock
@@ -11,16 +11,16 @@ from cti_app.application.production_state import (
     MAX_PRODUCTION_STATE_BYTES,
     ProductionStateError,
     ProductionStateService,
-    ProductionStateSnapshotV1,
-    ProductionStateSnapshotV3,
+    ProductionStateSnapshotV4,
     _exported_repair_block,
     _validate_snapshot,
     compute_production_state_checksum,
 )
+from cti_app.domain.classification import TLP
 from cti_app.domain.production import (
     EditionProductionBatchItem,
-    SubjectProductionRun,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
 )
 from tools.production_state_checksum import canonical_checksum
 
@@ -28,13 +28,15 @@ from tools.production_state_checksum import canonical_checksum
 def _payload() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format": "autowork.production-state",
-        "schema_version": 1,
+        "schema_version": 4,
         "exported_at": "2026-08-26T15:00:00Z",
         "origin": {
             "subject_title": "Titre original",
-            "editorial_type": "brief",
-            "profile": "brief_auto",
+            "subject_id": str(uuid4()),
+            "production_run_id": str(uuid4()),
             "research_date": "2026-08-26",
+            "discovery_snapshot_id": str(uuid4()),
+            "discovery_snapshot_version": 1,
         },
         "artifacts": {
             "references": {
@@ -56,7 +58,7 @@ def _payload() -> dict[str, Any]:
         },
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV1.model_validate(payload)
+    snapshot = ProductionStateSnapshotV4.model_validate(payload)
     payload["content_sha256"] = compute_production_state_checksum(snapshot)
     return payload
 
@@ -67,8 +69,8 @@ class _FailingFactory:
 
 
 class _ImportUow:
-    def __init__(self, current: SubjectProductionRun, item: Any | None) -> None:
-        self.subject_production_runs = SimpleNamespace(
+    def __init__(self, current: ProductionRun, item: Any | None) -> None:
+        self.production_runs = SimpleNamespace(
             lock_creation_for_subject=AsyncMock(),
             get_current_for_subject=AsyncMock(return_value=current),
             allocate_next_run_number=AsyncMock(return_value=current.run_number + 1),
@@ -78,7 +80,55 @@ class _ImportUow:
             get_by_run=AsyncMock(return_value=item),
             save=AsyncMock(),
         )
-        self.editorial_groups = SimpleNamespace(get_by_subject=AsyncMock(return_value=None))
+        discovery_subject_id = uuid4()
+        self.editions = SimpleNamespace(
+            get_for_update=AsyncMock(return_value=SimpleNamespace(state=None)),
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    period_start=date(2026, 1, 1), period_end=date(2026, 12, 31)
+                )
+            ),
+        )
+        self.subjects = SimpleNamespace(
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    id=current.subject_id,
+                    edition_id=current.edition_id,
+                    title="Imported subject",
+                    version=1,
+                    tlp=TLP.AMBER,
+                )
+            )
+        )
+        self.subject_discovery_origins = SimpleNamespace(
+            get_by_subject=AsyncMock(
+                return_value=SimpleNamespace(
+                    subject_id=current.subject_id,
+                    edition_id=current.edition_id,
+                    discovery_subject_id=discovery_subject_id,
+                    selection_decision_id=uuid4(),
+                )
+            )
+        )
+        self.discovery_subject_identities = SimpleNamespace(
+            resolve_canonical_subject=AsyncMock(return_value=discovery_subject_id)
+        )
+        self.discovery_snapshots = SimpleNamespace(
+            get_active=AsyncMock(
+                return_value=SimpleNamespace(
+                    id=uuid4(),
+                    version=1,
+                    subjects=[
+                        SimpleNamespace(
+                            subject_id=discovery_subject_id,
+                            member_references=(),
+                            candidate=SimpleNamespace(summary="Imported subject"),
+                        )
+                    ],
+                )
+            )
+        )
+        self.discovery_candidates = SimpleNamespace(list_for_edition=AsyncMock(return_value=[]))
         self.production_artifacts = SimpleNamespace(append=AsyncMock())
         self.production_input_snapshots = SimpleNamespace(add=AsyncMock())
         self.commit = AsyncMock()
@@ -114,10 +164,10 @@ class _ImportArtifactStore:
 def _import_service(item: Any | None) -> tuple[ProductionStateService, _ImportUow, UUID, UUID]:
     subject_id = uuid4()
     edition_id = uuid4()
-    current = SubjectProductionRun(
+    current = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
+        status=ProductionRunStatus.NEEDS_REVIEW,
     )
     uow = _ImportUow(current, item)
     service = ProductionStateService(_ImportFactory(uow), _ImportArtifactStore())
@@ -127,7 +177,7 @@ def _import_service(item: Any | None) -> tuple[ProductionStateService, _ImportUo
 @pytest.mark.asyncio
 async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() -> None:
     service, uow, subject_id, edition_id = _import_service(None)
-    current_run_id = uow.subject_production_runs.get_current_for_subject.return_value.id
+    current_run_id = uow.production_runs.get_current_for_subject.return_value.id
     item = EditionProductionBatchItem(
         batch_id=uuid4(),
         subject_id=subject_id,
@@ -163,11 +213,7 @@ async def test_import_without_batch_item_succeeds() -> None:
 @pytest.mark.asyncio
 async def test_import_round_trip_preserves_repair_audit_without_regeneration() -> None:
     payload = _payload()
-    payload["schema_version"] = 3
-    payload["origin"] = {
-        "subject_title": "Titre original",
-        "research_date": "2026-08-26",
-    }
+    payload["origin"]["subject_title"] = "Titre original"
     decision_id = str(uuid4())
     base_id = str(uuid4())
     materialization = {
@@ -199,7 +245,7 @@ async def test_import_round_trip_preserves_repair_audit_without_regeneration() -
         "materialization": materialization,
     }
     payload["content_sha256"] = compute_production_state_checksum(
-        ProductionStateSnapshotV3.model_validate(payload)
+        ProductionStateSnapshotV4.model_validate(payload)
     )
     service, uow, subject_id, edition_id = _import_service(None)
 
@@ -227,9 +273,9 @@ def test_checksum_tool_repairs_edited_snapshot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_import_accepts_v1_checksum_and_rejects_unknown_fields() -> None:
+async def test_import_accepts_v4_checksum_and_rejects_unknown_fields() -> None:
     payload = _payload()
-    snapshot = ProductionStateSnapshotV1.model_validate(payload)
+    snapshot = ProductionStateSnapshotV4.model_validate(payload)
     assert snapshot.content_sha256 == compute_production_state_checksum(snapshot)
 
     payload["unexpected"] = True
@@ -273,7 +319,7 @@ async def test_import_rejects_bad_checksum_without_side_effects() -> None:
 
 def test_checksum_is_deterministic_and_excludes_checksum_field() -> None:
     payload = _payload()
-    snapshot = ProductionStateSnapshotV1.model_validate(payload)
+    snapshot = ProductionStateSnapshotV4.model_validate(payload)
     changed = snapshot.model_copy(update={"content_sha256": "e" * 64})
     assert compute_production_state_checksum(snapshot) == compute_production_state_checksum(changed)
 

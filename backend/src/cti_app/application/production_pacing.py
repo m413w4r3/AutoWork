@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 
 from cti_app.config import Settings
-from cti_app.domain.production import SubjectProductionStage
+from cti_app.domain.production import ProductionStage
 
 
 class ProductionPacingKind(StrEnum):
@@ -115,12 +115,12 @@ class ProductionPacingPolicy:
             )
         return max(0, round(self.subject_delay_seconds() * 1000))
 
-    def model_delay_ms(self, stage: SubjectProductionStage | str) -> int:
+    def model_delay_ms(self, stage: ProductionStage | str) -> int:
         """Return a deferred dispatch delay for Q1 or Q4 only."""
-        normalized = stage.value if isinstance(stage, SubjectProductionStage) else str(stage)
+        normalized = stage.value if isinstance(stage, ProductionStage) else str(stage)
         if normalized not in {
-            SubjectProductionStage.REFERENCES.value,
-            SubjectProductionStage.SYNTHESIS.value,
+            ProductionStage.REFERENCES.value,
+            ProductionStage.SYNTHESIS.value,
         }:
             return 0
         return max(0, round(self.model_delay_seconds() * 1000))

@@ -49,13 +49,6 @@ from cti_app.domain.discovery import (
     SourceRole,
 )
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
-)
 from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import Job
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun
@@ -205,19 +198,6 @@ async def _seed_subject(
         slug=f"subject-{uuid4().hex}",
         tlp=TLP.AMBER,
     )
-    group = EditorialGroup(
-        edition_id=edition.id,
-        title=topic.title,
-        candidate_references=(CandidateReference(batch.id, topic.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=EditorialScore(2, 2, 2, 2, 2, 2, {"impact": "test"}),
-        source_relationship_status=candidates[0].relationship_status,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject.id)
     discovery_model_run = ModelRun(
         id=batch.discovery_model_run_id,
         provider=ModelProvider.FAKE,
@@ -233,7 +213,6 @@ async def _seed_subject(
         SourceCollection(
             subject_id=subject.id,
             edition_id=edition.id,
-            group_id=group.id,
             batch_id=batch.id,
             source_candidate_id=candidate.id,
             requested_url=candidate.canonical_url,
@@ -261,7 +240,6 @@ async def _seed_subject(
         await uow.subjects.add(subject)
         await uow.model_runs.add(discovery_model_run)
         assert await uow.discovery_batches.add_if_absent(batch)
-        await uow.editorial_groups.add(group)
         for collection in collections:
             assert await uow.source_collections.add_if_absent(collection)
         await uow.commit()

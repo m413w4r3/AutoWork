@@ -17,8 +17,8 @@ import pytest
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.production import (
     ProductionArtifactStage,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 from .support import ProductionScenario
@@ -90,7 +90,7 @@ def _diagnostic_events(scenario: ProductionScenario) -> list[dict[str, Any]]:
 async def _state(scenario: ProductionScenario) -> tuple[Any, list[Any], list[Any]]:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(scenario.run_id)
+        run = await uow.production_runs.get(scenario.run_id)
         artifacts = list(await uow.production_artifacts.list_for_run(scenario.run_id))
         collections = list(await uow.source_collections.list_for_subject(scenario.subject.id))
     assert run is not None
@@ -108,8 +108,8 @@ async def test_every_core_source_unreachable_stops_before_any_model_call(
     run = await scenario.run_until_terminal()
     persisted, artifacts, collections = await _state(scenario)
 
-    assert run.status is not SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.SOURCES
+    assert run.status is not ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.SOURCES
     assert scenario.model.calls == []
     assert scenario.model.provider_calls == []
     assert artifacts == []
@@ -132,8 +132,8 @@ async def test_one_unreachable_core_source_does_not_stop_the_other(
     run = await scenario.run_until_terminal()
     persisted, artifacts, collections = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.ASSEMBLY
     archived = {
         collection.canonical_url
         for collection in collections
@@ -162,8 +162,8 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
     run = await scenario.run_until_terminal()
     persisted, artifacts, collections = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
-    assert persisted.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert persisted.current_stage is ProductionStage.ASSEMBLY
     assert {
         collection.canonical_url
         for collection in collections
@@ -208,7 +208,7 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     run = await scenario.run_until_terminal()
     persisted, _, collections = await _state(scenario)
 
-    assert run.status is SubjectProductionStatus.READY
+    assert run.status is ProductionRunStatus.READY
     failed = next(collection for collection in collections if collection.canonical_url == S2)
     assert failed.state is CollectionState.FAILED_RETRYABLE
     s2_requests = [

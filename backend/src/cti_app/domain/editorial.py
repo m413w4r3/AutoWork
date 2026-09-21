@@ -6,34 +6,6 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from cti_app.domain.discovery import SourceRelationshipStatus
-
-
-class GroupingOutcome(StrEnum):
-    NEW_SUBJECT = "new_subject"
-    DUPLICATE_PUBLICATION = "duplicate_same_publication"
-    UPDATE_PREVIOUS = "update_previous_subject"
-    NON_INDEPENDENT_REPRINT = "non_independent_reprint"
-    AMBIGUOUS_REVIEW = "ambiguous_review"
-
-
-class EditorialGroupStatus(StrEnum):
-    """Statuses of the legacy editorial projection.
-
-    TODO AW-009: delete with LegacyEditorialProjection. Since AW-008 no human
-    decision is taken here: a group is created PROPOSED and immediately moved
-    to SELECTED by the projection of an existing `SubjectDiscoveryOrigin`.
-    """
-
-    PROPOSED = "proposed"
-    SELECTED = "selected"
-
-
-class GroupingConfidence(StrEnum):
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-
 
 class HumanDecisionType(StrEnum):
     CLAIM_VALIDATE = "claim_validate"
@@ -69,104 +41,10 @@ class AnalystDecisionTargetType(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class CandidateReference:
-    batch_id: UUID
-    candidate_id: UUID
-
-
-@dataclass(frozen=True, slots=True)
-class EditorialScore:
-    impact: int
-    novelty: int
-    technical_depth: int
-    hunting_potential: int
-    actionability: int
-    source_quality: int
-    justifications: dict[str, str]
-
-    def __post_init__(self) -> None:
-        values = (
-            self.impact,
-            self.novelty,
-            self.technical_depth,
-            self.hunting_potential,
-            self.actionability,
-            self.source_quality,
-        )
-        if any(value < 0 or value > 4 for value in values):
-            raise ValueError("Editorial score dimensions must be between 0 and 4")
-
-    @property
-    def total(self) -> int:
-        return sum(
-            (
-                self.impact,
-                self.novelty,
-                self.technical_depth,
-                self.hunting_potential,
-                self.actionability,
-                self.source_quality,
-            )
-        )
-
-
-@dataclass(slots=True)
-class EditorialGroup:
-    edition_id: UUID
-    title: str
-    candidate_references: tuple[CandidateReference, ...]
-    outcome: GroupingOutcome
-    score: EditorialScore
-    source_relationship_status: SourceRelationshipStatus
-    needs_source_verification: bool
-    needs_source_expansion: bool
-    grouping_confidence: GroupingConfidence
-    grouping_justification: str
-    id: UUID = field(default_factory=uuid4)
-    status: EditorialGroupStatus = EditorialGroupStatus.PROPOSED
-    subject_id: UUID | None = None
-    discovery_subject_id: UUID | None = None
-    version: int = 1
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-    def __post_init__(self) -> None:
-        self.title = self.title.strip()
-        self.grouping_justification = self.grouping_justification.strip()
-        self.candidate_references = tuple(dict.fromkeys(self.candidate_references))
-        if not self.title or not self.candidate_references or not self.grouping_justification:
-            raise ValueError("Editorial group title, candidates and justification are required")
-        if self.source_relationship_status is SourceRelationshipStatus.PROVISIONAL:
-            self.needs_source_verification = True
-
-    def synchronize_candidate_references(self, references: tuple[CandidateReference, ...]) -> None:
-        """Project canonical Fusion membership onto a live editorial group."""
-        if self.status not in (EditorialGroupStatus.PROPOSED, EditorialGroupStatus.SELECTED):
-            raise ValueError("Only proposed or selected groups can be synchronized")
-        updated = tuple(dict.fromkeys(references))
-        if not updated:
-            raise ValueError("A synchronized editorial group cannot be empty")
-        if updated != self.candidate_references:
-            self.candidate_references = updated
-            self._bump()
-
-    def select(self, subject_id: UUID) -> None:
-        if self.status is not EditorialGroupStatus.PROPOSED:
-            raise ValueError("Only proposed groups can be selected")
-        self.status = EditorialGroupStatus.SELECTED
-        self.subject_id = subject_id
-        self._bump()
-
-    def _bump(self) -> None:
-        self.version += 1
-        self.updated_at = datetime.now(UTC)
-
-
-@dataclass(frozen=True, slots=True)
 class HumanDecision:
     edition_id: UUID
     decision_type: HumanDecisionType
-    group_ids: tuple[UUID, ...]
+    subject_ids: tuple[UUID, ...]
     actor_id: str
     correlation_id: str
     payload: dict[str, Any]
@@ -174,8 +52,8 @@ class HumanDecision:
     occurred_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
-        if not self.group_ids or not self.actor_id.strip() or not self.correlation_id.strip():
-            raise ValueError("Human decision requires groups, actor and correlation")
+        if not self.subject_ids or not self.actor_id.strip() or not self.correlation_id.strip():
+            raise ValueError("Human decision requires subjects, actor and correlation")
 
 
 @dataclass(frozen=True, slots=True)

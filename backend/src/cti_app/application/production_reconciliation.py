@@ -29,9 +29,9 @@ from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import ModelBackend, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
+    ProductionRun,
+    ProductionRunStatus,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStatus,
     model_run_awaits_reconciliation,
 )
 
@@ -325,7 +325,7 @@ class ProductionReconciliationService:
         provenance: str,
     ) -> tuple[UUID | None, bool]:
         async with self._uow_factory() as uow:
-            probe = await uow.subject_production_runs.get(run_id)
+            probe = await uow.production_runs.get(run_id)
             if probe is None:
                 raise ProductionReconciliationError(
                     "production_run_not_found", "Le run de production est introuvable."
@@ -342,7 +342,7 @@ class ProductionReconciliationService:
                 )
             self._ensure_edition_safety(edition.state)
             await self._ensure_batch_safety(uow, probe, reopen=True)
-            run = await uow.subject_production_runs.get_for_update(run_id)
+            run = await uow.production_runs.get_for_update(run_id)
             if run is None:
                 raise ProductionReconciliationError(
                     "production_run_not_found", "Le run de production est introuvable."
@@ -369,7 +369,7 @@ class ProductionReconciliationService:
                     "La sortie du ModelRun exact n'est pas archivée comme réussie.",
                 )
             if current.stage is not reconciliation.stage or run.current_stage is not current.stage:
-                if run.status is SubjectProductionStatus.RUNNING:
+                if run.status is ProductionRunStatus.RUNNING:
                     return None, True
                 raise ProductionReconciliationError(
                     "production_reconciliation_stage_changed",
@@ -389,20 +389,20 @@ class ProductionReconciliationService:
                     "production_reconciliation_provenance_mismatch",
                     "Cette réponse a déjà été adoptée avec une autre provenance.",
                 )
-            if run.status is SubjectProductionStatus.NEEDS_REVIEW:
+            if run.status is ProductionRunStatus.NEEDS_REVIEW:
                 if run.error_code != PRODUCTION_RECONCILIATION_ERROR_CODE:
                     raise ProductionReconciliationError(
                         "production_reconciliation_error_changed",
                         "Le motif de revue du run a changé.",
                     )
                 run.resume_reconciled(expected_stage=current.stage)
-                await uow.subject_production_runs.save(run)
+                await uow.production_runs.save(run)
                 await uow.commit()
                 generation = run.pipeline_generation
-            elif run.status is SubjectProductionStatus.RUNNING and run.error_code is None:
+            elif run.status is ProductionRunStatus.RUNNING and run.error_code is None:
                 generation = run.pipeline_generation
                 if current.output_sha256 is None:
-                    await uow.subject_production_runs.save(run)
+                    await uow.production_runs.save(run)
                 # A repeated adoption may still be the call that reopens the
                 # batch, so this path commits even when the run is unchanged.
                 await uow.commit()
@@ -440,9 +440,9 @@ class ProductionReconciliationService:
 
     async def _load_review(
         self, run_id: UUID, *, allow_adopted: bool = True
-    ) -> tuple[SubjectProductionRun, ProductionSubmissionReconciliation, Any]:
+    ) -> tuple[ProductionRun, ProductionSubmissionReconciliation, Any]:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
             if run is None:
                 raise ProductionReconciliationError(
                     "production_run_not_found", "Le run de production est introuvable."
@@ -451,11 +451,11 @@ class ProductionReconciliationService:
                 run.reconciliation is not None
                 and run.reconciliation.output_sha256 is not None
                 and run.reconciliation.provenance in {"manual_import", "visible_recovery"}
-                and run.status in {SubjectProductionStatus.RUNNING, SubjectProductionStatus.READY}
+                and run.status in {ProductionRunStatus.RUNNING, ProductionRunStatus.READY}
                 and run.error_code is None
             )
             reviewable = (
-                run.status is SubjectProductionStatus.NEEDS_REVIEW
+                run.status is ProductionRunStatus.NEEDS_REVIEW
                 and run.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
             )
             if (
@@ -492,7 +492,7 @@ class ProductionReconciliationService:
             return run, run.reconciliation, model
 
     async def _ensure_batch_safety(
-        self, uow: Any, run: SubjectProductionRun, *, reopen: bool = False
+        self, uow: Any, run: ProductionRun, *, reopen: bool = False
     ) -> None:
         """Share the Review recovery rule with the ordinary business retry.
 
@@ -506,7 +506,7 @@ class ProductionReconciliationService:
             code, message = _RECOVERY_CONFLICTS[exc.reason]
             raise ProductionReconciliationError(code, message) from exc
 
-    async def _ensure_resume_context(self, run: SubjectProductionRun) -> None:
+    async def _ensure_resume_context(self, run: ProductionRun) -> None:
         async with self._uow_factory() as uow:
             edition = await uow.editions.get(run.edition_id)
             if edition is None:
@@ -526,14 +526,14 @@ class ProductionReconciliationService:
             )
 
     @staticmethod
-    def _ensure_resume_safety(run: SubjectProductionRun) -> None:
+    def _ensure_resume_safety(run: ProductionRun) -> None:
         already_adopted = (
-            run.status in {SubjectProductionStatus.RUNNING, SubjectProductionStatus.READY}
+            run.status in {ProductionRunStatus.RUNNING, ProductionRunStatus.READY}
             and run.error_code is None
             and run.reconciliation is not None
             and run.reconciliation.output_sha256 is not None
         )
-        if run.status is not SubjectProductionStatus.NEEDS_REVIEW and not already_adopted:
+        if run.status is not ProductionRunStatus.NEEDS_REVIEW and not already_adopted:
             raise ProductionReconciliationError(
                 "production_reconciliation_not_eligible",
                 "Ce run n'est plus en attente de réconciliation.",
@@ -605,12 +605,12 @@ class ProductionReconciliationService:
 
     async def _generation(self, run_id: UUID) -> int:
         async with self._uow_factory() as uow:
-            run = await uow.subject_production_runs.get(run_id)
+            run = await uow.production_runs.get(run_id)
             return run.pipeline_generation if run else 0
 
     @staticmethod
     def _preview(
-        run: SubjectProductionRun,
+        run: ProductionRun,
         reconciliation: ProductionSubmissionReconciliation,
         text: str,
         *,

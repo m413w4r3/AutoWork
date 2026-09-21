@@ -32,9 +32,9 @@ from cti_app.domain.production import (
     PUBLICATION_REBUILD_REQUIRED_ERROR_CODE,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -46,13 +46,13 @@ _SYNTHESIS = ProductionArtifactStage.SYNTHESIS.value
 _PUBLICATION = ProductionArtifactStage.PUBLICATION.value
 
 
-def _run(status: SubjectProductionStatus = SubjectProductionStatus.READY) -> SubjectProductionRun:
+def _run(status: ProductionRunStatus = ProductionRunStatus.READY) -> ProductionRun:
     now = datetime.now(UTC)
-    return SubjectProductionRun(
+    return ProductionRun(
         subject_id=SUBJECT_ID,
         edition_id=EDITION_ID,
         status=status,
-        current_stage=SubjectProductionStage.ASSEMBLY,
+        current_stage=ProductionStage.ASSEMBLY,
         run_number=1,
         research_date=date(2026, 9, 1),
         started_at=now,
@@ -65,20 +65,20 @@ def _run(status: SubjectProductionStatus = SubjectProductionStatus.READY) -> Sub
 
 class _RunsRepository:
     def __init__(self) -> None:
-        self.saved: list[SubjectProductionRun] = []
+        self.saved: list[ProductionRun] = []
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.saved.append(run)
 
 
 class _Uow:
     def __init__(self) -> None:
-        self.subject_production_runs = _RunsRepository()
+        self.production_runs = _RunsRepository()
 
 
 def _row(
     *,
-    run_status: SubjectProductionStatus = SubjectProductionStatus.READY,
+    run_status: ProductionRunStatus = ProductionRunStatus.READY,
     live_stages: frozenset[str] | None,
     document: bool,
 ) -> EditionReviewReadItem:
@@ -112,50 +112,48 @@ async def test_staling_the_publication_takes_a_ready_run_out_of_ready() -> None:
     uow = _Uow()
 
     changed = await _require_publication_rebuild(
-        uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+        uow, run, retry_stage=ProductionStage.SYNTHESIS.value
     )
 
     assert changed is True
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert run.error_code == PUBLICATION_REBUILD_REQUIRED_ERROR_CODE
     assert run.error_message
     assert run.error_details == {"retry_stage": "synthesis"}
     # Persisted through the caller's UoW: the write rides the stale's
     # transaction rather than following it.
-    assert uow.subject_production_runs.saved == [run]
+    assert uow.production_runs.saved == [run]
 
 
 @pytest.mark.asyncio
 async def test_a_run_that_already_failed_keeps_its_own_diagnosis() -> None:
     """The rebuild debt is less informative than the failure that caused it."""
-    run = _run(status=SubjectProductionStatus.RUNNING)
+    run = _run(status=ProductionRunStatus.RUNNING)
     run.mark_failed(code="synthesis_unusable", message="Le modèle n'a rien rendu d'exploitable.")
     uow = _Uow()
 
     changed = await _require_publication_rebuild(
-        uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+        uow, run, retry_stage=ProductionStage.SYNTHESIS.value
     )
 
     assert changed is False
-    assert run.status is SubjectProductionStatus.FAILED
+    assert run.status is ProductionRunStatus.FAILED
     assert run.error_code == "synthesis_unusable"
-    assert uow.subject_production_runs.saved == []
+    assert uow.production_runs.saved == []
 
 
 @pytest.mark.asyncio
 async def test_a_cancelled_run_is_never_moved() -> None:
     """Cancellation owns its own resume gesture; a rebuild must not hijack it."""
-    run = _run(status=SubjectProductionStatus.RUNNING)
+    run = _run(status=ProductionRunStatus.RUNNING)
     run.mark_cancelled()
     uow = _Uow()
 
     assert (
-        await _require_publication_rebuild(
-            uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
-        )
+        await _require_publication_rebuild(uow, run, retry_stage=ProductionStage.SYNTHESIS.value)
         is False
     )
-    assert run.status is SubjectProductionStatus.CANCELLED
+    assert run.status is ProductionRunStatus.CANCELLED
 
 
 # --------------------------------------------------------------------------
@@ -169,23 +167,23 @@ async def test_a_cancelled_run_is_never_moved() -> None:
         # The IOC repair case: synthesis and publication staled together.
         (
             {_REFERENCES, _EXTRACTION},
-            SubjectProductionStage.SYNTHESIS,
+            ProductionStage.SYNTHESIS,
         ),
         # A references reconciliation stales everything downstream of it.
-        ({_REFERENCES}, SubjectProductionStage.EXTRACTION),
+        ({_REFERENCES}, ProductionStage.EXTRACTION),
         # Nothing survived at all.
-        (set(), SubjectProductionStage.REFERENCES),
+        (set(), ProductionStage.REFERENCES),
         # Publication alone was staled, ready for a deterministic reassembly.
         (
             {_REFERENCES, _EXTRACTION, _SYNTHESIS},
-            SubjectProductionStage.ASSEMBLY,
+            ProductionStage.ASSEMBLY,
         ),
     ],
 )
 def test_retry_stage_is_the_first_missing_artifact(
-    live: set[str], expected: SubjectProductionStage
+    live: set[str], expected: ProductionStage
 ) -> None:
-    assert resolve_retry_stage(live, current_stage=SubjectProductionStage.ASSEMBLY) is expected
+    assert resolve_retry_stage(live, current_stage=ProductionStage.ASSEMBLY) is expected
 
 
 def test_a_complete_run_replays_its_last_stage() -> None:
@@ -193,8 +191,8 @@ def test_a_complete_run_replays_its_last_stage() -> None:
     live = {_REFERENCES, _EXTRACTION, _SYNTHESIS, _PUBLICATION}
 
     assert (
-        resolve_retry_stage(live, current_stage=SubjectProductionStage.ASSEMBLY)
-        is SubjectProductionStage.ASSEMBLY
+        resolve_retry_stage(live, current_stage=ProductionStage.ASSEMBLY)
+        is ProductionStage.ASSEMBLY
     )
 
 
@@ -206,9 +204,9 @@ def test_retry_stage_never_points_at_a_stage_whose_prerequisite_is_missing() -> 
     """
     live = {_REFERENCES, _EXTRACTION}
 
-    stage = resolve_retry_stage(live, current_stage=SubjectProductionStage.ASSEMBLY)
+    stage = resolve_retry_stage(live, current_stage=ProductionStage.ASSEMBLY)
 
-    assert stage is not SubjectProductionStage.ASSEMBLY
+    assert stage is not ProductionStage.ASSEMBLY
 
 
 # --------------------------------------------------------------------------
@@ -220,7 +218,7 @@ def test_a_ready_run_without_a_publication_owes_a_rebuild() -> None:
     row = _row(live_stages=frozenset({_REFERENCES, _EXTRACTION}), document=False)
 
     assert row.rebuild_required is True
-    assert row.rebuild_stage is SubjectProductionStage.SYNTHESIS
+    assert row.rebuild_stage is ProductionStage.SYNTHESIS
 
 
 def test_a_ready_run_with_its_publication_owes_nothing() -> None:
@@ -234,9 +232,9 @@ def test_a_ready_run_with_its_publication_owes_nothing() -> None:
 
 @pytest.mark.parametrize(
     "run_status",
-    [SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING],
+    [ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING],
 )
-def test_a_run_in_flight_owes_no_rebuild(run_status: SubjectProductionStatus) -> None:
+def test_a_run_in_flight_owes_no_rebuild(run_status: ProductionRunStatus) -> None:
     """It has not produced its outputs yet; the pipeline owns that, not the desk."""
     row = _row(run_status=run_status, live_stages=frozenset(), document=False)
 
@@ -253,7 +251,7 @@ def test_the_debt_does_not_depend_on_any_repair_decision() -> None:
     row = _row(live_stages=frozenset({_REFERENCES}), document=False)
 
     assert row.rebuild_required is True
-    assert row.rebuild_stage is SubjectProductionStage.EXTRACTION
+    assert row.rebuild_stage is ProductionStage.EXTRACTION
 
 
 def test_an_unsupplied_artifact_inventory_names_no_stage() -> None:
@@ -273,7 +271,7 @@ def test_an_unsupplied_artifact_inventory_names_no_stage() -> None:
 
 
 def _rows_from_state(
-    state: list[tuple[SubjectProductionStatus, set[str]]],
+    state: list[tuple[ProductionRunStatus, set[str]]],
 ) -> list[EditionReviewReadItem]:
     return [
         _row(
@@ -295,17 +293,15 @@ def test_ready_requires_a_verified_publication() -> None:
     complete = {_REFERENCES, _EXTRACTION, _SYNTHESIS, _PUBLICATION}
     rows = _rows_from_state(
         [
-            (SubjectProductionStatus.READY, complete),
+            (ProductionRunStatus.READY, complete),
             # The repaired article now leaves READY instead of staying there.
-            (SubjectProductionStatus.NEEDS_REVIEW, {_REFERENCES, _EXTRACTION}),
-            (SubjectProductionStatus.RUNNING, set()),
+            (ProductionRunStatus.NEEDS_REVIEW, {_REFERENCES, _EXTRACTION}),
+            (ProductionRunStatus.RUNNING, set()),
         ]
     )
 
     offenders = [
-        row
-        for row in rows
-        if row.run_status is SubjectProductionStatus.READY and row.rebuild_required
+        row for row in rows if row.run_status is ProductionRunStatus.READY and row.rebuild_required
     ]
 
     assert offenders == []
@@ -317,16 +313,14 @@ def test_the_invariant_actually_catches_the_regression() -> None:
     This is the shape the four production runs were found in -- READY, with
     every downstream artifact staled.
     """
-    rows = _rows_from_state([(SubjectProductionStatus.READY, {_REFERENCES, _EXTRACTION})])
+    rows = _rows_from_state([(ProductionRunStatus.READY, {_REFERENCES, _EXTRACTION})])
 
     offenders = [
-        row
-        for row in rows
-        if row.run_status is SubjectProductionStatus.READY and row.rebuild_required
+        row for row in rows if row.run_status is ProductionRunStatus.READY and row.rebuild_required
     ]
 
     assert len(offenders) == 1
-    assert offenders[0].rebuild_stage is SubjectProductionStage.SYNTHESIS
+    assert offenders[0].rebuild_stage is ProductionStage.SYNTHESIS
 
 
 # --------------------------------------------------------------------------
@@ -340,17 +334,17 @@ async def test_ioc_added_after_publication_leaves_a_named_debt() -> None:
     run = _run()
     uow = _Uow()
 
-    await _require_publication_rebuild(uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value)
+    await _require_publication_rebuild(uow, run, retry_stage=ProductionStage.SYNTHESIS.value)
     row = _row(
         run_status=run.status,
         live_stages=frozenset({_REFERENCES, _EXTRACTION}),
         document=False,
     )
 
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert row.rebuild_required is True
     # The gesture the desk offers is the one the retry service will accept.
-    assert row.rebuild_stage is SubjectProductionStage.SYNTHESIS
+    assert row.rebuild_stage is ProductionStage.SYNTHESIS
 
 
 @pytest.mark.asyncio
@@ -364,8 +358,8 @@ async def test_an_article_with_no_ioc_is_never_disturbed() -> None:
     )
 
     assert row.rebuild_required is False
-    assert run.status is SubjectProductionStatus.READY
-    assert uow.subject_production_runs.saved == []
+    assert run.status is ProductionRunStatus.READY
+    assert uow.production_runs.saved == []
 
 
 @pytest.mark.asyncio
@@ -375,16 +369,16 @@ async def test_the_transition_is_idempotent_across_repeated_repairs() -> None:
     uow = _Uow()
 
     first = await _require_publication_rebuild(
-        uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+        uow, run, retry_stage=ProductionStage.SYNTHESIS.value
     )
     version_after_first = run.version
     second = await _require_publication_rebuild(
-        uow, run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+        uow, run, retry_stage=ProductionStage.SYNTHESIS.value
     )
 
     assert (first, second) == (True, False)
     assert run.version == version_after_first
-    assert uow.subject_production_runs.saved == [run]
+    assert uow.production_runs.saved == [run]
 
 
 @pytest.mark.asyncio
@@ -394,8 +388,8 @@ async def test_a_repair_service_without_a_run_port_does_not_crash() -> None:
 
     assert (
         await _require_publication_rebuild(
-            SimpleNamespace(), run, retry_stage=SubjectProductionStage.SYNTHESIS.value
+            SimpleNamespace(), run, retry_stage=ProductionStage.SYNTHESIS.value
         )
         is True
     )
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW

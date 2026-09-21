@@ -39,27 +39,27 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionReconciliationRequiredError,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 
 
 class _Runs:
     def __init__(self) -> None:
-        self.items: dict[UUID, SubjectProductionRun] = {}
+        self.items: dict[UUID, ProductionRun] = {}
 
-    async def add(self, run: SubjectProductionRun) -> None:
+    async def add(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
 
@@ -104,7 +104,7 @@ class _BatchItems:
 
 class _Uow:
     def __init__(self) -> None:
-        self.subject_production_runs = _Runs()
+        self.production_runs = _Runs()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
         self.jobs = _ExecutionJobs()
@@ -196,13 +196,13 @@ class _Orchestrator:
 
     def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
-        self.calls: list[SubjectProductionStage] = []
+        self.calls: list[ProductionStage] = []
         self.after_execute: Callable[[], None] | None = None
 
     async def execute_stage(
         self,
         run_id: UUID,
-        expected_stage: SubjectProductionStage,
+        expected_stage: ProductionStage,
         context: object | None = None,
         correlation_id: str = "-",
     ) -> dict[str, Any]:
@@ -249,14 +249,14 @@ def _build(
     return registry, jobs, orchestrator
 
 
-def _run(uow: _Uow, stage: SubjectProductionStage) -> SubjectProductionRun:
-    run = SubjectProductionRun(
+def _run(uow: _Uow, stage: ProductionStage) -> ProductionRun:
+    run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
     )
     run.start_running()
     run.current_stage = stage
-    uow.subject_production_runs.items[run.id] = run
+    uow.production_runs.items[run.id] = run
     return run
 
 
@@ -276,22 +276,16 @@ async def test_successful_stage_queues_the_next_one(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "sources", "status": "success"})
-    run = _run(uow, SubjectProductionStage.SOURCES)
+    run = _run(uow, ProductionStage.SOURCES)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.SOURCES))
     await handler(
-        ProductionStageParameters(
-            run_id=run.id, expected_stage=SubjectProductionStage.SOURCES.value
-        ),
+        ProductionStageParameters(run_id=run.id, expected_stage=ProductionStage.SOURCES.value),
         _Context(),  # type: ignore[arg-type]
     )
 
-    assert [job.kind for job in jobs.submitted] == [
-        stage_job_kind(SubjectProductionStage.REFERENCES)
-    ]
-    assert uow.subject_production_runs.items[run.id].current_stage is (
-        SubjectProductionStage.REFERENCES
-    )
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.REFERENCES)]
+    assert uow.production_runs.items[run.id].current_stage is (ProductionStage.REFERENCES)
 
 
 async def test_reconciliation_resume_consumes_exact_archived_run_and_same_generation(
@@ -300,14 +294,14 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "extraction", "status": "success"}
     )
-    run = _run(uow, SubjectProductionStage.EXTRACTION)
+    run = _run(uow, ProductionStage.EXTRACTION)
     run.pipeline_generation = 11
     model_run_id = uuid4()
     output_sha256 = "c" * 64
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=model_run_id,
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-response-1",
         submission_state="submitted_or_unknown",
         phase="reconciliation",
@@ -323,7 +317,7 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
     await handler(
         ProductionReconciliationResumeParameters(
             run_id=run.id,
-            expected_stage=SubjectProductionStage.EXTRACTION.value,
+            expected_stage=ProductionStage.EXTRACTION.value,
             pipeline_generation=run.pipeline_generation,
             reconciliation_model_run_id=model_run_id,
             reconciled_output_sha256=output_sha256,
@@ -331,15 +325,15 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
         _Context(),  # type: ignore[arg-type]
     )
 
-    assert orchestrator.calls == [SubjectProductionStage.EXTRACTION]
+    assert orchestrator.calls == [ProductionStage.EXTRACTION]
     assert run.pipeline_generation == 11
-    assert run.current_stage is SubjectProductionStage.SYNTHESIS
-    assert jobs.submitted[0].kind == stage_job_kind(SubjectProductionStage.SYNTHESIS)
+    assert run.current_stage is ProductionStage.SYNTHESIS
+    assert jobs.submitted[0].kind == stage_job_kind(ProductionStage.SYNTHESIS)
     assert jobs.submitted[0].idempotency_key == f"production-synthesis-{run.id}-g11"
     assert (
         production_reconciliation_resume_idempotency_key(
             run.id,
-            SubjectProductionStage.EXTRACTION,
+            ProductionStage.EXTRACTION,
             11,
             model_run_id,
             output_sha256,
@@ -352,13 +346,13 @@ async def test_cancelled_run_is_a_worker_fence(uow: _Uow, monkeypatch: pytest.Mo
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "sources", "status": "success"}
     )
-    run = _run(uow, SubjectProductionStage.SOURCES)
+    run = _run(uow, ProductionStage.SOURCES)
     run.mark_cancelled()
 
-    result = await registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))(
+    result = await registry.handler(stage_job_kind(ProductionStage.SOURCES))(
         ProductionStageParameters(
             run_id=run.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
+            expected_stage=ProductionStage.SOURCES.value,
             pipeline_generation=run.pipeline_generation,
         ),
         _Context(),  # type: ignore[arg-type]
@@ -375,22 +369,22 @@ async def test_cancelled_worker_cannot_repeat_an_existing_batch_handoff(
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "assembly", "status": "success"}
     )
-    first = _run(uow, SubjectProductionStage.ASSEMBLY)
+    first = _run(uow, ProductionStage.ASSEMBLY)
     second = _batch_of(uow, first)
     first.mark_cancelled()
     second.start_running()
 
-    result = await registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))(
+    result = await registry.handler(stage_job_kind(ProductionStage.ASSEMBLY))(
         ProductionStageParameters(
             run_id=first.id,
-            expected_stage=SubjectProductionStage.ASSEMBLY.value,
+            expected_stage=ProductionStage.ASSEMBLY.value,
             pipeline_generation=first.pipeline_generation,
         ),
         _Context(),  # type: ignore[arg-type]
     )
 
     assert result.endswith("#cancelled")
-    assert second.status is SubjectProductionStatus.RUNNING
+    assert second.status is ProductionRunStatus.RUNNING
     assert orchestrator.calls == []
     assert jobs.submitted == []
 
@@ -401,21 +395,21 @@ async def test_inflight_result_never_advances_a_cancelled_run(
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "sources", "status": "success"}
     )
-    run = _run(uow, SubjectProductionStage.SOURCES)
+    run = _run(uow, ProductionStage.SOURCES)
     orchestrator.after_execute = run.mark_cancelled
 
-    result = await registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))(
+    result = await registry.handler(stage_job_kind(ProductionStage.SOURCES))(
         ProductionStageParameters(
             run_id=run.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
+            expected_stage=ProductionStage.SOURCES.value,
             pipeline_generation=run.pipeline_generation,
         ),
         _Context(),  # type: ignore[arg-type]
     )
 
     assert result.endswith("#cancelled")
-    assert run.status is SubjectProductionStatus.CANCELLED
-    assert run.current_stage is SubjectProductionStage.SOURCES
+    assert run.status is ProductionRunStatus.CANCELLED
+    assert run.current_stage is ProductionStage.SOURCES
     assert jobs.submitted == []
 
 
@@ -425,23 +419,21 @@ async def test_recovered_old_stage_job_resubmits_the_current_stage_without_faili
     registry, jobs, orchestrator = _build(
         uow, monkeypatch, {"stage": "sources", "status": "success"}
     )
-    run = _run(uow, SubjectProductionStage.REFERENCES)
+    run = _run(uow, ProductionStage.REFERENCES)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.SOURCES))
     await handler(
         ProductionStageParameters(
             run_id=run.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
+            expected_stage=ProductionStage.SOURCES.value,
             pipeline_generation=run.pipeline_generation,
         ),
         _Context(),  # type: ignore[arg-type]
     )
 
     assert orchestrator.calls == []
-    assert [job.kind for job in jobs.submitted] == [
-        stage_job_kind(SubjectProductionStage.REFERENCES)
-    ]
-    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.REFERENCES)]
+    assert uow.production_runs.items[run.id].status is ProductionRunStatus.RUNNING
 
 
 async def test_next_stage_job_is_idempotent_per_run_and_stage(
@@ -449,13 +441,11 @@ async def test_next_stage_job_is_idempotent_per_run_and_stage(
 ) -> None:
     """A retried handler must never re-send the same prompt."""
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "sources", "status": "success"})
-    run = _run(uow, SubjectProductionStage.SOURCES)
+    run = _run(uow, ProductionStage.SOURCES)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.SOURCES))
     await handler(
-        ProductionStageParameters(
-            run_id=run.id, expected_stage=SubjectProductionStage.SOURCES.value
-        ),
+        ProductionStageParameters(run_id=run.id, expected_stage=ProductionStage.SOURCES.value),
         _Context(),  # type: ignore[arg-type]
     )
 
@@ -467,13 +457,11 @@ async def test_assembly_stage_queues_no_further_stage(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "assembly", "status": "success"})
-    run = _run(uow, SubjectProductionStage.ASSEMBLY)
+    run = _run(uow, ProductionStage.ASSEMBLY)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))
+    handler = registry.handler(stage_job_kind(ProductionStage.ASSEMBLY))
     await handler(
-        ProductionStageParameters(
-            run_id=run.id, expected_stage=SubjectProductionStage.ASSEMBLY.value
-        ),
+        ProductionStageParameters(run_id=run.id, expected_stage=ProductionStage.ASSEMBLY.value),
         _Context(),  # type: ignore[arg-type]
     )
 
@@ -484,26 +472,26 @@ async def test_cancelled_batch_never_starts_or_dispatches_the_next_subject(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "assembly", "status": "success"})
-    first = _run(uow, SubjectProductionStage.ASSEMBLY)
+    first = _run(uow, ProductionStage.ASSEMBLY)
     first.mark_ready()
     second = _batch_of(uow, first)
     batch = next(iter(uow.edition_production_batches.items.values()))
     batch.cancel()
 
-    await registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))(
+    await registry.handler(stage_job_kind(ProductionStage.ASSEMBLY))(
         ProductionStageParameters(
             run_id=first.id,
-            expected_stage=SubjectProductionStage.ASSEMBLY.value,
+            expected_stage=ProductionStage.ASSEMBLY.value,
             pipeline_generation=first.pipeline_generation,
         ),
         _Context(),  # type: ignore[arg-type]
     )
 
-    assert second.status is SubjectProductionStatus.CANCELLED
+    assert second.status is ProductionRunStatus.CANCELLED
     assert jobs.submitted == []
 
 
-def _batch_of(uow: _Uow, first: SubjectProductionRun) -> SubjectProductionRun:
+def _batch_of(uow: _Uow, first: ProductionRun) -> ProductionRun:
     """A two-subject batch whose second subject is still queued."""
     batch = EditionProductionBatch(
         edition_id=first.edition_id,
@@ -511,11 +499,11 @@ def _batch_of(uow: _Uow, first: SubjectProductionRun) -> SubjectProductionRun:
     )
     uow.edition_production_batches.items[batch.id] = batch
 
-    second = SubjectProductionRun(
+    second = ProductionRun(
         subject_id=uuid4(),
         edition_id=first.edition_id,
     )
-    uow.subject_production_runs.items[second.id] = second
+    uow.production_runs.items[second.id] = second
 
     for position, run in enumerate((first, second), start=1):
         uow.edition_production_batch_items.items.append(
@@ -533,20 +521,18 @@ async def test_finished_subject_starts_the_next_one_in_the_batch(
     uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     registry, jobs, _ = _build(uow, monkeypatch, {"stage": "assembly", "status": "success"})
-    first = _run(uow, SubjectProductionStage.ASSEMBLY)
+    first = _run(uow, ProductionStage.ASSEMBLY)
     first.mark_ready()
     second = _batch_of(uow, first)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.ASSEMBLY))
+    handler = registry.handler(stage_job_kind(ProductionStage.ASSEMBLY))
     await handler(
-        ProductionStageParameters(
-            run_id=first.id, expected_stage=SubjectProductionStage.ASSEMBLY.value
-        ),
+        ProductionStageParameters(run_id=first.id, expected_stage=ProductionStage.ASSEMBLY.value),
         _Context(),  # type: ignore[arg-type]
     )
 
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
-    assert uow.subject_production_runs.items[second.id].status is (SubjectProductionStatus.RUNNING)
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
+    assert uow.production_runs.items[second.id].status is (ProductionRunStatus.RUNNING)
 
 
 async def test_failed_subject_does_not_block_the_batch(
@@ -556,21 +542,21 @@ async def test_failed_subject_does_not_block_the_batch(
     registry, jobs, _ = _build(
         uow, monkeypatch, {"stage": "references", "status": "error", "error": "boom"}
     )
-    first = _run(uow, SubjectProductionStage.REFERENCES)
+    first = _run(uow, ProductionStage.REFERENCES)
     second = _batch_of(uow, first)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
     with pytest.raises(JobHandlerError):
         await handler(
             ProductionStageParameters(
-                run_id=first.id, expected_stage=SubjectProductionStage.REFERENCES.value
+                run_id=first.id, expected_stage=ProductionStage.REFERENCES.value
             ),
             _Context(),  # type: ignore[arg-type]
         )
 
-    assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.FAILED
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
-    assert uow.subject_production_runs.items[second.id].status is (SubjectProductionStatus.RUNNING)
+    assert uow.production_runs.items[first.id].status is ProductionRunStatus.FAILED
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
+    assert uow.production_runs.items[second.id].status is (ProductionRunStatus.RUNNING)
 
 
 async def test_terminalization_calls_the_checkpoint_once(
@@ -583,14 +569,14 @@ async def test_terminalization_calls_the_checkpoint_once(
         {"stage": "references", "status": "error", "error": "boom"},
         checkpoint=checkpoint,
     )
-    first = _run(uow, SubjectProductionStage.REFERENCES)
+    first = _run(uow, ProductionStage.REFERENCES)
     _batch_of(uow, first)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
     with pytest.raises(JobHandlerError):
         await handler(
             ProductionStageParameters(
-                run_id=first.id, expected_stage=SubjectProductionStage.REFERENCES.value
+                run_id=first.id, expected_stage=ProductionStage.REFERENCES.value
             ),
             _Context(),  # type: ignore[arg-type]
         )
@@ -607,23 +593,21 @@ async def test_needs_review_is_a_business_outcome_not_a_crash(
         monkeypatch,
         {"stage": "references", "status": "needs_review", "error_code": "format_unusable"},
     )
-    first = _run(uow, SubjectProductionStage.REFERENCES)
+    first = _run(uow, ProductionStage.REFERENCES)
     second = _batch_of(uow, first)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
     await handler(
-        ProductionStageParameters(
-            run_id=first.id, expected_stage=SubjectProductionStage.REFERENCES.value
-        ),
+        ProductionStageParameters(run_id=first.id, expected_stage=ProductionStage.REFERENCES.value),
         _Context(),  # type: ignore[arg-type]
     )
 
-    parked = uow.subject_production_runs.items[first.id]
-    assert parked.status is SubjectProductionStatus.NEEDS_REVIEW
+    parked = uow.production_runs.items[first.id]
+    assert parked.status is ProductionRunStatus.NEEDS_REVIEW
     assert parked.error_code == "format_unusable"
     # The queue keeps going.
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(SubjectProductionStage.SOURCES)]
-    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.RUNNING
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
+    assert uow.production_runs.items[second.id].status is ProductionRunStatus.RUNNING
 
 
 async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
@@ -639,15 +623,15 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
             "details": {"failure_class": "global_transient_pre_submission"},
         },
     )
-    run = _run(uow, SubjectProductionStage.REFERENCES)
+    run = _run(uow, ProductionStage.REFERENCES)
     context = _Context()
     uow.jobs.items[context.job_id] = _ExecutionJob(attempt=1, max_attempts=3)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
     with pytest.raises(JobHandlerError) as excinfo:
         await handler(
             ProductionStageParameters(
-                run_id=run.id, expected_stage=SubjectProductionStage.REFERENCES.value
+                run_id=run.id, expected_stage=ProductionStage.REFERENCES.value
             ),
             context,  # type: ignore[arg-type]
         )
@@ -655,7 +639,7 @@ async def test_transient_error_stays_retryable_and_keeps_the_run_alive(
     assert excinfo.value.transient is True
     assert excinfo.value.details == {"failure_class": "global_transient_pre_submission"}
     # The run must not be terminated: the job will be retried.
-    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.RUNNING
+    assert uow.production_runs.items[run.id].status is ProductionRunStatus.RUNNING
     assert jobs.submitted == []
 
 
@@ -667,44 +651,44 @@ async def test_transient_extraction_failure_holds_the_batch_slot_until_retry_exh
         monkeypatch,
         {"stage": "extraction", "status": "transient_error", "error_code": "bridge_ui_timeout"},
     )
-    first = _run(uow, SubjectProductionStage.EXTRACTION)
+    first = _run(uow, ProductionStage.EXTRACTION)
     second = _batch_of(uow, first)
     context = _Context()
     uow.jobs.items[context.job_id] = _ExecutionJob(attempt=1, max_attempts=3)
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.EXTRACTION))
+    handler = registry.handler(stage_job_kind(ProductionStage.EXTRACTION))
     with pytest.raises(JobHandlerError) as excinfo:
         await handler(
             ProductionStageParameters(
-                run_id=first.id, expected_stage=SubjectProductionStage.EXTRACTION.value
+                run_id=first.id, expected_stage=ProductionStage.EXTRACTION.value
             ),
             context,  # type: ignore[arg-type]
         )
 
     assert excinfo.value.transient is True
-    assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.RUNNING
-    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.QUEUED
+    assert uow.production_runs.items[first.id].status is ProductionRunStatus.RUNNING
+    assert uow.production_runs.items[second.id].status is ProductionRunStatus.QUEUED
     assert jobs.submitted == []
 
 
 @pytest.mark.parametrize(
     ("recovery_stage", "expected_delay"),
     (
-        (SubjectProductionStage.SOURCES, 7000),
-        (SubjectProductionStage.EXTRACTION, 7000),
-        (SubjectProductionStage.REFERENCES, 18000),
-        (SubjectProductionStage.SYNTHESIS, 18000),
+        (ProductionStage.SOURCES, 7000),
+        (ProductionStage.EXTRACTION, 7000),
+        (ProductionStage.REFERENCES, 18000),
+        (ProductionStage.SYNTHESIS, 18000),
     ),
 )
 async def test_recovery_dispatch_combines_subject_and_model_pacing(
     uow: _Uow,
     monkeypatch: pytest.MonkeyPatch,
-    recovery_stage: SubjectProductionStage,
+    recovery_stage: ProductionStage,
     expected_delay: int,
 ) -> None:
-    first = _run(uow, SubjectProductionStage.SOURCES)
+    first = _run(uow, ProductionStage.SOURCES)
     next_run = _run(uow, recovery_stage)
-    next_run.status = SubjectProductionStatus.RUNNING
+    next_run.status = ProductionRunStatus.RUNNING
     batch = EditionProductionBatch(
         edition_id=first.edition_id,
         status="running",
@@ -728,7 +712,7 @@ async def test_recovery_dispatch_combines_subject_and_model_pacing(
 
         async def on_subject_terminal(
             self, batch_id: UUID, run_id: UUID, *, correlation_id: str
-        ) -> SubjectProductionRun:
+        ) -> ProductionRun:
             del batch_id, run_id, correlation_id
             return next_run
 
@@ -737,7 +721,7 @@ async def test_recovery_dispatch_combines_subject_and_model_pacing(
             return 7000
 
     monkeypatch.setattr(
-        "cti_app.application.production_jobs.EditionProductionService", RecoveryBatchService
+        "cti_app.application.production_jobs.ProductionBatchService", RecoveryBatchService
     )
     monkeypatch.setattr(
         "cti_app.application.production_jobs.ProductionWorkflowOrchestrator",
@@ -759,11 +743,11 @@ async def test_recovery_dispatch_combines_subject_and_model_pacing(
     chain.bind(jobs, dispatcher)  # type: ignore[arg-type]
     register_production_jobs(registry, lambda: uow, chain=chain)  # type: ignore[arg-type]
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.SOURCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.SOURCES))
     with pytest.raises(JobHandlerError):
         await handler(
             ProductionStageParameters(
-                run_id=first.id, expected_stage=SubjectProductionStage.SOURCES.value
+                run_id=first.id, expected_stage=ProductionStage.SOURCES.value
             ),
             _Context(),  # type: ignore[arg-type]
         )
@@ -779,7 +763,7 @@ def test_stage_parameters_survive_the_json_round_trip() -> None:
     """
     run_id = uuid4()
     encoded = ProductionStageParameters(
-        run_id=run_id, expected_stage=SubjectProductionStage.SOURCES.value
+        run_id=run_id, expected_stage=ProductionStage.SOURCES.value
     ).model_dump(mode="json")
 
     assert isinstance(encoded["run_id"], str)
@@ -787,7 +771,7 @@ def test_stage_parameters_survive_the_json_round_trip() -> None:
     decoded = ProductionStageParameters.model_validate(encoded)
 
     assert decoded.run_id == run_id
-    assert decoded.expected_stage == SubjectProductionStage.SOURCES.value
+    assert decoded.expected_stage == ProductionStage.SOURCES.value
 
 
 def test_registry_validates_the_parameters_it_receives_from_the_queue() -> None:
@@ -797,7 +781,7 @@ def test_registry_validates_the_parameters_it_receives_from_the_queue() -> None:
     run_id = uuid4()
 
     validated = registry.validate(
-        stage_job_kind(SubjectProductionStage.SOURCES),
+        stage_job_kind(ProductionStage.SOURCES),
         {"run_id": str(run_id), "expected_stage": "sources"},
     )
 
@@ -846,7 +830,7 @@ async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
             "details": {"reason": "active_signal_stalled", "output_chars": 4211},
         },
     )
-    run = _run(uow, SubjectProductionStage.REFERENCES)
+    run = _run(uow, ProductionStage.REFERENCES)
     uow.model_runs.items[model_run_id] = SimpleNamespace(
         id=model_run_id,
         # The ModelRun keeps the real bridge reason, not the state machine's code.
@@ -856,27 +840,25 @@ async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
         status=ModelRunStatus.NEEDS_REVIEW,
     )
 
-    handler = registry.handler(stage_job_kind(SubjectProductionStage.REFERENCES))
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
     await handler(
-        ProductionStageParameters(
-            run_id=run.id, expected_stage=SubjectProductionStage.REFERENCES.value
-        ),
+        ProductionStageParameters(run_id=run.id, expected_stage=ProductionStage.REFERENCES.value),
         _Context(),  # type: ignore[arg-type]
     )
 
-    parked = uow.subject_production_runs.items[run.id]
-    assert parked.status is SubjectProductionStatus.NEEDS_REVIEW
+    parked = uow.production_runs.items[run.id]
+    assert parked.status is ProductionRunStatus.NEEDS_REVIEW
     assert parked.error_code == "model_submission_reconciliation_required"
     assert parked.requires_reconciliation is True
     assert parked.reconciliation is not None
     assert parked.reconciliation.model_run_id == model_run_id
     assert parked.reconciliation.bridge_response_id == "resp_65a707c50a5549a582b2fc3f"
-    assert parked.reconciliation.stage is SubjectProductionStage.REFERENCES
+    assert parked.reconciliation.stage is ProductionStage.REFERENCES
     # No ordinary retry: neither the automatic policy nor a manual one.
     assert (
         ProductionRecoveryPolicyV1.disposition(parked.error_code)
         is ProductionRecoveryDisposition.MANUAL_ONLY
     )
     with pytest.raises(ProductionReconciliationRequiredError):
-        parked.retry_from_stage(SubjectProductionStage.REFERENCES)
+        parked.retry_from_stage(ProductionStage.REFERENCES)
     assert jobs.submitted == []

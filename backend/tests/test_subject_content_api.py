@@ -17,7 +17,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionRun,
+    ProductionRun,
 )
 
 SUBJECT_ID = uuid4()
@@ -32,10 +32,10 @@ class _Subjects:
 
 
 class _Runs:
-    def __init__(self, runs: list[SubjectProductionRun]) -> None:
+    def __init__(self, runs: list[ProductionRun]) -> None:
         self.runs = runs
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         matches = [run for run in self.runs if run.subject_id == subject_id]
         return max(matches, key=lambda run: run.created_at) if matches else None
 
@@ -75,13 +75,13 @@ class _Uow:
     def __init__(
         self,
         subject: Subject | None = None,
-        runs: list[SubjectProductionRun] | None = None,
+        runs: list[ProductionRun] | None = None,
         artifacts: list[ProductionArtifact] | None = None,
         sources: list[SourceDocument] | None = None,
         samples: list[Sample] | None = None,
     ) -> None:
         self.subjects = _Subjects(subject)
-        self.subject_production_runs = _Runs(runs or [])
+        self.production_runs = _Runs(runs or [])
         self.production_artifacts = _Artifacts(artifacts or [])
         self.source_documents = _Sources(sources or [])
         self.samples = _Samples(samples or [])
@@ -139,8 +139,8 @@ def subject() -> Subject:
     )
 
 
-def _run(*, created_at: datetime | None = None, generation: int = 1) -> SubjectProductionRun:
-    return SubjectProductionRun(
+def _run(*, created_at: datetime | None = None, generation: int = 1) -> ProductionRun:
+    return ProductionRun(
         id=uuid4(),
         subject_id=SUBJECT_ID,
         edition_id=uuid4(),
@@ -150,7 +150,7 @@ def _run(*, created_at: datetime | None = None, generation: int = 1) -> SubjectP
 
 
 def _artifact(
-    run: SubjectProductionRun,
+    run: ProductionRun,
     stage: ProductionArtifactStage,
     canonical_blob_id: UUID,
     *,

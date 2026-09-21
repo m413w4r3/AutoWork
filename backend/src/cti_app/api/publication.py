@@ -80,9 +80,9 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
+    ProductionRunStatus,
+    ProductionStage,
     RepairDecisionApplicationState,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.production import RepairExecutionPlan as DomainRepairExecutionPlan
 from cti_app.domain.publication_review import PublicationDecision, PublicationReviewDecision
@@ -133,7 +133,7 @@ class ReviewItemView(BaseModel):
     title: str
     run_id: UUID
     pipeline_generation: int
-    run_status: SubjectProductionStatus
+    run_status: ProductionRunStatus
     document_artifact_id: UUID | None
     document_artifact_version: int | None
     document_input_hash: str | None
@@ -158,7 +158,7 @@ class ReviewItemView(BaseModel):
     # ``can_retry`` and ``requires_reconciliation`` are mutually exclusive and
     # each names exactly one operator action.
     can_retry: bool
-    retry_stage: SubjectProductionStage | None
+    retry_stage: ProductionStage | None
     # A cancelled article is resumed instead: nothing it produced was deleted.
     can_resume: bool = False
     requires_reconciliation: bool = False
@@ -970,7 +970,7 @@ async def _edition_subject_production_state(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "edition_archived"},
             )
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None or run.edition_id != edition_id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1159,12 +1159,12 @@ async def rebuild_edition_review_item(
                 retry = await _retry_production_run(
                     request,
                     run.id,
-                    RetryProductionStageRequest(stage=SubjectProductionStage.SYNTHESIS),
+                    RetryProductionStageRequest(stage=ProductionStage.SYNTHESIS),
                     actor_id,
                 )
                 return {
                     "action": "retry_required",
-                    "stage": SubjectProductionStage.SYNTHESIS.value,
+                    "stage": ProductionStage.SYNTHESIS.value,
                     "run_id": str(retry.get("run_id", run.id)),
                     "batch_id": retry.get("batch_id"),
                     "changed": projection.changed,
@@ -1228,12 +1228,12 @@ async def rebuild_edition_review_item(
                 retry = await _retry_production_run(
                     request,
                     run.id,
-                    RetryProductionStageRequest(stage=SubjectProductionStage.EXTRACTION),
+                    RetryProductionStageRequest(stage=ProductionStage.EXTRACTION),
                     actor_id,
                 )
                 return {
                     "action": "rebuild_references_and_retry",
-                    "stage": SubjectProductionStage.EXTRACTION.value,
+                    "stage": ProductionStage.EXTRACTION.value,
                     "run_id": str(retry.get("run_id", run.id)),
                     "batch_id": retry.get("batch_id"),
                     "changed": True,
@@ -1243,12 +1243,12 @@ async def rebuild_edition_review_item(
                 retry = await _retry_production_run(
                     request,
                     run.id,
-                    RetryProductionStageRequest(stage=SubjectProductionStage.EXTRACTION),
+                    RetryProductionStageRequest(stage=ProductionStage.EXTRACTION),
                     actor_id,
                 )
                 return {
                     "action": "retry_stage",
-                    "stage": SubjectProductionStage.EXTRACTION.value,
+                    "stage": ProductionStage.EXTRACTION.value,
                     "run_id": str(retry.get("run_id", run.id)),
                     "batch_id": retry.get("batch_id"),
                     "changed": True,
@@ -1256,20 +1256,20 @@ async def rebuild_edition_review_item(
                 }
             return {
                 "action": "rebuild_references",
-                "stage": SubjectProductionStage.REFERENCES.value,
+                "stage": ProductionStage.REFERENCES.value,
                 "run_id": str(run.id),
                 "batch_id": str(batch_id) if batch_id else None,
                 "changed": False,
                 "job_id": None,
             }
         next_stage = (
-            SubjectProductionStage.REFERENCES
+            ProductionStage.REFERENCES
             if references is None
-            else SubjectProductionStage.EXTRACTION
+            else ProductionStage.EXTRACTION
             if extraction is None
-            else SubjectProductionStage.SYNTHESIS
+            else ProductionStage.SYNTHESIS
             if synthesis is None
-            else SubjectProductionStage.ASSEMBLY
+            else ProductionStage.ASSEMBLY
             if publication is None
             else None
         )

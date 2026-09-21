@@ -53,7 +53,7 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
-    SubjectProductionStatus,
+    ProductionRunStatus,
 )
 from cti_app.domain.publication_review import PublicationDecision
 
@@ -215,6 +215,63 @@ class _Runs:
         return [run for run in self.runs if run.edition_id == edition_id]
 
 
+DISCOVERY_SUBJECT_A = UUID("ffffffff-6666-4666-8666-ffffffffffff")
+DISCOVERY_CANDIDATE_A = UUID("99999999-7777-4777-8777-999999999999")
+
+
+def _subject() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=SUBJECT_A,
+        edition_id=EDITION_ID,
+        title="Article 1",
+        version=1,
+        tlp=TLP.AMBER,
+    )
+
+
+def _discovery_origin() -> SimpleNamespace:
+    return SimpleNamespace(
+        subject_id=SUBJECT_A,
+        edition_id=EDITION_ID,
+        discovery_subject_id=DISCOVERY_SUBJECT_A,
+        selection_decision_id=UUID("88888888-8888-4888-8888-888888888888"),
+    )
+
+
+def _discovery_candidate() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=DISCOVERY_CANDIDATE_A,
+        discovery_batch_id=UUID("77777777-9999-4999-8999-777777777777"),
+        actor_or_campaign="Campaign X",
+        evidence=SimpleNamespace(actors=(), campaigns=(), sources=()),
+    )
+
+
+def _discovery_snapshot() -> SimpleNamespace:
+    return SimpleNamespace(
+        id=UUID("eeeeeeee-5555-4555-8555-eeeeeeeeeeee"),
+        version=7,
+        subjects=(
+            SimpleNamespace(
+                subject_id=DISCOVERY_SUBJECT_A,
+                member_references=(SimpleNamespace(candidate_id=DISCOVERY_CANDIDATE_A),),
+                candidate=SimpleNamespace(summary="Résumé Discovery"),
+            ),
+        ),
+    )
+
+
+def _input_snapshot(run_id: UUID) -> SimpleNamespace:
+    return SimpleNamespace(
+        production_run_id=run_id,
+        subject_id=SUBJECT_A,
+        subject_title="Article 1",
+        research_date=date(2026, 8, 28),
+        discovery_snapshot_id=UUID("eeeeeeee-5555-4555-8555-eeeeeeeeeeee"),
+        discovery_snapshot_version=7,
+    )
+
+
 class _Uow:
     def __init__(
         self,
@@ -225,9 +282,14 @@ class _Uow:
         collections: list[Any] | None = None,
         rows: list[EditionReviewReadItem] | None = None,
     ) -> None:
-        self.subject_production_runs = _Runs(runs)
+        self.production_runs = _Runs(runs)
         self.production_artifacts = _Artifacts(artifacts)
         self.production_repair_decisions = _Decisions(decisions)
+        # A state export reads its provenance from the frozen run input, never
+        # from the live Subject.
+        self.production_input_snapshots = SimpleNamespace(
+            get_by_run=lambda run_id: _value(_input_snapshot(run_id))
+        )
         self._collections = list(collections or [])
         self.source_collections = SimpleNamespace(
             list_for_subject=self._list_collections,
@@ -289,7 +351,7 @@ def _run(
         id=run_id,
         edition_id=EDITION_ID,
         subject_id=subject_id,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
         requires_reconciliation=False,
         pipeline_generation=generation,
         research_date=date(2026, 8, 15),
@@ -310,7 +372,7 @@ def _row(
         title=f"Article {position}",
         run_id=run_id,
         pipeline_generation=generation,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=uuid4(),
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -975,9 +1037,9 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
 
 
 def _snapshot(extraction: TechnicalExtraction) -> Any:
-    """Minimal V3 snapshot used where only the extraction matters."""
+    """Minimal V4 snapshot used where only the extraction matters."""
     from cti_app.application.production_state import (
-        ProductionStateSnapshotV3,
+        ProductionStateSnapshotV4,
         compute_production_state_checksum,
     )
 
@@ -985,7 +1047,14 @@ def _snapshot(extraction: TechnicalExtraction) -> Any:
         "format": "autowork.production-state",
         "schema_version": PRODUCTION_STATE_SCHEMA_VERSION,
         "exported_at": "2026-08-29T10:00:00Z",
-        "origin": {"subject_title": "Article 1", "research_date": "2026-08-15"},
+        "origin": {
+            "subject_title": "Article 1",
+            "subject_id": str(SUBJECT_A),
+            "production_run_id": str(RUN_A),
+            "research_date": "2026-08-15",
+            "discovery_snapshot_id": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+            "discovery_snapshot_version": 7,
+        },
         "artifacts": {
             "references": {"input_hash": "a" * 64, "canonical_content": {"sources": []}},
             "extraction": {
@@ -997,7 +1066,7 @@ def _snapshot(extraction: TechnicalExtraction) -> Any:
         "repair": None,
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV3.model_validate(payload)
+    snapshot = ProductionStateSnapshotV4.model_validate(payload)
     return snapshot.model_copy(
         update={"content_sha256": compute_production_state_checksum(snapshot)}
     )
@@ -1006,8 +1075,25 @@ def _snapshot(extraction: TechnicalExtraction) -> Any:
 class _StateUow(_Uow):
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
-        self.editorial_groups = SimpleNamespace(get_by_subject=lambda _id: _value(None))
-        self.production_input_snapshots = SimpleNamespace(add=lambda _item: _value(None))
+        # An import freezes a brand new run input, so the target unit of work
+        # must expose the discovery lineage rather than an editorial group.
+        self.subjects = SimpleNamespace(get=lambda _id: _value(_subject()))
+        self.subject_discovery_origins = SimpleNamespace(
+            get_by_subject=lambda _id: _value(_discovery_origin())
+        )
+        self.discovery_subject_identities = SimpleNamespace(
+            resolve_canonical_subject=lambda subject_id: _value(subject_id)
+        )
+        self.discovery_snapshots = SimpleNamespace(
+            get_active=lambda _id: _value(_discovery_snapshot())
+        )
+        self.discovery_candidates = SimpleNamespace(
+            list_for_edition=lambda _id, include_replaced=False: _value([_discovery_candidate()])
+        )
+        self.production_input_snapshots = SimpleNamespace(
+            add=lambda _item: _value(None),
+            get_by_run=lambda run_id: _value(_input_snapshot(run_id)),
+        )
         self.edition_production_batch_items = SimpleNamespace(
             get_by_run=lambda _run_id: _value(None)
         )
@@ -1078,9 +1164,9 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
     )
 
     service = ProductionStateService(_factory(uow), store)  # type: ignore[arg-type]
-    snapshot = await service.export_run_state(RUN_A, subject_title="Article 1")
+    snapshot = await service.export_run_state(RUN_A)
 
-    assert snapshot.schema_version == PRODUCTION_STATE_SCHEMA_VERSION == 3
+    assert snapshot.schema_version == PRODUCTION_STATE_SCHEMA_VERSION == 4
     assert snapshot.repair is not None
     assert snapshot.repair.included_repair_keys == (key,)
     assert snapshot.repair.base_extraction_artifact_id == str(base.id)
@@ -1109,7 +1195,7 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
         payload=snapshot.model_dump(mode="json"),
     )
 
-    assert result.schema_version == 3
+    assert result.schema_version == 4
     imported = next(
         item
         for item in target.production_artifacts.items

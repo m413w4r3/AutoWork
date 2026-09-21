@@ -23,7 +23,7 @@ from cti_app.domain.production import (
     LoopBudget,
     ProductionArtifact,
     ProductionArtifactStage,
-    SubjectProductionRun,
+    ProductionRun,
 )
 from cti_app.infrastructure.database.models.invariants import (
     CandidateInvariantRow,
@@ -61,7 +61,7 @@ async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigat
             slug=f"p09-{suffix}",
             tlp=TLP.AMBER,
         )
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=subject.id,
             edition_id=edition.id,
         )
@@ -79,7 +79,7 @@ async def _make_investigation(session_factory, suffix: str) -> AnalystInvestigat
             budget=LoopBudget(),
         )
         await uow.subjects.add(subject)
-        await uow.subject_production_runs.add(run)
+        await uow.production_runs.add(run)
         await uow.production_artifacts.append(artifact)
         await uow.analyst_investigations.add(investigation)
         await uow.commit()

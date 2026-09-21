@@ -68,7 +68,7 @@ function renderPipeline() {
   });
   return render(
     <QueryClientProvider client={client}>
-      <PipelineTab subjectId={SUBJECT_ID} />
+      <PipelineTab subjectId={SUBJECT_ID} editionId={EDITION_ID} />
     </QueryClientProvider>,
   );
 }

@@ -13,8 +13,8 @@ from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 
 from .support import ProductionScenario
@@ -112,13 +112,13 @@ async def test_complete_production_pipeline_reaches_ready(
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
     initial = await scenario.start()
-    assert initial.status is SubjectProductionStatus.RUNNING
-    assert initial.current_stage is SubjectProductionStage.SOURCES
+    assert initial.status is ProductionRunStatus.RUNNING
+    assert initial.current_stage is ProductionStage.SOURCES
 
     run = await scenario.run_until_terminal()
 
-    assert run.status is SubjectProductionStatus.READY
-    assert run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert run.status is ProductionRunStatus.READY
+    assert run.current_stage is ProductionStage.ASSEMBLY
     assert run.reconciliation is None
     assert run.error_code is None
     assert run.extraction_progress is not None
@@ -135,7 +135,7 @@ async def test_complete_production_pipeline_reaches_ready(
     )
 
     async with scenario.uow_factory() as uow:
-        persisted_run = await uow.subject_production_runs.get(run.id)
+        persisted_run = await uow.production_runs.get(run.id)
         snapshot = await uow.production_input_snapshots.get_by_run(run.id)
         collections = list(await uow.source_collections.list_for_subject(run.subject_id))
         documents = list(await uow.source_documents.list_for_subject(run.subject_id))
@@ -294,10 +294,10 @@ async def test_complete_production_pipeline_reaches_ready(
     assert all(turn.status.value == "succeeded" for turn in turns)
 
     async with scenario.uow_factory() as uow:
-        refreshed = await uow.subject_production_runs.get(run.id)
+        refreshed = await uow.production_runs.get(run.id)
         refreshed_artifacts = await uow.production_artifacts.list_for_run(run.id)
     assert refreshed is not None
-    assert refreshed.status is SubjectProductionStatus.READY
+    assert refreshed.status is ProductionRunStatus.READY
     assert {artifact.stage for artifact in refreshed_artifacts} == set(by_stage)
 
 
@@ -317,9 +317,9 @@ async def test_invalid_q2_response_cannot_reach_ready(
     await scenario.start()
     run = await scenario.run_until_terminal()
 
-    assert run.status is not SubjectProductionStatus.READY
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
-    assert run.current_stage is SubjectProductionStage.EXTRACTION
+    assert run.status is not ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
+    assert run.current_stage is ProductionStage.EXTRACTION
     assert run.error_code == "q2_source_coverage_failed"
     assert run.reconciliation is None
     assert scenario.model.calls[-1].stage == "extraction"

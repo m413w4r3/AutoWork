@@ -27,16 +27,16 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionBatchPhase,
     ProductionBatchStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
     model_run_awaits_reconciliation,
 )
 
 
 class _Runs:
-    def __init__(self, run: SubjectProductionRun, model: ModelRun) -> None:
+    def __init__(self, run: ProductionRun, model: ModelRun) -> None:
         self.runs = {run.id: run}
         self.models = {model.id: model}
 
@@ -46,7 +46,7 @@ class _Runs:
     async def get_for_update(self, run_id: UUID):
         return self.runs.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.runs[run.id] = run
 
 
@@ -116,7 +116,7 @@ class _Manifests:
 class _Uow:
     def __init__(
         self,
-        run: SubjectProductionRun,
+        run: ProductionRun,
         model: ModelRun,
         *,
         edition_state: EditionStatus = EditionStatus.OPEN,
@@ -135,7 +135,7 @@ class _Uow:
             production_run_id=run.id,
             position=1,
         )
-        self.subject_production_runs = _Runs(run, model)
+        self.production_runs = _Runs(run, model)
         self.model_runs = _Models({model.id: model})
         self.editions = _EditionRepo(edition)
         self.edition_production_batches = _BatchRepo(batch)
@@ -261,12 +261,12 @@ def _build_fixture(
         response_id="bridge-1",
         error_code="model_submission_reconciliation_required",
     )
-    run = SubjectProductionRun(
+    run = ProductionRun(
         id=uuid4(),
         subject_id=subject_id,
         edition_id=edition_id,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.EXTRACTION,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.EXTRACTION,
         pipeline_generation=7,
         error_code="model_submission_reconciliation_required",
         error_message="reconcile",
@@ -275,7 +275,7 @@ def _build_fixture(
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=model_id,
-        stage=SubjectProductionStage.EXTRACTION,
+        stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-1",
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -316,7 +316,7 @@ def review_fixture() -> ReconciliationFixture:
 @pytest.mark.asyncio
 async def test_preview_and_hash_mismatch_do_not_mutate(fixture: ReconciliationFixture) -> None:
     service, uow, gateway, bridge, jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     preview = await service.preview_visible(run.id)
     assert preview.sha256 == hashlib.sha256(preview.text.encode()).hexdigest()
     assert gateway.adapter_calls == 0
@@ -333,11 +333,11 @@ async def test_adoption_resumes_same_generation_and_repeats_idempotently(
     fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, bridge, jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     expected = hashlib.sha256(b"# recovered\n\nanswer").hexdigest()
     result = await service.adopt_visible(run.id, expected, actor_id="analyst")
     assert gateway.model.status is ModelRunStatus.SUCCEEDED
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     assert run.pipeline_generation == 7
     assert result["provenance"] == "visible_recovery"
     assert jobs.submissions == 1
@@ -353,7 +353,7 @@ async def test_manual_adoption_has_no_visible_preview_or_provider_call(
     fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, bridge, jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     text = "manual markdown"
     digest = hashlib.sha256(text.encode()).hexdigest()
     await service.preview_manual(run.id, text)
@@ -370,14 +370,14 @@ async def test_abandon_releases_exact_visible_target_without_adopting_it(
     fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, bridge, jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
 
     result = await service.abandon_visible(run.id)
 
     assert result["action"] == "production_reconciliation_abandoned"
     assert bridge.releases == 1
     assert gateway.model.status is ModelRunStatus.NEEDS_REVIEW
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert jobs.submissions == 0
 
 
@@ -387,19 +387,19 @@ async def test_resume_safety_fences_are_typed_conflicts(
     fixture: ReconciliationFixture, blocked: str
 ) -> None:
     service, uow, gateway, bridge, jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     if blocked == "cancelled":
         uow.edition_production_batches.batch.status = ProductionBatchStatus.CANCELLED
     elif blocked == "archived":
         uow.editions.edition.state = EditionStatus.ARCHIVED
     else:
-        sibling = SubjectProductionRun(
+        sibling = ProductionRun(
             subject_id=uuid4(),
             edition_id=run.edition_id,
-            status=SubjectProductionStatus.RUNNING,
-            current_stage=SubjectProductionStage.SOURCES,
+            status=ProductionRunStatus.RUNNING,
+            current_stage=ProductionStage.SOURCES,
         )
-        uow.subject_production_runs.runs[sibling.id] = sibling
+        uow.production_runs.runs[sibling.id] = sibling
         item = EditionProductionBatchItem(
             batch_id=uow.edition_production_batches.batch.id,
             subject_id=sibling.subject_id,
@@ -430,7 +430,7 @@ async def test_adoption_reopens_the_finished_batch_for_a_review_recovery(
 ) -> None:
     """The batch is the dispatch fence, so the resume must reopen it."""
     service, uow, _, _, jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     expected = hashlib.sha256(b"# recovered\n\nanswer").hexdigest()
 
     result = await service.adopt_visible(run.id, expected, actor_id="analyst")
@@ -439,7 +439,7 @@ async def test_adoption_reopens_the_finished_batch_for_a_review_recovery(
     assert batch.status is ProductionBatchStatus.RUNNING
     assert batch.phase is ProductionBatchPhase.REVIEW
     assert batch.finished_at is None
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     # The exact archived answer is resumed: same generation, no new prompt.
     assert run.pipeline_generation == 7
     assert result["pipeline_generation"] == 7
@@ -451,7 +451,7 @@ async def test_repeated_adoption_reopens_once_and_submits_one_job(
     review_fixture: ReconciliationFixture,
 ) -> None:
     service, uow, _, _, jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     expected = hashlib.sha256(b"# recovered\n\nanswer").hexdigest()
 
     await service.adopt_visible(run.id, expected, actor_id="analyst")
@@ -469,7 +469,7 @@ async def test_cancelled_batch_is_never_reopened_by_a_review_recovery(
     review_fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, _, jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     uow.edition_production_batches.batch.status = ProductionBatchStatus.CANCELLED
 
     with pytest.raises(ProductionReconciliationError) as error:
@@ -488,14 +488,14 @@ async def test_open_edition_reconciliation_is_allowed_with_publication_manifest(
     review_fixture: ReconciliationFixture,
 ) -> None:
     service, uow, _, _, jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     uow.publication_manifests.present = True
 
     await service.adopt_manual(
         run.id, "manual", hashlib.sha256(b"manual").hexdigest(), actor_id="analyst"
     )
 
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     assert uow.edition_production_batches.batch.status is (ProductionBatchStatus.RUNNING)
     assert jobs.submissions == 1
 
@@ -505,7 +505,7 @@ async def test_archived_edition_reconciliation_is_refused(
     review_fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, _, jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     uow.editions.edition.state = EditionStatus.ARCHIVED
 
     with pytest.raises(ProductionReconciliationError) as error:
@@ -524,7 +524,7 @@ async def test_visible_adoption_forwards_the_verified_external_turn_id(
 ) -> None:
     """The DOM turn id captured by the bridge is what reaches the gateway."""
     service, uow, gateway, _bridge, _jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     preview = await service.preview_visible(run.id)
 
     assert preview.external_turn_id == "dom-turn-77"
@@ -550,7 +550,7 @@ async def test_review_adoption_uses_the_same_identity_contract(
 ) -> None:
     """Review and Production adopt through one contract; identity must match."""
     service, uow, gateway, _bridge, _jobs = review_fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     preview = await service.preview_visible(run.id)
     await service.adopt_visible(run.id, preview.sha256, actor_id="reviewer")
 
@@ -562,7 +562,7 @@ async def test_manual_adoption_never_invents_an_external_turn_id(
     fixture: ReconciliationFixture,
 ) -> None:
     service, uow, gateway, bridge, _jobs = fixture
-    run = next(iter(uow.subject_production_runs.runs.values()))
+    run = next(iter(uow.production_runs.runs.values()))
     markdown = "# import manuel\n\ncontenu"
     preview = await service.preview_manual(run.id, markdown)
 
@@ -596,12 +596,12 @@ async def test_bridge_reason_model_run_is_reconcilable_and_resumes_same_generati
     adoptable, and adoption must resume the same pipeline generation.
     """
     service, uow, gateway, bridge, jobs = _build_fixture()
-    run = next(iter(uow.subject_production_runs.runs.values()))
-    run.current_stage = SubjectProductionStage.REFERENCES
+    run = next(iter(uow.production_runs.runs.values()))
+    run.current_stage = ProductionStage.REFERENCES
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=gateway.model.id,
-        stage=SubjectProductionStage.REFERENCES,
+        stage=ProductionStage.REFERENCES,
         bridge_response_id="bridge-1",
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",
@@ -615,7 +615,7 @@ async def test_bridge_reason_model_run_is_reconcilable_and_resumes_same_generati
     adopted = await service.adopt_visible(run.id, preview.sha256, actor_id="analyst")
 
     assert gateway.model.status is ModelRunStatus.SUCCEEDED
-    assert run.status is SubjectProductionStatus.RUNNING
+    assert run.status is ProductionRunStatus.RUNNING
     assert run.pipeline_generation == 7
     assert adopted["pipeline_generation"] == 7
     assert adopted["provenance"] == "visible_recovery"
@@ -637,12 +637,12 @@ async def test_external_turn_identity_unavailable_is_reconcilable_never_retried(
     assert model_run_awaits_reconciliation("external_turn_identity_unavailable")
 
     service, uow, gateway, _bridge, jobs = _build_fixture()
-    run = next(iter(uow.subject_production_runs.runs.values()))
-    run.current_stage = SubjectProductionStage.REFERENCES
+    run = next(iter(uow.production_runs.runs.values()))
+    run.current_stage = ProductionStage.REFERENCES
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=gateway.model.id,
-        stage=SubjectProductionStage.REFERENCES,
+        stage=ProductionStage.REFERENCES,
         bridge_response_id="bridge-1",
         submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
         phase="reconciliation",

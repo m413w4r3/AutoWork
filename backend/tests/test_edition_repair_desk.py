@@ -30,9 +30,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRepairAction,
     ProductionRepairIssueKind,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.domain.publication_review import PublicationDecision
 
@@ -62,7 +62,7 @@ def _row(subject_id: UUID, position: int) -> EditionReviewReadItem:
         title=f"Article {position}",
         run_id=run_id,
         pipeline_generation=2,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=uuid4(),
         document_artifact_version=1,
         document_input_hash="a" * 64,
@@ -439,7 +439,7 @@ class _NoBlobReadStore:
 
 class _LightIssueUow:
     def __init__(self, artifact: object, run: object) -> None:
-        self.subject_production_runs = SimpleNamespace(
+        self.production_runs = SimpleNamespace(
             list_for_edition=lambda _edition_id: _async_value([run])
         )
         self.production_artifacts = SimpleNamespace(
@@ -531,9 +531,7 @@ async def test_source_issue_listing_uses_compact_reference_index_without_blob_re
     )
 
     class _SourceUow:
-        subject_production_runs = SimpleNamespace(
-            list_for_edition=lambda _edition_id: _async_value([run])
-        )
+        production_runs = SimpleNamespace(list_for_edition=lambda _edition_id: _async_value([run]))
         production_artifacts = SimpleNamespace(
             get_current=lambda _run_id, _stage: _async_value(artifact)
         )
@@ -595,14 +593,14 @@ class _BulkDecisions:
 class _BulkUow:
     def __init__(
         self,
-        runs: dict[UUID, SubjectProductionRun],
+        runs: dict[UUID, ProductionRun],
         artifacts: dict[UUID, ProductionArtifact],
         edition_state: EditionStatus = EditionStatus.OPEN,
     ) -> None:
         self.editions = SimpleNamespace(
             get_for_update=lambda _edition_id: _async_value(SimpleNamespace(state=edition_state))
         )
-        self.subject_production_runs = SimpleNamespace(
+        self.production_runs = SimpleNamespace(
             get_for_update=lambda run_id: _async_value(runs.get(run_id))
         )
         self.production_artifacts = _BulkArtifacts(artifacts)
@@ -623,7 +621,7 @@ def _bulk_case(
     status_b: ProductionArtifactStatus = ProductionArtifactStatus.VERIFIED,
     edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[_BulkUow, list[ProductionRepairDecisionInput]]:
-    runs: dict[UUID, SubjectProductionRun] = {}
+    runs: dict[UUID, ProductionRun] = {}
     artifacts: dict[UUID, ProductionArtifact] = {}
     inputs: list[ProductionRepairDecisionInput] = []
     for index, artifact_status in enumerate(
@@ -631,11 +629,11 @@ def _bulk_case(
         start=1,
     ):
         subject_id = SUBJECT_A if index == 1 else SUBJECT_B
-        run = SubjectProductionRun(
+        run = ProductionRun(
             subject_id=subject_id,
             edition_id=EDITION_ID,
-            status=SubjectProductionStatus.READY,
-            current_stage=SubjectProductionStage.EXTRACTION,
+            status=ProductionRunStatus.READY,
+            current_stage=ProductionStage.EXTRACTION,
         )
         artifact = ProductionArtifact(
             production_run_id=run.id,

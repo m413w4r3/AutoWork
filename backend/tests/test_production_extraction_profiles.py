@@ -28,10 +28,10 @@ from cti_app.domain.production import (
     ExtractionProfile,
     ProductionInputSnapshot,
     ProductionInputSource,
+    ProductionRun,
+    ProductionStage,
     SourceExtraction,
     SourceExtractionStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
 )
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -51,8 +51,7 @@ def _source(url: str, published_at: date | None) -> ParsedSource:
 
 def _input_source(url: str, published_at: date | None) -> ProductionInputSource:
     return ProductionInputSource(
-        batch_id=uuid4(),
-        candidate_id=uuid4(),
+        discovery_candidate_id=uuid4(),
         source_candidate_id=uuid4(),
         canonical_url=url,
         role=SourceRole.PRIMARY,
@@ -70,10 +69,16 @@ def _snapshot(core_sources: tuple[ProductionInputSource, ...]) -> ProductionInpu
         production_run_id=uuid4(),
         subject_id=uuid4(),
         edition_id=uuid4(),
-        editorial_group_id=uuid4(),
-        editorial_group_version=1,
+        subject_version=1,
         subject_title="Subject",
-        subject_description="Description",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=uuid4(),
+        canonical_discovery_subject_id=uuid4(),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=tuple(source.discovery_candidate_id for source in core_sources),
+        discovery_summary="Description",
         actor_or_campaign="Actor",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
@@ -352,7 +357,7 @@ class _CacheUow:
         self.source_collections = state.collections
         self.source_documents = state.documents
         self.production_artifacts = state.artifacts
-        self.subject_production_runs = state.runs
+        self.production_runs = state.runs
 
     async def __aenter__(self) -> _CacheUow:
         return self
@@ -383,7 +388,7 @@ class _CacheState:
         self.runs = SimpleNamespace(get=lambda run_id: self._run(run_id))
         self._docs_by_id = docs
         self._collections_by_id = collections
-        self._runs: dict[UUID, SubjectProductionRun] = {}
+        self._runs: dict[UUID, ProductionRun] = {}
 
     async def _documents(
         self, subject_id: UUID, docs: dict[UUID, SimpleNamespace]
@@ -399,7 +404,7 @@ class _CacheState:
         del run_id, stage
         return SimpleNamespace(canonical_blob_id=uuid4(), input_hash="a" * 64)
 
-    async def _run(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def _run(self, run_id: UUID) -> ProductionRun | None:
         return self._runs.get(run_id)
 
 
@@ -546,7 +551,7 @@ def _individual_setup(
     published_at: date = date(2026, 7, 10),
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator,
-    SubjectProductionRun,
+    ProductionRun,
     _CacheState,
     _ExtractionSink,
 ]:
@@ -575,10 +580,10 @@ def _individual_setup(
         return ReferenceReport(sources=(_source(url, published_at),), events=())
 
     orchestrator._load_reference_report = load_report
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[run.id] = run
     return orchestrator, run, state, sink
@@ -591,7 +596,7 @@ def _multi_individual_setup(
     gateway: _CacheGateway,
 ) -> tuple[
     production_workflow.ProductionWorkflowOrchestrator,
-    SubjectProductionRun,
+    ProductionRun,
     _CacheState,
 ]:
     subject = uuid4()
@@ -624,10 +629,10 @@ def _multi_individual_setup(
         return ReferenceReport(sources=tuple(state._report_sources), events=())
 
     orchestrator._load_reference_report = load_report
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[run.id] = run
     return orchestrator, run, state
@@ -758,10 +763,10 @@ async def test_retry_and_new_run_reuse_the_unchanged_source_checkpoint(
 
     # A new production run with the same archived capture reuses the same
     # source checkpoint too; a changed decoded SHA is what authorizes a read.
-    next_run = SubjectProductionRun(
+    next_run = ProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[next_run.id] = next_run
     third = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
@@ -797,10 +802,10 @@ async def test_changed_source_hash_is_a_q2_miss_with_explainable_events(
     document.decoded_sha256 = digest
     collection.decoded_blob_id = blob_id
 
-    next_run = SubjectProductionRun(
+    next_run = ProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[next_run.id] = next_run
     second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
@@ -854,10 +859,10 @@ async def test_five_source_rebuild_reuses_unchanged_q2_and_calls_once_for_s6(
     state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
     state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
 
-    next_run = SubjectProductionRun(
+    next_run = ProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[next_run.id] = next_run
     second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
@@ -930,10 +935,10 @@ async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
     state._docs_by_id[s6.id] = s6
     state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
     state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
-    next_run = SubjectProductionRun(
+    next_run = ProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[next_run.id] = next_run
     second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)

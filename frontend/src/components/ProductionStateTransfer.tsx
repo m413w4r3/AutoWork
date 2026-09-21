@@ -30,6 +30,10 @@ function isNullableString(value: unknown): value is string | null {
   return value === null || typeof value === "string";
 }
 
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 function isArtifacts(value: unknown): boolean {
   if (!isRecord(value)) return false;
   const references = value.references;
@@ -52,12 +56,60 @@ function isArtifacts(value: unknown): boolean {
   );
 }
 
+function isRepair(value: unknown): boolean {
+  if (value === null) return true;
+  if (!isRecord(value)) return false;
+  if (
+    !hasExactKeys(value, [
+      "projection_version",
+      "base_extraction_artifact_id",
+      "actor_id",
+      "included_repair_keys",
+      "excluded_repair_keys",
+      "unresolved_repair_keys",
+      "decisions",
+      "materialization",
+    ]) ||
+    typeof value.projection_version !== "string" ||
+    typeof value.base_extraction_artifact_id !== "string" ||
+    !isNullableString(value.actor_id) ||
+    !isStringArray(value.included_repair_keys) ||
+    !isStringArray(value.excluded_repair_keys) ||
+    !isStringArray(value.unresolved_repair_keys) ||
+    !Array.isArray(value.decisions) ||
+    !(value.materialization === null || isRecord(value.materialization))
+  ) {
+    return false;
+  }
+  return value.decisions.every((decision) => {
+    if (!isRecord(decision)) return false;
+    return (
+      hasExactKeys(decision, [
+        "repair_key",
+        "decision_id",
+        "issue_kind",
+        "action",
+        "actor_id",
+        "decided_at",
+        "reason",
+      ]) &&
+      typeof decision.repair_key === "string" &&
+      isNullableString(decision.decision_id) &&
+      typeof decision.issue_kind === "string" &&
+      typeof decision.action === "string" &&
+      typeof decision.actor_id === "string" &&
+      typeof decision.decided_at === "string" &&
+      isNullableString(decision.reason)
+    );
+  });
+}
+
 function isProductionStateSnapshot(
   value: unknown,
 ): value is ProductionStateSnapshot {
   if (!isRecord(value)) return false;
   if (
-    !hasExactKeys(value, [
+    !(hasExactKeys(value, [
       "format",
       "schema_version",
       "exported_at",
@@ -65,36 +117,45 @@ function isProductionStateSnapshot(
       "artifacts",
       "content_sha256",
     ]) ||
+      hasExactKeys(value, [
+        "format",
+        "schema_version",
+        "exported_at",
+        "origin",
+        "artifacts",
+        "repair",
+        "content_sha256",
+      ])) ||
     value.format !== "autowork.production-state" ||
-    (value.schema_version !== 1 && value.schema_version !== 2) ||
+    value.schema_version !== 4 ||
     typeof value.exported_at !== "string" ||
     typeof value.content_sha256 !== "string" ||
     !isArtifacts(value.artifacts) ||
-    !isRecord(value.origin)
+    !isRecord(value.origin) ||
+    (Object.prototype.hasOwnProperty.call(value, "repair") &&
+      !isRepair(value.repair))
   ) {
     return false;
   }
 
   const origin = value.origin;
-  if (value.schema_version === 1) {
-    return (
-      hasExactKeys(origin, [
-        "subject_title",
-        "editorial_type",
-        "profile",
-        "research_date",
-      ]) &&
-      typeof origin.subject_title === "string" &&
-      origin.editorial_type === "brief" &&
-      origin.profile === "brief_auto" &&
-      isNullableString(origin.research_date)
-    );
-  }
-
   return (
-    hasExactKeys(origin, ["subject_title", "research_date"]) &&
+    hasExactKeys(origin, [
+      "subject_title",
+      "subject_id",
+      "production_run_id",
+      "research_date",
+      "discovery_snapshot_id",
+      "discovery_snapshot_version",
+    ]) &&
     typeof origin.subject_title === "string" &&
-    isNullableString(origin.research_date)
+    typeof origin.subject_id === "string" &&
+    typeof origin.production_run_id === "string" &&
+    typeof origin.research_date === "string" &&
+    typeof origin.discovery_snapshot_id === "string" &&
+    typeof origin.discovery_snapshot_version === "number" &&
+    Number.isInteger(origin.discovery_snapshot_version) &&
+    origin.discovery_snapshot_version >= 1
   );
 }
 
@@ -183,7 +244,7 @@ export function ProductionStateTransfer({
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v2-${filesystemTimestamp(snapshot.exported_at)}.json`;
+      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v4-${filesystemTimestamp(snapshot.exported_at)}.json`;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -295,6 +356,12 @@ export function ProductionStateTransfer({
         <div className="production-state-transfer__preview">
           <h4>État prêt à importer</h4>
           <p>Sujet d’origine : {selectedSnapshot.origin.subject_title}</p>
+          <p>Sujet : {selectedSnapshot.origin.subject_id}</p>
+          <p>Run : {selectedSnapshot.origin.production_run_id}</p>
+          <p>
+            Snapshot Discovery : {selectedSnapshot.origin.discovery_snapshot_id}{" "}
+            (v{selectedSnapshot.origin.discovery_snapshot_version})
+          </p>
           <p>
             Exporté le :{" "}
             {new Date(selectedSnapshot.exported_at).toLocaleString("fr-FR")}

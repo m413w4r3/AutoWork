@@ -16,19 +16,14 @@ from cti_app.domain.collection import (
     RejectedModelProposal,
     SourceCollection,
 )
-from cti_app.domain.discovery import DiscoveryBatch
+from cti_app.domain.discovery import DiscoveryBatch, DiscoveryCandidate
+from cti_app.domain.discovery_cumulative import DiscoverySnapshot
 from cti_app.domain.editions import Edition
-from cti_app.domain.editorial import EditorialGroup, HumanDecision
+from cti_app.domain.editorial import HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, SourceDocument, Subject
-from tests.discovery_support import (
-    BatchProjectedDiscoveryCandidateRepository,
-    InMemoryDiscoveryBatchRepository,
-)
-from tests.editorial_support import (
-    InMemoryEditorialGroupRepository,
-    InMemoryHumanDecisionRepository,
-    InMemorySubjectRepository,
-)
+from cti_app.domain.selection import SubjectDiscoveryOrigin
+from tests.discovery_support import InMemoryDiscoveryBatchRepository
+from tests.editorial_support import InMemoryHumanDecisionRepository, InMemorySubjectRepository
 
 
 class InMemoryBlobRepository:
@@ -216,6 +211,59 @@ class InMemoryRejectedProposalRepository:
         self._proposals.extend(deepcopy(list(proposals)))
 
 
+class InMemorySubjectDiscoveryOriginRepository:
+    def __init__(self, origins: dict[UUID, SubjectDiscoveryOrigin]) -> None:
+        self._origins = origins
+
+    async def get_by_subject(self, subject_id: UUID) -> SubjectDiscoveryOrigin | None:
+        value = self._origins.get(subject_id)
+        return deepcopy(value) if value else None
+
+
+class InMemoryDiscoverySubjectIdentityRepository:
+    def __init__(self, canonical_ids: dict[UUID, UUID]) -> None:
+        self._canonical_ids = canonical_ids
+
+    async def resolve_canonical_subject(self, subject_id: UUID) -> UUID:
+        return self._canonical_ids.get(subject_id, subject_id)
+
+
+class InMemoryDiscoverySnapshotRepository:
+    def __init__(self, snapshots: dict[UUID, DiscoverySnapshot]) -> None:
+        self._snapshots = snapshots
+
+    async def get_active(self, edition_id: UUID) -> DiscoverySnapshot | None:
+        value = self._snapshots.get(edition_id)
+        return deepcopy(value) if value else None
+
+
+class InMemoryDiscoveryCandidateRepository:
+    def __init__(
+        self,
+        candidates: dict[UUID, DiscoveryCandidate],
+        batches: dict[UUID, DiscoveryBatch],
+    ) -> None:
+        self._candidates = candidates
+        self._batches = batches
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> list[DiscoveryCandidate]:
+        del include_replaced
+        return [
+            deepcopy(candidate)
+            for candidate in self._candidates.values()
+            if self._batches[candidate.discovery_batch_id].edition_id == edition_id
+        ]
+
+    async def list_for_batch(self, batch_id: UUID) -> list[DiscoveryCandidate]:
+        return [
+            deepcopy(candidate)
+            for candidate in self._candidates.values()
+            if candidate.discovery_batch_id == batch_id
+        ]
+
+
 class InMemoryProvenanceRepository:
     def __init__(self, events: list[ProvenanceEvent]) -> None:
         self._events = events
@@ -240,8 +288,16 @@ class InMemoryCollectionUnitOfWork:
         self.source_documents = InMemorySourceDocumentRepository(factory.documents)
         self.provenance = InMemoryProvenanceRepository(factory.provenance)
         self.discovery_batches = InMemoryDiscoveryBatchRepository(factory.batches)
-        self.discovery_candidates = BatchProjectedDiscoveryCandidateRepository(factory.batches)
-        self.editorial_groups = InMemoryEditorialGroupRepository(factory.groups, factory.editions)
+        self.discovery_candidates = InMemoryDiscoveryCandidateRepository(
+            factory.candidates, factory.batches
+        )
+        self.subject_discovery_origins = InMemorySubjectDiscoveryOriginRepository(
+            factory.subject_discovery_origins
+        )
+        self.discovery_subject_identities = InMemoryDiscoverySubjectIdentityRepository(
+            factory.discovery_canonical_ids
+        )
+        self.discovery_snapshots = InMemoryDiscoverySnapshotRepository(factory.discovery_snapshots)
         self.human_decisions = InMemoryHumanDecisionRepository(factory.decisions)
         self.source_collections = InMemorySourceCollectionRepository(factory.collections)
         self.collection_attempts = InMemoryAttemptRepository(factory.attempts)
@@ -278,7 +334,10 @@ class InMemoryCollectionUnitOfWorkFactory:
         self.documents: dict[UUID, SourceDocument] = {}
         self.provenance: list[ProvenanceEvent] = []
         self.batches: dict[UUID, DiscoveryBatch] = {}
-        self.groups: dict[UUID, EditorialGroup] = {}
+        self.candidates: dict[UUID, DiscoveryCandidate] = {}
+        self.subject_discovery_origins: dict[UUID, SubjectDiscoveryOrigin] = {}
+        self.discovery_canonical_ids: dict[UUID, UUID] = {}
+        self.discovery_snapshots: dict[UUID, DiscoverySnapshot] = {}
         self.editions: dict[UUID, Edition] = {}
         self.decisions: list[HumanDecision] = []
         self.collections: dict[UUID, SourceCollection] = {}

@@ -78,7 +78,9 @@ export function SubjectWorkbench({ subjectId }: { subjectId: string }) {
       ) : null}
       {tab === "indicators" ? <IndicatorsTab subjectId={subjectId} /> : null}
       {tab === "assets" ? <AssetsTab subjectId={subjectId} /> : null}
-      {tab === "pipeline" ? <PipelineTab subjectId={subjectId} /> : null}
+      {tab === "pipeline" ? (
+        <PipelineTab subjectId={subjectId} editionId={subject.edition_id} />
+      ) : null}
     </section>
   );
 }

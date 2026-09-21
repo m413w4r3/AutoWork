@@ -54,8 +54,8 @@ from cti_app.domain.production import (
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
+    ProductionRunStatus,
     RepairDecisionApplicationState,
-    SubjectProductionStatus,
 )
 
 EDITION_ID = UUID("aaaaaaaa-9999-4999-8999-aaaaaaaaaaaa")
@@ -187,7 +187,7 @@ class _Uow:
         self._state = state
         self.production_artifacts = state.artifacts
         self.production_repair_decisions = state.decisions
-        self.subject_production_runs = SimpleNamespace(
+        self.production_runs = SimpleNamespace(
             get=self._get_run,
             get_for_update=self._get_run,
             get_current_for_subject=self._current_run,
@@ -271,7 +271,7 @@ def _run() -> SimpleNamespace:
         id=RUN_ID,
         edition_id=EDITION_ID,
         subject_id=SUBJECT_ID,
-        status=SubjectProductionStatus.READY,
+        status=ProductionRunStatus.READY,
         requires_reconciliation=False,
         pipeline_generation=0,
         research_date=date(2026, 8, 15),
@@ -285,7 +285,7 @@ def _row() -> EditionReviewReadItem:
         title="Article 1",
         run_id=RUN_ID,
         pipeline_generation=0,
-        run_status=SubjectProductionStatus.READY,
+        run_status=ProductionRunStatus.READY,
         document_artifact_id=uuid4(),
         document_artifact_version=1,
         document_input_hash="a" * 64,

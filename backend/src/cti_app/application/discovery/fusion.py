@@ -196,11 +196,9 @@ class FusionService:
         self,
         uow_factory: UnitOfWorkFactory,
         *,
-        after_activation: Callable[[UUID], Awaitable[object]] | None = None,
         replan_intake: Callable[[ReconcileDiscoveryParameters], Awaitable[object]] | None = None,
     ) -> None:
         self._uow_factory = uow_factory
-        self._after_activation = after_activation
         self._replan_intake = replan_intake
 
     async def get_board(self, edition_id: UUID) -> FusionBoard:
@@ -216,7 +214,6 @@ class FusionService:
         decisions: Sequence[FusionReviewDecision],
         actor_id: str,
     ) -> FusionBoard:
-        activated = False
         stale_parent = False
         replan: ReconcileDiscoveryParameters | None = None
         async with self._uow_factory() as uow:
@@ -324,15 +321,12 @@ class FusionService:
                     await uow.subject_contributions.append_many(applied.contributions)
                     await uow.discovery_merge_runs.mark_resolved(run.id)
                     await uow.commit()
-                    activated = True
         if stale_parent:
             if replan is not None and self._replan_intake is not None:
                 await self._replan_intake(replan)
             raise FusionSnapshotStaleError(
                 "The fusion proposal was planned against an older snapshot"
             )
-        if activated:
-            await self._after_activation_call(edition_id)
         return await self.get_board(edition_id)
 
     async def merge(
@@ -380,7 +374,6 @@ class FusionService:
             await uow.discovery_snapshots.deactivate(snapshot.id)
             await uow.discovery_snapshots.append(applied.snapshot)
             await uow.commit()
-        await self._after_activation_call(edition_id)
         return await self.get_board(edition_id)
 
     async def split(
@@ -424,7 +417,6 @@ class FusionService:
             await uow.discovery_snapshots.deactivate(snapshot.id)
             await uow.discovery_snapshots.append(applied.snapshot)
             await uow.commit()
-        await self._after_activation_call(edition_id)
         return await self.get_board(edition_id)
 
     async def _board(self, uow: UnitOfWork, edition_id: UUID) -> FusionBoard:
@@ -660,10 +652,6 @@ class FusionService:
                 )
             # DEFER keeps the group untouched: it stays in review.
         return transformed, handle_map
-
-    async def _after_activation_call(self, edition_id: UUID) -> None:
-        if self._after_activation is not None:
-            await self._after_activation(edition_id)
 
     @staticmethod
     async def _validate_activation(

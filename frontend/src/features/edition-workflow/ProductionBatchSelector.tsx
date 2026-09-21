@@ -20,6 +20,7 @@ export function ProductionBatchSelector({
   onSelectAll: () => void;
   onSelectNone: () => void;
 }) {
+  const startableSubjects = subjects.filter((subject) => subject.can_start);
   return (
     <section
       className="production-batch-selector"
@@ -34,7 +35,8 @@ export function ProductionBatchSelector({
             type="button"
             className="button button--secondary"
             disabled={
-              subjects.length === 0 || selected.size === subjects.length
+              startableSubjects.length === 0 ||
+              selected.size === startableSubjects.length
             }
             onClick={onSelectAll}
           >
@@ -56,16 +58,27 @@ export function ProductionBatchSelector({
         <ul className="production-batch-selector__list">
           {subjects.map((subject) => (
             <li key={subject.subject_id}>
-              <label className="production-batch-selector__choice">
-                <input
-                  type="checkbox"
-                  checked={selected.has(subject.subject_id)}
-                  onChange={(event) =>
-                    onToggle(subject.subject_id, event.target.checked)
-                  }
-                />
-                {subject.title}
-              </label>
+              {subject.can_start ? (
+                <label className="production-batch-selector__choice">
+                  <input
+                    type="checkbox"
+                    checked={selected.has(subject.subject_id)}
+                    onChange={(event) =>
+                      onToggle(subject.subject_id, event.target.checked)
+                    }
+                  />
+                  {subject.title}
+                </label>
+              ) : (
+                <span className="production-batch-selector__choice">
+                  {subject.title}
+                </span>
+              )}
+              {!subject.can_start && subject.blocking_reason ? (
+                <span className="production-batch-selector__blocking-reason">
+                  {subject.blocking_reason}
+                </span>
+              ) : null}
               <Link to={`/subjects/${subject.subject_id}`}>
                 Ouvrir le sujet
               </Link>

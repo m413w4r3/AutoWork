@@ -15,36 +15,36 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
+    DiscoveryCandidate,
     DiscoverySourceMode,
     SourceCandidate,
-    SourceRelationshipStatus,
     SourceRole,
 )
-from cti_app.domain.editions import EditionStatus
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMemberReference,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubject,
 )
+from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
     EditionProductionBatchItem,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
 )
+from cti_app.domain.selection import SubjectDiscoveryOrigin
 
 
 class _Runs:
-    def __init__(self, current: SubjectProductionRun) -> None:
+    def __init__(self, current: ProductionRun) -> None:
         self.items = {current.id: current}
 
     async def lock_creation_for_subject(self, subject_id: UUID) -> None:
         del subject_id
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         matches = [run for run in self.items.values() if run.subject_id == subject_id]
         return max(matches, key=lambda run: run.created_at) if matches else None
 
@@ -54,19 +54,19 @@ class _Runs:
             default=0,
         )
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]:
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[ProductionRun]:
         return [run for run in self.items.values() if run.edition_id == edition_id]
 
-    async def add(self, run: SubjectProductionRun) -> None:
+    async def add(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
 
@@ -79,14 +79,6 @@ class _Snapshots:
 
     async def get_by_run(self, run_id: UUID) -> Any | None:
         return self.items.get(run_id)
-
-
-class _Groups:
-    def __init__(self, group: EditorialGroup) -> None:
-        self.group = group
-
-    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
-        return self.group if self.group.subject_id == subject_id else None
 
 
 class _Subjects:
@@ -135,6 +127,38 @@ class _BatchItems:
     def __init__(self, item: EditionProductionBatchItem) -> None:
         self.item = item
 
+
+class _Origins:
+    def __init__(self, origin: SubjectDiscoveryOrigin) -> None:
+        self.origin = origin
+
+    async def get_by_subject(self, subject_id: UUID) -> SubjectDiscoveryOrigin | None:
+        return self.origin if self.origin.subject_id == subject_id else None
+
+
+class _Identities:
+    async def resolve_canonical_subject(self, subject_id: UUID) -> UUID:
+        return subject_id
+
+
+class _DiscoverySnapshots:
+    def __init__(self, snapshot: DiscoverySnapshot) -> None:
+        self.snapshot = snapshot
+
+    async def get_active(self, edition_id: UUID) -> DiscoverySnapshot | None:
+        return self.snapshot if self.snapshot.edition_id == edition_id else None
+
+
+class _DiscoveryCandidates:
+    def __init__(self, candidates: Sequence[DiscoveryCandidate]) -> None:
+        self.candidates = tuple(candidates)
+
+    async def list_for_edition(
+        self, edition_id: UUID, *, include_replaced: bool = False
+    ) -> Sequence[DiscoveryCandidate]:
+        del edition_id, include_replaced
+        return self.candidates
+
     async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
         return self.item if self.item.production_run_id == run_id else None
 
@@ -147,19 +171,56 @@ class _Uow:
         self,
         runs: _Runs,
         snapshots: _Snapshots,
-        groups: _Groups,
         subjects: _Subjects,
         editions: _Editions,
         batches: _Batches,
         items: _BatchItems,
     ) -> None:
-        self.subject_production_runs = runs
+        self.production_runs = runs
         self.production_input_snapshots = snapshots
-        self.editorial_groups = groups
         self.subjects = subjects
         self.editions = editions
         self.discovery_batches = batches
         self.edition_production_batch_items = items
+        subject = subjects.subject
+        source_batch = batches.batches[-1]
+        candidate = DiscoveryCandidate.from_candidate_topic(
+            source_batch.candidates[0],
+            discovery_run_id=source_batch.discovery_run_id,
+            discovery_batch_id=source_batch.id,
+            position=0,
+        )
+        snapshot = DiscoverySnapshot(
+            edition_id=subject.edition_id,
+            version=1,
+            parent_snapshot_id=None,
+            intake_id=None,
+            merge_run_id=uuid4(),
+            planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            subjects=(
+                DiscoverySubject(
+                    subject_id=subject.id,
+                    candidate=source_batch.candidates[0],
+                    member_references=(DiscoveryMemberReference(candidate.id),),
+                    created_at=candidate.created_at,
+                ),
+            ),
+            snapshot_hash="a" * 64,
+            is_active=True,
+        )
+        self.subject_discovery_origins = _Origins(
+            SubjectDiscoveryOrigin(
+                subject_id=subject.id,
+                edition_id=subject.edition_id,
+                discovery_subject_id=subject.id,
+                selection_decision_id=uuid4(),
+                selected_snapshot_id=snapshot.id,
+                selected_snapshot_version=1,
+            )
+        )
+        self.discovery_subject_identities = _Identities()
+        self.discovery_snapshots = _DiscoverySnapshots(snapshot)
+        self.discovery_candidates = _DiscoveryCandidates((candidate,))
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -198,18 +259,6 @@ class _Factory:
 
     def __call__(self) -> _Uow:
         return self.uow
-
-
-def _score() -> EditorialScore:
-    return EditorialScore(
-        impact=3,
-        novelty=3,
-        technical_depth=3,
-        hunting_potential=3,
-        actionability=3,
-        source_quality=3,
-        justifications={},
-    )
 
 
 def _candidate(title: str, url: str) -> CandidateTopic:
@@ -261,11 +310,11 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    old_run = SubjectProductionRun(
+    old_run = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
-        status=SubjectProductionStatus.NEEDS_REVIEW,
-        current_stage=SubjectProductionStage.SOURCES,
+        status=ProductionRunStatus.NEEDS_REVIEW,
+        current_stage=ProductionStage.SOURCES,
         created_at=datetime(2026, 9, 3, 10, tzinfo=UTC),
         updated_at=datetime(2026, 9, 3, 10, tzinfo=UTC),
     )
@@ -305,19 +354,6 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
         source_coverage_complete=False,
         source_coverage_incomplete_reason="test",
     )
-    group = EditorialGroup(
-        edition_id=edition_id,
-        title="Blocked report",
-        candidate_references=(CandidateReference(replacement_batch.id, new_candidate.id),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=_score(),
-        source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-        needs_source_verification=True,
-        needs_source_expansion=True,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject_id)
     item = EditionProductionBatchItem(
         batch_id=uuid4(),
         subject_id=subject_id,
@@ -338,7 +374,6 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     uow = _Uow(
         runs,
         snapshots,
-        _Groups(group),
         _Subjects(subject),
         editions,
         _Batches([old_batch, replacement_batch]),
@@ -375,7 +410,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
 
     if edition_state is EditionStatus.ARCHIVED:
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "edition_archived"
+        assert response.json()["detail"]["code"] == "production_edition_archived"
         assert len(runs.items) == 1
         assert item.production_run_id == old_run.id
         assert jobs.submitted == []
@@ -384,7 +419,7 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
 
     if archive_before_repoint:
         assert response.status_code == 409
-        assert response.json()["detail"]["code"] == "edition_archived"
+        assert response.json()["detail"]["code"] == "production_edition_archived"
         assert len(runs.items) == 2
         assert item.production_run_id == old_run.id
         assert jobs.submitted == []
@@ -403,8 +438,8 @@ async def test_restart_with_new_sources_captures_fresh_snapshot_and_repoints_bat
     assert "https://blocked.example/report" not in {
         source.canonical_url for source in snapshot.core_sources
     }
-    assert item.production_run_id == new_run_id
-    assert item.auto_recovery_count == 0
+    assert item.production_run_id == old_run.id
+    assert item.auto_recovery_count == 1
     assert jobs.submitted[0]["kind"] == "production.subject.sources"
     assert dispatcher.dispatched == jobs.ids
     assert editions.state is EditionStatus.OPEN

@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from typing import Any, Literal, NoReturn, cast
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from cti_app.application.identity import IdentityProvider
@@ -28,7 +28,7 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
-from cti_app.application.production_read_model import BatchStatusReadService
+from cti_app.application.production_read_model import BatchStatusReadService, ProductionRunSummary
 from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
@@ -71,12 +71,13 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
     ProductionStateService,
-    ProductionStateSnapshotV3,
+    ProductionStateSnapshotV4,
 )
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
     EditionProductionBatchOwnershipError,
-    EditionProductionService,
+    ProductionBatchConflictError,
+    ProductionBatchService,
     ProductionRunNotFoundError,
     RetryPrerequisiteMissingError,
     StaleEditionProductionBatchError,
@@ -84,6 +85,7 @@ from cti_app.application.subject_production import (
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.entities import Subject
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStage,
@@ -94,10 +96,10 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionReuseInvalidation,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.selection import SubjectDiscoveryOrigin
@@ -109,23 +111,18 @@ router = APIRouter(prefix="/api", tags=["production"])
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
 
-class StartSubjectProductionRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
 class StartEditionProductionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    # subject_ids omitted -> every selected Subject of the edition is produced.
     subject_ids: list[UUID] | None = None
 
 
 class RetryProductionStageRequest(BaseModel):
-    stage: SubjectProductionStage
+    stage: ProductionStage
 
 
 class ProductionReuseInvalidationRequest(BaseModel):
-    from_stage: SubjectProductionStage
+    from_stage: ProductionStage
 
 
 class ReconciliationAdoptRequest(BaseModel):
@@ -216,7 +213,7 @@ class ProductionResumePlanView(BaseModel):
     """What resuming a cancelled run would reuse, run, and cost."""
 
     previous_status: str
-    resume_from_stage: SubjectProductionStage
+    resume_from_stage: ProductionStage
     reused_artifacts: list[str]
     model_calls_expected: int
 
@@ -260,8 +257,8 @@ class BatchItemDetail(BaseModel):
     subject_id: str
     title: str
     run_id: str
-    status: SubjectProductionStatus
-    current_stage: SubjectProductionStage
+    status: ProductionRunStatus
+    current_stage: ProductionStage
     pipeline_generation: int
     auto_recovery_count: int
     error_code: str | None = None
@@ -276,7 +273,7 @@ class ProductionReconciliationView(BaseModel):
     bridge_response_id: str | None
     submission_state: str
     phase: str
-    stage: SubjectProductionStage
+    stage: ProductionStage
     pipeline_generation: int
     output_sha256: str | None = None
     provenance: str | None = None
@@ -303,6 +300,26 @@ class BatchStatus(BaseModel):
     finished_at: str | None = None
     phase: str
     next_dispatch_at: str | None
+
+
+class ProductionSubject(BaseModel):
+    subject_id: str
+    title: str
+    tlp: str
+    latest_run_id: str | None = None
+    latest_run_number: int | None = None
+    latest_status: ProductionRunStatus | None = None
+    latest_stage: ProductionStage | None = None
+    active_run_id: str | None = None
+    can_start: bool
+    blocking_reason: str | None = None
+
+
+class ProductionBoard(BaseModel):
+    edition_id: str
+    active_batch: BatchStatus | None = None
+    subjects: list[ProductionSubject]
+    recent_batches: list[BatchStatus]
 
 
 def _runtime(request: Request) -> tuple[UnitOfWorkFactory, JobService, JobDispatcher]:
@@ -353,6 +370,7 @@ def _production_state_error(exc: ProductionStateError) -> HTTPException:
         "production_state_invalid": status.HTTP_400_BAD_REQUEST,
         "production_state_checksum_mismatch": status.HTTP_400_BAD_REQUEST,
         "production_state_research_date_required": status.HTTP_400_BAD_REQUEST,
+        "production_input_snapshot_missing": status.HTTP_409_CONFLICT,
     }
     return HTTPException(
         status_code=code_to_status[exc.code],
@@ -549,7 +567,7 @@ def _repair_cursor_offset(cursor: str | None) -> int:
 
 async def _ensure_reconciliation_required(request: Request, run_id: UUID) -> None:
     async with request.app.state.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(run_id)
+        run = await uow.production_runs.get(run_id)
     if run is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -657,9 +675,7 @@ def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
     )
 
 
-def _run_view(
-    run: SubjectProductionRun, edition_id: UUID, *, job_id: UUID | None
-) -> dict[str, Any]:
+def _run_view(run: ProductionRun, edition_id: UUID, *, job_id: UUID | None) -> dict[str, Any]:
     return {
         "run_id": str(run.id),
         "subject_id": str(run.subject_id),
@@ -704,13 +720,13 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     completed = needs_review = failed = cancelled = 0
     details: list[BatchItemDetail] = []
     for item in items:
-        if item.status is SubjectProductionStatus.READY:
+        if item.status is ProductionRunStatus.READY:
             completed += 1
-        elif item.status is SubjectProductionStatus.NEEDS_REVIEW:
+        elif item.status is ProductionRunStatus.NEEDS_REVIEW:
             needs_review += 1
-        elif item.status is SubjectProductionStatus.FAILED:
+        elif item.status is ProductionRunStatus.FAILED:
             failed += 1
-        elif item.status is SubjectProductionStatus.CANCELLED:
+        elif item.status is ProductionRunStatus.CANCELLED:
             cancelled += 1
 
         details.append(
@@ -730,7 +746,7 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                     reconciliation_view(
                         item.run_id,
                         item.reconciliation
-                        if item.status is SubjectProductionStatus.NEEDS_REVIEW
+                        if item.status is ProductionRunStatus.NEEDS_REVIEW
                         and item.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
                         else None,
                         pipeline_generation=item.pipeline_generation,
@@ -757,19 +773,72 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
     )
 
 
+async def ensure_initial_dispatch(
+    request: Request,
+    batch_id: UUID,
+    *,
+    actor_id: str,
+) -> UUID | None:
+    """Repair the first SOURCES dispatch after a committed batch creation."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
+    started = await service.start_next(batch_id)
+    if started is None:
+        async with uow_factory() as uow:
+            batch = await uow.edition_production_batches.get(batch_id)
+            if batch is None or batch.status not in {
+                ProductionBatchStatus.QUEUED,
+                ProductionBatchStatus.RUNNING,
+            }:
+                return None
+            items = await uow.edition_production_batch_items.list_for_batch(batch_id)
+            started = None
+            for item in items:
+                candidate = await uow.production_runs.get(item.production_run_id)
+                if candidate is not None and candidate.status is ProductionRunStatus.RUNNING:
+                    started = candidate
+                    break
+    if started is None or not await _production_run_can_dispatch(
+        uow_factory, started.id, batch_id=batch_id
+    ):
+        return None
+
+    parameters = ProductionStageParameters(
+        run_id=started.id,
+        expected_stage=ProductionStage.SOURCES.value,
+        pipeline_generation=started.pipeline_generation,
+    )
+    try:
+        job = await jobs.submit(
+            kind="production.subject.sources",
+            aggregate_type="subject",
+            aggregate_id=started.subject_id,
+            idempotency_key=production_stage_idempotency_key(started, ProductionStage.SOURCES),
+            correlation_id=get_correlation_id(),
+            input_parameters=parameters.model_dump(mode="json"),
+            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+            actor_id=actor_id,
+        )
+    except DuplicateJobError as exc:
+        job = await jobs.get(exc.existing_job_id)
+    if job.status is JobStatus.QUEUED:
+        await dispatcher.dispatch(job.id)
+    return job.id
+
+
 async def _start_production_run(
     uow_factory: UnitOfWorkFactory,
     jobs: JobService,
     dispatcher: JobDispatcher,
     *,
-    run: SubjectProductionRun,
+    run: ProductionRun,
     actor_id: str,
-) -> tuple[SubjectProductionRun, UUID | None]:
+) -> tuple[ProductionRun, UUID | None]:
     """Start one queued run and submit exactly its SOURCES job."""
     service = SubjectProductionService(uow_factory)
-    if run.status is SubjectProductionStatus.RUNNING:
+    if run.status is ProductionRunStatus.RUNNING:
         return run, None
-    if run.status is not SubjectProductionStatus.QUEUED:
+    if run.status is not ProductionRunStatus.QUEUED:
         return run, None
 
     # start_run persists and returns the RUNNING run; keep that object, not
@@ -784,21 +853,21 @@ async def _start_production_run(
         if edition is None:
             raise ValueError("edition_not_found")
         if edition.state is EditionStatus.ARCHIVED:
-            raise ValueError("edition_archived")
+            raise ValueError("production_edition_archived")
 
-        latest = await uow.subject_production_runs.get_for_update(run.id)
+        latest = await uow.production_runs.get_for_update(run.id)
         if latest is None:
             return run, None
         if latest.edition_id != edition.id:
             raise ValueError("production_run_edition_changed")
-        if latest.status is not SubjectProductionStatus.RUNNING:
+        if latest.status is not ProductionRunStatus.RUNNING:
             await uow.commit()
             return latest, None
 
         # The idempotency key makes a concurrent duplicate POST reuse this job.
         parameters = ProductionStageParameters(
             run_id=latest.id,
-            expected_stage=SubjectProductionStage.SOURCES.value,
+            expected_stage=ProductionStage.SOURCES.value,
             pipeline_generation=latest.pipeline_generation,
         )
         try:
@@ -806,9 +875,7 @@ async def _start_production_run(
                 kind="production.subject.sources",
                 aggregate_type="subject",
                 aggregate_id=latest.subject_id,
-                idempotency_key=production_stage_idempotency_key(
-                    latest, SubjectProductionStage.SOURCES
-                ),
+                idempotency_key=production_stage_idempotency_key(latest, ProductionStage.SOURCES),
                 correlation_id=get_correlation_id(),
                 input_parameters=parameters.model_dump(mode="json"),
                 max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
@@ -822,37 +889,6 @@ async def _start_production_run(
         return latest, job.id
 
 
-async def _create_and_start_run(
-    uow_factory: UnitOfWorkFactory,
-    jobs: JobService,
-    dispatcher: JobDispatcher,
-    *,
-    subject_id: UUID,
-    edition_id: UUID,
-    actor_id: str,
-) -> tuple[SubjectProductionRun, UUID | None]:
-    """Creates (or reuses an in-flight) run and submits its SOURCES job.
-
-    Shared by "start production" and "retry references": both must go through
-    `SubjectProductionService.create_run`'s idempotency so a duplicate POST
-    never creates a second run nor submits a second job.
-    """
-    service = SubjectProductionService(uow_factory)
-    run, created = await service.create_run(
-        subject_id=subject_id,
-        edition_id=edition_id,
-    )
-
-    del created
-    return await _start_production_run(
-        uow_factory,
-        jobs,
-        dispatcher,
-        run=run,
-        actor_id=actor_id,
-    )
-
-
 async def _production_run_can_dispatch(
     uow_factory: UnitOfWorkFactory,
     run_id: UUID,
@@ -861,8 +897,8 @@ async def _production_run_can_dispatch(
 ) -> bool:
     """Re-read the exact run (and batch, when applicable) before dispatch."""
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get(run_id)
-        if run is None or run.status is not SubjectProductionStatus.RUNNING:
+        run = await uow.production_runs.get(run_id)
+        if run is None or run.status is not ProductionRunStatus.RUNNING:
             return False
         edition = await uow.editions.get(run.edition_id)
         if edition is None or edition.state is EditionStatus.ARCHIVED:
@@ -878,7 +914,7 @@ async def _production_run_can_dispatch(
 
 async def _dispatch_handed_off_production_run(
     request: Request,
-    started: SubjectProductionRun,
+    started: ProductionRun,
     batch_id: UUID,
     *,
     actor_id: str,
@@ -886,18 +922,18 @@ async def _dispatch_handed_off_production_run(
     """Submit a hand-off stage only after revalidating the exact run/batch."""
     uow_factory, jobs, dispatcher = _runtime(request)
     async with uow_factory() as uow:
-        latest = await uow.subject_production_runs.get(started.id)
-    if latest is None or latest.status is SubjectProductionStatus.CANCELLED:
+        latest = await uow.production_runs.get(started.id)
+    if latest is None or latest.status is ProductionRunStatus.CANCELLED:
         return
     if not await _production_run_can_dispatch(uow_factory, latest.id, batch_id=batch_id):
         return
 
     pacing = _production_pacing(request)
-    batch_service = EditionProductionService(uow_factory, pacing)
+    batch_service = ProductionBatchService(uow_factory, pacing)
     delay_ms = await batch_service.next_dispatch_delay_ms(batch_id)
     if latest.current_stage in {
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.SYNTHESIS,
+        ProductionStage.REFERENCES,
+        ProductionStage.SYNTHESIS,
     }:
         delay_ms += pacing.model_delay_ms(latest.current_stage)
 
@@ -931,7 +967,9 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
         "Une tentative est déjà en cours pour cet article. Attendez qu'elle se termine."
     ),
     "retry_stage_not_in_pipeline": "Cette étape ne fait pas partie du pipeline de production.",
-    "edition_archived": ("L'édition est archivée : plus aucune production ne peut être modifiée."),
+    "production_edition_archived": (
+        "L'édition est archivée : plus aucune production ne peut être modifiée."
+    ),
     "edition_not_found": "L'édition de cet article est introuvable.",
     "production_run_edition_changed": (
         "Cet article a changé d'édition depuis l'ouverture de la revue. Rechargez la page."
@@ -1078,7 +1116,7 @@ async def _cancel_non_terminal_run_jobs(
 
 async def _resume_plan_view(
     uow: Any,
-    run: SubjectProductionRun,
+    run: ProductionRun,
     *,
     archived_sources: int,
 ) -> ProductionResumePlanView:
@@ -1199,10 +1237,10 @@ async def _cancel_production_run(
             detail=f"No production run found for run {run_id}",
         ) from exc
     except ValueError as exc:
-        if str(exc) == "edition_archived":
+        if str(exc) in {"edition_archived", "production_edition_archived"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_archived"},
+                detail={"code": "production_edition_archived"},
             ) from exc
         if str(exc) != "production_run_not_cancellable":
             raise
@@ -1220,7 +1258,7 @@ async def _cancel_production_run(
         actor_id=actor_id,
     )
     if cancellation.changed and cancellation.batch_id is not None:
-        batch_service = EditionProductionService(uow_factory, _production_pacing(request))
+        batch_service = ProductionBatchService(uow_factory, _production_pacing(request))
         started = await batch_service.on_subject_terminal(
             cancellation.batch_id,
             cancellation.run.id,
@@ -1237,80 +1275,11 @@ async def _cancel_production_run(
     return {
         "action": "cancel",
         "run_id": str(cancellation.run.id),
-        "status": SubjectProductionStatus.CANCELLED.value,
+        "status": ProductionRunStatus.CANCELLED.value,
     }
 
 
 # Subject Production Endpoints
-
-
-@router.post("/subjects/{subject_id}/production")
-async def start_subject_production(
-    subject_id: UUID,
-    request: Request,
-    body: StartSubjectProductionRequest | None = None,
-) -> dict[str, Any]:
-    uow_factory, jobs, dispatcher = _runtime(request)
-
-    async with uow_factory() as uow:
-        subject = await uow.subjects.get(subject_id)
-        if subject is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No subject found for {subject_id}",
-            )
-        origin = await uow.subject_discovery_origins.get_by_subject(subject_id)
-        if (
-            origin is None
-            or origin.subject_id != subject_id
-            or origin.edition_id != subject.edition_id
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Subject has no discovery origin",
-            )
-        edition_id = subject.edition_id
-
-        # A subject produced inside an edition batch is repaired through that
-        # batch, never by a standalone run: once the current run is terminal,
-        # starting again would create a run the batch does not own — invisible
-        # to Review and unable to repair the batch item it appears to replace.
-        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
-        if current is not None and current.status not in {
-            SubjectProductionStatus.QUEUED,
-            SubjectProductionStatus.RUNNING,
-        }:
-            get_by_run = getattr(uow.edition_production_batch_items, "get_by_run", None)
-            item = await get_by_run(current.id) if get_by_run is not None else None
-            if item is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail={"code": "production_run_batch_owned"},
-                )
-
-    await request.app.state.legacy_editorial_projection_service.synchronize(edition_id)
-
-    try:
-        run, job_id = await _create_and_start_run(
-            uow_factory,
-            jobs,
-            dispatcher,
-            subject_id=subject_id,
-            edition_id=edition_id,
-            actor_id=await _actor_id(request),
-        )
-    except ValueError as e:
-        if str(e) == "edition_archived":
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_archived"},
-            ) from e
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
-        ) from e
-
-    return _run_view(run, edition_id, job_id=job_id)
 
 
 @router.post("/production/subjects/{subject_id}/production/restart-with-new-sources")
@@ -1321,15 +1290,15 @@ async def restart_subject_with_new_sources(
     """Create a fresh-input run after an analyst replaced a discovery URL."""
     uow_factory, jobs, dispatcher = _runtime(request)
     async with uow_factory() as uow:
-        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        current = await uow.production_runs.get_current_for_subject(subject_id)
         if current is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"No production run found for subject {subject_id}",
             )
         if current.status in {
-            SubjectProductionStatus.QUEUED,
-            SubjectProductionStatus.RUNNING,
+            ProductionRunStatus.QUEUED,
+            ProductionRunStatus.RUNNING,
         }:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1349,10 +1318,10 @@ async def restart_subject_with_new_sources(
             edition_id=edition_id,
         )
     except ValueError as exc:
-        if str(exc) == "edition_archived":
+        if str(exc) in {"edition_archived", "production_edition_archived"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_archived"},
+                detail={"code": "production_edition_archived"},
             ) from exc
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1362,8 +1331,8 @@ async def restart_subject_with_new_sources(
     # A concurrent restart may have won after the initial read; never attach a
     # second request to an active run or submit its SOURCES job twice.
     if not created and run.status in {
-        SubjectProductionStatus.QUEUED,
-        SubjectProductionStatus.RUNNING,
+        ProductionRunStatus.QUEUED,
+        ProductionRunStatus.RUNNING,
     }:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -1379,14 +1348,14 @@ async def restart_subject_with_new_sources(
             if edition is None:
                 raise ValueError("edition_not_found")
             if edition.state is EditionStatus.ARCHIVED:
-                raise ValueError("edition_archived")
+                raise ValueError("production_edition_archived")
             await _repoint_batch_item(uow, replaced_run_id, run.id)
             await uow.commit()
     except ValueError as exc:
-        if str(exc) == "edition_archived":
+        if str(exc) in {"edition_archived", "production_edition_archived"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_archived"},
+                detail={"code": "production_edition_archived"},
             ) from exc
         raise
 
@@ -1399,10 +1368,10 @@ async def restart_subject_with_new_sources(
             actor_id=actor_id,
         )
     except ValueError as exc:
-        if str(exc) == "edition_archived":
+        if str(exc) in {"edition_archived", "production_edition_archived"}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail={"code": "edition_archived"},
+                detail={"code": "production_edition_archived"},
             ) from exc
         raise
 
@@ -1413,7 +1382,7 @@ async def restart_subject_with_new_sources(
 async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
-) -> ProductionStateSnapshotV3:
+) -> ProductionStateSnapshotV4:
     await _selected_subject(request, subject_id)
     async with request.app.state.uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
@@ -1424,7 +1393,7 @@ async def export_subject_production_state(
         )
     service = _production_state_service(request)
     try:
-        return await service.export_state(subject_id=subject_id, subject_title=subject.title)
+        return await service.export_state(subject_id=subject_id)
     except ProductionStateError as exc:
         raise _production_state_error(exc) from exc
 
@@ -1463,7 +1432,7 @@ async def get_subject_production(
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if not run:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1503,7 +1472,7 @@ async def get_subject_production(
         completed_stages = completed_stage_count(stages)
         resume_plan = (
             await _resume_plan_view(uow, run, archived_sources=archived_sources)
-            if run.status is SubjectProductionStatus.CANCELLED
+            if run.status is ProductionRunStatus.CANCELLED
             else None
         )
 
@@ -1536,7 +1505,7 @@ async def get_subject_production(
                 reconciliation_view(
                     run.id,
                     run.reconciliation
-                    if run.status is SubjectProductionStatus.NEEDS_REVIEW
+                    if run.status is ProductionRunStatus.NEEDS_REVIEW
                     and run.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
                     else None,
                     pipeline_generation=run.pipeline_generation,
@@ -1549,12 +1518,75 @@ async def get_subject_production(
         )
 
 
+def _production_run_summary(run: ProductionRun) -> dict[str, Any]:
+    summary = ProductionRunSummary(
+        run_id=run.id,
+        edition_id=run.edition_id,
+        subject_id=run.subject_id,
+        run_number=run.run_number,
+        status=run.status,
+        current_stage=run.current_stage,
+        pipeline_generation=run.pipeline_generation,
+        research_date=run.research_date,
+        created_at=run.created_at,
+        started_at=run.started_at,
+        finished_at=run.finished_at,
+        error_code=run.error_code,
+        error_message=run.error_message,
+    )
+    return {
+        "run_id": str(summary.run_id),
+        "edition_id": str(summary.edition_id),
+        "subject_id": str(summary.subject_id),
+        "run_number": summary.run_number,
+        "status": summary.status.value,
+        "current_stage": summary.current_stage.value,
+        "pipeline_generation": summary.pipeline_generation,
+        "research_date": summary.research_date.isoformat() if summary.research_date else None,
+        "created_at": summary.created_at.isoformat(),
+        "started_at": summary.started_at.isoformat() if summary.started_at else None,
+        "finished_at": summary.finished_at.isoformat() if summary.finished_at else None,
+        "error_code": summary.error_code,
+        "error_message": summary.error_message,
+    }
+
+
+@router.get("/production/runs/{run_id}")
+async def get_production_run(run_id: UUID, request: Request) -> dict[str, Any]:
+    async with request.app.state.uow_factory() as uow:
+        run = await uow.production_runs.get(run_id)
+        if run is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Production run not found"
+            )
+        return _production_run_summary(run)
+
+
+@router.get("/subjects/{subject_id}/production/runs")
+async def list_subject_production_runs(subject_id: UUID, request: Request) -> list[dict[str, Any]]:
+    async with request.app.state.uow_factory() as uow:
+        subject = await uow.subjects.get(subject_id)
+        if subject is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subject not found")
+        loader = getattr(uow.production_runs, "list_for_subject", None)
+        runs = (
+            await loader(subject_id)
+            if loader is not None
+            else [
+                run
+                for run in await uow.production_runs.list_for_edition(subject.edition_id)
+                if run.subject_id == subject_id
+            ]
+        )
+        return [_production_run_summary(run) for run in runs]
+
+
 @router.get("/subjects/{subject_id}/investigation")
 async def get_subject_investigation(subject_id: UUID, request: Request) -> dict[str, Any]:
     """Read-only visibility into the manual major-assisted checkpoint."""
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="No production run found"
@@ -1596,7 +1628,7 @@ async def get_subject_production_repairs(
     """List current Repair Desk issues with cursor pagination."""
     uow_factory = request.app.state.uow_factory
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1652,7 +1684,7 @@ async def get_subject_production_repair_detail(
     """Return the complete inert value for one rejected Q2 object."""
     uow_factory = request.app.state.uow_factory
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1691,7 +1723,7 @@ async def rebuild_subject_references(
     """Rebuild Q1's canonical report from its already archived raw answer."""
     uow_factory = request.app.state.uow_factory
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1727,14 +1759,14 @@ async def rebuild_subject_references(
         "changed": result.changed,
         "restored_source_count": len(result.restored_source_ids),
         "restored_event_count": len(result.restored_event_ids),
-        "recommended_retry_stage": SubjectProductionStage.EXTRACTION.value,
+        "recommended_retry_stage": ProductionStage.EXTRACTION.value,
     }
     if (payload or RebuildReferencesRequest()).resume:
         try:
             response["resume"] = await _retry_production_run(
                 request,
                 run_id,
-                RetryProductionStageRequest(stage=SubjectProductionStage.EXTRACTION),
+                RetryProductionStageRequest(stage=ProductionStage.EXTRACTION),
                 await _actor_id(request),
             )
         except Exception as exc:
@@ -1757,7 +1789,7 @@ async def verify_subject_production_replacement(
 ) -> dict[str, Any]:
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1809,7 +1841,7 @@ async def decide_subject_production_repair(
     """
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1917,7 +1949,7 @@ async def apply_subject_production_repairs(
     """Persist the effective extraction, then optionally resume SYNTHESIS."""
     uow_factory = request.app.state.uow_factory
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -1971,7 +2003,7 @@ async def apply_subject_production_repairs(
             await _retry_production_run(
                 request,
                 run_id,
-                RetryProductionStageRequest(stage=SubjectProductionStage.SYNTHESIS),
+                RetryProductionStageRequest(stage=ProductionStage.SYNTHESIS),
                 await _actor_id(request),
             )
             response["resumed"] = True
@@ -1994,7 +2026,7 @@ async def retry_production_stage(
     """Deliberately recompute a stage in the current run and chain onward."""
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        current = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        current = await uow.production_runs.get_current_for_subject(subject_id)
         if not current:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2130,9 +2162,9 @@ async def invalidate_production_reuse(
 ) -> dict[str, Any]:
     """Prevent future cross-run reuse from one costly stage onward."""
     if payload.from_stage not in {
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
+        ProductionStage.REFERENCES,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
     }:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -2142,13 +2174,13 @@ async def invalidate_production_reuse(
     actor_id = await _actor_id(request)
     uow_factory, _, _ = _runtime(request)
     async with uow_factory() as uow:
-        lock_creation = getattr(uow.subject_production_runs, "lock_creation_for_subject", None)
+        lock_creation = getattr(uow.production_runs, "lock_creation_for_subject", None)
         if lock_creation is not None:
             await lock_creation(subject_id)
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if run is None:
             raise HTTPException(status_code=404, detail="No production run found")
-        if run.status in {SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING}:
+        if run.status in {ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING}:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"code": "reuse_invalidation_run_active"},
@@ -2200,7 +2232,7 @@ async def resume_production(
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if not run:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2227,7 +2259,7 @@ async def cancel_production(
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if not run:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -2250,7 +2282,7 @@ async def _artifact_view(
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+        run = await uow.production_runs.get_current_for_subject(subject_id)
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
@@ -2265,7 +2297,7 @@ async def _artifact_view_for_run(
     uow_factory, _, _ = _runtime(request)
 
     async with uow_factory() as uow:
-        run = await uow.subject_production_runs.get(run_id)
+        run = await uow.production_runs.get(run_id)
         if not run:
             raise HTTPException(status_code=404, detail="No production run found")
 
@@ -2329,124 +2361,131 @@ async def get_run_publication_artifact(run_id: UUID, request: Request) -> dict[s
     return await _artifact_view_for_run(request, run_id, ProductionArtifactStage.PUBLICATION.value)
 
 
-@router.post("/editions/{edition_id}/production")
+@router.post("/editions/{edition_id}/production/batches")
 async def start_edition_production(
     edition_id: UUID,
     request: Request,
-    body: StartEditionProductionRequest | None = None,
+    body: StartEditionProductionRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> BatchStatus:
-    # Idempotent: returns the existing active batch if one exists.
-    payload = body or StartEditionProductionRequest()
-    if payload.subject_ids is not None and not payload.subject_ids:
+    if idempotency_key is None or not idempotency_key.strip():
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="At least one subject must be selected for production",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "production_idempotency_key_required"},
+        )
+    if body.subject_ids is None or not body.subject_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "production_subject_ids_required"},
         )
     uow_factory, jobs, dispatcher = _runtime(request)
-    service = EditionProductionService(uow_factory, _production_pacing(request))
-
-    async with uow_factory() as uow:
-        active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
-        if active_batch:
-            return await _batch_status_view(uow, active_batch)
-
-        origins = await uow.subject_discovery_origins.list_for_edition(edition_id)
-        eligible_order: list[UUID] = []
-        for origin in origins:
-            if origin.edition_id != edition_id:
-                continue
-            subject = await uow.subjects.get(origin.subject_id)
-            if subject is not None and subject.edition_id == edition_id:
-                eligible_order.append(subject.id)
-
-    if not eligible_order:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No selected Subjects found for edition",
-        )
-
-    if payload.subject_ids is not None:
-        requested = set(payload.subject_ids)
-        unknown = requested - set(eligible_order)
-        if unknown:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Some requested Subjects are not selected Subjects",
-            )
-        subject_ids = [sid for sid in eligible_order if sid in requested]
-    else:
-        subject_ids = list(eligible_order)
-
-    await request.app.state.legacy_editorial_projection_service.synchronize(edition_id)
+    del jobs, dispatcher
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
+    actor_id = await _actor_id(request)
 
     try:
-        actor_id = await _actor_id(request)
-        batch = await service.create_batch(
+        result = await service.create(
             edition_id=edition_id,
-            subject_ids=subject_ids,
+            subject_ids=body.subject_ids,
+            idempotency_key=idempotency_key,
             actor_id=actor_id,
             correlation_id=get_correlation_id(),
         )
-
-        # create_batch already made a run per subject and linked items to them;
-        # start_next promotes the first one to RUNNING.
-        first_run = await service.start_next(batch.id)
-        if first_run is not None:
-            if await _production_run_can_dispatch(uow_factory, first_run.id, batch_id=batch.id):
-                parameters = ProductionStageParameters(
-                    run_id=first_run.id,
-                    expected_stage=SubjectProductionStage.SOURCES.value,
-                    pipeline_generation=first_run.pipeline_generation,
-                )
-                job = await jobs.submit(
-                    kind="production.subject.sources",
-                    aggregate_type="subject",
-                    aggregate_id=first_run.subject_id,
-                    idempotency_key=production_stage_idempotency_key(
-                        first_run, SubjectProductionStage.SOURCES
-                    ),
-                    correlation_id=get_correlation_id(),
-                    input_parameters=parameters.model_dump(mode="json"),
-                    max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-                    actor_id=actor_id,
-                )
-                if await _production_run_can_dispatch(uow_factory, first_run.id, batch_id=batch.id):
-                    await dispatcher.dispatch(job.id)
-                else:
-                    await _cancel_non_terminal_run_jobs(
-                        jobs,
-                        [(first_run.id, first_run.subject_id)],
-                        actor_id=actor_id,
-                    )
-    except ValueError as e:
+    except ProductionBatchConflictError as e:
+        code = e.code
+        http_status = (
+            status.HTTP_422_UNPROCESSABLE_ENTITY
+            if code in {"production_subject_ids_required", "production_subject_ids_duplicate"}
+            else status.HTTP_409_CONFLICT
+        )
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
+            status_code=http_status,
+            detail={"code": code, "subject_ids": [str(item) for item in e.subject_ids]},
         ) from e
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    await ensure_initial_dispatch(request, result.batch.id, actor_id=actor_id)
 
     async with uow_factory() as uow:
-        persisted_batch = await uow.edition_production_batches.get(batch.id)
-        return await _batch_status_view(uow, persisted_batch or batch)
+        persisted_batch = await uow.edition_production_batches.get(result.batch.id)
+        return await _batch_status_view(uow, persisted_batch or result.batch)
 
 
 @router.get("/editions/{edition_id}/production")
 async def get_edition_production(
     edition_id: UUID,
     request: Request,
-) -> BatchStatus:
-    # 404 here is the signal the UI uses to offer production.
+) -> ProductionBoard:
     uow_factory, _, _ = _runtime(request)
-    service = EditionProductionService(uow_factory)
 
     async with uow_factory() as uow:
-        batch = await service.get_batch(edition_id)
-        if not batch:
+        edition = await uow.editions.get(edition_id)
+        if edition is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No batch found for edition {edition_id}",
+                detail=f"No edition found for {edition_id}",
             )
+        active_batch = await uow.edition_production_batches.get_active_for_edition(edition_id)
+        recent_loader = getattr(uow.edition_production_batches, "list_recent_for_edition", None)
+        recent_batches = await recent_loader(edition_id, 10) if recent_loader is not None else []
+        origins = await uow.subject_discovery_origins.list_for_edition(edition_id)
+        runs = await uow.production_runs.list_for_edition(edition_id)
+        runs_by_subject: dict[UUID, list[ProductionRun]] = {}
+        for run in runs:
+            runs_by_subject.setdefault(run.subject_id, []).append(run)
 
-        return await _batch_status_view(uow, batch)
+        subjects: list[ProductionSubject] = []
+        archived = edition.state is EditionStatus.ARCHIVED
+        for origin in origins:
+            if origin.edition_id != edition_id:
+                continue
+            subject = await uow.subjects.get(origin.subject_id)
+            if subject is None or subject.edition_id != edition_id:
+                continue
+            subject_runs = sorted(
+                runs_by_subject.get(subject.id, []),
+                key=lambda run: (run.run_number, run.created_at),
+                reverse=True,
+            )
+            latest = subject_runs[0] if subject_runs else None
+            active = next(
+                (
+                    run
+                    for run in subject_runs
+                    if run.status in {ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING}
+                ),
+                None,
+            )
+            reason = (
+                "production_edition_archived"
+                if archived
+                else "production_batch_active"
+                if active_batch is not None
+                else "production_subject_active"
+                if active is not None
+                else None
+            )
+            subjects.append(
+                ProductionSubject(
+                    subject_id=str(subject.id),
+                    title=subject.title,
+                    tlp=subject.tlp.value,
+                    latest_run_id=str(latest.id) if latest else None,
+                    latest_run_number=latest.run_number if latest else None,
+                    latest_status=latest.status if latest else None,
+                    latest_stage=latest.current_stage if latest else None,
+                    active_run_id=str(active.id) if active else None,
+                    can_start=reason is None,
+                    blocking_reason=reason,
+                )
+            )
+        return ProductionBoard(
+            edition_id=str(edition_id),
+            active_batch=(await _batch_status_view(uow, active_batch) if active_batch else None),
+            subjects=subjects,
+            recent_batches=[await _batch_status_view(uow, batch) for batch in recent_batches],
+        )
 
 
 @router.post("/editions/{edition_id}/production/{batch_id}/cancel")
@@ -2458,7 +2497,7 @@ async def cancel_edition_batch(
     uow_factory, jobs, _ = _runtime(request)
     actor_id = await _actor_id(request)
 
-    service = EditionProductionService(uow_factory, _production_pacing(request))
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
     try:
         cancellation = await service.cancel_batch_with_result(
             edition_id,

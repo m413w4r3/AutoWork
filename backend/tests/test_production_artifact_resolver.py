@@ -8,7 +8,7 @@ from cti_app.application.production_artifact_resolver import current_publication
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
-    SubjectProductionStage,
+    ProductionStage,
     production_stages,
 )
 
@@ -59,9 +59,9 @@ async def test_publication_resolver_does_not_fall_back_to_other_stages() -> None
 
 def test_current_pipeline_contains_only_the_five_article_stages() -> None:
     assert production_stages() == (
-        SubjectProductionStage.SOURCES,
-        SubjectProductionStage.REFERENCES,
-        SubjectProductionStage.EXTRACTION,
-        SubjectProductionStage.SYNTHESIS,
-        SubjectProductionStage.ASSEMBLY,
+        ProductionStage.SOURCES,
+        ProductionStage.REFERENCES,
+        ProductionStage.EXTRACTION,
+        ProductionStage.SYNTHESIS,
+        ProductionStage.ASSEMBLY,
     )

@@ -13,9 +13,9 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.domain.production import (
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 
 
@@ -27,14 +27,31 @@ class BatchStatusItem:
     subject_id: UUID
     title: str
     run_id: UUID
-    status: SubjectProductionStatus
-    current_stage: SubjectProductionStage
+    status: ProductionRunStatus
+    current_stage: ProductionStage
     pipeline_generation: int
     auto_recovery_count: int
     error_code: str | None
     error_message: str | None
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionSubmissionReconciliation | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionRunSummary:
+    run_id: UUID
+    edition_id: UUID
+    subject_id: UUID
+    run_number: int
+    status: ProductionRunStatus
+    current_stage: ProductionStage
+    pipeline_generation: int
+    research_date: Any
+    created_at: Any
+    started_at: Any
+    finished_at: Any
+    error_code: str | None
+    error_message: str | None
 
 
 class BatchStatusReadRepository(Protocol):

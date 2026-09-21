@@ -27,8 +27,8 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.domain.production import (
     ProductionArtifactStage,
-    SubjectProductionStage,
-    SubjectProductionStatus,
+    ProductionRunStatus,
+    ProductionStage,
 )
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
@@ -240,7 +240,7 @@ async def _fresh_runtime(
 async def _reload(scenario: ProductionScenario) -> DurableState:
     assert scenario.run_id is not None
     async with scenario.uow_factory() as uow:
-        run = await uow.subject_production_runs.get(scenario.run_id)
+        run = await uow.production_runs.get(scenario.run_id)
         snapshot = await uow.production_input_snapshots.get_by_run(scenario.run_id)
         artifacts = tuple(await uow.production_artifacts.list_for_run(scenario.run_id))
         collections = tuple(await uow.source_collections.list_for_subject(scenario.subject.id))
@@ -320,7 +320,7 @@ async def test_restart_after_sources_reconstructs_the_pipeline(
     await scenario.start()
     assert await scenario.runner.run_next()
     before = await _reload(scenario)
-    assert before.run.current_stage is SubjectProductionStage.REFERENCES
+    assert before.run.current_stage is ProductionStage.REFERENCES
     assert all(item.state is CollectionState.ARCHIVED for item in before.collections)
     assert not [
         artifact
@@ -335,8 +335,8 @@ async def test_restart_after_sources_reconstructs_the_pipeline(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
-    assert after.run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert final.status is ProductionRunStatus.READY
+    assert after.run.current_stage is ProductionStage.ASSEMBLY
     assert _provider_stages(restarted.model) == [
         "references",
         "extraction",
@@ -368,7 +368,7 @@ async def test_restart_after_references_reads_the_persisted_artifact(
     )
     assert references.canonical_blob_id is not None
     references_payload = before.blobs[references.canonical_blob_id]
-    assert before.run.current_stage is SubjectProductionStage.EXTRACTION
+    assert before.run.current_stage is ProductionStage.EXTRACTION
 
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
         # Deliberately do not configure a References answer. A call would be
@@ -379,7 +379,7 @@ async def test_restart_after_references_reads_the_persisted_artifact(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert _provider_stages(restarted.model) == ["extraction", "extraction", "synthesis"]
     assert _provider_stages(restarted.model).count("references") == 0
     reloaded_references = next(
@@ -439,7 +439,7 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert _q2_provider_calls(restarted.model) == [(urls[2], "live_url")]
     assert _q2_provider_calls(scenario.model) == [(urls[0], "live_url"), (urls[1], "live_url")]
 
@@ -531,7 +531,7 @@ async def test_restart_between_live_unavailable_and_archive_fallback(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert _q2_provider_calls(restarted.model) == [
         (urls[0], "archive_fallback"),
         (urls[1], "live_url"),
@@ -558,7 +558,7 @@ async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
     await scenario.start()
     await _run_prefix(scenario, 4)
     before = await _reload(scenario)
-    assert before.run.current_stage is SubjectProductionStage.ASSEMBLY
+    assert before.run.current_stage is ProductionStage.ASSEMBLY
     synthesis = next(
         artifact
         for artifact in before.artifacts
@@ -574,7 +574,7 @@ async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert restarted.model.provider_calls == []
     reloaded_synthesis = next(
         artifact
@@ -601,9 +601,9 @@ async def test_restart_after_success_retries_only_browser_cleanup(
     async def crash_before_cleanup(
         orchestrator: ProductionWorkflowOrchestrator,
         run: Any,
-        stage: SubjectProductionStage,
+        stage: ProductionStage,
     ) -> None:
-        if stage is SubjectProductionStage.SYNTHESIS:
+        if stage is ProductionStage.SYNTHESIS:
             raise ProcessCrash("process lost before browser cleanup")
         await original_close(orchestrator, run, stage)
 
@@ -636,7 +636,7 @@ async def test_restart_after_success_retries_only_browser_cleanup(
         )
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert restarted.model.provider_calls == []
     assert before.run.references_conversation_id is not None
     assert browser.calls == [
@@ -670,7 +670,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     await scenario.start()
     run = await scenario.run_until_terminal()
     before = await _reload(scenario)
-    assert run.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert before.run.reconciliation is not None
     model_run_id = before.run.reconciliation.model_run_id
 
@@ -711,7 +711,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
 
     _assert_refetched(before, after)
     assert adopted["model_run_id"] == str(model_run_id)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert visible.previews == 2
     assert visible.releases == 1
     assert _q2_provider_calls(restarted.model) == []
@@ -748,7 +748,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     await scenario.start()
     await _run_prefix(scenario, 3)
     before = await _reload(scenario)
-    assert before.run.current_stage is SubjectProductionStage.SYNTHESIS
+    assert before.run.current_stage is ProductionStage.SYNTHESIS
     assert before.run.extraction_progress is not None
     assert {
         item["source_id"]: item["status"] for item in before.run.extraction_progress["sources"]
@@ -766,7 +766,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
         after = await _reload(restarted)
 
     _assert_refetched(before, after)
-    assert final.status is SubjectProductionStatus.READY
+    assert final.status is ProductionRunStatus.READY
     assert _q2_provider_calls(restarted.model) == []
     assert any(
         artifact.id == extraction_id and artifact.stage is ProductionArtifactStage.EXTRACTION

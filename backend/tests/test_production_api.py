@@ -7,12 +7,11 @@ offer a start button based on a 404, so these endpoints must answer 404 — neve
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import hashlib
 import json
-from collections.abc import AsyncIterator, Iterable, Sequence
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator, Sequence
+from datetime import UTC, date, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,22 +29,15 @@ from cti_app.application.production_parsers import technical_extraction_from_jso
 from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.application.production_reconciliation_resolver import ReconciliationOutcome
 from cti_app.application.production_state import (
-    ProductionStateSnapshotV1,
+    ProductionStateSnapshotV4,
     compute_production_state_checksum,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
-from cti_app.domain.discovery import SourceRelationshipStatus
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import EditionStatus
-from cti_app.domain.editorial import (
-    CandidateReference,
-    EditorialGroup,
-    EditorialGroupStatus,
-    EditorialScore,
-    GroupingConfidence,
-    GroupingOutcome,
-)
 from cti_app.domain.entities import Subject
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -59,43 +51,14 @@ from cti_app.domain.production import (
     ProductionBatchPhase,
     ProductionBatchStatus,
     ProductionReuseInvalidation,
+    ProductionRun,
+    ProductionRunStatus,
+    ProductionStage,
     ProductionSubmissionReconciliation,
-    SubjectProductionRun,
-    SubjectProductionStage,
-    SubjectProductionStatus,
 )
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
-
-
-def _score() -> EditorialScore:
-    return EditorialScore(
-        impact=3,
-        novelty=3,
-        technical_depth=3,
-        hunting_potential=3,
-        actionability=3,
-        source_quality=3,
-        justifications={},
-    )
-
-
-def _group(edition_id: UUID, title: str, subject_id: UUID) -> EditorialGroup:
-    group = EditorialGroup(
-        edition_id=edition_id,
-        title=title,
-        candidate_references=(CandidateReference(uuid4(), uuid4()),),
-        outcome=GroupingOutcome.NEW_SUBJECT,
-        score=_score(),
-        source_relationship_status=SourceRelationshipStatus.PROVISIONAL,
-        needs_source_verification=False,
-        needs_source_expansion=False,
-        grouping_confidence=GroupingConfidence.HIGH,
-        grouping_justification="test",
-    )
-    group.select(subject_id)
-    return group
 
 
 def _origin(edition_id: UUID, subject_id: UUID) -> SubjectDiscoveryOrigin:
@@ -113,12 +76,6 @@ class _Origins:
     def __init__(self) -> None:
         self.items: list[SubjectDiscoveryOrigin] = []
 
-    def ensure_for_group(self, group: EditorialGroup) -> None:
-        if group.subject_id is not None and not any(
-            origin.subject_id == group.subject_id for origin in self.items
-        ):
-            self.items.append(_origin(group.edition_id, group.subject_id))
-
     async def add(self, origin: SubjectDiscoveryOrigin) -> None:
         self.items.append(origin)
 
@@ -129,63 +86,24 @@ class _Origins:
         return [origin for origin in self.items if origin.edition_id == edition_id]
 
 
-class _Groups:
-    def __init__(
-        self,
-        groups: list[EditorialGroup],
-        subjects: _Subjects,
-        origins: _Origins,
-    ) -> None:
-        self._groups = _GroupList(groups, subjects, origins)
-
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[EditorialGroup]:
-        return [g for g in self._groups if g.edition_id == edition_id]
-
-    async def get_by_subject(self, subject_id: UUID) -> EditorialGroup | None:
-        return next((g for g in self._groups if g.subject_id == subject_id), None)
-
-
 class _Subjects:
     def __init__(self) -> None:
         self.items: dict[UUID, Subject] = {}
 
-    def add_for_group(self, group: EditorialGroup) -> None:
-        if group.subject_id is None or group.subject_id in self.items:
-            return
-        self.items[group.subject_id] = Subject(
-            id=group.subject_id,
-            edition_id=group.edition_id,
-            title=group.title,
-            slug=f"subject-{group.subject_id.hex}",
-            tlp=TLP.AMBER,
+    def add(self, edition_id: UUID, title: str, subject_id: UUID) -> None:
+        self.items.setdefault(
+            subject_id,
+            Subject(
+                id=subject_id,
+                edition_id=edition_id,
+                title=title,
+                slug=f"subject-{subject_id.hex}",
+                tlp=TLP.AMBER,
+            ),
         )
 
     async def get(self, subject_id: UUID) -> Subject | None:
         return self.items.get(subject_id)
-
-
-class _GroupList(list[EditorialGroup]):
-    def __init__(
-        self,
-        groups: list[EditorialGroup],
-        subjects: _Subjects,
-        origins: _Origins,
-    ) -> None:
-        super().__init__(groups)
-        self._subjects = subjects
-        self._origins = origins
-        for group in groups:
-            subjects.add_for_group(group)
-            origins.ensure_for_group(group)
-
-    def append(self, group: EditorialGroup) -> None:
-        super().append(group)
-        self._subjects.add_for_group(group)
-        self._origins.ensure_for_group(group)
-
-    def extend(self, groups: Iterable[EditorialGroup]) -> None:
-        for group in groups:
-            self.append(group)
 
 
 class _Edition:
@@ -226,30 +144,85 @@ class _Audit:
         self.events.append(event)
 
 
-class _DiscoveryBatches:
-    def __init__(self, groups: Sequence[EditorialGroup]) -> None:
-        # Tests that need a batch attached to another edition than the selected
-        # group substitute stand-ins exposing only the two fields read below.
-        self.groups: Sequence[Any] = groups
+class _DiscoveryLineage:
+    """The Discovery identity, snapshot and candidates a run freezes.
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[SimpleNamespace]:
-        return [
-            SimpleNamespace(
-                id=reference.batch_id,
-                candidates=[
+    Production resolves its inputs through `SubjectDiscoveryOrigin` and the
+    active snapshot, so the fakes model that chain instead of the batches the
+    old editorial projection used to walk.
+    """
+
+    def __init__(self) -> None:
+        self.canonical_ids: dict[UUID, UUID] = {}
+        self.candidates: dict[UUID, list[SimpleNamespace]] = {}
+        self.snapshots: dict[UUID, SimpleNamespace] = {}
+
+    def register(self, edition_id: UUID, discovery_subject_id: UUID) -> UUID:
+        """Add one canonical discovery subject with a single member candidate."""
+        self.canonical_ids[discovery_subject_id] = discovery_subject_id
+        candidate_id = uuid4()
+        candidate = SimpleNamespace(
+            id=candidate_id,
+            discovery_batch_id=uuid4(),
+            actor_or_campaign="Campaign X",
+            evidence=SimpleNamespace(
+                actors=("Actor Y",),
+                campaigns=(),
+                sources=(
                     SimpleNamespace(
-                        id=reference.candidate_id,
-                        sources=[],
-                        actors=(),
-                        campaigns=(),
-                        actor_or_campaign="unknown",
-                    )
-                ],
-            )
-            for group in self.groups
-            if group.edition_id == edition_id
-            for reference in group.candidate_references
-        ]
+                        id=uuid4(),
+                        canonical_url=f"https://example.test/{candidate_id.hex}",
+                        role=SourceRole.PRIMARY,
+                        title="Candidate source",
+                        publisher="Publisher",
+                        published_at=date(2026, 8, 2),
+                        tlp=TLP.CLEAR,
+                        sensitivity="public",
+                        external_llm_allowed=True,
+                    ),
+                ),
+            ),
+        )
+        self.candidates.setdefault(edition_id, []).append(candidate)
+        snapshot = self.snapshots.get(edition_id)
+        entry = SimpleNamespace(
+            subject_id=discovery_subject_id,
+            member_references=(SimpleNamespace(candidate_id=candidate_id),),
+            candidate=SimpleNamespace(summary="Résumé Discovery"),
+        )
+        subjects = (*snapshot.subjects, entry) if snapshot is not None else (entry,)
+        self.snapshots[edition_id] = SimpleNamespace(
+            id=snapshot.id if snapshot is not None else uuid4(),
+            version=7,
+            subjects=subjects,
+        )
+        return candidate_id
+
+
+class _DiscoverySubjectIdentities:
+    def __init__(self, lineage: _DiscoveryLineage) -> None:
+        self._lineage = lineage
+
+    async def resolve_canonical_subject(self, subject_id: UUID) -> UUID:
+        return self._lineage.canonical_ids.get(subject_id, subject_id)
+
+
+class _DiscoverySnapshots:
+    def __init__(self, lineage: _DiscoveryLineage) -> None:
+        self._lineage = lineage
+
+    async def get_active(self, edition_id: UUID) -> SimpleNamespace | None:
+        return self._lineage.snapshots.get(edition_id)
+
+
+class _DiscoveryCandidates:
+    def __init__(self, lineage: _DiscoveryLineage) -> None:
+        self._lineage = lineage
+
+    async def list_for_edition(
+        self, edition_id: UUID, include_replaced: bool = False
+    ) -> Sequence[SimpleNamespace]:
+        return list(self._lineage.candidates.get(edition_id, []))
 
 
 class _Snapshots:
@@ -265,15 +238,15 @@ class _Snapshots:
 
 class _Runs:
     def __init__(self) -> None:
-        self.items: dict[UUID, SubjectProductionRun] = {}
+        self.items: dict[UUID, ProductionRun] = {}
 
-    async def add(self, run: SubjectProductionRun) -> None:
+    async def add(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def get(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get(self, run_id: UUID) -> ProductionRun | None:
         return self.items.get(run_id)
 
-    async def get_for_update(self, run_id: UUID) -> SubjectProductionRun | None:
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
         # A real SQL repository reloads a distinct object on every fetch;
         # returning the exact same reference here would let a caller that
         # merely mutates in place look correct by accident. `replace` detaches
@@ -281,16 +254,16 @@ class _Runs:
         run = self.items.get(run_id)
         return dataclasses.replace(run) if run is not None else None
 
-    async def save(self, run: SubjectProductionRun) -> None:
+    async def save(self, run: ProductionRun) -> None:
         self.items[run.id] = run
 
-    async def get_current_for_subject(self, subject_id: UUID) -> SubjectProductionRun | None:
+    async def get_current_for_subject(self, subject_id: UUID) -> ProductionRun | None:
         # Mirrors the real repository: most recently created run wins, not
         # insertion order — a retry's new run must shadow the old one.
         matches = [r for r in self.items.values() if r.subject_id == subject_id]
         return max(matches, key=lambda r: r.created_at) if matches else None
 
-    async def list_for_edition(self, edition_id: UUID) -> Sequence[SubjectProductionRun]:
+    async def list_for_edition(self, edition_id: UUID) -> Sequence[ProductionRun]:
         return [r for r in self.items.values() if r.edition_id == edition_id]
 
 
@@ -303,6 +276,18 @@ class _Batches:
 
     async def get(self, batch_id: UUID) -> EditionProductionBatch | None:
         return self.items.get(batch_id)
+
+    async def get_by_idempotency_key(
+        self, edition_id: UUID, idempotency_key: str
+    ) -> EditionProductionBatch | None:
+        return next(
+            (
+                batch
+                for batch in self.items.values()
+                if batch.edition_id == edition_id and batch.idempotency_key == idempotency_key
+            ),
+            None,
+        )
 
     async def get_for_update(self, batch_id: UUID) -> EditionProductionBatch | None:
         return self.items.get(batch_id)
@@ -354,7 +339,7 @@ class _BatchStatusReadModel:
             for item in self._uow.edition_production_batch_items.items
             if item.batch_id == batch_id
         ]
-        runs = self._uow.subject_production_runs.items
+        runs = self._uow.production_runs.items
         subjects = self._uow.subjects.items
         result: list[BatchStatusItem] = []
         for item in items:
@@ -501,13 +486,15 @@ class _ReuseInvalidations:
 class _Uow:
     """Single shared in-memory unit of work; commit is a no-op."""
 
-    def __init__(self, groups: list[EditorialGroup]) -> None:
+    def __init__(self) -> None:
         self.subjects = _Subjects()
         self.subject_discovery_origins = _Origins()
-        self.editorial_groups = _Groups(groups, self.subjects, self.subject_discovery_origins)
         self.editions = _Editions()
-        self.discovery_batches = _DiscoveryBatches(self.editorial_groups._groups)
-        self.subject_production_runs = _Runs()
+        self.discovery_lineage = _DiscoveryLineage()
+        self.discovery_subject_identities = _DiscoverySubjectIdentities(self.discovery_lineage)
+        self.discovery_snapshots = _DiscoverySnapshots(self.discovery_lineage)
+        self.discovery_candidates = _DiscoveryCandidates(self.discovery_lineage)
+        self.production_runs = _Runs()
         self.production_input_snapshots = _Snapshots()
         self.edition_production_batches = _Batches()
         self.edition_production_batch_items = _BatchItems()
@@ -535,15 +522,26 @@ class _Uow:
 class _Job:
     def __init__(self) -> None:
         self.id = uuid4()
+        self.status = JobStatus.QUEUED
 
 
 class _Jobs:
     def __init__(self) -> None:
         self.submitted: list[dict[str, Any]] = []
+        self.jobs_by_key: dict[str, _Job] = {}
+        self.fail_before_submit = False
 
     async def submit(self, **kwargs: Any) -> _Job:
+        if self.fail_before_submit:
+            self.fail_before_submit = False
+            raise RuntimeError("crash before job submit")
+        existing = self.jobs_by_key.get(kwargs["idempotency_key"])
+        if existing is not None:
+            return existing
+        job = _Job()
         self.submitted.append(kwargs)
-        return _Job()
+        self.jobs_by_key[kwargs["idempotency_key"]] = job
+        return job
 
 
 class _TrackedJob:
@@ -551,11 +549,11 @@ class _TrackedJob:
         self.id = uuid4()
         self.subject_id = subject_id
         self.input_parameters = {"run_id": str(run_id)}
-        self.status = "running"
+        self.status = JobStatus.QUEUED
 
     @property
     def is_terminal(self) -> bool:
-        return self.status == "cancelled"
+        return self.status is JobStatus.CANCELLED
 
 
 class _CancelableJobs:
@@ -582,7 +580,7 @@ class _CancelableJobs:
     async def cancel(self, job_id: UUID, *, actor_id: str = "system") -> _TrackedJob:
         del actor_id
         job = next(job for job in self.jobs if job.id == job_id)
-        job.status = "cancelled"
+        job.status = JobStatus.CANCELLED
         self.cancelled.append(job.id)
         return job
 
@@ -591,8 +589,14 @@ class _Dispatcher:
     def __init__(self) -> None:
         self.dispatched: list[UUID] = []
         self.delays: list[int] = []
+        self.fail_before_dispatch = False
 
     async def dispatch(self, job_id: UUID, *, delay_ms: int = 0) -> None:
+        if self.fail_before_dispatch:
+            self.fail_before_dispatch = False
+            raise RuntimeError("crash before dispatch")
+        if job_id in self.dispatched:
+            return
         self.dispatched.append(job_id)
         self.delays.append(delay_ms)
 
@@ -602,15 +606,6 @@ class _FailingModel:
 
     def __getattr__(self, name: str) -> object:
         raise AssertionError(f"model must not be called during state import: {name}")
-
-
-class _LegacyEditorialProjection:
-    def __init__(self) -> None:
-        self.editions: list[UUID] = []
-
-    async def synchronize(self, edition_id: UUID) -> list[EditorialGroup]:
-        self.editions.append(edition_id)
-        return []
 
 
 class _Bridge404:
@@ -663,7 +658,14 @@ class _ArtifactStore:
 
 @pytest.fixture
 def uow() -> _Uow:
-    return _Uow([])
+    return _Uow()
+
+
+def _select(uow: _Uow, edition_id: UUID, title: str, subject_id: UUID) -> None:
+    uow.subjects.add(edition_id, title, subject_id)
+    origin = _origin(edition_id, subject_id)
+    uow.subject_discovery_origins.items.append(origin)
+    uow.discovery_lineage.register(edition_id, origin.discovery_subject_id)
 
 
 @pytest.fixture
@@ -678,7 +680,6 @@ def production_app(uow: _Uow) -> FastAPI:
     application.state.production_artifact_store = _ArtifactStore()
     application.state.model_service = _FailingModel()
     application.state.model_gateway = _FailingModel()
-    application.state.legacy_editorial_projection_service = _LegacyEditorialProjection()
     return application
 
 
@@ -688,6 +689,20 @@ async def api(production_app: FastAPI) -> AsyncIterator[AsyncClient]:
         transport=ASGITransport(app=production_app), base_url="http://test"
     ) as client:
         yield client
+
+
+async def _start_batch(
+    api: AsyncClient,
+    edition_id: UUID,
+    subject_ids: Sequence[UUID],
+    *,
+    idempotency_key: str = "production-test-batch",
+) -> Any:
+    return await api.post(
+        f"/api/editions/{edition_id}/production/batches",
+        headers={"Idempotency-Key": idempotency_key},
+        json={"subject_ids": [str(subject_id) for subject_id in subject_ids]},
+    )
 
 
 async def test_get_subject_production_without_run_returns_404(api: AsyncClient) -> None:
@@ -701,7 +716,7 @@ async def test_get_subject_production_without_run_returns_404(api: AsyncClient) 
 async def test_get_edition_production_without_batch_returns_404(api: AsyncClient) -> None:
     response = await api.get(f"/api/editions/{uuid4()}/production")
 
-    assert response.status_code == 404
+    assert response.status_code == 200
     assert response.status_code != 422
 
 
@@ -716,10 +731,8 @@ async def test_invalidate_reuse_without_run_returns_404(api: AsyncClient) -> Non
 
 async def test_invalidate_reuse_rejects_active_run(api: AsyncClient, uow: _Uow) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Active", subject_id))
-    await uow.subject_production_runs.add(
-        SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
-    )
+    _select(uow, edition_id, "Active", subject_id)
+    await uow.production_runs.add(ProductionRun(subject_id=subject_id, edition_id=edition_id))
 
     response = await api.post(
         f"/api/subjects/{subject_id}/production/reuse/invalidate",
@@ -735,9 +748,9 @@ async def test_invalidate_reuse_rejects_non_costly_stage(
     api: AsyncClient, uow: _Uow, from_stage: str
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Rejected", subject_id))
-    await uow.subject_production_runs.add(
-        _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
+    _select(uow, edition_id, "Rejected", subject_id)
+    await uow.production_runs.add(
+        _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
     )
 
     response = await api.post(
@@ -758,9 +771,9 @@ async def test_invalidate_reuse_persists_identity_from_provider(
     from_stage: str,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Accepted", subject_id))
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    _select(uow, edition_id, "Accepted", subject_id)
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
     production_app.state.identity_provider = LocalIdentityProvider("provider-user")
 
     response = await api.post(
@@ -781,32 +794,15 @@ async def test_invalidate_reuse_persists_identity_from_provider(
     assert invalidation.occurred_at.tzinfo is not None
 
 
-async def test_start_subject_production_needs_no_edition_id(api: AsyncClient, uow: _Uow) -> None:
-    """The subject page only knows the subject id; the edition is resolved server-side."""
-    group_edition_id = uuid4()
-    subject_edition_id = uuid4()
+async def test_subject_production_has_no_start_endpoint(api: AsyncClient, uow: _Uow) -> None:
+    """Starting a single subject goes through the edition batch primitive only."""
+    edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(group_edition_id, "TAG-182", subject_id))
-    uow.subjects.items[subject_id] = dataclasses.replace(
-        uow.subjects.items[subject_id], edition_id=subject_edition_id
-    )
-    uow.subject_discovery_origins.items[0] = dataclasses.replace(
-        uow.subject_discovery_origins.items[0], edition_id=subject_edition_id
-    )
-    uow.discovery_batches.groups = [
-        SimpleNamespace(
-            edition_id=subject_edition_id,
-            candidate_references=uow.editorial_groups._groups[-1].candidate_references,
-        )
-    ]
+    _select(uow, edition_id, "TAG-182", subject_id)
 
     response = await api.post(f"/api/subjects/{subject_id}/production", json={})
 
-    assert response.status_code == 200, response.text
-    assert response.json()["edition_id"] == str(subject_edition_id)
-    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
-    assert run is not None
-    assert run.edition_id == subject_edition_id
+    assert response.status_code == 405, response.text
 
 
 async def test_start_subject_production_ignores_spoofed_user_query_parameter(
@@ -814,12 +810,13 @@ async def test_start_subject_production_ignores_spoofed_user_query_parameter(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Identity", subject_id))
+    _select(uow, edition_id, "Identity", subject_id)
     production_app.state.identity_provider = LocalIdentityProvider("real-user")
 
     response = await api.post(
-        f"/api/subjects/{subject_id}/production?user=administrator",
-        json={},
+        f"/api/editions/{edition_id}/production/batches?user=administrator",
+        headers={"Idempotency-Key": "identity-test"},
+        json={"subject_ids": [str(subject_id)]},
     )
 
     assert response.status_code == 200, response.text
@@ -835,14 +832,14 @@ async def test_start_subject_production_returns_the_run_actually_started(
     so this only passes if the API keeps the object start_run() returns."""
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["status"] == "running"
-    assert body["stage"] == "sources"
+    run = next(iter(uow.production_runs.items.values()))
+    assert run.status is ProductionRunStatus.RUNNING
+    assert run.current_stage is ProductionStage.SOURCES
 
     jobs = production_app.state.job_service
     sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
@@ -860,23 +857,23 @@ async def test_start_subject_production_rejects_archived_edition_without_mutatio
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Archived", subject_id))
+    _select(uow, edition_id, "Archived", subject_id)
     edition = await uow.editions.get(edition_id)
     edition.state = EditionStatus.ARCHIVED
     version = edition.version
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "edition_archived"
-    assert uow.subject_production_runs.items == {}
+    assert response.json()["detail"]["code"] == "production_edition_archived"
+    assert uow.production_runs.items == {}
     assert production_app.state.job_service.submitted == []
     assert production_app.state.job_dispatcher.dispatched == []
     assert edition.state is EditionStatus.ARCHIVED
     assert edition.version == version
 
 
-async def test_archive_winning_final_standalone_dispatch_fence_submits_nothing(
+async def test_archive_winning_batch_dispatch_fence_submits_nothing(
     api: AsyncClient,
     uow: _Uow,
     production_app: FastAPI,
@@ -884,35 +881,23 @@ async def test_archive_winning_final_standalone_dispatch_fence_submits_nothing(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Race", subject_id))
+    _select(uow, edition_id, "Race", subject_id)
     edition = await uow.editions.get(edition_id)
-    final_fence_entered = asyncio.Event()
-    archive_committed = asyncio.Event()
-    original_get_for_update = uow.editions.get_for_update
-    calls = 0
 
-    async def gated_get_for_update(locked_edition_id: UUID) -> _Edition:
-        nonlocal calls
-        calls += 1
-        locked = await original_get_for_update(locked_edition_id)
-        if calls == 3:
-            final_fence_entered.set()
-            await archive_committed.wait()
-        return locked
-
-    monkeypatch.setattr(uow.editions, "get_for_update", gated_get_for_update)
-
-    async def archive_after_final_fence_entry() -> None:
-        await final_fence_entered.wait()
+    async def archive_before_dispatch(
+        _uow_factory: Any,
+        _run_id: UUID,
+        *,
+        batch_id: UUID | None = None,
+    ) -> bool:
+        del _uow_factory, _run_id, batch_id
         edition.state = EditionStatus.ARCHIVED
-        archive_committed.set()
+        return False
 
-    archive_task = asyncio.create_task(archive_after_final_fence_entry())
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
-    await archive_task
+    monkeypatch.setattr(production_api, "_production_run_can_dispatch", archive_before_dispatch)
+    response = await _start_batch(api, edition_id, [subject_id])
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "edition_archived"
+    assert response.status_code == 200, response.text
     assert production_app.state.job_service.submitted == []
     assert production_app.state.job_dispatcher.dispatched == []
     assert edition.state is EditionStatus.ARCHIVED
@@ -925,11 +910,11 @@ async def test_standalone_cancellation_exposes_archived_conflict_without_mutatio
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Cancel archived", subject_id))
+    _select(uow, edition_id, "Cancel archived", subject_id)
 
-    started = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
-    run_id = UUID(started.json()["run_id"])
+    run_id = next(iter(uow.production_runs.items))
     edition = await uow.editions.get(edition_id)
     edition.state = EditionStatus.ARCHIVED
     version = edition.version
@@ -937,8 +922,8 @@ async def test_standalone_cancellation_exposes_archived_conflict_without_mutatio
     response = await api.post(f"/api/subjects/{subject_id}/production/cancel")
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "edition_archived"
-    assert uow.subject_production_runs.items[run_id].status is SubjectProductionStatus.RUNNING
+    assert response.json()["detail"]["code"] == "production_edition_archived"
+    assert uow.production_runs.items[run_id].status is ProductionRunStatus.RUNNING
     assert edition.state is EditionStatus.ARCHIVED
     assert edition.version == version
     assert len(production_app.state.job_service.submitted) == 1
@@ -949,11 +934,9 @@ async def test_start_subject_production_ignores_legacy_group_status(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    group = _group(edition_id, "Cavern", subject_id)
-    group.status = EditorialGroupStatus.PROPOSED
-    uow.editorial_groups._groups.append(group)
+    _select(uow, edition_id, "Cavern", subject_id)
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 200, response.text
 
@@ -964,11 +947,9 @@ async def test_start_edition_uses_subject_origins_for_eligibility(
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        group = _group(edition_id, name, subject_id)
-        group.status = EditorialGroupStatus.PROPOSED
-        uow.editorial_groups._groups.append(group)
+        _select(uow, edition_id, name, subject_id)
 
-    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+    response = await _start_batch(api, edition_id, subjects)
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 3
@@ -982,26 +963,26 @@ async def test_selected_legacy_group_without_origin_is_not_eligible(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Legacy only", subject_id))
+    _select(uow, edition_id, "Legacy only", subject_id)
     uow.subject_discovery_origins.items.clear()
 
-    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
-    assert response.status_code == 400
-    assert response.json()["detail"] == "No selected Subjects found for edition"
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "production_subject_discovery_origin_missing"
 
 
 async def test_start_edition_rejects_an_archived_edition(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
     edition = await uow.editions.get(edition_id)
     edition.state = EditionStatus.ARCHIVED
     version = edition.version
 
-    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
-    assert response.status_code == 400
+    assert response.status_code == 409
     assert not uow.edition_production_batches.items
     assert edition.state is EditionStatus.ARCHIVED
     assert edition.version == version
@@ -1011,17 +992,14 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     uow.subject_discovery_origins.items[:] = [
         uow.subject_discovery_origins.items[2],
         uow.subject_discovery_origins.items[0],
         uow.subject_discovery_origins.items[1],
     ]
 
-    response = await api.post(
-        f"/api/editions/{edition_id}/production",
-        json={"subject_ids": [str(subjects[0]), str(subjects[2])]},
-    )
+    response = await _start_batch(api, edition_id, [subjects[0], subjects[2]])
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 2
@@ -1030,7 +1008,7 @@ async def test_start_edition_honours_subject_selection(api: AsyncClient, uow: _U
         item.subject_id
         for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     ]
-    assert produced == [subjects[2], subjects[0]]
+    assert produced == [subjects[0], subjects[2]]
 
 
 async def test_start_edition_rejects_explicit_empty_subject_selection(
@@ -1038,14 +1016,15 @@ async def test_start_edition_rejects_explicit_empty_subject_selection(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
 
     response = await api.post(
-        f"/api/editions/{edition_id}/production",
+        f"/api/editions/{edition_id}/production/batches",
+        headers={"Idempotency-Key": "empty-selection"},
         json={"subject_ids": []},
     )
 
-    assert response.status_code == 400
+    assert response.status_code == 422
     assert not uow.edition_production_batches.items
     assert (await uow.editions.get(edition_id)).state is EditionStatus.OPEN
 
@@ -1053,13 +1032,13 @@ async def test_start_edition_rejects_explicit_empty_subject_selection(
 async def test_start_subject_requires_subject_discovery_origin(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Legacy only", subject_id))
+    _select(uow, edition_id, "Legacy only", subject_id)
     uow.subject_discovery_origins.items.clear()
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 409
-    assert response.json()["detail"] == "Subject has no discovery origin"
+    assert response.json()["detail"]["code"] == "production_subject_discovery_origin_missing"
 
 
 async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chosen_subset(
@@ -1075,12 +1054,9 @@ async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chos
         (subject_a, subject_b, subject_c, subject_d),
         strict=True,
     ):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
 
-    response = await api.post(
-        f"/api/editions/{edition_id}/production",
-        json={"subject_ids": [str(subject_b), str(subject_d)]},
-    )
+    response = await _start_batch(api, edition_id, [subject_b, subject_d])
 
     assert response.status_code == 200, response.text
     assert response.json()["items"] == 2
@@ -1089,7 +1065,7 @@ async def test_start_edition_with_more_eligible_than_selected_runs_only_the_chos
     assert [item.subject_id for item in items] == [subject_b, subject_d]
     assert [item.position for item in items] == [1, 2]
 
-    produced_subjects = {run.subject_id for run in uow.subject_production_runs.items.values()}
+    produced_subjects = {run.subject_id for run in uow.production_runs.items.values()}
     assert produced_subjects == {subject_b, subject_d}
     assert subject_a not in produced_subjects
     assert subject_c not in produced_subjects
@@ -1105,9 +1081,9 @@ async def test_start_edition_submits_sources_job_with_standard_retry_policy(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
 
-    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 200, response.text
     jobs = production_app.state.job_service
@@ -1116,13 +1092,79 @@ async def test_start_edition_submits_sources_job_with_standard_retry_policy(
     assert sources_jobs[0]["max_attempts"] == 3
 
 
+async def test_batch_replay_repairs_crash_after_run_promotion_before_job_submit(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    _select(uow, edition_id, "Replay before submit", subject_id)
+    jobs = production_app.state.job_service
+    jobs.fail_before_submit = True
+
+    with pytest.raises(RuntimeError, match="crash before job submit"):
+        await _start_batch(api, edition_id, [subject_id], idempotency_key="replay-before-submit")
+
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    run = next(iter(uow.production_runs.items.values()))
+    assert run.status is ProductionRunStatus.RUNNING
+    assert jobs.submitted == []
+    assert production_app.state.job_dispatcher.dispatched == []
+
+    replay = await _start_batch(
+        api, edition_id, [subject_id], idempotency_key="replay-before-submit"
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["batch_id"] == str(batch.id)
+    assert len(uow.production_runs.items) == 1
+    assert len(jobs.submitted) == 1
+    assert jobs.submitted[0]["input_parameters"]["run_id"] == str(run.id)
+    assert len(production_app.state.job_dispatcher.dispatched) == 1
+
+
+async def test_batch_replay_repairs_crash_after_job_submit_before_dispatch(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    _select(uow, edition_id, "Replay before dispatch", subject_id)
+    dispatcher = production_app.state.job_dispatcher
+    dispatcher.fail_before_dispatch = True
+
+    with pytest.raises(RuntimeError, match="crash before dispatch"):
+        await _start_batch(api, edition_id, [subject_id], idempotency_key="replay-before-dispatch")
+
+    batch = next(iter(uow.edition_production_batches.items.values()))
+    run = next(iter(uow.production_runs.items.values()))
+    jobs = production_app.state.job_service
+    job = jobs.jobs_by_key[f"production-sources-{run.id}-g0"]
+    assert run.status is ProductionRunStatus.RUNNING
+    assert len(jobs.submitted) == 1
+    assert dispatcher.dispatched == []
+
+    replay = await _start_batch(
+        api, edition_id, [subject_id], idempotency_key="replay-before-dispatch"
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["batch_id"] == str(batch.id)
+    assert len(uow.production_runs.items) == 1
+    assert len(jobs.submitted) == 1
+    assert jobs.jobs_by_key[f"production-sources-{run.id}-g0"].id == job.id
+    assert dispatcher.dispatched == [job.id]
+
+
 async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     api: AsyncClient, uow: _Uow
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
 
     batch = next(iter(uow.edition_production_batches.items.values()))
@@ -1130,13 +1172,13 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     batch.next_dispatch_at = datetime.now(UTC)
     item = uow.edition_production_batch_items.items[0]
     item.auto_recovery_count = 1
-    run = uow.subject_production_runs.items[item.production_run_id]
+    run = uow.production_runs.items[item.production_run_id]
     run.pipeline_generation = 2
     run.mark_failed(code="bridge_timeout", message="bridge stopped")
 
     response = await api.get(f"/api/editions/{edition_id}/production")
     assert response.status_code == 200, response.text
-    body = response.json()
+    body = response.json()["active_batch"]
     assert body["phase"] == "recovery"
     assert body["next_dispatch_at"] is not None
     assert body["item_details"][0]["auto_recovery_count"] == 1
@@ -1151,11 +1193,11 @@ async def test_subject_and_batch_status_expose_extraction_progress(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
 
-    run = uow.subject_production_runs.items[next(iter(uow.subject_production_runs.items))]
+    run = uow.production_runs.items[next(iter(uow.production_runs.items))]
     progress = {
         "total_sources": 1,
         "completed_sources": 0,
@@ -1194,7 +1236,9 @@ async def test_subject_and_batch_status_expose_extraction_progress(
     assert subject_response.status_code == 200, subject_response.text
     assert subject_response.json()["extraction_progress"] == progress
     assert batch_response.status_code == 200, batch_response.text
-    assert batch_response.json()["item_details"][0]["extraction_progress"] == progress
+    assert (
+        batch_response.json()["active_batch"]["item_details"][0]["extraction_progress"] == progress
+    )
 
 
 async def test_subject_status_exposes_extraction_rejections_with_a_200_entry_limit(
@@ -1202,11 +1246,11 @@ async def test_subject_status_exposes_extraction_rejections_with_a_200_entry_lim
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
 
-    run = uow.subject_production_runs.items[next(iter(uow.subject_production_runs.items))]
+    run = uow.production_runs.items[next(iter(uow.production_runs.items))]
     rejections: list[dict[str, Any]] = [
         {
             "source_id": "S3",
@@ -1265,14 +1309,14 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     uow.subjects.items[subjects[2]].title = "Canonical subject title C"
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     uow.batch_status_read_model.calls = 0
     batch_items = uow.edition_production_batch_items.items
-    first_run = uow.subject_production_runs.items[batch_items[0].production_run_id]
+    first_run = uow.production_runs.items[batch_items[0].production_run_id]
     first_run.pipeline_generation = 3
     uow.batch_status_read_model.snapshots[first_run.id] = SimpleNamespace(
         subject_title="Snapshot title"
@@ -1281,7 +1325,7 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
     response = await api.get(f"/api/editions/{edition_id}/production")
 
     assert response.status_code == 200, response.text
-    details = response.json()["item_details"]
+    details = response.json()["active_batch"]["item_details"]
     assert [detail["position"] for detail in details] == [1, 2, 3]
     assert details[0]["title"] == "Snapshot title"
     assert details[2]["title"] == "Canonical subject title C"
@@ -1291,10 +1335,10 @@ async def test_batch_status_read_model_returns_set_based_rows_and_snapshot_title
 
 async def test_subject_status_uses_current_subject_title(api: AsyncClient, uow: _Uow) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Editorial group title", subject_id))
+    _select(uow, edition_id, "Canonical subject title", subject_id)
     uow.subjects.items[subject_id].title = "Canonical subject title"
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
     await uow.production_input_snapshots.add(
         SimpleNamespace(
             production_run_id=run.id,
@@ -1312,12 +1356,9 @@ async def test_subject_status_uses_current_subject_title(api: AsyncClient, uow: 
 async def test_start_edition_rejects_unselected_subject(api: AsyncClient, uow: _Uow) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
 
-    response = await api.post(
-        f"/api/editions/{edition_id}/production",
-        json={"subject_ids": [str(uuid4())]},
-    )
+    response = await _start_batch(api, edition_id, [uuid4()])
 
     assert response.status_code == 409
 
@@ -1327,21 +1368,21 @@ async def test_batch_creates_exactly_one_run_per_subject(api: AsyncClient, uow: 
     edition_id = uuid4()
     subjects = [uuid4() for _ in range(3)]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
 
-    response = await api.post(f"/api/editions/{edition_id}/production", json={})
+    response = await _start_batch(api, edition_id, subjects)
 
     assert response.status_code == 200, response.text
-    assert len(uow.subject_production_runs.items) == 3
+    assert len(uow.production_runs.items) == 3
 
     # Every batch item must point at a run that actually exists.
     linked = {item.production_run_id for item in uow.edition_production_batch_items.items}
-    assert linked == set(uow.subject_production_runs.items)
+    assert linked == set(uow.production_runs.items)
 
     running = [
         run
-        for run in uow.subject_production_runs.items.values()
-        if run.status is SubjectProductionStatus.RUNNING
+        for run in uow.production_runs.items.values()
+        if run.status is ProductionRunStatus.RUNNING
     ]
     assert len(running) == 1
 
@@ -1352,53 +1393,50 @@ async def test_second_start_while_running_does_not_reprompt(
     """A duplicate POST must not start the run again nor submit a second job."""
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
 
-    first = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    first = await _start_batch(api, edition_id, [subject_id])
     assert first.status_code == 200, first.text
 
     jobs = production_app.state.job_service
     submitted_after_first = len(jobs.submitted)
 
-    second = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    second = await _start_batch(api, edition_id, [subject_id])
 
     assert second.status_code == 200, second.text
-    assert second.json()["run_id"] == first.json()["run_id"]
-    assert second.json()["job_id"] is None
+    assert second.json()["batch_id"] == first.json()["batch_id"]
     assert len(jobs.submitted) == submitted_after_first
-    assert len(uow.subject_production_runs.items) == 1
+    assert len(uow.production_runs.items) == 1
 
 
 def _terminal_run(
     edition_id: UUID,
     subject_id: UUID,
     *,
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
     run_number: int = 1,
-) -> SubjectProductionRun:
-    run = SubjectProductionRun(
+) -> ProductionRun:
+    run = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
         run_number=run_number,
     )
     run.start_running()
-    if status is SubjectProductionStatus.FAILED:
+    if status is ProductionRunStatus.FAILED:
         run.mark_failed(code="model_gateway_error", message="Model run needs reconciliation")
-    elif status is SubjectProductionStatus.NEEDS_REVIEW:
+    elif status is ProductionRunStatus.NEEDS_REVIEW:
         run.mark_needs_review(code="no_model_response", message="No response from model")
     else:  # pragma: no cover - guard against a bad call in a future edit
         raise AssertionError(f"Unsupported terminal status for this helper: {status}")
     return run
 
 
-@pytest.mark.parametrize(
-    "status", (SubjectProductionStatus.FAILED, SubjectProductionStatus.NEEDS_REVIEW)
-)
+@pytest.mark.parametrize("status", (ProductionRunStatus.FAILED, ProductionRunStatus.NEEDS_REVIEW))
 async def test_start_production_after_failure_creates_a_new_run(
     api: AsyncClient,
     uow: _Uow,
     production_app: FastAPI,
-    status: SubjectProductionStatus,
+    status: ProductionRunStatus,
 ) -> None:
     """P23.6 part F: POST /subjects/{id}/production is the retry path for a
     FAILED or NEEDS_REVIEW run -- it must create a brand-new run (new run_id,
@@ -1406,26 +1444,26 @@ async def test_start_production_after_failure_creates_a_new_run(
     reanimate the terminal one, and dispatch a real SOURCES job."""
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
     previous = _terminal_run(edition_id, subject_id, status=status)
-    await uow.subject_production_runs.add(previous)
+    await uow.production_runs.add(previous)
 
-    response = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    response = await _start_batch(api, edition_id, [subject_id])
 
     assert response.status_code == 200, response.text
     body = response.json()
-    assert body["run_id"] != str(previous.id)
-    assert body["status"] == "running"
-    assert body["stage"] == "sources"
+    assert body["batch_id"]
+    new_run = next(run for run in uow.production_runs.items.values() if run.id != previous.id)
+    assert new_run.status is ProductionRunStatus.RUNNING
+    assert new_run.current_stage is ProductionStage.SOURCES
 
     # The old run is untouched, immutable history.
-    assert uow.subject_production_runs.items[previous.id].status is status
-    assert uow.subject_production_runs.items[previous.id].id == previous.id
+    assert uow.production_runs.items[previous.id].status is status
+    assert uow.production_runs.items[previous.id].id == previous.id
 
-    new_run = uow.subject_production_runs.items[UUID(body["run_id"])]
     assert new_run.run_number == previous.run_number + 1
-    assert new_run.status is SubjectProductionStatus.RUNNING
-    assert new_run.current_stage is SubjectProductionStage.SOURCES
+    assert new_run.status is ProductionRunStatus.RUNNING
+    assert new_run.current_stage is ProductionStage.SOURCES
 
     jobs = production_app.state.job_service
     sources_jobs = [job for job in jobs.submitted if job["kind"] == "production.subject.sources"]
@@ -1436,8 +1474,8 @@ async def test_start_production_after_failure_creates_a_new_run(
     assert len(dispatcher.dispatched) == 1
 
 
-def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> SubjectProductionRun:
-    run = SubjectProductionRun(
+def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> ProductionRun:
+    run = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
         run_number=run_number,
@@ -1447,7 +1485,7 @@ def _ready_run(edition_id: UUID, subject_id: UUID, *, run_number: int = 1) -> Su
     return run
 
 
-def _artifact(run: SubjectProductionRun, stage: ProductionArtifactStage) -> ProductionArtifact:
+def _artifact(run: ProductionRun, stage: ProductionArtifactStage) -> ProductionArtifact:
     return ProductionArtifact(
         production_run_id=run.id,
         subject_id=run.subject_id,
@@ -1460,13 +1498,15 @@ def _artifact(run: SubjectProductionRun, stage: ProductionArtifactStage) -> Prod
 def _state_payload() -> dict[str, Any]:
     payload: dict[str, Any] = {
         "format": "autowork.production-state",
-        "schema_version": 1,
+        "schema_version": 4,
         "exported_at": "2026-08-26T15:00:00Z",
         "origin": {
             "subject_title": "TAG-182",
-            "editorial_type": "brief",
-            "profile": "brief_auto",
+            "subject_id": str(uuid4()),
+            "production_run_id": str(uuid4()),
             "research_date": "2026-08-26",
+            "discovery_snapshot_id": str(uuid4()),
+            "discovery_snapshot_version": 1,
         },
         "artifacts": {
             "references": {
@@ -1514,17 +1554,27 @@ def _state_payload() -> dict[str, Any]:
         },
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV1.model_validate(payload)
+    snapshot = ProductionStateSnapshotV4.model_validate(payload)
     payload["content_sha256"] = compute_production_state_checksum(snapshot)
     return payload
 
 
 async def _seed_exportable_run(
     uow: _Uow, store: _ArtifactStore, edition_id: UUID, subject_id: UUID
-) -> SubjectProductionRun:
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    run.current_stage = SubjectProductionStage.ASSEMBLY
-    await uow.subject_production_runs.add(run)
+) -> ProductionRun:
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    run.current_stage = ProductionStage.ASSEMBLY
+    await uow.production_runs.add(run)
+    await uow.production_input_snapshots.add(
+        SimpleNamespace(
+            production_run_id=run.id,
+            subject_id=subject_id,
+            subject_title=uow.subjects.items[subject_id].title,
+            research_date=date(2026, 8, 26),
+            discovery_snapshot_id=uuid4(),
+            discovery_snapshot_version=7,
+        )
+    )
     payload = _state_payload()
     artifacts = payload["artifacts"]
     assert isinstance(artifacts, dict)
@@ -1561,7 +1611,7 @@ async def test_production_state_export_import_is_transparent(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
     uow.subjects.items[subject_id].title = "Canonical export title"
     store = production_app.state.production_artifact_store
     run = await _seed_exportable_run(uow, store, edition_id, subject_id)
@@ -1570,8 +1620,13 @@ async def test_production_state_export_import_is_transparent(
     assert exported.status_code == 200, exported.text
     snapshot = exported.json()
     assert snapshot["format"] == "autowork.production-state"
-    assert snapshot["schema_version"] == 3
+    assert snapshot["schema_version"] == 4
     assert snapshot["origin"]["subject_title"] == "Canonical export title"
+    input_snapshot = uow.production_input_snapshots.items[run.id]
+    assert snapshot["origin"]["subject_id"] == str(subject_id)
+    assert snapshot["origin"]["production_run_id"] == str(run.id)
+    assert snapshot["origin"]["discovery_snapshot_id"] == str(input_snapshot.discovery_snapshot_id)
+    assert snapshot["origin"]["discovery_snapshot_version"] == 7
     # A run with no repair projection exports an explicitly empty audit block.
     assert snapshot["repair"] is None
     assert snapshot["content_sha256"]
@@ -1583,7 +1638,7 @@ async def test_production_state_export_import_is_transparent(
     assert snapshot["artifacts"]["synthesis"]["rendered_content"] == "Fait [S1]"
 
     imported_subject = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", imported_subject))
+    _select(uow, edition_id, "TAG-182", imported_subject)
     imported_edition_id = uuid4()
     uow.subjects.items[imported_subject] = dataclasses.replace(
         uow.subjects.items[imported_subject], edition_id=imported_edition_id
@@ -1594,12 +1649,9 @@ async def test_production_state_export_import_is_transparent(
     uow.subject_discovery_origins.items[imported_origin_index] = dataclasses.replace(
         imported_origin, edition_id=imported_edition_id
     )
-    uow.discovery_batches.groups = [
-        SimpleNamespace(
-            edition_id=imported_edition_id,
-            candidate_references=uow.editorial_groups._groups[-1].candidate_references,
-        )
-    ]
+    # The imported subject freezes its own inputs, so its edition needs the
+    # same discovery lineage the selected subject had.
+    uow.discovery_lineage.register(imported_edition_id, imported_origin.discovery_subject_id)
     submitted = len(production_app.state.job_service.submitted)
     imported = await api.post(
         f"/api/subjects/{imported_subject}/production/state/import", json=snapshot
@@ -1639,7 +1691,7 @@ async def test_production_state_export_import_is_transparent(
     )
     assert run.id != UUID(imported.json()["run_id"])
 
-    imported_run = await uow.subject_production_runs.get_current_for_subject(imported_subject)
+    imported_run = await uow.production_runs.get_current_for_subject(imported_subject)
     assert imported_run is not None
     assert imported_run.edition_id == imported_edition_id
     extraction_artifact = await uow.production_artifacts.get_current(imported_run.id, "extraction")
@@ -1654,29 +1706,27 @@ async def test_production_state_import_has_no_generation_side_effects(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, source_id, target_id = uuid4(), uuid4(), uuid4()
-    uow.editorial_groups._groups.extend(
-        [_group(edition_id, "Source", source_id), _group(edition_id, "Target", target_id)]
-    )
+    _select(uow, edition_id, "Source", source_id)
+    _select(uow, edition_id, "Target", target_id)
     await _seed_exportable_run(
         uow, production_app.state.production_artifact_store, edition_id, source_id
     )
     snapshot = (await api.get(f"/api/subjects/{source_id}/production/state/export")).json()
     jobs = production_app.state.job_service
     before_jobs = len(jobs.submitted)
-    before_runs = len(uow.subject_production_runs.items)
+    before_runs = len(uow.production_runs.items)
     response = await api.post(f"/api/subjects/{target_id}/production/state/import", json=snapshot)
     assert response.status_code == 200
     assert len(jobs.submitted) == before_jobs
-    assert len(uow.subject_production_runs.items) == before_runs + 1
+    assert len(uow.production_runs.items) == before_runs + 1
 
 
 async def test_production_state_export_import_export_preserves_business_content(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, source_id, target_id = uuid4(), uuid4(), uuid4()
-    uow.editorial_groups._groups.extend(
-        [_group(edition_id, "Source", source_id), _group(edition_id, "Target", target_id)]
-    )
+    _select(uow, edition_id, "Source", source_id)
+    _select(uow, edition_id, "Target", target_id)
     await _seed_exportable_run(
         uow, production_app.state.production_artifact_store, edition_id, source_id
     )
@@ -1697,7 +1747,7 @@ async def test_production_state_import_keeps_history_and_previous_artifacts(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Subject", subject_id))
+    _select(uow, edition_id, "Subject", subject_id)
     original = await _seed_exportable_run(
         uow, production_app.state.production_artifact_store, edition_id, subject_id
     )
@@ -1709,10 +1759,10 @@ async def test_production_state_import_keeps_history_and_previous_artifacts(
         )
         assert response.status_code == 200
         imported_ids.append(UUID(response.json()["run_id"]))
-    assert len(uow.subject_production_runs.items) == 3
+    assert len(uow.production_runs.items) == 3
     assert (
-        await uow.subject_production_runs.get_current_for_subject(subject_id)
-        == uow.subject_production_runs.items[imported_ids[-1]]
+        await uow.production_runs.get_current_for_subject(subject_id)
+        == uow.production_runs.items[imported_ids[-1]]
     )
     for run_id in imported_ids:
         artifacts = await uow.production_artifacts.list_for_run(run_id)
@@ -1728,7 +1778,7 @@ async def test_production_state_export_excludes_foreign_ids_and_raw_output(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "Subject", subject_id))
+    _select(uow, edition_id, "Subject", subject_id)
     run = await _seed_exportable_run(
         uow, production_app.state.production_artifact_store, edition_id, subject_id
     )
@@ -1744,10 +1794,10 @@ async def test_production_state_export_excludes_foreign_ids_and_raw_output(
     extraction_content["items"][0]["model_run_ids"] = [str(uuid4())]
     snapshot = (await api.get(f"/api/subjects/{subject_id}/production/state/export")).json()
     serialized = json.dumps(snapshot)
-    forbidden = [
-        str(run.id),
-        *(str(a.id) for a in uow.production_artifacts.items if a.production_run_id == run.id),
-    ]
+    # The run id is part of the V4 provenance block; artifact and blob ids
+    # are internals that must never cross the export boundary.
+    assert snapshot["origin"]["production_run_id"] == str(run.id)
+    forbidden = [str(a.id) for a in uow.production_artifacts.items if a.production_run_id == run.id]
     forbidden.extend(
         str(value) for value in (extraction.canonical_blob_id, extraction.rendered_blob_id)
     )
@@ -1767,7 +1817,7 @@ async def test_production_state_import_maps_validation_errors(
     api: AsyncClient, uow: _Uow, payload_change: dict[str, Any], code: str
 ) -> None:
     subject_id, edition_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
+    _select(uow, edition_id, "TAG-182", subject_id)
     payload = _state_payload()
     payload.update(payload_change)
     response = await api.post(f"/api/subjects/{subject_id}/production/state/import", json=payload)
@@ -1779,34 +1829,34 @@ async def test_production_state_import_maps_validation_errors(
     ("initial_status", "stage", "expected_stale"),
     (
         (
-            SubjectProductionStatus.READY,
-            SubjectProductionStage.SOURCES,
+            ProductionRunStatus.READY,
+            ProductionStage.SOURCES,
             ["references", "extraction", "synthesis", "publication"],
         ),
         (
-            SubjectProductionStatus.READY,
-            SubjectProductionStage.REFERENCES,
+            ProductionRunStatus.READY,
+            ProductionStage.REFERENCES,
             ["references", "extraction", "synthesis", "publication"],
         ),
         (
-            SubjectProductionStatus.READY,
-            SubjectProductionStage.EXTRACTION,
+            ProductionRunStatus.READY,
+            ProductionStage.EXTRACTION,
             ["extraction", "synthesis", "publication"],
         ),
         (
-            SubjectProductionStatus.READY,
-            SubjectProductionStage.SYNTHESIS,
+            ProductionRunStatus.READY,
+            ProductionStage.SYNTHESIS,
             ["synthesis", "publication"],
         ),
-        (SubjectProductionStatus.READY, SubjectProductionStage.ASSEMBLY, ["publication"]),
+        (ProductionRunStatus.READY, ProductionStage.ASSEMBLY, ["publication"]),
         (
-            SubjectProductionStatus.FAILED,
-            SubjectProductionStage.EXTRACTION,
+            ProductionRunStatus.FAILED,
+            ProductionStage.EXTRACTION,
             ["extraction", "synthesis", "publication"],
         ),
         (
-            SubjectProductionStatus.NEEDS_REVIEW,
-            SubjectProductionStage.EXTRACTION,
+            ProductionRunStatus.NEEDS_REVIEW,
+            ProductionStage.EXTRACTION,
             ["extraction", "synthesis", "publication"],
         ),
     ),
@@ -1815,21 +1865,21 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     api: AsyncClient,
     uow: _Uow,
     production_app: FastAPI,
-    initial_status: SubjectProductionStatus,
-    stage: SubjectProductionStage,
+    initial_status: ProductionRunStatus,
+    stage: ProductionStage,
     expected_stale: list[str],
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
-    run.current_stage = SubjectProductionStage.ASSEMBLY
-    if initial_status is SubjectProductionStatus.READY:
+    run.current_stage = ProductionStage.ASSEMBLY
+    if initial_status is ProductionRunStatus.READY:
         run.mark_ready()
-    elif initial_status is SubjectProductionStatus.FAILED:
+    elif initial_status is ProductionRunStatus.FAILED:
         run.mark_failed(code="extraction_failed", message="failed")
     else:
         run.mark_needs_review(code="extraction_review", message="review")
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
@@ -1842,9 +1892,9 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     body = response.json()
     assert body["run_id"] == str(run.id)
     assert body["pipeline_generation"] == 1
-    persisted = uow.subject_production_runs.items[run.id]
+    persisted = uow.production_runs.items[run.id]
     assert persisted.current_stage is stage
-    assert persisted.status is SubjectProductionStatus.RUNNING
+    assert persisted.status is ProductionRunStatus.RUNNING
     assert body["staled_artifacts"] == expected_stale
     stale = {
         item.stage.value
@@ -1860,7 +1910,7 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     job = production_app.state.job_service.submitted[-1]
     expected_kind = (
         "production.subject.assemble"
-        if stage is SubjectProductionStage.ASSEMBLY
+        if stage is ProductionStage.ASSEMBLY
         else f"production.subject.{stage.value}"
     )
     assert job["kind"] == expected_kind
@@ -1868,16 +1918,14 @@ async def test_retry_stage_reuses_run_and_stales_selected_stage_and_downstream(
     assert job["max_attempts"] == 3
 
 
-@pytest.mark.parametrize(
-    "status", (SubjectProductionStatus.QUEUED, SubjectProductionStatus.RUNNING)
-)
+@pytest.mark.parametrize("status", (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING))
 async def test_retry_stage_rejects_queued_or_running_run(
-    api: AsyncClient, uow: _Uow, status: SubjectProductionStatus
+    api: AsyncClient, uow: _Uow, status: ProductionRunStatus
 ) -> None:
-    run = SubjectProductionRun(subject_id=uuid4(), edition_id=uuid4())
-    if status is SubjectProductionStatus.RUNNING:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    if status is ProductionRunStatus.RUNNING:
         run.start_running()
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
 
     response = await api.post(
@@ -1893,10 +1941,10 @@ async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
     uow: _Uow,
 ) -> None:
     subject_id = uuid4()
-    first = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.FAILED)
-    second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
-    await uow.subject_production_runs.add(first)
-    await uow.subject_production_runs.add(second)
+    first = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    second = _terminal_run(first.edition_id, subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(first)
+    await uow.production_runs.add(second)
     first_artifact = _artifact(first, ProductionArtifactStage.PUBLICATION)
     second_artifact = _artifact(second, ProductionArtifactStage.PUBLICATION)
     await uow.production_artifacts.append(first_artifact)
@@ -1917,10 +1965,10 @@ async def test_retry_by_run_changes_only_the_requested_run(
     production_app: FastAPI,
 ) -> None:
     subject_id = uuid4()
-    first = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.FAILED)
-    second = _terminal_run(first.edition_id, subject_id, status=SubjectProductionStatus.FAILED)
-    await uow.subject_production_runs.add(first)
-    await uow.subject_production_runs.add(second)
+    first = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    second = _terminal_run(first.edition_id, subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(first)
+    await uow.production_runs.add(second)
     (await uow.editions.get(first.edition_id)).state = EditionStatus.OPEN
     await uow.production_artifacts.append(_artifact(first, ProductionArtifactStage.REFERENCES))
 
@@ -1930,8 +1978,8 @@ async def test_retry_by_run_changes_only_the_requested_run(
 
     assert response.status_code == 200, response.text
     assert response.json()["run_id"] == str(first.id)
-    assert uow.subject_production_runs.items[first.id].pipeline_generation == 1
-    assert uow.subject_production_runs.items[second.id].pipeline_generation == 0
+    assert uow.production_runs.items[first.id].pipeline_generation == 1
+    assert uow.production_runs.items[second.id].pipeline_generation == 0
     assert production_app.state.job_service.submitted[-1]["input_parameters"]["run_id"] == str(
         first.id
     )
@@ -1950,8 +1998,8 @@ async def test_a_refused_retry_names_the_stage_that_would_run(
     one gesture that works.
     """
     subject_id = uuid4()
-    run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
     (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
     # Everything downstream of EXTRACTION was invalidated by the repair.
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
@@ -1968,7 +2016,7 @@ async def test_a_refused_retry_names_the_stage_that_would_run(
     assert detail["retry_stage"] == "synthesis"
     assert "Synthèse" in detail["message"]
     # Nothing was started: a refused retry must not open a generation.
-    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+    assert uow.production_runs.items[run.id].pipeline_generation == 0
 
 
 async def test_the_named_retry_stage_is_the_one_that_succeeds(
@@ -1977,8 +2025,8 @@ async def test_the_named_retry_stage_is_the_one_that_succeeds(
 ) -> None:
     """Following the instruction the refusal gave must actually work."""
     subject_id = uuid4()
-    run = _terminal_run(uuid4(), subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
     (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
@@ -1989,7 +2037,7 @@ async def test_the_named_retry_stage_is_the_one_that_succeeds(
 
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["requested_stage"] == "synthesis"
-    assert uow.subject_production_runs.items[run.id].pipeline_generation == 1
+    assert uow.production_runs.items[run.id].pipeline_generation == 1
 
 
 async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
@@ -2000,14 +2048,14 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     edition_id = uuid4()
     subjects = [uuid4(), uuid4()]
     for name, subject_id in zip(("A", "B"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
-    first_run = uow.subject_production_runs.items[
+    first_run = uow.production_runs.items[
         uow.edition_production_batch_items.items[0].production_run_id
     ]
     unrelated = _TrackedJob(subject_id=subjects[0], run_id=uuid4())
@@ -2026,8 +2074,7 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert edition.version == 1
     assert uow.edition_audit.events == []
     assert all(
-        run.status is SubjectProductionStatus.CANCELLED
-        for run in uow.subject_production_runs.items.values()
+        run.status is ProductionRunStatus.CANCELLED for run in uow.production_runs.items.values()
     )
     exact_job = jobs.jobs[0]
     assert str(first_run.id) == exact_job.input_parameters["run_id"]
@@ -2043,14 +2090,14 @@ async def test_batch_cancel_preserves_terminal_runs(
     edition_id = uuid4()
     subjects = [uuid4(), uuid4(), uuid4()]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     items = sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
-    terminal = uow.subject_production_runs.items[items[1].production_run_id]
+    terminal = uow.production_runs.items[items[1].production_run_id]
     terminal.mark_ready()
 
     response = await api.post(
@@ -2058,12 +2105,12 @@ async def test_batch_cancel_preserves_terminal_runs(
     )
 
     assert response.status_code == 200, response.text
-    assert terminal.status is SubjectProductionStatus.READY
-    assert uow.subject_production_runs.items[items[0].production_run_id].status is (
-        SubjectProductionStatus.CANCELLED
+    assert terminal.status is ProductionRunStatus.READY
+    assert uow.production_runs.items[items[0].production_run_id].status is (
+        ProductionRunStatus.CANCELLED
     )
-    assert uow.subject_production_runs.items[items[2].production_run_id].status is (
-        SubjectProductionStatus.CANCELLED
+    assert uow.production_runs.items[items[2].production_run_id].status is (
+        ProductionRunStatus.CANCELLED
     )
     assert response.json()["edition_state"] == "open"
     assert "edition_status" not in response.json()
@@ -2075,9 +2122,9 @@ async def test_batch_cancel_rejects_an_archived_edition(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
     edition = await uow.editions.get(edition_id)
@@ -2087,7 +2134,7 @@ async def test_batch_cancel_rejects_an_archived_edition(
     response = await api.post(f"/api/editions/{edition_id}/production/{batch.id}/cancel")
 
     assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "edition_archived"
+    assert response.json()["detail"]["code"] == "production_edition_archived"
     assert batch.status == ProductionBatchStatus.RUNNING
     assert edition.state is EditionStatus.ARCHIVED
     assert edition.version == version
@@ -2100,23 +2147,27 @@ async def test_repeated_old_batch_cancel_cannot_affect_newer_batch(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    first = await api.post(f"/api/editions/{edition_id}/production", json={})
+    first = await _start_batch(api, edition_id, [subject_id])
     assert first.status_code == 200, first.text
     old_batch_id = first.json()["batch_id"]
     stopped = await api.post(f"/api/editions/{edition_id}/production/{old_batch_id}/cancel")
     assert stopped.status_code == 200, stopped.text
 
-    second = await api.post(f"/api/editions/{edition_id}/production", json={})
+    # A distinct key is what makes this a new wave: replaying the first key
+    # would legitimately return the very batch that was just cancelled.
+    second = await _start_batch(
+        api, edition_id, [subject_id], idempotency_key="production-test-batch-2"
+    )
     assert second.status_code == 200, second.text
     new_batch_id = second.json()["batch_id"]
     assert new_batch_id != old_batch_id
     new_run = next(
         run
-        for run in uow.subject_production_runs.items.values()
+        for run in uow.production_runs.items.values()
         if run.id
         == next(
             item.production_run_id
@@ -2130,15 +2181,15 @@ async def test_repeated_old_batch_cancel_cannot_affect_newer_batch(
 
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == "stale_production_batch"
-    assert uow.subject_production_runs.items[new_run.id].status is SubjectProductionStatus.RUNNING
+    assert uow.production_runs.items[new_run.id].status is ProductionRunStatus.RUNNING
     assert len(uow.edition_audit.events) == audit_count
 
 
 async def test_completed_batch_cannot_be_cancelled(api: AsyncClient, uow: _Uow) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
     batch.finish()
@@ -2158,23 +2209,23 @@ async def test_exact_run_cancel_hands_off_to_the_next_batch_subject(
     edition_id = uuid4()
     subjects = [uuid4(), uuid4()]
     for name, subject_id in zip(("A", "B"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
     first, second = (
-        uow.subject_production_runs.items[item.production_run_id]
+        uow.production_runs.items[item.production_run_id]
         for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     )
 
     response = await api.post(f"/api/production/runs/{first.id}/cancel")
 
     assert response.status_code == 200, response.text
-    assert uow.subject_production_runs.items[first.id].status is SubjectProductionStatus.CANCELLED
-    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.RUNNING
+    assert uow.production_runs.items[first.id].status is ProductionRunStatus.CANCELLED
+    assert uow.production_runs.items[second.id].status is ProductionRunStatus.RUNNING
     assert batch.status is ProductionBatchStatus.RUNNING
     assert [
         job.input_parameters["run_id"]
@@ -2192,14 +2243,14 @@ async def test_exact_run_cancel_twice_does_not_repeat_batch_handoff(
     edition_id = uuid4()
     subjects = [uuid4(), uuid4(), uuid4()]
     for name, subject_id in zip(("A", "B", "C"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     runs = [
-        uow.subject_production_runs.items[item.production_run_id]
+        uow.production_runs.items[item.production_run_id]
         for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     ]
 
@@ -2218,21 +2269,19 @@ async def test_exact_run_cancel_of_last_subject_closes_batch(
     production_app: FastAPI,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
-    run = uow.subject_production_runs.items[
-        uow.edition_production_batch_items.items[0].production_run_id
-    ]
+    run = uow.production_runs.items[uow.edition_production_batch_items.items[0].production_run_id]
 
     response = await api.post(f"/api/production/runs/{run.id}/cancel")
 
     assert response.status_code == 200, response.text
-    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.CANCELLED
+    assert uow.production_runs.items[run.id].status is ProductionRunStatus.CANCELLED
     assert batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
     assert batch.phase is ProductionBatchPhase.REVIEW
     assert jobs.jobs[-1].input_parameters["run_id"] == str(run.id)
@@ -2248,15 +2297,15 @@ async def test_exact_run_cancel_does_not_dispatch_after_batch_cancel_fence(
     edition_id = uuid4()
     subjects = [uuid4(), uuid4()]
     for name, subject_id in zip(("A", "B"), subjects, strict=True):
-        uow.editorial_groups._groups.append(_group(edition_id, name, subject_id))
+        _select(uow, edition_id, name, subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    started = await _start_batch(api, edition_id, subjects)
     assert started.status_code == 200, started.text
     batch = next(iter(uow.edition_production_batches.items.values()))
     first, second = (
-        uow.subject_production_runs.items[item.production_run_id]
+        uow.production_runs.items[item.production_run_id]
         for item in sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
     )
     dispatcher = production_app.state.job_dispatcher
@@ -2276,10 +2325,10 @@ async def test_exact_run_cancel_does_not_dispatch_after_batch_cancel_fence(
         async with uow_factory() as race_uow:
             batch.cancel(now=datetime.now(UTC))
             await race_uow.edition_production_batches.save(batch)
-            queued = await race_uow.subject_production_runs.get_for_update(second.id)
+            queued = await race_uow.production_runs.get_for_update(second.id)
             assert queued is not None
             queued.mark_cancelled(now=datetime.now(UTC))
-            await race_uow.subject_production_runs.save(queued)
+            await race_uow.production_runs.save(queued)
             await race_uow.commit()
 
     monkeypatch.setattr(
@@ -2290,7 +2339,7 @@ async def test_exact_run_cancel_does_not_dispatch_after_batch_cancel_fence(
 
     assert response.status_code == 200, response.text
     assert batch.status is ProductionBatchStatus.CANCELLED
-    assert uow.subject_production_runs.items[second.id].status is SubjectProductionStatus.CANCELLED
+    assert uow.production_runs.items[second.id].status is ProductionRunStatus.CANCELLED
     assert dispatcher.dispatched == []
     assert sum(job.input_parameters["run_id"] == str(second.id) for job in jobs.jobs) == 0
 
@@ -2302,17 +2351,17 @@ async def test_subject_cancel_marks_run_and_cancels_its_exact_job(
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "A", subject_id))
+    _select(uow, edition_id, "A", subject_id)
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
 
-    started = await api.post(f"/api/subjects/{subject_id}/production", json={})
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
-    run_id = UUID(started.json()["run_id"])
+    run_id = next(iter(uow.production_runs.items))
     response = await api.post(f"/api/subjects/{subject_id}/production/cancel")
 
     assert response.status_code == 200, response.text
-    assert uow.subject_production_runs.items[run_id].status is SubjectProductionStatus.CANCELLED
+    assert uow.production_runs.items[run_id].status is ProductionRunStatus.CANCELLED
     assert jobs.cancelled == [jobs.jobs[0].id]
 
 
@@ -2323,22 +2372,22 @@ async def test_exact_run_cancel_is_idempotent_and_never_touches_same_subject_his
 ) -> None:
     edition_id = uuid4()
     subject_id = uuid4()
-    old_run = SubjectProductionRun(
+    old_run = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
         run_number=1,
     )
     old_run.start_running()
-    current_run = SubjectProductionRun(
+    current_run = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
         run_number=2,
-        status=SubjectProductionStatus.FAILED,
+        status=ProductionRunStatus.FAILED,
     )
     current_run.started_at = old_run.started_at
     current_run.finished_at = datetime.now(UTC)
-    await uow.subject_production_runs.add(old_run)
-    await uow.subject_production_runs.add(current_run)
+    await uow.production_runs.add(old_run)
+    await uow.production_runs.add(current_run)
 
     jobs = _CancelableJobs()
     production_app.state.job_service = jobs
@@ -2356,12 +2405,8 @@ async def test_exact_run_cancel_is_idempotent_and_never_touches_same_subject_his
         "run_id": str(old_run.id),
         "status": "cancelled",
     }
-    assert uow.subject_production_runs.items[old_run.id].status is (
-        SubjectProductionStatus.CANCELLED
-    )
-    assert uow.subject_production_runs.items[current_run.id].status is (
-        SubjectProductionStatus.FAILED
-    )
+    assert uow.production_runs.items[old_run.id].status is (ProductionRunStatus.CANCELLED)
+    assert uow.production_runs.items[current_run.id].status is (ProductionRunStatus.FAILED)
     assert jobs.cancelled == [old_job.id]
     assert current_job.id not in jobs.cancelled
 
@@ -2372,9 +2417,9 @@ async def test_exact_run_cancel_preserves_existing_artifacts(
     production_app: FastAPI,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     references = _artifact(run, ProductionArtifactStage.REFERENCES)
     extraction = _artifact(run, ProductionArtifactStage.EXTRACTION)
     await uow.production_artifacts.append(references)
@@ -2394,23 +2439,23 @@ async def test_exact_run_cancel_preserves_existing_artifacts(
 @pytest.mark.parametrize(
     "terminal_status",
     (
-        SubjectProductionStatus.READY,
-        SubjectProductionStatus.FAILED,
-        SubjectProductionStatus.NEEDS_REVIEW,
+        ProductionRunStatus.READY,
+        ProductionRunStatus.FAILED,
+        ProductionRunStatus.NEEDS_REVIEW,
     ),
 )
 async def test_exact_run_cancel_rejects_inactive_terminal_run(
     api: AsyncClient,
     uow: _Uow,
-    terminal_status: SubjectProductionStatus,
+    terminal_status: ProductionRunStatus,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
     run = (
         _ready_run(edition_id, subject_id)
-        if terminal_status is SubjectProductionStatus.READY
+        if terminal_status is ProductionRunStatus.READY
         else _terminal_run(edition_id, subject_id, status=terminal_status)
     )
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
 
     response = await api.post(f"/api/production/runs/{run.id}/cancel")
 
@@ -2422,10 +2467,10 @@ def _reconciliation_run(
     edition_id: UUID,
     subject_id: UUID,
     *,
-    stage: SubjectProductionStage = SubjectProductionStage.EXTRACTION,
-) -> SubjectProductionRun:
+    stage: ProductionStage = ProductionStage.EXTRACTION,
+) -> ProductionRun:
     """A run stopped by an ambiguous provider submission, as production leaves it."""
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
     run.current_stage = stage
     run.mark_needs_review(
@@ -2453,7 +2498,7 @@ async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
     """The current stage and every earlier one are equally refused."""
     edition_id, subject_id = uuid4(), uuid4()
     run = _reconciliation_run(edition_id, subject_id)
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
@@ -2466,9 +2511,9 @@ async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "production_reconciliation_required"
-    persisted = uow.subject_production_runs.items[run.id]
+    persisted = uow.production_runs.items[run.id]
     assert persisted.pipeline_generation == 0
-    assert persisted.status is SubjectProductionStatus.NEEDS_REVIEW
+    assert persisted.status is ProductionRunStatus.NEEDS_REVIEW
     assert persisted.reconciliation is not None
     # Nothing was scheduled, so no stage worker and no provider submission.
     assert jobs.submitted == []
@@ -2482,8 +2527,8 @@ async def test_retry_by_subject_is_refused_while_reconciliation_is_pending(
 async def test_reconciliation_probe_rejects_a_run_without_reconciliation(
     api: AsyncClient, uow: _Uow
 ) -> None:
-    run = _terminal_run(uuid4(), uuid4(), status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(uuid4(), uuid4(), status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
 
     response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
 
@@ -2495,21 +2540,21 @@ async def test_reconciliation_probe_404_releases_the_run(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     run = _reconciliation_run(uuid4(), uuid4())
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     production_app.state.bridge_capabilities_provider = _Bridge404()
 
     response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
 
     assert response.status_code == 200, response.text
     assert response.json() == {"outcome": "released", "bridge_status": "not_found"}
-    assert uow.subject_production_runs.items[run.id].requires_reconciliation is False
+    assert uow.production_runs.items[run.id].requires_reconciliation is False
 
 
 async def test_declare_lost_returns_resumed_without_releasing_when_probe_finds_answer(
     api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     run = _reconciliation_run(uuid4(), uuid4())
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
 
     class _ResumedProbe:
         _last_bridge_status = "completed"
@@ -2531,7 +2576,7 @@ async def test_declare_lost_returns_resumed_without_releasing_when_probe_finds_a
 
     assert response.status_code == 200
     assert response.json() == {"outcome": "resumed", "bridge_status": "completed"}
-    assert uow.subject_production_runs.items[run.id].requires_reconciliation is True
+    assert uow.production_runs.items[run.id].requires_reconciliation is True
 
 
 async def test_declare_lost_requires_explicit_confirmation(api: AsyncClient) -> None:
@@ -2548,7 +2593,7 @@ async def test_declare_lost_releases_and_audits_the_run(
     api: AsyncClient, uow: _Uow, production_app: FastAPI, tmp_path: Path
 ) -> None:
     run = _reconciliation_run(uuid4(), uuid4())
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     production_app.state.identity_provider = LocalIdentityProvider("analyst-1")
     production_app.state.production_diagnostics = DiagnosticsLog.from_env(tmp_path)
 
@@ -2559,7 +2604,7 @@ async def test_declare_lost_releases_and_audits_the_run(
 
     assert response.status_code == 200, response.text
     assert response.json() == {"outcome": "released", "declared_lost": True}
-    assert uow.subject_production_runs.items[run.id].requires_reconciliation is False
+    assert uow.production_runs.items[run.id].requires_reconciliation is False
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     assert event["event"] == "production.reconciliation_declared_lost"
     assert event["run_id"] == str(run.id)
@@ -2577,7 +2622,7 @@ async def test_retry_by_run_is_refused_while_reconciliation_is_pending(
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
     run = _reconciliation_run(edition_id, subject_id)
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
@@ -2590,7 +2635,7 @@ async def test_retry_by_run_is_refused_while_reconciliation_is_pending(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "production_reconciliation_required"
-    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+    assert uow.production_runs.items[run.id].pipeline_generation == 0
     assert jobs.submitted == []
     assert dispatcher.dispatched == []
 
@@ -2601,9 +2646,9 @@ async def test_reconciliation_barrier_does_not_change_the_ordinary_retry_contrac
 ) -> None:
     """A NEEDS_REVIEW run without a reconciliation identity still retries."""
     edition_id, subject_id = uuid4(), uuid4()
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    run.current_stage = SubjectProductionStage.EXTRACTION
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    run.current_stage = ProductionStage.EXTRACTION
+    await uow.production_runs.add(run)
     (await uow.editions.get(edition_id)).state = EditionStatus.OPEN
     for artifact_stage in ProductionArtifactStage:
         await uow.production_artifacts.append(_artifact(run, artifact_stage))
@@ -2613,7 +2658,7 @@ async def test_reconciliation_barrier_does_not_change_the_ordinary_retry_contrac
     )
 
     assert response.status_code == 200, response.text
-    assert uow.subject_production_runs.items[run.id].pipeline_generation == 1
+    assert uow.production_runs.items[run.id].pipeline_generation == 1
 
 
 async def test_subject_production_status_exposes_the_owning_batch(
@@ -2621,8 +2666,8 @@ async def test_subject_production_status_exposes_the_owning_batch(
     uow: _Uow,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-900", subject_id))
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.FAILED)
+    _select(uow, edition_id, "TAG-900", subject_id)
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.FAILED)
     run.mark_failed(
         code="q2_source_coverage_failed",
         message="A source could not be analysed",
@@ -2636,7 +2681,7 @@ async def test_subject_production_status_exposes_the_owning_batch(
             }
         },
     )
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     await uow.production_input_snapshots.add(
         SimpleNamespace(
             production_run_id=run.id,
@@ -2676,11 +2721,11 @@ async def test_a_cancelled_batch_article_is_not_restarted_as_a_standalone_run(
 ) -> None:
     """A new standalone run would never repair the batch item it seems to replace."""
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-901", subject_id))
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    _select(uow, edition_id, "TAG-901", subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
     run.mark_cancelled()
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
     batch = EditionProductionBatch(
         edition_id=edition_id,
         status=ProductionBatchStatus.COMPLETED_WITH_ISSUES,
@@ -2702,10 +2747,9 @@ async def test_a_cancelled_batch_article_is_not_restarted_as_a_standalone_run(
 
     response = await api.post(f"/api/subjects/{subject_id}/production", json={})
 
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "production_run_batch_owned"
-    assert len(uow.subject_production_runs.items) == 1
-    assert uow.subject_production_runs.items[run.id].status is SubjectProductionStatus.CANCELLED
+    assert response.status_code == 405, response.text
+    assert len(uow.production_runs.items) == 1
+    assert uow.production_runs.items[run.id].status is ProductionRunStatus.CANCELLED
     assert jobs.submitted == []
 
 
@@ -2714,29 +2758,31 @@ async def test_a_subject_outside_any_batch_can_still_be_restarted(
     uow: _Uow,
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-902", subject_id))
-    run = SubjectProductionRun(subject_id=subject_id, edition_id=edition_id)
+    _select(uow, edition_id, "TAG-902", subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
     run.start_running()
     run.mark_cancelled()
-    await uow.subject_production_runs.add(run)
+    await uow.production_runs.add(run)
 
     response = await api.post(f"/api/subjects/{subject_id}/production", json={})
 
-    assert response.status_code == 200, response.text
-    assert response.json()["run_id"] != str(run.id)
+    assert response.status_code == 405, response.text
+    current = await uow.production_runs.get_current_for_subject(subject_id)
+    assert current is not None
+    assert current.id == run.id
 
 
-async def _cancelled_batch_run(api: AsyncClient, uow: _Uow) -> tuple[UUID, SubjectProductionRun]:
+async def _cancelled_batch_run(api: AsyncClient, uow: _Uow) -> tuple[UUID, ProductionRun]:
     """One article of an edition batch, cancelled right after it started."""
     edition_id, subject_id = uuid4(), uuid4()
-    uow.editorial_groups._groups.append(_group(edition_id, "TAG-182", subject_id))
-    started = await api.post(f"/api/editions/{edition_id}/production", json={})
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
     assert started.status_code == 200, started.text
-    run = await uow.subject_production_runs.get_current_for_subject(subject_id)
+    run = await uow.production_runs.get_current_for_subject(subject_id)
     assert run is not None
     cancelled = await api.post(f"/api/production/runs/{run.id}/cancel")
     assert cancelled.status_code == 200, cancelled.text
-    return subject_id, uow.subject_production_runs.items[run.id]
+    return subject_id, uow.production_runs.items[run.id]
 
 
 async def test_cancelled_production_status_carries_its_resume_plan(
@@ -2757,7 +2803,7 @@ async def test_cancelled_production_status_carries_its_resume_plan(
         # Q1, one Q2 call for the single archived source, then Q4.
         "model_calls_expected": 3,
     }
-    assert run.status is SubjectProductionStatus.CANCELLED
+    assert run.status is ProductionRunStatus.CANCELLED
 
 
 async def test_resume_dispatches_the_first_incomplete_stage_and_logs_its_plan(
@@ -2783,9 +2829,9 @@ async def test_resume_dispatches_the_first_incomplete_stage_and_logs_its_plan(
     assert body["status"] == "running"
     assert body["resume_plan"]["resume_from_stage"] == "extraction"
     assert body["resume_plan"]["reused_artifacts"] == ["references"]
-    resumed = uow.subject_production_runs.items[run.id]
-    assert resumed.status is SubjectProductionStatus.RUNNING
-    assert resumed.current_stage is SubjectProductionStage.EXTRACTION
+    resumed = uow.production_runs.items[run.id]
+    assert resumed.status is ProductionRunStatus.RUNNING
+    assert resumed.current_stage is ProductionStage.EXTRACTION
     # A resume reuses; only a retry invalidates a stage.
     assert resumed.force_recompute_from_stage is None
     assert resumed.pipeline_generation == run.pipeline_generation + 1
@@ -2806,8 +2852,8 @@ async def test_resume_is_refused_on_a_run_that_is_not_cancelled(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
-    run = _terminal_run(edition_id, subject_id, status=SubjectProductionStatus.NEEDS_REVIEW)
-    await uow.subject_production_runs.add(run)
+    run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
     jobs = production_app.state.job_service
     jobs.submitted.clear()
 
@@ -2815,5 +2861,5 @@ async def test_resume_is_refused_on_a_run_that_is_not_cancelled(
 
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "production_run_not_resumable"
-    assert uow.subject_production_runs.items[run.id].pipeline_generation == 0
+    assert uow.production_runs.items[run.id].pipeline_generation == 0
     assert jobs.submitted == []

@@ -70,7 +70,7 @@ async def build_edition_document(
     """
     publications: list[EditionPublicationV2] = []
     for ref in refs:
-        run = await uow.subject_production_runs.get(ref.production_run_id)
+        run = await uow.production_runs.get(ref.production_run_id)
         artifact = await uow.production_artifacts.get(ref.artifact_id)
         current = (
             await uow.production_artifacts.get_current(

@@ -39,9 +39,9 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRole, ModelRunStatus
 from cti_app.domain.production import (
     ExtractionProfile,
+    ProductionRun,
+    ProductionStage,
     SourceExtractionStatus,
-    SubjectProductionRun,
-    SubjectProductionStage,
 )
 from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
 from tests.model_support import InMemoryModelRunUnitOfWorkFactory
@@ -455,7 +455,7 @@ def _batch_workflow(
     response: str,
     *,
     gateway: _BatchGateway | None = None,
-) -> tuple[object, SubjectProductionRun, _CacheState, _ExtractionSink, _BatchGateway]:
+) -> tuple[object, ProductionRun, _CacheState, _ExtractionSink, _BatchGateway]:
     subject = uuid4()
     blobs = _ArchivedBlobs()
     documents: dict[UUID, SimpleNamespace] = {}
@@ -490,10 +490,10 @@ def _batch_workflow(
         return report
 
     orchestrator._load_reference_report = load_report
-    run = SubjectProductionRun(
+    run = ProductionRun(
         subject_id=subject,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[run.id] = run
     return orchestrator, run, state, sink, actual_gateway
@@ -896,10 +896,10 @@ async def test_retry_of_the_same_run_reuses_the_batch_model_run(
     # these sources is unchanged, so the new run consumes the checkpoint and
     # pays no provider call, and every skipped call is explained by a typed
     # reuse decision rather than by silence.
-    replay = SubjectProductionRun(
+    replay = ProductionRun(
         subject_id=run.subject_id,
         edition_id=uuid4(),
-        current_stage=SubjectProductionStage.EXTRACTION,
+        current_stage=ProductionStage.EXTRACTION,
     )
     state._runs[replay.id] = replay
     second = await orchestrator._execute_direct_url_extraction(replay, snapshot=snapshot)

@@ -68,29 +68,19 @@ async def build_subject_production_context(
         research_date = snapshot.research_date
     elif snapshot is not None:
         research_date = snapshot.research_date
+    if snapshot is None:
+        raise ValueError("production_input_snapshot_missing")
+    if snapshot.subject_id != subject_id:
+        raise ValueError("production_input_snapshot_subject_mismatch")
     if research_date is None:
-        raise ValueError("research_date or production input snapshot is required")
+        raise ValueError("production_input_snapshot_research_date_missing")
     relevant_urls = frozenset(relevant_source_urls or ())
 
-    if snapshot is not None:
-        title = snapshot.subject_title
-        description = snapshot.subject_description
-        period_start = snapshot.period_start.isoformat()
-        period_end = snapshot.period_end.isoformat()
-        actor_info = snapshot.actor_or_campaign
-    else:
-        subject = await uow.subjects.get(subject_id)
-        if subject is None:
-            raise ValueError("subject_not_found")
-        edition = await uow.editions.get(subject.edition_id)
-        if edition is None:
-            raise ValueError("subject_edition_not_found")
-        group = await uow.editorial_groups.get_by_subject(subject_id)
-        title = subject.title
-        description = group.grouping_justification if group else ""
-        period_start = edition.period_start.isoformat()
-        period_end = edition.period_end.isoformat()
-        actor_info = (getattr(group, "actor_or_campaign", "") or "") if group is not None else ""
+    title = snapshot.subject_title
+    description = snapshot.discovery_summary
+    period_start = snapshot.period_start.isoformat()
+    period_end = snapshot.period_end.isoformat()
+    actor_info = snapshot.actor_or_campaign
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
     if snapshot is not None:
