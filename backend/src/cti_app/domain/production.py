@@ -772,6 +772,11 @@ class ProductionInputSnapshot:
         payload["research_date"] = self.research_date.isoformat()
         return payload
 
+    @property
+    def subject_description(self) -> str:
+        """Expose the prompt-facing name for the frozen discovery summary."""
+        return self.discovery_summary
+
     def compute_reuse_basis_hash(self) -> str:
         encoded = json.dumps(
             self.reuse_basis_payload(),
