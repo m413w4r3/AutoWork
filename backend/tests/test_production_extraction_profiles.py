@@ -953,3 +953,131 @@ async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
         if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
     ]
     assert {event["source_url"] for event in started} == {urls[2], urls[5]}
+
+
+class _ProjectionStore:
+    """A store serving one canonical corpus payload and one RAW answer."""
+
+    def __init__(self, *, canonical: dict[str, object], raw: str) -> None:
+        self.canonical = canonical
+        self.raw = raw
+
+    async def read_json(self, blob_id: UUID) -> dict[str, object]:
+        del blob_id
+        return self.canonical
+
+    async def read_text(self, blob_id: UUID) -> str:
+        del blob_id
+        return self.raw
+
+
+_LEGACY_RAW = """# REFERENCES
+editorial-title: Legacy title
+
+## SOURCE S1
+
+title: Kept
+url: https://example.test/kept
+publisher: Publisher
+published-at: 2026-07-10
+role: independent
+
+## SOURCE S2
+
+title: Unavailable
+url: https://example.test/unavailable
+publisher: Publisher
+published-at: 2026-07-11
+role: independent
+
+## EVENT R1
+
+date: 2026-07-12
+sources: S1
+text: Kept event
+
+## EVENT R2
+
+date: 2026-07-13
+sources: S2
+text: Unavailable event
+
+# UNCERTAINTIES
+- none
+"""
+
+
+@pytest.mark.asyncio
+async def test_q2_legacy_projection_keeps_only_extractable_corpus_sources() -> None:
+    corpus_payload = {
+        "schema_version": 1,
+        "subject_id": str(uuid4()),
+        "research_date": "2026-08-01",
+        "production_input_hash": "a" * 64,
+        "research_status": "completed",
+        "sources": [
+            {
+                "canonical_url": "https://example.test/kept",
+                "tier": "core",
+                "kind": "publication",
+                "role": "primary",
+                "title": "Kept",
+                "publisher": "Publisher",
+                "published_at": "2026-07-10",
+                "source_collection_id": str(uuid4()),
+                "source_document_id": str(uuid4()),
+                "discovery_candidate_ids": [],
+                "collection_state": "archived",
+                "content_sha256": "b" * 64,
+                "relevance_reason": None,
+                "proposed_by_model": False,
+                "eligible_for_extraction": True,
+            },
+            {
+                "canonical_url": "https://example.test/unavailable",
+                "tier": "supporting",
+                "kind": "publication",
+                "role": "independent",
+                "title": "Unavailable",
+                "publisher": "Publisher",
+                "published_at": "2026-07-11",
+                "source_collection_id": None,
+                "source_document_id": None,
+                "discovery_candidate_ids": [],
+                "collection_state": "unavailable",
+                "content_sha256": None,
+                "relevance_reason": "Additional coverage",
+                "proposed_by_model": True,
+                "eligible_for_extraction": False,
+            },
+        ],
+        "warnings": ["supporting_source_unavailable:https://example.test/unavailable"],
+    }
+    store = _ProjectionStore(canonical=corpus_payload, raw=_LEGACY_RAW)
+    artifact = SimpleNamespace(canonical_blob_id=uuid4(), raw_blob_id=uuid4())
+
+    report = await production_workflow.load_reference_projection(store, artifact)
+
+    assert report is not None
+    assert [source.canonical_url for source in report.sources] == ["https://example.test/kept"]
+    assert report.editorial_title == "Legacy title"
+    assert [event.local_id for event in report.events] == ["R1"]
+    assert report.uncertainties
+
+    # A V4-style legacy payload is never upgraded or reshaped.
+    legacy = await production_workflow.load_reference_projection(
+        _ProjectionStore(
+            canonical={
+                "parser_version": "production-markdown-v4",
+                "schema_version": "2",
+                "editorial_title": None,
+                "sources": [],
+                "events": [],
+                "uncertainties": [],
+            },
+            raw="# REFERENCES\n",
+        ),
+        artifact,
+    )
+    assert legacy is not None
+    assert legacy.sources == ()

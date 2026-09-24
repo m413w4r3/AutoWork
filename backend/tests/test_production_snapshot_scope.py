@@ -12,7 +12,7 @@ import pytest
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.jobs import JobHandlerError
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.production_parsers import ParsedEvent, ParsedSource, ReferenceReport
+from cti_app.application.production_references import ProductionReferenceProposal
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
@@ -23,6 +23,11 @@ from cti_app.domain.production import (
     ProductionInputSource,
     ProductionRun,
     ProductionStage,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceTier,
 )
 
 
@@ -44,8 +49,13 @@ class _Uow:
         *,
         subject: object | None = None,
         edition: object | None = None,
+        documents: Sequence[object] | None = None,
     ) -> None:
         self.source_collections = _Collections(items)
+        if documents is not None:
+            self.source_documents = SimpleNamespace(
+                list_for_subject=AsyncMock(return_value=list(documents))
+            )
         self.subjects = SimpleNamespace(
             get=AsyncMock(
                 return_value=subject
@@ -432,7 +442,7 @@ async def test_archived_source_outside_snapshot_cannot_make_sources_succeed() ->
 
 
 @pytest.mark.asyncio
-async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
+async def test_q1_collects_only_proposed_urls_by_exact_collection_id() -> None:
     subject_id = uuid4()
     report_url = "https://example.test/q1"
     unrelated = _source(
@@ -469,22 +479,15 @@ async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
     orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
     orchestrator._collection_service = cast(Any, collection_service)
     orchestrator._uow_factory = cast(Any, lambda: _Uow(items))
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title="Q1",
-                url=report_url,
-                canonical_url=report_url,
-                publisher="Publisher",
-                published_at=date(2026, 8, 1),
-                role=SourceRole.INDEPENDENT,
-            ),
-        ),
-        events=(
-            ParsedEvent(
-                local_id="E1", event_date=date(2026, 8, 2), source_ids=("S1",), text="Event"
-            ),
+    proposals = (
+        ProductionReferenceProposal(
+            canonical_url=report_url,
+            title="Q1",
+            publisher="Publisher",
+            published_at=date(2026, 8, 1),
+            role=SourceRole.INDEPENDENT,
+            kind=ProductionReferenceKind.PUBLICATION,
+            relevance_reason="Additional coverage of the subject",
         ),
     )
     run = ProductionRun(
@@ -492,15 +495,17 @@ async def test_q1_collects_only_report_urls_by_exact_collection_id() -> None:
         edition_id=uuid4(),
     )
 
-    result = await orchestrator._integrate_reference_sources(run, report, cast(Any, _Context()))
+    outcome = await orchestrator._collect_reference_proposals(
+        run, proposals, cast(Any, _Context())
+    )
 
     assert collection_service.calls == [q1_collection.id]
-    assert result["archived_sources"] == 1
-    assert result["report"].source_ids() == {"S1"}
+    assert outcome.new_sources == 0
+    assert outcome.warnings == ()
 
 
 @pytest.mark.asyncio
-async def test_supplemental_failure_drops_only_unbacked_events_and_keeps_shared_event() -> None:
+async def test_supplemental_collection_failure_keeps_the_source_in_the_corpus() -> None:
     subject_id = uuid4()
     failed = _source(
         subject_id,
@@ -562,58 +567,40 @@ async def test_supplemental_failure_drops_only_unbacked_events_and_keeps_shared_
     orchestrator._uow_factory = cast(Any, lambda: _Uow(items))
     orchestrator._diagnostics = diagnostics
     orchestrator._correlation_id = "test"
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S3",
-                title="Hatching",
-                url=failed.requested_url,
-                canonical_url=failed.canonical_url,
-                publisher="Hatching",
-                published_at=date(2026, 8, 1),
-                role=SourceRole.INDEPENDENT,
-            ),
-            ParsedSource(
-                local_id="S4",
-                title="Triage",
-                url=archived.requested_url,
-                canonical_url=archived.canonical_url,
-                publisher="Triage",
-                published_at=date(2026, 8, 2),
-                role=SourceRole.INDEPENDENT,
-            ),
+    proposals = (
+        ProductionReferenceProposal(
+            canonical_url=failed.canonical_url,
+            title="Hatching",
+            publisher="Hatching",
+            published_at=date(2026, 8, 1),
+            role=SourceRole.INDEPENDENT,
+            kind=ProductionReferenceKind.PUBLICATION,
+            relevance_reason="Corroboration of the subject",
         ),
-        events=(
-            ParsedEvent(
-                local_id="R1",
-                event_date=date(2026, 8, 1),
-                source_ids=("S3",),
-                text="only failed",
-            ),
-            ParsedEvent(
-                local_id="R2",
-                event_date=date(2026, 8, 2),
-                source_ids=("S3", "S4"),
-                text="shared evidence",
-            ),
+        ProductionReferenceProposal(
+            canonical_url=archived.canonical_url,
+            title="Triage",
+            publisher="Triage",
+            published_at=date(2026, 8, 2),
+            role=SourceRole.INDEPENDENT,
+            kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+            relevance_reason="Sandbox report for the same sample",
         ),
     )
     run = ProductionRun(subject_id=subject_id, edition_id=uuid4())
 
-    result = await orchestrator._integrate_reference_sources(run, report, _Context())
+    outcome = await orchestrator._collect_reference_proposals(run, proposals, _Context())
 
     assert collection_service.retry_calls == [failed.id]
     assert collection_service.collect_calls == [failed.id]
-    assert [event.local_id for event in result["kept_events"]] == ["R2"]
-    assert result["kept_events"][0].source_ids == ("S4",)
-    assert result["report"].source_ids() == {"S4"}
-    assert result["supplemental_collection_failures"][0]["canonical_url"] == failed.canonical_url
-    assert result["supplemental_collection_failures"][0]["failed_retryable"] == 1
+    # A failed collection is a warning, never a dropped source.
+    assert outcome.failures[0]["canonical_url"] == failed.canonical_url
+    assert outcome.failures[0]["failed_retryable"] == 1
     assert any(
         "supplemental_collection_failed:url=https://hatching.example/article:"
         "code=source_collection_no_success:failed_retryable=1:blocked=0:unavailable=0:failed_terminal=0"
         in warning
-        for warning in result["warnings"]
+        for warning in outcome.warnings
     )
     assert any(
         event["event"] == "q1.supplemental_collection_failed"
@@ -622,3 +609,78 @@ async def test_supplemental_failure_drops_only_unbacked_events_and_keeps_shared_
         and event["retry_attempted"] is True
         for event in diagnostics.events
     )
+
+
+@pytest.mark.asyncio
+async def test_references_corpus_keeps_core_identity_and_the_exact_source_document() -> None:
+    subject_id = uuid4()
+    core_url = "https://example.test/core"
+    snapshot = _snapshot(subject_id, core_url)
+    collection = _source(subject_id, core_url, origin=SourceOriginKind.DISCOVERY)
+    used_document = SimpleNamespace(id=uuid4(), decoded_sha256="d" * 64)
+    # A newer history entry for the same URL must never win: the corpus
+    # captures the observation the SourceCollection actually holds.
+    newer_document = SimpleNamespace(id=uuid4(), decoded_sha256="f" * 64)
+    collection.source_document_id = used_document.id
+    other_collection = _source(
+        subject_id,
+        "https://example.test/unavailable",
+        origin=SourceOriginKind.REFERENCE_RESEARCH,
+    )
+    other_collection.state = CollectionState.BLOCKED
+    items = [collection, other_collection]
+    uow = _Uow(items, documents=[newer_document, used_document])
+
+    orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
+    orchestrator._uow_factory = cast(Any, lambda: uow)
+    run = ProductionRun(subject_id=subject_id, edition_id=uuid4())
+    proposals = (
+        ProductionReferenceProposal(
+            canonical_url=other_collection.canonical_url,
+            title="Blocked source",
+            publisher="Publisher",
+            published_at=date(2026, 8, 2),
+            role=SourceRole.INDEPENDENT,
+            kind=ProductionReferenceKind.PUBLICATION,
+            relevance_reason="Additional coverage",
+        ),
+    )
+
+    corpus = await orchestrator._build_reference_corpus(
+        run=run,
+        snapshot=snapshot,
+        research_date=snapshot.research_date,
+        proposals=proposals,
+        warnings=["reference_kind_missing_defaulted_to_publication"],
+    )
+
+    assert [source.tier for source in corpus.sources] == [
+        ProductionReferenceTier.CORE,
+        ProductionReferenceTier.SUPPORTING,
+    ]
+    core = corpus.sources[0]
+    assert core.canonical_url in {source.canonical_url for source in snapshot.core_sources}
+    assert core.role is snapshot.core_sources[0].role
+    assert core.title == snapshot.core_sources[0].title
+    assert core.discovery_candidate_ids == (
+        snapshot.core_sources[0].discovery_candidate_id,
+    )
+    assert core.proposed_by_model is False
+    assert core.source_collection_id == collection.id
+    assert core.source_document_id == used_document.id
+    assert core.content_sha256 == "d" * 64
+    assert core.collection_state is CollectionState.ARCHIVED
+    assert core.eligible_for_extraction is True
+
+    blocked = corpus.sources[1]
+    assert blocked.proposed_by_model is True
+    assert blocked.collection_state is CollectionState.BLOCKED
+    assert blocked.content_sha256 is None
+    assert blocked.eligible_for_extraction is False
+    assert corpus.warnings == (
+        "reference_kind_missing_defaulted_to_publication",
+        f"supporting_source_unavailable:{other_collection.canonical_url}",
+    )
+    assert corpus.production_input_hash == snapshot.input_hash
+    assert corpus.schema_version == 1
+    assert corpus.research_status is ProductionReferenceResearchStatus.COMPLETED

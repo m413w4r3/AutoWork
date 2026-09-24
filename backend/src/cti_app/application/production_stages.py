@@ -20,6 +20,11 @@ from cti_app.application.production_parsers import (
     reference_report_from_json,
     technical_extraction_from_json,
 )
+from cti_app.application.production_references import (
+    load_legacy_reference_report,
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.publication_builder import build_publication_document
 from cti_app.application.semantic_annotation import SEMANTIC_ANNOTATOR_VERSION
@@ -29,13 +34,51 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
 )
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+)
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
+
+# AW-010 contract versions. They participate in the functional REFERENCES
+# identity: a parser or schema change invalidates the stored corpus.
+PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v1"
+PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
 
 
 def compute_input_hash(input_data: dict[str, Any]) -> str:
     """Compute deterministic SHA-256 hash of input data."""
     json_str = json.dumps(input_data, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(json_str.encode()).hexdigest()
+
+
+async def load_reference_projection(
+    store: ProductionArtifactStore,
+    artifact: ProductionArtifact,
+) -> ReferenceReport | None:
+    """Read a REFERENCES artifact as the temporary legacy ``ReferenceReport``.
+
+    This is the single compatibility boundary between the canonical AW-010
+    corpus and the consumers that are not migrated yet (Q2, Synthesis,
+    Assembly, QA, ProductionState V4).
+
+    TODO AW-011/AW-012/AW-013: delete this projection once Extraction consumes
+    ``ProductionReferenceCorpusV1`` directly.
+    """
+    if artifact.canonical_blob_id is None:
+        return None
+    payload = await store.read_json(artifact.canonical_blob_id)
+    try:
+        corpus = production_reference_corpus_from_json(payload)
+    except ValueError:
+        corpus = None
+    if corpus is None:
+        # A V4 imported artifact is a legacy reference report.  It is never
+        # upgraded into a corpus and never presented as one.
+        return reference_report_from_json(payload)
+    if artifact.raw_blob_id is None:
+        return None
+    raw = await store.read_text(artifact.raw_blob_id)
+    return load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
 
 
 class _ArtifactPayloadMixin:
@@ -72,19 +115,46 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         subject_id: UUID,
         input_hash: str,
         raw_result: str,
-        canonical_json: dict[str, Any],
+        corpus: ProductionReferenceCorpusV1,
         model_run_id: UUID | None = None,
-        conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
-        repair_source_index: dict[str, Any] | None = None,
-    ) -> ProductionArtifact:
+    ) -> tuple[ProductionArtifact, bool]:
+        """Persist the RAW wire format and only the canonical corpus.
+
+        The RAW answer is kept because the not-yet-migrated stages rebuild the
+        legacy ``ReferenceReport`` from it; the canonical payload is the
+        versioned corpus and nothing else.
+
+        Returns the artifact and whether a new functional version was created.
+        A rebuild whose corpus is byte-identical to the current one is a no-op.
+        """
+        if not isinstance(corpus, ProductionReferenceCorpusV1):
+            raise ValueError("REFERENCES canonical state must be a ProductionReferenceCorpusV1")
+        canonical_json = production_reference_corpus_to_json(corpus)
+        encoded = ProductionArtifactStore.canonical_json_bytes(canonical_json)
+
         async with self._uow_factory() as uow:
+            current = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.REFERENCES.value
+            )
+            if (
+                current is not None
+                and current.status is ProductionArtifactStatus.VERIFIED
+                and current.input_hash == input_hash
+                and current.canonical_blob_id is not None
+                and self._artifact_store is not None
+            ):
+                stored = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                if stored == encoded:
+                    return current, False
+
             prior_versions = [
                 artifact.version
                 for artifact in await uow.production_artifacts.list_for_run(run_id)
                 if artifact.stage is ProductionArtifactStage.REFERENCES
             ]
             version = max(prior_versions, default=0) + 1
+            counts = _reference_corpus_counts(corpus)
 
             raw_id, canonical_id, _ = await self._store_payloads(
                 raw=raw_result, canonical=canonical_json
@@ -99,18 +169,19 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
                 raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
                 model_run_id=model_run_id,
-                conversation_turn_id=conversation_turn_id,
                 metadata={
-                    "event_count": len(canonical_json.get("events", [])),
-                    "source_count": len(canonical_json.get("sources", [])),
+                    "schema_version": corpus.schema_version,
+                    "core_source_count": counts["core"],
+                    "supporting_source_count": counts["supporting"],
+                    "technical_source_count": counts["technical"],
+                    "eligible_source_count": counts["eligible"],
+                    "unavailable_source_count": len(corpus.sources) - counts["eligible"],
                     "warnings": warnings or [],
-                    "parser_version": canonical_json.get("parser_version"),
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    **(
-                        {"repair_source_index": dict(repair_source_index)}
-                        if repair_source_index is not None
-                        else {}
+                    "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+                    "research_model_run_id": (
+                        str(model_run_id) if model_run_id is not None else None
                     ),
+                    "generated_at": datetime.now(UTC).isoformat(),
                 },
             )
             await uow.production_artifacts.append(artifact)
@@ -120,7 +191,17 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
             )
 
             await uow.commit()
-            return artifact
+            return artifact, True
+
+
+def _reference_corpus_counts(corpus: ProductionReferenceCorpusV1) -> dict[str, int]:
+    """Deterministic tier and eligibility counters for artifact metadata."""
+    counts = {"core": 0, "supporting": 0, "technical": 0, "eligible": 0}
+    for source in corpus.sources:
+        counts[source.tier.value] += 1
+        if source.eligible_for_extraction:
+            counts["eligible"] += 1
+    return counts
 
 
 class ExtractionService(_ArtifactPayloadMixin):
@@ -625,9 +706,9 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             raise ValueError("Extraction artifact has no canonical payload")
         if synthesis_artifact.rendered_blob_id is None:
             raise ValueError("Synthesis artifact has no rendered payload")
-        report = reference_report_from_json(
-            await self._artifact_store.read_json(references_artifact.canonical_blob_id)
-        )
+        report = await load_reference_projection(self._artifact_store, references_artifact)
+        if report is None:
+            raise ValueError("References payload is not readable")
         extraction = technical_extraction_from_json(
             await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
         )
