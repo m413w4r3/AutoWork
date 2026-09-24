@@ -39,12 +39,14 @@ from cti_app.application.http_collection import (
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import (
-    parse_reference_report,
-    reconcile_reference_report_with_archives,
-    reference_report_to_json,
+from cti_app.application.production_references import (
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
 )
-from cti_app.application.production_repairs import ProductionRepairIssueService
+from cti_app.application.production_repairs import (
+    ProductionReferenceRepairService,
+    ProductionRepairIssueService,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.discovery import (
@@ -74,12 +76,20 @@ from cti_app.domain.production import (
     ProductionStage,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+)
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 
 SOURCE_ONE = "https://one.example/report"
 SOURCE_TWO = "https://two.example/report"
+S1_HTML = b"<!doctype html><html><body>First report: ExampleRAT is documented.</body></html>"
 S2_HTML = b"<!doctype html><html><body>Second report: ExampleRAT and evil[.]example.</body></html>"
 
 RAW_Q1 = """# REFERENCES
@@ -102,6 +112,63 @@ date: 2026-08-03
 sources: S2
 text: Second-only event
 """
+
+#: The AW-010 wire format of the same answer: the sources carry their kind and
+#: their relevance reason, and the corpus -- not the EVENT section -- is the
+#: canonical list.
+RAW_Q1_AW010 = """# REFERENCES
+editorial-title: [Publication] ExampleRAT
+## SOURCE S1
+title: First
+url: https://one.example/report
+publisher: One
+published-at: 2026-08-10
+role: independent
+kind: publication
+reason: Documents the ExampleRAT infrastructure
+## SOURCE S2
+title: Second
+url: https://two.example/report
+publisher: Two
+published-at: 2026-08-11
+role: independent
+kind: publication
+reason: Corroborates the ExampleRAT infrastructure
+## EVENT R1
+date: 2026-08-02
+sources: S1, S2
+text: Shared event
+"""
+
+
+def _corpus_source(
+    url: str,
+    *,
+    tier: ProductionReferenceTier,
+    state: CollectionState,
+    digest: str | None = None,
+    title: str | None = None,
+    proposed_by_model: bool = False,
+) -> ProductionReferenceSourceV1:
+    """One canonical corpus source; eligibility follows the capture it holds."""
+    document_identity = uuid4() if digest is not None else None
+    return ProductionReferenceSourceV1(
+        canonical_url=url,
+        tier=tier,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        title=title,
+        publisher="Publisher",
+        published_at=None,
+        source_collection_id=document_identity,
+        source_document_id=document_identity,
+        discovery_candidate_ids=(),
+        collection_state=state,
+        content_sha256=digest,
+        relevance_reason=None if tier is ProductionReferenceTier.CORE else "Adds context",
+        proposed_by_model=proposed_by_model,
+        eligible_for_extraction=digest is not None,
+    )
 
 
 class _NoNetworkResolver:
@@ -600,8 +667,15 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     sources = await collection_service.initialize(subject.id)
     first = next(item for item in sources if item.canonical_url == SOURCE_ONE)
     second = next(item for item in sources if item.canonical_url == SOURCE_TWO)
-    # S1 was collected; S2 failed for good.
-    collection_factory.collections[first.id].state = CollectionState.ARCHIVED
+    # S1 was collected (a real capture, so the corpus can call it eligible);
+    # S2 failed for good.
+    await collection_service.archive_manual_content(
+        first.id,
+        content=S1_HTML,
+        declared_mime_type="text/html",
+        final_url=SOURCE_ONE,
+        actor_id="lot24-analyst",
+    )
     collection_factory.collections[first.id].origin_kind = SourceOriginKind.DISCOVERY
     collection_factory.collections[second.id].state = CollectionState.FAILED_TERMINAL
 
@@ -625,12 +699,34 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     world.gateway = _ExplodingModelGateway()  # type: ignore[attr-defined]
     store = ProductionArtifactStore(world.store_catalog)  # type: ignore[arg-type]
 
-    parsed = parse_reference_report(RAW_Q1, date(2026, 8, 15))
-    assert parsed.value is not None
-    canonical_v1 = reconcile_reference_report_with_archives(parsed.value, {SOURCE_ONE}).report
-    assert {item.local_id for item in canonical_v1.sources} == {"S1"}
+    corpus_v1 = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject.id,
+        research_date=date(2026, 8, 15),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            _corpus_source(
+                SOURCE_ONE,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.ARCHIVED,
+                digest=hashlib.sha256(S1_HTML).hexdigest(),
+                title="First",
+                proposed_by_model=True,
+            ),
+            _corpus_source(
+                SOURCE_TWO,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.UNAVAILABLE,
+                title="Second",
+                proposed_by_model=True,
+            ),
+        ),
+        warnings=("supporting_source_unavailable:https://two.example/report",),
+    )
     raw_id, canonical_id, _ = await store.store_stage_payloads(
-        raw=RAW_Q1, canonical=reference_report_to_json(canonical_v1)
+        raw=RAW_Q1_AW010,
+        canonical=production_reference_corpus_to_json(corpus_v1),
     )
     await world.artifacts.append(
         ProductionArtifact(
@@ -642,15 +738,6 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
             status=ProductionArtifactStatus.VERIFIED,
             raw_blob_id=raw_id,
             canonical_blob_id=canonical_id,
-            metadata={
-                "repair_source_index": {
-                    "proposed": [
-                        {"source_id": "S1", "source_url": SOURCE_ONE, "source_title": "First"},
-                        {"source_id": "S2", "source_url": SOURCE_TWO, "source_title": "Second"},
-                    ],
-                    "canonical": [{"source_id": "S1", "source_url": SOURCE_ONE}],
-                }
-            },
         )
     )
     for stage, digest in (
@@ -660,13 +747,16 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     ):
         await world.artifacts.append(_stage_artifact(run, stage, 1, input_hash=digest * 64))
 
-    # --- 1. The desk shows S2 as an unarchived Q1 proposal. -----------------
+    # --- 1. The desk shows S2 as a corpus source it cannot extract yet. -----
     application = _application(world, collection_service)
     async with _client(application) as client:
         listed = await client.get(f"/api/editions/{edition.id}/review/repairs")
     assert listed.status_code == 200
     body = listed.json()
+    # The corpus is the source authority; the wire label stays display-only.
     assert [item["source_id"] for item in body["items"]] == ["S2"]
+    assert [item["source_url"] for item in body["items"]] == [SOURCE_TWO]
+    assert body["items"][0]["source_title"] == "Second"
     assert body["items"][0]["repair_state"] == SupplementalSourceRepairState.UNARCHIVED
     assert body["items"][0]["resolved"] is False
     assert body["summary"]["sources_to_supply"] == 1
@@ -694,6 +784,7 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     assert len(body["items"]) == 1
     item = body["items"][0]
     assert item["source_id"] == "S2"
+    assert item["source_url"] == SOURCE_TWO
     assert item["repair_state"] == SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES
     assert item["rebuild_required"] is True
     assert item["recommended_stage"] == "rebuild_references"
@@ -726,16 +817,17 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
     )
     assert references_v2 is not None and references_v2.version == 2
     assert references_v2.raw_blob_id == raw_id  # the same archived Q1 answer
-    rebuilt_report = await store.read_json(references_v2.canonical_blob_id)  # type: ignore[arg-type]
-    assert {source["url"] for source in rebuilt_report["sources"]} == {
+    rebuilt_corpus = production_reference_corpus_from_json(
+        await store.read_json(references_v2.canonical_blob_id)  # type: ignore[arg-type]
+    )
+    assert {source.canonical_url for source in rebuilt_corpus.sources} == {
         SOURCE_ONE,
         SOURCE_TWO,
     }
-    # The S2-only event is back too.
-    assert [event["source_ids"] for event in rebuilt_report["events"]] == [
-        ["S1", "S2"],
-        ["S2"],
-    ]
+    # The manual archive is the newer fact: S2 is now extractable, and the
+    # availability warning it used to carry is gone -- never re-served stale.
+    assert all(source.eligible_for_extraction for source in rebuilt_corpus.sources)
+    assert rebuilt_corpus.warnings == ()
     # EXTRACTION and everything after it was staled and re-queued.
     assert all(
         artifact.status is ProductionArtifactStatus.STALE
@@ -781,6 +873,146 @@ async def test_audit4_supplied_source_blocks_publication_until_references_rebuil
 
 
 @pytest.mark.asyncio
+async def test_a_second_rebuild_of_an_unchanged_corpus_allocates_no_new_version(
+    tmp_path: Path,
+) -> None:
+    """AW-010 no-op rebuild: an identical functional corpus keeps its version."""
+    collection_factory = InMemoryCollectionUnitOfWorkFactory()
+    subject, edition = _selected_subject(collection_factory, (SOURCE_ONE, SOURCE_TWO))
+    collection_service = SubjectCollectionService(
+        collection_factory,
+        _collector(),
+        FilesystemBlobStore(tmp_path / "blobs"),
+    )
+    initialized = {
+        collection.canonical_url: collection
+        for collection in await collection_service.initialize(subject.id)
+    }
+    first = initialized[SOURCE_ONE]
+    second = initialized[SOURCE_TWO]
+    await collection_service.archive_manual_content(
+        first.id,
+        content=S1_HTML,
+        declared_mime_type="text/html",
+        final_url=SOURCE_ONE,
+        actor_id="lot24-analyst",
+    )
+    # The repository stores copies: read the durable rows back.
+    first = collection_factory.collections[first.id]
+    second = collection_factory.collections[second.id]
+    document_id = first.source_document_id
+    assert document_id is not None
+    document = collection_factory.documents[document_id]
+
+    run = ProductionRun(
+        subject_id=subject.id,
+        edition_id=edition.id,
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
+        research_date=date(2026, 8, 15),
+    )
+    world = _World(
+        edition=edition,
+        subject_id=subject.id,
+        run=run,
+        collections=collection_factory.collections,
+        documents=collection_factory.documents,
+    )
+    world.store_catalog = _BlobCatalog()  # type: ignore[attr-defined]
+    world.jobs = _Jobs()  # type: ignore[attr-defined]
+    world.dispatcher = _Dispatcher()  # type: ignore[attr-defined]
+    world.gateway = _ExplodingModelGateway()  # type: ignore[attr-defined]
+    store = ProductionArtifactStore(world.store_catalog)  # type: ignore[arg-type]
+
+    # The corpus already holds exactly what the RAW proposes, and the
+    # observation of each source is already the current one.
+    corpus_v1 = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject.id,
+        research_date=date(2026, 8, 15),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url=SOURCE_ONE,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="First",
+                publisher="One",
+                published_at=date(2026, 8, 10),
+                source_collection_id=first.id,
+                source_document_id=document.id,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=document.decoded_sha256,
+                relevance_reason="Documents the ExampleRAT infrastructure",
+                proposed_by_model=True,
+                eligible_for_extraction=True,
+            ),
+            ProductionReferenceSourceV1(
+                canonical_url=SOURCE_TWO,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="Second",
+                publisher="Two",
+                published_at=date(2026, 8, 11),
+                source_collection_id=second.id,
+                source_document_id=None,
+                discovery_candidate_ids=(),
+                collection_state=second.state,
+                content_sha256=None,
+                relevance_reason="Corroborates the ExampleRAT infrastructure",
+                proposed_by_model=True,
+                eligible_for_extraction=False,
+            ),
+        ),
+        warnings=(f"supporting_source_unavailable:{SOURCE_TWO}",),
+    )
+    raw_id, canonical_id, _ = await store.store_stage_payloads(
+        raw=RAW_Q1_AW010,
+        canonical=production_reference_corpus_to_json(corpus_v1),
+    )
+    base = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="a" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        raw_blob_id=raw_id,
+        canonical_blob_id=canonical_id,
+    )
+    await world.artifacts.append(base)
+    for stage, digest in (
+        (ProductionArtifactStage.EXTRACTION, "b"),
+        (ProductionArtifactStage.SYNTHESIS, "c"),
+        (ProductionArtifactStage.PUBLICATION, "d"),
+    ):
+        await world.artifacts.append(_stage_artifact(run, stage, 1, input_hash=digest * 64))
+
+    result = await ProductionReferenceRepairService(world, store).rebuild_from_archived_q1(
+        run.id, actor_id="lot24-analyst"
+    )
+
+    assert result.changed is False
+    assert result.artifact.id == base.id
+    assert [
+        artifact.version
+        for artifact in world.artifacts.items
+        if artifact.stage is ProductionArtifactStage.REFERENCES
+    ] == [1]
+    assert world.gateway.calls == 0
+    assert world.jobs.submitted == []
+    assert all(
+        artifact.status is ProductionArtifactStatus.VERIFIED
+        for artifact in world.artifacts.items
+        if artifact.stage is not ProductionArtifactStage.REFERENCES
+    )
+
+
+@pytest.mark.asyncio
 async def test_audit4_source_without_collection_is_visible_and_preparable(
     tmp_path: Path,
 ) -> None:
@@ -813,6 +1045,34 @@ async def test_audit4_source_without_collection_is_visible_and_preparable(
     world.jobs = _Jobs()  # type: ignore[attr-defined]
     world.dispatcher = _Dispatcher()  # type: ignore[attr-defined]
     world.gateway = _ExplodingModelGateway()  # type: ignore[attr-defined]
+    store = ProductionArtifactStore(world.store_catalog)  # type: ignore[arg-type]
+    corpus_v1 = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject.id,
+        research_date=date(2026, 8, 15),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            _corpus_source(
+                SOURCE_ONE,
+                tier=ProductionReferenceTier.CORE,
+                state=CollectionState.ARCHIVED,
+                digest="1" * 64,
+                title="First",
+            ),
+            _corpus_source(
+                SOURCE_TWO,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.UNAVAILABLE,
+                title="Second",
+                proposed_by_model=True,
+            ),
+        ),
+        warnings=("supporting_source_unavailable:https://two.example/report",),
+    )
+    _, corpus_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(corpus_v1)
+    )
     await world.artifacts.append(
         ProductionArtifact(
             production_run_id=run.id,
@@ -821,15 +1081,7 @@ async def test_audit4_source_without_collection_is_visible_and_preparable(
             version=1,
             input_hash="a" * 64,
             status=ProductionArtifactStatus.VERIFIED,
-            metadata={
-                "repair_source_index": {
-                    "proposed": [
-                        {"source_id": "S1", "source_url": SOURCE_ONE, "source_title": "First"},
-                        {"source_id": "S2", "source_url": SOURCE_TWO, "source_title": "Second"},
-                    ],
-                    "canonical": [{"source_id": "S1", "source_url": SOURCE_ONE}],
-                }
-            },
+            canonical_blob_id=corpus_blob_id,
         )
     )
     await world.artifacts.append(

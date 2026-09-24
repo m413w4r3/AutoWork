@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from time import perf_counter
 from typing import Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -39,7 +39,6 @@ from cti_app.application.production_parsers import (
     Q2SourceOutput,
     ReferenceReport,
     TechnicalExtraction,
-    parse_reference_report,
     reconcile_reference_report_with_archives,
     reference_report_from_json,
     reference_report_to_json,
@@ -51,6 +50,13 @@ from cti_app.application.production_prompts import (
     IOC_RULES_BATCH_PROMPT_VERSION,
 )
 from cti_app.application.production_q2_batch import Q2_BATCH_PARSER_VERSION
+from cti_app.application.production_references import (
+    ProductionReferenceProposal,
+    load_legacy_reference_report,
+    parse_production_reference_proposals,
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
@@ -65,10 +71,12 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
 )
 from cti_app.application.production_stages import (
+    PRODUCTION_REFERENCE_PARSER_VERSION,
     ExtractionService,
     ProductionQAService,
     PublicationAssemblyService,
     compute_input_hash,
+    load_reference_projection,
 )
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
@@ -99,12 +107,27 @@ from cti_app.domain.production import (
     RepairRemediation,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+)
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 REPAIR_PLANNER_VERSION = "33.1"
 MAX_REPAIR_PREVIEW_CHARS = 512
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+#: Collection states whose capture can feed Q2 exactly as ``CollectionState``.
+_ARCHIVED_COLLECTION_STATES = frozenset(
+    {CollectionState.ARCHIVED, CollectionState.EXTRACTED, CollectionState.COMPLETED}
+)
+#: Corpus warnings that restate availability and are therefore recomputed.
+_UNAVAILABLE_WARNING_PREFIXES = (
+    "core_source_unavailable:",
+    "supporting_source_unavailable:",
+)
 
 
 def _sha256(value: str) -> str:
@@ -1694,7 +1717,15 @@ class ProductionRepairIssueService:
     async def list_supplemental_source_issues(
         self, edition_id: UUID, subject_id: UUID | None = None
     ) -> tuple[SupplementalSourceRepairIssue, ...]:
-        """Read unarchived Q1 proposals from raw/canonical reference blobs."""
+        """Read the canonical sources no collection can feed extraction with.
+
+        AW-010 made ``ProductionReferenceCorpusV1`` the authority of the source
+        list: a proposed source is never dropped from the corpus, it is kept
+        with ``eligible_for_extraction = false``.  The desk therefore reads the
+        corpus itself instead of a metadata index.  An artifact whose canonical
+        payload is still the legacy ``ReferenceReport`` (a V4 import) keeps the
+        RAW/canonical projection as its source list.
+        """
         if self._artifact_store is None:
             return ()
 
@@ -1719,9 +1750,7 @@ class ProductionRepairIssueService:
                     collections_by_subject[
                         current_subject_id
                     ] = await collection_repository.list_for_subject(current_subject_id)
-            contexts: list[
-                tuple[Any, Any, Sequence[Any], tuple[list[dict[str, Any]], set[str]] | None]
-            ] = []
+            contexts: list[tuple[Any, Any, Sequence[Any], _ReferenceSourceView]] = []
             for run in runs:
                 if subject_id is not None and run.subject_id != subject_id:
                     continue
@@ -1731,27 +1760,27 @@ class ProductionRepairIssueService:
                 ):
                     continue
                 collections = collections_by_subject.get(run.subject_id, ())
-                contexts.append((run, artifact, collections, _reference_source_index(artifact)))
-            q2_previews: dict[UUID, dict[str, int]] = {}
-            for run, _artifact, collections, source_index in contexts:
-                if source_index is None:
+                view = await self._reference_source_view(
+                    artifact, getattr(run, "research_date", None)
+                )
+                if view is None:
                     continue
-                proposed_sources, canonical_urls = source_index
+                contexts.append((run, artifact, collections, view))
+            q2_previews: dict[UUID, dict[str, int]] = {}
+            for run, _artifact, collections, view in contexts:
                 archived_urls = {
                     str(collection.canonical_url)
                     for collection in collections
                     if _enum_value(getattr(collection, "state", None))
                     in {"archived", "extracted", "completed"}
                 }
-                proposed_urls = {
-                    str(item.get("source_url"))
-                    for item in proposed_sources
-                    if isinstance(item, dict) and item.get("source_url")
+                source_urls = set(view.canonical_urls) | {
+                    candidate.canonical_url for candidate in view.candidates
                 }
                 q2_previews[run.id] = await _q2_reuse_preview(
                     uow,
                     run=run,
-                    source_urls=sorted((set(canonical_urls) | proposed_urls) & archived_urls),
+                    source_urls=sorted(source_urls & archived_urls),
                     collections=collections,
                 )
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
@@ -1761,45 +1790,15 @@ class ProductionRepairIssueService:
         }
         issues: list[SupplementalSourceRepairIssue] = []
         preview_assigned: set[UUID] = set()
-        for run, artifact, collections, source_index in contexts:
-            if source_index is not None:
-                proposed_sources, canonical_urls = source_index
-            else:
-                if artifact.raw_blob_id is None or artifact.canonical_blob_id is None:
-                    continue
-                research_date = getattr(run, "research_date", None)
-                if research_date is None:
-                    continue
-                try:
-                    raw = await self._artifact_store.read_text(artifact.raw_blob_id)
-                    proposed_result = parse_reference_report(raw, research_date)
-                    if not proposed_result.usable or proposed_result.value is None:
-                        continue
-                    canonical = reference_report_from_json(
-                        await self._artifact_store.read_json(artifact.canonical_blob_id)
-                    )
-                except Exception:
-                    # A read endpoint must not turn one corrupt historical payload
-                    # into a 500 for every other Repair Desk issue.
-                    continue
-                proposed_sources = [
-                    {
-                        "source_id": source.local_id,
-                        "source_title": source.title,
-                        "source_url": source.canonical_url,
-                        "publisher": source.publisher,
-                    }
-                    for source in proposed_result.value.sources
-                ]
-                canonical_urls = {source.canonical_url for source in canonical.sources}
+        for run, artifact, collections, view in contexts:
             collections_by_url = {
                 collection.canonical_url: collection
                 for collection in collections
                 if getattr(collection, "canonical_url", None)
             }
-            for source in proposed_sources:
-                source_url = str(source.get("source_url", ""))
-                if not source_url or source_url in canonical_urls:
+            for candidate in view.candidates:
+                source_url = candidate.canonical_url
+                if not source_url:
                     continue
                 collection = collections_by_url.get(source_url)
                 repair_key = repair_key_for_supplemental_source(
@@ -1824,14 +1823,10 @@ class ProductionRepairIssueService:
                     SupplementalSourceRepairIssue(
                         repair_key=repair_key,
                         kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
-                        source_id=str(source.get("source_id", "")),
-                        source_title=str(source.get("source_title", "")),
+                        source_id=candidate.identity,
+                        source_title=candidate.title or "",
                         source_url=source_url,
-                        publisher=(
-                            str(source["publisher"])
-                            if source.get("publisher") is not None
-                            else None
-                        ),
+                        publisher=candidate.publisher,
                         collection_id=(
                             getattr(collection, "id", None) if collection is not None else None
                         ),
@@ -1860,6 +1855,99 @@ class ProductionRepairIssueService:
                     )
                 )
         return tuple(sorted(issues, key=lambda item: (item.source_url, item.source_id)))
+
+    async def _reference_source_view(
+        self, artifact: Any, research_date: date | None
+    ) -> _ReferenceSourceView | None:
+        """Read one REFERENCES artifact as its canonical source list.
+
+        An AW-010 corpus is read directly: every source it holds, eligible or
+        not, is canonical, and the ones that cannot feed extraction are exactly
+        the candidates the desk owes a decision.  A V4 import carries the
+        legacy ``ReferenceReport`` instead; it keeps the RAW + canonical
+        projection as its source list and is never upgraded into a corpus.
+
+        Returns ``None`` when the payload is unreadable: a read endpoint must
+        not turn one corrupt historical payload into a 500 for every other
+        Repair Desk issue.
+        """
+        store = self._artifact_store
+        if store is None or artifact.canonical_blob_id is None:
+            return None
+        try:
+            payload = await store.read_json(artifact.canonical_blob_id)
+        except Exception:
+            return None
+        try:
+            corpus = production_reference_corpus_from_json(payload)
+        except ValueError:
+            return await self._legacy_reference_source_view(artifact, payload, research_date)
+        labels = await self._raw_reference_labels(artifact, research_date)
+        return _ReferenceSourceView(
+            candidates=tuple(
+                _ReferenceCandidateSource(
+                    canonical_url=source.canonical_url,
+                    identity=labels.get(source.canonical_url) or source.tier.value,
+                    title=source.title,
+                    publisher=source.publisher,
+                )
+                for source in corpus.sources
+                if not source.eligible_for_extraction
+            ),
+            canonical_urls=frozenset(source.canonical_url for source in corpus.sources),
+        )
+
+    async def _raw_reference_labels(
+        self, artifact: Any, research_date: date | None
+    ) -> dict[str, str]:
+        """Recover the wire label of each SOURCE block, display metadata only.
+
+        The label ("S1", "S2") is the model's own block name: it is never an
+        authority and never the identity of a corpus source, which is why a
+        URL the RAW does not name falls back to its tier.  The RAW is read
+        through the single compatibility boundary, and an unreadable RAW
+        simply yields no labels.
+        """
+        store = self._artifact_store
+        if store is None or artifact.raw_blob_id is None or research_date is None:
+            return {}
+        try:
+            raw = await store.read_text(artifact.raw_blob_id)
+            proposed = load_legacy_reference_report(raw, research_date, legacy_imported=True)
+        except Exception:
+            return {}
+        return {source.canonical_url: source.local_id for source in proposed.sources}
+
+    async def _legacy_reference_source_view(
+        self,
+        artifact: Any,
+        payload: dict[str, Any],
+        research_date: date | None,
+    ) -> _ReferenceSourceView | None:
+        """Legacy compatibility: the RAW proposals missing from the report."""
+        store = self._artifact_store
+        if store is None or artifact.raw_blob_id is None or research_date is None:
+            return None
+        try:
+            report = reference_report_from_json(payload)
+            raw = await store.read_text(artifact.raw_blob_id)
+            proposed = load_legacy_reference_report(raw, research_date, legacy_imported=True)
+        except Exception:
+            return None
+        canonical_urls = frozenset(source.canonical_url for source in report.sources)
+        return _ReferenceSourceView(
+            candidates=tuple(
+                _ReferenceCandidateSource(
+                    canonical_url=source.canonical_url,
+                    identity=source.local_id,
+                    title=source.title,
+                    publisher=source.publisher,
+                )
+                for source in proposed.sources
+                if source.canonical_url not in canonical_urls
+            ),
+            canonical_urls=canonical_urls,
+        )
 
     async def get_supplemental_source_issue(
         self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
@@ -2860,10 +2948,12 @@ class ProductionRepairProjectionService:
         if references is None or references.canonical_blob_id is None:
             return hashes
         try:
-            report = reference_report_from_json(
-                await self._artifact_store.read_json(references.canonical_blob_id)
-            )
+            # The one compatibility boundary: an AW-010 corpus is projected
+            # through its RAW, an imported legacy artifact is already a report.
+            report = await load_reference_projection(self._artifact_store, references)
         except Exception:
+            return hashes
+        if report is None:
             return hashes
 
         source_tiers_by_url: dict[str, str] = {}
@@ -4836,35 +4926,24 @@ def _is_archived_collection(collection: Any) -> bool:
     }
 
 
-def _reference_source_index(
-    artifact: Any,
-) -> tuple[list[dict[str, Any]], set[str]] | None:
-    """Read the bounded Q1 proposal/canonical index from artifact metadata."""
-    metadata = getattr(artifact, "metadata", {}) or {}
-    index = metadata.get("repair_source_index") if isinstance(metadata, dict) else None
-    if not isinstance(index, dict):
-        return None
-    proposed_raw = index.get("proposed")
-    canonical_raw = index.get("canonical")
-    if not isinstance(proposed_raw, list) or not isinstance(canonical_raw, list):
-        return None
+@dataclass(frozen=True, slots=True)
+class _ReferenceCandidateSource:
+    """One canonical source that cannot feed extraction yet."""
 
-    proposed: list[dict[str, Any]] = []
-    for value in proposed_raw:
-        if not isinstance(value, dict):
-            continue
-        source_url = value.get("source_url")
-        source_id = value.get("source_id")
-        if not isinstance(source_url, str) or not isinstance(source_id, str):
-            continue
-        proposed.append(dict(value))
+    canonical_url: str
+    #: What the desk may show as provenance. AW-010 has no local source ids:
+    #: the corpus tier is the identity, and "S1"/"S2" never is.
+    identity: str
+    title: str | None
+    publisher: str | None
 
-    canonical_urls: set[str] = set()
-    for value in canonical_raw:
-        source_url = value.get("source_url") if isinstance(value, dict) else value
-        if isinstance(source_url, str) and source_url:
-            canonical_urls.add(source_url)
-    return proposed, canonical_urls
+
+@dataclass(frozen=True, slots=True)
+class _ReferenceSourceView:
+    """The canonical source list of one REFERENCES artifact."""
+
+    candidates: tuple[_ReferenceCandidateSource, ...]
+    canonical_urls: frozenset[str]
 
 
 def _issue_record(
@@ -5068,159 +5147,327 @@ class ProductionReferenceRepairService:
 
             try:
                 raw_q1 = await self._artifact_store.read_text(base.raw_blob_id)
-                proposed = parse_reference_report(raw_q1, run.research_date)
-                canonical = reference_report_from_json(
-                    await self._artifact_store.read_json(base.canonical_blob_id)
-                )
+                canonical_payload = await self._artifact_store.read_json(base.canonical_blob_id)
             except Exception as exc:
                 raise ProductionReferenceRepairError(
                     "references_payload_unavailable", str(exc)
                 ) from exc
-            if not proposed.usable or proposed.value is None:
-                raise ProductionReferenceRepairError(
-                    "references_raw_unusable",
-                    "; ".join(proposed.errors) or "The archived Q1 response is unusable",
-                )
-
-            archived_projection = await _archived_source_projection(uow, run.subject_id)
-            reconciliation = reconcile_reference_report_with_archives(
-                proposed.value,
-                {item[0] for item in archived_projection},
-                previous_canonical_report=canonical,
-            )
-            source_delta = await _source_delta(
-                uow,
-                previous_report=canonical,
-                current_report=reconciliation.report,
-                archived_projection=archived_projection,
-                base_artifact=base,
-            )
-            has_source_delta = any(
-                source_delta[key]
-                for key in ("added_sources", "removed_sources", "changed_content_sources")
-            )
-            if reconciliation.report == canonical and not has_source_delta:
-                await uow.commit()
-                return ProductionReferenceRepairResult(
-                    artifact=base,
-                    changed=False,
-                    source_delta=source_delta,
-                )
-
-            derived_input_hash = compute_input_hash(
-                {
-                    "repair_projection_version": self._REPAIR_PROJECTION_VERSION,
-                    "base_references_artifact_id": str(base.id),
-                    "base_input_hash": base.input_hash,
-                    "archived_sources": [list(item) for item in archived_projection],
-                }
-            )
-            canonical_json = reference_report_to_json(reconciliation.report)
             try:
-                canonical_blob_id, _ = await self._artifact_store.put_canonical_json(
-                    canonical_json, bucket=self._CANONICAL_BUCKET
+                corpus = production_reference_corpus_from_json(canonical_payload)
+            except ValueError:
+                corpus = None
+            if corpus is None:
+                # A V4 import is a legacy ReferenceReport, not a corpus.  It is
+                # rebuilt in the contract it was written in and never upgraded
+                # with an invented collection identity.
+                return await self._rebuild_legacy_reference_report(
+                    uow, run=run, base=base, raw=raw_q1, actor_id=actor_id
                 )
-            except Exception as exc:
-                raise ProductionReferenceRepairError(
-                    "production_repair_storage_unavailable", str(exc)
-                ) from exc
+            return await self._rebuild_reference_corpus(
+                uow, run=run, base=base, raw=raw_q1, corpus=corpus, actor_id=actor_id
+            )
 
-            prior_versions = [
-                artifact.version
-                for artifact in await uow.production_artifacts.list_for_run(run.id)
-                if artifact.stage is ProductionArtifactStage.REFERENCES
-            ]
-            generated_at = datetime.now(UTC)
-            base_warnings = base.metadata.get("warnings", [])
-            if not isinstance(base_warnings, list):
-                base_warnings = []
-            repair_source_index = None
-            base_source_index = base.metadata.get("repair_source_index")
-            if isinstance(base_source_index, dict) and isinstance(
-                base_source_index.get("proposed"), list
-            ):
-                repair_source_index = {
-                    "proposed": [
-                        dict(item)
-                        for item in base_source_index["proposed"]
-                        if isinstance(item, dict)
-                    ],
-                    "canonical": [
-                        {
-                            "source_id": source.local_id,
-                            "source_url": source.canonical_url,
-                        }
-                        for source in reconciliation.report.sources
-                    ],
-                    "source_hashes": {url: digest for url, digest in archived_projection if digest},
-                }
-            artifact = ProductionArtifact(
-                production_run_id=run.id,
-                subject_id=run.subject_id,
-                stage=ProductionArtifactStage.REFERENCES,
-                version=max(prior_versions, default=0) + 1,
-                input_hash=derived_input_hash,
-                status=ProductionArtifactStatus.VERIFIED,
-                raw_blob_id=base.raw_blob_id,
-                canonical_blob_id=canonical_blob_id,
-                model_run_id=base.model_run_id,
-                conversation_turn_id=base.conversation_turn_id,
-                metadata={
-                    "event_count": len(reconciliation.report.events),
-                    "source_count": len(reconciliation.report.sources),
-                    "warnings": list(base_warnings),
-                    "parser_version": canonical_json.get("parser_version"),
-                    "generated_at": generated_at.isoformat(),
-                    "derived_repair": True,
-                    "repaired_from_artifact_id": str(base.id),
-                    "repair_kind": "reference_reconciliation",
-                    "actor_id": actor_id,
-                    "restored_source_ids": list(reconciliation.restored_source_ids),
-                    "restored_event_ids": list(reconciliation.restored_event_ids),
-                    "dropped_source_ids": list(reconciliation.dropped_source_ids),
-                    "dropped_event_ids": list(reconciliation.dropped_event_ids),
-                    "archived_sources": [list(item) for item in archived_projection],
-                    "source_delta": source_delta,
-                    "added_sources": [
-                        item["canonical_url"] for item in source_delta["added_sources"]
-                    ],
-                    "removed_sources": [
-                        item["canonical_url"] for item in source_delta["removed_sources"]
-                    ],
-                    "unchanged_sources": [
-                        item["canonical_url"] for item in source_delta["unchanged_sources"]
-                    ],
-                    "changed_content_sources": [
-                        item["canonical_url"] for item in source_delta["changed_content_sources"]
-                    ],
-                    "unknown_baseline_sources": [
-                        item["canonical_url"] for item in source_delta["unknown_baseline_sources"]
-                    ],
-                    **(
-                        {"repair_source_index": repair_source_index}
-                        if repair_source_index is not None
-                        else {}
-                    ),
-                },
-            )
-            await uow.production_artifacts.append(artifact)
-            await uow.production_artifacts.mark_downstream_stale(
-                run.id, ProductionArtifactStage.REFERENCES.value
-            )
-            # Same invariant as the Extraction repair: the deliverable this run
-            # published is gone, so the run cannot keep claiming READY. The
-            # transition rides the stale's transaction.
-            await _require_publication_rebuild(
-                uow, run, retry_stage=ProductionStage.EXTRACTION.value
-            )
+    async def _rebuild_reference_corpus(
+        self,
+        uow: Any,
+        *,
+        run: Any,
+        base: ProductionArtifact,
+        raw: str,
+        corpus: ProductionReferenceCorpusV1,
+        actor_id: str,
+    ) -> ProductionReferenceRepairResult:
+        """Rebuild the canonical corpus from RAW, the previous corpus and collection.
+
+        No model call is ever needed: the RAW answer is already archived, and
+        the manual archive the analyst performed is exactly the newer fact this
+        rebuild has to observe.  A source the analyst never supplied keeps its
+        place in the corpus with ``eligible_for_extraction = false``.
+        """
+        store = self._artifact_store
+        if store is None:
+            raise ProductionReferenceRepairError("production_repair_storage_unavailable")
+
+        parsed = parse_production_reference_proposals(raw, corpus.research_date)
+        snapshot = await _references_input_snapshot(uow, run.id)
+        core_sources = tuple(getattr(snapshot, "core_sources", ()) or ())
+        urls = {source.canonical_url for source in corpus.sources}
+        urls.update(proposal.canonical_url for proposal in (parsed.value or ()))
+        urls.update(str(source.canonical_url) for source in core_sources)
+        observations = await _reference_collection_observations(uow, run.subject_id, sorted(urls))
+        sources = _rebuilt_reference_corpus_sources(
+            core_sources=core_sources,
+            previous=corpus,
+            proposals=parsed.value or (),
+            observations=observations,
+        )
+        snapshot_hash = getattr(snapshot, "input_hash", None)
+        rebuilt = ProductionReferenceCorpusV1(
+            schema_version=corpus.schema_version,
+            subject_id=corpus.subject_id,
+            research_date=corpus.research_date,
+            production_input_hash=(
+                snapshot_hash if isinstance(snapshot_hash, str) else corpus.production_input_hash
+            ),
+            research_status=corpus.research_status,
+            sources=sources,
+            warnings=(
+                *(
+                    warning
+                    for warning in corpus.warnings
+                    if not warning.startswith(_UNAVAILABLE_WARNING_PREFIXES)
+                ),
+                *_reference_availability_warnings(sources),
+            ),
+        )
+
+        archived_projection = await _archived_source_projection(uow, run.subject_id)
+        source_delta = await _source_delta(
+            uow,
+            previous_urls=[source.canonical_url for source in corpus.sources],
+            current_urls=[source.canonical_url for source in rebuilt.sources],
+            previous_hashes=_corpus_source_hashes(corpus),
+            current_hashes={url: digest or None for url, digest in archived_projection},
+        )
+        has_source_delta = any(
+            source_delta[key]
+            for key in ("added_sources", "removed_sources", "changed_content_sources")
+        )
+        if rebuilt == corpus and not has_source_delta:
+            # Same functional corpus: never an artificial V+1.
             await uow.commit()
             return ProductionReferenceRepairResult(
-                artifact=artifact,
-                changed=True,
-                restored_source_ids=reconciliation.restored_source_ids,
-                restored_event_ids=reconciliation.restored_event_ids,
+                artifact=base,
+                changed=False,
                 source_delta=source_delta,
             )
+
+        restored_source_urls = tuple(
+            source.canonical_url
+            for source in rebuilt.sources
+            if source.eligible_for_extraction
+            and not _corpus_source_is_eligible(corpus, source.canonical_url)
+        )
+        derived_input_hash = compute_input_hash(
+            {
+                "repair_projection_version": self._REPAIR_PROJECTION_VERSION,
+                "base_references_artifact_id": str(base.id),
+                "base_input_hash": base.input_hash,
+                "archived_sources": [list(item) for item in archived_projection],
+            }
+        )
+        canonical_json = production_reference_corpus_to_json(rebuilt)
+        try:
+            canonical_blob_id, _ = await store.put_canonical_json(
+                canonical_json, bucket=self._CANONICAL_BUCKET
+            )
+        except Exception as exc:
+            raise ProductionReferenceRepairError(
+                "production_repair_storage_unavailable", str(exc)
+            ) from exc
+
+        prior_versions = [
+            artifact.version
+            for artifact in await uow.production_artifacts.list_for_run(run.id)
+            if artifact.stage is ProductionArtifactStage.REFERENCES
+        ]
+        generated_at = datetime.now(UTC)
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=ProductionArtifactStage.REFERENCES,
+            version=max(prior_versions, default=0) + 1,
+            input_hash=derived_input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=base.raw_blob_id,
+            canonical_blob_id=canonical_blob_id,
+            model_run_id=base.model_run_id,
+            conversation_turn_id=base.conversation_turn_id,
+            metadata={
+                **_reference_corpus_metadata(rebuilt),
+                "warnings": list(rebuilt.warnings),
+                "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+                "research_model_run_id": (
+                    str(base.model_run_id) if base.model_run_id is not None else None
+                ),
+                "generated_at": generated_at.isoformat(),
+                "derived_repair": True,
+                "repaired_from_artifact_id": str(base.id),
+                "repair_kind": "reference_corpus_reconciliation",
+                "actor_id": actor_id,
+                "restored_source_urls": list(restored_source_urls),
+                "archived_sources": [list(item) for item in archived_projection],
+                "source_delta": source_delta,
+                "added_sources": [item["canonical_url"] for item in source_delta["added_sources"]],
+                "removed_sources": [
+                    item["canonical_url"] for item in source_delta["removed_sources"]
+                ],
+                "unchanged_sources": [
+                    item["canonical_url"] for item in source_delta["unchanged_sources"]
+                ],
+                "changed_content_sources": [
+                    item["canonical_url"] for item in source_delta["changed_content_sources"]
+                ],
+                "unknown_baseline_sources": [
+                    item["canonical_url"] for item in source_delta["unknown_baseline_sources"]
+                ],
+            },
+        )
+        await uow.production_artifacts.append(artifact)
+        await uow.production_artifacts.mark_downstream_stale(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        # Same invariant as the Extraction repair: the deliverable this run
+        # published is gone, so the run cannot keep claiming READY. The
+        # transition rides the stale's transaction.
+        await _require_publication_rebuild(uow, run, retry_stage=ProductionStage.EXTRACTION.value)
+        await uow.commit()
+        return ProductionReferenceRepairResult(
+            artifact=artifact,
+            changed=True,
+            restored_source_ids=restored_source_urls,
+            source_delta=source_delta,
+        )
+
+    async def _rebuild_legacy_reference_report(
+        self,
+        uow: Any,
+        *,
+        run: Any,
+        base: ProductionArtifact,
+        raw: str,
+        actor_id: str,
+    ) -> ProductionReferenceRepairResult:
+        """Rebuild a pre-AW-010 artifact in the contract it was written in.
+
+        TODO AW-012/AW-013: delete this path with the legacy projection.  An
+        imported V4 artifact is never presented as a corpus and its missing
+        ``tier``/``collection_state``/``content_sha256`` are never invented.
+        """
+        store = self._artifact_store
+        if store is None:
+            raise ProductionReferenceRepairError("production_repair_storage_unavailable")
+        try:
+            proposed = load_legacy_reference_report(raw, run.research_date, legacy_imported=True)
+        except Exception as exc:
+            raise ProductionReferenceRepairError("references_raw_unusable", str(exc)) from exc
+        try:
+            canonical = reference_report_from_json(
+                await store.read_json(cast(UUID, base.canonical_blob_id))
+            )
+        except Exception as exc:
+            raise ProductionReferenceRepairError(
+                "references_payload_unavailable", str(exc)
+            ) from exc
+
+        archived_projection = await _archived_source_projection(uow, run.subject_id)
+        reconciliation = reconcile_reference_report_with_archives(
+            proposed,
+            {item[0] for item in archived_projection},
+            previous_canonical_report=canonical,
+        )
+        source_delta = await _source_delta(
+            uow,
+            previous_urls=[source.canonical_url for source in canonical.sources],
+            current_urls=[source.canonical_url for source in reconciliation.report.sources],
+            previous_hashes=_legacy_source_hashes(base),
+            current_hashes={url: digest or None for url, digest in archived_projection},
+        )
+        has_source_delta = any(
+            source_delta[key]
+            for key in ("added_sources", "removed_sources", "changed_content_sources")
+        )
+        if reconciliation.report == canonical and not has_source_delta:
+            await uow.commit()
+            return ProductionReferenceRepairResult(
+                artifact=base,
+                changed=False,
+                source_delta=source_delta,
+            )
+
+        derived_input_hash = compute_input_hash(
+            {
+                "repair_projection_version": self._REPAIR_PROJECTION_VERSION,
+                "base_references_artifact_id": str(base.id),
+                "base_input_hash": base.input_hash,
+                "archived_sources": [list(item) for item in archived_projection],
+            }
+        )
+        canonical_json = reference_report_to_json(reconciliation.report)
+        try:
+            canonical_blob_id, _ = await store.put_canonical_json(
+                canonical_json, bucket=self._CANONICAL_BUCKET
+            )
+        except Exception as exc:
+            raise ProductionReferenceRepairError(
+                "production_repair_storage_unavailable", str(exc)
+            ) from exc
+
+        prior_versions = [
+            artifact.version
+            for artifact in await uow.production_artifacts.list_for_run(run.id)
+            if artifact.stage is ProductionArtifactStage.REFERENCES
+        ]
+        generated_at = datetime.now(UTC)
+        base_warnings = base.metadata.get("warnings", [])
+        if not isinstance(base_warnings, list):
+            base_warnings = []
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=ProductionArtifactStage.REFERENCES,
+            version=max(prior_versions, default=0) + 1,
+            input_hash=derived_input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=base.raw_blob_id,
+            canonical_blob_id=canonical_blob_id,
+            model_run_id=base.model_run_id,
+            conversation_turn_id=base.conversation_turn_id,
+            metadata={
+                "event_count": len(reconciliation.report.events),
+                "source_count": len(reconciliation.report.sources),
+                "warnings": list(base_warnings),
+                "parser_version": canonical_json.get("parser_version"),
+                "generated_at": generated_at.isoformat(),
+                "derived_repair": True,
+                "legacy_reference_report": True,
+                "repaired_from_artifact_id": str(base.id),
+                "repair_kind": "reference_reconciliation",
+                "actor_id": actor_id,
+                "restored_source_ids": list(reconciliation.restored_source_ids),
+                "restored_event_ids": list(reconciliation.restored_event_ids),
+                "dropped_source_ids": list(reconciliation.dropped_source_ids),
+                "dropped_event_ids": list(reconciliation.dropped_event_ids),
+                "archived_sources": [list(item) for item in archived_projection],
+                "source_delta": source_delta,
+                "added_sources": [item["canonical_url"] for item in source_delta["added_sources"]],
+                "removed_sources": [
+                    item["canonical_url"] for item in source_delta["removed_sources"]
+                ],
+                "unchanged_sources": [
+                    item["canonical_url"] for item in source_delta["unchanged_sources"]
+                ],
+                "changed_content_sources": [
+                    item["canonical_url"] for item in source_delta["changed_content_sources"]
+                ],
+                "unknown_baseline_sources": [
+                    item["canonical_url"] for item in source_delta["unknown_baseline_sources"]
+                ],
+            },
+        )
+        await uow.production_artifacts.append(artifact)
+        await uow.production_artifacts.mark_downstream_stale(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        await _require_publication_rebuild(uow, run, retry_stage=ProductionStage.EXTRACTION.value)
+        await uow.commit()
+        return ProductionReferenceRepairResult(
+            artifact=artifact,
+            changed=True,
+            restored_source_ids=reconciliation.restored_source_ids,
+            restored_event_ids=reconciliation.restored_event_ids,
+            source_delta=source_delta,
+        )
 
 
 async def _archived_source_projection(uow: Any, subject_id: UUID) -> tuple[tuple[str, str], ...]:
@@ -5260,54 +5507,33 @@ async def _archived_source_projection(uow: Any, subject_id: UUID) -> tuple[tuple
 async def _source_delta(
     uow: Any,
     *,
-    previous_report: ReferenceReport,
-    current_report: ReferenceReport,
-    archived_projection: Sequence[tuple[str, str]],
-    base_artifact: ProductionArtifact,
+    previous_urls: Sequence[str],
+    current_urls: Sequence[str],
+    previous_hashes: Mapping[str, str | None],
+    current_hashes: Mapping[str, str | None],
 ) -> dict[str, list[dict[str, str | None]]]:
-    """Compare REFERENCES sources by canonical URL and archived content hash."""
-    current_hashes = {url: digest or None for url, digest in archived_projection}
-    previous_hashes: dict[str, str | None] = {}
-    metadata = base_artifact.metadata if isinstance(base_artifact.metadata, dict) else {}
-    source_index = metadata.get("repair_source_index")
-    historical_hashes = (
-        source_index.get("source_hashes") if isinstance(source_index, dict) else None
-    )
-    if isinstance(historical_hashes, dict):
-        previous_hashes.update(
-            {
-                str(url): str(value).casefold()
-                for url, value in historical_hashes.items()
-                if isinstance(url, str) and isinstance(value, str) and _is_sha256(value)
-            }
-        )
-    archived_sources = metadata.get("archived_sources")
-    if isinstance(archived_sources, list):
-        for item in archived_sources:
-            if (
-                isinstance(item, list | tuple)
-                and len(item) == 2
-                and isinstance(item[0], str)
-                and isinstance(item[1], str)
-                and _is_sha256(item[1])
-            ):
-                previous_hashes.setdefault(item[0], item[1].casefold())
+    """Compare REFERENCES sources by canonical URL and recorded content hash.
 
-    # The baseline is deliberately NOT completed from ``source_extractions``:
-    # that table is content-addressed and shared by every subject, so an
-    # arbitrary row for the same URL may describe another edition's capture.
-    # Attributing it to this subject would report "content changed" for a
-    # source this subject never captured differently. When this subject holds
-    # no recorded baseline, the honest answer is "unknown", below.
+    ``previous_hashes`` is what the artifact itself recorded for each source
+    (the corpus ``content_sha256``, or the legacy metadata of a V4 import) and
+    ``current_hashes`` what this subject holds now.
 
-    previous_urls = {source.canonical_url for source in previous_report.sources}
-    current_urls = {source.canonical_url for source in current_report.sources}
-    added = sorted(current_urls - previous_urls)
-    removed = sorted(previous_urls - current_urls)
+    The baseline is deliberately NOT completed from ``source_extractions``:
+    that table is content-addressed and shared by every subject, so an
+    arbitrary row for the same URL may describe another edition's capture.
+    Attributing it to this subject would report "content changed" for a source
+    this subject never captured differently. When no baseline was recorded, the
+    honest answer is "unknown", below.
+    """
+    del uow  # no repository may be consulted for a baseline
+    previous = set(previous_urls)
+    current = set(current_urls)
+    added = sorted(current - previous)
+    removed = sorted(previous - current)
     unchanged: list[dict[str, str | None]] = []
     changed: list[dict[str, str | None]] = []
     unknown_baseline: list[dict[str, str | None]] = []
-    for url in sorted(previous_urls & current_urls):
+    for url in sorted(previous & current):
         previous_sha = previous_hashes.get(url)
         current_sha = current_hashes.get(url)
         entry = {
@@ -5346,6 +5572,219 @@ async def _source_delta(
         "unchanged_sources": unchanged,
         "changed_content_sources": changed,
         "unknown_baseline_sources": unknown_baseline,
+    }
+
+
+def _corpus_source_hashes(corpus: ProductionReferenceCorpusV1) -> dict[str, str | None]:
+    """The capture each canonical URL recorded into the corpus, or None."""
+    return {source.canonical_url: source.content_sha256 for source in corpus.sources}
+
+
+def _corpus_source_is_eligible(corpus: ProductionReferenceCorpusV1, url: str) -> bool:
+    return any(
+        source.canonical_url == url and source.eligible_for_extraction for source in corpus.sources
+    )
+
+
+def _legacy_source_hashes(base_artifact: ProductionArtifact) -> dict[str, str | None]:
+    """The per-source baseline a pre-AW-010 artifact recorded in its metadata."""
+    hashes: dict[str, str | None] = {}
+    metadata = base_artifact.metadata if isinstance(base_artifact.metadata, dict) else {}
+    archived_sources = metadata.get("archived_sources")
+    if isinstance(archived_sources, list):
+        for item in archived_sources:
+            if (
+                isinstance(item, list | tuple)
+                and len(item) == 2
+                and isinstance(item[0], str)
+                and isinstance(item[1], str)
+                and _is_sha256(item[1])
+            ):
+                hashes.setdefault(item[0], item[1].casefold())
+    return hashes
+
+
+async def _references_input_snapshot(uow: Any, run_id: UUID) -> Any | None:
+    """Read the immutable run input the corpus proves it was computed from."""
+    snapshots = getattr(uow, "production_input_snapshots", None)
+    getter = getattr(snapshots, "get_by_run", None)
+    if snapshots is None or not callable(getter):
+        return None
+    return await getter(run_id)
+
+
+@dataclass(frozen=True, slots=True)
+class _CollectionObservation:
+    """The exact SourceCollection/SourceDocument behind one corpus source."""
+
+    collection_id: UUID | None = None
+    state: CollectionState = CollectionState.UNAVAILABLE
+    source_document_id: UUID | None = None
+    content_sha256: str | None = None
+
+    @property
+    def eligible_for_extraction(self) -> bool:
+        return (
+            self.state in _ARCHIVED_COLLECTION_STATES
+            and self.source_document_id is not None
+            and self.content_sha256 is not None
+        )
+
+
+async def _reference_collection_observations(
+    uow: Any, subject_id: UUID, urls: Sequence[str]
+) -> dict[str, _CollectionObservation]:
+    """Read the collection state each canonical URL really holds right now.
+
+    The corpus captures the ``SourceDocument`` attached to the exact
+    ``SourceCollection`` of this subject -- never the most recent document that
+    happens to share the URL.  Nothing is inferred from the URL itself.
+    """
+    observations = {url: _CollectionObservation() for url in urls}
+    collections_repository = getattr(uow, "source_collections", None)
+    list_collections = getattr(collections_repository, "list_for_subject", None)
+    if not callable(list_collections):
+        return observations
+    documents_repository = getattr(uow, "source_documents", None)
+    list_documents = getattr(documents_repository, "list_for_subject", None)
+    collections = await list_collections(subject_id)
+    documents = await list_documents(subject_id) if callable(list_documents) else ()
+    documents_by_id = {getattr(document, "id", None): document for document in documents}
+    collections_by_url: dict[str, Any] = {}
+    for collection in collections:
+        canonical_url = getattr(collection, "canonical_url", None)
+        if isinstance(canonical_url, str):
+            collections_by_url.setdefault(canonical_url, collection)
+    for url in urls:
+        collection = collections_by_url.get(url)
+        if collection is None:
+            continue
+        document = documents_by_id.get(getattr(collection, "source_document_id", None))
+        digest = getattr(document, "decoded_sha256", None)
+        content_sha256 = digest.casefold() if isinstance(digest, str) else ""
+        if not _SHA256_RE.fullmatch(content_sha256):
+            content_sha256 = ""
+        observations[url] = _CollectionObservation(
+            collection_id=getattr(collection, "id", None),
+            state=_typed_collection_state(getattr(collection, "state", None)),
+            source_document_id=getattr(collection, "source_document_id", None),
+            content_sha256=content_sha256 or None,
+        )
+    return observations
+
+
+def _typed_collection_state(value: Any) -> CollectionState:
+    """One typed collection state, never a free-form string."""
+    if isinstance(value, CollectionState):
+        return value
+    try:
+        return CollectionState(str(getattr(value, "value", value)))
+    except ValueError:
+        return CollectionState.UNAVAILABLE
+
+
+def _reference_availability_warnings(
+    sources: Sequence[ProductionReferenceSourceV1],
+) -> list[str]:
+    """An inaccessible source stays in the corpus and says why it cannot feed Q2."""
+    warnings: list[str] = []
+    for source in sources:
+        if source.eligible_for_extraction:
+            continue
+        prefix = (
+            "core_source_unavailable"
+            if source.tier is ProductionReferenceTier.CORE
+            else "supporting_source_unavailable"
+        )
+        warnings.append(f"{prefix}:{source.canonical_url}")
+    return warnings
+
+
+def _rebuilt_reference_corpus_sources(
+    *,
+    core_sources: Sequence[Any],
+    previous: ProductionReferenceCorpusV1,
+    proposals: Sequence[ProductionReferenceProposal],
+    observations: Mapping[str, _CollectionObservation],
+) -> tuple[ProductionReferenceSourceV1, ...]:
+    """Merge the previous corpus, the snapshot cores and the RAW proposals.
+
+    Core entries always win a duplicated URL and can only come from the
+    snapshot; the model stays additive; a source the rebuild cannot collect
+    keeps its place with a refreshed -- never invented -- observation.
+    """
+    identities: dict[str, ProductionReferenceSourceV1] = {
+        source.canonical_url: source for source in previous.sources
+    }
+    for core in core_sources:
+        identities[str(core.canonical_url)] = ProductionReferenceSourceV1(
+            canonical_url=str(core.canonical_url),
+            tier=ProductionReferenceTier.CORE,
+            kind=ProductionReferenceKind.PUBLICATION,
+            role=core.role,
+            title=core.title,
+            publisher=core.publisher,
+            published_at=core.published_at,
+            source_collection_id=None,
+            source_document_id=None,
+            discovery_candidate_ids=(core.discovery_candidate_id,),
+            collection_state=CollectionState.UNAVAILABLE,
+            content_sha256=None,
+            relevance_reason=None,
+            proposed_by_model=False,
+            eligible_for_extraction=False,
+        )
+    for proposal in proposals:
+        identities.setdefault(
+            proposal.canonical_url,
+            ProductionReferenceSourceV1(
+                canonical_url=proposal.canonical_url,
+                tier=proposal.tier,
+                kind=proposal.kind,
+                role=proposal.role,
+                title=proposal.title,
+                publisher=proposal.publisher,
+                published_at=proposal.published_at,
+                source_collection_id=None,
+                source_document_id=None,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.UNAVAILABLE,
+                content_sha256=None,
+                relevance_reason=proposal.relevance_reason,
+                proposed_by_model=True,
+                eligible_for_extraction=False,
+            ),
+        )
+    sources: list[ProductionReferenceSourceV1] = []
+    for url, identity in identities.items():
+        observation = observations.get(url) or _CollectionObservation()
+        sources.append(
+            replace(
+                identity,
+                source_collection_id=observation.collection_id,
+                source_document_id=observation.source_document_id,
+                collection_state=observation.state,
+                content_sha256=observation.content_sha256,
+                eligible_for_extraction=observation.eligible_for_extraction,
+            )
+        )
+    return tuple(sources)
+
+
+def _reference_corpus_metadata(corpus: ProductionReferenceCorpusV1) -> dict[str, Any]:
+    """The bounded counters of an AW-010 REFERENCES artifact."""
+    counts = {"core": 0, "supporting": 0, "technical": 0, "eligible": 0}
+    for source in corpus.sources:
+        counts[source.tier.value] += 1
+        if source.eligible_for_extraction:
+            counts["eligible"] += 1
+    return {
+        "schema_version": corpus.schema_version,
+        "core_source_count": counts["core"],
+        "supporting_source_count": counts["supporting"],
+        "technical_source_count": counts["technical"],
+        "eligible_source_count": counts["eligible"],
+        "unavailable_source_count": len(corpus.sources) - counts["eligible"],
     }
 
 

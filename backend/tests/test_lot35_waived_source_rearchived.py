@@ -14,6 +14,7 @@ render, so the two sides can never drift.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from datetime import date
@@ -25,10 +26,9 @@ import pytest
 
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import (
-    parse_reference_report,
-    reconcile_reference_report_with_archives,
-    reference_report_to_json,
+from cti_app.application.production_references import (
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
 )
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.production import (
@@ -41,10 +41,16 @@ from cti_app.domain.production import (
     ProductionStage,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceTier,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.collection_support import InMemoryCollectionUnitOfWorkFactory
 from tests.test_repair_desk_source_durability import (
     RAW_Q1,
+    S1_HTML,
     S2_HTML,
     SOURCE_ONE,
     SOURCE_TWO,
@@ -52,6 +58,7 @@ from tests.test_repair_desk_source_durability import (
     _BlobCatalog,
     _client,
     _collector,
+    _corpus_source,
     _Dispatcher,
     _ExplodingModelGateway,
     _Jobs,
@@ -157,7 +164,15 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     sources = await collection_service.initialize(subject.id)
     first = next(item for item in sources if item.canonical_url == SOURCE_ONE)
     second = next(item for item in sources if item.canonical_url == SOURCE_TWO)
-    collection_factory.collections[first.id].state = CollectionState.ARCHIVED
+    # S1 holds a real capture, so the corpus may call it eligible; S2 is the
+    # source the analyst could not obtain yet.
+    await collection_service.archive_manual_content(
+        first.id,
+        content=S1_HTML,
+        declared_mime_type="text/html",
+        final_url=SOURCE_ONE,
+        actor_id="lot35-analyst",
+    )
     collection_factory.collections[first.id].origin_kind = SourceOriginKind.DISCOVERY
     collection_factory.collections[second.id].state = CollectionState.FAILED_TERMINAL
 
@@ -182,11 +197,32 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
     world.gateway = _ExplodingModelGateway()  # type: ignore[attr-defined]
     store = ProductionArtifactStore(world.store_catalog)  # type: ignore[arg-type]
 
-    parsed = parse_reference_report(RAW_Q1, date(2026, 8, 15))
-    assert parsed.value is not None
-    canonical_v1 = reconcile_reference_report_with_archives(parsed.value, {SOURCE_ONE}).report
+    corpus_v1 = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject.id,
+        research_date=date(2026, 8, 15),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            _corpus_source(
+                SOURCE_ONE,
+                tier=ProductionReferenceTier.CORE,
+                state=CollectionState.ARCHIVED,
+                digest=hashlib.sha256(S1_HTML).hexdigest(),
+                title="First",
+            ),
+            _corpus_source(
+                SOURCE_TWO,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.UNAVAILABLE,
+                title="Second",
+                proposed_by_model=True,
+            ),
+        ),
+        warnings=("supporting_source_unavailable:https://two.example/report",),
+    )
     raw_id, canonical_id, _ = await store.store_stage_payloads(
-        raw=RAW_Q1, canonical=reference_report_to_json(canonical_v1)
+        raw=RAW_Q1, canonical=production_reference_corpus_to_json(corpus_v1)
     )
     references_v1 = ProductionArtifact(
         production_run_id=run.id,
@@ -197,15 +233,6 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
         status=ProductionArtifactStatus.VERIFIED,
         raw_blob_id=raw_id,
         canonical_blob_id=canonical_id,
-        metadata={
-            "repair_source_index": {
-                "proposed": [
-                    {"source_id": "S1", "source_url": SOURCE_ONE, "source_title": "First"},
-                    {"source_id": "S2", "source_url": SOURCE_TWO, "source_title": "Second"},
-                ],
-                "canonical": [{"source_id": "S1", "source_url": SOURCE_ONE}],
-            }
-        },
     )
     await world.artifacts.append(references_v1)
     for stage, digest in (
@@ -339,8 +366,14 @@ async def test_lot35_waived_source_archived_later_blocks_signoff_until_rebuild(
         run.id, ProductionArtifactStage.REFERENCES.value
     )
     assert references_v2 is not None and references_v2.version == 2
-    rebuilt_report = await store.read_json(references_v2.canonical_blob_id)  # type: ignore[arg-type]
-    assert {source["url"] for source in rebuilt_report["sources"]} == {SOURCE_ONE, SOURCE_TWO}
+    rebuilt_corpus = production_reference_corpus_from_json(
+        await store.read_json(references_v2.canonical_blob_id)  # type: ignore[arg-type]
+    )
+    assert {source.canonical_url for source in rebuilt_corpus.sources} == {
+        SOURCE_ONE,
+        SOURCE_TWO,
+    }
+    assert all(source.eligible_for_extraction for source in rebuilt_corpus.sources)
 
     replayed = await world.runs.get(run.id)
     assert replayed is not None

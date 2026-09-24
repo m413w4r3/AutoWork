@@ -16,6 +16,7 @@ from cti_app.application.edition_review import (
     EditionReviewReadItem,
     EditionReviewService,
 )
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
     ProductionRepairDecisionInput,
     ProductionRepairDecisionService,
@@ -23,6 +24,7 @@ from cti_app.application.production_repairs import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -33,6 +35,13 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 from cti_app.domain.publication_review import PublicationDecision
 
@@ -495,32 +504,55 @@ async def test_light_issue_listing_uses_compact_index_without_blob_read() -> Non
 
 
 @pytest.mark.asyncio
-async def test_source_issue_listing_uses_compact_reference_index_without_blob_read() -> None:
+async def test_source_issue_listing_reads_the_canonical_corpus_only() -> None:
+    """AW-010: the desk reads the corpus, and the corpus alone.
+
+    The compact metadata index is gone; the canonical payload is the authority
+    of the source list, and a corpus artifact never needs its RAW to be read
+    back for a listing.
+    """
     source_url = "https://example.test/proposed"
+    canonical_blob_id = uuid4()
     run = SimpleNamespace(
         id=uuid4(),
         subject_id=SUBJECT_A,
         pipeline_generation=2,
+        research_date=date(2026, 8, 15),
+    )
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=SUBJECT_A,
+        research_date=date(2026, 8, 15),
+        production_input_hash="d" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url=source_url,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="Proposed report",
+                publisher="Publisher",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=None,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.FAILED_RETRYABLE,
+                content_sha256=None,
+                relevance_reason="Corroborates the core report",
+                proposed_by_model=True,
+                eligible_for_extraction=False,
+            ),
+        ),
+        warnings=(),
     )
     artifact = SimpleNamespace(
         id=uuid4(),
         version=1,
         raw_blob_id=None,
-        canonical_blob_id=None,
+        canonical_blob_id=canonical_blob_id,
         status=ProductionArtifactStatus.VERIFIED,
-        metadata={
-            "repair_source_index": {
-                "proposed": [
-                    {
-                        "source_id": "S1",
-                        "source_title": "Proposed report",
-                        "source_url": source_url,
-                        "publisher": "Publisher",
-                    }
-                ],
-                "canonical": [],
-            }
-        },
+        metadata={},
     )
     collection = SimpleNamespace(
         id=uuid4(),
@@ -550,11 +582,33 @@ async def test_source_issue_listing_uses_compact_reference_index_without_blob_re
 
     issues = await ProductionRepairIssueService(
         lambda: _SourceUow(),
-        _NoBlobReadStore(),  # type: ignore[arg-type]
+        _CanonicalCorpusStore(canonical_blob_id, production_reference_corpus_to_json(corpus)),
     ).list_supplemental_source_issues(EDITION_ID, SUBJECT_A)
 
     assert len(issues) == 1
     assert issues[0].source_url == source_url
+    assert issues[0].source_title == "Proposed report"
+    assert issues[0].publisher == "Publisher"
+    # AW-010 has no local "S1" identity: the corpus tier is the provenance.
+    assert issues[0].source_id == "supporting"
+
+
+class _CanonicalCorpusStore:
+    """Serves exactly one canonical corpus; any other read is a defect."""
+
+    def __init__(self, blob_id: UUID, payload: dict[str, object]) -> None:
+        self._blob_id = blob_id
+        self._payload = payload
+
+    async def read_json(self, blob_id: UUID) -> dict[str, object]:
+        assert blob_id == self._blob_id, "only the canonical corpus may be read"
+        return self._payload
+
+    async def read_text(self, blob_id: UUID) -> str:
+        raise AssertionError(f"a corpus listing must not read {blob_id}")
+
+    async def read_repair_evidence(self, _blob_id: UUID) -> dict[str, object]:
+        raise AssertionError("the Repair Desk list must not read the evidence blob")
 
 
 class _BulkArtifacts:
