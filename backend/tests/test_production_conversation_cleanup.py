@@ -90,20 +90,11 @@ def _orchestrator(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("stage", "conversation_field"),
-    [
-        (ProductionStage.REFERENCES, "references_conversation_id"),
-        (ProductionStage.SYNTHESIS, "synthesis_conversation_id"),
-    ],
-)
-async def test_completed_references_and_synthesis_archive_conversation(
-    stage: ProductionStage,
-    conversation_field: str,
-) -> None:
+async def test_completed_synthesis_archives_conversation() -> None:
+    stage = ProductionStage.SYNTHESIS
     run = _run(stage)
     conversation_id = uuid4()
-    setattr(run, conversation_field, conversation_id)
+    run.synthesis_conversation_id = conversation_id
     model_service = _ModelService()
     orchestrator = _orchestrator(run, model_service, _Diagnostics())
 
@@ -230,6 +221,7 @@ async def test_cleanup_failure_recovered_on_second_attempt_is_not_diagnosed(
     "stage",
     [
         ProductionStage.SOURCES,
+        ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
         ProductionStage.ASSEMBLY,
     ],
@@ -251,21 +243,13 @@ async def test_stage_without_conversation_does_not_archive(stage: ProductionStag
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["cached", "reused"])
-@pytest.mark.parametrize(
-    ("stage", "conversation_field"),
-    [
-        (ProductionStage.REFERENCES, "references_conversation_id"),
-        (ProductionStage.SYNTHESIS, "synthesis_conversation_id"),
-    ],
-)
 async def test_cached_and_reused_results_retry_conversation_cleanup(
-    stage: ProductionStage,
-    conversation_field: str,
     status: str,
 ) -> None:
+    stage = ProductionStage.SYNTHESIS
     run = _run(stage)
     conversation_id = uuid4()
-    setattr(run, conversation_field, conversation_id)
+    run.synthesis_conversation_id = conversation_id
     model_service = _ModelService()
     orchestrator = _orchestrator(run, model_service, _Diagnostics())
 

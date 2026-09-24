@@ -1303,9 +1303,7 @@ class ProductionWorkflowOrchestrator:
             return
 
         conversation_id: UUID | None = None
-        if stage is ProductionStage.REFERENCES:
-            conversation_id = run.references_conversation_id
-        elif stage is ProductionStage.SYNTHESIS:
+        if stage is ProductionStage.SYNTHESIS:
             conversation_id = run.synthesis_conversation_id
 
         if conversation_id is None:

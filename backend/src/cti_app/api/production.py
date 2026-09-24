@@ -226,7 +226,6 @@ class ProductionStatus(BaseModel):
     current_stage: str
     progress_current: int
     progress_total: int
-    references_conversation_id: str | None = None
     synthesis_conversation_id: str | None = None
     run_id: str
     pipeline_generation: int = 0
@@ -1484,9 +1483,6 @@ async def get_subject_production(
             current_stage=run.current_stage.value,
             progress_current=completed_stages,
             progress_total=len(stages),
-            references_conversation_id=(
-                str(run.references_conversation_id) if run.references_conversation_id else None
-            ),
             synthesis_conversation_id=(
                 str(run.synthesis_conversation_id) if run.synthesis_conversation_id else None
             ),

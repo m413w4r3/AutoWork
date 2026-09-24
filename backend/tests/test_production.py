@@ -36,7 +36,7 @@ class TestProductionRun:
         assert isinstance(run.current_stage, ProductionStage)
         assert run.created_at.tzinfo is not None
         assert run.updated_at.tzinfo is not None
-        assert run.references_conversation_id is None
+        assert not hasattr(run, "references_conversation_id")
         assert run.synthesis_conversation_id is None
 
     @pytest.mark.parametrize("field", ["run_number", "version"])
