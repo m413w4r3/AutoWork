@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -92,3 +93,25 @@ def test_single_alembic_baseline() -> None:
     )
 
     assert revisions == ["0001_baseline.py"]
+
+
+def test_production_reference_modules_do_not_import_malware_reference_corpus() -> None:
+    forbidden = {
+        "cti_app.domain.reference_corpus",
+        "cti_app.application.reference_corpus",
+    }
+    modules = (
+        _BACKEND / "src" / "cti_app" / "domain" / "production_references.py",
+        _BACKEND / "src" / "cti_app" / "application" / "production_references.py",
+    )
+
+    for path in modules:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imports: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                base = node.module or ""
+                imports.update(f"{base}.{alias.name}" for alias in node.names)
+            elif isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+        assert imports.isdisjoint(forbidden), path
