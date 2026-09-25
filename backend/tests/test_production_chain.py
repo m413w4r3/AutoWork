@@ -880,7 +880,6 @@ async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
     assert jobs.submitted == []
 
 
-
 def _references_corpus_result() -> dict[str, Any]:
     """The exact AW-010 REFERENCES result shape for a usable core corpus."""
     subject_id = uuid4()

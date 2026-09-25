@@ -74,6 +74,7 @@ type ProductionReferenceKind = "publication" | "technical_resource";
 
 interface ProductionReferenceSource {
   canonical_url: string;
+  title: string | null;
   tier: ProductionReferenceTier;
   role: string;
   kind: ProductionReferenceKind;
@@ -89,9 +90,18 @@ interface ProductionReferenceCorpus {
 }
 
 const REFERENCE_TIER_LABELS: Record<ProductionReferenceTier, string> = {
-  core: "CORE — source du sujet",
-  supporting: "SUPPORTING — référence complémentaire",
-  technical: "TECHNICAL — ressource technique",
+  core: "Core",
+  supporting: "Référence complémentaire",
+  technical: "Ressource technique",
+};
+
+const REFERENCE_ROLE_LABELS: Record<string, string> = {
+  primary: "Primaire",
+  independent: "Indépendante",
+  relay: "Relais",
+  aggregator: "Agrégateur",
+  social: "Réseau social",
+  unknown: "Inconnu",
 };
 
 const REFERENCE_KIND_LABELS: Record<ProductionReferenceKind, string> = {
@@ -105,7 +115,6 @@ const COLLECTION_STATE_LABELS: Record<string, string> = {
   completed: "Terminée",
   unavailable: "Indisponible",
   blocked: "Bloquée",
-  failed: "Échec",
   failed_retryable: "Échec — nouvel essai possible",
   failed_terminal: "Échec définitif",
 };
@@ -120,6 +129,7 @@ function isProductionReferenceSource(
   return (
     isRecord(value) &&
     typeof value.canonical_url === "string" &&
+    (typeof value.title === "string" || value.title === null) &&
     (value.tier === "core" ||
       value.tier === "supporting" ||
       value.tier === "technical") &&
@@ -158,14 +168,16 @@ function ProductionReferenceCorpusView({
           {corpus.sources.map((source) => (
             <li key={source.canonical_url}>
               <article>
-                <h4>
-                  <a href={source.canonical_url}>{source.canonical_url}</a>
-                </h4>
+                <h4>{source.title ?? source.canonical_url}</h4>
                 <dl>
+                  <dt>Source</dt>
+                  <dd>
+                    <a href={source.canonical_url}>{source.canonical_url}</a>
+                  </dd>
                   <dt>Provenance</dt>
                   <dd>{REFERENCE_TIER_LABELS[source.tier]}</dd>
                   <dt>Rôle</dt>
-                  <dd>{source.role}</dd>
+                  <dd>{REFERENCE_ROLE_LABELS[source.role] ?? source.role}</dd>
                   <dt>Type</dt>
                   <dd>{REFERENCE_KIND_LABELS[source.kind]}</dd>
                   <dt>Éditeur</dt>

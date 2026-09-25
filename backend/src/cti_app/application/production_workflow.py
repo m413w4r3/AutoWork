@@ -7,8 +7,8 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -21,7 +21,6 @@ from cti_app.application.extraction import _html_encoding, parse_document
 from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
-    CONVERSATION_PROMPT_ID,
     ConversationTurnFailedError,
     ModelConversationService,
     conversation_close_failure_fields,
@@ -49,7 +48,6 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
-    PARSER_VERSION,
     Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
@@ -88,9 +86,16 @@ from cti_app.application.production_q2_batch import (
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_references import (
+    PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+    PRODUCTION_REFERENCE_PARSER_VERSION,
     ProductionReferenceProposal,
+    build_production_reference_corpus,
+    has_usable_core_source,
+    load_reference_projection,
+    observe_reference_collections,
     parse_production_reference_proposals,
     production_reference_corpus_from_json,
+    production_reference_corpus_metadata,
 )
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
@@ -111,15 +116,12 @@ from cti_app.application.production_source_evidence import (
     verify_q2_output_against_source,
 )
 from cti_app.application.production_stages import (
-    PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
-    PRODUCTION_REFERENCE_PARSER_VERSION,
     ExtractionService,
     ProductionQAService,
     PublicationAssemblyService,
     ReferenceResearchService,
     SynthesisService,
     compute_input_hash,
-    load_reference_projection,
 )
 from cti_app.application.production_synthesis_revision import (
     MAX_SYNTHESIS_REVISION_CONTEXT_BYTES,
@@ -163,13 +165,7 @@ from cti_app.domain.production import (
     SourceExtractionStatus,
     SynthesisMode,
 )
-from cti_app.domain.production_references import (
-    ProductionReferenceCorpusV1,
-    ProductionReferenceKind,
-    ProductionReferenceResearchStatus,
-    ProductionReferenceSourceV1,
-    ProductionReferenceTier,
-)
+from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 if TYPE_CHECKING:
@@ -178,10 +174,6 @@ if TYPE_CHECKING:
 
 # Collection states that count as "the source is available for analysis".
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
-
-# The temporary legacy projection still reads the historical Q1 Markdown wire
-# format, so its parser version stays addressable from this module.
-REFERENCES_LEGACY_REPORT_PARSER_VERSION = PARSER_VERSION
 
 # Version routing decision separately from prompt/schema: changing provider policy
 # must produce a distinct persisted Q2 checkpoint.
@@ -195,7 +187,10 @@ Q2_ROUTING_POLICY_VERSION = "4"
 # invalidate Q2 reuse without changing the live-web request format.
 Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
 Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-cross-run-v2"
-REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
+# REFERENCES names only the role and routing hint; the ModelRouter owns the
+# backend choice, so this version carries no provider.
+REFERENCES_ROUTING_POLICY_VERSION = "model-router-web-research-v1"
+REFERENCES_PROMPT_TEMPLATE_ID = "production-references"
 
 # Une fermeture d'onglet qui tombe pendant une éviction du service worker MV3
 # réussit quelques secondes plus tard.
@@ -902,24 +897,6 @@ class _ArchivedSource:
 
 
 @dataclass(frozen=True, slots=True)
-class _ReferenceObservation:
-    """The exact collection observation backing one corpus source."""
-
-    collection_id: UUID | None = None
-    state: CollectionState = CollectionState.UNAVAILABLE
-    source_document_id: UUID | None = None
-    content_sha256: str | None = None
-
-    @property
-    def eligible_for_extraction(self) -> bool:
-        return (
-            self.state.value in _ARCHIVED_STATES
-            and self.source_document_id is not None
-            and self.content_sha256 is not None
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class _ReferenceCollectionOutcome:
     """What the supplementary collection pass added or failed to add."""
 
@@ -998,156 +975,6 @@ async def _archived_sources_by_url(
     return archived
 
 
-def _collection_state(value: Any) -> CollectionState:
-    """One typed collection state, never a free-form string."""
-    if isinstance(value, CollectionState):
-        return value
-    try:
-        return CollectionState(str(getattr(value, "value", value)))
-    except ValueError:
-        return CollectionState.UNAVAILABLE
-
-
-async def _reference_observations(
-    uow: UnitOfWork, subject_id: UUID, urls: Sequence[str]
-) -> dict[str, _ReferenceObservation]:
-    """Read the observed collection state for each requested canonical URL.
-
-    The corpus captures the ``SourceDocument`` actually attached to the exact
-    ``SourceCollection`` of this subject — never the most recent document that
-    happens to share the URL.
-    """
-    collections_repository = getattr(uow, "source_collections", None)
-    documents_repository = getattr(uow, "source_documents", None)
-    if collections_repository is None:
-        return {url: _ReferenceObservation() for url in urls}
-    collections = await collections_repository.list_for_subject(subject_id)
-    documents = (
-        await documents_repository.list_for_subject(subject_id)
-        if documents_repository is not None
-        else ()
-    )
-
-    documents_by_id = {document.id: document for document in documents}
-    collections_by_url: dict[str, Any] = {}
-    for collection in collections:
-        collections_by_url.setdefault(collection.canonical_url, collection)
-
-    observations: dict[str, _ReferenceObservation] = {}
-    for url in urls:
-        collection = collections_by_url.get(url)
-        if collection is None:
-            observations[url] = _ReferenceObservation()
-            continue
-        document = documents_by_id.get(getattr(collection, "source_document_id", None))
-        digest = getattr(document, "decoded_sha256", None)
-        content_sha256 = digest.casefold() if isinstance(digest, str) else ""
-        if not re.fullmatch(r"[0-9a-f]{64}", content_sha256):
-            content_sha256 = ""
-        observations[url] = _ReferenceObservation(
-            collection_id=getattr(collection, "id", None),
-            state=_collection_state(collection.state),
-            source_document_id=getattr(collection, "source_document_id", None),
-            content_sha256=content_sha256 or None,
-        )
-    return observations
-
-
-def _production_reference_sources(
-    *,
-    snapshot: ProductionInputSnapshot,
-    proposals: Sequence[ProductionReferenceProposal],
-    observations: Mapping[str, _ReferenceObservation],
-) -> tuple[ProductionReferenceSourceV1, ...]:
-    """Build the corpus sources: every snapshot core, then model proposals.
-
-    Core entries are the snapshot's own sources and can only win a duplicated
-    URL; the model is additive and never creates a CORE tier.
-    """
-
-    def build(
-        *,
-        canonical_url: str,
-        tier: ProductionReferenceTier,
-        kind: ProductionReferenceKind,
-        role: SourceRole,
-        title: str | None,
-        publisher: str | None,
-        published_at: date | None,
-        discovery_candidate_ids: tuple[UUID, ...],
-        relevance_reason: str | None,
-        proposed_by_model: bool,
-    ) -> ProductionReferenceSourceV1:
-        observation = observations.get(canonical_url) or _ReferenceObservation()
-        return ProductionReferenceSourceV1(
-            canonical_url=canonical_url,
-            tier=tier,
-            kind=kind,
-            role=role,
-            title=title,
-            publisher=publisher,
-            published_at=published_at,
-            source_collection_id=observation.collection_id,
-            source_document_id=observation.source_document_id,
-            discovery_candidate_ids=discovery_candidate_ids,
-            collection_state=observation.state,
-            content_sha256=observation.content_sha256,
-            relevance_reason=relevance_reason,
-            proposed_by_model=proposed_by_model,
-            eligible_for_extraction=observation.eligible_for_extraction,
-        )
-
-    sources: list[ProductionReferenceSourceV1] = []
-    for core in snapshot.core_sources:
-        sources.append(
-            build(
-                canonical_url=core.canonical_url,
-                tier=ProductionReferenceTier.CORE,
-                kind=ProductionReferenceKind.PUBLICATION,
-                role=core.role,
-                title=core.title,
-                publisher=core.publisher,
-                published_at=core.published_at,
-                discovery_candidate_ids=(core.discovery_candidate_id,),
-                relevance_reason=None,
-                proposed_by_model=False,
-            )
-        )
-    for proposal in proposals:
-        sources.append(
-            build(
-                canonical_url=proposal.canonical_url,
-                tier=proposal.tier,
-                kind=proposal.kind,
-                role=proposal.role,
-                title=proposal.title,
-                publisher=proposal.publisher,
-                published_at=proposal.published_at,
-                discovery_candidate_ids=(),
-                relevance_reason=proposal.relevance_reason,
-                proposed_by_model=True,
-            )
-        )
-    return tuple(sources)
-
-
-def _reference_availability_warnings(
-    sources: Sequence[ProductionReferenceSourceV1],
-) -> list[str]:
-    """An inaccessible source stays in the corpus and says why it cannot feed Q2."""
-    warnings: list[str] = []
-    for source in sources:
-        if source.eligible_for_extraction:
-            continue
-        prefix = (
-            "core_source_unavailable"
-            if source.tier is ProductionReferenceTier.CORE
-            else "supporting_source_unavailable"
-        )
-        warnings.append(f"{prefix}:{source.canonical_url}")
-    return warnings
-
-
 def _reference_corpus_result(
     *,
     corpus: ProductionReferenceCorpusV1,
@@ -1158,26 +985,11 @@ def _reference_corpus_result(
     rebuilt: bool = False,
 ) -> dict[str, Any]:
     """One deterministic stage result shape for a first run and a rebuild."""
-    tier_counts = {"core": 0, "supporting": 0, "technical": 0}
-    eligible = 0
-    archived = 0
-    for source in corpus.sources:
-        tier_counts[source.tier.value] += 1
-        if source.eligible_for_extraction:
-            eligible += 1
-        if source.collection_state.value in _ARCHIVED_STATES:
-            archived += 1
     result: dict[str, Any] = {
         "stage": "references",
         "artifact_id": str(artifact.id),
-        "schema_version": corpus.schema_version,
+        **production_reference_corpus_metadata(corpus),
         "sources_count": len(corpus.sources),
-        "core_source_count": tier_counts["core"],
-        "supporting_source_count": tier_counts["supporting"],
-        "technical_source_count": tier_counts["technical"],
-        "eligible_source_count": eligible,
-        "unavailable_source_count": len(corpus.sources) - eligible,
-        "archived_sources": archived,
         "new_sources": new_sources,
         "warnings": list(warnings),
         "research_model_run_id": (
@@ -1185,10 +997,7 @@ def _reference_corpus_result(
         ),
         "rebuilt": rebuilt,
     }
-    if any(
-        source.tier is ProductionReferenceTier.CORE and source.eligible_for_extraction
-        for source in corpus.sources
-    ):
+    if has_usable_core_source(corpus):
         result["status"] = "success"
     else:
         result.update(
@@ -1804,8 +1613,8 @@ class ProductionWorkflowOrchestrator:
     ) -> tuple[Any | None, str, UUID | None, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
-        Used by Q1 (references) and Q4 (synthesis): both draft FRESH with web
-        search, then repair CONTINUE without web search — the repair turn
+        Used by Q4 (synthesis): it drafts FRESH with web search, then repairs
+        CONTINUE without web search — the repair turn
         never researches again, it restates the same answer in the expected
         structure. Returns the parse result, the raw text used, and the turn
         id it came from.
@@ -2080,19 +1889,16 @@ class ProductionWorkflowOrchestrator:
                 return content.output_text
         return None
 
-    async def _open_conversation(
-        self, run: ProductionRun, subject_title: str, purpose: ConversationPurpose
+    async def _open_synthesis_conversation(
+        self, run: ProductionRun, subject_title: str
     ) -> ModelConversation:
+        """Synthesis keeps its drafting conversation; REFERENCES is stateless."""
         assert self._model_service is not None
         return await self._model_service.create(
             provider=ModelProvider.OPENAI,
             transport=ConversationTransport.CHATGPT_BRIDGE,
-            purpose=purpose,
-            title=(
-                f"Production research — {subject_title}"
-                if purpose is ConversationPurpose.SUBJECT_RESEARCH
-                else f"Production synthesis — {subject_title}"
-            ),
+            purpose=ConversationPurpose.DRAFTING,
+            title=f"Production synthesis — {subject_title}",
             edition_id=run.edition_id,
             subject_id=run.subject_id,
             expected_profile=None,
@@ -2197,11 +2003,7 @@ class ProductionWorkflowOrchestrator:
             )
             subject_title = ctx.subject_title
 
-            input_hash = _references_input_hash(
-                subject_id=run.subject_id,
-                snapshot=snapshot,
-                research_date=research_date,
-            )
+            input_hash = _references_input_hash(snapshot=snapshot, research_date=research_date)
             current = await uow.production_artifacts.get_current(run.id, "references")
 
         # A rebuild of this run re-materializes the corpus from the RAW it
@@ -2259,7 +2061,7 @@ class ProductionWorkflowOrchestrator:
         model_run_id = production_references_model_run_id(run.id, input_hash)
         request = ModelRequest(
             text=prompt,
-            prompt_template_id=CONVERSATION_PROMPT_ID,
+            prompt_template_id=REFERENCES_PROMPT_TEMPLATE_ID,
             prompt_template_version=REFERENCES_PROMPT_VERSION,
             evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
             external_llm_allowed=ctx.external_llm_allowed,
@@ -2328,7 +2130,6 @@ class ProductionWorkflowOrchestrator:
             raw_result=raw,
             corpus=corpus,
             model_run_id=research_model_run_id,
-            warnings=list(corpus.warnings),
         )
         return _reference_corpus_result(
             corpus=corpus,
@@ -2371,13 +2172,15 @@ class ProductionWorkflowOrchestrator:
         parsed = parse_production_reference_proposals(raw, stored_corpus.research_date)
         self._log_parse(run, "references-rebuild", parsed)
         # No collection, no model call: the rebuild only observes what the
-        # subject holds right now.
+        # subject holds right now. Parser and collection warnings are those
+        # of the previous corpus, so an unchanged corpus stays byte-identical.
         corpus = await self._build_reference_corpus(
             run=run,
             snapshot=snapshot,
             research_date=stored_corpus.research_date,
             proposals=parsed.value or (),
-            warnings=parsed.warnings,
+            warnings=stored_corpus.warnings,
+            previous=stored_corpus,
         )
         artifact, created = await self._references.store_references_result(
             run_id=run.id,
@@ -2386,7 +2189,6 @@ class ProductionWorkflowOrchestrator:
             raw_result=raw,
             corpus=corpus,
             model_run_id=current.model_run_id,
-            warnings=list(corpus.warnings),
         )
         if not created:
             # Same functional corpus: no artificial V+1.
@@ -2414,34 +2216,24 @@ class ProductionWorkflowOrchestrator:
         research_date: date,
         proposals: Sequence[ProductionReferenceProposal],
         warnings: Sequence[str],
+        previous: ProductionReferenceCorpusV1 | None = None,
     ) -> ProductionReferenceCorpusV1:
         """Assemble the canonical corpus: core sources then additive proposals."""
         urls = [source.canonical_url for source in snapshot.core_sources]
         urls.extend(proposal.canonical_url for proposal in proposals)
+        if previous is not None:
+            urls.extend(source.canonical_url for source in previous.sources)
         async with self._uow_factory() as uow:
-            observations = await _reference_observations(uow, run.subject_id, urls)
-        sources = _production_reference_sources(
-            snapshot=snapshot,
-            proposals=proposals,
-            observations=observations,
-        )
-        corpus = ProductionReferenceCorpusV1(
-            schema_version=PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+            observations = await observe_reference_collections(uow, run.subject_id, urls)
+        return build_production_reference_corpus(
             subject_id=run.subject_id,
             research_date=research_date,
             production_input_hash=snapshot.input_hash,
-            research_status=ProductionReferenceResearchStatus.COMPLETED,
-            sources=sources,
-            warnings=tuple(warnings),
-        )
-        # Availability is read from the deduplicated corpus: a URL proposed by
-        # the model and also held as a snapshot core is one source, not two.
-        return replace(
-            corpus,
-            warnings=(
-                *corpus.warnings,
-                *_reference_availability_warnings(corpus.sources),
-            ),
+            core_sources=snapshot.core_sources,
+            proposals=proposals,
+            observations=observations,
+            warnings=warnings,
+            previous=previous,
         )
 
     async def _execute_extraction_stage(
@@ -5598,9 +5390,7 @@ class ProductionWorkflowOrchestrator:
                 }
 
             if run.synthesis_conversation_id is None:
-                conversation = await self._open_conversation(
-                    run, subject_title, ConversationPurpose.DRAFTING
-                )
+                conversation = await self._open_synthesis_conversation(run, subject_title)
                 run.synthesis_conversation_id = conversation.id
                 persisted = await uow.production_runs.get_for_update(run.id)
                 if persisted is not None:
@@ -6053,8 +5843,7 @@ def _q2_batch_model_run_id(
 
 def _references_input_hash(
     *,
-    subject_id: UUID,
-    snapshot: ProductionInputSnapshot | None,
+    snapshot: ProductionInputSnapshot,
     research_date: Any,
 ) -> str:
     """Functional Q1 identity: snapshot, research date and contract versions.
@@ -6064,19 +5853,9 @@ def _references_input_hash(
     deliberately absent, so two runs of the same Subject compute one corpus and
     reuse it across runs.
     """
-    snapshot_hash = (
-        snapshot.input_hash
-        if snapshot is not None
-        else compute_input_hash(
-            {
-                "subject_id": str(subject_id),
-                "research_date": str(research_date),
-            }
-        )
-    )
     return compute_input_hash(
         {
-            "production_input_snapshot_hash": snapshot_hash,
+            "production_input_snapshot_hash": snapshot.input_hash,
             "research_date": str(research_date),
             "prompt_version": REFERENCES_PROMPT_VERSION,
             "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,

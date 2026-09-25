@@ -167,6 +167,7 @@ def _references(urls: tuple[str, ...]) -> str:
                 f"publisher: Invariant Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {'primary' if index == 1 else 'independent'}",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )
@@ -523,9 +524,9 @@ async def test_archived_source_unavailable_live_does_not_block_publication(
     assert references_artifact.canonical_blob_id is not None
     references = await scenario.artifact_store.read_json(references_artifact.canonical_blob_id)
     assert len(references["sources"]) == 14
-    assert {source["id"] for source in references["sources"]} == {
-        f"S{index}" for index in range(1, 15)
-    }
+    assert {source["canonical_url"] for source in references["sources"]} == set(urls)
+    assert [source["tier"] for source in references["sources"]].count("core") == 3
+    assert all(source["eligible_for_extraction"] for source in references["sources"])
 
     progress = persisted.extraction_progress
     assert progress is not None
@@ -1279,8 +1280,7 @@ async def test_restart_reconstructs_the_same_business_decision_from_postgres_and
     assert len(restarted_q2_provider_calls) == len(urls)
     assert [request.metadata["source_url"] for request in restarted_q2_provider_calls] == list(urls)
     assert not any(
-        request.prompt_template_id == "analyst-conversation"
-        and request.routing_hint.value == "web_research"
+        request.prompt_template_id == "production-references"
         for request in restarted.model.provider_calls
     )
 

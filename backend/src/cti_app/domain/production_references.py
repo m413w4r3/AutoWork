@@ -33,11 +33,28 @@ _TIER_ORDER = {
     ProductionReferenceTier.SUPPORTING: 1,
     ProductionReferenceTier.TECHNICAL: 2,
 }
-_EXTRACTION_STATES = {
-    CollectionState.ARCHIVED,
-    CollectionState.EXTRACTED,
-    CollectionState.COMPLETED,
-}
+PRODUCTION_REFERENCE_EXTRACTION_STATES = frozenset(
+    {
+        CollectionState.ARCHIVED,
+        CollectionState.EXTRACTED,
+        CollectionState.COMPLETED,
+    }
+)
+
+
+def is_eligible_for_extraction(
+    *,
+    collection_state: CollectionState,
+    source_document_id: UUID | None,
+    content_sha256: str | None,
+) -> bool:
+    """A source feeds Extraction only through one exact, hashed archive."""
+    return (
+        collection_state in PRODUCTION_REFERENCE_EXTRACTION_STATES
+        and source_document_id is not None
+        and content_sha256 is not None
+        and _SHA256.fullmatch(content_sha256) is not None
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -100,10 +117,10 @@ class ProductionReferenceSourceV1:
         if self.tier is ProductionReferenceTier.CORE and self.proposed_by_model:
             raise ValueError("CORE references must come from the production input snapshot")
 
-        eligible = (
-            self.collection_state in _EXTRACTION_STATES
-            and self.source_document_id is not None
-            and self.content_sha256 is not None
+        eligible = is_eligible_for_extraction(
+            collection_state=self.collection_state,
+            source_document_id=self.source_document_id,
+            content_sha256=self.content_sha256,
         )
         if type(self.eligible_for_extraction) is not bool or (
             self.eligible_for_extraction is not eligible

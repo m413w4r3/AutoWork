@@ -146,6 +146,7 @@ def _references(urls: tuple[str, ...]) -> str:
                 f"publisher: Restart Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {'primary' if index == 1 else 'independent'}",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )
@@ -638,12 +639,8 @@ async def test_restart_after_success_retries_only_browser_cleanup(
     _assert_refetched(before, after)
     assert final.status is ProductionRunStatus.READY
     assert restarted.model.provider_calls == []
-    assert before.run.references_conversation_id is not None
-    assert browser.calls == [
-        before.run.references_conversation_id,
-        conversation_id,
-        conversation_id,
-    ]
+    # REFERENCES is stateless: the only browser session is Synthesis'.
+    assert browser.calls == [conversation_id, conversation_id]
     assert browser.present == set()
 
 

@@ -51,10 +51,15 @@ from cti_app.application.production_prompts import (
 )
 from cti_app.application.production_q2_batch import Q2_BATCH_PARSER_VERSION
 from cti_app.application.production_references import (
-    ProductionReferenceProposal,
+    PRODUCTION_REFERENCE_PARSER_VERSION,
+    build_production_reference_corpus,
+    legacy_reference_source_labels,
     load_legacy_reference_report,
+    load_reference_projection,
+    observe_reference_collections,
     parse_production_reference_proposals,
     production_reference_corpus_from_json,
+    production_reference_corpus_metadata,
     production_reference_corpus_to_json,
 )
 from cti_app.application.production_repair_payloads import (
@@ -71,12 +76,10 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
 )
 from cti_app.application.production_stages import (
-    PRODUCTION_REFERENCE_PARSER_VERSION,
     ExtractionService,
     ProductionQAService,
     PublicationAssemblyService,
     compute_input_hash,
-    load_reference_projection,
 )
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
 from cti_app.domain.discovery import canonicalize_http_url
@@ -109,9 +112,6 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
-    ProductionReferenceKind,
-    ProductionReferenceSourceV1,
-    ProductionReferenceTier,
 )
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
@@ -119,15 +119,6 @@ REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 REPAIR_PLANNER_VERSION = "33.1"
 MAX_REPAIR_PREVIEW_CHARS = 512
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-#: Collection states whose capture can feed Q2 exactly as ``CollectionState``.
-_ARCHIVED_COLLECTION_STATES = frozenset(
-    {CollectionState.ARCHIVED, CollectionState.EXTRACTED, CollectionState.COMPLETED}
-)
-#: Corpus warnings that restate availability and are therefore recomputed.
-_UNAVAILABLE_WARNING_PREFIXES = (
-    "core_source_unavailable:",
-    "supporting_source_unavailable:",
-)
 
 
 def _sha256(value: str) -> str:
@@ -1913,10 +1904,9 @@ class ProductionRepairIssueService:
             return {}
         try:
             raw = await store.read_text(artifact.raw_blob_id)
-            proposed = load_legacy_reference_report(raw, research_date, legacy_imported=True)
+            return legacy_reference_source_labels(raw, research_date)
         except Exception:
             return {}
-        return {source.canonical_url: source.local_id for source in proposed.sources}
 
     async def _legacy_reference_source_view(
         self,
@@ -5189,43 +5179,34 @@ class ProductionReferenceRepairService:
             raise ProductionReferenceRepairError("production_repair_storage_unavailable")
 
         parsed = parse_production_reference_proposals(raw, corpus.research_date)
+        proposals = parsed.value or ()
         snapshot = await _references_input_snapshot(uow, run.id)
         core_sources = tuple(getattr(snapshot, "core_sources", ()) or ())
         urls = {source.canonical_url for source in corpus.sources}
-        urls.update(proposal.canonical_url for proposal in (parsed.value or ()))
-        urls.update(str(source.canonical_url) for source in core_sources)
-        observations = await _reference_collection_observations(uow, run.subject_id, sorted(urls))
-        sources = _rebuilt_reference_corpus_sources(
-            core_sources=core_sources,
-            previous=corpus,
-            proposals=parsed.value or (),
-            observations=observations,
-        )
+        urls.update(proposal.canonical_url for proposal in proposals)
+        urls.update(source.canonical_url for source in core_sources)
+        observations = await observe_reference_collections(uow, run.subject_id, sorted(urls))
         snapshot_hash = getattr(snapshot, "input_hash", None)
-        rebuilt = ProductionReferenceCorpusV1(
-            schema_version=corpus.schema_version,
+        rebuilt = build_production_reference_corpus(
             subject_id=corpus.subject_id,
             research_date=corpus.research_date,
             production_input_hash=(
                 snapshot_hash if isinstance(snapshot_hash, str) else corpus.production_input_hash
             ),
-            research_status=corpus.research_status,
-            sources=sources,
-            warnings=(
-                *(
-                    warning
-                    for warning in corpus.warnings
-                    if not warning.startswith(_UNAVAILABLE_WARNING_PREFIXES)
-                ),
-                *_reference_availability_warnings(sources),
-            ),
+            core_sources=core_sources,
+            proposals=proposals,
+            observations=observations,
+            warnings=corpus.warnings,
+            previous=corpus,
         )
 
+        # The delta describes what Extraction can read: a source that only
+        # becomes eligible after a manual archive is an added source.
         archived_projection = await _archived_source_projection(uow, run.subject_id)
         source_delta = await _source_delta(
             uow,
-            previous_urls=[source.canonical_url for source in corpus.sources],
-            current_urls=[source.canonical_url for source in rebuilt.sources],
+            previous_urls=_eligible_corpus_urls(corpus),
+            current_urls=_eligible_corpus_urls(rebuilt),
             previous_hashes=_corpus_source_hashes(corpus),
             current_hashes={url: digest or None for url, digest in archived_projection},
         )
@@ -5246,7 +5227,7 @@ class ProductionReferenceRepairService:
             source.canonical_url
             for source in rebuilt.sources
             if source.eligible_for_extraction
-            and not _corpus_source_is_eligible(corpus, source.canonical_url)
+            and source.canonical_url not in _eligible_corpus_urls(corpus)
         )
         derived_input_hash = compute_input_hash(
             {
@@ -5284,7 +5265,7 @@ class ProductionReferenceRepairService:
             model_run_id=base.model_run_id,
             conversation_turn_id=base.conversation_turn_id,
             metadata={
-                **_reference_corpus_metadata(rebuilt),
+                **production_reference_corpus_metadata(rebuilt),
                 "warnings": list(rebuilt.warnings),
                 "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
                 "research_model_run_id": (
@@ -5580,10 +5561,8 @@ def _corpus_source_hashes(corpus: ProductionReferenceCorpusV1) -> dict[str, str 
     return {source.canonical_url: source.content_sha256 for source in corpus.sources}
 
 
-def _corpus_source_is_eligible(corpus: ProductionReferenceCorpusV1, url: str) -> bool:
-    return any(
-        source.canonical_url == url and source.eligible_for_extraction for source in corpus.sources
-    )
+def _eligible_corpus_urls(corpus: ProductionReferenceCorpusV1) -> list[str]:
+    return [source.canonical_url for source in corpus.sources if source.eligible_for_extraction]
 
 
 def _legacy_source_hashes(base_artifact: ProductionArtifact) -> dict[str, str | None]:
@@ -5611,181 +5590,6 @@ async def _references_input_snapshot(uow: Any, run_id: UUID) -> Any | None:
     if snapshots is None or not callable(getter):
         return None
     return await getter(run_id)
-
-
-@dataclass(frozen=True, slots=True)
-class _CollectionObservation:
-    """The exact SourceCollection/SourceDocument behind one corpus source."""
-
-    collection_id: UUID | None = None
-    state: CollectionState = CollectionState.UNAVAILABLE
-    source_document_id: UUID | None = None
-    content_sha256: str | None = None
-
-    @property
-    def eligible_for_extraction(self) -> bool:
-        return (
-            self.state in _ARCHIVED_COLLECTION_STATES
-            and self.source_document_id is not None
-            and self.content_sha256 is not None
-        )
-
-
-async def _reference_collection_observations(
-    uow: Any, subject_id: UUID, urls: Sequence[str]
-) -> dict[str, _CollectionObservation]:
-    """Read the collection state each canonical URL really holds right now.
-
-    The corpus captures the ``SourceDocument`` attached to the exact
-    ``SourceCollection`` of this subject -- never the most recent document that
-    happens to share the URL.  Nothing is inferred from the URL itself.
-    """
-    observations = {url: _CollectionObservation() for url in urls}
-    collections_repository = getattr(uow, "source_collections", None)
-    list_collections = getattr(collections_repository, "list_for_subject", None)
-    if not callable(list_collections):
-        return observations
-    documents_repository = getattr(uow, "source_documents", None)
-    list_documents = getattr(documents_repository, "list_for_subject", None)
-    collections = await list_collections(subject_id)
-    documents = await list_documents(subject_id) if callable(list_documents) else ()
-    documents_by_id = {getattr(document, "id", None): document for document in documents}
-    collections_by_url: dict[str, Any] = {}
-    for collection in collections:
-        canonical_url = getattr(collection, "canonical_url", None)
-        if isinstance(canonical_url, str):
-            collections_by_url.setdefault(canonical_url, collection)
-    for url in urls:
-        collection = collections_by_url.get(url)
-        if collection is None:
-            continue
-        document = documents_by_id.get(getattr(collection, "source_document_id", None))
-        digest = getattr(document, "decoded_sha256", None)
-        content_sha256 = digest.casefold() if isinstance(digest, str) else ""
-        if not _SHA256_RE.fullmatch(content_sha256):
-            content_sha256 = ""
-        observations[url] = _CollectionObservation(
-            collection_id=getattr(collection, "id", None),
-            state=_typed_collection_state(getattr(collection, "state", None)),
-            source_document_id=getattr(collection, "source_document_id", None),
-            content_sha256=content_sha256 or None,
-        )
-    return observations
-
-
-def _typed_collection_state(value: Any) -> CollectionState:
-    """One typed collection state, never a free-form string."""
-    if isinstance(value, CollectionState):
-        return value
-    try:
-        return CollectionState(str(getattr(value, "value", value)))
-    except ValueError:
-        return CollectionState.UNAVAILABLE
-
-
-def _reference_availability_warnings(
-    sources: Sequence[ProductionReferenceSourceV1],
-) -> list[str]:
-    """An inaccessible source stays in the corpus and says why it cannot feed Q2."""
-    warnings: list[str] = []
-    for source in sources:
-        if source.eligible_for_extraction:
-            continue
-        prefix = (
-            "core_source_unavailable"
-            if source.tier is ProductionReferenceTier.CORE
-            else "supporting_source_unavailable"
-        )
-        warnings.append(f"{prefix}:{source.canonical_url}")
-    return warnings
-
-
-def _rebuilt_reference_corpus_sources(
-    *,
-    core_sources: Sequence[Any],
-    previous: ProductionReferenceCorpusV1,
-    proposals: Sequence[ProductionReferenceProposal],
-    observations: Mapping[str, _CollectionObservation],
-) -> tuple[ProductionReferenceSourceV1, ...]:
-    """Merge the previous corpus, the snapshot cores and the RAW proposals.
-
-    Core entries always win a duplicated URL and can only come from the
-    snapshot; the model stays additive; a source the rebuild cannot collect
-    keeps its place with a refreshed -- never invented -- observation.
-    """
-    identities: dict[str, ProductionReferenceSourceV1] = {
-        source.canonical_url: source for source in previous.sources
-    }
-    for core in core_sources:
-        identities[str(core.canonical_url)] = ProductionReferenceSourceV1(
-            canonical_url=str(core.canonical_url),
-            tier=ProductionReferenceTier.CORE,
-            kind=ProductionReferenceKind.PUBLICATION,
-            role=core.role,
-            title=core.title,
-            publisher=core.publisher,
-            published_at=core.published_at,
-            source_collection_id=None,
-            source_document_id=None,
-            discovery_candidate_ids=(core.discovery_candidate_id,),
-            collection_state=CollectionState.UNAVAILABLE,
-            content_sha256=None,
-            relevance_reason=None,
-            proposed_by_model=False,
-            eligible_for_extraction=False,
-        )
-    for proposal in proposals:
-        identities.setdefault(
-            proposal.canonical_url,
-            ProductionReferenceSourceV1(
-                canonical_url=proposal.canonical_url,
-                tier=proposal.tier,
-                kind=proposal.kind,
-                role=proposal.role,
-                title=proposal.title,
-                publisher=proposal.publisher,
-                published_at=proposal.published_at,
-                source_collection_id=None,
-                source_document_id=None,
-                discovery_candidate_ids=(),
-                collection_state=CollectionState.UNAVAILABLE,
-                content_sha256=None,
-                relevance_reason=proposal.relevance_reason,
-                proposed_by_model=True,
-                eligible_for_extraction=False,
-            ),
-        )
-    sources: list[ProductionReferenceSourceV1] = []
-    for url, identity in identities.items():
-        observation = observations.get(url) or _CollectionObservation()
-        sources.append(
-            replace(
-                identity,
-                source_collection_id=observation.collection_id,
-                source_document_id=observation.source_document_id,
-                collection_state=observation.state,
-                content_sha256=observation.content_sha256,
-                eligible_for_extraction=observation.eligible_for_extraction,
-            )
-        )
-    return tuple(sources)
-
-
-def _reference_corpus_metadata(corpus: ProductionReferenceCorpusV1) -> dict[str, Any]:
-    """The bounded counters of an AW-010 REFERENCES artifact."""
-    counts = {"core": 0, "supporting": 0, "technical": 0, "eligible": 0}
-    for source in corpus.sources:
-        counts[source.tier.value] += 1
-        if source.eligible_for_extraction:
-            counts["eligible"] += 1
-    return {
-        "schema_version": corpus.schema_version,
-        "core_source_count": counts["core"],
-        "supporting_source_count": counts["supporting"],
-        "technical_source_count": counts["technical"],
-        "eligible_source_count": counts["eligible"],
-        "unavailable_source_count": len(corpus.sources) - counts["eligible"],
-    }
 
 
 async def _q2_reuse_preview(

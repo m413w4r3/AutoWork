@@ -49,6 +49,7 @@ from cti_app.application.edition_rule_archive import (
     EditionRuleArchiveService,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.application.production_references import load_reference_projection
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
@@ -71,7 +72,6 @@ from cti_app.application.production_repairs import (
     repair_application_diagnostic,
     repair_issue_execution_state,
 )
-from cti_app.application.production_stages import load_reference_projection
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (

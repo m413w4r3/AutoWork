@@ -57,6 +57,7 @@ def _references(urls: Sequence[str]) -> str:
                 f"publisher: Collect Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {'primary' if index == 1 else 'independent'}",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )
@@ -186,6 +187,14 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
     assert [url for call in q2_calls for url in call.source_urls] == [S1]
     assert persisted.extraction_progress is not None
     assert {item["source_id"] for item in persisted.extraction_progress["sources"]} == {"S1"}
+    references = next(
+        artifact for artifact in artifacts if artifact.stage is ProductionArtifactStage.REFERENCES
+    )
+    assert references.canonical_blob_id is not None
+    corpus = await scenario.artifact_store.read_json(references.canonical_blob_id)
+    s2 = next(source for source in corpus["sources"] if source["canonical_url"] == S2)
+    assert s2["eligible_for_extraction"] is False
+    assert s2["collection_state"] != CollectionState.ARCHIVED.value
 
 
 @pytest.mark.asyncio

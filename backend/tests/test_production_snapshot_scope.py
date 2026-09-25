@@ -495,9 +495,7 @@ async def test_q1_collects_only_proposed_urls_by_exact_collection_id() -> None:
         edition_id=uuid4(),
     )
 
-    outcome = await orchestrator._collect_reference_proposals(
-        run, proposals, cast(Any, _Context())
-    )
+    outcome = await orchestrator._collect_reference_proposals(run, proposals, cast(Any, _Context()))
 
     assert collection_service.calls == [q1_collection.id]
     assert outcome.new_sources == 0
@@ -662,9 +660,7 @@ async def test_references_corpus_keeps_core_identity_and_the_exact_source_docume
     assert core.canonical_url in {source.canonical_url for source in snapshot.core_sources}
     assert core.role is snapshot.core_sources[0].role
     assert core.title == snapshot.core_sources[0].title
-    assert core.discovery_candidate_ids == (
-        snapshot.core_sources[0].discovery_candidate_id,
-    )
+    assert core.discovery_candidate_ids == (snapshot.core_sources[0].discovery_candidate_id,)
     assert core.proposed_by_model is False
     assert core.source_collection_id == collection.id
     assert core.source_document_id == used_document.id

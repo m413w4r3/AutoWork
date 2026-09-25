@@ -39,6 +39,8 @@ def _references() -> str:
                 f"publisher: LOT 38 Labs {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {'primary' if index == 1 else 'independent'}",
+                "kind: publication",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )
@@ -116,6 +118,16 @@ async def test_references_rebuild_reuses_five_q2_sources_and_calls_s6_once(
     initial_q2 = [call for call in scenario.model.calls if call.stage == "extraction"]
     initial_covered_urls = {url for call in initial_q2 for url in call.source_urls}
     assert initial_covered_urls == set(URLS[:5])
+
+    async with scenario.uow_factory() as uow:
+        references = await uow.production_artifacts.get_current(
+            initial.id, ProductionArtifactStage.REFERENCES.value
+        )
+    assert references is not None and references.canonical_blob_id is not None
+    corpus = await scenario.artifact_store.read_json(references.canonical_blob_id)
+    s6_record = next(source for source in corpus["sources"] if source["canonical_url"] == URLS[5])
+    assert s6_record["collection_state"] == CollectionState.UNAVAILABLE.value
+    assert s6_record["eligible_for_extraction"] is False
 
     collections = await scenario.collection_service.list_sources(scenario.subject.id)
     s6 = next(collection for collection in collections if collection.canonical_url == URLS[5])

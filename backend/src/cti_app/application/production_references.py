@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import date
 from enum import StrEnum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from cti_app.application.production_parsers import (
-    ParsedEvent,
     ParseResult,
     ReferenceReport,
     _fields,
@@ -20,6 +20,8 @@ from cti_app.application.production_parsers import (
     _split_blocks,
     normalize_text,
     parse_reference_report,
+    reconcile_reference_report_with_archives,
+    reference_report_from_json,
 )
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
@@ -29,7 +31,24 @@ from cti_app.domain.production_references import (
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+    is_eligible_for_extraction,
 )
+
+if TYPE_CHECKING:
+    from cti_app.application.production_artifact_store import ProductionArtifactStore
+    from cti_app.domain.production import ProductionArtifact, ProductionInputSource
+
+# AW-010 contract versions. They participate in the functional REFERENCES
+# identity: a parser or schema change invalidates the stored corpus.
+PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v1"
+PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
+
+#: Corpus warnings that restate availability and are recomputed on each build.
+_AVAILABILITY_WARNING_PREFIXES = (
+    "core_source_unavailable:",
+    "supporting_source_unavailable:",
+)
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _CORPUS_KEYS = {
     "schema_version",
@@ -75,6 +94,177 @@ class ProductionReferenceProposal:
         if self.kind is ProductionReferenceKind.PUBLICATION:
             return ProductionReferenceTier.SUPPORTING
         return ProductionReferenceTier.TECHNICAL
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceCollectionObservation:
+    """The exact SourceCollection/SourceDocument behind one corpus source."""
+
+    collection_id: UUID | None = None
+    state: CollectionState = CollectionState.UNAVAILABLE
+    source_document_id: UUID | None = None
+    content_sha256: str | None = None
+
+
+async def observe_reference_collections(
+    uow: Any, subject_id: UUID, urls: Sequence[str]
+) -> dict[str, ReferenceCollectionObservation]:
+    """Read the collection state each canonical URL holds right now.
+
+    The corpus captures the ``SourceDocument`` attached to the exact
+    ``SourceCollection`` of this subject -- never the most recent document that
+    happens to share the URL. A URL without a collection is ``UNAVAILABLE``.
+    """
+    observations = {url: ReferenceCollectionObservation() for url in urls}
+    collections_repository = getattr(uow, "source_collections", None)
+    if collections_repository is None:
+        return observations
+    documents_repository = getattr(uow, "source_documents", None)
+    collections = await collections_repository.list_for_subject(subject_id)
+    documents = (
+        await documents_repository.list_for_subject(subject_id)
+        if documents_repository is not None
+        else ()
+    )
+    documents_by_id = {document.id: document for document in documents}
+    collections_by_url: dict[str, Any] = {}
+    for collection in collections:
+        collections_by_url.setdefault(collection.canonical_url, collection)
+    for url in urls:
+        collection = collections_by_url.get(url)
+        if collection is None:
+            continue
+        document_id = getattr(collection, "source_document_id", None)
+        digest = getattr(documents_by_id.get(document_id), "decoded_sha256", None)
+        content_sha256 = digest.casefold() if isinstance(digest, str) else None
+        if content_sha256 is not None and not _SHA256_RE.fullmatch(content_sha256):
+            content_sha256 = None
+        observations[url] = ReferenceCollectionObservation(
+            collection_id=collection.id,
+            state=_collection_state(collection.state),
+            source_document_id=document_id,
+            content_sha256=content_sha256,
+        )
+    return observations
+
+
+def build_production_reference_corpus(
+    *,
+    subject_id: UUID,
+    research_date: date,
+    production_input_hash: str,
+    core_sources: Sequence[ProductionInputSource],
+    proposals: Sequence[ProductionReferenceProposal],
+    observations: Mapping[str, ReferenceCollectionObservation],
+    warnings: Sequence[str],
+    previous: ProductionReferenceCorpusV1 | None = None,
+) -> ProductionReferenceCorpusV1:
+    """Assemble the canonical corpus from its identities and observations.
+
+    Identity precedence: a snapshot CORE always wins a duplicated URL (its URL,
+    role and discovery candidates are authoritative); a rebuild keeps every
+    source of the ``previous`` corpus so nothing disappears; model proposals are
+    additive and the first one for a URL wins. Every source then receives the
+    collection observation read now, and availability warnings are recomputed.
+    """
+    identities: dict[str, ProductionReferenceSourceV1] = {}
+    if previous is not None:
+        identities.update((source.canonical_url, source) for source in previous.sources)
+    for core in core_sources:
+        identities[core.canonical_url] = _unobserved_source(
+            canonical_url=core.canonical_url,
+            tier=ProductionReferenceTier.CORE,
+            kind=ProductionReferenceKind.PUBLICATION,
+            role=core.role,
+            title=core.title,
+            publisher=core.publisher,
+            published_at=core.published_at,
+            discovery_candidate_ids=(core.discovery_candidate_id,),
+            relevance_reason=None,
+            proposed_by_model=False,
+        )
+    for proposal in proposals:
+        identities.setdefault(
+            proposal.canonical_url,
+            _unobserved_source(
+                canonical_url=proposal.canonical_url,
+                tier=proposal.tier,
+                kind=proposal.kind,
+                role=proposal.role,
+                title=proposal.title,
+                publisher=proposal.publisher,
+                published_at=proposal.published_at,
+                discovery_candidate_ids=(),
+                relevance_reason=proposal.relevance_reason,
+                proposed_by_model=True,
+            ),
+        )
+
+    sources: list[ProductionReferenceSourceV1] = []
+    for url, identity in identities.items():
+        observation = observations.get(url) or ReferenceCollectionObservation()
+        sources.append(
+            replace(
+                identity,
+                source_collection_id=observation.collection_id,
+                source_document_id=observation.source_document_id,
+                collection_state=observation.state,
+                content_sha256=observation.content_sha256,
+                eligible_for_extraction=is_eligible_for_extraction(
+                    collection_state=observation.state,
+                    source_document_id=observation.source_document_id,
+                    content_sha256=observation.content_sha256,
+                ),
+            )
+        )
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+        subject_id=subject_id,
+        research_date=research_date,
+        production_input_hash=production_input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=tuple(sources),
+        warnings=(),
+    )
+    availability: list[str] = []
+    for source in corpus.sources:
+        if source.eligible_for_extraction:
+            continue
+        prefix = (
+            "core_source_unavailable"
+            if source.tier is ProductionReferenceTier.CORE
+            else "supporting_source_unavailable"
+        )
+        availability.append(f"{prefix}:{source.canonical_url}")
+    kept = tuple(
+        warning for warning in warnings if not warning.startswith(_AVAILABILITY_WARNING_PREFIXES)
+    )
+    return replace(corpus, warnings=(*kept, *availability))
+
+
+def production_reference_corpus_metadata(corpus: ProductionReferenceCorpusV1) -> dict[str, int]:
+    """The bounded counters of a REFERENCES artifact; sources are not copied."""
+    counts = {tier: 0 for tier in ProductionReferenceTier}
+    eligible = 0
+    for source in corpus.sources:
+        counts[source.tier] += 1
+        eligible += source.eligible_for_extraction
+    return {
+        "schema_version": corpus.schema_version,
+        "core_source_count": counts[ProductionReferenceTier.CORE],
+        "supporting_source_count": counts[ProductionReferenceTier.SUPPORTING],
+        "technical_source_count": counts[ProductionReferenceTier.TECHNICAL],
+        "eligible_source_count": eligible,
+        "unavailable_source_count": len(corpus.sources) - eligible,
+    }
+
+
+def has_usable_core_source(corpus: ProductionReferenceCorpusV1) -> bool:
+    """REFERENCES may advance only with at least one extractable CORE source."""
+    return any(
+        source.tier is ProductionReferenceTier.CORE and source.eligible_for_extraction
+        for source in corpus.sources
+    )
 
 
 def production_reference_corpus_to_json(
@@ -273,46 +463,67 @@ def load_legacy_reference_report(
     corpus: ProductionReferenceCorpusV1 | None = None,
     legacy_imported: bool = False,
 ) -> ReferenceReport:
-    """Build the temporary ReferenceReport projection. TODO AW-012/AW-013.
+    """Project REFERENCES back to the legacy ``ReferenceReport``.
 
-    V4 imported references remain legacy ReferenceReport data and are never
-    upgraded or represented as a ProductionReferenceCorpusV1.
+    TODO AW-012/AW-013: legacy production compatibility only. This is the
+    single boundary through which Q2, Synthesis, Assembly, QA, the Repair Desk
+    and ProductionState V4 still read ``ReferenceReport``; delete it once they
+    consume ``ProductionReferenceCorpusV1`` directly.
+
+    For an AW-010 artifact the report is re-parsed from the RAW wire format and
+    reduced to the corpus sources eligible for extraction; events keep only the
+    source IDs that survive and disappear when none does. A V4 imported report
+    (``legacy_imported``) is returned as-is and is never upgraded to a corpus.
     """
-    if legacy_imported and corpus is not None:
-        raise ValueError("A V4 imported legacy report cannot be labelled as a V1 corpus")
-    if not legacy_imported and corpus is None:
-        raise ValueError("A V1 corpus is required for a non-legacy reference artifact")
+    if legacy_imported == (corpus is not None):
+        raise ValueError("Pass exactly one of a V1 corpus or legacy_imported=True")
 
     parsed = parse_reference_report(raw_text, research_date)
     if not parsed.usable or parsed.value is None:
         raise ValueError("Legacy reference report could not be reconstructed from RAW")
     report = parsed.value
-    if legacy_imported:
+    if corpus is None:
         return report
 
     eligible_urls = {
         source.canonical_url for source in corpus.sources if source.eligible_for_extraction
     }
-    kept_sources = tuple(
-        source for source in report.sources if source.canonical_url in eligible_urls
-    )
-    kept_ids = {source.local_id for source in kept_sources}
-    kept_events = tuple(
-        ParsedEvent(
-            local_id=event.local_id,
-            event_date=event.event_date,
-            source_ids=tuple(source_id for source_id in event.source_ids if source_id in kept_ids),
-            text=event.text,
-        )
-        for event in report.events
-        if any(source_id in kept_ids for source_id in event.source_ids)
-    )
-    return ReferenceReport(
-        sources=kept_sources,
-        events=kept_events,
-        uncertainties=report.uncertainties,
-        editorial_title=report.editorial_title,
-    )
+    return reconcile_reference_report_with_archives(report, eligible_urls).report
+
+
+def legacy_reference_source_labels(raw_text: str, research_date: date) -> dict[str, str]:
+    """Map each RAW SOURCE block's canonical URL to its wire label ("S1").
+
+    TODO AW-012/AW-013: display metadata for the Repair Desk only. The label is
+    the model's block name, never the identity of a corpus source.
+    """
+    parsed = parse_reference_report(raw_text, research_date)
+    if parsed.value is None:
+        return {}
+    return {source.canonical_url: source.local_id for source in parsed.value.sources}
+
+
+async def load_reference_projection(
+    store: ProductionArtifactStore,
+    artifact: ProductionArtifact,
+) -> ReferenceReport | None:
+    """Read a REFERENCES artifact as the legacy ``ReferenceReport``.
+
+    TODO AW-012/AW-013: the async side of the single compatibility boundary
+    (see ``load_legacy_reference_report``). A V4 imported artifact keeps its
+    legacy report payload; an AW-010 artifact is projected from RAW + corpus.
+    """
+    if artifact.canonical_blob_id is None:
+        return None
+    payload = await store.read_json(artifact.canonical_blob_id)
+    try:
+        corpus = production_reference_corpus_from_json(payload)
+    except ValueError:
+        return reference_report_from_json(payload)
+    if artifact.raw_blob_id is None:
+        return None
+    raw = await store.read_text(artifact.raw_blob_id)
+    return load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
 
 
 def _required_string(payload: Mapping[str, Any], key: str) -> str:
@@ -371,9 +582,30 @@ def _enum[T: StrEnum](enum_type: type[T], value: object, field: str) -> T:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string enum value")
     try:
-        return enum_type(value)  # type: ignore[call-arg]
+        return enum_type(value)
     except ValueError as exc:
         raise ValueError(f"{field} is not a supported value") from exc
+
+
+def _unobserved_source(**identity: Any) -> ProductionReferenceSourceV1:
+    return ProductionReferenceSourceV1(
+        **identity,
+        source_collection_id=None,
+        source_document_id=None,
+        collection_state=CollectionState.UNAVAILABLE,
+        content_sha256=None,
+        eligible_for_extraction=False,
+    )
+
+
+def _collection_state(value: Any) -> CollectionState:
+    """One typed collection state, never a free-form string."""
+    if isinstance(value, CollectionState):
+        return value
+    try:
+        return CollectionState(str(getattr(value, "value", value)))
+    except ValueError:
+        return CollectionState.UNAVAILABLE
 
 
 def _optional_field(value: str | None) -> str | None:

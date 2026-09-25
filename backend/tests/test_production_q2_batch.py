@@ -397,7 +397,6 @@ def test_batch_identity_ignores_q1_parser_and_individual_ioc_rules_prompt(
         "canonical_urls": ("https://example.test/a", "https://example.test/b"),
     }
     first = _q2_batch_model_run_id(**identity)  # type: ignore[arg-type]
-    monkeypatch.setattr(production_workflow, "PARSER_VERSION", "q1-next")
     monkeypatch.setattr(production_parsers, "PARSER_VERSION", "q1-next")
     monkeypatch.setattr(production_prompts, "IOC_RULES_PROMPT_VERSION", "999")
     assert _q2_batch_model_run_id(**identity) == first  # type: ignore[arg-type]

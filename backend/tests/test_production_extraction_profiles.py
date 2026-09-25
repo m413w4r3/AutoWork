@@ -18,6 +18,7 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     project_q2_source_output,
 )
+from cti_app.application.production_references import load_reference_projection
 from cti_app.application.production_workflow import (
     _enforce_q2_profile,
     plan_q2_extraction_profiles,
@@ -1056,7 +1057,7 @@ async def test_q2_legacy_projection_keeps_only_extractable_corpus_sources() -> N
     store = _ProjectionStore(canonical=corpus_payload, raw=_LEGACY_RAW)
     artifact = SimpleNamespace(canonical_blob_id=uuid4(), raw_blob_id=uuid4())
 
-    report = await production_workflow.load_reference_projection(store, artifact)
+    report = await load_reference_projection(store, artifact)
 
     assert report is not None
     assert [source.canonical_url for source in report.sources] == ["https://example.test/kept"]
@@ -1065,7 +1066,7 @@ async def test_q2_legacy_projection_keeps_only_extractable_corpus_sources() -> N
     assert report.uncertainties
 
     # A V4-style legacy payload is never upgraded or reshaped.
-    legacy = await production_workflow.load_reference_projection(
+    legacy = await load_reference_projection(
         _ProjectionStore(
             canonical={
                 "parser_version": "production-markdown-v4",

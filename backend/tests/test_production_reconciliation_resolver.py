@@ -328,9 +328,7 @@ async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable
 
 @pytest.mark.asyncio
 async def test_in_progress_bridge_run_stays_undecided() -> None:
-    resolver, run, model, _, gateway = _fixture(
-        {"id": "resp_123", "status": "running"}
-    )
+    resolver, run, model, _, gateway = _fixture({"id": "resp_123", "status": "running"})
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
     assert run.requires_reconciliation

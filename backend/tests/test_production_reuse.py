@@ -513,12 +513,10 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
         captured_at=datetime.now(UTC),
     )
     base = _references_input_hash(
-        subject_id=snapshot.subject_id,
         snapshot=snapshot,
         research_date=snapshot.research_date,
     )
     assert base == _references_input_hash(
-        subject_id=snapshot.subject_id,
         snapshot=replace(snapshot, production_run_id=uuid4(), input_hash="", reuse_basis_hash=""),
         research_date=snapshot.research_date,
     )
@@ -526,7 +524,6 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
     # different dates are two different corpus computations.
     assert (
         _references_input_hash(
-            subject_id=snapshot.subject_id,
             snapshot=snapshot,
             research_date=date(2026, 8, 30),
         )
@@ -550,7 +547,6 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
     ):
         assert (
             _references_input_hash(
-                subject_id=changed.subject_id,
                 snapshot=changed,
                 research_date=changed.research_date,
             )
@@ -565,7 +561,6 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
         monkeypatch.setattr(production_workflow, version_name, "next")
         assert (
             _references_input_hash(
-                subject_id=snapshot.subject_id,
                 snapshot=snapshot,
                 research_date=snapshot.research_date,
             )
@@ -702,7 +697,7 @@ class _BlobStore:
         return (await self.read_bytes(blob_id)).decode("utf-8")
 
     async def read_json(self, blob_id: UUID) -> dict[str, Any]:
-        return json.loads((await self.read_bytes(blob_id)).decode("utf-8"))
+        return cast(dict[str, Any], json.loads((await self.read_bytes(blob_id)).decode("utf-8")))
 
     async def store_stage_payloads(
         self,
@@ -895,9 +890,7 @@ async def test_references_stage_is_stateless_and_persists_only_the_corpus(
     store = _BlobStore()
     gateway = _ResearchGateway(_RAW_REFERENCES)
     run = _run_for(snapshot, status=ProductionRunStatus.RUNNING)
-    orchestrator = _corpus_orchestrator(
-        monkeypatch, uow=uow, store=store, gateway=gateway
-    )
+    orchestrator = _corpus_orchestrator(monkeypatch, uow=uow, store=store, gateway=gateway)
 
     result = await orchestrator._execute_references_stage(run, None, snapshot)
 
@@ -915,9 +908,7 @@ async def test_references_stage_is_stateless_and_persists_only_the_corpus(
     assert request.routing_hint is production_workflow.ModelRoutingHint.WEB_RESEARCH
     assert request.run_id == production_references_model_run_id(
         run.id,
-        _references_input_hash(
-            subject_id=run.subject_id, snapshot=snapshot, research_date=run.research_date
-        ),
+        _references_input_hash(snapshot=snapshot, research_date=run.research_date),
     )
 
     artifact = max(artifacts.items, key=lambda item: item.version)
@@ -1147,9 +1138,7 @@ async def test_references_rebuild_never_upgrades_a_legacy_imported_artifact(
         subject_id=snapshot.subject_id,
         stage=ProductionArtifactStage.REFERENCES,
         version=1,
-        input_hash=_references_input_hash(
-            subject_id=run.subject_id, snapshot=snapshot, research_date=run.research_date
-        ),
+        input_hash=_references_input_hash(snapshot=snapshot, research_date=run.research_date),
         status=ProductionArtifactStatus.VERIFIED,
         raw_blob_id=raw_id,
         canonical_blob_id=canonical_id,

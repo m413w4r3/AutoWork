@@ -587,12 +587,12 @@ editorial-title: [Publication] Corpus
 title: Source
 url: https://example.test/source
 publisher: Publisher
-published-at: 2026-10-02
+published-at: 2026-09-02
 role: independent
 kind: publication
 reason: Documents the campaign
 ## EVENT R1
-date: 2026-10-03
+date: 2026-09-03
 sources: S1
 text: Shared fact
 """
@@ -650,7 +650,7 @@ text: Shared fact
                     role=SourceRole.INDEPENDENT,
                     title="Source",
                     publisher="Publisher",
-                    published_at=date(2026, 10, 2),
+                    published_at=date(2026, 9, 2),
                     source_collection_id=uuid4(),
                     source_document_id=uuid4(),
                     discovery_candidate_ids=(uuid4(),),

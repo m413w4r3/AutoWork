@@ -162,7 +162,7 @@ it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique",
               canonical_url: "https://research.example/ioc-feed",
               tier: "technical",
               kind: "technical_resource",
-              role: "technical",
+              role: "unknown",
               title: "IOC feed",
               publisher: "Research Lab",
               published_at: null,
@@ -196,7 +196,7 @@ it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique",
               canonical_url: "https://reports.example/terminal",
               tier: "technical",
               kind: "technical_resource",
-              role: "technical",
+              role: "unknown",
               title: "Terminal failure report",
               publisher: "Reports",
               published_at: null,
@@ -233,16 +233,21 @@ it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique",
     "https://reports.example/retry",
     "https://reports.example/terminal",
   ]) {
-    expect(screen.getByRole("link", { name: url })).toHaveAttribute("href", url);
+    expect(screen.getByRole("link", { name: url })).toHaveAttribute(
+      "href",
+      url,
+    );
   }
-  expect(screen.getByText("CORE — source du sujet")).toBeInTheDocument();
+  expect(screen.getByText("Core")).toBeInTheDocument();
+  expect(screen.getAllByText("Référence complémentaire")).toHaveLength(2);
   expect(
-    screen.getAllByText("SUPPORTING — référence complémentaire"),
-  ).toHaveLength(2);
-  expect(screen.getAllByText("TECHNICAL — ressource technique")).toHaveLength(2);
-  expect(screen.getByText("primary")).toBeInTheDocument();
+    screen.getByRole("heading", { name: "Core report" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Primaire")).toBeInTheDocument();
+  expect(screen.getAllByText("Inconnu")).toHaveLength(2);
   expect(screen.getAllByText("Publication")).toHaveLength(3);
-  expect(screen.getAllByText("Ressource technique")).toHaveLength(2);
+  // Two TECHNICAL tiers plus two technical_resource kinds.
+  expect(screen.getAllByText("Ressource technique")).toHaveLength(4);
   expect(screen.getByText("Vendor")).toBeInTheDocument();
   expect(screen.getByText("2026-09-20")).toBeInTheDocument();
   expect(screen.getByText("Archivée")).toBeInTheDocument();

@@ -78,7 +78,11 @@ réutilisé ne porte donc pas d’identité de `ProductionRun`.
 Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
 production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
 La projection legacy `ReferenceReport` demeure temporaire pour les stages qui n’ont pas encore
-migré.
+migré. Elle n’a qu’une frontière, `application/production_references.py`
+(`load_legacy_reference_report` et `load_reference_projection`) : le RAW est re-parsé puis réduit
+aux sources du corpus éligibles à l’extraction, ce qui préserve le comportement historique de Q2
+(une source non archivée n’atteint jamais Q2). Aucun autre service n’appelle
+`parse_reference_report`.
 
 Transition prévue : AW-011 fera consommer directement le corpus par Extraction; AW-012 retirera
 la dépendance aux `EVENT` legacy dans Synthesis; AW-013 terminera la suppression de la projection
