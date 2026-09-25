@@ -82,6 +82,19 @@ pipeline. La progression se lit depuis le batch et les runs en base. Une annulat
 actif annule les runs non terminés, conserve les artifacts historiques et laisse l’édition
 `OPEN`. Une nouvelle production peut ensuite capturer un nouvel état avec une nouvelle clé.
 
+Pour AW-010, `REFERENCES` a pour contenu canonique `ProductionReferenceCorpusV1`. Les sources
+CORE viennent du `ProductionInputSnapshot`; la recherche via `ModelGateway` est additive et les
+références complémentaires sont collectées par le service de collecte existant. Le corpus retient
+l’état de collecte observé, ainsi que l’identifiant du `SourceDocument` exact et son hash lorsqu’il
+est disponible. Son hash fonctionnel autorise la réutilisation cross-run d’un artifact équivalent.
+Le stage n’a pas de conversation canonique; le RAW conserve temporairement le wire format avec
+les champs legacy nécessaires aux anciens consommateurs.
+
+Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` et ne partage
+avec lui ni module ni service. La transition prévue est : AW-011 fait consommer le corpus
+directement à Extraction, AW-012 retire `EVENT` de la compatibilité Synthesis, puis AW-013
+termine la suppression de la projection legacy `ReferenceReport`.
+
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection
 de regroupement éditorial et n’ajoute aucun statut de production à l’édition.
 

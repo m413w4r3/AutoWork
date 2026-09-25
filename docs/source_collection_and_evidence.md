@@ -59,6 +59,18 @@ gzip/deflate ; son hash est `decoded_sha256`. Les deux blobs sont immuables et a
 `SourceDocument` conserve les deux références, tailles et hashes, ainsi que les URL demandée/finale,
 MIME déclaré/détecté, titre, éditeur, date, TLP et identifiants de provenance.
 
+Dans la production AW-010, `ProductionReferenceCorpusV1` capture pour chaque référence l’état
+réel de collecte, sa provenance, et l’identité du `SourceDocument` effectivement rattaché à la
+collecte, avec son `decoded_sha256`. Il ne recherche pas après coup le document le plus récent de
+la même URL. Les sources core proviennent du `ProductionInputSnapshot`; les sources découvertes
+par recherche sont collectées avec le service existant. Une source indisponible ou bloquée reste
+représentée dans le corpus mais n’est pas éligible à l’extraction. La réutilisation cross-run
+d’un artifact de références ne change ni son hash fonctionnel ni l’identité exacte des documents
+qu’il décrit.
+
+Ce corpus de production éditoriale est distinct du Reference corpus malware/investigation : les
+deux contrats ne partagent ni module ni service.
+
 Le fichier analyste et l'endpoint de téléchargement utilisent toujours le blob decoded et le MIME
 détecté. Un document gzip HTML n'est donc jamais servi comme octets gzip sous une extension HTML.
 

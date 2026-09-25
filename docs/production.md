@@ -61,6 +61,29 @@ sont triées avant sérialisation. AW-010 à AW-013 préciseront les règles de 
 Tous les stages construisent leur contexte depuis ce snapshot. Son absence est une erreur
 `production_input_snapshot_missing` ; il n’existe aucune lecture de repli.
 
+### REFERENCES et corpus de production
+
+Dans AW-010, l’artifact canonique de `REFERENCES` est `ProductionReferenceCorpusV1` : il décrit
+les sources retenues pour ce run, leur provenance, tier, type, état de collecte, document archivé
+exact, hash du contenu et éligibilité à l’extraction. Les sources du snapshot sont conservées
+comme `CORE`; la recherche web peut ajouter des références `SUPPORTING` ou des ressources
+`TECHNICAL`. Une source inaccessible reste dans le corpus avec son état et n’est pas éligible.
+
+Le blob RAW conserve temporairement le wire format de recherche historique, notamment
+`editorial-title` et `EVENT`, pour les consommateurs legacy. Ces champs ne font pas partie du
+corpus canonique. `REFERENCES` appelle `ModelGateway` sans conversation canonique. Le hash
+fonctionnel de l’étape permet la réutilisation d’un artifact compatible entre runs; le corpus
+réutilisé ne porte donc pas d’identité de `ProductionRun`.
+
+Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
+production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
+La projection legacy `ReferenceReport` demeure temporaire pour les stages qui n’ont pas encore
+migré.
+
+Transition prévue : AW-011 fera consommer directement le corpus par Extraction; AW-012 retirera
+la dépendance aux `EVENT` legacy dans Synthesis; AW-013 terminera la suppression de la projection
+`ReferenceReport`.
+
 ## ProductionBoard
 
 Le board d’une édition est lu par :
