@@ -114,8 +114,21 @@ class ProductionReferenceSourceV1:
             raise ValueError("Reference relevance reason must be text or None")
         if type(self.proposed_by_model) is not bool:
             raise ValueError("Reference model provenance flag must be boolean")
-        if self.tier is ProductionReferenceTier.CORE and self.proposed_by_model:
-            raise ValueError("CORE references must come from the production input snapshot")
+        if self.proposed_by_model:
+            if self.relevance_reason is None or not self.relevance_reason.strip():
+                raise ValueError("Model-proposed references require a relevance reason")
+            if self.tier is ProductionReferenceTier.CORE:
+                raise ValueError("CORE references must come from the production input snapshot")
+            if (
+                self.kind is ProductionReferenceKind.PUBLICATION
+                and self.tier is not ProductionReferenceTier.SUPPORTING
+            ):
+                raise ValueError("Model-proposed publications must have SUPPORTING tier")
+            if (
+                self.kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+                and self.tier is not ProductionReferenceTier.TECHNICAL
+            ):
+                raise ValueError("Model-proposed technical resources must have TECHNICAL tier")
 
         eligible = is_eligible_for_extraction(
             collection_state=self.collection_state,

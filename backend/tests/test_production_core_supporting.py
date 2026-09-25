@@ -231,6 +231,62 @@ def test_production_reference_corpus_round_trip_orders_sources_and_excludes_lega
         production_reference_corpus_from_json({**payload, "production_run_id": str(uuid4())})
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("relevance_reason", None, "relevance reason"),
+        ("relevance_reason", "", "relevance reason"),
+        ("relevance_reason", "   ", "relevance reason"),
+        ("tier", "technical", "SUPPORTING"),
+        ("kind", "technical_resource", "TECHNICAL"),
+        ("tier", "core", "CORE"),
+    ),
+)
+def test_production_reference_corpus_from_json_rejects_invalid_model_sources(
+    field: str,
+    value: str | None,
+    message: str,
+) -> None:
+    payload = production_reference_corpus_to_json(
+        _reference_corpus(
+            (
+                _reference_source(
+                    "https://model.example/report",
+                    ProductionReferenceTier.SUPPORTING,
+                    proposed_by_model=True,
+                ),
+            )
+        )
+    )
+    payload["sources"][0][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        production_reference_corpus_from_json(payload)
+
+
+def test_production_reference_corpus_from_json_accepts_valid_model_source_kinds() -> None:
+    corpus = _reference_corpus(
+        (
+            _reference_source(
+                "https://publication.example/report",
+                ProductionReferenceTier.SUPPORTING,
+                proposed_by_model=True,
+            ),
+            _reference_source(
+                "https://technical.example/resource",
+                ProductionReferenceTier.TECHNICAL,
+                kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+                proposed_by_model=True,
+            ),
+        )
+    )
+
+    payload = production_reference_corpus_to_json(corpus)
+    round_trip = production_reference_corpus_from_json(payload)
+
+    assert production_reference_corpus_to_json(round_trip) == payload
+
+
 def test_production_reference_corpus_core_wins_duplicate_canonical_url() -> None:
     core = _reference_source(
         "https://same.example/report",
