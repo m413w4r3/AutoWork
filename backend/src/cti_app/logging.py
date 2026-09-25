@@ -66,13 +66,24 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(payload, ensure_ascii=False)
 
 
+class _JsonStreamHandler(logging.StreamHandler[Any]):
+    """The single root stream handler managed by ``configure_logging``."""
+
+
 def configure_logging(level: str) -> None:
-    handler = logging.StreamHandler()
+    handler = _JsonStreamHandler()
     handler.setFormatter(JsonFormatter())
     handler.addFilter(CorrelationIdFilter())
 
     root_logger = logging.getLogger()
-    root_logger.handlers = [handler]
+    # Keep handlers owned by pytest, monitoring, or the embedding process.
+    # Replace only our own sink so repeated configuration stays idempotent.
+    root_logger.handlers[:] = [
+        existing
+        for existing in root_logger.handlers
+        if not isinstance(existing, _JsonStreamHandler)
+    ]
+    root_logger.addHandler(handler)
     root_logger.setLevel(level.upper())
 
     for logger_name in ("uvicorn", "uvicorn.error", "dramatiq"):
