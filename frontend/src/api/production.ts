@@ -138,7 +138,6 @@ export interface ProductionStatus {
   current_stage: ProductionStage;
   progress_current: number;
   progress_total: number;
-  references_conversation_id: string | null;
   synthesis_conversation_id: string | null;
   run_id: string;
   pipeline_generation: number;

@@ -51,7 +51,6 @@ function productionStatus(
     current_stage: "assembly",
     progress_current: 5,
     progress_total: 5,
-    references_conversation_id: null,
     synthesis_conversation_id: null,
     run_id: "run-1",
     pipeline_generation: 1,

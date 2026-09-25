@@ -96,9 +96,6 @@ class ProductionRunRow(Base):
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    references_conversation_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
-    )
     synthesis_conversation_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
     )

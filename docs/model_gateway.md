@@ -70,6 +70,21 @@ Les requêtes n'acceptent que du texte et des métadonnées JSON. `bytes`, `byte
 `memoryview` sont rejetés. Les secrets usuels, Bearer tokens, chemins internes et clés de
 métadonnées sensibles sont retirés avant calcul du hash et avant appel.
 
+### Recherche REFERENCES de Production
+
+Dans AW-010, la recherche de références de Production passe directement par `ModelGateway` avec
+le routage de recherche web (`ModelRole.RESEARCH`, `ModelRoutingHint.WEB_RESEARCH` et
+`web_search=true`). Le stage ne dépend pas d'une conversation : il transmet une requête
+stateless, et aucune conversation REFERENCES n'est une identité canonique ou un prérequis de
+reprise. Le choix du backend reste celui du routeur, sans branche propre au fournisseur dans
+REFERENCES. Si la politique interdit un modèle externe et que le backend retenu est externe, le
+stage requiert une revue (`external_llm_blocked`).
+
+La sortie brute conserve temporairement le format wire legacy requis par les consommateurs
+actuels. L'artifact canonique reste `ProductionReferenceCorpusV1`; une réutilisation cross-run
+est fondée sur le hash fonctionnel d'entrée, indépendamment de l'identité d'exécution. Le run de
+modèle et ses identifiants de reprise restent dans leurs propres enregistrements de traçabilité.
+
 ## Responses API et bridge ChatGPT
 
 Les adaptateurs construisent une requête Responses standard. `ChatGPTBridgeClient`, qui hérite

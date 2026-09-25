@@ -19,9 +19,11 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     validate_synthesis,
 )
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_state import ProductionStateService
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -52,6 +54,13 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
@@ -553,6 +562,172 @@ async def test_production_state_round_trip_uses_real_postgres_and_blob_catalog(
         imported_synthesis,
         reference_report_from_json(refs),
         technical_extraction_from_json(extraction),
+    ).usable
+
+
+@pytest.mark.asyncio
+async def test_aw010_corpus_exports_as_v4_and_imports_as_legacy_on_real_postgres(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    """A corpus round-trips through V4 without ever entering the V4 payload."""
+    edition = Edition(
+        country="France",
+        country_code="FR",
+        period_start=date(2026, 10, 1),
+        period_end=date(2026, 10, 31),
+        tlp=TLP.AMBER,
+        languages=("fr",),
+    )
+    store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    )
+    raw = """# REFERENCES
+editorial-title: [Publication] Corpus
+## SOURCE S1
+title: Source
+url: https://example.test/source
+publisher: Publisher
+published-at: 2026-09-02
+role: independent
+kind: publication
+reason: Documents the campaign
+## EVENT R1
+date: 2026-09-03
+sources: S1
+text: Shared fact
+"""
+    extraction: dict[str, Any] = {"items": [], "uncertainties": []}
+    synthesis = "Fait [S1]"
+    extraction_blob = await store.store_stage_payloads(canonical=extraction)
+    synthesis_blob = await store.store_stage_payloads(rendered=synthesis)
+    async with uow_factory() as uow:
+        await uow.editions.add_if_absent(edition)
+        source = Subject(
+            edition_id=edition.id,
+            title="Corpus subject",
+            slug="state-corpus",
+            tlp=TLP.AMBER,
+        )
+        target = Subject(
+            edition_id=edition.id,
+            title="Corpus target",
+            slug="state-corpus-target",
+            tlp=TLP.AMBER,
+        )
+        await uow.subjects.add(source)
+        await uow.subjects.add(target)
+        await uow.commit()
+
+    await _seed_subject_discovery_lineage(
+        uow_factory,
+        edition=edition,
+        subjects=(source, target),
+        complementary_axis="production-state-corpus-round-trip",
+    )
+    production = SubjectProductionService(uow_factory)
+    run, created = await production.create_run(source.id, edition.id)
+    assert created
+    run = await production.start_run(run.id)
+    async with uow_factory() as uow:
+        persisted_run = await uow.production_runs.get_for_update(run.id)
+        assert persisted_run is not None
+        persisted_run.current_stage = ProductionStage.ASSEMBLY
+        persisted_run.mark_needs_review(code="seed", message="seed")
+        await uow.production_runs.save(persisted_run)
+        input_snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+        assert input_snapshot is not None
+        corpus = ProductionReferenceCorpusV1(
+            schema_version=1,
+            subject_id=source.id,
+            research_date=input_snapshot.research_date,
+            production_input_hash=input_snapshot.input_hash,
+            research_status=ProductionReferenceResearchStatus.COMPLETED,
+            sources=(
+                ProductionReferenceSourceV1(
+                    canonical_url="https://example.test/source",
+                    tier=ProductionReferenceTier.CORE,
+                    kind=ProductionReferenceKind.PUBLICATION,
+                    role=SourceRole.INDEPENDENT,
+                    title="Source",
+                    publisher="Publisher",
+                    published_at=date(2026, 9, 2),
+                    source_collection_id=uuid4(),
+                    source_document_id=uuid4(),
+                    discovery_candidate_ids=(uuid4(),),
+                    collection_state=CollectionState.ARCHIVED,
+                    content_sha256="b" * 64,
+                    relevance_reason=None,
+                    proposed_by_model=False,
+                    eligible_for_extraction=True,
+                ),
+            ),
+            warnings=(),
+        )
+        raw_id, canonical_id, _ = await store.store_stage_payloads(
+            raw=raw, canonical=production_reference_corpus_to_json(corpus)
+        )
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=persisted_run.id,
+                subject_id=source.id,
+                stage=ProductionArtifactStage.REFERENCES,
+                version=1,
+                input_hash=input_snapshot.input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=raw_id,
+                canonical_blob_id=canonical_id,
+            )
+        )
+        for stage, canonical_blob_id, rendered_blob_id in (
+            (ProductionArtifactStage.EXTRACTION, extraction_blob[1], None),
+            (ProductionArtifactStage.SYNTHESIS, None, synthesis_blob[2]),
+        ):
+            await uow.production_artifacts.append(
+                ProductionArtifact(
+                    production_run_id=persisted_run.id,
+                    subject_id=source.id,
+                    stage=stage,
+                    version=1,
+                    input_hash="a" * 64,
+                    status=ProductionArtifactStatus.VERIFIED,
+                    canonical_blob_id=canonical_blob_id,
+                    rendered_blob_id=rendered_blob_id,
+                )
+            )
+        await uow.commit()
+
+    service = ProductionStateService(uow_factory, store)
+    snapshot = await service.export_state(subject_id=source.id)
+    # V4 carries the projected legacy contract, never the corpus itself.
+    exported_references = snapshot.artifacts.references.canonical_content
+    assert "production_input_hash" not in exported_references
+    assert [item["id"] for item in exported_references["sources"]] == ["S1"]
+    result = await service.import_state(
+        subject_id=target.id, edition_id=edition.id, payload=snapshot.model_dump(mode="json")
+    )
+
+    async with uow_factory() as uow:
+        imported_references = await uow.production_artifacts.get_current(
+            result.run_id, ProductionArtifactStage.REFERENCES.value
+        )
+    assert imported_references is not None
+    assert imported_references.canonical_blob_id is not None
+    assert imported_references.metadata["legacy_reference_report"] is True
+    imported_content = await store.read_json(imported_references.canonical_blob_id)
+    imported_report = reference_report_from_json(imported_content)
+    assert [source.local_id for source in imported_report.sources] == ["S1"]
+    # Nothing the legacy report lacks is invented for the imported artifact.
+    assert set(imported_content["sources"][0]) <= {
+        "id",
+        "title",
+        "url",
+        "canonical_url",
+        "publisher",
+        "published_at",
+        "role",
+    }
+    assert validate_synthesis(
+        synthesis, imported_report, technical_extraction_from_json(extraction)
     ).usable
 
 

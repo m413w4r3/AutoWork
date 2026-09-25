@@ -340,8 +340,6 @@ def _verified_external_turn_id(payload: dict[str, Any]) -> str | None:
 
 
 def _conversation_id(run: ProductionRun) -> UUID | None:
-    if run.current_stage is ProductionStage.REFERENCES:
-        return run.references_conversation_id
     if run.current_stage is ProductionStage.SYNTHESIS:
         return run.synthesis_conversation_id
     return None

@@ -197,6 +197,25 @@ Une reprise ne doit jamais dépendre d'un workspace local. Elle repart de Postgr
 store, ou d'un artifact canonique déjà validé. Les jobs continuent à être adressés par identifiant
 et à exposer leur progression, leurs retries et leurs erreurs depuis l'état canonique en base.
 
+### Frontière du corpus de références de production (AW-010)
+
+`ProductionReferenceCorpusV1` est le contrat canonique de l'artifact REFERENCES : il conserve les
+sources du snapshot comme CORE, les références complémentaires proposées par recherche, leur
+provenance et leur état de collecte. Il capture l'identifiant du `SourceDocument` effectivement
+utilisé et son hash de contenu; une référence non collectée reste présente mais non éligible à
+l'extraction. La recherche utilise `ModelGateway` en mode stateless, sans conversation REFERENCES
+canonique. Le hash fonctionnel des entrées permet la réutilisation cross-run sans inscrire
+l'identité d'un `ProductionRun` dans le corpus.
+
+Le wire format RAW reste temporairement compatible avec les consommateurs existants, dont les
+champs éditoriaux et `EVENT`; ce RAW n'est pas le corpus canonique. Le `Reference corpus` du
+domaine malware/investigation est un concept séparé de `ProductionReferenceCorpusV1` : aucun
+module ou service n'est partagé entre les deux.
+
+La transition s'effectuera par étapes : AW-011 fera consommer directement le corpus à Extraction;
+AW-012 retirera la dépendance de Synthesis aux `EVENT` legacy; AW-013 terminera la suppression de
+la projection `ReferenceReport`. Ces étapes ne sont pas déclarées réalisées par le présent ADR.
+
 À l'intérieur d'une édition, la production reste séquentielle pour garder un comportement
 prévisible vis-à-vis des modèles, des conversations, des quotas externes et du pacing. La
 concurrence entre éditions indépendantes pourra être introduite plus tard sans changer le modèle

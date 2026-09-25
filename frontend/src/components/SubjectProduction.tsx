@@ -450,9 +450,6 @@ export function SubjectProduction({
         <a href={`/subjects/${subjectId}/production/artifacts/synthesis`}>
           Voir la synthèse
         </a>
-        {status.references_conversation_id ? (
-          <a href={`/subjects/${subjectId}#conversations`}>Voir la recherche</a>
-        ) : null}
         {status.synthesis_conversation_id ? (
           <a href={`/subjects/${subjectId}#conversations`}>Voir la synthèse</a>
         ) : null}
@@ -497,9 +494,7 @@ export function SubjectProduction({
           ) : null}
           <p>Code : {issueCode ?? "inconnu"}</p>
           {issueMessage ? <p>{issueMessage}</p> : null}
-          {issueIsConversation &&
-          (status.references_conversation_id ||
-            status.synthesis_conversation_id) ? (
+          {issueIsConversation && status.synthesis_conversation_id ? (
             <a href={`/subjects/${subjectId}#conversations`}>
               Voir la conversation
             </a>

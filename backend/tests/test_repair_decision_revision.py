@@ -31,6 +31,7 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
     ProductionRepairAdjudicationRequest,
     ProductionRepairAdjudicationService,
@@ -46,6 +47,7 @@ from cti_app.application.production_repairs import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -56,6 +58,13 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRunStatus,
     RepairDecisionApplicationState,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 
 EDITION_ID = UUID("aaaaaaaa-9999-4999-8999-aaaaaaaaaaaa")
@@ -930,6 +939,36 @@ async def test_i_legacy_unbuildable_include_never_counts_as_applied() -> None:
 @pytest.mark.asyncio
 async def test_waived_source_that_is_finally_archived_owes_a_references_rebuild() -> None:
     store = ProductionArtifactStore(_BlobCatalog())  # type: ignore[arg-type]
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=SUBJECT_ID,
+        research_date=date(2026, 8, 15),
+        production_input_hash="c" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url=SOURCE_URL,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="Missing report",
+                publisher="Publisher",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=None,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.FAILED_TERMINAL,
+                content_sha256=None,
+                relevance_reason="Adds context to the core report",
+                proposed_by_model=True,
+                eligible_for_extraction=False,
+            ),
+        ),
+        warnings=(),
+    )
+    _, canonical_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(corpus)
+    )
     references = ProductionArtifact(
         production_run_id=RUN_ID,
         subject_id=SUBJECT_ID,
@@ -937,18 +976,7 @@ async def test_waived_source_that_is_finally_archived_owes_a_references_rebuild(
         version=1,
         input_hash="c" * 64,
         status=ProductionArtifactStatus.VERIFIED,
-        metadata={
-            "repair_source_index": {
-                "proposed": [
-                    {
-                        "source_id": "S9",
-                        "source_url": SOURCE_URL,
-                        "source_title": "Missing report",
-                    }
-                ],
-                "canonical": [],
-            }
-        },
+        canonical_blob_id=canonical_blob_id,
     )
     state = _State([references], _run(), _row())
     collection = SimpleNamespace(

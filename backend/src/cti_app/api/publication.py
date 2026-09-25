@@ -49,6 +49,7 @@ from cti_app.application.edition_rule_archive import (
     EditionRuleArchiveService,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.application.production_references import load_reference_projection
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     ProductionReferenceRepairError,
@@ -1201,18 +1202,19 @@ async def rebuild_edition_review_item(
         reference_is_derived = bool(
             isinstance(reference_metadata, dict) and reference_metadata.get("derived_repair")
         )
+        # The canonical source list is the corpus of the artifact, read through
+        # the single compatibility adapter.  An unavailable source still sits in
+        # the corpus, so the comparison below keeps asking whether the archived
+        # collection is one the current artifact can actually extract.
+        reference_store = getattr(request.app.state, "production_artifact_store", None)
         indexed_canonical_urls: set[str] | None = None
-        if isinstance(reference_metadata, dict):
-            source_index = reference_metadata.get("repair_source_index")
-            canonical_index = (
-                source_index.get("canonical") if isinstance(source_index, dict) else None
-            )
-            if isinstance(canonical_index, list):
-                indexed_canonical_urls = {
-                    str(item.get("source_url"))
-                    for item in canonical_index
-                    if isinstance(item, dict) and item.get("source_url")
-                }
+        if references is not None and reference_store is not None:
+            try:
+                report = await load_reference_projection(reference_store, references)
+            except Exception:
+                report = None
+            if report is not None:
+                indexed_canonical_urls = {source.canonical_url for source in report.sources}
         references_need_repair = archived_sources and (
             not reference_is_derived
             or (

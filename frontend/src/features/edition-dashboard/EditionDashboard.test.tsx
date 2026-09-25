@@ -98,7 +98,6 @@ function makeProduction(
     current_stage: "assembly",
     progress_current: 1,
     progress_total: 1,
-    references_conversation_id: null,
     synthesis_conversation_id: null,
     run_id: `run-${subjectId}`,
     pipeline_generation: 1,

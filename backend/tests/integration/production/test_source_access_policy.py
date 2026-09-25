@@ -105,6 +105,7 @@ def _reference_report(urls: Sequence[str]) -> str:
                 f"publisher: Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {role}",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )

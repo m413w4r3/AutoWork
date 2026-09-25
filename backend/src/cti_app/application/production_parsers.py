@@ -79,6 +79,8 @@ class ParsedSource:
 
 @dataclass(frozen=True)
 class ParsedEvent:
+    """Legacy production compatibility (TODO AW-012): one Q1 timeline EVENT."""
+
     local_id: str
     event_date: date | None
     source_ids: tuple[str, ...]
@@ -87,6 +89,14 @@ class ParsedEvent:
 
 @dataclass(frozen=True)
 class ReferenceReport:
+    """Legacy production compatibility (TODO AW-012/AW-013).
+
+    Not the canonical REFERENCES state since AW-010: that is
+    ``ProductionReferenceCorpusV1``. A ``ReferenceReport`` (events and
+    ``editorial_title`` included) is only obtained through
+    ``application.production_references.load_legacy_reference_report``.
+    """
+
     sources: tuple[ParsedSource, ...]
     events: tuple[ParsedEvent, ...]
     uncertainties: tuple[str, ...] = ()
@@ -100,10 +110,9 @@ class ReferenceReport:
 class ReferenceIntegrationResult:
     """Deterministic projection of a Q1 proposal onto archived URLs.
 
-    The parser produces a proposal, while this projection is the only rule
-    that decides which part of that proposal can become canonical production
-    state.  The optional counters and diagnostics are populated by the live
-    collection workflow; the reconciliation itself never performs I/O.
+    Legacy production compatibility (TODO AW-012/AW-013): the rule shared by
+    the ``ReferenceReport`` projection and the V4 legacy repair. It never
+    performs I/O.
     """
 
     report: ReferenceReport
@@ -111,22 +120,6 @@ class ReferenceIntegrationResult:
     dropped_event_ids: tuple[str, ...] = ()
     restored_source_ids: tuple[str, ...] = ()
     restored_event_ids: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
-    new_sources: int = 0
-    archived_sources: int = 0
-    supplemental_collection_failures: tuple[dict[str, Any], ...] = ()
-
-    @property
-    def kept_events(self) -> tuple[ParsedEvent, ...]:
-        return self.report.events
-
-    def __getitem__(self, key: str) -> Any:
-        """Keep the pre-LOT-19 mapping shape for internal/test callers."""
-        if key == "kept_events":
-            return list(self.kept_events)
-        if key == "supplemental_collection_failures":
-            return list(self.supplemental_collection_failures)
-        return getattr(self, key)
 
 
 def reconcile_reference_report_with_archives(
@@ -659,7 +652,11 @@ _Q1_BLOCKS = {
 
 
 def parse_reference_report(text: str, research_date: date) -> ParseResult[ReferenceReport]:
-    """Parse the Q1 reference report.
+    """Parse the Q1 reference report -- legacy production compatibility.
+
+    TODO AW-012/AW-013: since AW-010 the canonical REFERENCES path parses only
+    SOURCE blocks with ``parse_production_reference_proposals``; this parser
+    feeds the temporary ``ReferenceReport`` projection and V4 imports.
 
     Sources are deduplicated by canonical URL and events are remapped onto the
     surviving ids. An event survives if it still cites at least one known

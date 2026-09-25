@@ -65,7 +65,6 @@ function status(
     current_stage: currentStage,
     progress_current: 2,
     progress_total: 5,
-    references_conversation_id: "c-1",
     synthesis_conversation_id: null,
     run_id: "r-1",
     pipeline_generation: 3,
@@ -749,6 +748,34 @@ describe("SubjectProduction retry from stage", () => {
     });
     expect(select).toHaveValue("");
     expect(screen.getAllByRole("option")).toHaveLength(6);
+  });
+
+  it("REFERENCES n’expose plus de lien vers une conversation de recherche", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("ready", "assembly"),
+          synthesis_conversation_id: "c-2",
+        }),
+      ),
+    );
+    renderProduction();
+    const references = await screen.findByRole("link", {
+      name: "Voir les références",
+    });
+    expect(references).toHaveAttribute(
+      "href",
+      `/subjects/${SUBJECT_ID}/production/artifacts/references`,
+    );
+    expect(
+      screen.queryByRole("link", { name: "Voir la recherche" }),
+    ).toBeNull();
+    const conversationLinks = screen
+      .getAllByRole("link")
+      .filter((link) => link.getAttribute("href")?.endsWith("#conversations"));
+    expect(conversationLinks).toHaveLength(1);
+    expect(conversationLinks[0]).toHaveTextContent("Voir la synthèse");
   });
 
   it("RUNNING n’affiche aucune action retry", async () => {

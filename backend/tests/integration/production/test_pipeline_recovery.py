@@ -86,6 +86,7 @@ def _references_response(urls: tuple[str, ...]) -> str:
                 f"publisher: Lab {index}",
                 f"published-at: 2026-08-{10 + index:02d}",
                 f"role: {'primary' if index == 1 else 'independent'}",
+                "reason: Coverage of the ExampleRAT activity",
                 "",
             )
         )
@@ -853,5 +854,6 @@ async def test_cleanup_failure_after_success_keeps_verified_artifact_and_progres
         for event in _diagnostic_events(scenario)
         if event.get("event") == "production.conversation_close_failed"
     ]
-    assert {event["stage"] for event in cleanup_events} == {"references", "synthesis"}
+    # REFERENCES is stateless (no conversation); only Synthesis has one to close.
+    assert {event["stage"] for event in cleanup_events} == {"synthesis"}
     await _assert_artifact_invariants(scenario, artifacts)

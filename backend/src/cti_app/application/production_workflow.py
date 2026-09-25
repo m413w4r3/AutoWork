@@ -48,21 +48,16 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
-    PARSER_VERSION,
     Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
     IndicatorStatus,
     ParsedSource,
     ParseResult,
     Q2SourceOutput,
-    ReferenceIntegrationResult,
     ReferenceReport,
     parse_q2_proposals_markdown,
-    parse_reference_report,
     q2_source_output_from_json,
     q2_source_output_to_json,
-    reconcile_reference_report_with_archives,
-    reference_report_from_json,
     reference_report_to_json,
     technical_extraction_from_json,
     technical_extraction_to_json,
@@ -75,7 +70,6 @@ from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     IOC_RULES_BATCH_PROMPT_VERSION,
     IOC_RULES_PROMPT_VERSION,
-    REFERENCES_FORMAT_REPAIR_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
     SYNTHESIS_PROMPT_VERSION,
@@ -91,6 +85,18 @@ from cti_app.application.production_q2_batch import (
     q2_batch_model_run_id,
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_references import (
+    PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+    PRODUCTION_REFERENCE_PARSER_VERSION,
+    ProductionReferenceProposal,
+    build_production_reference_corpus,
+    has_usable_core_source,
+    load_reference_projection,
+    observe_reference_collections,
+    parse_production_reference_proposals,
+    production_reference_corpus_from_json,
+    production_reference_corpus_metadata,
+)
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     SYNTHESIS_EVIDENCE_PACK_VERSION,
@@ -159,6 +165,7 @@ from cti_app.domain.production import (
     SourceExtractionStatus,
     SynthesisMode,
 )
+from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 if TYPE_CHECKING:
@@ -180,7 +187,10 @@ Q2_ROUTING_POLICY_VERSION = "4"
 # invalidate Q2 reuse without changing the live-web request format.
 Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
 Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-cross-run-v2"
-REFERENCES_ROUTING_POLICY_VERSION = "openai-web-research-v1"
+# REFERENCES names only the role and routing hint; the ModelRouter owns the
+# backend choice, so this version carries no provider.
+REFERENCES_ROUTING_POLICY_VERSION = "model-router-web-research-v1"
+REFERENCES_PROMPT_TEMPLATE_ID = "production-references"
 
 # Une fermeture d'onglet qui tombe pendant une éviction du service worker MV3
 # réussit quelques secondes plus tard.
@@ -887,6 +897,15 @@ class _ArchivedSource:
 
 
 @dataclass(frozen=True, slots=True)
+class _ReferenceCollectionOutcome:
+    """What the supplementary collection pass added or failed to add."""
+
+    new_sources: int = 0
+    warnings: tuple[str, ...] = ()
+    failures: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class _Q2SourceWork:
     """One planned Q2 source, with its collection provenance for diagnostics."""
 
@@ -954,6 +973,41 @@ async def _archived_sources_by_url(
             mime_type=getattr(document, "detected_mime_type", None),
         )
     return archived
+
+
+def _reference_corpus_result(
+    *,
+    corpus: ProductionReferenceCorpusV1,
+    artifact: ProductionArtifact,
+    warnings: Sequence[str],
+    new_sources: int,
+    research_model_run_id: UUID | None,
+    rebuilt: bool = False,
+) -> dict[str, Any]:
+    """One deterministic stage result shape for a first run and a rebuild."""
+    result: dict[str, Any] = {
+        "stage": "references",
+        "artifact_id": str(artifact.id),
+        **production_reference_corpus_metadata(corpus),
+        "sources_count": len(corpus.sources),
+        "new_sources": new_sources,
+        "warnings": list(warnings),
+        "research_model_run_id": (
+            str(research_model_run_id) if research_model_run_id is not None else None
+        ),
+        "rebuilt": rebuilt,
+    }
+    if has_usable_core_source(corpus):
+        result["status"] = "success"
+    else:
+        result.update(
+            {
+                "status": "needs_review",
+                "error_code": "references_no_usable_core_source",
+                "error": "No core source of this run is archived and extractable",
+            }
+        )
+    return result
 
 
 class ProductionWorkflowOrchestrator:
@@ -1058,9 +1112,7 @@ class ProductionWorkflowOrchestrator:
             return
 
         conversation_id: UUID | None = None
-        if stage is ProductionStage.REFERENCES:
-            conversation_id = run.references_conversation_id
-        elif stage is ProductionStage.SYNTHESIS:
+        if stage is ProductionStage.SYNTHESIS:
             conversation_id = run.synthesis_conversation_id
 
         if conversation_id is None:
@@ -1561,8 +1613,8 @@ class ProductionWorkflowOrchestrator:
     ) -> tuple[Any | None, str, UUID | None, UUID | None]:
         """Ask the model, and give it exactly one chance to fix its formatting.
 
-        Used by Q1 (references) and Q4 (synthesis): both draft FRESH with web
-        search, then repair CONTINUE without web search — the repair turn
+        Used by Q4 (synthesis): it drafts FRESH with web search, then repairs
+        CONTINUE without web search — the repair turn
         never researches again, it restates the same answer in the expected
         structure. Returns the parse result, the raw text used, and the turn
         id it came from.
@@ -1642,33 +1694,35 @@ class ProductionWorkflowOrchestrator:
         repaired.warnings.extend(result.errors)
         return repaired, repaired_raw, repair_turn.id, repair_model_run_id
 
-    async def _integrate_reference_sources(
+    async def _collect_reference_proposals(
         self,
         run: ProductionRun,
-        report: ReferenceReport,
+        proposals: Sequence[ProductionReferenceProposal],
         context: JobExecutionContext | None,
         snapshot: ProductionInputSnapshot | None = None,
-    ) -> ReferenceIntegrationResult:
-        """Attach, collect and archive the publications Q1 proposed.
+    ) -> _ReferenceCollectionOutcome:
+        """Attach, collect and archive the supplementary URLs Q1 proposed.
 
-        An event survives if at least one of its sources ended up archived; a
-        URL already attached to the subject is reused, never re-downloaded.
+        Collection is additive: a failed download never removes a source from
+        the corpus and never fails the stage on its own. A URL already attached
+        to the subject is reused, never re-downloaded.
         """
         warnings: list[str] = []
         supplemental_failures: list[dict[str, Any]] = []
         new_sources = 0
 
-        if self._collection_service is not None:
+        if self._collection_service is not None and proposals:
             supplemental = [
                 SupplementalSource(
-                    url=source.canonical_url,
-                    title=source.title or None,
-                    publisher=source.publisher,
-                    published_at=source.published_at,
-                    role=source.role,
+                    url=proposal.canonical_url,
+                    title=proposal.title,
+                    publisher=proposal.publisher,
+                    published_at=proposal.published_at,
+                    role=proposal.role,
                 )
-                for source in report.sources
+                for proposal in proposals
             ]
+            proposed_urls = {proposal.canonical_url for proposal in proposals}
             try:
                 await self._check_cancellation(run.id, context)
                 added = await self._collection_service.add_supplemental_sources(
@@ -1676,10 +1730,9 @@ class ProductionWorkflowOrchestrator:
                 )
                 new_sources = len(added)
                 if context is not None:
-                    report_urls = {source.canonical_url for source in report.sources}
                     for collection in await self._collection_service.list_sources(run.subject_id):
                         if (
-                            collection.canonical_url not in report_urls
+                            collection.canonical_url not in proposed_urls
                             or collection.state.value in _ARCHIVED_STATES
                         ):
                             continue
@@ -1749,27 +1802,10 @@ class ProductionWorkflowOrchestrator:
                         **failure_fields,
                     )
 
-        archived_urls: set[str] = set()
-        async with self._uow_factory() as uow:
-            for item in await uow.source_collections.list_for_subject(run.subject_id):
-                if item.state.value in _ARCHIVED_STATES:
-                    archived_urls.add(item.canonical_url)
-
-        reconciled = reconcile_reference_report_with_archives(report, archived_urls)
-        warnings.extend(
-            f"event_without_archived_source_dropped:{event_id}"
-            for event_id in reconciled.dropped_event_ids
-        )
-        return ReferenceIntegrationResult(
-            report=reconciled.report,
-            dropped_source_ids=reconciled.dropped_source_ids,
-            dropped_event_ids=reconciled.dropped_event_ids,
-            restored_source_ids=reconciled.restored_source_ids,
-            restored_event_ids=reconciled.restored_event_ids,
-            warnings=tuple(warnings),
+        return _ReferenceCollectionOutcome(
             new_sources=new_sources,
-            archived_sources=len(reconciled.report.sources),
-            supplemental_collection_failures=tuple(supplemental_failures),
+            warnings=tuple(warnings),
+            failures=tuple(supplemental_failures),
         )
 
     async def _load_qa_inputs(
@@ -1786,9 +1822,9 @@ class ProductionWorkflowOrchestrator:
         loaded: dict[str, Any] = {}
         try:
             if references.canonical_blob_id is not None:
-                loaded["report"] = reference_report_from_json(
-                    await store.read_json(references.canonical_blob_id)
-                )
+                report = await load_reference_projection(store, references)
+                if report is not None:
+                    loaded["report"] = report
             if extraction.canonical_blob_id is not None:
                 loaded["extraction"] = technical_extraction_from_json(
                     await store.read_json(extraction.canonical_blob_id)
@@ -1802,12 +1838,16 @@ class ProductionWorkflowOrchestrator:
         return loaded
 
     async def _load_reference_report(self, artifact: Any) -> ReferenceReport | None:
-        """Read back the canonical Q1 report stored with the artifact."""
-        if self._artifact_store is None or artifact.canonical_blob_id is None:
+        """Read the REFERENCES artifact as the temporary legacy `ReferenceReport`.
+
+        The single Q1 compatibility boundary: a canonical AW-010 corpus is
+        projected back through the RAW wire format, while a V4 imported
+        artifact stays the legacy report it already is.
+        """
+        if self._artifact_store is None or getattr(artifact, "canonical_blob_id", None) is None:
             return None
         try:
-            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            return reference_report_from_json(payload)
+            return await load_reference_projection(self._artifact_store, artifact)
         except (OSError, UnicodeError, ValueError):
             return None
 
@@ -1849,19 +1889,16 @@ class ProductionWorkflowOrchestrator:
                 return content.output_text
         return None
 
-    async def _open_conversation(
-        self, run: ProductionRun, subject_title: str, purpose: ConversationPurpose
+    async def _open_synthesis_conversation(
+        self, run: ProductionRun, subject_title: str
     ) -> ModelConversation:
+        """Synthesis keeps its drafting conversation; REFERENCES is stateless."""
         assert self._model_service is not None
         return await self._model_service.create(
             provider=ModelProvider.OPENAI,
             transport=ConversationTransport.CHATGPT_BRIDGE,
-            purpose=purpose,
-            title=(
-                f"Production research — {subject_title}"
-                if purpose is ConversationPurpose.SUBJECT_RESEARCH
-                else f"Production synthesis — {subject_title}"
-            ),
+            purpose=ConversationPurpose.DRAFTING,
+            title=f"Production synthesis — {subject_title}",
             edition_id=run.edition_id,
             subject_id=run.subject_id,
             expected_profile=None,
@@ -1942,7 +1979,20 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
+        """Q1: one stateless web-research call, then an additive corpus.
+
+        The corpus is the canonical REFERENCES state: every snapshot core plus
+        the supplementary publications the model proposed, each with its exact
+        collection observation. A rebuild of the same run re-materializes from
+        the RAW already held, so a manual archive never calls the model again.
+        """
         await self._check_cancellation(run.id, context)
+        if snapshot is None:
+            return {
+                "stage": "references",
+                "status": "error",
+                "error": "production_input_snapshot_missing",
+            }
         async with self._uow_factory() as uow:
             research_date = run.research_date or datetime.now(UTC).date()
             ctx = await build_subject_production_context(
@@ -1953,168 +2003,238 @@ class ProductionWorkflowOrchestrator:
             )
             subject_title = ctx.subject_title
 
-            input_hash = _references_input_hash(
-                subject_id=run.subject_id,
-                snapshot=snapshot,
-                subject_title=subject_title,
-                subject_description=ctx.subject_description,
-                research_date=research_date,
+            input_hash = _references_input_hash(snapshot=snapshot, research_date=research_date)
+            current = await uow.production_artifacts.get_current(run.id, "references")
+
+        # A rebuild of this run re-materializes the corpus from the RAW it
+        # already holds and the collection state observed right now.  This is
+        # what lets an analyst archive a proposed source by hand and get a new
+        # corpus version without a second model call.
+        if (
+            current is not None
+            and current.status is ProductionArtifactStatus.VERIFIED
+            and current.input_hash == input_hash
+        ):
+            rebuilt = await self._rematerialize_references_artifact(
+                run=run, snapshot=snapshot, current=current
             )
-            reused = await self._reuse_artifact(run, "references", input_hash)
-            if reused is not None:
-                return reused
+            if rebuilt is not None:
+                return rebuilt
 
-            if not self._model_service:
-                return {
-                    "stage": "references",
-                    "status": "error",
-                    "error": "ModelConversationService not configured",
-                }
+        # Cross-run reuse happens before any submission: an identical
+        # functional identity must never cost another web research.
+        reused = await self._reuse_artifact(run, "references", input_hash)
+        if reused is not None:
+            return reused
 
-            # The diffusion policy, not a hardcoded flag, decides whether this
-            # subject may be sent to an external model.
-            if not ctx.external_llm_allowed:
-                return {
-                    "stage": "references",
-                    "status": "needs_review",
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
-                }
-
-            # Q1 has its own research conversation; Q2 remains stateless.
-            if not run.references_conversation_id:
-                conversation = await self._open_conversation(
-                    run, subject_title, ConversationPurpose.SUBJECT_RESEARCH
-                )
-                run.references_conversation_id = conversation.id
-                persisted = await uow.production_runs.get_for_update(run.id)
-                if persisted is not None:
-                    persisted.references_conversation_id = conversation.id
-                    await uow.production_runs.save(persisted)
-                    await uow.commit()
-
-            prompt = ProductionPromptTemplates.get_references_prompt(
-                subject_title=subject_title,
-                subject_description=ctx.subject_description,
-                actor_info=ctx.actor_info,
-                technical_summary=ctx.technical_summary,
-                research_date=research_date.isoformat(),
-                period_start=ctx.period_start,
-                period_end=ctx.period_end,
-                core_sources_text=ctx.core_sources_text,
-                supporting_sources_text=ctx.supporting_sources_text,
-            )
-
-            try:
-                parsed, raw, turn_id, _ = await self._ask_with_format_repair(
-                    run=run,
-                    conversation_id=run.references_conversation_id,
-                    stage="references",
-                    prompt=prompt,
-                    prompt_version=REFERENCES_PROMPT_VERSION,
-                    repair_version=REFERENCES_FORMAT_REPAIR_VERSION,
-                    mode=ConversationMode.FRESH,
-                    parse=lambda text: parse_reference_report(text, research_date),
-                    external_llm_allowed=ctx.external_llm_allowed,
-                    web_search=True,
-                    request_identity=f"g{run.pipeline_generation}",
-                    context=context,
-                )
-            except JobCancelledError:
-                raise
-            except Exception as e:
-                await self._check_cancellation(run.id, context)
-                return self._handle_stage_exception(run, "references", e)
-
-            if parsed is None:
-                return {
-                    "stage": "references",
-                    "status": "needs_review",
-                    "error_code": "no_model_response",
-                    "error": "No response from model",
-                }
-            if not parsed.usable:
-                # A format the parser cannot read is a review case, never a crash.
-                return {
-                    "stage": "references",
-                    "status": "needs_review",
-                    "error_code": "references_format_unusable",
-                    "error": "; ".join(parsed.errors),
-                    "warnings": parsed.warnings,
-                }
-
-            report = parsed.value
-            assert report is not None
-            proposed_source_index = [
-                {
-                    "source_id": source.local_id,
-                    "source_title": source.title,
-                    "source_url": source.canonical_url,
-                    "publisher": source.publisher,
-                }
-                for source in report.sources
-            ]
-
-            # Order matters: the new publications must be attached, downloaded
-            # and archived before Q1 is recorded, so extraction only ever sees
-            # events backed by a source we actually hold.
-            await self._check_cancellation(run.id, context)
-            integration = await self._integrate_reference_sources(run, report, context, snapshot)
-            parsed.warnings.extend(integration.warnings)
-            report = integration.report
-
-            archived_for_index = await _archived_sources_by_url(uow, run.subject_id, report)
-
-            await self._check_cancellation(run.id, context)
-            artifact = await self._references.store_references_result(
-                run_id=run.id,
-                subject_id=run.subject_id,
-                input_hash=input_hash,
-                raw_result=raw,
-                canonical_json=reference_report_to_json(report),
-                conversation_turn_id=turn_id,
-                warnings=parsed.warnings,
-                repair_source_index={
-                    "proposed": proposed_source_index,
-                    "canonical": [
-                        {
-                            "source_id": source.local_id,
-                            "source_url": source.canonical_url,
-                        }
-                        for source in report.sources
-                    ],
-                    "source_hashes": {
-                        url: item.content_sha256 for url, item in archived_for_index.items()
-                    },
-                },
-            )
-
-            # Keep raw Q1 and the empty canonical projection available even
-            # when collection failures left no usable event.  This is what
-            # lets the Repair Desk archive one of those proposed sources and
-            # deterministically rebuild REFERENCES later, without asking the
-            # model the same Q1 question again.
-            if not integration.kept_events:
-                return {
-                    "stage": "references",
-                    "status": "needs_review",
-                    "artifact_id": str(artifact.id),
-                    "error_code": "no_event_with_archived_source",
-                    "error": "No chronological event is backed by an archived source",
-                    "warnings": parsed.warnings,
-                }
-
+        if self._model_gateway is None:
             return {
                 "stage": "references",
-                "status": "success",
-                "artifact_id": str(artifact.id),
-                "sources_count": len(report.sources),
-                "events_count": len(report.events),
-                "new_sources": integration.new_sources,
-                "archived_sources": integration.archived_sources,
-                "warnings": parsed.warnings,
-                "repair_actions": parsed.repair_actions,
+                "status": "error",
+                "error": "ModelGateway not configured",
             }
+
+        # The diffusion policy, not a hardcoded flag, decides whether this
+        # subject may be sent to an external model.
+        if not ctx.external_llm_allowed:
+            return {
+                "stage": "references",
+                "status": "needs_review",
+                "error_code": "external_llm_blocked",
+                "error": "Diffusion policy forbids sending this subject to an external model",
+            }
+
+        prompt = ProductionPromptTemplates.get_references_prompt(
+            subject_title=subject_title,
+            subject_description=ctx.subject_description,
+            actor_info=ctx.actor_info,
+            technical_summary=ctx.technical_summary,
+            research_date=research_date.isoformat(),
+            period_start=ctx.period_start,
+            period_end=ctx.period_end,
+            core_sources_text=ctx.core_sources_text,
+            supporting_sources_text=ctx.supporting_sources_text,
+        )
+        # Stateless research: no conversation, exact retry identity.  The
+        # gateway owns provider selection, background resume, reconciliation
+        # and the refusal to replay an unsafe submission.
+        model_run_id = production_references_model_run_id(run.id, input_hash)
+        request = ModelRequest(
+            text=prompt,
+            prompt_template_id=REFERENCES_PROMPT_TEMPLATE_ID,
+            prompt_template_version=REFERENCES_PROMPT_VERSION,
+            evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
+            external_llm_allowed=ctx.external_llm_allowed,
+            routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            web_search=True,
+            conversation=None,
+            run_id=model_run_id,
+            metadata={
+                "subject_id": str(run.subject_id),
+                "references_input_hash": input_hash,
+                "production_input_snapshot_hash": snapshot.input_hash,
+                "research_date": research_date.isoformat(),
+                "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+                "corpus_schema_version": PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+                "routing_policy_version": REFERENCES_ROUTING_POLICY_VERSION,
+            },
+            parameters={
+                "references_input_hash": input_hash,
+                "prompt_version": REFERENCES_PROMPT_VERSION,
+                "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+                "corpus_schema_version": PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
+                "routing_policy_version": REFERENCES_ROUTING_POLICY_VERSION,
+            },
+        )
+        model_gateway = cast(ModelGateway, self._model_gateway)
+        try:
+            execution = await model_gateway.research(request)
+        except JobCancelledError:
+            raise
+        except Exception as e:
+            await self._check_cancellation(run.id, context)
+            return self._handle_stage_exception(run, "references", e)
+
+        raw = execution.output_text or ""
+        research_model_run_id = getattr(execution.run, "id", None)
+        if not raw:
+            return {
+                "stage": "references",
+                "status": "needs_review",
+                "error_code": "no_model_response",
+                "error": "No response from model",
+            }
+
+        # The canonical parser reads SOURCE blocks only; the legacy
+        # editorial-title/EVENT/UNCERTAINTIES sections of the RAW are ignored
+        # here and re-projected later for the stages that still need them.
+        parsed = parse_production_reference_proposals(raw, research_date)
+        self._log_parse(run, "references", parsed)
+        await self._check_cancellation(run.id, context)
+        collection = await self._collect_reference_proposals(
+            run, parsed.value or (), context, snapshot
+        )
+        corpus = await self._build_reference_corpus(
+            run=run,
+            snapshot=snapshot,
+            research_date=research_date,
+            proposals=parsed.value or (),
+            warnings=[*parsed.warnings, *collection.warnings],
+        )
+
+        await self._check_cancellation(run.id, context)
+        artifact, created = await self._references.store_references_result(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            input_hash=input_hash,
+            raw_result=raw,
+            corpus=corpus,
+            model_run_id=research_model_run_id,
+        )
+        return _reference_corpus_result(
+            corpus=corpus,
+            artifact=artifact,
+            warnings=corpus.warnings,
+            new_sources=collection.new_sources,
+            research_model_run_id=research_model_run_id,
+            rebuilt=not created,
+        )
+
+    async def _rematerialize_references_artifact(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        current: ProductionArtifact,
+    ) -> dict[str, Any] | None:
+        """Rebuild this run's corpus from its RAW and the live collection state.
+
+        Returns ``None`` when the stored canonical payload is not an AW-010
+        corpus (a V4 import or another legacy artifact), so the caller falls
+        back to the ordinary reuse path instead of upgrading it.
+        """
+        store = self._artifact_store
+        if store is None or current.raw_blob_id is None or current.canonical_blob_id is None:
+            return None
+        try:
+            payload = await store.read_json(current.canonical_blob_id)
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except (OSError, UnicodeError, ValueError):
+            return None
+        try:
+            stored_corpus = production_reference_corpus_from_json(payload)
+        except ValueError:
+            # TODO AW-012/AW-013: a legacy imported artifact is reused as-is.
+            return None
+
+        raw = await store.read_text(current.raw_blob_id)
+        parsed = parse_production_reference_proposals(raw, stored_corpus.research_date)
+        self._log_parse(run, "references-rebuild", parsed)
+        # No collection, no model call: the rebuild only observes what the
+        # subject holds right now. Parser and collection warnings are those
+        # of the previous corpus, so an unchanged corpus stays byte-identical.
+        corpus = await self._build_reference_corpus(
+            run=run,
+            snapshot=snapshot,
+            research_date=stored_corpus.research_date,
+            proposals=parsed.value or (),
+            warnings=stored_corpus.warnings,
+            previous=stored_corpus,
+        )
+        artifact, created = await self._references.store_references_result(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            input_hash=current.input_hash,
+            raw_result=raw,
+            corpus=corpus,
+            model_run_id=current.model_run_id,
+        )
+        if not created:
+            # Same functional corpus: no artificial V+1.
+            return {
+                "stage": "references",
+                "status": "cached",
+                "artifact_id": str(artifact.id),
+                "reused": False,
+                "reused_from_artifact_id": None,
+            }
+        return _reference_corpus_result(
+            corpus=corpus,
+            artifact=artifact,
+            warnings=corpus.warnings,
+            new_sources=0,
+            research_model_run_id=current.model_run_id,
+            rebuilt=True,
+        )
+
+    async def _build_reference_corpus(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        research_date: date,
+        proposals: Sequence[ProductionReferenceProposal],
+        warnings: Sequence[str],
+        previous: ProductionReferenceCorpusV1 | None = None,
+    ) -> ProductionReferenceCorpusV1:
+        """Assemble the canonical corpus: core sources then additive proposals."""
+        urls = [source.canonical_url for source in snapshot.core_sources]
+        urls.extend(proposal.canonical_url for proposal in proposals)
+        if previous is not None:
+            urls.extend(source.canonical_url for source in previous.sources)
+        async with self._uow_factory() as uow:
+            observations = await observe_reference_collections(uow, run.subject_id, urls)
+        return build_production_reference_corpus(
+            subject_id=run.subject_id,
+            research_date=research_date,
+            production_input_hash=snapshot.input_hash,
+            core_sources=snapshot.core_sources,
+            proposals=proposals,
+            observations=observations,
+            warnings=warnings,
+            previous=previous,
+        )
 
     async def _execute_extraction_stage(
         self,
@@ -5270,9 +5390,7 @@ class ProductionWorkflowOrchestrator:
                 }
 
             if run.synthesis_conversation_id is None:
-                conversation = await self._open_conversation(
-                    run, subject_title, ConversationPurpose.DRAFTING
-                )
+                conversation = await self._open_synthesis_conversation(run, subject_title)
                 run.synthesis_conversation_id = conversation.id
                 persisted = await uow.production_runs.get_for_update(run.id)
                 if persisted is not None:
@@ -5725,35 +5843,41 @@ def _q2_batch_model_run_id(
 
 def _references_input_hash(
     *,
-    subject_id: UUID,
-    snapshot: ProductionInputSnapshot | None,
-    subject_title: str,
-    subject_description: str,
+    snapshot: ProductionInputSnapshot,
     research_date: Any,
 ) -> str:
-    """Functional Q1 identity; execution/run identities are deliberately absent."""
-    snapshot_hash = (
-        snapshot.input_hash
-        if snapshot is not None
-        else compute_input_hash(
-            {
-                "subject_id": str(subject_id),
-                "title": subject_title,
-                "description": subject_description,
-                "research_date": str(research_date),
-            }
-        )
-    )
+    """Functional Q1 identity: snapshot, research date and contract versions.
+
+    Execution identities (run id, job id, model run id, provider, response or
+    conversation id, pipeline generation) and technical timestamps are
+    deliberately absent, so two runs of the same Subject compute one corpus and
+    reuse it across runs.
+    """
     return compute_input_hash(
         {
-            "subject_id": str(subject_id),
-            "production_input_snapshot_hash": snapshot_hash,
+            "production_input_snapshot_hash": snapshot.input_hash,
+            "research_date": str(research_date),
             "prompt_version": REFERENCES_PROMPT_VERSION,
-            "format_repair_version": REFERENCES_FORMAT_REPAIR_VERSION,
-            "parser_version": PARSER_VERSION,
+            "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+            "corpus_schema_version": PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
             "routing_policy_version": REFERENCES_ROUTING_POLICY_VERSION,
             "stage": "references",
         }
+    )
+
+
+def production_references_model_run_id(
+    production_run_id: UUID,
+    references_input_hash: str,
+) -> UUID:
+    """Stable execution identity for one run's REFERENCES research submission.
+
+    ``ModelRun`` is an execution identity, so the production run belongs here;
+    it stays out of the functional corpus.
+    """
+    return uuid5(
+        NAMESPACE_URL,
+        f"production-references-model:{production_run_id}:{references_input_hash}",
     )
 
 

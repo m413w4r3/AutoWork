@@ -19,7 +19,6 @@ const production = {
   current_stage: "sources",
   progress_current: 0,
   progress_total: 5,
-  references_conversation_id: null,
   synthesis_conversation_id: null,
   run_id: "run-1",
   pipeline_generation: 1,

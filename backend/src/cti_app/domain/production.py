@@ -967,7 +967,6 @@ class ProductionRun:
     edition_id: UUID
     status: ProductionRunStatus = ProductionRunStatus.QUEUED
     current_stage: ProductionStage = ProductionStage.SOURCES
-    references_conversation_id: UUID | None = None
     synthesis_conversation_id: UUID | None = None
     run_number: int = 1
     # A manual retry is a new pipeline generation, distinct from a worker's
@@ -1169,7 +1168,6 @@ class ProductionRun:
     def _reset_conversations_from(self, stage: ProductionStage) -> None:
         """Drop the model conversations the stages from ``stage`` on will rebuild."""
         if stage in (ProductionStage.SOURCES, ProductionStage.REFERENCES):
-            self.references_conversation_id = None
             self.synthesis_conversation_id = None
         elif stage in (ProductionStage.EXTRACTION, ProductionStage.SYNTHESIS):
             self.synthesis_conversation_id = None

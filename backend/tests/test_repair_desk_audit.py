@@ -12,7 +12,7 @@ import json
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -29,6 +29,10 @@ from cti_app.application.production_parsers import (
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
+from cti_app.application.production_references import (
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_repairs import (
     MAX_REPAIR_PREVIEW_CHARS,
     ProductionRepairIssueService,
@@ -44,6 +48,7 @@ from cti_app.application.production_state import (
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -54,6 +59,13 @@ from cti_app.domain.production import (
     ProductionRepairDecision,
     ProductionRepairIssueKind,
     ProductionRunStatus,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 from cti_app.domain.publication_review import PublicationDecision
 
@@ -329,6 +341,70 @@ def _factory(uow: _Uow) -> Any:
     return lambda: uow
 
 
+def _corpus_source(
+    url: str,
+    *,
+    tier: ProductionReferenceTier,
+    state: CollectionState,
+    digest: str | None = None,
+    title: str | None = None,
+    publisher: str | None = "Publisher",
+) -> ProductionReferenceSourceV1:
+    """One canonical corpus source, archived only when it carries a capture."""
+    document_identity = uuid4() if digest is not None else None
+    return ProductionReferenceSourceV1(
+        canonical_url=url,
+        tier=tier,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        title=title,
+        publisher=publisher,
+        published_at=None,
+        source_collection_id=document_identity,
+        source_document_id=document_identity,
+        discovery_candidate_ids=(),
+        collection_state=state,
+        content_sha256=digest,
+        relevance_reason=(
+            "Corroborates the core report" if tier is not ProductionReferenceTier.CORE else None
+        ),
+        proposed_by_model=tier is not ProductionReferenceTier.CORE,
+        eligible_for_extraction=digest is not None,
+    )
+
+
+async def _corpus_references_artifact(
+    store: ProductionArtifactStore,
+    *,
+    run_id: UUID = RUN_A,
+    subject_id: UUID = SUBJECT_A,
+    sources: tuple[ProductionReferenceSourceV1, ...],
+    version: int = 1,
+) -> ProductionArtifact:
+    """A verified AW-010 REFERENCES artifact holding only its corpus."""
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject_id,
+        research_date=date(2026, 8, 15),
+        production_input_hash="c" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
+    )
+    _, canonical_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(corpus)
+    )
+    return ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=version,
+        input_hash="c" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=canonical_blob_id,
+    )
+
+
 def _edition() -> Edition:
     return Edition(
         id=EDITION_ID,
@@ -521,28 +597,30 @@ async def test_audit1_every_rejection_stays_reachable_with_intact_bodies() -> No
         error_reason="collection_failed",
         attempt_count=2,
     )
-    references = ProductionArtifact(
-        production_run_id=RUN_A,
-        subject_id=SUBJECT_A,
-        stage=ProductionArtifactStage.REFERENCES,
-        version=1,
-        input_hash="c" * 64,
-        status=ProductionArtifactStatus.VERIFIED,
-        raw_blob_id=uuid4(),
-        canonical_blob_id=uuid4(),
-        metadata={
-            "repair_source_index": {
-                "proposed": [
-                    {"source_id": "S1", "source_url": SOURCE_ONE, "source_title": "One"},
-                    {"source_id": "S2", "source_url": SOURCE_TWO, "source_title": "Two"},
-                    {"source_id": "S3", "source_url": SOURCE_THREE, "source_title": "Three"},
-                ],
-                "canonical": [
-                    {"source_id": "S1", "source_url": SOURCE_ONE},
-                    {"source_id": "S2", "source_url": SOURCE_TWO},
-                ],
-            }
-        },
+    references = await _corpus_references_artifact(
+        store,
+        sources=(
+            _corpus_source(
+                SOURCE_ONE,
+                tier=ProductionReferenceTier.CORE,
+                state=CollectionState.ARCHIVED,
+                digest="1" * 64,
+                title="One",
+            ),
+            _corpus_source(
+                SOURCE_TWO,
+                tier=ProductionReferenceTier.CORE,
+                state=CollectionState.ARCHIVED,
+                digest="2" * 64,
+                title="Two",
+            ),
+            _corpus_source(
+                SOURCE_THREE,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.FAILED_TERMINAL,
+                title="Three",
+            ),
+        ),
     )
     uow = _Uow(
         runs=[_run()],
@@ -978,22 +1056,23 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
         error_reason="collection_failed",
         attempt_count=3,
     )
-    references = ProductionArtifact(
-        production_run_id=RUN_A,
-        subject_id=SUBJECT_A,
-        stage=ProductionArtifactStage.REFERENCES,
-        version=1,
-        input_hash="c" * 64,
-        status=ProductionArtifactStatus.VERIFIED,
-        metadata={
-            "repair_source_index": {
-                "proposed": [
-                    {"source_id": "S1", "source_url": SOURCE_ONE, "source_title": "One"},
-                    {"source_id": "S3", "source_url": SOURCE_THREE, "source_title": "Three"},
-                ],
-                "canonical": [{"source_id": "S1", "source_url": SOURCE_ONE}],
-            }
-        },
+    references = await _corpus_references_artifact(
+        store,
+        sources=(
+            _corpus_source(
+                SOURCE_ONE,
+                tier=ProductionReferenceTier.CORE,
+                state=CollectionState.ARCHIVED,
+                digest="1" * 64,
+                title="One",
+            ),
+            _corpus_source(
+                SOURCE_THREE,
+                tier=ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.FAILED_TERMINAL,
+                title="Three",
+            ),
+        ),
     )
     key = repair_key_for_supplemental_source(
         edition_id=EDITION_ID, subject_id=SUBJECT_A, source_url=SOURCE_THREE
@@ -1021,9 +1100,15 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
     assert issue.effective_decision is not None
     assert issue.effective_decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
     assert issue.recommended_action == "continue_without_source"
-    # The canonical reference report was never rewritten by the waiver.
-    canonical_index = references.metadata["repair_source_index"]["canonical"]
-    assert canonical_index == [{"source_id": "S1", "source_url": SOURCE_ONE}]
+    # The canonical corpus was never rewritten by the waiver: the waived source
+    # is still there, unavailable, and the archived core is still eligible.
+    canonical = production_reference_corpus_from_json(
+        await store.read_json(cast(UUID, references.canonical_blob_id))
+    )
+    eligibility = {
+        source.canonical_url: source.eligible_for_extraction for source in canonical.sources
+    }
+    assert eligibility == {SOURCE_ONE: True, SOURCE_THREE: False}
 
     review = EditionReviewService.from_rows(EDITION_ID, [_row()], repair_issues=list(sources))
     assert review.unresolved_repair_count == 0

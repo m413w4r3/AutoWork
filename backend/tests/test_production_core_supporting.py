@@ -1,6 +1,9 @@
 import json
 from datetime import date
 from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
 
 from cti_app.application.production_parsers import (
     DisplayPolicy,
@@ -16,11 +19,26 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
+from cti_app.application.production_references import (
+    load_legacy_reference_report,
+    parse_production_reference_proposals,
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _repair_problem_descriptions,
 )
+from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import DetectionRule, DetectionRuleType
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+)
 from cti_app.domain.publication import ArtifactType
 
 
@@ -65,7 +83,344 @@ def test_references_prompt_separates_linked_technical_sources_without_following_
         assert linked_resource in one_line
     assert "same subject" in one_line
     assert "Do not turn every hyperlink into a SOURCE" in one_line
-    assert REFERENCES_PROMPT_VERSION == "6"
+    assert REFERENCES_PROMPT_VERSION == "7"
+    assert "kind: publication|technical_resource" in one_line
+    assert "reason: <short explanation of relevance to the Subject>" in one_line
+    assert "editorial-title:" in one_line
+    assert "## EVENT R1" in one_line
+    assert "# UNCERTAINTIES" in one_line
+
+
+def _reference_source(
+    url: str,
+    tier: ProductionReferenceTier,
+    *,
+    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
+    state: CollectionState = CollectionState.ARCHIVED,
+    document_id=None,
+    content_sha256: str | None = "a" * 64,
+    proposed_by_model: bool = False,
+    role: SourceRole = SourceRole.PRIMARY,
+) -> ProductionReferenceSourceV1:
+    if document_id is None and state is not CollectionState.UNAVAILABLE:
+        document_id = uuid4()
+    if state is CollectionState.UNAVAILABLE:
+        content_sha256 = None
+    return ProductionReferenceSourceV1(
+        canonical_url=url,
+        tier=tier,
+        kind=kind,
+        role=role,
+        title=None,
+        publisher=None,
+        published_at=None,
+        source_collection_id=None,
+        source_document_id=document_id,
+        discovery_candidate_ids=(),
+        collection_state=state,
+        content_sha256=content_sha256,
+        relevance_reason="Relevant to the subject" if proposed_by_model else None,
+        proposed_by_model=proposed_by_model,
+        eligible_for_extraction=(
+            state
+            in {
+                CollectionState.ARCHIVED,
+                CollectionState.EXTRACTED,
+                CollectionState.COMPLETED,
+            }
+            and document_id is not None
+            and content_sha256 is not None
+        ),
+    )
+
+
+def _reference_corpus(
+    sources: tuple[ProductionReferenceSourceV1, ...],
+) -> ProductionReferenceCorpusV1:
+    return ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=uuid4(),
+        research_date=date(2026, 8, 1),
+        production_input_hash="b" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
+    )
+
+
+def test_production_reference_corpus_strictly_validates_schema_hash_url_and_collection_state() -> (
+    None
+):
+    with pytest.raises(ValueError, match="schema version"):
+        ProductionReferenceCorpusV1(
+            schema_version=2,
+            subject_id=uuid4(),
+            research_date=date(2026, 8, 1),
+            production_input_hash="b" * 64,
+            research_status=ProductionReferenceResearchStatus.COMPLETED,
+            sources=(),
+            warnings=(),
+        )
+    with pytest.raises(ValueError, match="SHA-256"):
+        ProductionReferenceCorpusV1(
+            schema_version=1,
+            subject_id=uuid4(),
+            research_date=date(2026, 8, 1),
+            production_input_hash="B" * 64,
+            research_status=ProductionReferenceResearchStatus.COMPLETED,
+            sources=(),
+            warnings=(),
+        )
+    with pytest.raises(ValueError, match="canonical"):
+        _reference_source("https://example.test/report/", ProductionReferenceTier.CORE)
+    with pytest.raises(ValueError, match="content hash"):
+        _reference_source(
+            "https://example.test/report",
+            ProductionReferenceTier.CORE,
+            content_sha256="A" * 64,
+        )
+    with pytest.raises(ValueError, match="collection state"):
+        ProductionReferenceSourceV1(
+            canonical_url="https://example.test/report",
+            tier=ProductionReferenceTier.CORE,
+            kind=ProductionReferenceKind.PUBLICATION,
+            role=SourceRole.PRIMARY,
+            title=None,
+            publisher=None,
+            published_at=None,
+            source_collection_id=None,
+            source_document_id=None,
+            discovery_candidate_ids=(),
+            collection_state="archived",
+            content_sha256="a" * 64,
+            relevance_reason=None,
+            proposed_by_model=False,
+            eligible_for_extraction=True,
+        )
+
+
+def test_production_reference_corpus_round_trip_orders_sources_and_excludes_legacy_fields() -> None:
+    corpus = _reference_corpus(
+        (
+            _reference_source("https://z.example/report", ProductionReferenceTier.TECHNICAL),
+            _reference_source("https://support.example/report", ProductionReferenceTier.SUPPORTING),
+            _reference_source("https://z-core.example/report", ProductionReferenceTier.CORE),
+            _reference_source("https://a-core.example/report", ProductionReferenceTier.CORE),
+        )
+    )
+    payload = production_reference_corpus_to_json(corpus)
+
+    assert [source["tier"] for source in payload["sources"]] == [
+        "core",
+        "core",
+        "supporting",
+        "technical",
+    ]
+    assert [source["canonical_url"] for source in payload["sources"]] == [
+        "https://a-core.example/report",
+        "https://z-core.example/report",
+        "https://support.example/report",
+        "https://z.example/report",
+    ]
+    round_trip = production_reference_corpus_to_json(production_reference_corpus_from_json(payload))
+    assert round_trip == payload
+    assert "production_run_id" not in payload
+    assert "events" not in payload
+    assert "editorial_title" not in payload
+    with pytest.raises(ValueError, match="invalid shape"):
+        production_reference_corpus_from_json({**payload, "production_run_id": str(uuid4())})
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("relevance_reason", None, "relevance reason"),
+        ("relevance_reason", "", "relevance reason"),
+        ("relevance_reason", "   ", "relevance reason"),
+        ("tier", "technical", "SUPPORTING"),
+        ("kind", "technical_resource", "TECHNICAL"),
+        ("tier", "core", "CORE"),
+    ),
+)
+def test_production_reference_corpus_from_json_rejects_invalid_model_sources(
+    field: str,
+    value: str | None,
+    message: str,
+) -> None:
+    payload = production_reference_corpus_to_json(
+        _reference_corpus(
+            (
+                _reference_source(
+                    "https://model.example/report",
+                    ProductionReferenceTier.SUPPORTING,
+                    proposed_by_model=True,
+                ),
+            )
+        )
+    )
+    payload["sources"][0][field] = value
+
+    with pytest.raises(ValueError, match=message):
+        production_reference_corpus_from_json(payload)
+
+
+def test_production_reference_corpus_from_json_accepts_valid_model_source_kinds() -> None:
+    corpus = _reference_corpus(
+        (
+            _reference_source(
+                "https://publication.example/report",
+                ProductionReferenceTier.SUPPORTING,
+                proposed_by_model=True,
+            ),
+            _reference_source(
+                "https://technical.example/resource",
+                ProductionReferenceTier.TECHNICAL,
+                kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+                proposed_by_model=True,
+            ),
+        )
+    )
+
+    payload = production_reference_corpus_to_json(corpus)
+    round_trip = production_reference_corpus_from_json(payload)
+
+    assert production_reference_corpus_to_json(round_trip) == payload
+
+
+def test_production_reference_corpus_core_wins_duplicate_canonical_url() -> None:
+    core = _reference_source(
+        "https://same.example/report",
+        ProductionReferenceTier.CORE,
+        proposed_by_model=False,
+        role=SourceRole.PRIMARY,
+    )
+    proposal = _reference_source(
+        "https://same.example/report",
+        ProductionReferenceTier.SUPPORTING,
+        proposed_by_model=True,
+        role=SourceRole.RELAY,
+    )
+
+    corpus = _reference_corpus((proposal, core))
+
+    assert len(corpus.sources) == 1
+    assert corpus.sources[0].tier is ProductionReferenceTier.CORE
+    assert corpus.sources[0].role is SourceRole.PRIMARY
+
+
+def test_production_reference_proposal_parser_is_tolerant_and_reads_source_blocks_only() -> None:
+    parsed = parse_production_reference_proposals(
+        """# REFERENCES
+editorial-title: Legacy title
+## SOURCE S1
+title: First
+url: https://example.test/report?utm_source=mail
+role: primary
+kind: publication
+reason: Primary coverage of the subject
+## SOURCE S2
+url: file:///tmp/local.txt
+reason: Invalid URL
+## SOURCE S3
+title: Future
+url: https://future.example/report
+published-at: 2026-08-02
+kind: technical_resource
+reason: Future source
+## SOURCE S4
+title: Missing kind
+url: https://missing-kind.example/report
+reason: Supporting coverage
+## SOURCE S5
+url: https://invalid-kind.example/report
+kind: dataset
+reason: Invalid kind
+## SOURCE S6
+title: Duplicate
+url: https://example.test/report
+kind: technical_resource
+reason: Duplicates the first canonical URL
+## EVENT R1
+date: 2026-07-01
+sources: S1
+text: Ignored legacy event
+# UNCERTAINTIES
+- ignored by the canonical proposal parser
+""",
+        date(2026, 8, 1),
+    )
+
+    assert parsed.usable
+    assert parsed.value is not None
+    assert [proposal.canonical_url for proposal in parsed.value] == [
+        "https://example.test/report",
+        "https://missing-kind.example/report",
+    ]
+    assert parsed.value[0].kind is ProductionReferenceKind.PUBLICATION
+    assert parsed.value[0].tier is ProductionReferenceTier.SUPPORTING
+    assert parsed.value[1].kind is ProductionReferenceKind.PUBLICATION
+    assert "reference_invalid_url" in parsed.warnings
+    assert "reference_future_date" in parsed.warnings
+    assert "reference_kind_missing_defaulted_to_publication" in parsed.warnings
+    assert "reference_invalid_kind" in parsed.warnings
+    assert "reference_duplicate_url_ignored" in parsed.warnings
+
+
+def test_production_reference_proposal_requires_reason_and_accepts_no_new_sources() -> None:
+    missing_reason = parse_production_reference_proposals(
+        "## SOURCE S1\nurl: https://example.test/report\nkind: publication",
+        date(2026, 8, 1),
+    )
+    empty = parse_production_reference_proposals(
+        "# REFERENCES\neditorial-title: legacy\n## EVENT R1\ntext: ignored",
+        date(2026, 8, 1),
+    )
+
+    assert missing_reason.usable and missing_reason.value == ()
+    assert "reference_missing_reason" in missing_reason.warnings
+    assert empty.usable and empty.value == ()
+
+
+def test_legacy_reference_projection_filters_to_eligible_corpus_sources_and_handles_v4() -> None:
+    corpus = _reference_corpus(
+        (
+            _reference_source("https://eligible.example/report", ProductionReferenceTier.CORE),
+            _reference_source(
+                "https://unavailable.example/report",
+                ProductionReferenceTier.SUPPORTING,
+                state=CollectionState.UNAVAILABLE,
+                proposed_by_model=True,
+            ),
+        )
+    )
+    raw = """# REFERENCES
+editorial-title: Legacy title
+## SOURCE S1
+title: Eligible
+url: https://eligible.example/report
+## SOURCE S2
+title: Unavailable
+url: https://unavailable.example/report
+## EVENT R1
+date: 2026-07-01
+sources: S1, S2
+text: Backed by eligible and unavailable sources
+## EVENT R2
+date: 2026-07-02
+sources: S2
+text: Unbacked after filtering
+"""
+
+    projected = load_legacy_reference_report(raw, date(2026, 8, 1), corpus=corpus)
+    imported = load_legacy_reference_report(raw, date(2026, 8, 1), legacy_imported=True)
+
+    assert [source.canonical_url for source in projected.sources] == [
+        "https://eligible.example/report"
+    ]
+    assert [event.source_ids for event in projected.events] == [("S1",)]
+    assert projected.editorial_title == "Legacy title"
+    # Historical V4 data stays legacy; no V1 facts are fabricated.
+    assert len(imported.sources) == 2
 
 
 def test_synthesis_pack_assigns_tiers_without_defaulting_unknown_to_core() -> None:

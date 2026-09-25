@@ -8,6 +8,7 @@ subject — including when it failed, so one bad subject cannot block the queue.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import date
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -33,16 +34,31 @@ from cti_app.application.production_recovery import (
     ProductionRecoveryDisposition,
     ProductionRecoveryPolicyV1,
 )
-from cti_app.application.production_workflow import _transient_or_terminal
+from cti_app.application.production_workflow import (
+    _reference_corpus_result,
+    _transient_or_terminal,
+)
+from cti_app.domain.collection import CollectionState
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelRunStatus, ModelSubmissionState
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionReconciliationRequiredError,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
     ProductionSubmissionReconciliation,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 
 
@@ -862,3 +878,97 @@ async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
     with pytest.raises(ProductionReconciliationRequiredError):
         parked.retry_from_stage(ProductionStage.REFERENCES)
     assert jobs.submitted == []
+
+
+def _references_corpus_result() -> dict[str, Any]:
+    """The exact AW-010 REFERENCES result shape for a usable core corpus."""
+    subject_id = uuid4()
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject_id,
+        research_date=date(2026, 8, 1),
+        production_input_hash="b" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url="https://core.example/report",
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                title="Core",
+                publisher="Publisher",
+                published_at=date(2026, 8, 1),
+                source_collection_id=uuid4(),
+                source_document_id=uuid4(),
+                discovery_candidate_ids=(uuid4(),),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256="c" * 64,
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+            ),
+        ),
+        warnings=(),
+    )
+    artifact = ProductionArtifact(
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="a" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+    )
+    return _reference_corpus_result(
+        corpus=corpus,
+        artifact=artifact,
+        warnings=corpus.warnings,
+        new_sources=0,
+        research_model_run_id=uuid4(),
+    )
+
+
+async def test_references_corpus_result_advances_the_pipeline_to_extraction(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _references_corpus_result()
+    assert result["status"] == "success"
+    registry, jobs, _ = _build(uow, monkeypatch, result)
+    run = _run(uow, ProductionStage.REFERENCES)
+
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
+    await handler(
+        ProductionStageParameters(run_id=run.id, expected_stage=ProductionStage.REFERENCES.value),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    assert uow.production_runs.items[run.id].current_stage is ProductionStage.EXTRACTION
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.EXTRACTION)]
+
+
+async def test_references_without_a_usable_core_source_parks_the_subject(
+    uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _references_corpus_result()
+    result.update(
+        {
+            "status": "needs_review",
+            "error_code": "references_no_usable_core_source",
+            "error": "No core source of this run is archived and extractable",
+        }
+    )
+    registry, jobs, _ = _build(uow, monkeypatch, result)
+    first = _run(uow, ProductionStage.REFERENCES)
+    second = _batch_of(uow, first)
+
+    handler = registry.handler(stage_job_kind(ProductionStage.REFERENCES))
+    await handler(
+        ProductionStageParameters(run_id=first.id, expected_stage=ProductionStage.REFERENCES.value),
+        _Context(),  # type: ignore[arg-type]
+    )
+
+    parked = uow.production_runs.items[first.id]
+    assert parked.status is ProductionRunStatus.NEEDS_REVIEW
+    assert parked.error_code == "references_no_usable_core_source"
+    # The batch keeps moving: the corpus was persisted, the subject is parked.
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
+    assert uow.production_runs.items[second.id].status is ProductionRunStatus.RUNNING

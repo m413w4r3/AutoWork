@@ -9,7 +9,9 @@ correction touched. Two ways it used to lie:
   content-addressed table shared by every subject, so another edition's
   capture was attributed to this one.
 
-Both made a one-article correction look like a full corpus rewrite.
+Both made a one-article correction look like a full corpus rewrite.  AW-010
+moved the per-source baseline into the corpus itself: ``content_sha256`` is the
+capture the artifact really recorded, and the legacy metadata index is gone.
 """
 
 from __future__ import annotations
@@ -17,34 +19,61 @@ from __future__ import annotations
 from datetime import date
 from types import SimpleNamespace
 from typing import Any
+from uuid import uuid4
 
 import pytest
 
-from cti_app.application.production_parsers import ParsedSource, ReferenceReport
-from cti_app.application.production_repairs import _source_delta
+from cti_app.application.production_repairs import (
+    _corpus_source_hashes,
+    _legacy_source_hashes,
+    _source_delta,
+)
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+)
 
 _SHA_A = "a" * 64
 _SHA_B = "b" * 64
 _SHA_OTHER_SUBJECT = "c" * 64
 
 
-def _source(index: int, url: str) -> ParsedSource:
-    return ParsedSource(
-        local_id=f"S{index}",
-        title=f"Source {index}",
-        url=url,
+def _source(url: str, *, digest: str | None) -> ProductionReferenceSourceV1:
+    return ProductionReferenceSourceV1(
         canonical_url=url,
-        publisher="Publisher",
-        published_at=date(2026, 7, index),
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
         role=SourceRole.INDEPENDENT,
+        title="Source",
+        publisher="Publisher",
+        published_at=date(2026, 7, 1),
+        source_collection_id=uuid4() if digest is not None else None,
+        source_document_id=uuid4() if digest is not None else None,
+        discovery_candidate_ids=(),
+        collection_state=(
+            CollectionState.ARCHIVED if digest is not None else CollectionState.UNAVAILABLE
+        ),
+        content_sha256=digest,
+        relevance_reason="Corroborates the core report",
+        proposed_by_model=True,
+        eligible_for_extraction=digest is not None,
     )
 
 
-def _report(*urls: str) -> ReferenceReport:
-    return ReferenceReport(
-        sources=tuple(_source(index, url) for index, url in enumerate(urls, start=1)),
-        events=(),
+def _corpus(*sources: ProductionReferenceSourceV1) -> ProductionReferenceCorpusV1:
+    return ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=uuid4(),
+        research_date=date(2026, 8, 1),
+        production_input_hash="d" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
     )
 
 
@@ -63,10 +92,6 @@ class _LeakyExtractions:
         return (SimpleNamespace(source_content_sha256=_SHA_OTHER_SUBJECT),)
 
 
-def _artifact(metadata: dict[str, Any]) -> Any:
-    return SimpleNamespace(metadata=metadata)
-
-
 def _urls(entries: list[dict[str, str | None]]) -> list[str | None]:
     return [entry["canonical_url"] for entry in entries]
 
@@ -76,14 +101,15 @@ async def test_an_unrecorded_baseline_is_unknown_not_changed() -> None:
     kept = "https://example.test/kept"
     added = "https://example.test/added"
     extractions = _LeakyExtractions()
+    previous = _corpus(_source(kept, digest=None))
+    current = _corpus(_source(kept, digest=_SHA_A), _source(added, digest=_SHA_B))
 
     delta = await _source_delta(
         SimpleNamespace(source_extractions=extractions),
-        previous_report=_report(kept),
-        current_report=_report(kept, added),
-        archived_projection=((kept, _SHA_A), (added, _SHA_B)),
-        # A legacy REFERENCES artifact: no recorded per-source baseline.
-        base_artifact=_artifact({}),
+        previous_urls=[source.canonical_url for source in previous.sources],
+        current_urls=[source.canonical_url for source in current.sources],
+        previous_hashes=_corpus_source_hashes(previous),
+        current_hashes={kept: _SHA_A, added: _SHA_B},
     )
 
     # The one real change is the added article, and nothing else.
@@ -101,13 +127,14 @@ async def test_an_unrecorded_baseline_is_unknown_not_changed() -> None:
 async def test_a_recorded_identical_baseline_is_unchanged() -> None:
     kept = "https://example.test/kept"
     added = "https://example.test/added"
+    previous = _corpus(_source(kept, digest=_SHA_A))
 
     delta = await _source_delta(
         SimpleNamespace(source_extractions=_LeakyExtractions()),
-        previous_report=_report(kept),
-        current_report=_report(kept, added),
-        archived_projection=((kept, _SHA_A), (added, _SHA_B)),
-        base_artifact=_artifact({"archived_sources": [[kept, _SHA_A]]}),
+        previous_urls=[source.canonical_url for source in previous.sources],
+        current_urls=[kept, added],
+        previous_hashes=_corpus_source_hashes(previous),
+        current_hashes={kept: _SHA_A, added: _SHA_B},
     )
 
     assert _urls(delta["unchanged_sources"]) == [kept]
@@ -120,16 +147,36 @@ async def test_a_recorded_identical_baseline_is_unchanged() -> None:
 async def test_a_genuinely_recaptured_source_is_still_reported_as_changed() -> None:
     """The fix must not blind the delta to a real re-archival."""
     kept = "https://example.test/kept"
+    previous = _corpus(_source(kept, digest=_SHA_A))
 
     delta = await _source_delta(
         SimpleNamespace(source_extractions=_LeakyExtractions()),
-        previous_report=_report(kept),
-        current_report=_report(kept),
-        archived_projection=((kept, _SHA_B),),
-        base_artifact=_artifact({"repair_source_index": {"source_hashes": {kept: _SHA_A}}}),
+        previous_urls=[source.canonical_url for source in previous.sources],
+        current_urls=[kept],
+        previous_hashes=_corpus_source_hashes(previous),
+        current_hashes={kept: _SHA_B},
     )
 
     assert _urls(delta["changed_content_sources"]) == [kept]
     assert delta["changed_content_sources"][0]["previous_source_sha256"] == _SHA_A
     assert delta["changed_content_sources"][0]["current_source_sha256"] == _SHA_B
     assert delta["unknown_baseline_sources"] == []
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_artifact_keeps_its_recorded_metadata_baseline() -> None:
+    """A V4 import still compares against the baseline its metadata recorded."""
+    kept = "https://example.test/kept"
+    base = SimpleNamespace(metadata={"archived_sources": [[kept, _SHA_A]]})
+
+    assert _legacy_source_hashes(base) == {kept: _SHA_A}
+
+    delta = await _source_delta(
+        SimpleNamespace(source_extractions=_LeakyExtractions()),
+        previous_urls=[kept],
+        current_urls=[kept],
+        previous_hashes=_legacy_source_hashes(base),
+        current_hashes={kept: _SHA_A},
+    )
+
+    assert _urls(delta["unchanged_sources"]) == [kept]

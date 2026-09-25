@@ -517,10 +517,7 @@ async def _seed_reusable_article(
     )
     extraction = TechnicalExtraction(items=())
     refs_hash = _references_input_hash(
-        subject_id=subject.id,
         snapshot=snapshot,
-        subject_title=snapshot.subject_title,
-        subject_description=snapshot.subject_description,
         research_date=snapshot.research_date,
     )
     refs_payload = reference_report_to_json(report)
@@ -893,10 +890,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     )
     extraction = TechnicalExtraction(items=())
     refs_hash = _references_input_hash(
-        subject_id=subject.id,
         snapshot=snapshot_a,
-        subject_title=snapshot_a.subject_title,
-        subject_description=snapshot_a.subject_description,
         research_date=snapshot_a.research_date,
     )
     refs_payload = reference_report_to_json(report)

@@ -10,7 +10,7 @@ from cti_app.application.production_synthesis_revision import (
 )
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "6"
+REFERENCES_PROMPT_VERSION = "7"
 # Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
 # not guarantee response_format / JSON Schema.
 # "18" / "11": Q2 analyses the live publication behind the exact canonical URL,
@@ -34,7 +34,6 @@ EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
 }
 SYNTHESIS_PROMPT_VERSION = "8"
-REFERENCES_FORMAT_REPAIR_VERSION = "1"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "5"
 
 
@@ -245,6 +244,8 @@ url: https://...
 publisher: <publisher>
 published-at: YYYY-MM-DD
 role: primary|independent|relay|aggregator|social|unknown
+kind: publication|technical_resource
+reason: <short explanation of relevance to the Subject>
 
 ## EVENT R1
 
@@ -811,6 +812,8 @@ url: https://...
 publisher: <publisher>
 published-at: YYYY-MM-DD
 role: primary
+kind: publication|technical_resource
+reason: <short explanation of relevance to the Subject>
 
 ## EVENT R1
 

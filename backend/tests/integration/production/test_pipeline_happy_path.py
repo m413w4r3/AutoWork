@@ -35,6 +35,8 @@ url: https://example.test/core
 publisher: Core Labs
 published-at: 2026-08-10
 role: primary
+kind: publication
+reason: Primary reporting on the campaign
 
 ## SOURCE S2
 
@@ -43,6 +45,8 @@ url: https://example.test/secondary
 publisher: Secondary Labs
 published-at: 2026-08-11
 role: independent
+kind: publication
+reason: Independent corroboration of the campaign
 
 ## EVENT R1
 
@@ -147,7 +151,6 @@ async def test_complete_production_pipeline_reaches_ready(
         artifacts = list(await uow.production_artifacts.list_for_run(run.id))
         turns = []
         for conversation_id in (
-            persisted_run.references_conversation_id if persisted_run else None,
             persisted_run.synthesis_conversation_id if persisted_run else None,
         ):
             if conversation_id is not None:
@@ -225,7 +228,7 @@ async def test_complete_production_pipeline_reaches_ready(
     assert covered_q2_urls == SOURCE_URLS
     assert len(model_calls) == 2 + len(q2_calls)
     assert all(call.web_search for call in model_calls)
-    assert model_calls[0].conversation_id is not None
+    assert model_calls[0].conversation_id is None
     assert model_calls[-1].conversation_id is not None
     assert all(call.conversation_id is None for call in q2_calls)
     assert all(call.prompt_version for call in model_calls)
@@ -253,9 +256,11 @@ async def test_complete_production_pipeline_reaches_ready(
     assert all(model_run is not None for model_run in model_runs.values())
     assert all(model_run.status is ModelRunStatus.SUCCEEDED for model_run in model_runs.values())
     assert all(model_run.raw_output_sha256 for model_run in model_runs.values())
+    assert model_calls[0].model_run_id == by_stage[ProductionArtifactStage.REFERENCES].model_run_id
     assert len(references_payload["sources"]) == 2
-    reference_source_ids = {source["id"] for source in references_payload["sources"]}
     assert {source["canonical_url"] for source in references_payload["sources"]} == set(SOURCE_URLS)
+    # Canonical V1 stores corpus source metadata, not legacy Markdown local IDs.
+    reference_source_ids = {"S1", "S2"}
     extraction_items = extraction_payload["items"]
     assert any(item["value"] == "core-c2.security-lab.io" for item in extraction_items), (
         extraction_items

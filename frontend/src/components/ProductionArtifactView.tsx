@@ -69,6 +69,142 @@ function isExtractionDocument(value: unknown): value is ExtractionDocumentV2 {
   );
 }
 
+type ProductionReferenceTier = "core" | "supporting" | "technical";
+type ProductionReferenceKind = "publication" | "technical_resource";
+
+interface ProductionReferenceSource {
+  canonical_url: string;
+  title: string | null;
+  tier: ProductionReferenceTier;
+  role: string;
+  kind: ProductionReferenceKind;
+  publisher: string | null;
+  published_at: string | null;
+  collection_state: string;
+  eligible_for_extraction: boolean;
+}
+
+interface ProductionReferenceCorpus {
+  schema_version: 1;
+  sources: ProductionReferenceSource[];
+}
+
+const REFERENCE_TIER_LABELS: Record<ProductionReferenceTier, string> = {
+  core: "Core",
+  supporting: "Référence complémentaire",
+  technical: "Ressource technique",
+};
+
+const REFERENCE_ROLE_LABELS: Record<string, string> = {
+  primary: "Primaire",
+  independent: "Indépendante",
+  relay: "Relais",
+  aggregator: "Agrégateur",
+  social: "Réseau social",
+  unknown: "Inconnu",
+};
+
+const REFERENCE_KIND_LABELS: Record<ProductionReferenceKind, string> = {
+  publication: "Publication",
+  technical_resource: "Ressource technique",
+};
+
+const COLLECTION_STATE_LABELS: Record<string, string> = {
+  archived: "Archivée",
+  extracted: "Extraite",
+  completed: "Terminée",
+  unavailable: "Indisponible",
+  blocked: "Bloquée",
+  failed_retryable: "Échec — nouvel essai possible",
+  failed_terminal: "Échec définitif",
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function isProductionReferenceSource(
+  value: unknown,
+): value is ProductionReferenceSource {
+  return (
+    isRecord(value) &&
+    typeof value.canonical_url === "string" &&
+    (typeof value.title === "string" || value.title === null) &&
+    (value.tier === "core" ||
+      value.tier === "supporting" ||
+      value.tier === "technical") &&
+    typeof value.role === "string" &&
+    (value.kind === "publication" || value.kind === "technical_resource") &&
+    (typeof value.publisher === "string" || value.publisher === null) &&
+    (typeof value.published_at === "string" || value.published_at === null) &&
+    typeof value.collection_state === "string" &&
+    typeof value.eligible_for_extraction === "boolean"
+  );
+}
+
+function isProductionReferenceCorpus(
+  value: unknown,
+): value is ProductionReferenceCorpus {
+  return (
+    isRecord(value) &&
+    value.schema_version === 1 &&
+    Array.isArray(value.sources) &&
+    value.sources.every(isProductionReferenceSource)
+  );
+}
+
+function ProductionReferenceCorpusView({
+  corpus,
+}: {
+  corpus: ProductionReferenceCorpus;
+}) {
+  return (
+    <section className="production-reference-corpus">
+      <h3>Corpus de références</h3>
+      {corpus.sources.length === 0 ? (
+        <p>Aucune source dans le corpus.</p>
+      ) : (
+        <ul>
+          {corpus.sources.map((source) => (
+            <li key={source.canonical_url}>
+              <article>
+                <h4>{source.title ?? source.canonical_url}</h4>
+                <dl>
+                  <dt>Source</dt>
+                  <dd>
+                    <a href={source.canonical_url}>{source.canonical_url}</a>
+                  </dd>
+                  <dt>Provenance</dt>
+                  <dd>{REFERENCE_TIER_LABELS[source.tier]}</dd>
+                  <dt>Rôle</dt>
+                  <dd>{REFERENCE_ROLE_LABELS[source.role] ?? source.role}</dd>
+                  <dt>Type</dt>
+                  <dd>{REFERENCE_KIND_LABELS[source.kind]}</dd>
+                  <dt>Éditeur</dt>
+                  <dd>{source.publisher ?? "Non renseigné"}</dd>
+                  <dt>Date de publication</dt>
+                  <dd>{source.published_at ?? "Non renseignée"}</dd>
+                  <dt>État de collecte</dt>
+                  <dd>
+                    {COLLECTION_STATE_LABELS[source.collection_state] ??
+                      source.collection_state}
+                  </dd>
+                  <dt>Éligibilité</dt>
+                  <dd>
+                    {source.eligible_for_extraction
+                      ? "Éligible à l’extraction"
+                      : "Non éligible à l’extraction"}
+                  </dd>
+                </dl>
+              </article>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 function RichText({ spans }: { spans: RichSpan[] }) {
   return spans.map((span, index) => {
     if (span.kind === "citation") {
@@ -361,6 +497,12 @@ export function ProductionArtifactView({
     );
   }
 
+  const referencesCorpus =
+    stage === "references" &&
+    isProductionReferenceCorpus(artifact.canonical_content)
+      ? artifact.canonical_content
+      : null;
+
   return (
     <section className="artifact-view">
       <div className="artifact-view__header">
@@ -412,6 +554,10 @@ export function ProductionArtifactView({
           <ExtractionPreview document={artifact.canonical_content} />
         )}
 
+      {referencesCorpus ? (
+        <ProductionReferenceCorpusView corpus={referencesCorpus} />
+      ) : null}
+
       {stage === "publication" && artifact.rendered_content && (
         <p>
           <a
@@ -426,6 +572,7 @@ export function ProductionArtifactView({
 
       {stage !== "publication" &&
         stage !== "extraction" &&
+        !referencesCorpus &&
         artifact.rendered_content && (
           <div className="artifact-content">
             <div className="rendered-markdown">
@@ -436,6 +583,7 @@ export function ProductionArtifactView({
 
       {stage !== "publication" &&
         stage !== "extraction" &&
+        !referencesCorpus &&
         artifact.canonical_content && (
           <div className="artifact-canonical">
             <details>

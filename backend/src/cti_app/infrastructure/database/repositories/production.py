@@ -207,7 +207,6 @@ class SqlAlchemyProductionRunRepository:
             edition_id=run.edition_id,
             status=run.status.value,
             current_stage=run.current_stage.value,
-            references_conversation_id=run.references_conversation_id,
             synthesis_conversation_id=run.synthesis_conversation_id,
             run_number=run.run_number,
             pipeline_generation=run.pipeline_generation,
@@ -279,7 +278,6 @@ class SqlAlchemyProductionRunRepository:
             .values(
                 status=run.status.value,
                 current_stage=run.current_stage.value,
-                references_conversation_id=run.references_conversation_id,
                 synthesis_conversation_id=run.synthesis_conversation_id,
                 pipeline_generation=run.pipeline_generation,
                 research_date=run.research_date,
@@ -1146,7 +1144,6 @@ def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
         edition_id=row.edition_id,
         status=ProductionRunStatus(row.status),
         current_stage=ProductionStage(row.current_stage),
-        references_conversation_id=row.references_conversation_id,
         synthesis_conversation_id=row.synthesis_conversation_id,
         run_number=row.run_number,
         pipeline_generation=row.pipeline_generation,

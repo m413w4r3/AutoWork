@@ -28,8 +28,13 @@ from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
     reference_report_from_json,
+    reference_report_to_json,
     technical_extraction_from_json,
     validate_synthesis,
+)
+from cti_app.application.production_references import (
+    load_legacy_reference_report,
+    production_reference_corpus_from_json,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
 from cti_app.application.subject_production import (
@@ -217,6 +222,30 @@ def compute_production_state_checksum(
 
 def _invalid(message: str) -> ProductionStateError:
     return ProductionStateError(code="production_state_invalid", message=message)
+
+
+async def _portable_references_content(
+    store: ProductionArtifactStore,
+    artifact: ProductionArtifact,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Project REFERENCES into the legacy contract V4 still expects.
+
+    V4 carries a ``ReferenceReport``.  An AW-010 corpus is converted through
+    its RAW answer and the single compatibility adapter, so V4 stays portable
+    without changing its schema -- and without writing the corpus into a field
+    a V4 reader would misread.  An imported legacy artifact is already a
+    report and travels unchanged.
+    """
+    try:
+        corpus = production_reference_corpus_from_json(payload)
+    except ValueError:
+        return payload
+    if artifact.raw_blob_id is None:
+        raise ValueError("REFERENCES RAW payload is missing")
+    raw = await store.read_text(artifact.raw_blob_id)
+    report = load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
+    return reference_report_to_json(report)
 
 
 def _json_size(payload: dict[str, Any]) -> int:
@@ -475,6 +504,9 @@ class ProductionStateService:
                 repair_materialization.update(dict(candidate))
         try:
             refs_content = await self._artifact_store.read_json(refs.canonical_blob_id)
+            refs_content = await _portable_references_content(
+                self._artifact_store, refs, refs_content
+            )
             extraction_content = _portable_extraction_content(
                 await self._artifact_store.read_json(extraction.canonical_blob_id)
             )
@@ -555,6 +587,10 @@ class ProductionStateService:
         metadata_base = _snapshot_metadata(snapshot, now)
         refs_meta = {
             **metadata_base,
+            # A V4 import stays a legacy ``ReferenceReport``: it is never
+            # presented as a ``ProductionReferenceCorpusV1``, and its missing
+            # collection identity is never fabricated.
+            "legacy_reference_report": True,
             "event_count": len(refs_content.get("events", [])),
             "source_count": len(refs_content.get("sources", [])),
             "parser_version": refs_content.get("parser_version"),

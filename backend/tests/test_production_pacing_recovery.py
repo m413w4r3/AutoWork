@@ -494,24 +494,22 @@ async def test_stage_dispatch_uses_model_jitter_and_subject_override() -> None:
 
 
 @pytest.mark.parametrize(
-    ("stage", "keep_references", "keep_synthesis"),
+    ("stage", "keep_synthesis"),
     (
-        (ProductionStage.SOURCES, False, False),
-        (ProductionStage.REFERENCES, False, False),
-        (ProductionStage.EXTRACTION, True, False),
-        (ProductionStage.SYNTHESIS, True, False),
-        (ProductionStage.ASSEMBLY, True, True),
+        (ProductionStage.SOURCES, False),
+        (ProductionStage.REFERENCES, False),
+        (ProductionStage.EXTRACTION, False),
+        (ProductionStage.SYNTHESIS, False),
+        (ProductionStage.ASSEMBLY, True),
     ),
 )
-def test_business_retry_uses_fresh_conversations_per_stage(
-    stage: ProductionStage, keep_references: bool, keep_synthesis: bool
+def test_business_retry_resets_synthesis_conversation_when_needed(
+    stage: ProductionStage, keep_synthesis: bool
 ) -> None:
-    references_id = uuid4()
     synthesis_id = uuid4()
     run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
-        references_conversation_id=references_id,
         synthesis_conversation_id=synthesis_id,
     )
     run.start_running()
@@ -519,6 +517,5 @@ def test_business_retry_uses_fresh_conversations_per_stage(
 
     run.retry_from_stage(stage)
 
-    assert run.references_conversation_id == (references_id if keep_references else None)
     assert run.synthesis_conversation_id == (synthesis_id if keep_synthesis else None)
     assert run.pipeline_generation == 1

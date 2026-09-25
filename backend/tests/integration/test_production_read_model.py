@@ -77,7 +77,6 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             edition_id=edition_id,
             status=status,
             current_stage=stage,
-            references_conversation_id=None,
             synthesis_conversation_id=None,
             run_number=1,
             pipeline_generation=pipeline_generation,
@@ -348,3 +347,4 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
         None,
         "Assembly failed",
     ]
+    assert all(not hasattr(item, "references_conversation_id") for item in result)

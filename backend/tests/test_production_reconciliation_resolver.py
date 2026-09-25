@@ -22,6 +22,7 @@ from cti_app.application.production_jobs import (
 from cti_app.application.production_reconciliation_resolver import (
     ProductionReconciliationResolver,
     ReconciliationOutcome,
+    _conversation_id,
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import (
@@ -117,21 +118,6 @@ class _Bridge:
         return self.result
 
 
-class _ConversationService:
-    def __init__(self) -> None:
-        self.calls: list[tuple[UUID, bool, UUID | None]] = []
-
-    async def reconcile(
-        self,
-        conversation_id: UUID,
-        *,
-        available: bool,
-        context_subject_id: UUID | None = None,
-    ) -> object:
-        self.calls.append((conversation_id, available, context_subject_id))
-        return object()
-
-
 class _Gateway:
     def __init__(self, model: ModelRun) -> None:
         self.model = model
@@ -164,7 +150,6 @@ class _Gateway:
 def _fixture(
     bridge_result: dict[str, Any] | Exception,
     *,
-    with_conversation: bool = True,
     with_edition: bool = False,
     edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[
@@ -172,12 +157,10 @@ def _fixture(
     ProductionRun,
     ModelRun,
     _Bridge,
-    _ConversationService,
     _Gateway,
 ]:
     subject_id = uuid4()
     model_id = uuid4()
-    conversation_id = uuid4() if with_conversation else None
     model = ModelRun(
         id=model_id,
         provider=ModelProvider.OPENAI,
@@ -198,7 +181,6 @@ def _fixture(
         edition_id=uuid4(),
         status=ProductionRunStatus.NEEDS_REVIEW,
         current_stage=ProductionStage.REFERENCES,
-        references_conversation_id=conversation_id,
         error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
         error_details={"bridge_request_id": "bridge-request:a1"},
         reconciliation=ProductionSubmissionReconciliation(
@@ -225,20 +207,28 @@ def _fixture(
         edition_state=edition_state,
     )
     bridge = _Bridge(bridge_result)
-    conversations = _ConversationService()
     gateway = _Gateway(model)
     resolver = ProductionReconciliationResolver(
         cast(Any, lambda: uow),
         bridge,
         cast(Any, gateway),
-        cast(Any, conversations),
     )
-    return resolver, run, model, bridge, conversations, gateway
+    return resolver, run, model, bridge, gateway
+
+
+def test_conversation_id_is_only_available_for_synthesis() -> None:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run.current_stage = ProductionStage.REFERENCES
+    assert _conversation_id(run) is None
+
+    run.current_stage = ProductionStage.SYNTHESIS
+    run.synthesis_conversation_id = uuid4()
+    assert _conversation_id(run) == run.synthesis_conversation_id
 
 
 @pytest.mark.asyncio
 async def test_retryable_bridge_error_stays_undecided() -> None:
-    resolver, run, _, bridge, conversations, gateway = _fixture(
+    resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError(
             "bridge_timeout",
             "timeout",
@@ -249,13 +239,12 @@ async def test_retryable_bridge_error_stays_undecided() -> None:
     assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
     assert bridge.calls == ["bridge-request:a1"]
     assert run.requires_reconciliation
-    assert conversations.calls == []
     assert gateway.calls == []
 
 
 @pytest.mark.asyncio
-async def test_bridge_404_releases_and_marks_conversation_unavailable() -> None:
-    resolver, run, _, bridge, conversations, gateway = _fixture(
+async def test_bridge_404_releases_references_without_model_conversation() -> None:
+    resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError(
             "bridge_protocol_error",
             "not found",
@@ -268,13 +257,12 @@ async def test_bridge_404_releases_and_marks_conversation_unavailable() -> None:
     assert bridge.calls == ["bridge-request:a1"]
     assert run.requires_reconciliation is False
     assert run.error_code == "bridge_run_unavailable"
-    assert conversations.calls == [(run.references_conversation_id, False, run.subject_id)]
     assert gateway.calls == []
 
 
 @pytest.mark.asyncio
 async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
-    resolver, run, model, bridge, conversations, gateway = _fixture(
+    resolver, run, model, bridge, gateway = _fixture(
         {"id": "resp_123", "status": "completed", "output_text": "# answer"},
         with_edition=True,
     )
@@ -287,12 +275,12 @@ async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
     assert run.reconciliation.provenance == "automatic_bridge_retrieval"
     assert model.status is ModelRunStatus.SUCCEEDED
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
-    assert conversations.calls == [(run.references_conversation_id, True, run.subject_id)]
+    assert _conversation_id(run) is None
 
 
 @pytest.mark.asyncio
 async def test_archived_edition_keeps_resolver_undecided() -> None:
-    resolver, run, model, bridge, conversations, gateway = _fixture(
+    resolver, run, model, bridge, gateway = _fixture(
         {"id": "resp_123", "status": "completed", "output_text": "# answer"},
         with_edition=True,
         edition_state=EditionStatus.ARCHIVED,
@@ -303,12 +291,12 @@ async def test_archived_edition_keeps_resolver_undecided() -> None:
     assert run.requires_reconciliation
     assert model.status is ModelRunStatus.SUCCEEDED
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
-    assert conversations.calls == [(run.references_conversation_id, True, run.subject_id)]
+    assert _conversation_id(run) is None
 
 
 @pytest.mark.asyncio
 async def test_terminal_failure_releases_without_adopting_output() -> None:
-    resolver, run, model, _, conversations, gateway = _fixture(
+    resolver, run, model, _, gateway = _fixture(
         {"id": "resp_123", "status": "failed", "error": {"code": "bridge_server_error"}}
     )
 
@@ -316,12 +304,12 @@ async def test_terminal_failure_releases_without_adopting_output() -> None:
     assert run.requires_reconciliation is False
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert conversations.calls == [(run.references_conversation_id, False, run.subject_id)]
+    assert _conversation_id(run) is None
 
 
 @pytest.mark.asyncio
 async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable() -> None:
-    resolver, run, model, _, conversations, gateway = _fixture(
+    resolver, run, model, _, gateway = _fixture(
         BridgeTransportError(
             "bridge_server_error",
             "the bridge recorded a failed run",
@@ -335,25 +323,23 @@ async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable
     assert run.requires_reconciliation is False
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert conversations.calls == [(run.references_conversation_id, False, run.subject_id)]
+    assert _conversation_id(run) is None
 
 
 @pytest.mark.asyncio
 async def test_in_progress_bridge_run_stays_undecided() -> None:
-    resolver, run, model, _, conversations, gateway = _fixture(
-        {"id": "resp_123", "status": "running"}
-    )
+    resolver, run, model, _, gateway = _fixture({"id": "resp_123", "status": "running"})
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
     assert run.requires_reconciliation
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert conversations.calls == []
+    assert _conversation_id(run) is None
 
 
 @pytest.mark.asyncio
 async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Path) -> None:
-    resolver, run, _, _, conversations, gateway = _fixture(
+    resolver, run, _, _, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
     )
     resolver._diagnostics = DiagnosticsLog.from_env(tmp_path)
@@ -366,7 +352,7 @@ async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Pa
     )
     assert run.requires_reconciliation is False
     assert run.error_code == "production_reconciliation_declared_lost"
-    assert conversations.calls == [(run.references_conversation_id, False, run.subject_id)]
+    assert _conversation_id(run) is None
     assert gateway.calls == []
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     assert event == {
@@ -413,14 +399,13 @@ class _ProbeContext:
 
 @pytest.mark.asyncio
 async def test_probe_404_restarts_the_same_production_stage_without_posting() -> None:
-    resolver, run, _, bridge, _, _ = _fixture(
+    resolver, run, _, bridge, _ = _fixture(
         BridgeTransportError(
             "bridge_protocol_error",
             "not found",
             retryable=False,
             status_code=404,
         ),
-        with_conversation=False,
     )
     run.current_stage = ProductionStage.SOURCES
     run.reconciliation = ProductionSubmissionReconciliation(
@@ -461,7 +446,7 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
 async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
     tmp_path: Path,
 ) -> None:
-    resolver, run, _, bridge, _, gateway = _fixture(
+    resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
     )
     jobs = _Jobs()

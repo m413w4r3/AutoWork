@@ -214,11 +214,12 @@ class ScriptedModelScript:
                 blocks.append(f"@@Q2:B{index}@@\n{response}")
             return "\n\n".join(blocks)
 
+        if request.prompt_template_id == "production-references":
+            if self._references is None:
+                raise AssertionError("No scripted references response")
+            return self._references
+
         if request.prompt_template_id == "analyst-conversation":
-            if request.routing_hint is ModelRoutingHint.WEB_RESEARCH:
-                if self._references is None:
-                    raise AssertionError("No scripted references response")
-                return self._references
             if request.routing_hint is ModelRoutingHint.STANDARD_DRAFT:
                 if self._synthesis is None:
                     raise AssertionError("No scripted synthesis response")
@@ -337,6 +338,14 @@ class ScriptedModelGateway(ModelGateway):
         self._adapter.is_external = True
 
     async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
+        self._record_call(request)
+        return await super().execute(request, role)
+
+    async def research(self, request: ModelRequest) -> ModelExecution:
+        self._record_call(request)
+        return await super().research(request)
+
+    def _record_call(self, request: ModelRequest) -> None:
         source_urls = _request_source_urls(request)
         if request.prompt_template_id.startswith("production-q2"):
             stage = "extraction"
@@ -358,7 +367,6 @@ class ScriptedModelGateway(ModelGateway):
                 request=request,
             )
         )
-        return await super().execute(request, role)
 
 
 def _request_source_urls(request: ModelRequest) -> tuple[str, ...]:

@@ -17,8 +17,13 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
-    reference_report_from_json,
     technical_extraction_from_json,
+)
+from cti_app.application.production_references import (
+    PRODUCTION_REFERENCE_PARSER_VERSION,
+    load_reference_projection,
+    production_reference_corpus_metadata,
+    production_reference_corpus_to_json,
 )
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.publication_builder import build_publication_document
@@ -28,6 +33,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
 )
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
 
@@ -72,13 +80,38 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
         subject_id: UUID,
         input_hash: str,
         raw_result: str,
-        canonical_json: dict[str, Any],
+        corpus: ProductionReferenceCorpusV1,
         model_run_id: UUID | None = None,
-        conversation_turn_id: UUID | None = None,
-        warnings: list[str] | None = None,
-        repair_source_index: dict[str, Any] | None = None,
-    ) -> ProductionArtifact:
+    ) -> tuple[ProductionArtifact, bool]:
+        """Persist the RAW wire format and only the canonical corpus.
+
+        The RAW answer is kept because the not-yet-migrated stages rebuild the
+        legacy ``ReferenceReport`` from it; the canonical payload is the
+        versioned corpus and nothing else.
+
+        Returns the artifact and whether a new functional version was created.
+        A rebuild whose corpus is byte-identical to the current one is a no-op.
+        """
+        if not isinstance(corpus, ProductionReferenceCorpusV1):
+            raise ValueError("REFERENCES canonical state must be a ProductionReferenceCorpusV1")
+        canonical_json = production_reference_corpus_to_json(corpus)
+        encoded = ProductionArtifactStore.canonical_json_bytes(canonical_json)
+
         async with self._uow_factory() as uow:
+            current = await uow.production_artifacts.get_current(
+                run_id, ProductionArtifactStage.REFERENCES.value
+            )
+            if (
+                current is not None
+                and current.status is ProductionArtifactStatus.VERIFIED
+                and current.input_hash == input_hash
+                and current.canonical_blob_id is not None
+                and self._artifact_store is not None
+            ):
+                stored = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                if stored == encoded:
+                    return current, False
+
             prior_versions = [
                 artifact.version
                 for artifact in await uow.production_artifacts.list_for_run(run_id)
@@ -99,18 +132,14 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
                 raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
                 model_run_id=model_run_id,
-                conversation_turn_id=conversation_turn_id,
                 metadata={
-                    "event_count": len(canonical_json.get("events", [])),
-                    "source_count": len(canonical_json.get("sources", [])),
-                    "warnings": warnings or [],
-                    "parser_version": canonical_json.get("parser_version"),
-                    "generated_at": datetime.now(UTC).isoformat(),
-                    **(
-                        {"repair_source_index": dict(repair_source_index)}
-                        if repair_source_index is not None
-                        else {}
+                    **production_reference_corpus_metadata(corpus),
+                    "warnings": list(corpus.warnings),
+                    "parser_version": PRODUCTION_REFERENCE_PARSER_VERSION,
+                    "research_model_run_id": (
+                        str(model_run_id) if model_run_id is not None else None
                     ),
+                    "generated_at": datetime.now(UTC).isoformat(),
                 },
             )
             await uow.production_artifacts.append(artifact)
@@ -120,7 +149,7 @@ class ReferenceResearchService(_ArtifactPayloadMixin):
             )
 
             await uow.commit()
-            return artifact
+            return artifact, True
 
 
 class ExtractionService(_ArtifactPayloadMixin):
@@ -625,9 +654,9 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             raise ValueError("Extraction artifact has no canonical payload")
         if synthesis_artifact.rendered_blob_id is None:
             raise ValueError("Synthesis artifact has no rendered payload")
-        report = reference_report_from_json(
-            await self._artifact_store.read_json(references_artifact.canonical_blob_id)
-        )
+        report = await load_reference_projection(self._artifact_store, references_artifact)
+        if report is None:
+            raise ValueError("References payload is not readable")
         extraction = technical_extraction_from_json(
             await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
         )
