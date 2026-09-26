@@ -17,6 +17,8 @@ from html.parser import HTMLParser
 
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
+    Q2EventProposal,
+    Q2FactProposal,
     Q2RuleProposal,
     Q2SourceOutput,
 )
@@ -371,10 +373,11 @@ def enumerate_q2_proposals(output: Q2SourceOutput) -> tuple[Q2ProposalIdentity, 
 
     Recovering a historical rejection from an archived Q2 output means finding
     the proposal the gate rejected, so both must count proposals the same way:
-    facts first, then artifacts, then rules.
+    facts, then events, then artifacts, then rules.  Events are not enumerated
+    because they are not repair-addressable; they only keep the offset right.
     """
     identities: list[Q2ProposalIdentity] = []
-    proposal_index = len(output.facts)
+    proposal_index = len(output.facts) + len(output.events)
     for artifact in output.artifacts:
         proposal_index += 1
         identities.append(
@@ -421,34 +424,70 @@ def verify_ioc_rules_output_against_source(
 ) -> SourceEvidenceResult:
     """Keep only IOC/rule proposals with literal proof in ``source_text``.
 
-    Facts are outside the IOC_RULES contract and are always dropped.  Every
-    surviving proposal has its narrative fields cleared; the model's value or
-    rule body is otherwise left untouched.
+    Facts and events are outside the IOC_RULES contract and are always
+    dropped.  Every surviving proposal is proven locally, keeps its exact value
+    or rule body and loses its model-supplied narrative context.  Canonical
+    provenance and evidence quotes are attached later, by the canonical
+    builder, from the same archived document.
     """
-    return _verify_output_against_source(output, source_text, preserve_facts=False)
+    return _verify_output_against_source(output, source_text, preserve_narrative=False)
 
 
 def verify_q2_output_against_source(
     output: Q2SourceOutput,
     source_text: str | SourceEvidenceDocument,
 ) -> SourceEvidenceResult:
-    """Gate archived Q2 output while preserving the FULL facts channel.
+    """Gate archived Q2 output against the exact archived document.
 
-    Facts are intentionally not source-gated: the archived source is the
-    model's input, but this deterministic gate only constrains artifacts and
-    detection rules.  Surviving artifacts and rules retain their exact value
-    or body while their model-supplied narrative fields are removed.
+    Every fact, event, artifact and rule must be proven locally; a dated event
+    must have its date supported by the same evidence area as its text.
+    Surviving artifacts and rules keep their exact value or body while
+    model-supplied narrative context is removed; proven facts and events are
+    preserved for synthesis.  Canonical provenance and evidence quotes are
+    attached later, by the canonical builder, from the same archived document.
     """
-    return _verify_output_against_source(output, source_text, preserve_facts=True)
+    return _verify_output_against_source(output, source_text, preserve_narrative=True)
+
+
+def _evidence_missing_reason(document: SourceEvidenceDocument, code: str) -> str:
+    return "source_evidence_not_text_verifiable" if document.has_unverifiable_visuals else code
+
+
+def _event_is_proven(
+    event: Q2EventProposal,
+    document: SourceEvidenceDocument,
+) -> bool:
+    """Prove an event text locally, and its date inside the same evidence area.
+
+    The whole source text is only an evidence area when the document exposes no
+    structural span at all.  A dated event is proven only when the date is
+    stated in the very area that carries the event text, so a date is never
+    borrowed from an unrelated part of the publication.
+    """
+    anchor = _text_comparison_view(event.text)
+    if not anchor:
+        return False
+    date_marker = event.event_date.isoformat() if event.event_date is not None else None
+    areas = tuple(span.text for span in document.spans if span.text)
+    if not areas and document.decoded_source_view:
+        areas = (document.decoded_source_view,)
+    for area in areas:
+        view = _text_comparison_view(area)
+        if anchor not in view:
+            continue
+        if date_marker is not None and date_marker not in view:
+            continue
+        return True
+    return False
 
 
 def _verify_output_against_source(
     output: Q2SourceOutput,
     source_text: str | SourceEvidenceDocument,
     *,
-    preserve_facts: bool,
+    preserve_narrative: bool,
 ) -> SourceEvidenceResult:
-    """Apply the shared artifact/rule source-local gate."""
+    """Apply the shared source-local evidence gate to every proposal kind."""
     evidence_document = (
         source_text
         if isinstance(source_text, SourceEvidenceDocument)
@@ -466,20 +505,62 @@ def _verify_output_against_source(
         *base_source_views,
         *(_artifact_unwrapped_view(value) for value in base_source_views),
     )
-    rule_source_views = tuple(
-        _rule_whitespace_view(value)
+    text_source_views = tuple(
+        _text_comparison_view(value)
         for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
         if value
     )
+    facts: list[Q2FactProposal] = []
+    events: list[Q2EventProposal] = []
     artifacts: list[Q2ArtifactProposal] = []
     rules: list[Q2RuleProposal] = []
     warnings: list[str] = []
     rejections: list[SourceEvidenceRejection] = []
 
-    if output.facts and not preserve_facts:
+    if output.facts and not preserve_narrative:
         warnings.append("fact_not_allowed")
+    if output.events and not preserve_narrative:
+        warnings.append("event_not_allowed")
 
-    proposal_index = len(output.facts)
+    proposal_index = 0
+
+    for fact in output.facts:
+        proposal_index += 1
+        if not preserve_narrative:
+            continue
+        anchor = _text_comparison_view(fact.value)
+        if anchor and any(anchor in view for view in text_source_views):
+            facts.append(fact)
+        else:
+            rejections.append(
+                SourceEvidenceRejection(
+                    proposal_index=proposal_index,
+                    proposal_kind="fact",
+                    reason_code=_evidence_missing_reason(
+                        evidence_document, "source_fact_evidence_missing"
+                    ),
+                    value=fact.value,
+                )
+            )
+
+    for event in output.events:
+        proposal_index += 1
+        if not preserve_narrative:
+            continue
+        if _event_is_proven(event, evidence_document):
+            events.append(event.model_copy(update={"context": "", "evidence_quote": ""}))
+        else:
+            rejections.append(
+                SourceEvidenceRejection(
+                    proposal_index=proposal_index,
+                    proposal_kind="event",
+                    reason_code=_evidence_missing_reason(
+                        evidence_document, "source_event_evidence_missing"
+                    ),
+                    value=event.text,
+                )
+            )
+
     for artifact in output.artifacts:
         proposal_index += 1
         if any(_artifact_is_proven(artifact, source) for source in base_source_views):
@@ -504,8 +585,8 @@ def _verify_output_against_source(
 
     for rule in output.rules:
         proposal_index += 1
-        body = _rule_whitespace_view(rule.body)
-        if body and any(body in source for source in rule_source_views):
+        body_view = _text_comparison_view(rule.body)
+        if body_view and any(body_view in source for source in text_source_views):
             rules.append(rule.model_copy(update={"context": "", "evidence_quote": ""}))
         else:
             rejections.append(
@@ -519,7 +600,8 @@ def _verify_output_against_source(
             )
 
     filtered = Q2SourceOutput(
-        facts=list(output.facts) if preserve_facts else [],
+        facts=facts,
+        events=events,
         artifacts=artifacts,
         rules=rules,
         uncertainties=list(output.uncertainties),
@@ -578,6 +660,16 @@ def _rule_whitespace_view(value: str) -> str:
     in its own source.
     """
     return _RULE_WHITESPACE.sub(" ", _rule_comparison_view(value)).strip()
+
+
+def _text_comparison_view(value: str) -> str:
+    """Whitespace-collapsed view shared by facts, events and rule bodies.
+
+    A publication is re-indented and wrapped by its renderer.  Collapsing
+    whitespace keeps every token and their order, so a value proven in this
+    view is still literally present in the deterministic source representation.
+    """
+    return _rule_whitespace_view(value)
 
 
 def _artifact_is_proven(artifact: Q2ArtifactProposal, source: str) -> bool:

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import date
+from typing import get_args
 
 import pytest
 
@@ -10,14 +12,19 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_parsers import (
+    Q2_EXTRACTION_CONTRACT_VERSION,
     Q2_MARKDOWN_PARSER_VERSION,
+    Q2_SCHEMA_VERSION,
     DetectionRule,
     Q2ArtifactProposal,
+    Q2EventProposal,
+    Q2FactProposal,
     Q2RuleProposal,
     Q2SourceOutput,
     parse_q2_proposals_markdown,
     project_q2_source_output,
     q2_source_output_from_json,
+    q2_source_output_to_json,
 )
 from cti_app.application.production_prompts import (
     EXTRACTION_PROMPT_VERSION,
@@ -25,6 +32,7 @@ from cti_app.application.production_prompts import (
     ProductionPromptTemplates,
 )
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
+from cti_app.domain.production_extraction import EXTRACTION_FACT_CATEGORIES
 
 
 def _parse(text: str):
@@ -70,7 +78,7 @@ def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
     assert "Never repeat its URL" not in one_line
     assert "url, email, md5, sha1, sha256, sha512" in one_line
     assert EXTRACTION_PROMPT_VERSION == "18"
-    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v6"
+    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v7"
 
 
 def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
@@ -424,6 +432,7 @@ IOC confirmed domain
     [
         "IOC confirmed domain",
         "FACT malware\n\nIOC confirmed ip",
+        "EVENT 2024-03-02",
         "UNCERTAINTIES",
     ],
 )
@@ -556,10 +565,10 @@ def test_old_q2_v3_grouped_sections_are_not_supported() -> None:
 @pytest.mark.parametrize(
     ("contract_version", "schema_version"),
     [
-        (None, "3"),
-        ("q2-source-extraction-v2", "3"),
-        ("q2-source-extraction-v3", None),
-        ("q2-source-extraction-v3", "2"),
+        (None, Q2_SCHEMA_VERSION),
+        ("q2-source-extraction-v3", Q2_SCHEMA_VERSION),
+        (Q2_EXTRACTION_CONTRACT_VERSION, None),
+        (Q2_EXTRACTION_CONTRACT_VERSION, "3"),
     ],
 )
 def test_q2_checkpoint_requires_current_versions(
@@ -703,6 +712,90 @@ def test_cached_full_projection_keeps_rules_for_ioc_rules() -> None:
 
     projected = project_q2_source_output(output, ExtractionProfile.IOC_RULES)
     assert projected.rules == output.rules
+
+
+def test_full_fact_categories_match_the_canonical_contract() -> None:
+    categories = set(get_args(Q2FactProposal.model_fields["category"].annotation))
+
+    assert categories == set(EXTRACTION_FACT_CATEGORIES)
+    assert {"products", "sectors", "countries"} <= categories
+
+
+def test_full_extraction_covers_products_sectors_and_countries() -> None:
+    output = _parse(
+        "FACT products\n- Acme EDR\nFACT sectors\n- healthcare\nFACT countries\n- France\n"
+    )
+
+    assert [(fact.category, fact.value) for fact in output.facts] == [
+        ("products", "Acme EDR"),
+        ("sectors", "healthcare"),
+        ("countries", "France"),
+    ]
+
+
+def test_event_group_carries_a_precise_date_or_temporal_text() -> None:
+    output = _parse(
+        """EVENT 2024-03-02
+- Actor deployed ExampleRAT :: first stage
+
+EVENT early March 2024
+- Victim reported the intrusion
+
+EVENT
+- Attribution remained unconfirmed
+"""
+    )
+
+    assert [(event.event_date, event.date_text) for event in output.events] == [
+        (date(2024, 3, 2), None),
+        (None, "early March 2024"),
+        (None, None),
+    ]
+    assert [event.text for event in output.events] == [
+        "Actor deployed ExampleRAT",
+        "Victim reported the intrusion",
+        "Attribution remained unconfirmed",
+    ]
+    assert output.events[0].context == "first stage"
+
+
+def test_event_headers_never_invent_a_date() -> None:
+    output = _parse("EVENT 2024-13-45\n- Broken date stayed textual\n")
+
+    assert output.events[0].event_date is None
+    assert output.events[0].date_text == "2024-13-45"
+
+
+def test_q2_checkpoint_round_trip_preserves_events() -> None:
+    output = _parse("EVENT 2024-03-02\n- Actor deployed ExampleRAT\n")
+
+    payload = q2_source_output_to_json(output)
+
+    assert payload["events"][0]["event_date"] == "2024-03-02"
+    assert q2_source_output_from_json(payload) == output
+
+
+def test_ioc_rules_projection_drops_facts_and_events() -> None:
+    output = Q2SourceOutput(
+        facts=[Q2FactProposal(category="malware", value="ExampleRAT")],
+        events=[Q2EventProposal(event_date=date(2024, 1, 2), text="Deployed")],
+        artifacts=[
+            Q2ArtifactProposal(
+                value="evil.example", artifact_type="domain", indicator_status="confirmed_ioc"
+            )
+        ],
+        rules=[Q2RuleProposal(rule_type="yara", body="rule R { condition: true }", name="R")],
+        uncertainties=["partial load"],
+    )
+
+    projected = project_q2_source_output(output, ExtractionProfile.IOC_RULES)
+
+    assert projected.facts == []
+    assert projected.events == []
+    assert projected.artifacts == output.artifacts
+    assert projected.rules == output.rules
+    assert projected.uncertainties == ["partial load"]
+    assert project_q2_source_output(output, ExtractionProfile.FULL) is output
 
 
 def test_rule_canonical_body_hash_is_based_on_literal_body() -> None:

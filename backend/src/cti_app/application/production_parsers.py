@@ -290,6 +290,7 @@ class Q2FactProposal(BaseModel):
         "campaigns",
         "malware",
         "tools",
+        "products",
         "infection_chain",
         "ttps",
         "victimology",
@@ -299,10 +300,30 @@ class Q2FactProposal(BaseModel):
         "commands",
         "persistence",
         "detections",
+        "sectors",
+        "countries",
         "other_technical",
     ]
     value: str = Field(min_length=1, max_length=4000)
     attack_id: str | None = Field(default=None, pattern=r"^T\d{4}(?:\.\d{3})?$")
+    context: str = Field(default="", max_length=4000)
+    evidence_quote: str = Field(default="", max_length=8000)
+
+
+class Q2EventProposal(BaseModel):
+    """One chronology entry proposed by Q2.
+
+    ``event_date`` carries a precise calendar date only when the publication
+    states one; ``date_text`` preserves the temporal wording otherwise. A date
+    is never estimated. Orchestration attaches the source document identity and
+    verifies the date against the same local evidence area.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_date: date | None = None
+    date_text: str | None = Field(default=None, max_length=400)
+    text: str = Field(min_length=1, max_length=4000)
     context: str = Field(default="", max_length=4000)
     evidence_quote: str = Field(default="", max_length=8000)
 
@@ -349,18 +370,19 @@ class Q2SourceOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     facts: list[Q2FactProposal] = Field(default_factory=list)
+    events: list[Q2EventProposal] = Field(default_factory=list)
     artifacts: list[Q2ArtifactProposal] = Field(default_factory=list)
     rules: list[Q2RuleProposal] = Field(default_factory=list)
     uncertainties: list[str] = Field(default_factory=list)
 
 
 # Bump whenever Q2SourceOutput contract changes. Checkpoints validate against it.
-Q2_SCHEMA_VERSION = "3"
-Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v3"
+Q2_SCHEMA_VERSION = "4"
+Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v4"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v6"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v7"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -369,6 +391,7 @@ def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
         "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
         "schema_version": Q2_SCHEMA_VERSION,
         "facts": [fact.model_dump(mode="json") for fact in output.facts],
+        "events": [event.model_dump(mode="json") for event in output.events],
         "artifacts": [artifact.model_dump(mode="json") for artifact in output.artifacts],
         "rules": [rule.model_dump(mode="json") for rule in output.rules],
         "uncertainties": list(output.uncertainties),
@@ -384,6 +407,7 @@ def q2_source_output_from_json(payload: dict[str, Any]) -> Q2SourceOutput:
     return Q2SourceOutput.model_validate(
         {
             "facts": payload.get("facts", []),
+            "events": payload.get("events", []),
             "artifacts": payload.get("artifacts", []),
             "rules": payload.get("rules", []),
             "uncertainties": payload.get("uncertainties", []),
@@ -397,11 +421,9 @@ def project_q2_source_output(output: Q2SourceOutput, profile: ExtractionProfile)
         return output
     if profile is not ExtractionProfile.IOC_RULES:
         raise ValueError(f"Unsupported extraction profile: {profile}")
+    # IOC_RULES is artifacts + rules + uncertainties only: no narrative facts
+    # and no chronology inherit from a FULL result.
     return Q2SourceOutput(
-        # Artifact proposals are the exhaustive IOC/rule channel. File and
-        # detection facts are retained when a FULL result used a fact rather
-        # than an ARTIFACT block for that narrow light-profile scope.
-        facts=[fact for fact in output.facts if fact.category in {"files", "detections"}],
         artifacts=list(output.artifacts),
         rules=list(output.rules),
         uncertainties=list(output.uncertainties),
@@ -875,6 +897,7 @@ _Q2_FACT_CATEGORIES = frozenset(
         "campaigns",
         "malware",
         "tools",
+        "products",
         "infection_chain",
         "ttps",
         "victimology",
@@ -884,6 +907,8 @@ _Q2_FACT_CATEGORIES = frozenset(
         "commands",
         "persistence",
         "detections",
+        "sectors",
+        "countries",
         "other_technical",
     }
 )
@@ -917,6 +942,7 @@ _ATTACK_ID = re.compile(r"T\d{4}(?:\.\d{3})?")
 
 _Q2_HEADER_TEXT = re.compile(r"^\s*(?:#{1,6}\s+)?(?P<text>.+?)\s*#*\s*$")
 _Q2_FACT_HEADER = re.compile(r"^FACT(?:\s+(?P<category>.+))?$", re.IGNORECASE)
+_Q2_EVENT_HEADER = re.compile(r"^EVENT(?:[:\s]+(?P<spec>.+))?$", re.IGNORECASE)
 _Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$", re.IGNORECASE)
 _Q2_FENCE_OPEN = re.compile(r"^\s*```[^\n]*$")
 _Q2_RULE_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]+)\s*$")
@@ -955,6 +981,8 @@ class _Q2Header:
     artifact_type: str | None = None
     rule_type: DetectionRuleType | None = None
     name: str | None = None
+    event_date: date | None = None
+    date_text: str | None = None
     error_code: str | None = None
 
 
@@ -973,6 +1001,16 @@ def _parse_q2_header(line: str) -> _Q2Header | None:
 
     if candidate.casefold() == "uncertainties":
         return _Q2Header(kind="uncertainties")
+
+    event_match = _Q2_EVENT_HEADER.fullmatch(candidate)
+    if event_match is not None:
+        specification = (event_match.group("spec") or "").strip()
+        event_date = _parse_date(specification) if specification else None
+        return _Q2Header(
+            kind="event",
+            event_date=event_date,
+            date_text=None if event_date is not None else (specification or None),
+        )
 
     fact_match = _Q2_FACT_HEADER.fullmatch(candidate)
     if fact_match is not None:
@@ -1094,6 +1132,7 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
         return result
 
     facts: list[Q2FactProposal] = []
+    events: list[Q2EventProposal] = []
     artifacts: list[Q2ArtifactProposal] = []
     rules: list[Q2RuleProposal] = []
     uncertainties: list[str] = []
@@ -1240,6 +1279,19 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
                 result.warnings.append("fact_schema_invalid")
             else:
                 facts.append(fact)
+        elif current.kind == "event":
+            try:
+                event = Q2EventProposal(
+                    event_date=current.event_date,
+                    date_text=current.date_text,
+                    text=value,
+                    context=context,
+                    evidence_quote="",
+                )
+            except ValidationError:
+                result.warnings.append("event_schema_invalid")
+            else:
+                events.append(event)
         elif current.kind == "ioc":
             try:
                 artifact = Q2ArtifactProposal(
@@ -1261,12 +1313,13 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
         result.errors.append("q2_compact_sections_missing")
         return result
 
-    if not (facts or artifacts or rules or uncertainties):
+    if not (facts or events or artifacts or rules or uncertainties):
         result.errors.append("q2_no_payload")
         return result
 
     result.value = Q2SourceOutput(
         facts=facts,
+        events=events,
         artifacts=artifacts,
         rules=rules,
         uncertainties=list(dict.fromkeys((*uncertainties, *result.uncertainties))),
