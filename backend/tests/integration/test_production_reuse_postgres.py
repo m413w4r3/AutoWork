@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
@@ -85,6 +86,7 @@ from cti_app.domain.model_runs import (
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -93,6 +95,8 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SourceExtraction,
+    SourceExtractionStatus,
 )
 from cti_app.domain.selection import (
     SelectionAction,
@@ -104,6 +108,89 @@ from cti_app.integrations.models import BlobModelOutputStore
 from tests.discovery_support import make_discovery_run_for_edition
 
 pytestmark = pytest.mark.integration
+
+
+def _source_identity(extraction: SourceExtraction) -> dict[str, str]:
+    return {
+        "source_content_sha256": extraction.source_content_sha256,
+        "profile": extraction.profile.value,
+        "contract_version": extraction.contract_version,
+        "prompt_version": extraction.prompt_version,
+        "parser_version": extraction.parser_version,
+        "verifier_version": extraction.verifier_version,
+        "source_text_contract_version": extraction.source_text_contract_version,
+        "model_policy_version": extraction.model_policy_version,
+        "routing_policy_version": extraction.routing_policy_version,
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_extraction_checkpoint_identity_is_durable(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    source = SourceExtraction(
+        canonical_url="https://example.test/first",
+        source_content_sha256="a" * 64,
+        profile=ExtractionProfile.FULL,
+        contract_version="contract-v1",
+        prompt_version="prompt-v1",
+        parser_version="parser-v1",
+        verifier_version="verifier-v1",
+        source_text_contract_version="text-v1",
+        model_policy_version="model-v1",
+        routing_policy_version="routing-v1",
+        status=SourceExtractionStatus.VERIFIED,
+    )
+    async with uow_factory() as uow:
+        assert await uow.source_extractions.claim(source)
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        found = await uow.source_extractions.get_by_identity(**_source_identity(source))
+        assert found == source
+        # A second URL with identical bytes and policy reuses this checkpoint.
+        duplicate_url = replace(source, id=uuid4(), canonical_url="https://example.test/second")
+        assert not await uow.source_extractions.claim(duplicate_url)
+        assert (
+            await uow.source_extractions.get_by_identity(**_source_identity(duplicate_url))
+        ) == source
+
+    changes: dict[str, str | ExtractionProfile] = {
+        "source_content_sha256": "b" * 64,
+        "profile": ExtractionProfile.IOC_RULES,
+        "contract_version": "contract-v2",
+        "prompt_version": "prompt-v2",
+        "parser_version": "parser-v2",
+        "verifier_version": "verifier-v2",
+        "source_text_contract_version": "text-v2",
+        "model_policy_version": "model-v2",
+        "routing_policy_version": "routing-v2",
+    }
+    for field_name, value in changes.items():
+        changed = replace(source, id=uuid4(), **{field_name: value})
+        async with uow_factory() as uow:
+            assert await uow.source_extractions.get_by_identity(**_source_identity(changed)) is None
+            assert await uow.source_extractions.claim(changed)
+            await uow.commit()
+        async with uow_factory() as uow:
+            found = await uow.source_extractions.get_by_identity(**_source_identity(changed))
+            assert found == changed
+
+    # The weaker IOC_RULES profile cannot satisfy a FULL lookup.
+    ioc = replace(
+        source,
+        id=uuid4(),
+        source_content_sha256="c" * 64,
+        profile=ExtractionProfile.IOC_RULES,
+    )
+    async with uow_factory() as uow:
+        assert await uow.source_extractions.claim(ioc)
+        await uow.commit()
+    async with uow_factory() as uow:
+        found = await uow.source_extractions.get_by_identity(
+            **{**_source_identity(ioc), "profile": ExtractionProfile.FULL.value}
+        )
+        assert found is None
 
 
 class _CountingRetryModelAdapter:

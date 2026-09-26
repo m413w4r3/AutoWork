@@ -205,6 +205,9 @@ class SourceExtractionRow(Base):
             "prompt_version",
             "parser_version",
             "verifier_version",
+            "source_text_contract_version",
+            "model_policy_version",
+            "routing_policy_version",
             name="uq_source_extractions_identity",
         ),
         CheckConstraint(
@@ -235,6 +238,9 @@ class SourceExtractionRow(Base):
     prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
     parser_version: Mapped[str] = mapped_column(String(64), nullable=False)
     verifier_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_text_contract_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    model_policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    routing_policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     canonical_blob_id: Mapped[UUID | None] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT")

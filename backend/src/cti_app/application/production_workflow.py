@@ -2566,6 +2566,13 @@ class ProductionWorkflowOrchestrator:
                     prompt_version=str(versions["prompt_version"]),
                     parser_version=str(versions["parser_version"]),
                     verifier_version=ARTIFACT_VERIFIER_VERSION,
+                    source_text_contract_version=(
+                        ARCHIVED_SOURCE_ACCESS_VERSION
+                        if access_mode == "archive_fallback"
+                        else SOURCE_EVIDENCE_VERSION
+                    ),
+                    model_policy_version=Q2_MODEL_POLICY_VERSION,
+                    routing_policy_version=Q2_ROUTING_POLICY_VERSION,
                 )
 
         async def read_source_extraction_checkpoint(
@@ -2751,6 +2758,13 @@ class ProductionWorkflowOrchestrator:
                     prompt_version=str(versions["prompt_version"]),
                     parser_version=str(versions["parser_version"]),
                     verifier_version=ARTIFACT_VERIFIER_VERSION,
+                    source_text_contract_version=(
+                        ARCHIVED_SOURCE_ACCESS_VERSION
+                        if access_mode == "archive_fallback"
+                        else SOURCE_EVIDENCE_VERSION
+                    ),
+                    model_policy_version=Q2_MODEL_POLICY_VERSION,
+                    routing_policy_version=Q2_ROUTING_POLICY_VERSION,
                     status=SourceExtractionStatus.VERIFIED,
                     canonical_blob_id=canonical_blob_id,
                     raw_blob_id=raw_blob_id,

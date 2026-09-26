@@ -866,6 +866,9 @@ class SourceExtraction:
     prompt_version: str
     parser_version: str
     verifier_version: str
+    source_text_contract_version: str
+    model_policy_version: str
+    routing_policy_version: str
     status: SourceExtractionStatus = SourceExtractionStatus.RUNNING
     canonical_blob_id: UUID | None = None
     raw_blob_id: UUID | None = None
@@ -883,6 +886,9 @@ class SourceExtraction:
             ("prompt_version", self.prompt_version),
             ("parser_version", self.parser_version),
             ("verifier_version", self.verifier_version),
+            ("source_text_contract_version", self.source_text_contract_version),
+            ("model_policy_version", self.model_policy_version),
+            ("routing_policy_version", self.routing_policy_version),
         ):
             if not value.strip():
                 raise ValueError(f"{name} is required")
