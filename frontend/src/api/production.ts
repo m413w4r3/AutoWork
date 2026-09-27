@@ -303,7 +303,325 @@ export interface ArtifactResponse {
   /** Publication Markdown is downloadable alongside the canonical document. */
   rendered_content: string | null;
   canonical_content:
-    PublicationDocument | ExtractionDocumentV2 | Record<string, unknown> | null;
+    | PublicationDocument
+    | ProductionExtractionV1
+    | ExtractionDocumentV2
+    | Record<string, unknown>
+    | null;
+}
+
+export type ProductionExtractionTierV1 = "core" | "supporting" | "technical";
+export type ProductionExtractionProfileV1 = "full" | "ioc_rules";
+export type ProductionExtractionReuseStateV1 = "fresh" | "reused";
+export const PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION =
+  "production-reference-tier-v1" as const;
+
+export interface ProductionExtractionEvidenceV1 {
+  evidence_quote: string;
+  evidence_basis: string;
+}
+
+export interface ProductionExtractionFactV1 extends ProductionExtractionEvidenceV1 {
+  category: string;
+  value: string;
+  context: string;
+}
+
+export interface ProductionExtractionEventV1 extends ProductionExtractionEvidenceV1 {
+  event_date: string | null;
+  date_text: string | null;
+  text: string;
+  context: string;
+  source_document_id: string;
+}
+
+export interface ProductionExtractionArtifactV1 extends ProductionExtractionEvidenceV1 {
+  artifact_type: string;
+  value: string;
+  normalized_value: string | null;
+  context: string;
+}
+
+export interface ProductionExtractionRuleV1 extends ProductionExtractionEvidenceV1 {
+  rule_type: string;
+  name: string | null;
+  body: string;
+}
+
+export interface ProductionSourceExtractionV1 {
+  source_document_id: string;
+  canonical_url: string;
+  content_sha256: string;
+  tier: ProductionExtractionTierV1;
+  kind: "publication" | "technical_resource";
+  role: string;
+  profile: ProductionExtractionProfileV1;
+  checkpoint_id: string;
+  reuse_state: ProductionExtractionReuseStateV1;
+  facts: ProductionExtractionFactV1[];
+  events: ProductionExtractionEventV1[];
+  indicators: ProductionExtractionArtifactV1[];
+  rules: ProductionExtractionRuleV1[];
+  uncertainties: string[];
+  title?: string | null;
+}
+
+export interface ProductionExtractionOmissionV1 {
+  canonical_url: string;
+  tier: ProductionExtractionTierV1;
+  collection_state: string;
+  reason: string;
+  source_document_id?: string | null;
+  title?: string | null;
+}
+
+export interface ProductionExtractionV1 {
+  schema_version: 1;
+  subject_id: string;
+  production_input_hash: string;
+  references_corpus_hash: string;
+  profile_policy_version: typeof PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION;
+  sources: ProductionSourceExtractionV1[];
+  omitted_sources: ProductionExtractionOmissionV1[];
+  warnings: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean {
+  return Object.keys(value).every((key) => keys.includes(key));
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isUuid(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
+}
+
+function isSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
+}
+
+function isProductionExtractionTierV1(
+  value: unknown,
+): value is ProductionExtractionTierV1 {
+  return value === "core" || value === "supporting" || value === "technical";
+}
+
+function isEvidenceV1(value: unknown): value is ProductionExtractionEvidenceV1 {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.evidence_quote) &&
+    isNonEmptyString(value.evidence_basis)
+  );
+}
+
+function isFactV1(value: unknown): value is ProductionExtractionFactV1 {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "category",
+      "value",
+      "context",
+      "evidence_quote",
+      "evidence_basis",
+    ]) &&
+    isNonEmptyString(value.category) &&
+    isNonEmptyString(value.value) &&
+    typeof value.context === "string" &&
+    isEvidenceV1(value)
+  );
+}
+
+function isEventV1(value: unknown): value is ProductionExtractionEventV1 {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "event_date",
+      "date_text",
+      "text",
+      "context",
+      "source_document_id",
+      "evidence_quote",
+      "evidence_basis",
+    ]) &&
+    (value.event_date === null ||
+      (typeof value.event_date === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(value.event_date))) &&
+    (value.date_text === null || typeof value.date_text === "string") &&
+    isNonEmptyString(value.text) &&
+    typeof value.context === "string" &&
+    isUuid(value.source_document_id) &&
+    isEvidenceV1(value)
+  );
+}
+
+function isArtifactV1(value: unknown): value is ProductionExtractionArtifactV1 {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "artifact_type",
+      "value",
+      "normalized_value",
+      "context",
+      "evidence_quote",
+      "evidence_basis",
+    ]) &&
+    isNonEmptyString(value.artifact_type) &&
+    isNonEmptyString(value.value) &&
+    (value.normalized_value === null ||
+      typeof value.normalized_value === "string") &&
+    typeof value.context === "string" &&
+    isEvidenceV1(value)
+  );
+}
+
+function isRuleV1(value: unknown): value is ProductionExtractionRuleV1 {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "rule_type",
+      "name",
+      "body",
+      "evidence_quote",
+      "evidence_basis",
+    ]) &&
+    isNonEmptyString(value.rule_type) &&
+    (value.name === null || typeof value.name === "string") &&
+    isNonEmptyString(value.body) &&
+    isEvidenceV1(value)
+  );
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) && value.every((item) => typeof item === "string")
+  );
+}
+
+function isProductionSourceExtractionV1(
+  value: unknown,
+): value is ProductionSourceExtractionV1 {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "source_document_id",
+      "canonical_url",
+      "content_sha256",
+      "tier",
+      "kind",
+      "role",
+      "profile",
+      "checkpoint_id",
+      "reuse_state",
+      "facts",
+      "events",
+      "indicators",
+      "rules",
+      "uncertainties",
+      "title",
+    ]) ||
+    !isUuid(value.source_document_id) ||
+    !isNonEmptyString(value.canonical_url) ||
+    !isSha256(value.content_sha256) ||
+    !isProductionExtractionTierV1(value.tier) ||
+    (value.kind !== "publication" && value.kind !== "technical_resource") ||
+    !isNonEmptyString(value.role) ||
+    (value.profile !== "full" && value.profile !== "ioc_rules") ||
+    !isUuid(value.checkpoint_id) ||
+    (value.reuse_state !== "fresh" && value.reuse_state !== "reused") ||
+    !Array.isArray(value.facts) ||
+    !value.facts.every(isFactV1) ||
+    !Array.isArray(value.events) ||
+    !value.events.every(isEventV1) ||
+    !Array.isArray(value.indicators) ||
+    !value.indicators.every(isArtifactV1) ||
+    !Array.isArray(value.rules) ||
+    !value.rules.every(isRuleV1) ||
+    !isStringArray(value.uncertainties) ||
+    ("title" in value &&
+      value.title !== null &&
+      typeof value.title !== "string")
+  ) {
+    return false;
+  }
+  return (
+    value.profile === (value.tier === "core" ? "full" : "ioc_rules") &&
+    value.events.every(
+      (event) => event.source_document_id === value.source_document_id,
+    )
+  );
+}
+
+function isProductionExtractionOmissionV1(
+  value: unknown,
+): value is ProductionExtractionOmissionV1 {
+  return (
+    isRecord(value) &&
+    hasOnlyKeys(value, [
+      "canonical_url",
+      "tier",
+      "collection_state",
+      "reason",
+      "source_document_id",
+      "title",
+    ]) &&
+    isNonEmptyString(value.canonical_url) &&
+    isProductionExtractionTierV1(value.tier) &&
+    isNonEmptyString(value.collection_state) &&
+    isNonEmptyString(value.reason) &&
+    (!("source_document_id" in value) ||
+      value.source_document_id === null ||
+      isUuid(value.source_document_id)) &&
+    (!("title" in value) ||
+      value.title === null ||
+      typeof value.title === "string")
+  );
+}
+
+export function isProductionExtractionV1(
+  value: unknown,
+): value is ProductionExtractionV1 {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
+      "schema_version",
+      "subject_id",
+      "production_input_hash",
+      "references_corpus_hash",
+      "profile_policy_version",
+      "sources",
+      "omitted_sources",
+      "warnings",
+    ]) ||
+    value.schema_version !== 1 ||
+    !isUuid(value.subject_id) ||
+    !isSha256(value.production_input_hash) ||
+    !isSha256(value.references_corpus_hash) ||
+    value.profile_policy_version !==
+      PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION ||
+    !Array.isArray(value.sources) ||
+    !value.sources.every(isProductionSourceExtractionV1) ||
+    !Array.isArray(value.omitted_sources) ||
+    !value.omitted_sources.every(isProductionExtractionOmissionV1) ||
+    !isStringArray(value.warnings)
+  ) {
+    return false;
+  }
+  const documentIds = value.sources.map((source) => source.source_document_id);
+  return new Set(documentIds).size === documentIds.length;
 }
 
 export interface ExtractionItemV2 {

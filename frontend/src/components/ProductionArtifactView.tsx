@@ -4,7 +4,14 @@ import {
   getExtractionArtifact,
   getSynthesisArtifact,
   getPublicationArtifact,
+  isProductionExtractionV1,
   type ArtifactResponse,
+  type ProductionExtractionArtifactV1,
+  type ProductionExtractionEventV1,
+  type ProductionExtractionFactV1,
+  type ProductionExtractionRuleV1,
+  type ProductionExtractionV1,
+  type ProductionSourceExtractionV1,
   type PublicationDocument,
   type ExtractionDocumentV2,
   type ExtractionItemV2,
@@ -399,6 +406,306 @@ function ExtractionPreview({ document }: { document: ExtractionDocumentV2 }) {
   );
 }
 
+function ProductionExtractionSourceCard({
+  source,
+}: {
+  source: ProductionSourceExtractionV1;
+}) {
+  return (
+    <li>
+      <article className="extraction-source">
+        <h4>{source.title?.trim() || source.canonical_url}</h4>
+        <a href={source.canonical_url}>{source.canonical_url}</a>
+        <dl>
+          <div>
+            <dt>Tier</dt>
+            <dd>{REFERENCE_TIER_LABELS[source.tier]}</dd>
+          </div>
+          <div>
+            <dt>Type de source</dt>
+            <dd>{REFERENCE_KIND_LABELS[source.kind]}</dd>
+          </div>
+          <div>
+            <dt>Rôle</dt>
+            <dd>{REFERENCE_ROLE_LABELS[source.role] ?? source.role}</dd>
+          </div>
+          <div>
+            <dt>Profil</dt>
+            <dd>{source.profile === "full" ? "FULL" : "IOC_RULES"}</dd>
+          </div>
+          <div>
+            <dt>SHA-256</dt>
+            <dd>{source.content_sha256.slice(0, 12)}…</dd>
+          </div>
+          <div>
+            <dt>Résultat</dt>
+            <dd>
+              {source.reuse_state === "reused" ? "Réutilisée" : "Calculée"}
+            </dd>
+          </div>
+          <div>
+            <dt>Checkpoint</dt>
+            <dd>{source.checkpoint_id}</dd>
+          </div>
+          <div>
+            <dt>Faits</dt>
+            <dd>{source.facts.length}</dd>
+          </div>
+          <div>
+            <dt>Événements</dt>
+            <dd>{source.events.length}</dd>
+          </div>
+          <div>
+            <dt>IOC / artefacts</dt>
+            <dd>{source.indicators.length}</dd>
+          </div>
+          <div>
+            <dt>Règles</dt>
+            <dd>{source.rules.length}</dd>
+          </div>
+        </dl>
+      </article>
+    </li>
+  );
+}
+
+function ExtractionSourceProvenance({
+  source,
+}: {
+  source: ProductionSourceExtractionV1;
+}) {
+  return (
+    <p className="extraction-provenance">
+      Source : {source.source_document_id} ·{" "}
+      <a href={source.canonical_url}>
+        {source.title?.trim() || source.canonical_url}
+      </a>
+    </p>
+  );
+}
+
+function ExtractionEvidence({
+  item,
+  source,
+}: {
+  item:
+    | ProductionExtractionArtifactV1
+    | ProductionExtractionEventV1
+    | ProductionExtractionFactV1
+    | ProductionExtractionRuleV1;
+  source: ProductionSourceExtractionV1;
+}) {
+  return (
+    <>
+      <ExtractionSourceProvenance source={source} />
+      <blockquote>{item.evidence_quote}</blockquote>
+      <p className="extraction-evidence-basis">
+        Base de preuve : {item.evidence_basis}
+      </p>
+    </>
+  );
+}
+
+function ProductionExtractionPreview({
+  document,
+}: {
+  document: ProductionExtractionV1;
+}) {
+  const fullSources = document.sources.filter(
+    (source) => source.profile === "full",
+  );
+  const iocSources = document.sources.filter(
+    (source) => source.profile === "ioc_rules",
+  );
+  const events = fullSources.flatMap((source) =>
+    source.events.map((item) => ({ item, source })),
+  );
+  const facts = fullSources.flatMap((source) =>
+    source.facts.map((item) => ({ item, source })),
+  );
+  const indicators = document.sources.flatMap((source) =>
+    source.indicators.map((item) => ({ item, source })),
+  );
+  const rules = document.sources.flatMap((source) =>
+    source.rules.map((item) => ({ item, source })),
+  );
+  const uncertainties = document.sources.flatMap((source) =>
+    source.uncertainties.map((text, index) => ({ source, text, index })),
+  );
+
+  return (
+    <article className="extraction-preview extraction-preview--canonical">
+      <section className="extraction-section">
+        <h3>Sources FULL</h3>
+        {fullSources.length > 0 ? (
+          <ul className="extraction-sources">
+            {fullSources.map((source) => (
+              <ProductionExtractionSourceCard
+                key={source.source_document_id}
+                source={source}
+              />
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune source FULL.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Sources IOC_RULES</h3>
+        {iocSources.length > 0 ? (
+          <ul className="extraction-sources">
+            {iocSources.map((source) => (
+              <ProductionExtractionSourceCard
+                key={source.source_document_id}
+                source={source}
+              />
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune source IOC_RULES.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Chronologie</h3>
+        {events.length > 0 ? (
+          <ul>
+            {events.map(({ item, source }, index) => (
+              <li key={`${source.source_document_id}-event-${index}`}>
+                <p>
+                  {item.event_date ? (
+                    <strong>{item.event_date} — </strong>
+                  ) : null}
+                  {item.date_text ? <strong>{item.date_text} — </strong> : null}
+                  {item.text}
+                </p>
+                {item.context ? <p>{item.context}</p> : null}
+                <ExtractionEvidence item={item} source={source} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucun événement extrait.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Faits</h3>
+        {facts.length > 0 ? (
+          <ul>
+            {facts.map(({ item, source }, index) => (
+              <li key={`${source.source_document_id}-fact-${index}`}>
+                <strong>{item.category} : </strong>
+                {item.value}
+                {item.context ? <p>{item.context}</p> : null}
+                <ExtractionEvidence item={item} source={source} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucun fait extrait.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>IOC / artefacts</h3>
+        {indicators.length > 0 ? (
+          <ul>
+            {indicators.map(({ item, source }, index) => (
+              <li key={`${source.source_document_id}-indicator-${index}`}>
+                <strong>{item.artifact_type} : </strong>
+                <code>{item.value}</code>
+                {item.normalized_value &&
+                  item.normalized_value !== item.value && (
+                    <span> · valeur normalisée : {item.normalized_value}</span>
+                  )}
+                {item.context ? <p>{item.context}</p> : null}
+                <ExtractionEvidence item={item} source={source} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucun IOC ou artefact extrait.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Règles publiées</h3>
+        {rules.length > 0 ? (
+          <ul>
+            {rules.map(({ item, source }, index) => (
+              <li key={`${source.source_document_id}-rule-${index}`}>
+                <p>
+                  <strong>{item.name ?? item.rule_type}</strong> ·{" "}
+                  {item.rule_type}
+                </p>
+                <pre>{item.body}</pre>
+                <ExtractionEvidence item={item} source={source} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune règle publiée extraite.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Incertitudes</h3>
+        {uncertainties.length > 0 ? (
+          <ul>
+            {uncertainties.map(({ source, text, index }) => (
+              <li key={`${source.source_document_id}-uncertainty-${index}`}>
+                {text}
+                <ExtractionSourceProvenance source={source} />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune incertitude signalée.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Sources omises / en erreur</h3>
+        {document.omitted_sources.length > 0 ? (
+          <ul>
+            {document.omitted_sources.map((omission, index) => (
+              <li key={`${omission.canonical_url}-${index}`}>
+                <h4>{omission.title?.trim() || omission.canonical_url}</h4>
+                <a href={omission.canonical_url}>{omission.canonical_url}</a>
+                <p>
+                  {REFERENCE_TIER_LABELS[omission.tier]} ·{" "}
+                  {omission.collection_state}
+                </p>
+                <p>{omission.reason}</p>
+                {omission.source_document_id ? (
+                  <p>Document : {omission.source_document_id}</p>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune source omise ou en erreur.</p>
+        )}
+      </section>
+
+      <section className="extraction-section">
+        <h3>Warnings</h3>
+        {document.warnings.length > 0 ? (
+          <ul>
+            {document.warnings.map((warning, index) => (
+              <li key={`${warning}-${index}`}>{warning}</li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucun warning.</p>
+        )}
+      </section>
+    </article>
+  );
+}
+
 export function PublicationDocumentView({
   document,
 }: {
@@ -550,6 +857,12 @@ export function ProductionArtifactView({
         )}
 
       {stage === "extraction" &&
+        isProductionExtractionV1(artifact.canonical_content) && (
+          <ProductionExtractionPreview document={artifact.canonical_content} />
+        )}
+
+      {stage === "extraction" &&
+        !isProductionExtractionV1(artifact.canonical_content) &&
         isExtractionDocument(artifact.canonical_content) && (
           <ExtractionPreview document={artifact.canonical_content} />
         )}

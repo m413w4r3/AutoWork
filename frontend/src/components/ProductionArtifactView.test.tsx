@@ -262,3 +262,175 @@ it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique",
   expect(container.querySelector('a[href*="#conversations"]')).toBeNull();
   expect(screen.queryByText("legacy S1 S2")).not.toBeInTheDocument();
 });
+
+it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", async () => {
+  const fullDocumentId = "11111111-1111-4111-8111-111111111111";
+  const iocDocumentId = "22222222-2222-4222-8222-222222222222";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "extraction-1",
+        stage: "extraction",
+        version: 1,
+        status: "verified",
+        metadata: {},
+        rendered_content: null,
+        canonical_content: {
+          schema_version: 1,
+          subject_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          production_input_hash: "a".repeat(64),
+          references_corpus_hash: "b".repeat(64),
+          profile_policy_version: "production-reference-tier-v1",
+          sources: [
+            {
+              source_document_id: fullDocumentId,
+              canonical_url: "https://vendor.example/report",
+              title: "Vendor threat report",
+              content_sha256: "c".repeat(64),
+              tier: "core",
+              kind: "publication",
+              role: "primary",
+              profile: "full",
+              checkpoint_id: "33333333-3333-4333-8333-333333333333",
+              reuse_state: "fresh",
+              facts: [
+                {
+                  category: "actor",
+                  value: "Cavern Manticore",
+                  context: "Le groupe conduit la campagne.",
+                  evidence_quote: "Cavern Manticore launched the campaign.",
+                  evidence_basis: "exact_quote",
+                },
+              ],
+              events: [
+                {
+                  event_date: "2026-08-20",
+                  date_text: "20 August 2026",
+                  text: "The campaign began.",
+                  context: "Première activité observée.",
+                  source_document_id: fullDocumentId,
+                  evidence_quote: "The campaign began on 20 August 2026.",
+                  evidence_basis: "date_and_event_quote",
+                },
+              ],
+              indicators: [],
+              rules: [],
+              uncertainties: [],
+            },
+            {
+              source_document_id: iocDocumentId,
+              canonical_url: "https://research.example/iocs",
+              title: "Research IOC note",
+              content_sha256: "d".repeat(64),
+              tier: "technical",
+              kind: "technical_resource",
+              role: "unknown",
+              profile: "ioc_rules",
+              checkpoint_id: "44444444-4444-4444-8444-444444444444",
+              reuse_state: "reused",
+              facts: [],
+              events: [],
+              indicators: [
+                {
+                  artifact_type: "domain",
+                  value: "c2.example",
+                  normalized_value: "c2.example",
+                  context: "Command and control domain.",
+                  evidence_quote: "C2 domain: c2.example",
+                  evidence_basis: "exact_quote",
+                },
+              ],
+              rules: [
+                {
+                  rule_type: "sigma",
+                  name: "Suspicious process launch",
+                  body: "title: Suspicious process launch\nlogsource:\n  product: windows",
+                  evidence_quote: "title: Suspicious process launch",
+                  evidence_basis: "published_rule_body",
+                },
+              ],
+              uncertainties: [
+                "Le domaine peut être partagé avec un autre outil.",
+              ],
+            },
+          ],
+          omitted_sources: [
+            {
+              canonical_url: "https://reports.example/unavailable",
+              title: "Unavailable report",
+              tier: "supporting",
+              collection_state: "unavailable",
+              reason: "reference_not_eligible",
+              source_document_id: null,
+            },
+          ],
+          warnings: ["Une source complémentaire a été omise."],
+        },
+      }),
+    ),
+  );
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  const { container } = render(
+    <QueryClientProvider client={client}>
+      <ProductionArtifactView subjectId="subject-1" stage="extraction" />
+    </QueryClientProvider>,
+  );
+
+  expect(
+    await screen.findByRole("heading", { name: "Sources FULL" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Sources IOC_RULES" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Vendor threat report" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Research IOC note" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Réutilisée")).toBeInTheDocument();
+  expect(screen.getByText("Calculée")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Sources omises / en erreur" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("reference_not_eligible")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Chronologie" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("The campaign began.")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Faits" })).toBeInTheDocument();
+  expect(
+    screen.getByText("Cavern Manticore", { exact: true }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "IOC / artefacts" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("c2.example")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Règles publiées" }),
+  ).toBeInTheDocument();
+  expect(container.querySelector("pre")).toHaveTextContent(
+    "title: Suspicious process launch",
+  );
+  expect(
+    screen.getByRole("heading", { name: "Incertitudes" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Le domaine peut être partagé avec un autre outil."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Warnings" })).toBeInTheDocument();
+  expect(
+    screen.getByText("Une source complémentaire a été omise."),
+  ).toBeInTheDocument();
+  expect(container.querySelector(".extraction-provenance")).toHaveTextContent(
+    fullDocumentId,
+  );
+  expect(
+    container.querySelector(".extraction-evidence-basis"),
+  ).toHaveTextContent("date_and_event_quote");
+  expect(screen.queryByText(/schema_version/)).not.toBeInTheDocument();
+});
