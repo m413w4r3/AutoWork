@@ -213,11 +213,11 @@ describe("PipelineTab manual source content", () => {
       vi.fn().mockResolvedValue(
         Response.json({
           ...production,
-          error_code: "q2_source_coverage_failed",
+          error_code: "extraction_core_source_failed",
           stages: {
             sources: {
               ...production.stages.sources,
-              error_code: "q2_source_coverage_failed",
+              error_code: "extraction_core_source_failed",
             },
           },
         }),

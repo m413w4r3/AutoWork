@@ -126,7 +126,7 @@ async def test_one_unreachable_core_source_does_not_stop_the_other(
     """A single dead publication must not cost the run its surviving source."""
     scenario = production_scenario_factory(_specs({S1: 200, S2: 404}))
     scenario.model.script.references(_references((S1,)))
-    scenario.model.script.q2(source_url=S1, access_mode="live_url", response=_q2(1))
+    scenario.model.script.q2(source_url=S1, response=_q2(1))
     scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
@@ -156,7 +156,7 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
     scenario.restrict_core_sources((S1,))
     # Q1 proposes both: S2 is only reachable through supplemental collection.
     scenario.model.script.references(_references((S1, S2)))
-    scenario.model.script.q2(source_url=S1, access_mode="live_url", response=_q2(1))
+    scenario.model.script.q2(source_url=S1, response=_q2(1))
     scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
@@ -186,7 +186,10 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     assert [url for call in q2_calls for url in call.source_urls] == [S1]
     assert persisted.extraction_progress is not None
-    assert {item["source_id"] for item in persisted.extraction_progress["sources"]} == {"S1"}
+    # The ineligible source stays visible without ever reaching the model.
+    assert {
+        item["canonical_url"]: item["status"] for item in persisted.extraction_progress["sources"]
+    } == {S1: "succeeded", S2: "omitted"}
     references = next(
         artifact for artifact in artifacts if artifact.stage is ProductionArtifactStage.REFERENCES
     )
@@ -210,7 +213,7 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     scenario = production_scenario_factory(_specs({S1: 200, S2: 503}))
     scenario.restrict_core_sources((S1,))
     scenario.model.script.references(_references((S1, S2)))
-    scenario.model.script.q2(source_url=S1, access_mode="live_url", response=_q2(1))
+    scenario.model.script.q2(source_url=S1, response=_q2(1))
     scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
@@ -227,4 +230,7 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     q2_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
     assert [url for call in q2_calls for url in call.source_urls] == [S1]
     assert persisted.extraction_progress is not None
-    assert {item["source_id"] for item in persisted.extraction_progress["sources"]} == {"S1"}
+    # The ineligible source stays visible without ever reaching the model.
+    assert {
+        item["canonical_url"]: item["status"] for item in persisted.extraction_progress["sources"]
+    } == {S1: "succeeded", S2: "omitted"}

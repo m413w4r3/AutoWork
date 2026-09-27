@@ -298,6 +298,70 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       });
       return;
     }
+    if (path === `/api/subjects/${subjectId}/production/artifacts/extraction`) {
+      await route.fulfill({
+        json: {
+          artifact_id: "extraction-artifact-1",
+          stage: "extraction",
+          version: 1,
+          status: "verified",
+          metadata: {},
+          rendered_content: null,
+          canonical_content: {
+            schema_version: 1,
+            subject_id: subjectId,
+            production_input_hash: hash,
+            references_corpus_hash: "b".repeat(64),
+            profile_policy_version: "production-reference-tier-v1",
+            sources: [
+              {
+                source_document_id: "12121212-1212-4212-8212-121212121212",
+                canonical_url: "https://vendor.example/iranian-proxy",
+                content_sha256: "c".repeat(64),
+                tier: "core",
+                kind: "publication",
+                role: "primary",
+                profile: "full",
+                checkpoint_id: "34343434-3434-4434-8434-343434343434",
+                reuse_state: "fresh",
+                facts: [
+                  {
+                    category: "actors",
+                    value: "Iranian Proxy",
+                    attack_id: null,
+                    context: "Campaign attribution.",
+                    evidence_quote: "Iranian Proxy conducted the campaign.",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [
+                      "12121212-1212-4212-8212-121212121212",
+                    ],
+                  },
+                ],
+                events: [
+                  {
+                    event_date: "2026-08-12",
+                    date_text: null,
+                    text: "The campaign was first observed.",
+                    context: "Initial activity.",
+                    evidence_quote: "First observed on 12 August 2026.",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [
+                      "12121212-1212-4212-8212-121212121212",
+                    ],
+                  },
+                ],
+                indicators: [],
+                rules: [],
+                uncertainties: [],
+              },
+            ],
+            omitted_sources: [],
+            warnings: [],
+          },
+        },
+      });
+      return;
+    }
     await route.fulfill({ status: 404, json: {} });
   });
 
@@ -391,5 +455,21 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     ]),
   );
   expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
+
+  // The canonical extraction artifact is rendered, not dumped as JSON.
+  await page.goto(`/subjects/${subjectId}/production/artifacts/extraction`);
+  await expect(
+    page.getByRole("heading", { name: "Sources FULL" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("link", { name: "https://vendor.example/iranian-proxy" })
+      .first(),
+  ).toBeVisible();
+  await expect(
+    page.getByText("The campaign was first observed."),
+  ).toBeVisible();
+  await expect(page.getByText(/schema_version/)).toHaveCount(0);
+
   expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

@@ -18,7 +18,7 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import technical_extraction_from_json
+from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
@@ -378,7 +378,7 @@ class EditionProductionCheckpointService:
                 raise
             publication, rendered = await self._optional_publication(run_id)
             sources, assets = await self._optional_asset_manifests(context.subject_id)
-            extraction = technical_extraction_from_json(
+            extraction = legacy_technical_extraction_from_payload(
                 state.artifacts.extraction.canonical_content
             )
             materialization = await self._materializer.materialize(

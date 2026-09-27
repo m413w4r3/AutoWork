@@ -23,6 +23,7 @@ adressés par SHA-256. Un workspace ou une conversation ne peut jamais être une
 | `edition_production_batches` | Lot explicite, état agrégé, clé d’idempotence (`UNIQUE(edition_id, idempotency_key)`) et empreinte du payload. |
 | `edition_production_batch_items` | Position de chaque sujet dans le lot et run exact qu’il pilote. |
 | `production_artifacts` | Résultats versionnés des étapes de production, référencés par hash. |
+| `source_extractions` | Checkpoints d’extraction adressés par contenu, indépendants du Subject et du run. |
 | `publication_manifests` | Ordre et artifacts exacts retenus pour une publication, append-only. |
 | `blobs` | Catalogue des objets MinIO, unicité par bucket logique et SHA-256. |
 
@@ -63,6 +64,27 @@ La pipeline d’un run est fixe : `SOURCES`, `REFERENCES`, `EXTRACTION`, `SYNTHE
 puis `READY`. Les états asynchrones vivent en PostgreSQL ; Redis ne transporte que les identifiants
 de jobs. L’annulation conserve l’historique, arrête les travaux non terminés et ne ferme pas
 l’édition.
+
+### Extraction : artifact borné et checkpoints source-level
+
+`production_artifacts` porte, pour l’étape `EXTRACTION`, un unique `canonical_blob_id` vers
+`ProductionExtractionV1`. PostgreSQL ne recopie ni les faits, ni les IOC, ni les règles, ni la
+chronologie : le metadata reste une projection bornée (compteurs `source_count`,
+`full_source_count`, `ioc_rules_source_count`, `reused_source_count`, `fresh_source_count`,
+`omitted_source_count`, `fact_count`, `event_count`, `indicator_count`, `rule_count`,
+`warning_count`, versions de contrat et de policy). Le `raw_blob_id` run-level reste vide : les
+sorties modèle brutes appartiennent aux checkpoints source-level, donc `model_run_id` n’est pas
+fixé sur l’artifact lorsqu’une extraction a nécessité plusieurs appels.
+
+`source_extractions` est un checkpoint content-addressed, indépendant du `Subject` et du
+`ProductionRun`. Son identité fonctionnelle
+(`uq_source_extractions_identity`) couvre `source_content_sha256`, `profile`, `contract_version`,
+`prompt_version`, `parser_version`, `verifier_version`, `source_text_contract_version`,
+`model_policy_version` et `routing_policy_version`. Même contenu et mêmes versions ⇒
+réutilisation sans appel modèle ; un contenu ou une version différent ⇒ nouveau checkpoint. Un
+checkpoint `IOC_RULES` ne satisfait jamais `FULL` ; la projection `FULL` → `IOC_RULES` reste
+déterministe. Deux URLs au contenu identique partagent un calcul mais conservent chacune leur
+entrée canonique et leur provenance.
 
 ## Blobs et workspaces
 

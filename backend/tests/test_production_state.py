@@ -1,3 +1,4 @@
+import hashlib
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -26,12 +27,27 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
+    DetectionRuleType,
     EditionProductionBatchItem,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
     ProductionRun,
     ProductionRunStatus,
+)
+from cti_app.domain.production_extraction import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionFactV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    ExtractionReuseState,
+    ExtractionRuleV1,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_from_json,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -40,6 +56,7 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
+from cti_app.domain.publication import ArtifactType
 from tools.production_state_checksum import canonical_checksum
 
 
@@ -570,3 +587,153 @@ async def test_import_rejects_oversized_snapshot_before_creating_a_run() -> None
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
         )
     assert exc_info.value.code == "production_state_too_large"
+
+
+def _v1_extraction_payload(subject_id: UUID) -> dict[str, Any]:
+    """One AW-011 canonical extraction, as EXTRACTION now persists it."""
+    document_id = uuid4()
+    checkpoint_id = uuid4()
+    rule_body = "rule Example { condition: true }"
+    return production_extraction_to_json(
+        ProductionExtractionV1(
+            schema_version=1,
+            subject_id=subject_id,
+            production_input_hash="a" * 64,
+            references_corpus_hash="b" * 64,
+            profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+            sources=(
+                ProductionSourceExtractionV1(
+                    source_document_id=document_id,
+                    canonical_url="https://example.test/source",
+                    content_sha256="c" * 64,
+                    tier=ProductionReferenceTier.CORE,
+                    kind=ProductionReferenceKind.PUBLICATION,
+                    role=SourceRole.PRIMARY,
+                    profile=ExtractionProfile.FULL,
+                    checkpoint_id=checkpoint_id,
+                    reuse_state=ExtractionReuseState.FRESH,
+                    facts=(
+                        ExtractionFactV1(
+                            category="malware",
+                            value="FooRAT",
+                            attack_id=None,
+                            context="",
+                            evidence_quote="FooRAT",
+                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                            source_document_ids=(document_id,),
+                        ),
+                    ),
+                    events=(),
+                    indicators=(
+                        ExtractionIndicatorV1(
+                            value="evil.example",
+                            artifact_type=ArtifactType.DOMAIN,
+                            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                            context="",
+                            evidence_quote="evil.example",
+                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                            source_document_ids=(document_id,),
+                        ),
+                    ),
+                    rules=(
+                        ExtractionRuleV1(
+                            rule_type=DetectionRuleType.YARA,
+                            name="Example",
+                            body=rule_body,
+                            sha256=hashlib.sha256(rule_body.encode()).hexdigest(),
+                            context="",
+                            evidence_quote=rule_body,
+                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                            source_document_ids=(document_id,),
+                        ),
+                    ),
+                    uncertainties=(),
+                ),
+            ),
+            omitted_sources=(),
+            warnings=(),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_extraction_exports_as_legacy_v4_and_import_never_promotes_it() -> None:
+    """AW-011: V4 keeps its legacy contract; nothing promotes legacy to V1."""
+    run = ProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        status=ProductionRunStatus.NEEDS_REVIEW,
+    )
+    store = _ExportStore()
+    references, _ = _corpus_state_artifacts(store, run_id=run.id, subject_id=run.subject_id)
+    v1_payload = _v1_extraction_payload(run.subject_id)
+    extraction = await store.store_stage_payloads(canonical=v1_payload)
+    synthesis = await store.store_stage_payloads(rendered="Fait [S1]")
+    artifacts = {
+        "references": references,
+        ProductionArtifactStage.EXTRACTION.value: ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash="b" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=extraction[1],
+        ),
+        ProductionArtifactStage.SYNTHESIS.value: ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=1,
+            input_hash="c" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+            rendered_blob_id=synthesis[2],
+        ),
+    }
+    snapshot = SimpleNamespace(
+        subject_title="Titre original",
+        subject_id=run.subject_id,
+        research_date=date(2026, 8, 26),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+    )
+    service = ProductionStateService(
+        cast(Any, lambda: _ExportUow(run, snapshot, artifacts)), cast(Any, store)
+    )
+
+    exported = await service.export_run_state(run.id)
+
+    content = exported.artifacts.extraction.canonical_content
+    # The V4 extraction contract is the legacy one, never the canonical blob.
+    assert "sources" not in content
+    assert "profile_policy_version" not in content
+    with pytest.raises(ValueError):
+        production_extraction_from_json(content)
+    legacy = technical_extraction_from_json(content)
+    assert {item.value for item in legacy.items} == {"FooRAT", "evil.example"}
+    assert legacy.rules[0].body == "rule Example { condition: true }"
+
+    # An external V4 payload that carries the canonical contract is validated
+    # through the projection and imported back as legacy: no promotion.
+    payload = exported.model_dump(mode="json")
+    payload["artifacts"]["extraction"]["canonical_content"] = v1_payload
+    payload["content_sha256"] = compute_production_state_checksum(
+        ProductionStateSnapshotV4.model_validate(payload)
+    )
+    _, uow, subject_id, edition_id = _import_service(None)
+    imported_service = ProductionStateService(cast(Any, _ImportFactory(uow)), cast(Any, store))
+    result = await imported_service.import_state(
+        subject_id=subject_id,
+        edition_id=edition_id,
+        payload=payload,
+    )
+
+    assert result.status == "needs_review"
+    imported_extraction = uow.production_artifacts.append.await_args_list[1].args[0]
+    imported_content = store.json[imported_extraction.canonical_blob_id]
+    assert "sources" not in imported_content
+    with pytest.raises(ValueError):
+        production_extraction_from_json(imported_content)
+    assert technical_extraction_from_json(imported_content).rules[0].body == (
+        "rule Example { condition: true }"
+    )

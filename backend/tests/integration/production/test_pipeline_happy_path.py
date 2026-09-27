@@ -100,12 +100,8 @@ async def _configured_scenario(
 ) -> ProductionScenario:
     scenario = factory(_sources())
     scenario.model.script.references(Q1_RESPONSE)
-    scenario.model.script.q2(
-        source_url=SOURCE_URLS[0], access_mode="live_url", response=Q2_CORE_RESPONSE
-    )
-    scenario.model.script.q2(
-        source_url=SOURCE_URLS[1], access_mode="live_url", response=Q2_SECONDARY_RESPONSE
-    )
+    scenario.model.script.q2(source_url=SOURCE_URLS[0], response=Q2_CORE_RESPONSE)
+    scenario.model.script.q2(source_url=SOURCE_URLS[1], response=Q2_SECONDARY_RESPONSE)
     scenario.model.script.synthesis(Q4_RESPONSE)
     return scenario
 
@@ -126,12 +122,12 @@ async def test_complete_production_pipeline_reaches_ready(
     assert run.reconciliation is None
     assert run.error_code is None
     assert run.extraction_progress is not None
-    completed_source_ids = {
-        source["source_id"]
+    completed_source_urls = {
+        source["canonical_url"]
         for source in run.extraction_progress["sources"]
         if source["status"] == "succeeded"
     }
-    assert completed_source_ids == {"S1", "S2"}
+    assert completed_source_urls == set(SOURCE_URLS)
     assert run.extraction_progress["skipped_sources"] == 0
     assert (
         ProductionRecoveryPolicyV1.disposition_for_run(run)
@@ -192,12 +188,14 @@ async def test_complete_production_pipeline_reaches_ready(
         ]
         == 0
     )
-    verification = by_stage[ProductionArtifactStage.EXTRACTION].metadata[
-        "deterministic_verification"
-    ]
-    assert set(verification["completed_source_ids"]) == {"S1", "S2"}
-    assert verification["failed_source_ids"] == []
-    assert verification["skipped_source_ids"] == []
+    extraction_metadata = by_stage[ProductionArtifactStage.EXTRACTION].metadata
+    assert extraction_metadata["source_count"] == 2
+    assert extraction_metadata["full_source_count"] == 2
+    assert extraction_metadata["fresh_source_count"] == 2
+    assert extraction_metadata["omitted_source_count"] == 0
+    # The run-level artifact names no single model run and keeps no RAW.
+    assert by_stage[ProductionArtifactStage.EXTRACTION].model_run_id is None
+    assert by_stage[ProductionArtifactStage.EXTRACTION].raw_blob_id is None
 
     blob_ids = {
         blob_id
@@ -227,7 +225,8 @@ async def test_complete_production_pipeline_reaches_ready(
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
     assert len(model_calls) == 2 + len(q2_calls)
-    assert all(call.web_search for call in model_calls)
+    # Extraction analyses the archived capture and never searches the web.
+    assert all(call.web_search is (call.stage != "extraction") for call in model_calls)
     assert model_calls[0].conversation_id is None
     assert model_calls[-1].conversation_id is not None
     assert all(call.conversation_id is None for call in q2_calls)
@@ -261,21 +260,23 @@ async def test_complete_production_pipeline_reaches_ready(
     assert {source["canonical_url"] for source in references_payload["sources"]} == set(SOURCE_URLS)
     # Canonical V1 stores corpus source metadata, not legacy Markdown local IDs.
     reference_source_ids = {"S1", "S2"}
-    extraction_items = extraction_payload["items"]
-    assert any(item["value"] == "core-c2.security-lab.io" for item in extraction_items), (
-        extraction_items
-    )
-    assert any(item["value"] == "secondary-c2.security-lab.io" for item in extraction_items), (
-        extraction_items
-    )
-    assert any(
-        item["value"] == "secondary-c2.security-lab.io" and item["indicator_status"] == "contextual"
-        for item in extraction_items
-    )
-    q2_model_run_ids = {str(call.model_run_id) for call in q2_calls}
-    assert {
-        model_run_id for item in extraction_items for model_run_id in item["model_run_ids"]
-    } == q2_model_run_ids
+    indicators = {
+        indicator["value"]: indicator
+        for source in extraction_payload["sources"]
+        for indicator in source["indicators"]
+    }
+    assert indicators["core-c2.security-lab.io"]["indicator_status"] == "confirmed_ioc"
+    assert indicators["secondary-c2.security-lab.io"]["indicator_status"] == "contextual"
+    assert all(indicator["evidence_quote"] for indicator in indicators.values())
+    # Model provenance is source-level: each source names its checkpoint, whose
+    # ModelRun is one of the extraction calls.
+    async with scenario.uow_factory() as uow:
+        checkpoint_runs = set()
+        for source in extraction_payload["sources"]:
+            rows = await uow.source_extractions.list_for_url(source["canonical_url"])
+            row = next(row for row in rows if str(row.id) == source["checkpoint_id"])
+            checkpoint_runs.add(row.model_run_id)
+    assert checkpoint_runs == {call.model_run_id for call in q2_calls}
     assert "core-c2.security-lab.io" in synthesis_text
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)
@@ -284,11 +285,9 @@ async def test_complete_production_pipeline_reaches_ready(
         source["source_id"] for source in publication_payload["sources"]
     } == reference_source_ids
     extraction_indicator_values = {
-        item["value"]
-        for item in extraction_items
-        if item["artifact_type"] is not None
-        and item["indicator_status"] == "confirmed_ioc"
-        and item["display_policy"] in {"ioc_section", "both"}
+        value
+        for value, indicator in indicators.items()
+        if indicator["indicator_status"] == "confirmed_ioc"
     }
     publication_indicator_values = {
         value["value"] for group in publication_payload["indicators"] for value in group["values"]
@@ -315,7 +314,6 @@ async def test_invalid_q2_response_cannot_reach_ready(
     for source_url in SOURCE_URLS:
         scenario.model.script.q2(
             source_url=source_url,
-            access_mode="live_url",
             response="not a Q2 response",
         )
 
@@ -325,7 +323,9 @@ async def test_invalid_q2_response_cannot_reach_ready(
     assert run.status is not ProductionRunStatus.READY
     assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert run.current_stage is ProductionStage.EXTRACTION
-    assert run.error_code == "q2_source_coverage_failed"
+    assert run.error_code == "extraction_core_source_failed"
+    assert run.error_details is not None
+    assert run.error_details["source_failure_code"] == "extraction_source_output_invalid"
     assert run.reconciliation is None
     assert scenario.model.calls[-1].stage == "extraction"
     assert not any(call.stage == "synthesis" for call in scenario.model.calls)

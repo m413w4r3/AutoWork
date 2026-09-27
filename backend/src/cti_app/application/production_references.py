@@ -491,6 +491,15 @@ def load_legacy_reference_report(
     return reconcile_reference_report_with_archives(report, eligible_urls).report
 
 
+def report_source_labels(report: ReferenceReport) -> dict[str, str]:
+    """Map each legacy REFERENCES source's canonical URL to its label ("S1").
+
+    TODO AW-012/AW-013: lets the extraction compatibility projection speak the
+    labels the legacy Synthesis/QA/Assembly consumers correlate with.
+    """
+    return {source.canonical_url: source.local_id for source in report.sources}
+
+
 def legacy_reference_source_labels(raw_text: str, research_date: date) -> dict[str, str]:
     """Map each RAW SOURCE block's canonical URL to its wire label ("S1").
 

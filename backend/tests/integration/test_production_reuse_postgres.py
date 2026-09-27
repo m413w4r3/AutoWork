@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import zipfile
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -31,13 +33,19 @@ from cti_app.application.model_gateway import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import (
+    extraction_input_hash,
+    project_legacy_technical_extraction,
+    references_corpus_hash,
+)
 from cti_app.application.production_parsers import (
-    ParsedEvent,
-    ParsedSource,
-    ReferenceReport,
-    TechnicalExtraction,
+    Q2FactProposal,
+    Q2SourceOutput,
     reference_report_to_json,
-    technical_extraction_to_json,
+)
+from cti_app.application.production_references import (
+    load_legacy_reference_report,
+    production_reference_corpus_to_json,
 )
 from cti_app.application.production_stages import (
     PublicationAssemblyService,
@@ -45,7 +53,6 @@ from cti_app.application.production_stages import (
 )
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
-    _extraction_input_hash,
     _references_input_hash,
     _synthesis_input_hash,
 )
@@ -85,14 +92,32 @@ from cti_app.domain.model_runs import (
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionInputSnapshot,
     ProductionReuseInvalidation,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SourceExtraction,
+    SourceExtractionStatus,
+)
+from cti_app.domain.production_extraction import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_to_json,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 from cti_app.domain.selection import (
     SelectionAction,
@@ -106,21 +131,106 @@ from tests.discovery_support import make_discovery_run_for_edition
 pytestmark = pytest.mark.integration
 
 
+def _source_identity(extraction: SourceExtraction) -> dict[str, str]:
+    return {
+        "source_content_sha256": extraction.source_content_sha256,
+        "profile": extraction.profile.value,
+        "contract_version": extraction.contract_version,
+        "prompt_version": extraction.prompt_version,
+        "parser_version": extraction.parser_version,
+        "verifier_version": extraction.verifier_version,
+        "source_text_contract_version": extraction.source_text_contract_version,
+        "model_policy_version": extraction.model_policy_version,
+        "routing_policy_version": extraction.routing_policy_version,
+    }
+
+
+@pytest.mark.asyncio
+async def test_source_extraction_checkpoint_identity_is_durable(
+    uow_factory: UnitOfWorkFactory,
+) -> None:
+    source = SourceExtraction(
+        canonical_url="https://example.test/first",
+        source_content_sha256="a" * 64,
+        profile=ExtractionProfile.FULL,
+        contract_version="contract-v1",
+        prompt_version="prompt-v1",
+        parser_version="parser-v1",
+        verifier_version="verifier-v1",
+        source_text_contract_version="text-v1",
+        model_policy_version="model-v1",
+        routing_policy_version="routing-v1",
+        status=SourceExtractionStatus.VERIFIED,
+    )
+    async with uow_factory() as uow:
+        assert await uow.source_extractions.claim(source)
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        found = await uow.source_extractions.get_by_identity(**_source_identity(source))
+        assert found == source
+        # A second URL with identical bytes and policy reuses this checkpoint.
+        duplicate_url = replace(source, id=uuid4(), canonical_url="https://example.test/second")
+        assert not await uow.source_extractions.claim(duplicate_url)
+        assert (
+            await uow.source_extractions.get_by_identity(**_source_identity(duplicate_url))
+        ) == source
+
+    changes: dict[str, str | ExtractionProfile] = {
+        "source_content_sha256": "b" * 64,
+        "profile": ExtractionProfile.IOC_RULES,
+        "contract_version": "contract-v2",
+        "prompt_version": "prompt-v2",
+        "parser_version": "parser-v2",
+        "verifier_version": "verifier-v2",
+        "source_text_contract_version": "text-v2",
+        "model_policy_version": "model-v2",
+        "routing_policy_version": "routing-v2",
+    }
+    for field_name, value in changes.items():
+        changed = replace(source, id=uuid4(), **{field_name: value})
+        async with uow_factory() as uow:
+            assert await uow.source_extractions.get_by_identity(**_source_identity(changed)) is None
+            assert await uow.source_extractions.claim(changed)
+            await uow.commit()
+        async with uow_factory() as uow:
+            found = await uow.source_extractions.get_by_identity(**_source_identity(changed))
+            assert found == changed
+
+    # The weaker IOC_RULES profile cannot satisfy a FULL lookup.
+    ioc = replace(
+        source,
+        id=uuid4(),
+        source_content_sha256="c" * 64,
+        profile=ExtractionProfile.IOC_RULES,
+    )
+    async with uow_factory() as uow:
+        assert await uow.source_extractions.claim(ioc)
+        await uow.commit()
+    async with uow_factory() as uow:
+        found = await uow.source_extractions.get_by_identity(
+            **{**_source_identity(ioc), "profile": ExtractionProfile.FULL.value}
+        )
+        assert found is None
+
+
 class _CountingRetryModelAdapter:
     """A deterministic bridge-shaped adapter for the real retry workflow."""
 
     provider = ModelProvider.OPENAI
     backend = ModelBackend.CHATGPT_BRIDGE
     transport = ModelTransport.OPENAI_RESPONSES
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
+    capabilities = ModelCapabilities(
+        web_search=True, background=True, conversation=True, structured_output=True
+    )
     requested_model = "fake-production-retry"
     is_external = False
 
     def __init__(self) -> None:
         self.calls: list[SafeModelRequest] = []
-        self._extraction_text = """FACT actors
-- Example actor :: The selected campaign
-"""
+        self._extraction_text = Q2SourceOutput(
+            facts=[Q2FactProposal(category="actors", value="Example actor")]
+        ).model_dump_json()
         self._synthesis_text = "The selected campaign was reported [S1]."
 
     async def invoke(
@@ -132,7 +242,11 @@ class _CountingRetryModelAdapter:
     ) -> AdapterResult:
         del output_schema
         self.calls.append(request)
-        output_text = self._extraction_text if role is ModelRole.RESEARCH else self._synthesis_text
+        output_text = (
+            self._extraction_text
+            if role is ModelRole.STRUCTURED_EXTRACTION
+            else self._synthesis_text
+        )
         conversation = request.conversation
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
@@ -465,6 +579,133 @@ async def _prepare_reusable_article(
     return batch, source
 
 
+async def _store_canonical_first_pass(
+    store: ProductionArtifactStore,
+    *,
+    snapshot: ProductionInputSnapshot,
+    subject: Subject,
+    source: SourceCandidate,
+    event_text: str,
+    document_id: UUID | None = None,
+    content_sha256: str = "d" * 64,
+) -> SimpleNamespace:
+    """Persist the REFERENCES and EXTRACTION payloads of one canonical first pass.
+
+    REFERENCES is the AW-010 corpus plus its Q1 RAW; EXTRACTION is the AW-011
+    ``ProductionExtractionV1``.  The returned hashes are the exact functional
+    identities the orchestrator recomputes for a second run.
+    """
+    published_at = source.published_at or date(2026, 8, 5)
+    raw = "\n".join(
+        (
+            "# REFERENCES",
+            "",
+            "## SOURCE S1",
+            f"title: {source.title}",
+            f"url: {source.canonical_url}",
+            f"publisher: {source.publisher}",
+            f"published-at: {published_at.isoformat()}",
+            f"role: {source.role.value}",
+            "kind: publication",
+            "reason: Selected publication",
+            "",
+            "## EVENT R1",
+            "date: 2026-08-05",
+            "sources: S1",
+            f"text: {event_text}",
+        )
+    )
+    document_id = document_id or uuid4()
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject.id,
+        research_date=snapshot.research_date,
+        production_input_hash=snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url=source.canonical_url,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=source.role,
+                title=source.title,
+                publisher=source.publisher,
+                published_at=published_at,
+                source_collection_id=None,
+                source_document_id=document_id,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=content_sha256,
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+            ),
+        ),
+        warnings=(),
+    )
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=subject.id,
+        production_input_hash=snapshot.input_hash,
+        references_corpus_hash=references_corpus_hash(corpus),
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=document_id,
+                canonical_url=source.canonical_url,
+                content_sha256=content_sha256,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=source.role,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=None,
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(),
+        warnings=(),
+    )
+    report = load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
+    legacy = project_legacy_technical_extraction(extraction)
+    refs_hash = _references_input_hash(snapshot=snapshot, research_date=snapshot.research_date)
+    synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
+        report, legacy, {source.canonical_url: "core"}
+    )
+    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
+    # the orchestrator feeds the pack hash into every extraction slot so a
+    # non-semantic Q2 replay cannot manufacture a second synthesis call.
+    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
+    refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
+        raw=raw, canonical=production_reference_corpus_to_json(corpus)
+    )
+    _, extraction_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_extraction_to_json(extraction)
+    )
+    return SimpleNamespace(
+        refs_hash=refs_hash,
+        refs_raw_id=refs_raw_id,
+        refs_blob_id=refs_blob_id,
+        extraction_hash=extraction_input_hash(
+            references_corpus_hash=references_corpus_hash(corpus)
+        ),
+        extraction_blob_id=extraction_blob_id,
+        synthesis_hash=_synthesis_input_hash(
+            subject_id=subject.id,
+            references_hash=refs_hash,
+            reference_report_hash=compute_input_hash(reference_report_to_json(report)),
+            extraction_hash=semantic_synthesis_hash,
+            technical_extraction_hash=semantic_synthesis_hash,
+            synthesis_evidence_pack_hash=semantic_synthesis_hash,
+            current_synthesis_semantic_hash=semantic_synthesis_hash,
+        ),
+    )
+
+
 async def _seed_reusable_article(
     uow_factory: UnitOfWorkFactory,
     store: ProductionArtifactStore,
@@ -494,63 +735,18 @@ async def _seed_reusable_article(
         snapshot = await uow.production_input_snapshots.get_by_run(source_run.id)
     assert snapshot is not None
 
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title=source.title,
-                url=source.canonical_url,
-                canonical_url=source.canonical_url,
-                publisher=source.publisher,
-                published_at=source.published_at,
-                role=source.role,
-            ),
-        ),
-        events=(
-            ParsedEvent(
-                local_id="R1",
-                event_date=date(2026, 8, 5),
-                source_ids=("S1",),
-                text=f"{title} was reported.",
-            ),
-        ),
-    )
-    extraction = TechnicalExtraction(items=())
-    refs_hash = _references_input_hash(
+    first_pass = await _store_canonical_first_pass(
+        store,
         snapshot=snapshot,
-        research_date=snapshot.research_date,
+        subject=subject,
+        source=source,
+        event_text=f"{title} was reported.",
     )
-    refs_payload = reference_report_to_json(report)
-    extraction_payload = technical_extraction_to_json(extraction)
-    extraction_hash = _extraction_input_hash(
-        subject_id=subject.id,
-        references_hash=refs_hash,
-        source_urls=[source.canonical_url],
-        references_payload_hash=compute_input_hash(refs_payload),
-    )
-    synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
-        report, extraction, {source.canonical_url: "core"}
-    )
-    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
-    # the orchestrator feeds the pack hash into every extraction slot so a
-    # non-semantic Q2 replay cannot manufacture a second synthesis call.
-    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
-    synthesis_hash = _synthesis_input_hash(
-        subject_id=subject.id,
-        references_hash=refs_hash,
-        reference_report_hash=compute_input_hash(refs_payload),
-        extraction_hash=semantic_synthesis_hash,
-        technical_extraction_hash=semantic_synthesis_hash,
-        synthesis_evidence_pack_hash=semantic_synthesis_hash,
-        current_synthesis_semantic_hash=semantic_synthesis_hash,
-    )
-
-    refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
-        raw=f"{title} references", canonical=refs_payload
-    )
-    extraction_raw_id, extraction_blob_id, _ = await store.store_stage_payloads(
-        raw=f"{title} extraction", canonical=extraction_payload
-    )
+    refs_hash = first_pass.refs_hash
+    extraction_hash = first_pass.extraction_hash
+    synthesis_hash = first_pass.synthesis_hash
+    refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
+    extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
     _, _, synthesis_blob_id = await store.store_stage_payloads(
         raw=f"{title} synthesis", rendered=f"{title} was reported [S1]."
     )
@@ -804,7 +1000,9 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     # The retry extraction is deliberately live-model based, but its
     # structured output must still be checked against the exact archived
     # decoded bytes for this source.
-    archived_content = b"archived source evidence"
+    # Unique bytes: source checkpoints are content-addressed and shared by the
+    # session-scoped integration database.
+    archived_content = f"Example actor archived source evidence {uuid4().hex}".encode()
     raw_blob = await catalog.ingest(
         BytesIO(archived_content),
         logical_bucket="source-raw",
@@ -867,63 +1065,20 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         snapshot_a = await uow.production_input_snapshots.get_by_run(run_a.id)
     assert snapshot_a is not None
 
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title=source.title,
-                url=source.canonical_url,
-                canonical_url=source.canonical_url,
-                publisher=source.publisher,
-                published_at=source.published_at,
-                role=source.role,
-            ),
-        ),
-        events=(
-            ParsedEvent(
-                local_id="R1",
-                event_date=date(2026, 8, 5),
-                source_ids=("S1",),
-                text="The selected campaign was reported.",
-            ),
-        ),
-    )
-    extraction = TechnicalExtraction(items=())
-    refs_hash = _references_input_hash(
+    first_pass = await _store_canonical_first_pass(
+        store,
         snapshot=snapshot_a,
-        research_date=snapshot_a.research_date,
+        subject=subject,
+        source=source,
+        event_text="The selected campaign was reported.",
+        document_id=source_document.id,
+        content_sha256=source_document.decoded_sha256,
     )
-    refs_payload = reference_report_to_json(report)
-    extraction_payload = technical_extraction_to_json(extraction)
-    extraction_hash = _extraction_input_hash(
-        subject_id=subject.id,
-        references_hash=refs_hash,
-        source_urls=[source.canonical_url],
-        references_payload_hash=compute_input_hash(refs_payload),
-    )
-    synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
-        report, extraction, {source.canonical_url: "core"}
-    )
-    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
-    # the orchestrator feeds the pack hash into every extraction slot so a
-    # non-semantic Q2 replay cannot manufacture a second synthesis call.
-    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
-    synthesis_hash = _synthesis_input_hash(
-        subject_id=subject.id,
-        references_hash=refs_hash,
-        reference_report_hash=compute_input_hash(refs_payload),
-        extraction_hash=semantic_synthesis_hash,
-        technical_extraction_hash=semantic_synthesis_hash,
-        synthesis_evidence_pack_hash=semantic_synthesis_hash,
-        current_synthesis_semantic_hash=semantic_synthesis_hash,
-    )
-
-    refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
-        raw="references A", canonical=refs_payload
-    )
-    extraction_raw_id, extraction_blob_id, _ = await store.store_stage_payloads(
-        raw="extraction A", canonical=extraction_payload
-    )
+    refs_hash = first_pass.refs_hash
+    extraction_hash = first_pass.extraction_hash
+    synthesis_hash = first_pass.synthesis_hash
+    refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
+    extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
     _, _, synthesis_blob_id = await store.store_stage_payloads(
         raw="synthesis A", rendered="The selected campaign was reported [S1]."
     )

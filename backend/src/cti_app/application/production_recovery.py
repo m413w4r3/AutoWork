@@ -5,7 +5,6 @@ from __future__ import annotations
 from enum import StrEnum
 
 from cti_app.domain.production import (
-    PRODUCTION_RECONCILIATION_ERROR_CODE,
     EditionProductionBatchItem,
     ProductionRun,
     ProductionRunStatus,
@@ -19,14 +18,6 @@ class ProductionRecoveryDisposition(StrEnum):
 
 class ProductionRecoveryPolicyV1:
     """Allow exactly one automatic retry for known operational failures."""
-
-    Q2_SOURCE_COVERAGE_ERROR_CODE = "q2_source_coverage_failed"
-    _Q2_UNSAFE_FAILURE_CLASSES = frozenset(
-        {
-            "reconciliation_required",
-            "control_invariant_failure",
-        }
-    )
 
     MANUAL_ONLY_ERROR_CODES = frozenset(
         {
@@ -75,25 +66,13 @@ class ProductionRecoveryPolicyV1:
 
     @classmethod
     def disposition_for_run(cls, run: ProductionRun) -> ProductionRecoveryDisposition:
-        """Return the recovery disposition without losing run-local details."""
-        if run.error_code == cls.Q2_SOURCE_COVERAGE_ERROR_CODE:
-            if run.reconciliation is not None:
-                return cls.MANUAL_ONLY
-            return cls.AUTO if cls._all_q2_blocking_failures_retryable(run) else cls.MANUAL_ONLY
-        # A transient transport error can be the aggregate code after a Q2
-        # batch/attempt stopped early.  In that shape the aggregate code alone
-        # would incorrectly hide a terminal source failure from the policy.
-        # Once source-local failures are present, every blocking one must be
-        # explicitly retryable before the batch may open a new generation.
-        details = run.error_details
-        source_failures = details.get("source_failures") if isinstance(details, dict) else None
-        has_blocking_failure = isinstance(source_failures, dict) and any(
-            not isinstance(failure, dict)
-            or failure.get("contributes_to_coverage", True) is not False
-            for failure in source_failures.values()
-        )
-        if has_blocking_failure:
-            return cls.AUTO if cls._all_q2_blocking_failures_retryable(run) else cls.MANUAL_ONLY
+        """Return the recovery disposition of a stopped run.
+
+        A run awaiting reconciliation is never replayed automatically, whatever
+        the code it stopped with.
+        """
+        if run.reconciliation is not None:
+            return cls.MANUAL_ONLY
         return cls.disposition(run.error_code)
 
     @classmethod
@@ -108,49 +87,6 @@ class ProductionRecoveryPolicyV1:
             and run.current_stage is not None
             and cls.disposition_for_run(run) is cls.AUTO
         )
-
-    @classmethod
-    def _all_q2_blocking_failures_retryable(cls, run: ProductionRun) -> bool:
-        details = run.error_details
-        if not isinstance(details, dict):
-            return False
-
-        failures = details.get("source_failures")
-        if not isinstance(failures, dict) or not failures:
-            return False
-
-        blocking: list[dict[object, object]] = []
-        for failure in failures.values():
-            if not isinstance(failure, dict):
-                return False
-
-            failure_class = failure.get("failure_class")
-            if failure_class is not None:
-                if not isinstance(failure_class, str):
-                    return False
-                if failure_class in cls._Q2_UNSAFE_FAILURE_CLASSES:
-                    return False
-            if (
-                failure.get("error_code") == PRODUCTION_RECONCILIATION_ERROR_CODE
-                or failure.get("phase") == "reconciliation"
-            ):
-                return False
-
-            retryable = failure.get("retryable")
-            if retryable is not True and retryable is not False:
-                return False
-
-            contributes_to_coverage = failure.get("contributes_to_coverage", True)
-            if not isinstance(contributes_to_coverage, bool):
-                return False
-            if contributes_to_coverage is False:
-                continue
-            blocking.append(failure)
-
-        if not blocking:
-            return False
-
-        return all(failure.get("retryable") is True for failure in blocking)
 
     @classmethod
     def eligible(cls, item: EditionProductionBatchItem, run: ProductionRun) -> bool:

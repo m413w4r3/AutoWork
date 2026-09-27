@@ -24,7 +24,7 @@ from uuid import UUID
 from cti_app.application.edition_workspace import detection_rule_filename
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import technical_extraction_from_json
+from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     DetectionRule,
@@ -124,7 +124,7 @@ class EditionRuleArchiveService:
         try:
             document = await self._artifact_store.read_json(publication.canonical_blob_id)
             payload = await self._artifact_store.read_json(extraction.canonical_blob_id)
-            rules = technical_extraction_from_json(payload).rules
+            rules = legacy_technical_extraction_from_payload(payload).rules
         except (KeyError, TypeError, ValueError) as exc:
             raise EditionRuleArchiveError("extraction_document_invalid") from exc
 

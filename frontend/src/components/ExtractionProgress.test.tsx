@@ -4,20 +4,22 @@ import { describe, expect, it } from "vitest";
 import type { ExtractionProgress } from "../api/production";
 import { ExtractionProgressView } from "./ExtractionProgress";
 
-function progress(
-  sources: ExtractionProgress["sources"],
-  overrides: Partial<ExtractionProgress> = {},
-): ExtractionProgress {
+type ProgressSource = ExtractionProgress["sources"][number];
+
+function progress(sources: ProgressSource[]): ExtractionProgress {
   return {
     total_sources: sources.length,
-    completed_sources: 0,
+    completed_sources: sources.filter(
+      (source) => source.status === "cached" || source.status === "succeeded",
+    ).length,
     full_total: sources.filter((source) => source.profile === "full").length,
     full_completed: 0,
     ioc_rules_total: sources.filter((source) => source.profile === "ioc_rules")
       .length,
     ioc_rules_completed: 0,
     cache_hits: 0,
-    model_calls: 0,
+    model_calls: 1,
+    skipped_sources: 0,
     confirmed_iocs: 0,
     contextual_iocs: 0,
     rules_total: 0,
@@ -25,101 +27,90 @@ function progress(
     sigma_rules: 0,
     suricata_rules: 0,
     snort_rules: 0,
-    active_source_id: null,
-    active_source_title: null,
-    active_profile: null,
     sources,
-    ...overrides,
   };
 }
 
 function source(
-  source_id: string,
-  extra: Partial<ExtractionProgress["sources"][number]> = {},
-): ExtractionProgress["sources"][number] {
+  url: string,
+  extra: Partial<ProgressSource> = {},
+): ProgressSource {
   return {
-    source_id,
-    title: `Titre ${source_id}`,
-    profile: "ioc_rules",
+    source_id: url,
+    title: null,
+    canonical_url: url,
+    tier: "core",
+    profile: "full",
     status: "pending",
+    reuse_state: null,
     ioc_count: 0,
     rule_count: 0,
     ...extra,
   };
 }
 
-function sourceRow(source_id: string): HTMLElement {
+function sourceRow(text: string): HTMLElement {
   const list = screen.getByLabelText("Sources de l’extraction");
   const row = within(list)
     .getAllByRole("listitem")
-    .find((item) => item.textContent?.includes(source_id));
-  if (!row) throw new Error(`no row for ${source_id}`);
+    .find((item) => item.textContent?.includes(text));
+  if (!row) throw new Error(`no row for ${text}`);
   return row;
 }
 
 describe("ExtractionProgressView", () => {
-  it("explique pourquoi chaque source est lue ou réutilisée", () => {
-    render(
-      <ExtractionProgressView
-        progress={progress(
-          [
-            source("S1", {
-              status: "pending",
-              plan_disposition: "extract_individual",
-              plan_reason: "no_checkpoint",
-            }),
-            source("S2", {
-              status: "cached",
-              plan_disposition: "reused",
-              plan_reason: "reusable_checkpoint",
-            }),
-            source("S3", {
-              status: "pending",
-              plan_disposition: "extract_batched",
-              plan_reason: "source_content_changed",
-            }),
-          ],
-          { planned_model_calls: 2, planned_reuses: 1 },
-        )}
-      />,
-    );
-
-    expect(sourceRow("S1")).toHaveTextContent("aucun résultat réutilisable");
-    expect(sourceRow("S2")).toHaveTextContent("résultat existant réutilisé");
-    expect(sourceRow("S3")).toHaveTextContent("contenu réarchivé différent");
-    // Le coût prévu est lisible avant que le moindre appel soit émis.
-    expect(
-      screen.getByText(/Plan : 2 appels prévus · 1 source réutilisée/),
-    ).toBeInTheDocument();
-  });
-
-  it("nomme la source primaire d’un doublon de contenu", () => {
+  it("montre le tier, le profil et le verdict canonique de chaque source", () => {
     render(
       <ExtractionProgressView
         progress={progress([
-          source("S4", {
+          source("https://core.example/a", {
+            title: "Rapport CORE",
+            status: "succeeded",
+            reuse_state: "fresh",
+          }),
+          source("https://support.example/b", {
+            tier: "supporting",
+            profile: "ioc_rules",
             status: "cached",
-            plan_disposition: "content_duplicate",
-            plan_reason: "same_content_as_primary_source",
-            plan_primary_source_id: "S1",
+            reuse_state: "content_duplicate",
+          }),
+          source("https://tech.example/c", {
+            tier: "technical",
+            profile: null,
+            status: "omitted",
           }),
         ])}
       />,
     );
 
-    expect(sourceRow("S4")).toHaveTextContent(
-      "contenu identique à une autre source (S1)",
+    expect(sourceRow("Rapport CORE")).toHaveTextContent("CORE · FULL");
+    expect(sourceRow("Rapport CORE")).toHaveTextContent("Terminé");
+    expect(sourceRow("https://support.example/b")).toHaveTextContent(
+      "Complémentaire · IOC uniquement",
     );
+    expect(sourceRow("https://support.example/b")).toHaveTextContent(
+      "contenu identique à une autre source",
+    );
+    // A source the corpus left out keeps its line, without any profile.
+    expect(sourceRow("https://tech.example/c")).toHaveTextContent(
+      "Non éligible dans le corpus",
+    );
+    expect(sourceRow("https://tech.example/c")).not.toHaveTextContent("FULL");
   });
 
-  it("reste inchangé quand le backend n’a pas encore publié de plan", () => {
+  it("résume le coût modèle et les résultats réutilisés", () => {
     render(
       <ExtractionProgressView
-        progress={progress([source("S1", { status: "pending" })])}
+        progress={{
+          ...progress([source("https://core.example/a", { status: "cached" })]),
+          cache_hits: 1,
+          model_calls: 0,
+        }}
       />,
     );
 
-    expect(sourceRow("S1")).toHaveTextContent("En attente");
-    expect(screen.queryByText(/Plan :/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText("Résultats existants : 1 · Appels modèle : 0"),
+    ).toBeInTheDocument();
   });
 });

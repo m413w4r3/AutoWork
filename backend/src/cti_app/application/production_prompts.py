@@ -11,176 +11,64 @@ from cti_app.application.production_synthesis_revision import (
 from cti_app.domain.production import ExtractionProfile
 
 REFERENCES_PROMPT_VERSION = "7"
-# Q2 uses free-text GPT plus a stateless Markdown wire-format parser. The bridge does
-# not guarantee response_format / JSON Schema.
-# "18" / "11": Q2 analyses the live publication behind the exact canonical URL,
-# including its rendered tables, code and visible images. The local archive is
-# collection provenance and is never inlined in the prompt. Extraction is now
-# bounded by the requested Subject: exhaustiveness applies to subject-relevant
-# IOCs/rules, not to every indicator visible in a multi-actor publication.
-EXTRACTION_PROMPT_VERSION = "18"
-IOC_RULES_PROMPT_VERSION = "11"
-# Archive fallback is a separate access contract. The profile-specific Q2
-# contract remains the same; only the source-access block and its identity
-# change.
-ARCHIVED_SOURCE_ACCESS_VERSION = "1"
-ARCHIVE_FALLBACK_PROMPT_VERSION = "1"
-# "10": the batch input is the compact list of exact source URLs plus the single
-# shared Subject. Only the output stays marker-framed: a marker starts the next
-# block; EOF closes the final block.
-IOC_RULES_BATCH_PROMPT_VERSION = "10"
-EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
-    ExtractionProfile.FULL: EXTRACTION_PROMPT_VERSION,
-    ExtractionProfile.IOC_RULES: IOC_RULES_PROMPT_VERSION,
+
+# AW-011 canonical extraction. The archived document is the only source
+# material: each prompt is a pure function of that capture and of the requested
+# profile, carrying no Subject, run, job, URL or document identity, so one
+# content/profile checkpoint stays valid across runs and Subjects. The versions
+# are distinct so a single-source and a batch answer never share a checkpoint.
+CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v1"
+CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v1"
+CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v1"
+CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
+    ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
+    ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,
 }
+
 SYNTHESIS_PROMPT_VERSION = "8"
 SYNTHESIS_FORMAT_REPAIR_VERSION = "5"
 
 
-_Q2_WIRE_FORMAT = """FACT <category>
-- <value>
-- <value> :: <short context>
+# AW-011 canonical extraction writes one structured Q2SourceOutput object. The
+# semantic contract is shared by the single-source and batch prompts so every
+# archive-backed path produces the same canonical contract.
+_Q2_CANONICAL_RULES = """- Emit only values literally present in the archived capture, exactly as
+  published. Never import a value from a linked resource, from another capture
+  of the batch or from memory, and never translate, refang or reformat it.
+  Keep IPv6 literals intact.
+- `evidence_quote` is copied from the archived capture that supports the
+  proposal.
+- Never let the failure of one section suppress the others. Use empty lists
+  when the capture genuinely contains nothing for a section."""
 
-IOC <confirmed|contextual> <type>
-- <value>
+_Q2_CANONICAL_ARTIFACTS_AND_RULES = """- `artifacts`: every technical value literally published in the capture:
+  domain, ip, url, email, hash, filename, filepath or cve. `indicator_status`
+  is `confirmed_ioc` when the capture presents the value as an IOC or as
+  malicious infrastructure of the described activity, `contextual` when the
+  value is technically relevant without being published as an IOC, and
+  `excluded` for placeholders, examples, redactions or masked values.
+- `rules`: complete literal detection rules published in the capture (yara,
+  sigma, suricata, snort). Preserve the literal body, its syntax and its
+  visible line breaks. Never invent, repair, complete, refang, reformat,
+  flatten or merge a rule; report an incomplete rule under `uncertainties`
+  instead.
+- `uncertainties`: the unresolved points of the capture."""
 
-RULE <yara|sigma|suricata|snort>[: <visible name>]
-```<language>
-<literal body>
-```
+_Q2_CANONICAL_OUTPUT_PREAMBLE = """**Output contract** — answer with a single structured object matching the
+supplied schema and nothing else. Do not wrap it in Markdown and do not add
+prose around it. Every field is source-local: never emit internal identifiers,
+provenance fields, model run identifiers, archive hashes or the source URL."""
 
-UNCERTAINTIES
-- <uncertainty>
+_Q2_CANONICAL_ARCHIVED_SOURCE = """The exact archived capture of one CTI publication is supplied below.
 
-Or, when applicable, return exactly one of these terminal responses:
-EMPTY
+Analyse only the archived capture below. Do not browse the web, do not follow
+any link and do not supplement this source from memory or from another
+publication. The archived capture is the complete and only source material of
+this extraction.
 
-UNAVAILABLE"""
-
-_Q2_IOC_RULES_WIRE_FORMAT = """IOC <confirmed|contextual> <type>
-- <value>
-
-RULE <yara|sigma|suricata|snort>[: <visible name>]
-```<language>
-<literal body>
-```
-
-UNCERTAINTIES
-- <uncertainty>
-
-Or, when applicable, return exactly one of these terminal responses:
-EMPTY
-
-UNAVAILABLE"""
-
-# Batch output framing marker. The exact markers for a batch are rendered from
-# the actual source list below; there is no static B1/B2/B3 example to
-# extrapolate. The input side needs no framing: it is a list of exact URLs.
-Q2_BATCH_OUTPUT_MARKER = "@@Q2:{batch_id}@@"
-
-# Subject relevance policy shared by the three Q2 extraction paths. Selection
-# happens during extraction, while the model still has the full publication in
-# context: there is no post-Q2 classification pass and no deterministic actor
-# list on the Python side.
-_Q2_SUBJECT_RELEVANCE_POLICY = """Subject relevance is mandatory.
-
-Analyse the complete source, but emit only technical facts, IOCs and detection
-rules relevant to the requested Subject.
-
-A publication may discuss several actors, campaigns, malware families or
-operations. Relevance of the publication does not imply relevance of every
-indicator contained in it.
-
-For every IOC, determine from its local source context what actor, campaign,
-malware, operation or technical activity it belongs to before emitting it.
-
-Emit an IOC when the source associates it with:
-- the requested subject;
-- the actor/campaign represented by the requested subject;
-- the malware/family central to the requested subject;
-- infrastructure or artifacts explicitly supporting that subject.
-
-Do NOT emit an IOC merely because it appears elsewhere in the same publication.
-
-Do NOT emit an IOC when the source explicitly associates it with:
-- another actor;
-- another campaign or operation;
-- another unrelated malware family;
-- a comparison or historical-background section unrelated to the subject;
-- another row/group of a multi-actor IOC table.
-
-When an IOC's relationship to the subject is ambiguous, do not emit it as
-confirmed.
-
-IOC status is about the source's publication and association decision, not your
-confidence about the indicator's exact technical function. Use `confirmed` when
-the publication explicitly presents a value as an IOC, malicious infrastructure,
-C2 infrastructure, malware/file indicator or other defensive indicator belonging
-to the requested Subject. If the source places the value in a subject-relevant
-block headed `Indicators of Compromise`, `Indicators`, `IOCs`, `C2
-infrastructure`, `Malicious infrastructure`, `Network indicators`, `File
-indicators`, `Hashes`, `Domains and IPs`, or an IOC appendix/table, preserve it
-as `confirmed` even when it says potentially associated infrastructure, the
-exact operational role is unknown, or the purpose of the host is uncertain.
-Those qualifications concern function, not whether the source published the
-value for the Subject.
-
-Use `contextual` only when the technical value is relevant but the source does
-not itself establish it as an IOC of the requested Subject. This includes an
-example-only narrative mention, historically related infrastructure not tied to
-the campaign, a legitimate service domain, a research pivot, an explicitly
-hypothetical or ambiguous subject association, or an indicator belonging to a
-nearby but distinct activity. Do not promote every value appearing in the
-publication to `confirmed`.
-
-Shared legitimate infrastructure is not a useful IOC by itself. Generic roots
-or services such as GitHub, Telegram, Google Drive, common cloud platforms,
-public CDNs or vendor infrastructure must not be emitted solely because the
-subject used the service. A campaign-specific repository, account, URL,
-subdomain or other discriminating artifact may be emitted when explicitly
-supported.
-
-A detection rule must also be relevant to the requested Subject. Do not emit a
-rule explicitly associated only with another actor, campaign, malware family or
-operation mentioned in the publication.
-
-Source-local boundary is mandatory. Analyse only material belonging to this
-exact source URL: its rendered text, tables, code blocks and visible visual
-content that belongs to that page. Do not follow a link to another publication,
-IOC page, repository, sandbox report or appendix and attribute its indicators to
-this source. Linked technical resources are distinct sources for Q1.
-
-Exhaustiveness applies after relevance filtering: find every subject-relevant
-IOC, not every IOC in the publication. Perform an exhaustive subject-relevant
-IOC pass: IPv4/IPv6, domains, URLs, MD5/SHA1/SHA256/SHA512 and email addresses,
-including rendered tables, visible images and code. Omit irrelevant, example-only,
-placeholder, masked, truncated, REDACTED or FUZZ values; never reconstruct
-hidden values. Exhaustiveness includes every literal value in a subject-relevant
-IOC table or appendix rendered in this exact source: do not sample, summarize,
-collapse ranges, omit
-repetitive-looking subdomains, or stop after representative examples. A single
-table cell may contain multiple IOC literals separated by whitespace, newline,
-comma or semicolon. Treat each separator-delimited valid literal as a separate
-IOC and emit each one on its own `- <value>` line; never treat the whole cell as
-one value. For example, emit `uae1.example` and `uae14.example` separately; do
-not replace them with `uae1-uae14.example` or `multiple uae*.example subdomains`.
-
-Never sacrifice coverage of subject-relevant IOCs to reduce cost. Never
-increase coverage by importing indicators belonging to other activities
-mentioned in the source."""
-
-_Q2_IOC_RULES_BATCH_BODY_FORMAT = """IOC <confirmed|contextual> <type>
-- <value>
-
-RULE <yara|sigma|suricata|snort>[: <visible name>]
-```<language>
-<literal body>
-```
-
-Or, when applicable, return exactly one of these terminal responses:
-EMPTY
-
-UNAVAILABLE"""
+--- BEGIN ARCHIVED SOURCE ---
+{source_text}
+--- END ARCHIVED SOURCE ---"""
 
 
 class ProductionPromptTemplates:
@@ -265,193 +153,93 @@ Rules:
 - No date after the research date.
 """
 
-    TECHNICAL_EXTRACTION_MARKDOWN_V1 = (
-        """You are analysing one specific CTI source for a reusable, source-centric extraction.
-
-**Subject**: {subject_title}
-
-**Source title**: {source_title}
-
-{source_access}
+    CANONICAL_TECHNICAL_EXTRACTION_V1 = (
+        """You are analysing one archived CTI publication and extracting reusable, source-centric structured content.
 
 """
-        + _Q2_SUBJECT_RELEVANCE_POLICY
+        + _Q2_CANONICAL_ARCHIVED_SOURCE
         + """
 
-**Output format** — plain Markdown, no outer code fence, no JSON. Use only this
-wire format:
-
 """
-        + _Q2_WIRE_FORMAT
+        + _Q2_CANONICAL_OUTPUT_PREAMBLE
         + """
 
-Rules:
-- The response is bound to this one source. Do not emit source ids, provenance,
-  evidence quotes, model run ids or other internal identifiers. Do not repeat
-  the input source URL merely as provenance.
-- Emit source-supported, subject-relevant facts about malware, tools, files,
-  TTPs, infrastructure, victims and campaign context only in non-empty FACT
-  groups. FACT categories are exactly: actors, campaigns, malware, tools,
-  infection_chain, ttps, victimology, protocols, infrastructure, files,
-  commands, persistence, detections, other_technical.
-- Facts about another activity may be emitted only when they materially clarify
-  the requested subject's attribution, malware sharing, infrastructure sharing,
-  technical relationship or uncertainty. Do not extract unrelated parallel
-  activity as standalone subject facts.
-- IOC types are exactly: domain, ip, url, email, md5, sha1, sha256, sha512,
-  filename, filepath, cve. `confirmed` means confirmed IOC and `contextual`
-  means contextual IOC.
-- The complete header is authoritative and self-contained. Do not rely on a
-  previous header and do not repeat category, status or type on value lines.
-- Emit only values literally published or rendered in this exact source page.
-  Extract a URL indicator only when this exact page publishes it; never follow
-  a linked URL to obtain an indicator.
-- Use `:: short context` on FACT values only when useful, with whitespace on
-  both sides of `::`. IOC value lines carry no annotation. Keep every IPv6
-  literal intact.
-- Apply the subject relevance policy above to every IOC and rule, then be
-  exhaustive within what it allows.
-- Put complete literal detection rules visible in this source, and relevant to
-  the requested Subject, only in RULE. The fence is mandatory.
-  Preserve the complete literal body, syntax, visible line breaks and visible
-  rule name. Never reconstruct truncated content, invent missing variables,
-  repair braces, refang, reformat, flatten, unflatten, merge or transform a
-  rule. Report partial/truncated rules in UNCERTAINTIES, never as complete
-  rules. A flattened one-line YARA rule stays one line, and `hxxps\\://...`
-  stays exactly visible.
-- EMPTY means the source was actually analysed and contained nothing relevant.
-  UNAVAILABLE means the source could not actually be analysed. Either terminal
-  response must be alone except for surrounding whitespace.
+- `facts`: durable source-supported facts AW-012 can reuse. `category` is
+  exactly one of actors, campaigns, malware, tools, products, infection_chain,
+  ttps, victimology, protocols, infrastructure, files, commands, persistence,
+  detections, sectors, countries, other_technical. `value` is the fact,
+  `context` a short local explanation, and `attack_id` a MITRE ATT&CK
+  technique identifier only when the capture states one. Do not restate
+  article prose here.
+- `events`: the chronology stated by the capture. `text` is the event,
+  `event_date` a precise calendar date only when the capture states one,
+  `date_text` the temporal wording when no precise date is published, and
+  `evidence_quote` the publishing sentence. Never estimate or invent a date.
 """
+        + _Q2_CANONICAL_ARTIFACTS_AND_RULES
+        + """
+
+"""
+        + _Q2_CANONICAL_RULES
     )
 
-    IOC_RULES_EXTRACTION_MARKDOWN_V1 = (
-        """You are performing a reusable, source-centric IOC and detection-rule extraction for one CTI source.
-
-**Subject**: {subject_title}
-
-**Source title**: {source_title}
-
-{source_access}
+    CANONICAL_IOC_RULES_EXTRACTION_V1 = (
+        """You are analysing one archived CTI publication and extracting reusable published technical indicators and detection rules.
 
 """
-        + _Q2_SUBJECT_RELEVANCE_POLICY
+        + _Q2_CANONICAL_ARCHIVED_SOURCE
         + """
 
-This profile emits no FACT group or narrative facts: do not extract FACTS, TTP
-narrative, victimology, chronology, campaign context, tooling narrative,
-infection chains, or general historical context.
-
-**Output format** — plain Markdown, no outer code fence, no JSON. Use this
-wire format:
+This profile emits no narrative content: no facts, no events, no victimology,
+no campaign description and no infection chain. Leave `facts` and `events`
+empty.
 
 """
-        + _Q2_IOC_RULES_WIRE_FORMAT
+        + _Q2_CANONICAL_OUTPUT_PREAMBLE
         + """
 
-Rules:
-- The response is bound to this one source. Do not emit source ids, provenance,
-  evidence quotes, model run ids or other internal identifiers. Do not repeat
-  the input source URL merely as provenance.
-- Emit only non-empty IOC and RULE groups. IOC types are exactly: domain, ip,
-  url, email, md5, sha1, sha256, sha512, filename, filepath, cve. `confirmed`
-  means confirmed IOC and `contextual` means contextual IOC.
-- The complete header is authoritative and self-contained. Do not rely on a
-  previous header and do not repeat status or type on value lines.
-- Emit only values literally published or rendered in this exact source page.
-  Extract a URL indicator only when this exact page publishes it; never follow
-  a linked URL to obtain an indicator.
-- Apply the subject relevance policy above to every IOC and rule, then be
-  exhaustive within what it allows. Emit only source-supported indicators and
-  meaningful uncertainties.
-- IOC value lines carry no annotation: emit the bare value, with no attribution,
-  campaign label or justification. Keep every IPv6 literal intact.
-- Put complete literal detection rules visible in this source, and relevant to
-  the requested Subject, only in RULE. The fence is mandatory.
-  Preserve the complete literal body, syntax, visible line breaks and visible
-  rule name. Never reconstruct truncated content, invent missing variables,
-  repair braces, refang, reformat, flatten, unflatten, merge or transform a
-  rule. Report partial/truncated rules in UNCERTAINTIES, never as complete
-  rules. A flattened one-line YARA rule stays one line, and `hxxps\\://...`
-  stays exactly visible.
-- EMPTY means the source was actually analysed and contained nothing relevant.
-  UNAVAILABLE means the source could not actually be analysed. Either terminal
-  response must be alone except for surrounding whitespace.
 """
+        + _Q2_CANONICAL_ARTIFACTS_AND_RULES
+        + """
+
+"""
+        + _Q2_CANONICAL_RULES
     )
 
-    IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1 = (
-        """You are performing an IOC and detection-rule extraction over several independent CTI publications.
+    CANONICAL_IOC_RULES_BATCH_EXTRACTION_V1 = (
+        """You are analysing several independent archived CTI publications in one pass.
 
-**Subject**: {subject_title}
+Every capture below is delimited by its temporary local handle `@@Q2:B#@@`.
+Those handles are transport labels of this single answer: they are never source
+identities and never leave this answer.
 
-Open every exact source URL listed below.
+Analyse every capture independently and attribute each proposal to the capture
+that literally contains it. Never move an indicator or a rule from one capture
+to another, never use one capture to interpret another, and never infer content
+that is not literally present in the capture it is attributed to.
 
-Analyse each publication itself. Inspect the complete accessible rendered
-material belonging to that exact URL, including technical tables, code blocks,
-indicator lists and visible images/screenshots when available.
+Do not browse the web and do not follow any link.
 
-Do not follow a link to another publication, IOC page, repository, sandbox
-report or appendix and attribute its indicators to the current B#. Linked
-technical resources must be handled as distinct sources by Q1.
+This profile emits no narrative content: no facts, no events, no victimology,
+no campaign description and no infection chain. Leave `facts` and `events`
+empty in every entry.
 
-Do not replace a source with unrelated search results and do not use another
-publication as evidence for that B#.
-
-Treat every B# independently.
-
-"""
-        + _Q2_SUBJECT_RELEVANCE_POLICY
-        + """
-
-The Subject is the relevance boundary for every B#. Source independence does not
-suspend subject filtering. For each publication independently:
-1. inspect the complete publication;
-2. identify which IOC/rule groups belong to the requested Subject;
-3. discard indicators/rules explicitly belonging to other activities;
-4. exhaustively emit the remaining subject-relevant indicators/rules.
-
-For every B#, emit exactly one output section beginning with its exact
-@@Q2:B#@@ marker, alone on its line. The next output marker terminates the
-previous section and EOF terminates the last section. Do not emit a terminating
-marker.
-
-Never use one publication to interpret or classify another. Never move an IOC or
-rule between publications. Emit no FACT and no narrative context. Produce a
-compact response. The only provenance labels you may emit are the local B#
-labels carried by the output markers. Do not repeat an input source URL as
-provenance. Do not emit model ids, internal ids or internal content hashes.
-
-Extract URL, MD5, SHA1, SHA256 and SHA512 indicators only when they are
-actually published by that exact source URL; never follow a linked resource to
-obtain an indicator.
-
-Use EMPTY only after analysing that publication and finding no IOC or rule. Use
-UNAVAILABLE only when that publication could not be analysed. Do not let one
-failure suppress the other sources.
-
-Extract every subject-relevant source-supported literal IOC and every
-subject-relevant complete literal YARA, Sigma, Suricata or Snort rule from that
-publication. Preserve rule syntax, visible line breaks and
-visible names. Never invent, repair, refang, reformat, flatten, merge or
-transform a rule. Put partial rules in no RULE block.
-
-Output body grammar, shared by every section:
+**Output contract** — answer with a single structured object matching the
+supplied schema and nothing else. It contains one entry per analysed capture,
+each carrying the exact `batch_id` handle and a source-local `output` using the
+same IOC_RULES contract: artifacts, published detection rules and uncertainties
+only. Omit an entry only when its capture could not be analysed.
 
 """
-        + _Q2_IOC_RULES_BATCH_BODY_FORMAT
+        + _Q2_CANONICAL_ARTIFACTS_AND_RULES
         + """
 
-IOC types are exactly domain, ip, url, email, md5, sha1, sha256, sha512,
-filename, filepath and cve. Mark each IOC confirmed or contextual. Do not add
-annotations to value lines. The rule fence is mandatory. The framing is
-structural and takes precedence over Markdown fences. Never emit a Q2 output
-marker that is not one of the section markers listed below.
+"""
+        + _Q2_CANONICAL_RULES
+        + """
 
-Output structure for this batch, with one independent section per source:
-{batch_output_structure}
+Archived captures:
 
-Sources:
 {batch_sources}
 """
     )
@@ -695,111 +483,51 @@ Revision instructions:
             supporting_sources=supporting_sources_text or "- None supplied.",
         )
 
-    # Q2 analyses the live publication behind the exact canonical URL. The local
-    # archive is a collection snapshot and is never inlined here: its derived
-    # text does not represent what the rendered publication actually shows.
-    LIVE_SOURCE_ACCESS_V1 = """Open this exact source:
-{source_url}
-
-Analyse only material belonging to this exact source URL. Read the complete
-accessible page; inspect its rendered text, technical tables, code blocks and
-visible images/screenshots that belong to the page. Do not follow a link to
-another publication, IOC page, repository, sandbox report or appendix and
-attribute its indicators to this source. Linked technical resources must be
-handled as distinct sources by Q1. Do not replace the exact source with
-unrelated search results or use memory as evidence. If the exact source cannot
-be accessed, return `UNAVAILABLE` alone and do not invent an extraction."""
-
-    ARCHIVED_SOURCE_ACCESS_V1 = """The live source could not be accessed.
-
-Analyse only the archived capture supplied below.
-
-Canonical source URL (provenance only):
-{source_url}
-
-Do not browse the web.
-Do not follow links.
-Do not supplement this source from memory or other publications.
-Treat the archived content below as the complete source material available
-for this extraction.
-
---- BEGIN ARCHIVED SOURCE ---
-{source_text}
---- END ARCHIVED SOURCE ---"""
-
     @classmethod
-    def get_extraction_prompt(
+    def get_canonical_archive_extraction_prompt(
         cls,
-        subject_title: str,
-        source_id: str = "",
-        source_title: str = "",
-        source_url: str = "",
+        source_text: str,
+        *,
         profile: ExtractionProfile = ExtractionProfile.FULL,
     ) -> str:
-        del source_id
+        """Render the AW-011 canonical contract for one archived capture.
+
+        The archived text is the only variable input: the prompt never carries
+        a Subject, run, job, URL or document identity, so the same content and
+        profile always render the same prompt for every caller.
+        """
+        if not source_text.strip():
+            raise ValueError("A canonical extraction prompt requires archived source text")
         template = (
-            cls.TECHNICAL_EXTRACTION_MARKDOWN_V1
+            cls.CANONICAL_TECHNICAL_EXTRACTION_V1
             if profile is ExtractionProfile.FULL
-            else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
+            else cls.CANONICAL_IOC_RULES_EXTRACTION_V1
         )
-        return template.format(
-            subject_title=subject_title,
-            source_title=source_title,
-            source_url=source_url,
-            source_access=cls.LIVE_SOURCE_ACCESS_V1.format(source_url=source_url),
-        )
+        return template.format(source_text=source_text)
 
     @classmethod
-    def get_archived_extraction_prompt(
+    def get_canonical_archive_batch_prompt(
         cls,
-        subject_title: str,
-        source_id: str = "",
-        source_title: str = "",
-        source_url: str = "",
-        source_text: str = "",
-        profile: ExtractionProfile = ExtractionProfile.FULL,
-    ) -> str:
-        """Render the normal Q2 contract against one supplied archive only."""
-        del source_id
-        template = (
-            cls.TECHNICAL_EXTRACTION_MARKDOWN_V1
-            if profile is ExtractionProfile.FULL
-            else cls.IOC_RULES_EXTRACTION_MARKDOWN_V1
-        )
-        return template.format(
-            subject_title=subject_title,
-            source_title=source_title,
-            source_url=source_url,
-            source_access=cls.ARCHIVED_SOURCE_ACCESS_V1.format(
-                source_url=source_url,
-                source_text=source_text,
-            ),
-        )
-
-    @classmethod
-    def get_ioc_rules_batch_prompt(
-        cls,
-        subject_title: str,
         batch_sources: Sequence[tuple[str, str]],
     ) -> str:
-        """Render a URL-only IOC_RULES batch using local B# labels.
+        """Render the AW-011 IOC_RULES batch over archived captures.
 
-        The Subject is stated once for the whole batch: it is the relevance
-        boundary shared by every B#, never repeated per source block.
+        Each entry is a ``(batch_id, archived_text)`` pair. The local handles
+        are temporary transport labels; no URL or document identity is sent.
         """
-        blocks = "\n".join(f"{batch_id} {source_url}" for batch_id, source_url in batch_sources)
-        if not blocks.strip():
-            raise ValueError("A Q2 batch prompt requires at least one source")
-        output_structure = "\n\n".join(
-            f"{Q2_BATCH_OUTPUT_MARKER.format(batch_id=batch_id)}\n"
-            "<source-local IOC/rule output, EMPTY or UNAVAILABLE>"
-            for batch_id, _ in batch_sources
-        )
-        return cls.IOC_RULES_BATCH_EXTRACTION_MARKDOWN_V1.format(
-            subject_title=subject_title,
-            batch_sources=blocks,
-            batch_output_structure=output_structure,
-        )
+        blocks = []
+        for batch_id, source_text in batch_sources:
+            if not batch_id.strip() or not source_text.strip():
+                raise ValueError("A canonical batch entry requires a handle and text")
+            blocks.append(
+                f"@@Q2:{batch_id}@@\n"
+                "--- BEGIN ARCHIVED SOURCE ---\n"
+                f"{source_text}\n"
+                "--- END ARCHIVED SOURCE ---"
+            )
+        if not blocks:
+            raise ValueError("A canonical batch prompt requires at least one source")
+        return cls.CANONICAL_IOC_RULES_BATCH_EXTRACTION_V1.format(batch_sources="\n\n".join(blocks))
 
     _REFERENCES_STRUCTURE = """# REFERENCES
 

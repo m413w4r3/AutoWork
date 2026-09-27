@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
-from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,6 +12,7 @@ from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import ProductionBatchService
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -20,6 +20,7 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    ProductionSubmissionReconciliation,
 )
 
 
@@ -151,31 +152,6 @@ def _batch_uow(codes: list[str]) -> tuple[_Uow, list[ProductionRun]]:
     return _Uow(batch, runs, items, edition), runs
 
 
-def _q2_recovery_case(
-    source_failures: Any,
-) -> tuple[EditionProductionBatchItem, ProductionRun]:
-    uow, runs = _batch_uow(["q2_source_coverage_failed"])
-    run = runs[0]
-    run.error_details = {"source_failures": source_failures}
-    return uow.edition_production_batch_items.items[0], run
-
-
-def _q2_failure(
-    *,
-    retryable: Any = True,
-    contributes_to_coverage: Any = True,
-    failure_class: str | None = None,
-) -> dict[str, Any]:
-    failure: dict[str, Any] = {
-        "error_code": "source_content_invalid",
-        "retryable": retryable,
-        "contributes_to_coverage": contributes_to_coverage,
-    }
-    if failure_class is not None:
-        failure["failure_class"] = failure_class
-    return failure
-
-
 def test_recovery_policy_is_allow_list_only() -> None:
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("bridge_server_error")
     for code in (
@@ -185,84 +161,36 @@ def test_recovery_policy_is_allow_list_only() -> None:
     ):
         assert ProductionRecoveryPolicyV1.is_auto_recoverable(code)
     assert ProductionRecoveryPolicyV1.is_auto_recoverable("synthesis_validation_failed")
-    assert not ProductionRecoveryPolicyV1.is_auto_recoverable("q2_source_coverage_failed")
+    assert not ProductionRecoveryPolicyV1.is_auto_recoverable("extraction_core_source_failed")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable("unknown_code")
     assert not ProductionRecoveryPolicyV1.is_auto_recoverable(
         "model_submission_reconciliation_required"
     )
 
 
-def test_q2_terminal_source_failure_is_not_automatically_recoverable() -> None:
-    item, run = _q2_recovery_case(
-        {"S14": _q2_failure(retryable=False)},
+def test_a_core_extraction_failure_is_manual_only() -> None:
+    uow, runs = _batch_uow(["extraction_core_source_failed"])
+
+    assert not ProductionRecoveryPolicyV1.eligible(
+        uow.edition_production_batch_items.items[0], runs[0]
     )
 
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
 
+def test_a_run_awaiting_reconciliation_is_never_automatic_whatever_its_code() -> None:
+    uow, runs = _batch_uow(["bridge_unreachable"])
+    run = runs[0]
+    assert ProductionRecoveryPolicyV1.eligible(uow.edition_production_batch_items.items[0], run)
 
-def test_q2_missing_error_details_is_not_automatically_recoverable() -> None:
-    item, run = _q2_recovery_case(None)
-
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-def test_q2_malformed_source_failures_is_not_automatically_recoverable() -> None:
-    item, run = _q2_recovery_case([_q2_failure()])
-
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-def test_q2_missing_retryability_is_not_automatically_recoverable() -> None:
-    failure = _q2_failure()
-    del failure["retryable"]
-    item, run = _q2_recovery_case({"S1": failure})
-
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-def test_q2_mixed_retryability_is_not_automatically_recoverable() -> None:
-    item, run = _q2_recovery_case(
-        {
-            "S1": _q2_failure(retryable=True),
-            "S2": _q2_failure(retryable=False),
-        }
+    run.reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=uuid4(),
+        stage=ProductionStage.EXTRACTION,
+        bridge_response_id=None,
+        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        phase="reconciliation",
     )
 
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-def test_q2_all_blocking_failures_retryable_is_automatically_recoverable() -> None:
-    item, run = _q2_recovery_case(
-        {
-            "S1": _q2_failure(retryable=True),
-            "S2": _q2_failure(retryable=True),
-        }
-    )
-
-    assert ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-def test_q2_non_blocking_failure_does_not_hide_a_terminal_blocking_failure() -> None:
-    item, run = _q2_recovery_case(
-        {
-            "S1": _q2_failure(retryable=True, contributes_to_coverage=False),
-            "S2": _q2_failure(retryable=False),
-        }
-    )
-
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
-
-
-@pytest.mark.parametrize(
-    "failure_class",
-    ("reconciliation_required", "control_invariant_failure"),
-)
-def test_q2_reconciliation_and_control_failures_are_manual_only(failure_class: str) -> None:
-    item, run = _q2_recovery_case(
-        {"S1": _q2_failure(failure_class=failure_class)},
-    )
-
-    assert not ProductionRecoveryPolicyV1.eligible(item, run)
+    assert not ProductionRecoveryPolicyV1.eligible(uow.edition_production_batch_items.items[0], run)
 
 
 @pytest.mark.asyncio

@@ -23,18 +23,23 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
 from cti_app.application.production_batch_repointing import _repoint_batch_item
+from cti_app.application.production_extraction import (
+    extraction_compatibility_view,
+    legacy_technical_extraction_from_payload,
+)
 from cti_app.application.production_parsers import (
     ParseResult,
     ReferenceReport,
     TechnicalExtraction,
     reference_report_from_json,
     reference_report_to_json,
-    technical_extraction_from_json,
+    technical_extraction_to_json,
     validate_synthesis,
 )
 from cti_app.application.production_references import (
     load_legacy_reference_report,
     production_reference_corpus_from_json,
+    report_source_labels,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
 from cti_app.application.subject_production import (
@@ -260,7 +265,10 @@ def _validate_parsers(
 ) -> tuple[ReferenceReport, TechnicalExtraction]:
     try:
         report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
-        extraction = technical_extraction_from_json(snapshot.artifacts.extraction.canonical_content)
+        extraction = legacy_technical_extraction_from_payload(
+            snapshot.artifacts.extraction.canonical_content,
+            source_labels=report_source_labels(report),
+        )
         synthesis_result: ParseResult[str] = validate_synthesis(
             snapshot.artifacts.synthesis.rendered_content, report, extraction
         )
@@ -390,9 +398,22 @@ def _exported_repair_block(
     )
 
 
-def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
-    """Keep canonical extraction data, excluding model-run provenance."""
-    portable = dict(content)
+def _portable_extraction_content(
+    content: dict[str, Any], report: ReferenceReport
+) -> dict[str, Any]:
+    """Project any extraction payload onto the legacy contract V4 still carries.
+
+    An AW-011 ``ProductionExtractionV1`` payload is projected one way through
+    the single compatibility boundary, so V4 keeps its historical
+    ``TechnicalExtraction`` shape and never exposes the canonical contract to a
+    V4 reader.  A genuinely legacy payload travels unchanged: the state
+    transfer never promotes it into the canonical contract.  Model-run
+    provenance is not part of the portable V4 contract either way.
+    """
+    view = extraction_compatibility_view(content, source_labels=report_source_labels(report))
+    portable = (
+        technical_extraction_to_json(view.legacy) if view.canonical is not None else dict(content)
+    )
     for collection_name in ("items", "rules"):
         collection = portable.get(collection_name)
         if isinstance(collection, list):
@@ -508,7 +529,8 @@ class ProductionStateService:
                 self._artifact_store, refs, refs_content
             )
             extraction_content = _portable_extraction_content(
-                await self._artifact_store.read_json(extraction.canonical_blob_id)
+                await self._artifact_store.read_json(extraction.canonical_blob_id),
+                reference_report_from_json(refs_content),
             )
             synthesis_content = await self._artifact_store.read_text(synthesis.rendered_blob_id)
         except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
@@ -572,7 +594,8 @@ class ProductionStateService:
 
         refs_content = snapshot.artifacts.references.canonical_content
         extraction_content = _portable_extraction_content(
-            snapshot.artifacts.extraction.canonical_content
+            snapshot.artifacts.extraction.canonical_content,
+            reference_report_from_json(refs_content),
         )
         synthesis_content = snapshot.artifacts.synthesis.rendered_content
         _, refs_canonical, _ = await self._artifact_store.store_stage_payloads(

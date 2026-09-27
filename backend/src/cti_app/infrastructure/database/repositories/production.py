@@ -674,6 +674,9 @@ class SqlAlchemySourceExtractionRepository:
         prompt_version: str,
         parser_version: str,
         verifier_version: str,
+        source_text_contract_version: str,
+        model_policy_version: str,
+        routing_policy_version: str,
     ) -> SourceExtraction | None:
         values = {
             "source_content_sha256": source_content_sha256,
@@ -682,6 +685,9 @@ class SqlAlchemySourceExtractionRepository:
             "prompt_version": prompt_version,
             "parser_version": parser_version,
             "verifier_version": verifier_version,
+            "source_text_contract_version": source_text_contract_version,
+            "model_policy_version": model_policy_version,
+            "routing_policy_version": routing_policy_version,
         }
         row = await self._session.scalar(
             select(SourceExtractionRow).where(
@@ -721,6 +727,10 @@ class SqlAlchemySourceExtractionRepository:
                 SourceExtractionRow.prompt_version == extraction.prompt_version,
                 SourceExtractionRow.parser_version == extraction.parser_version,
                 SourceExtractionRow.verifier_version == extraction.verifier_version,
+                SourceExtractionRow.source_text_contract_version
+                == extraction.source_text_contract_version,
+                SourceExtractionRow.model_policy_version == extraction.model_policy_version,
+                SourceExtractionRow.routing_policy_version == extraction.routing_policy_version,
             )
             .with_for_update()
         )
@@ -1317,6 +1327,9 @@ def _source_extraction_values(extraction: SourceExtraction) -> dict[str, object]
         "prompt_version": extraction.prompt_version,
         "parser_version": extraction.parser_version,
         "verifier_version": extraction.verifier_version,
+        "source_text_contract_version": extraction.source_text_contract_version,
+        "model_policy_version": extraction.model_policy_version,
+        "routing_policy_version": extraction.routing_policy_version,
         "status": extraction.status.value,
         "canonical_blob_id": extraction.canonical_blob_id,
         "raw_blob_id": extraction.raw_blob_id,
@@ -1335,6 +1348,9 @@ def _source_extraction_from_row(row: SourceExtractionRow) -> SourceExtraction:
         prompt_version=row.prompt_version,
         parser_version=row.parser_version,
         verifier_version=row.verifier_version,
+        source_text_contract_version=row.source_text_contract_version,
+        model_policy_version=row.model_policy_version,
+        routing_policy_version=row.routing_policy_version,
         status=SourceExtractionStatus(row.status),
         canonical_blob_id=row.canonical_blob_id,
         raw_blob_id=row.raw_blob_id,

@@ -37,29 +37,6 @@ function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function booleanValue(value: unknown): boolean | null {
-  return typeof value === "boolean" ? value : null;
-}
-
-function stringArray(value: unknown): string[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
-}
-
-function nestedDetails(details: StringRecord | null): StringRecord | null {
-  return asRecord(details?.details) ?? details;
-}
-
-function recordField(
-  details: StringRecord | null,
-  key: string,
-): StringRecord | null {
-  const direct = asRecord(details?.[key]);
-  if (direct) return direct;
-  return asRecord(nestedDetails(details)?.[key]);
-}
-
 function stringField(
   details: StringRecord | null,
   ...keys: string[]
@@ -78,95 +55,39 @@ function sourceFromProgress(
   return progress?.sources.find((source) => source.source_id === sourceId);
 }
 
-function sourceTitle(
-  details: StringRecord | null,
-  progressSource: ExtractionProgressSource | undefined,
-): string | null {
-  return (
-    stringField(details, "title", "source_title", "source_name") ??
-    stringValue(progressSource?.title)
-  );
-}
-
-function sourceUrl(
-  details: StringRecord | null,
-  progressSource: ExtractionProgressSource | undefined,
-): string | null {
-  return (
-    stringField(details, "source_url", "url", "canonical_url") ??
-    stringValue(progressSource?.source_url) ??
-    stringValue(progressSource?.url)
-  );
-}
-
+/** The CORE source that stopped the canonical EXTRACTION stage, if any. */
 export function getBlockingSources(
   errorDetails: Record<string, unknown> | null | undefined,
   progress: ExtractionProgress | null | undefined,
 ): BlockingSource[] {
   const details = asRecord(errorDetails);
-  const failures = recordField(details, "source_failures");
-  const ids = [
-    ...Object.keys(failures ?? {}),
-    ...stringArray(details?.failed_source_ids),
-    ...stringArray(nestedDetails(details)?.failed_source_ids),
-  ];
-  const uniqueIds = [...new Set(ids)];
-
-  return uniqueIds.map((sourceId) => {
-    const failure = asRecord(failures?.[sourceId]);
-    const progressSource = sourceFromProgress(progress, sourceId);
-    return {
+  const sourceId = stringField(details, "source_document_id");
+  if (!sourceId) return [];
+  const progressSource = sourceFromProgress(progress, sourceId);
+  return [
+    {
       sourceId,
-      title: sourceTitle(failure, progressSource),
-      url: sourceUrl(failure, progressSource),
-      errorCode: stringField(failure, "error_code", "code"),
-    };
-  });
+      title: stringValue(progressSource?.title),
+      url:
+        stringField(details, "canonical_url") ??
+        progressSource?.canonical_url ??
+        null,
+      errorCode: stringField(details, "source_failure_code"),
+    },
+  ];
 }
 
+/** Complementary sources whose extraction failed without blocking the run. */
 export function getSkippedSources(
-  errorDetails: Record<string, unknown> | null | undefined,
   progress: ExtractionProgress | null | undefined,
 ): SkippedSource[] {
-  const details = asRecord(errorDetails);
-  const skips = new Map<string, StringRecord>();
-  const progressSkips = asRecord(progress?.source_skips);
-  const detailSkips = recordField(details, "source_skips");
-
-  for (const [sourceId, skip] of Object.entries(progressSkips ?? {})) {
-    const record = asRecord(skip);
-    if (record && booleanValue(record.blocking) !== true)
-      skips.set(sourceId, record);
-  }
-  for (const [sourceId, skip] of Object.entries(detailSkips ?? {})) {
-    const record = asRecord(skip);
-    if (record && booleanValue(record.blocking) !== true)
-      skips.set(sourceId, record);
-  }
-  for (const source of progress?.sources ?? []) {
-    if (source.status !== "skipped" || !source.skip) continue;
-    if (booleanValue(source.skip.blocking) !== true) {
-      skips.set(source.source_id, source.skip);
-    }
-  }
-
-  const skippedIds = [
-    ...stringArray(progress?.skipped_source_ids),
-    ...stringArray(details?.skipped_source_ids),
-    ...stringArray(nestedDetails(details)?.skipped_source_ids),
-  ];
-  for (const sourceId of skippedIds) {
-    if (!skips.has(sourceId)) skips.set(sourceId, {});
-  }
-
-  return [...skips.entries()].map(([sourceId, skip]) => {
-    const progressSource = sourceFromProgress(progress, sourceId);
-    return {
-      sourceId,
-      title: sourceTitle(skip, progressSource),
-      url: sourceUrl(skip, progressSource),
-    };
-  });
+  return (progress?.sources ?? [])
+    .filter((source) => source.status === "failed" && source.tier !== "core")
+    .map((source) => ({
+      sourceId: source.source_id,
+      title: stringValue(source.title),
+      url: source.canonical_url,
+    }));
 }
 
 function parseWarning(raw: string): {

@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application import production_workflow
+from cti_app.application import production_extraction, production_workflow
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import ModelGatewayError
 from cti_app.application.production_artifact_reuse import (
@@ -22,13 +22,13 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
+from cti_app.application.production_extraction import extraction_input_hash
 from cti_app.application.production_references import (
     production_reference_corpus_from_json,
 )
 from cti_app.application.production_stages import ReferenceResearchService
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
-    _extraction_input_hash,
     _references_input_hash,
     _synthesis_input_hash,
     production_references_model_run_id,
@@ -431,18 +431,6 @@ def test_same_run_cache_has_priority_and_force_only_disables_cross_run() -> None
     assert not cross_run_reuse_allowed(run, ProductionArtifactStage.SYNTHESIS)
 
 
-def test_functional_extraction_hash_ignores_pipeline_generation() -> None:
-    kwargs = {
-        "subject_id": uuid4(),
-        "references_hash": "b" * 64,
-        "references_payload_hash": "c" * 64,
-        "source_urls": ["https://example.test/source"],
-    }
-    assert _extraction_input_hash(**kwargs, pipeline_generation=0) == _extraction_input_hash(
-        **kwargs, pipeline_generation=9
-    )
-
-
 def test_snapshot_reuse_basis_excludes_research_date() -> None:
     values: dict[str, object] = {
         "production_run_id": uuid4(),
@@ -581,35 +569,25 @@ def test_production_references_model_run_id_is_stable_per_run_and_input() -> Non
     assert identity != production_references_model_run_id(run_id, "b" * 64)
 
 
-def test_extraction_hash_tracks_payload_urls_and_functional_versions(
+def test_extraction_hash_tracks_the_corpus_and_functional_versions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    kwargs = {
-        "subject_id": uuid4(),
-        "references_hash": "b" * 64,
-        "references_payload_hash": "c" * 64,
-        "source_urls": ["https://example.test/source"],
-    }
-    base = _extraction_input_hash(**kwargs, pipeline_generation=0)
-    assert base == _extraction_input_hash(**kwargs, pipeline_generation=9)
-    assert base != _extraction_input_hash(
-        **{**kwargs, "references_payload_hash": "d" * 64}, pipeline_generation=0
-    )
-    assert base != _extraction_input_hash(
-        **{**kwargs, "source_urls": ["https://example.test/other"]}, pipeline_generation=0
-    )
+    base = extraction_input_hash(references_corpus_hash="b" * 64)
+    assert base == extraction_input_hash(references_corpus_hash="b" * 64)
+    assert base != extraction_input_hash(references_corpus_hash="c" * 64)
     for version_name in (
-        "EXTRACTION_PROMPT_VERSION",
-        "IOC_RULES_PROMPT_VERSION",
-        "IOC_RULES_BATCH_PROMPT_VERSION",
-        "Q2_MARKDOWN_PARSER_VERSION",
-        "Q2_BATCH_PARSER_VERSION",
+        "PRODUCTION_EXTRACTION_SERVICE_VERSION",
+        "EXTRACTION_PROFILE_POLICY_VERSION",
+        "Q2_EXTRACTION_CONTRACT_VERSION",
+        "SOURCE_TEXT_CONTRACT_VERSION",
+        "CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION",
+        "EXTRACTION_RESPONSE_PARSER_VERSION",
         "ARTIFACT_VERIFIER_VERSION",
-        "IANA_TLD_SNAPSHOT_VERSION",
-        "Q2_ROUTING_POLICY_VERSION",
+        "EXTRACTION_MODEL_POLICY_VERSION",
+        "EXTRACTION_ROUTING_POLICY_VERSION",
     ):
-        monkeypatch.setattr(production_workflow, version_name, "next")
-        assert _extraction_input_hash(**kwargs, pipeline_generation=0) != base, version_name
+        monkeypatch.setattr(production_extraction, version_name, "next")
+        assert extraction_input_hash(references_corpus_hash="b" * 64) != base, version_name
         monkeypatch.undo()
 
 

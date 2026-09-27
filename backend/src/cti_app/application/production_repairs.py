@@ -22,14 +22,16 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
 from cti_app.application.production_artifact_verification import (
-    ARTIFACT_VERIFIER_VERSION,
     Q2ProposalSubmission,
     verify_q2_proposals,
 )
+from cti_app.application.production_extraction import (
+    extraction_compatibility_view,
+    is_current_source_checkpoint,
+    legacy_technical_extraction_from_payload,
+)
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
-    Q2_EXTRACTION_CONTRACT_VERSION,
-    Q2_MARKDOWN_PARSER_VERSION,
     DisplayPolicy,
     ExtractionItem,
     IndicatorProvenance,
@@ -42,14 +44,8 @@ from cti_app.application.production_parsers import (
     reconcile_reference_report_with_archives,
     reference_report_from_json,
     reference_report_to_json,
-    technical_extraction_from_json,
     technical_extraction_to_json,
 )
-from cti_app.application.production_prompts import (
-    EXTRACTION_PROMPT_VERSION_BY_PROFILE,
-    IOC_RULES_BATCH_PROMPT_VERSION,
-)
-from cti_app.application.production_q2_batch import Q2_BATCH_PARSER_VERSION
 from cti_app.application.production_references import (
     PRODUCTION_REFERENCE_PARSER_VERSION,
     build_production_reference_corpus,
@@ -61,6 +57,7 @@ from cti_app.application.production_references import (
     production_reference_corpus_from_json,
     production_reference_corpus_metadata,
     production_reference_corpus_to_json,
+    report_source_labels,
 )
 from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
@@ -109,6 +106,14 @@ from cti_app.domain.production import (
     RepairIssueExecutionState,
     RepairRemediation,
     SupplementalSourceRepairState,
+)
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    ExtractionRuleV1,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -3108,13 +3113,17 @@ class ProductionRepairProjectionService:
         if base.canonical_blob_id is None:
             raise ProductionRepairProjectionError("extraction_payload_missing")
 
+        labels = await _legacy_source_labels(uow, run.id, self._artifact_store)
         try:
-            base_extraction = technical_extraction_from_json(
-                await self._artifact_store.read_json(base.canonical_blob_id)
+            base_view = extraction_compatibility_view(
+                await self._artifact_store.read_json(base.canonical_blob_id),
+                source_labels=labels,
             )
+            base_extraction = base_view.legacy
         except Exception as exc:
             raise ProductionRepairProjectionError("extraction_payload_unavailable") from exc
         entries, payload_available = await _repair_entries_for_artifact(base, self._artifact_store)
+        entries = _entries_with_legacy_labels(entries, labels)
         decisions = await _effective_decisions_for_reader(uow, run.edition_id, run.subject_id)
         decisions_by_key = {
             decision.repair_key: decision
@@ -3229,8 +3238,9 @@ class ProductionRepairProjectionService:
         current_extraction = base_extraction
         if current.id != base.id:
             try:
-                current_extraction = technical_extraction_from_json(
-                    await self._artifact_store.read_json(current.canonical_blob_id)
+                current_extraction = legacy_technical_extraction_from_payload(
+                    await self._artifact_store.read_json(current.canonical_blob_id),
+                    source_labels=labels,
                 )
             except Exception:
                 current_extraction = base_extraction
@@ -3316,7 +3326,22 @@ class ProductionRepairProjectionService:
                 "effective_decisions": effective_decision_payload,
             }
         )
-        canonical_json = technical_extraction_to_json(projected)
+        legacy_json = technical_extraction_to_json(projected)
+        canonical_json = (
+            production_extraction_to_json(
+                _project_canonical_repair_overlay(
+                    canonical=base_view.canonical,
+                    projection=projection,
+                    entries_by_key={
+                        repair_key: (kind, entry)
+                        for repair_key, kind, entry, _hash in active_entries
+                    },
+                    resolved_payloads=resolved_payloads,
+                )
+            )
+            if base_view.canonical is not None
+            else legacy_json
+        )
         base_metadata = dict(getattr(base, "metadata", {}) or {})
         base_diagnostics = base_metadata.get("deterministic_verification", {})
         projection_metadata = {
@@ -3336,13 +3361,13 @@ class ProductionRepairProjectionService:
         metadata: dict[str, Any] = {
             "element_counts": {
                 category: len(value)
-                for category, value in canonical_json.items()
+                for category, value in legacy_json.items()
                 if isinstance(value, list)
             },
             "warnings": list(base_metadata.get("warnings", []))
             if isinstance(base_metadata.get("warnings", []), list)
             else [],
-            "parser_version": canonical_json.get("parser_version"),
+            "parser_version": legacy_json.get("parser_version"),
             # Rule counters belong to the effective extraction/rule
             # bundle.  Keeping them here prevents a YARA-only repair from
             # changing the functional publication projection.
@@ -3419,12 +3444,16 @@ async def reconcile_effective_repairs_in_uow(
     if artifact_store is None or base_extraction_artifact.canonical_blob_id is None:
         raise ProductionRepairProjectionError("production_repair_storage_unavailable")
 
-    base = technical_extraction_from_json(
-        await artifact_store.read_json(base_extraction_artifact.canonical_blob_id)
+    labels = await _legacy_source_labels(uow, run.id, artifact_store)
+    base_view = extraction_compatibility_view(
+        await artifact_store.read_json(base_extraction_artifact.canonical_blob_id),
+        source_labels=labels,
     )
+    base = base_view.legacy
     entries, payload_available = await _repair_entries_for_artifact(
         base_extraction_artifact, artifact_store
     )
+    entries = _entries_with_legacy_labels(entries, labels)
     decisions = tuple(
         decision
         for decision in await _effective_decisions_for_reader(uow, run.edition_id, run.subject_id)
@@ -3588,7 +3617,21 @@ async def reconcile_effective_repairs_in_uow(
             "replay_origin": "post_q2_reconciliation",
         }
     )
-    canonical_json = technical_extraction_to_json(projected.extraction)
+    legacy_json = technical_extraction_to_json(projected.extraction)
+    canonical_json = (
+        production_extraction_to_json(
+            _project_canonical_repair_overlay(
+                canonical=base_view.canonical,
+                projection=projected,
+                entries_by_key={
+                    repair_key: (kind, entry) for repair_key, kind, entry, _hash in active_entries
+                },
+                resolved_payloads=resolved_payloads,
+            )
+        )
+        if base_view.canonical is not None
+        else legacy_json
+    )
     base_metadata = dict(getattr(base_extraction_artifact, "metadata", {}) or {})
     replay_impact = _impact_from_projection_hashes(
         base,
@@ -3636,13 +3679,13 @@ async def reconcile_effective_repairs_in_uow(
     metadata: dict[str, Any] = {
         "element_counts": {
             category: len(value)
-            for category, value in canonical_json.items()
+            for category, value in legacy_json.items()
             if isinstance(value, list)
         },
         "warnings": list(base_metadata.get("warnings", []))
         if isinstance(base_metadata.get("warnings", []), list)
         else [],
-        "parser_version": canonical_json.get("parser_version"),
+        "parser_version": legacy_json.get("parser_version"),
         "generated_at": datetime.now(UTC).isoformat(),
         "deterministic_verification": dict(base_metadata.get("deterministic_verification", {}))
         if isinstance(base_metadata.get("deterministic_verification"), dict)
@@ -4261,6 +4304,43 @@ class ProductionRepairMaterializationService:
             raise ProductionRepairProjectionError("production_repair_qa_failed")
 
 
+async def _legacy_source_labels(
+    uow: Any, run_id: UUID, artifact_store: ProductionArtifactStore | None
+) -> dict[str, str]:
+    """The REFERENCES labels the legacy extraction projection must speak.
+
+    TODO AW-012/AW-013: the Repair Desk still reads ``TechnicalExtraction``
+    through the extraction compatibility boundary, whose items must carry the
+    labels of the legacy ``ReferenceReport``.
+    """
+    references = await uow.production_artifacts.get_current(
+        run_id, ProductionArtifactStage.REFERENCES.value
+    )
+    if artifact_store is None or references is None:
+        return {}
+    try:
+        report = await load_reference_projection(artifact_store, references)
+    except Exception:
+        return {}
+    return report_source_labels(report) if report is not None else {}
+
+
+def _entries_with_legacy_labels(
+    entries: list[dict[str, Any]], labels: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """Label canonical rejection entries like the legacy projection labels items.
+
+    A canonical entry names its exact ``source_document_id``; the overlay into
+    ``ProductionExtractionV1`` still resolves it by its canonical URL.
+    """
+    labelled: list[dict[str, Any]] = []
+    for entry in entries:
+        url = entry.get("source_url")
+        label = labels.get(url) if isinstance(url, str) else None
+        labelled.append({**entry, "source_id": label} if label else entry)
+    return labelled
+
+
 async def _repair_entries_for_artifact(
     artifact: Any, artifact_store: ProductionArtifactStore | None
 ) -> tuple[list[dict[str, Any]], bool]:
@@ -4482,6 +4562,170 @@ def _build_override_rule(entry: Mapping[str, Any], value: str, repair_key: str) 
         supported=True,
         model_run_ids=_entry_model_run_ids(entry),
         evidence_basis=evidence_basis,
+    )
+
+
+def _canonical_source_for_repair_entry(
+    entry: Mapping[str, Any],
+    sources: Mapping[UUID, ProductionSourceExtractionV1],
+) -> ProductionSourceExtractionV1 | None:
+    """Resolve the canonical source one repair entry really came from.
+
+    A canonical run records the exact ``source_document_id``.  A legacy
+    evidence pack only carries the temporary Q2 handle and the source URL;
+    both are identity, never position, so the documented source is accepted
+    only when its URL matches exactly one canonical source.
+    """
+    raw_id = entry.get("source_id")
+    if isinstance(raw_id, str):
+        try:
+            document_id: UUID | None = UUID(raw_id)
+        except ValueError:
+            document_id = None
+        if document_id is not None and document_id in sources:
+            return sources[document_id]
+    raw_url = entry.get("source_url")
+    if isinstance(raw_url, str):
+        try:
+            canonical_url: str | None = canonicalize_http_url(raw_url)
+        except (AttributeError, TypeError, ValueError):
+            canonical_url = None
+        if canonical_url is not None:
+            matches = [
+                source for source in sources.values() if source.canonical_url == canonical_url
+            ]
+            if len(matches) == 1:
+                return matches[0]
+    return None
+
+
+def _entry_evidence_basis(entry: Mapping[str, Any]) -> ProductionEvidenceBasis:
+    return ProductionEvidenceBasis(
+        str(entry.get("evidence_basis", ProductionEvidenceBasis.ANALYST_OVERRIDE.value))
+    )
+
+
+def _build_canonical_override_indicator(
+    entry: Mapping[str, Any],
+    value: str,
+    source_document_id: UUID,
+) -> ExtractionIndicatorV1:
+    artifact_type = _entry_artifact_type(entry.get("artifact_type"))
+    if (
+        artifact_type
+        in {
+            ArtifactType.YARA_RULE,
+            ArtifactType.SIGMA_RULE,
+            ArtifactType.SURICATA_RULE,
+        }
+        or artifact_type is ArtifactType.OTHER
+    ):
+        raise ValueError("Unsupported repair artifact type")
+    publication_ioc = is_publication_ioc_artifact_type(artifact_type)
+    return ExtractionIndicatorV1(
+        value=value,
+        artifact_type=artifact_type,
+        indicator_status=(
+            ExtractionIndicatorStatus.CONFIRMED_IOC
+            if publication_ioc
+            else ExtractionIndicatorStatus.CONTEXTUAL
+        ),
+        context="",
+        evidence_quote="",
+        evidence_basis=_entry_evidence_basis(entry),
+        source_document_ids=(source_document_id,),
+    )
+
+
+def _build_canonical_override_rule(
+    entry: Mapping[str, Any],
+    value: str,
+    source_document_id: UUID,
+) -> ExtractionRuleV1:
+    name = entry.get("name")
+    return ExtractionRuleV1(
+        rule_type=_entry_rule_type(entry.get("artifact_type")),
+        name=name if isinstance(name, str) else None,
+        body=value,
+        sha256=_sha256(value),
+        context="",
+        evidence_quote="",
+        evidence_basis=_entry_evidence_basis(entry),
+        source_document_ids=(source_document_id,),
+    )
+
+
+def _project_canonical_repair_overlay(
+    *,
+    canonical: ProductionExtractionV1,
+    projection: EffectiveExtractionProjection,
+    entries_by_key: Mapping[str, tuple[ProductionRepairIssueKind, Mapping[str, Any]]],
+    resolved_payloads: Mapping[str, str],
+) -> ProductionExtractionV1:
+    """Materialize the applied repairs inside the canonical extraction itself.
+
+    Only the decisions the deterministic projector really honored are
+    translated, one by one, into canonical analyst elements attached to the
+    exact source document they came from.  The canonical base is never rebuilt
+    from the legacy projection: archive identity, ``source_document_id`` and
+    every other source field travel unchanged, and a value the source already
+    publishes is never duplicated.
+    """
+    sources = {source.source_document_id: source for source in canonical.sources}
+    indicators: dict[UUID, list[ExtractionIndicatorV1]] = {}
+    rules: dict[UUID, list[ExtractionRuleV1]] = {}
+    seen_indicators: dict[UUID, set[tuple[ArtifactType, str]]] = {}
+    seen_rules: dict[UUID, set[tuple[DetectionRuleType, str]]] = {}
+    for decision in projection.applied_decisions:
+        if decision.get("action") == ProductionRepairAction.EXCLUDE.value:
+            continue
+        repair_key = decision.get("repair_key")
+        if not isinstance(repair_key, str):
+            continue
+        kind_entry = entries_by_key.get(repair_key)
+        value = resolved_payloads.get(repair_key)
+        if kind_entry is None or value is None:
+            raise ProductionRepairProjectionError("repair_payload_unavailable")
+        kind, entry = kind_entry
+        source = _canonical_source_for_repair_entry(entry, sources)
+        if source is None:
+            raise ProductionRepairProjectionError("repair_projection_source_unresolved")
+        document_id = source.source_document_id
+        if kind is ProductionRepairIssueKind.REJECTED_RULE:
+            rule = _build_canonical_override_rule(entry, value, document_id)
+            known = seen_rules.setdefault(
+                document_id, {(item.rule_type, item.sha256) for item in source.rules}
+            )
+            key = (rule.rule_type, rule.sha256)
+            if key in known:
+                continue
+            known.add(key)
+            rules.setdefault(document_id, []).append(rule)
+        else:
+            indicator = _build_canonical_override_indicator(entry, value, document_id)
+            known_indicators = seen_indicators.setdefault(
+                document_id,
+                {(item.artifact_type, item.value.strip().casefold()) for item in source.indicators},
+            )
+            indicator_key = (indicator.artifact_type, indicator.value.strip().casefold())
+            if indicator_key in known_indicators:
+                continue
+            known_indicators.add(indicator_key)
+            indicators.setdefault(document_id, []).append(indicator)
+    if not indicators and not rules:
+        return canonical
+    return replace(
+        canonical,
+        sources=tuple(
+            replace(
+                source,
+                indicators=source.indicators + tuple(indicators.get(source.source_document_id, ())),
+                rules=source.rules + tuple(rules.get(source.source_document_id, ())),
+            )
+            if source.source_document_id in indicators or source.source_document_id in rules
+            else source
+            for source in canonical.sources
+        ),
     )
 
 
@@ -5635,22 +5879,7 @@ async def _q2_reuse_preview(
         profile = ExtractionProfile.FULL if url in core_urls else ExtractionProfile.IOC_RULES
         rows = await finder(url)
         reusable = any(
-            getattr(row, "source_content_sha256", None) == digest
-            and getattr(row, "profile", None) is profile
-            and _enum_value(getattr(row, "status", None)) == "verified"
-            and getattr(row, "canonical_blob_id", None) is not None
-            and getattr(row, "model_run_id", None) is not None
-            and getattr(row, "contract_version", None) == Q2_EXTRACTION_CONTRACT_VERSION
-            and getattr(row, "prompt_version", None)
-            in {
-                EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
-                # Supporting-source checkpoints may have been produced by a
-                # deterministic IOC batch.
-                IOC_RULES_BATCH_PROMPT_VERSION,
-            }
-            and getattr(row, "parser_version", None)
-            in {Q2_MARKDOWN_PARSER_VERSION, Q2_BATCH_PARSER_VERSION}
-            and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
+            is_current_source_checkpoint(row, content_sha256=digest, profile=profile)
             for row in rows
         )
         if reusable:

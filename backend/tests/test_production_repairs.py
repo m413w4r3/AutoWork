@@ -14,6 +14,7 @@ from cti_app.application.production_artifact_store import (
     MAX_REPAIR_EVIDENCE_BYTES,
     ProductionArtifactStore,
 )
+from cti_app.application.production_extraction import project_legacy_technical_extraction
 from cti_app.application.production_parsers import (
     TechnicalExtraction,
     technical_extraction_from_json,
@@ -27,8 +28,10 @@ from cti_app.application.production_repairs import (
     repair_key_for_rejection,
 )
 from cti_app.application.production_stages import ExtractionService
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -38,6 +41,21 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRunStatus,
 )
+from cti_app.domain.production_extraction import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_from_json,
+    production_extraction_to_json,
+)
+from cti_app.domain.production_references import (
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
+from cti_app.domain.publication import ArtifactType
 
 EDITION_ID = uuid4()
 SUBJECT_ID = uuid4()
@@ -205,8 +223,7 @@ async def test_extraction_metadata_keeps_only_bounded_repair_pointer() -> None:
         run_id=RUN_ID,
         subject_id=SUBJECT_ID,
         input_hash="a" * 64,
-        raw_result="raw",
-        canonical_json={"items": []},
+        extraction=production_extraction_from_json(_v1_base_payload()),
         verification_diagnostics={"q2_rejected_rule_count": 201},
         repair_evidence_blob_id=UUID("00000000-0000-0000-0000-000000000099"),
         repair_evidence_entry_count=201,
@@ -218,6 +235,10 @@ async def test_extraction_metadata_keeps_only_bounded_repair_pointer() -> None:
         "entry_count": 201,
     }
     assert artifact.metadata["deterministic_verification"] == {"q2_rejected_rule_count": 201}
+    # A canonical extraction names no single model run and keeps no run-level RAW.
+    assert artifact.model_run_id is None
+    assert artifact.raw_blob_id is None
+    assert artifact.metadata["source_count"] == 1
 
 
 class _DecisionRepository:
@@ -674,3 +695,191 @@ async def test_repair_projection_includes_ioc_and_rule_from_base_without_mutatin
     assert base_extraction == technical_extraction_from_json(
         await store.read_json(base.canonical_blob_id)  # type: ignore[arg-type]
     )
+
+
+# --- canonical base compatibility ------------------------------------------
+
+V1_DOCUMENT_ID = UUID("11111111-1111-1111-1111-111111111111")
+V1_CHECKPOINT_ID = UUID("22222222-2222-2222-2222-222222222222")
+V1_CONTENT_SHA = "c" * 64
+
+
+def _v1_base_payload() -> dict[str, object]:
+    """One AW-011 canonical extraction, exactly as the new stage persists it."""
+    return production_extraction_to_json(
+        ProductionExtractionV1(
+            schema_version=1,
+            subject_id=SUBJECT_ID,
+            production_input_hash="a" * 64,
+            references_corpus_hash="b" * 64,
+            profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+            sources=(
+                ProductionSourceExtractionV1(
+                    source_document_id=V1_DOCUMENT_ID,
+                    canonical_url="https://example.test/report",
+                    content_sha256=V1_CONTENT_SHA,
+                    tier=ProductionReferenceTier.CORE,
+                    kind=ProductionReferenceKind.PUBLICATION,
+                    role=SourceRole.PRIMARY,
+                    profile=ExtractionProfile.FULL,
+                    checkpoint_id=V1_CHECKPOINT_ID,
+                    reuse_state=ExtractionReuseState.FRESH,
+                    facts=(),
+                    events=(),
+                    indicators=(
+                        ExtractionIndicatorV1(
+                            value="kept.example",
+                            artifact_type=ArtifactType.DOMAIN,
+                            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                            context="",
+                            evidence_quote="kept.example",
+                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                            source_document_ids=(V1_DOCUMENT_ID,),
+                        ),
+                    ),
+                    rules=(),
+                    uncertainties=("Chargement partiel.",),
+                ),
+            ),
+            omitted_sources=(),
+            warnings=(),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_v1_base_repair_projection_stays_canonical_and_keeps_provenance() -> None:
+    catalog = _BlobCatalog()
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    domain = "repaired.security-lab.io"
+    rule_body = 'rule Repaired { strings: $a = "marker" condition: $a }'
+    domain_key = repair_key_for_rejection(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+        source_url=SOURCE_URL,
+        artifact_type="domain",
+        value=domain,
+    )
+    rule_key = repair_key_for_rejection(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        kind=ProductionRepairIssueKind.REJECTED_RULE,
+        source_url=SOURCE_URL,
+        artifact_type="yara",
+        value=rule_body,
+    )
+    pack = build_repair_evidence_pack(
+        [
+            {
+                "repair_key": domain_key,
+                "source_id": "S1",
+                "source_title": "Source title",
+                "source_url": SOURCE_URL,
+                "proposal_kind": "artifact",
+                "artifact_type": "domain",
+                "reason_code": "source_evidence_missing",
+                "value": domain,
+                "value_sha256": hashlib.sha256(domain.encode()).hexdigest(),
+            },
+            {
+                "repair_key": rule_key,
+                "source_id": "S1",
+                "source_title": "Source title",
+                "source_url": SOURCE_URL,
+                "proposal_kind": "rule",
+                "artifact_type": "yara",
+                "reason_code": "source_rule_evidence_missing",
+                "value": rule_body,
+                "value_sha256": hashlib.sha256(rule_body.encode()).hexdigest(),
+            },
+        ]
+    )
+    evidence_id = await store.put_repair_evidence(pack)
+    base_payload = _v1_base_payload()
+    canonical_id = await store.put_json(base_payload, bucket="production-artifacts-canonical")
+    base = ProductionArtifact(
+        production_run_id=RUN_ID,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="d" * 64,
+        canonical_blob_id=canonical_id,
+        metadata={
+            "repair_evidence": {
+                "schema_version": "1",
+                "blob_id": str(evidence_id),
+                "entry_count": 2,
+            },
+            "deterministic_verification": {"q2_rejected_ioc_count": 1},
+        },
+    )
+    run = SimpleNamespace(
+        id=RUN_ID,
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        status=ProductionRunStatus.READY,
+        requires_reconciliation=False,
+        pipeline_generation=2,
+    )
+    decisions = [
+        ProductionRepairDecision(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            production_run_id=RUN_ID,
+            observed_artifact_id=base.id,
+            observed_pipeline_generation=2,
+            repair_key=domain_key,
+            issue_kind=ProductionRepairIssueKind.REJECTED_INDICATOR,
+            action=ProductionRepairAction.INCLUDE,
+            actor_id="analyst",
+        ),
+        ProductionRepairDecision(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            production_run_id=RUN_ID,
+            observed_artifact_id=base.id,
+            observed_pipeline_generation=2,
+            repair_key=rule_key,
+            issue_kind=ProductionRepairIssueKind.REJECTED_RULE,
+            action=ProductionRepairAction.INCLUDE,
+            actor_id="analyst",
+        ),
+    ]
+    uow = _ProjectionUow(run, base, decisions)
+    result = await ProductionRepairProjectionService(
+        _ProjectionFactory(uow),
+        store,  # type: ignore[arg-type]
+    ).project_effective_extraction(RUN_ID, actor_id="analyst")
+
+    assert result.changed
+    assert result.accepted_indicator_count == 1
+    assert result.accepted_rule_count == 1
+    assert result.unbuildable_repair_keys == ()
+    assert await store.read_json(base.canonical_blob_id) == base_payload
+
+    stored = await store.read_json(result.artifact.canonical_blob_id)  # type: ignore[arg-type]
+    # The V1 base is never downgraded: the projection is still canonical.
+    canonical = production_extraction_from_json(stored)
+    source = canonical.sources[0]
+    assert source.source_document_id == V1_DOCUMENT_ID
+    assert source.content_sha256 == V1_CONTENT_SHA
+    assert source.checkpoint_id == V1_CHECKPOINT_ID
+    assert source.uncertainties == ("Chargement partiel.",)
+    indicators = {indicator.value: indicator for indicator in source.indicators}
+    assert indicators["kept.example"].evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
+    assert indicators[domain].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    assert indicators[domain].source_document_ids == (V1_DOCUMENT_ID,)
+    assert indicators[domain].indicator_status is ExtractionIndicatorStatus.CONFIRMED_IOC
+    assert [rule.sha256 for rule in source.rules] == [
+        hashlib.sha256(rule_body.encode()).hexdigest()
+    ]
+    assert source.rules[0].body == rule_body
+    assert source.rules[0].source_document_ids == (V1_DOCUMENT_ID,)
+
+    # Legacy consumers keep the exact same behaviour through the projection.
+    projected = project_legacy_technical_extraction(canonical)
+    included = {item.value: item for item in projected.items}
+    assert included[domain].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    assert included[domain].source_ids == (str(V1_DOCUMENT_ID),)
+    assert projected.rules[0].body == rule_body

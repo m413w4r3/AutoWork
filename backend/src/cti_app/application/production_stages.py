@@ -14,16 +14,20 @@ from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_publication_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import (
+    legacy_technical_extraction_from_payload,
+    production_extraction_metadata,
+)
 from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
-    technical_extraction_from_json,
 )
 from cti_app.application.production_references import (
     PRODUCTION_REFERENCE_PARSER_VERSION,
     load_reference_projection,
     production_reference_corpus_metadata,
     production_reference_corpus_to_json,
+    report_source_labels,
 )
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.publication_builder import build_publication_document
@@ -33,6 +37,10 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
+)
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -163,19 +171,28 @@ class ExtractionService(_ArtifactPayloadMixin):
 
     async def store_extraction_result(
         self,
+        *,
         run_id: UUID,
         subject_id: UUID,
         input_hash: str,
-        raw_result: str,
-        canonical_json: dict[str, Any],
-        model_run_id: UUID | None = None,
-        conversation_turn_id: UUID | None = None,
+        extraction: ProductionExtractionV1,
         warnings: list[str] | None = None,
         verification_diagnostics: dict[str, Any] | None = None,
         repair_evidence_blob_id: UUID | None = None,
         repair_evidence_entry_count: int | None = None,
         repair_evidence_index: list[dict[str, Any]] | None = None,
     ) -> ProductionArtifact:
+        """Persist one EXTRACTION artifact from the canonical V1 contract.
+
+        The service owns the serialization: the canonical blob is the
+        ``ProductionExtractionV1`` payload and PostgreSQL only stores a bounded
+        counter/version projection.  An extraction may need several model
+        calls, so the run-level artifact names no single model run and keeps no
+        RAW: model provenance lives on the source checkpoints.
+        """
+
+        canonical_payload = production_extraction_to_json(extraction)
+        bounded_metadata = production_extraction_metadata(extraction)
         async with self._uow_factory() as uow:
             prior_versions = [
                 artifact.version
@@ -184,14 +201,8 @@ class ExtractionService(_ArtifactPayloadMixin):
             ]
             version = max(prior_versions, default=0) + 1
 
-            element_counts = {
-                category: len(items)
-                for category, items in canonical_json.items()
-                if isinstance(items, list)
-            }
-
             raw_id, canonical_id, _ = await self._store_payloads(
-                raw=raw_result, canonical=canonical_json
+                raw=None, canonical=canonical_payload
             )
             repair_evidence_metadata = None
             if repair_evidence_blob_id is not None:
@@ -217,12 +228,9 @@ class ExtractionService(_ArtifactPayloadMixin):
                 status=ProductionArtifactStatus.VERIFIED,
                 raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
-                model_run_id=model_run_id,
-                conversation_turn_id=conversation_turn_id,
                 metadata={
-                    "element_counts": element_counts,
+                    **bounded_metadata,
                     "warnings": warnings or [],
-                    "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
                     "deterministic_verification": verification_diagnostics or {},
                     **(
@@ -657,8 +665,9 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         report = await load_reference_projection(self._artifact_store, references_artifact)
         if report is None:
             raise ValueError("References payload is not readable")
-        extraction = technical_extraction_from_json(
-            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+        extraction = legacy_technical_extraction_from_payload(
+            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id),
+            source_labels=report_source_labels(report),
         )
         synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)
         return report, extraction, synthesis_text
