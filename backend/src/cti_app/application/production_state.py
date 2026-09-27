@@ -29,7 +29,7 @@ from cti_app.application.production_parsers import (
     TechnicalExtraction,
     reference_report_from_json,
     reference_report_to_json,
-    technical_extraction_from_json,
+    technical_extraction_to_json,
     validate_synthesis,
 )
 from cti_app.application.production_references import (
@@ -37,6 +37,10 @@ from cti_app.application.production_references import (
     production_reference_corpus_from_json,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
+from cti_app.application.production_stages import (
+    extraction_compatibility_view,
+    legacy_technical_extraction_from_payload,
+)
 from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,
@@ -260,7 +264,9 @@ def _validate_parsers(
 ) -> tuple[ReferenceReport, TechnicalExtraction]:
     try:
         report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
-        extraction = technical_extraction_from_json(snapshot.artifacts.extraction.canonical_content)
+        extraction = legacy_technical_extraction_from_payload(
+            snapshot.artifacts.extraction.canonical_content
+        )
         synthesis_result: ParseResult[str] = validate_synthesis(
             snapshot.artifacts.synthesis.rendered_content, report, extraction
         )
@@ -391,8 +397,19 @@ def _exported_repair_block(
 
 
 def _portable_extraction_content(content: dict[str, Any]) -> dict[str, Any]:
-    """Keep canonical extraction data, excluding model-run provenance."""
-    portable = dict(content)
+    """Project any extraction payload onto the legacy contract V4 still carries.
+
+    An AW-011 ``ProductionExtractionV1`` payload is projected one way through
+    the single compatibility boundary, so V4 keeps its historical
+    ``TechnicalExtraction`` shape and never exposes the canonical contract to a
+    V4 reader.  A genuinely legacy payload travels unchanged: the state
+    transfer never promotes it into the canonical contract.  Model-run
+    provenance is not part of the portable V4 contract either way.
+    """
+    view = extraction_compatibility_view(content)
+    portable = (
+        technical_extraction_to_json(view.legacy) if view.canonical is not None else dict(content)
+    )
     for collection_name in ("items", "rules"):
         collection = portable.get(collection_name)
         if isinstance(collection, list):

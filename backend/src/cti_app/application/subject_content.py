@@ -12,11 +12,8 @@ from cti_app.application.production_normalization import (
     display_indicator_value,
     normalize_indicator_value,
 )
-from cti_app.application.production_parsers import (
-    DisplayPolicy,
-    IndicatorStatus,
-    technical_extraction_from_json,
-)
+from cti_app.application.production_parsers import DisplayPolicy, IndicatorStatus
+from cti_app.application.production_stages import legacy_technical_extraction_from_payload
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -121,7 +118,7 @@ class SubjectContentService:
             )
             if artifact is None or artifact.canonical_blob_id is None:
                 return []
-            extraction = technical_extraction_from_json(
+            extraction = legacy_technical_extraction_from_payload(
                 await self._artifact_store.read_json(artifact.canonical_blob_id)
             )
 

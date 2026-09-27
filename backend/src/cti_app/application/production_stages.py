@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -14,6 +15,7 @@ from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_publication_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import project_legacy_technical_extraction
 from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
@@ -34,10 +36,53 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
 )
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_from_json,
+)
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
 )
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionCompatibilityView:
+    """One extraction payload decoded through the single AW-011 boundary.
+
+    ``legacy`` is the ``TechnicalExtraction`` view every not-yet-migrated
+    consumer keeps reading: an AW-011 ``ProductionExtractionV1`` payload is
+    projected one way through ``project_legacy_technical_extraction``, while a
+    payload that is genuinely the pre-AW-011 contract is already legacy data.
+
+    ``canonical`` is the loaded ``ProductionExtractionV1`` when the payload is
+    the canonical contract and ``None`` otherwise.  The reverse direction --
+    rebuilding the canonical contract from a legacy extraction -- deliberately
+    does not exist.
+    """
+
+    legacy: TechnicalExtraction
+    canonical: ProductionExtractionV1 | None
+
+
+def extraction_compatibility_view(payload: Mapping[str, Any]) -> ExtractionCompatibilityView:
+    """Decode one extraction payload through the compatibility boundary."""
+    try:
+        canonical = production_extraction_from_json(payload)
+    except ValueError:
+        return ExtractionCompatibilityView(
+            legacy=technical_extraction_from_json(dict(payload)),
+            canonical=None,
+        )
+    return ExtractionCompatibilityView(
+        legacy=project_legacy_technical_extraction(canonical),
+        canonical=canonical,
+    )
+
+
+def legacy_technical_extraction_from_payload(payload: Mapping[str, Any]) -> TechnicalExtraction:
+    """Return only the legacy view of one extraction payload."""
+    return extraction_compatibility_view(payload).legacy
 
 
 def compute_input_hash(input_data: dict[str, Any]) -> str:
@@ -657,7 +702,7 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         report = await load_reference_projection(self._artifact_store, references_artifact)
         if report is None:
             raise ValueError("References payload is not readable")
-        extraction = technical_extraction_from_json(
+        extraction = legacy_technical_extraction_from_payload(
             await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
         )
         synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)

@@ -46,6 +46,7 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_extraction import load_legacy_technical_extraction
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
@@ -59,7 +60,6 @@ from cti_app.application.production_parsers import (
     q2_source_output_from_json,
     q2_source_output_to_json,
     reference_report_to_json,
-    technical_extraction_from_json,
     technical_extraction_to_json,
     validate_synthesis,
 )
@@ -122,6 +122,7 @@ from cti_app.application.production_stages import (
     ReferenceResearchService,
     SynthesisService,
     compute_input_hash,
+    legacy_technical_extraction_from_payload,
 )
 from cti_app.application.production_synthesis_revision import (
     MAX_SYNTHESIS_REVISION_CONTEXT_BYTES,
@@ -1343,7 +1344,7 @@ class ProductionWorkflowOrchestrator:
                 if historical_extraction.created_at > candidate.created_at:
                     continue
                 try:
-                    historical = technical_extraction_from_json(
+                    historical = legacy_technical_extraction_from_payload(
                         await self._artifact_store.read_json(
                             cast(UUID, historical_extraction.canonical_blob_id)
                         )
@@ -1410,7 +1411,7 @@ class ProductionWorkflowOrchestrator:
         )
         for extraction_artifact in extraction_artifacts:
             try:
-                extraction = technical_extraction_from_json(
+                extraction = legacy_technical_extraction_from_payload(
                     await self._artifact_store.read_json(
                         cast(UUID, extraction_artifact.canonical_blob_id)
                     )
@@ -1826,7 +1827,7 @@ class ProductionWorkflowOrchestrator:
                 if report is not None:
                     loaded["report"] = report
             if extraction.canonical_blob_id is not None:
-                loaded["extraction"] = technical_extraction_from_json(
+                loaded["extraction"] = legacy_technical_extraction_from_payload(
                     await store.read_json(extraction.canonical_blob_id)
                 )
             if synthesis.rendered_blob_id is not None:
@@ -5178,9 +5179,18 @@ class ProductionWorkflowOrchestrator:
                 relevant_source_urls={source.canonical_url for source in report.sources},
             )
             synthesis_policy_allows = synthesis_ctx.external_llm_allowed
-            extraction_payload = technical_extraction_from_json(
-                await self._artifact_store.read_json(extraction.canonical_blob_id)
+            extraction_payload = await load_legacy_technical_extraction(
+                uow_factory=self._uow_factory,
+                artifact_store=self._artifact_store,
+                run_id=run.id,
             )
+            if extraction_payload is None:
+                return {
+                    "stage": "synthesis",
+                    "status": "terminal_error",
+                    "error_code": "synthesis_inputs_missing",
+                    "error": "Extraction payload is not readable",
+                }
             subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
             collections = await uow.source_collections.list_for_subject(run.subject_id)
             source_tiers_by_url: dict[str, str] = {}
