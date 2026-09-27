@@ -1,4 +1,4 @@
-"""Source-local evidence gate for Q2 IOC/rule proposals.
+"""Source-local evidence gate for Q2 proposals.
 
 This module deliberately knows about one source text only.  It does not assign
 provenance, call external services, or attempt to repair a model proposal.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from html import unescape
 from html.parser import HTMLParser
@@ -24,7 +25,7 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "6"
+SOURCE_EVIDENCE_VERSION = "7"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
@@ -425,10 +426,8 @@ def verify_ioc_rules_output_against_source(
     """Keep only IOC/rule proposals with literal proof in ``source_text``.
 
     Facts and events are outside the IOC_RULES contract and are always
-    dropped.  Every surviving proposal is proven locally, keeps its exact value
-    or rule body and loses its model-supplied narrative context.  Canonical
-    provenance and evidence quotes are attached later, by the canonical
-    builder, from the same archived document.
+    dropped.  Every surviving proposal keeps its exact value or rule body,
+    loses its model-supplied context and carries its local evidence quote.
     """
     return _verify_output_against_source(output, source_text, preserve_narrative=False)
 
@@ -439,12 +438,10 @@ def verify_q2_output_against_source(
 ) -> SourceEvidenceResult:
     """Gate archived Q2 output against the exact archived document.
 
-    Every fact, event, artifact and rule must be proven locally; a dated event
-    must have its date supported by the same evidence area as its text.
-    Surviving artifacts and rules keep their exact value or body while
-    model-supplied narrative context is removed; proven facts and events are
-    preserved for synthesis.  Canonical provenance and evidence quotes are
-    attached later, by the canonical builder, from the same archived document.
+    Every fact, event, artifact and rule must be proven locally and carries
+    its local evidence quote; a dated event must state its date inside the
+    same evidence area.  Surviving artifacts and rules keep their exact value
+    or body while model-supplied context is removed.
     """
     return _verify_output_against_source(output, source_text, preserve_narrative=True)
 
@@ -453,32 +450,166 @@ def _evidence_missing_reason(document: SourceEvidenceDocument, code: str) -> str
     return "source_evidence_not_text_verifiable" if document.has_unverifiable_visuals else code
 
 
-def _event_is_proven(
-    event: Q2EventProposal,
-    document: SourceEvidenceDocument,
-) -> bool:
-    """Prove an event text locally, and its date inside the same evidence area.
+#: Upper bound of one canonical evidence quote.  A longer structural area is
+#: cut to a deterministic window around the proven value.
+MAX_EVIDENCE_QUOTE_CHARS = 1_000
+_QUOTE_WINDOW_CHARS = 240
 
-    The whole source text is only an evidence area when the document exposes no
-    structural span at all.  A dated event is proven only when the date is
-    stated in the very area that carries the event text, so a date is never
-    borrowed from an unrelated part of the publication.
+_MONTHS_EN = (
+    "january",
+    "february",
+    "march",
+    "april",
+    "may",
+    "june",
+    "july",
+    "august",
+    "september",
+    "october",
+    "november",
+    "december",
+)
+_MONTHS_FR = (
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+)
+
+
+def _date_renderings(value: date) -> tuple[str, ...]:
+    """The published spellings that state exactly one calendar date."""
+    day, month, year = value.day, value.month, value.year
+    days = {str(day), f"{day:02d}"}
+    english = {_MONTHS_EN[month - 1], _MONTHS_EN[month - 1][:3]}
+    if month == 9:
+        english.add("sept")
+    ordinal = {1: "st", 2: "nd", 3: "rd", 21: "st", 22: "nd", 23: "rd", 31: "st"}.get(day, "th")
+    renderings = {
+        value.isoformat(),
+        f"{year}/{month:02d}/{day:02d}",
+        f"{day:02d}/{month:02d}/{year}",
+        f"{month:02d}/{day:02d}/{year}",
+        f"{day:02d}.{month:02d}.{year}",
+        f"{day:02d}-{month:02d}-{year}",
+    }
+    for name in english:
+        for rendered_day in (*days, f"{day}{ordinal}"):
+            renderings.add(f"{rendered_day} {name} {year}")
+            renderings.add(f"{rendered_day} {name}, {year}")
+            renderings.add(f"{name} {rendered_day}, {year}")
+            renderings.add(f"{name} {rendered_day} {year}")
+            renderings.add(f"{name}. {rendered_day}, {year}")
+    french_days = {*days, "1er"} if day == 1 else days
+    for rendered_day in french_days:
+        renderings.add(f"{rendered_day} {_MONTHS_FR[month - 1]} {year}")
+    return tuple(sorted(renderings))
+
+
+def _date_is_stated(area: str, value: date) -> bool:
+    folded = area.lower()
+    return any(rendering in folded for rendering in _date_renderings(value))
+
+
+def _find(view: str, needle: str) -> int:
+    """Case-insensitive search that never shifts the quoted positions."""
+    folded_view, folded_needle = view.lower(), needle.lower()
+    if len(folded_view) == len(view) and len(folded_needle) == len(needle):
+        return folded_view.find(folded_needle)
+    return view.find(needle)
+
+
+def _quote_around(view: str, start: int, length: int) -> str:
+    if len(view) <= MAX_EVIDENCE_QUOTE_CHARS:
+        return view
+    window_start = max(0, start - _QUOTE_WINDOW_CHARS)
+    window_end = min(len(view), start + length + _QUOTE_WINDOW_CHARS)
+    return view[window_start:window_end][:MAX_EVIDENCE_QUOTE_CHARS].strip()
+
+
+def _evidence_areas(document: SourceEvidenceDocument) -> tuple[str, ...]:
+    """Structural areas first; whole views only when no span exists."""
+    areas = tuple(
+        span.text
+        for span in document.spans
+        if span.text and span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
+    )
+    if areas:
+        return areas
+    return tuple(view for view in (document.parsed_text, document.decoded_source_view) if view)
+
+
+def locate_text_evidence(
+    document: SourceEvidenceDocument,
+    anchor: str,
+    *,
+    stated_date: date | None = None,
+) -> str | None:
+    """Return the local quote proving ``anchor``, or ``None``.
+
+    The anchor must appear, whitespace-collapsed and case-insensitively, in one
+    structural area of the exact archived document.  When ``stated_date`` is
+    given, the same area must also state that calendar date, so a date is never
+    borrowed from an unrelated part of the publication.  An undated anchor
+    wrapped across two structural areas is still found in the whole views.
     """
-    anchor = _text_comparison_view(event.text)
-    if not anchor:
-        return False
-    date_marker = event.event_date.isoformat() if event.event_date is not None else None
-    areas = tuple(span.text for span in document.spans if span.text)
-    if not areas and document.decoded_source_view:
-        areas = (document.decoded_source_view,)
-    for area in areas:
+    needle = _text_comparison_view(anchor)
+    if not needle:
+        return None
+    for area in _evidence_areas(document):
         view = _text_comparison_view(area)
-        if anchor not in view:
+        position = _find(view, needle)
+        if position < 0:
             continue
-        if date_marker is not None and date_marker not in view:
+        if stated_date is not None and not _date_is_stated(view, stated_date):
             continue
-        return True
-    return False
+        return _quote_around(view, position, len(needle))
+    if stated_date is not None:
+        return None
+    for whole in (document.parsed_text, document.decoded_source_view):
+        view = _text_comparison_view(whole)
+        position = _find(view, needle)
+        if position >= 0:
+            return _quote_around(view, position, len(needle))
+    return None
+
+
+def _first_located(
+    document: SourceEvidenceDocument,
+    anchors: tuple[str, ...],
+    *,
+    stated_date: date | None = None,
+) -> str | None:
+    for anchor in anchors:
+        quote = locate_text_evidence(document, anchor, stated_date=stated_date)
+        if quote is not None:
+            return quote
+    return None
+
+
+def _artifact_quote(artifact: Q2ArtifactProposal, document: SourceEvidenceDocument) -> str:
+    """Quote the structural area of a proven artifact, else its literal value."""
+    candidate = _artifact_comparison_view(artifact.value)
+    for span in source_evidence_context_for_artifact(artifact, document):
+        view = _text_comparison_view(_artifact_comparison_view(span.text))
+        position = _find(view, candidate)
+        return _quote_around(view, max(position, 0), len(candidate))
+    return candidate[:MAX_EVIDENCE_QUOTE_CHARS]
+
+
+def _rule_quote(rule: Q2RuleProposal, document: SourceEvidenceDocument) -> str:
+    body = _text_comparison_view(rule.body)
+    spans = source_evidence_context_for_rule(rule, document)
+    area = _text_comparison_view(spans[0].text) if spans else body
+    return _quote_around(area, max(_find(area, body), 0), len(body))
 
 
 def _verify_output_against_source(
@@ -487,7 +618,12 @@ def _verify_output_against_source(
     *,
     preserve_narrative: bool,
 ) -> SourceEvidenceResult:
-    """Apply the shared source-local evidence gate to every proposal kind."""
+    """Apply the shared source-local evidence gate to every proposal kind.
+
+    Every surviving proposal carries, in ``evidence_quote``, the deterministic
+    quote of the exact archived document that proves it; a model-supplied quote
+    is only ever an anchor to locate, never evidence by itself.
+    """
     evidence_document = (
         source_text
         if isinstance(source_text, SourceEvidenceDocument)
@@ -501,10 +637,7 @@ def _verify_output_against_source(
     # Un IOC publié dans une cellule de tableau est souvent replié : le rendu
     # texte insère un saut de ligne ou une suite d'espaces au milieu du token.
     # La vue compactée retire seulement ces coupures, sans rien réécrire.
-    source_views = (
-        *base_source_views,
-        *(_artifact_unwrapped_view(value) for value in base_source_views),
-    )
+    unwrapped_source_views = tuple(_artifact_unwrapped_view(value) for value in base_source_views)
     text_source_views = tuple(
         _text_comparison_view(value)
         for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
@@ -528,76 +661,91 @@ def _verify_output_against_source(
         proposal_index += 1
         if not preserve_narrative:
             continue
-        anchor = _text_comparison_view(fact.value)
-        if anchor and any(anchor in view for view in text_source_views):
-            facts.append(fact)
-        else:
-            rejections.append(
-                SourceEvidenceRejection(
-                    proposal_index=proposal_index,
-                    proposal_kind="fact",
-                    reason_code=_evidence_missing_reason(
-                        evidence_document, "source_fact_evidence_missing"
-                    ),
-                    value=fact.value,
-                )
+        quote = _first_located(evidence_document, (fact.evidence_quote, fact.value))
+        if quote is not None:
+            facts.append(fact.model_copy(update={"evidence_quote": quote}))
+            continue
+        rejections.append(
+            SourceEvidenceRejection(
+                proposal_index=proposal_index,
+                proposal_kind="fact",
+                reason_code=_evidence_missing_reason(
+                    evidence_document, "source_fact_evidence_missing"
+                ),
+                value=fact.value,
             )
+        )
 
     for event in output.events:
         proposal_index += 1
         if not preserve_narrative:
             continue
-        if _event_is_proven(event, evidence_document):
-            events.append(event.model_copy(update={"context": "", "evidence_quote": ""}))
-        else:
-            rejections.append(
-                SourceEvidenceRejection(
-                    proposal_index=proposal_index,
-                    proposal_kind="event",
-                    reason_code=_evidence_missing_reason(
-                        evidence_document, "source_event_evidence_missing"
-                    ),
-                    value=event.text,
-                )
+        quote = _first_located(
+            evidence_document,
+            (event.evidence_quote, event.text),
+            stated_date=event.event_date,
+        )
+        if quote is not None:
+            events.append(event.model_copy(update={"evidence_quote": quote}))
+            continue
+        rejections.append(
+            SourceEvidenceRejection(
+                proposal_index=proposal_index,
+                proposal_kind="event",
+                reason_code=_evidence_missing_reason(
+                    evidence_document, "source_event_evidence_missing"
+                ),
+                value=event.text,
             )
+        )
 
     for artifact in output.artifacts:
         proposal_index += 1
-        if any(_artifact_is_proven(artifact, source) for source in base_source_views):
-            artifacts.append(artifact.model_copy(update={"context": "", "evidence_quote": ""}))
-        elif any(_artifact_is_proven(artifact, source) for source in source_views):
+        proven = any(_artifact_is_proven(artifact, source) for source in base_source_views)
+        if not proven and any(
+            _artifact_is_proven(artifact, source) for source in unwrapped_source_views
+        ):
             warnings.append("artifact_proven_after_unwrap")
-            artifacts.append(artifact.model_copy(update={"context": "", "evidence_quote": ""}))
-        else:
-            rejections.append(
-                SourceEvidenceRejection(
-                    proposal_index=proposal_index,
-                    proposal_kind="artifact",
-                    reason_code=(
-                        "source_evidence_not_text_verifiable"
-                        if evidence_document.has_unverifiable_visuals
-                        else "source_evidence_missing"
-                    ),
-                    value=artifact.value,
-                    artifact_type=artifact.artifact_type,
+            proven = True
+        if proven:
+            artifacts.append(
+                artifact.model_copy(
+                    update={
+                        "context": "",
+                        "evidence_quote": _artifact_quote(artifact, evidence_document),
+                    }
                 )
             )
+            continue
+        rejections.append(
+            SourceEvidenceRejection(
+                proposal_index=proposal_index,
+                proposal_kind="artifact",
+                reason_code=_evidence_missing_reason(evidence_document, "source_evidence_missing"),
+                value=artifact.value,
+                artifact_type=artifact.artifact_type,
+            )
+        )
 
     for rule in output.rules:
         proposal_index += 1
         body_view = _text_comparison_view(rule.body)
         if body_view and any(body_view in source for source in text_source_views):
-            rules.append(rule.model_copy(update={"context": "", "evidence_quote": ""}))
-        else:
-            rejections.append(
-                SourceEvidenceRejection(
-                    proposal_index=proposal_index,
-                    proposal_kind="rule",
-                    reason_code="source_rule_evidence_missing",
-                    value=rule.body,
-                    artifact_type=rule.rule_type.value,
+            rules.append(
+                rule.model_copy(
+                    update={"context": "", "evidence_quote": _rule_quote(rule, evidence_document)}
                 )
             )
+            continue
+        rejections.append(
+            SourceEvidenceRejection(
+                proposal_index=proposal_index,
+                proposal_kind="rule",
+                reason_code="source_rule_evidence_missing",
+                value=rule.body,
+                artifact_type=rule.rule_type.value,
+            )
+        )
 
     filtered = Q2SourceOutput(
         facts=facts,
@@ -608,7 +756,7 @@ def _verify_output_against_source(
     )
     return SourceEvidenceResult(
         output=filtered,
-        warnings=tuple(warnings),
+        warnings=tuple(dict.fromkeys(warnings)),
         rejections=tuple(rejections),
     )
 

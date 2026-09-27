@@ -317,7 +317,6 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
               {
                 source_document_id: "12121212-1212-4212-8212-121212121212",
                 canonical_url: "https://vendor.example/iranian-proxy",
-                title: "Iranian Proxy technical report",
                 content_sha256: "c".repeat(64),
                 tier: "core",
                 kind: "publication",
@@ -327,22 +326,28 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
                 reuse_state: "fresh",
                 facts: [
                   {
-                    category: "actor",
+                    category: "actors",
                     value: "Iranian Proxy",
+                    attack_id: null,
                     context: "Campaign attribution.",
                     evidence_quote: "Iranian Proxy conducted the campaign.",
-                    evidence_basis: "exact_quote",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [
+                      "12121212-1212-4212-8212-121212121212",
+                    ],
                   },
                 ],
                 events: [
                   {
                     event_date: "2026-08-12",
-                    date_text: "12 August 2026",
+                    date_text: null,
                     text: "The campaign was first observed.",
                     context: "Initial activity.",
-                    source_document_id: "12121212-1212-4212-8212-121212121212",
                     evidence_quote: "First observed on 12 August 2026.",
-                    evidence_basis: "date_and_event_quote",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [
+                      "12121212-1212-4212-8212-121212121212",
+                    ],
                   },
                 ],
                 indicators: [],
@@ -421,17 +426,6 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     "aria-pressed",
     "true",
   );
-  await page.goto(`/subjects/${subjectId}/production/artifacts/extraction`);
-  await expect(
-    page.getByRole("heading", { name: "Sources FULL" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("heading", { name: "Iranian Proxy technical report" }),
-  ).toBeVisible();
-  await expect(
-    page.getByText("The campaign was first observed."),
-  ).toBeVisible();
-  await expect(page.getByText(/schema_version/)).toHaveCount(0);
   await page.goBack();
 
   await expect(
@@ -461,5 +455,21 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
     ]),
   );
   expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
+
+  // The canonical extraction artifact is rendered, not dumped as JSON.
+  await page.goto(`/subjects/${subjectId}/production/artifacts/extraction`);
+  await expect(
+    page.getByRole("heading", { name: "Sources FULL" }),
+  ).toBeVisible();
+  await expect(
+    page
+      .getByRole("link", { name: "https://vendor.example/iranian-proxy" })
+      .first(),
+  ).toBeVisible();
+  await expect(
+    page.getByText("The campaign was first observed."),
+  ).toBeVisible();
+  await expect(page.getByText(/schema_version/)).toHaveCount(0);
+
   expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

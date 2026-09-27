@@ -2699,19 +2699,7 @@ async def test_subject_production_status_exposes_the_owning_batch(
     edition_id, subject_id = uuid4(), uuid4()
     _select(uow, edition_id, "TAG-900", subject_id)
     run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.FAILED)
-    run.mark_failed(
-        code="q2_source_coverage_failed",
-        message="A source could not be analysed",
-        details={
-            "source_failures": {
-                "S1": {
-                    "error_code": "source_content_invalid",
-                    "retryable": True,
-                    "contributes_to_coverage": True,
-                }
-            }
-        },
-    )
+    run.mark_failed(code="bridge_unreachable", message="The bridge was unreachable")
     await uow.production_runs.add(run)
     await uow.production_input_snapshots.add(
         SimpleNamespace(

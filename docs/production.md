@@ -134,9 +134,37 @@ Extraction est provider-agnostic : le stage demande une capacité structurée à
 (profil, TLP, `external_llm_allowed`, `do_not_submit`, taille) et le router choisit l’adapter
 autorisé. Le domaine ne connaît ni provider ni nom de modèle.
 
-Synthesis et le Repair Desk continuent de lire `TechnicalExtraction` à travers l’unique frontière
-de compatibilité `application/production_extraction.py` : `ProductionExtractionV1` est projeté
-vers le contrat legacy, jamais l’inverse.
+Chaque élément canonique porte la citation locale qui le prouve, calculée par le gate de preuve à
+partir de l’archive exacte ; la citation éventuellement proposée par le modèle n’est qu’un point
+d’ancrage à retrouver. Un événement daté n’est retenu que si la même zone structurelle du document
+énonce cette date (ISO, formes anglaises et françaises usuelles) : une date n’est jamais estimée
+ni empruntée à un paragraphe voisin. L’agrégation ne supprime aucune source : un élément publié
+par plusieurs documents reste dans l’entrée de chacun et nomme l’union des documents qui le
+publient.
+
+Échecs : une source `CORE` sans extraction FULL vérifiée bloque le stage
+(`extraction_core_source_failed`, avec `source_document_id`, `canonical_url` et
+`source_failure_code`) avant tout appel pour les sources complémentaires. Une source
+`SUPPORTING`/`TECHNICAL` en échec devient une omission `source_extraction_failed` portant son code
+d’erreur, et la production continue. Une panne prouvée avant soumission n’empêche pas les autres
+sources d’atteindre leur checkpoint durable ; le stage est ensuite rejoué avec les mêmes identités
+de `ModelRun`. Une soumission possiblement acceptée arrête tout et passe en `NEEDS_REVIEW` avec
+l’identité exacte à réconcilier.
+
+`FULL` est toujours traité source par source ; les petites captures `IOC_RULES` peuvent être
+regroupées dans un lot, uniquement entre captures soumises à la même politique de diffusion. Les
+handles `B#` du lot sont temporaires : une réponse non attribuable sans ambiguïté est rejetée pour
+la source concernée, qui est relue seule, et aucun IOC n’est redistribué entre publications.
+
+La progression publiée par le stage liste chaque source du corpus avec son tier, son profil et son
+verdict (`succeeded`, `cached`, `failed`, `omitted`).
+
+Synthesis, QA, Assembly, l’export d’état et le Repair Desk continuent de lire
+`TechnicalExtraction` à travers l’unique frontière de compatibilité
+`application/production_extraction.py` : `ProductionExtractionV1` est projeté vers le contrat
+legacy, jamais l’inverse. Cette projection étiquette chaque source avec le label de la projection
+legacy de REFERENCES (`S1`…), que ces consommateurs corrèlent encore ; AW-012 la supprimera pour
+Synthesis.
 
 ## ProductionBoard
 

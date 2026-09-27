@@ -13,7 +13,6 @@ from cti_app.application.production_artifact_verification import (
 )
 from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
-    Q2_MARKDOWN_PARSER_VERSION,
     Q2_SCHEMA_VERSION,
     DetectionRule,
     Q2ArtifactProposal,
@@ -27,8 +26,7 @@ from cti_app.application.production_parsers import (
     q2_source_output_to_json,
 )
 from cti_app.application.production_prompts import (
-    EXTRACTION_PROMPT_VERSION,
-    IOC_RULES_PROMPT_VERSION,
+    CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE,
     ProductionPromptTemplates,
 )
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
@@ -42,169 +40,24 @@ def _parse(text: str):
     return result.value
 
 
-def test_full_prompt_requires_compact_facts_iocs_and_rules() -> None:
-    prompt = ProductionPromptTemplates.get_extraction_prompt(
-        "RedKitten",
-        source_id="S1",
-        source_title="Source",
-        source_url="https://source.example/report",
-        profile=ExtractionProfile.FULL,
+def test_canonical_prompts_carry_only_the_archived_capture() -> None:
+    full = ProductionPromptTemplates.get_canonical_archive_extraction_prompt(
+        "ExampleRAT reaches evil.example.", profile=ExtractionProfile.FULL
+    )
+    light = ProductionPromptTemplates.get_canonical_archive_extraction_prompt(
+        "ExampleRAT reaches evil.example.", profile=ExtractionProfile.IOC_RULES
     )
 
-    assert "FACT <category>" in prompt
-    assert "IOC <confirmed|contextual> <type>" in prompt
-    assert "RULE <yara|sigma|suricata|snort>" in prompt
-    assert "# FACTS" not in prompt
-    assert "# IOCS" not in prompt
-    assert "# RULES" not in prompt
-    assert "indicator-status" not in prompt
-    assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
-    assert " ".join(prompt.split()).count("Perform an exhaustive subject-relevant IOC pass:") == 1
-    assert "Perform an exhaustive IOC pass:" not in " ".join(prompt.split())
-    assert prompt.count("**Subject**: RedKitten") == 1
-    assert "https://source.example/report" in prompt
-    assert "<ARCHIVED_SOURCE>" not in prompt
-    assert "images/screenshots" in prompt
-    one_line = " ".join(prompt.split())
-    assert "Source-local boundary is mandatory." in one_line
-    assert "Do not follow a link to another publication, IOC page, repository" in one_line
-    assert "appendices/annexes reachable from the publication" not in one_line
-    assert "Do not repeat the input source URL merely as provenance." in one_line
-    assert (
-        "Extract a URL indicator only when this exact page publishes it; never follow a "
-        "linked URL to obtain an indicator."
-    ) in one_line
-    assert "Emit no source id, URL, provenance" not in one_line
-    assert "Never repeat its URL" not in one_line
-    assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert EXTRACTION_PROMPT_VERSION == "18"
-    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v7"
-
-
-def test_ioc_rules_prompt_forbids_facts_and_narrative_extraction() -> None:
-    prompt = ProductionPromptTemplates.get_extraction_prompt(
-        "RedKitten",
-        source_title="Source",
-        source_url="https://source.example/report",
-        profile=ExtractionProfile.IOC_RULES,
-    )
-
-    assert "IOC <confirmed|contextual> <type>" in prompt
-    assert "RULE <yara|sigma|suricata|snort>" in prompt
-    assert "FACT <category>" not in prompt
-    assert "# IOCS" not in prompt
-    assert "# RULES" not in prompt
-    assert "do not extract FACTS" in prompt
-    assert "narrative" in prompt
-    assert "<literal body>\n```\n\nUNCERTAINTIES" in prompt
-    assert " ".join(prompt.split()).count("Perform an exhaustive subject-relevant IOC pass:") == 1
-    assert "Perform an exhaustive IOC pass:" not in " ".join(prompt.split())
-    assert prompt.count("**Subject**: RedKitten") == 1
-    assert "https://source.example/report" in prompt
-    assert "<ARCHIVED_SOURCE>" not in prompt
-    assert "images/screenshots" in prompt
-    one_line = " ".join(prompt.split())
-    assert "Source-local boundary is mandatory." in one_line
-    assert "Do not follow a link to another publication, IOC page, repository" in one_line
-    assert "appendices/annexes reachable from the publication" not in one_line
-    assert "Do not repeat the input source URL merely as provenance." in one_line
-    assert (
-        "Extract a URL indicator only when this exact page publishes it; never follow a "
-        "linked URL to obtain an indicator."
-    ) in one_line
-    assert "Emit no source id, URL, provenance" not in one_line
-    assert "Never repeat its URL" not in one_line
-    assert "url, email, md5, sha1, sha256, sha512" in one_line
-    assert IOC_RULES_PROMPT_VERSION == "11"
-    # The transport format stays a bare value line: filtering happens during
-    # extraction, not through a new annotated wire format.
-    assert "IOC <confirmed|contextual> <type>\n- <value>" in prompt
-    assert " :: " not in prompt.split("Rules:")[0]
-
-
-@pytest.mark.parametrize("profile", [ExtractionProfile.FULL, ExtractionProfile.IOC_RULES])
-def test_q2_prompt_states_the_multi_actor_relevance_contract(profile: ExtractionProfile) -> None:
-    """The prompt, not a post-Q2 pass, carries the subject-selection contract."""
-    prompt = ProductionPromptTemplates.get_extraction_prompt(
-        "RedKitten",
-        source_title="Multi-actor report",
-        source_url="https://source.example/report",
-        profile=profile,
-    )
-    one_line = " ".join(prompt.split())
-
-    assert "**Subject**: RedKitten" in prompt
-    # relevant publication != every IOC is relevant
-    assert (
-        "Relevance of the publication does not imply relevance of every indicator"
-        " contained in it." in one_line
-    )
-    assert "Do NOT emit an IOC merely because it appears elsewhere in the same" in one_line
-    # other actor / campaign / operation / multi-actor table row -> excluded
-    for excluded in (
-        "another actor;",
-        "another campaign or operation;",
-        "another unrelated malware family;",
-        "another row/group of a multi-actor IOC table.",
-    ):
-        assert excluded in one_line
-    # ambiguous attribution -> not confirmed
-    assert (
-        "When an IOC's relationship to the subject is ambiguous, do not emit it as"
-        " confirmed." in one_line
-    )
-    # shared generic service -> not an IOC on its own, but a discriminating
-    # subject-specific artifact stays allowed
-    assert "Shared legitimate infrastructure is not a useful IOC by itself." in one_line
-    assert "must not be emitted solely because the subject used the service" in one_line
-    assert (
-        "A campaign-specific repository, account, URL, subdomain or other discriminating"
-        " artifact may be emitted when explicitly supported." in one_line
-    )
-    # detection rules follow the same boundary
-    assert "A detection rule must also be relevant to the requested Subject." in one_line
-    # exhaustive, but only after filtering
-    assert (
-        "Exhaustiveness applies after relevance filtering: find every subject-relevant"
-        " IOC, not every IOC in the publication." in one_line
-    )
-    assert "Use `confirmed` when the publication explicitly presents a value as an IOC" in one_line
-    assert (
-        "the exact operational role is unknown, or the purpose of the host is uncertain" in one_line
-    )
-    assert "Use `contextual` only when the technical value is relevant" in one_line
-    assert "Do not promote every value appearing in the publication to `confirmed`." in one_line
-    assert "do not sample, summarize, collapse ranges" in one_line
-    assert (
-        "A single table cell may contain multiple IOC literals separated by whitespace,"
-        " newline, comma or semicolon." in one_line
-    )
-    assert "emit each one on its own `- <value>` line" in one_line
-    assert (
-        "Never increase coverage by importing indicators belonging to other activities"
-        " mentioned in the source." in one_line
-    )
-    # existing safety rules are not weakened
-    for preserved in ("placeholder", "masked", "truncated", "REDACTED", "FUZZ", "IPv6"):
-        assert preserved in prompt
-    assert "UNAVAILABLE" in prompt and "EMPTY" in prompt
-
-
-def test_full_prompt_allows_only_clarifying_facts_about_another_activity() -> None:
-    prompt = ProductionPromptTemplates.get_extraction_prompt(
-        "RedKitten",
-        source_title="Multi-actor report",
-        source_url="https://source.example/report",
-        profile=ExtractionProfile.FULL,
-    )
-    one_line = " ".join(prompt.split())
-
-    assert (
-        "Facts about another activity may be emitted only when they materially clarify the"
-        " requested subject's attribution, malware sharing, infrastructure sharing,"
-        " technical relationship or uncertainty." in one_line
-    )
-    assert "Do not extract unrelated parallel activity as standalone subject facts." in one_line
+    for prompt in (full, light):
+        assert "ExampleRAT reaches evil.example." in prompt
+        assert "Do not browse the web" in prompt
+        assert "http" not in prompt.replace("evil.example", "")
+    assert "`events`" in full and "`facts`" in full
+    assert "Leave `facts` and `events`" in light
+    assert CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE == {
+        ExtractionProfile.FULL: "archive-full-v1",
+        ExtractionProfile.IOC_RULES: "archive-ioc-rules-v1",
+    }
 
 
 def test_ioc_group_parses_100_confirmed_iocs() -> None:

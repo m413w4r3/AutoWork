@@ -8,7 +8,7 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -24,6 +24,7 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_parsers import parse_q2_proposals_markdown
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import SubjectProductionService
@@ -52,19 +53,24 @@ pytestmark = pytest.mark.integration
 
 ScenarioFactory = Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario]
 
+_EXTRACTION_TEMPLATE = "production-extraction-archive-source"
+
 
 def _urls(count: int) -> tuple[str, ...]:
     return tuple(f"https://example.test/source-{index}" for index in range(1, count + 1))
 
 
 def _source_specs(urls: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    # Source checkpoints are content-addressed and the integration database is
+    # session-scoped: a per-scenario capture keeps each test's model calls its own.
+    capture = uuid4().hex
     return {
         url: {
             "status": 200,
             "mime": "text/plain",
             "body": (
                 f"ExampleRAT source {index} source-{index}.security-lab.io "
-                "was archived for this business test."
+                f"was archived for this business test (capture {capture})."
             ),
         }
         for index, url in enumerate(urls, start=1)
@@ -131,7 +137,6 @@ def _configured(
     for index, url in enumerate(urls, start=1):
         scenario.model.script.q2(
             source_url=url,
-            access_mode="live_url",
             response=_q2_response(index),
         )
     return scenario, urls
@@ -206,20 +211,21 @@ def _diagnostic_events(scenario: ProductionScenario) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def _extraction_source_model_ids(payload: Mapping[str, Any]) -> dict[str, set[str]]:
-    result: dict[str, set[str]] = {}
-    for item in payload.get("items", []):
-        if not isinstance(item, dict):
-            continue
-        source_ids = item.get("source_ids", [])
-        model_run_ids = item.get("model_run_ids", [])
-        if not isinstance(source_ids, list) or not isinstance(model_run_ids, list):
-            continue
-        for source_id in source_ids:
-            if isinstance(source_id, str):
-                result.setdefault(source_id, set()).update(
-                    value for value in model_run_ids if isinstance(value, str)
-                )
+def _captured_url(scenario: ProductionScenario, request: Any) -> str | None:
+    """The scripted URL whose archived capture one extraction request analyses."""
+    return scenario.model.script.source_url_for(request.metadata.get("source_content_sha256"))
+
+
+async def _checkpoint_model_runs(
+    scenario: ProductionScenario, payload: Mapping[str, Any]
+) -> dict[str, UUID | None]:
+    """Map each extracted source URL to the ModelRun of its checkpoint."""
+    result: dict[str, UUID | None] = {}
+    async with scenario.uow_factory() as uow:
+        for source in payload["sources"]:
+            rows = await uow.source_extractions.list_for_url(source["canonical_url"])
+            row = next(row for row in rows if str(row.id) == source["checkpoint_id"])
+            result[source["canonical_url"]] = row.model_run_id
     return result
 
 
@@ -242,11 +248,7 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
     ]
 
     def fail_s14_then_recover(request: Any) -> str | Exception:
-        if (
-            request.metadata.get("source_url") == urls[-1]
-            and request.metadata.get("access_mode") is None
-            and transient_failures
-        ):
+        if _captured_url(scenario, request) == urls[-1] and transient_failures:
             return transient_failures.pop(0)
         return original_response_for(request)
 
@@ -285,25 +287,17 @@ async def test_retryable_source_recovery_reuses_thirteen_checkpoints(
     assert extraction.status is ProductionArtifactStatus.VERIFIED
     assert extraction.canonical_blob_id is not None
     payload = await scenario.artifact_store.read_json(extraction.canonical_blob_id)
-    ids_by_source = _extraction_source_model_ids(payload)
-    for index, url in enumerate(urls[:-1], start=1):
-        assert str(first_model_ids[url]) in ids_by_source[f"S{index}"]
-        source_item = next(
-            item for item in payload["items"] if item["value"] == f"source-{index}.security-lab.io"
-        )
-        assert set(source_item["model_run_ids"]) == {str(first_model_ids[url])}
-    s14_item = next(
-        item for item in payload["items"] if item["value"] == "source-14.security-lab.io"
-    )
-    assert set(s14_item["model_run_ids"]) == {str(s14_calls[-1].model_run_id)}
-
-    diagnostics = extraction.metadata["deterministic_verification"]
-    assert diagnostics["cache_hits"] == 13
-    assert diagnostics["model_calls_avoided"] == 13
-    reused = [
-        event for event in _diagnostic_events(scenario) if event.get("event") == "q2.source.reused"
-    ]
-    assert {event["source_id"] for event in reused} >= {f"S{index}" for index in range(1, 14)}
+    # The recovery generation reused the thirteen durable checkpoints, each
+    # still pointing at the ModelRun of the first generation.
+    checkpoint_runs = await _checkpoint_model_runs(scenario, payload)
+    reuse_states = {source["canonical_url"]: source["reuse_state"] for source in payload["sources"]}
+    assert {url: reuse_states[url] for url in urls[:-1]} == dict.fromkeys(urls[:-1], "reused")
+    for url in urls[:-1]:
+        assert checkpoint_runs[url] == first_model_ids[url]
+    assert checkpoint_runs[urls[-1]] == s14_calls[-1].model_run_id
+    assert reuse_states[urls[-1]] == "fresh"
+    assert extraction.metadata["reused_source_count"] == 13
+    assert extraction.metadata["deterministic_verification"]["model_calls"] == 1
 
     async with scenario.uow_factory() as uow:
         for model_run_id in first_model_ids.values():
@@ -321,7 +315,6 @@ async def test_terminal_source_failure_does_not_schedule_a_next_generation(
     scenario, urls = _configured(production_scenario_factory, count=14)
     scenario.model.script.q2(
         source_url=urls[-1],
-        access_mode="live_url",
         response="not Q2 markdown",
     )
 
@@ -331,7 +324,10 @@ async def test_terminal_source_failure_does_not_schedule_a_next_generation(
     assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert run.current_stage is ProductionStage.EXTRACTION
     assert run.pipeline_generation == 0
-    assert run.error_code == "q2_source_coverage_failed"
+    assert run.error_code == "extraction_core_source_failed"
+    assert run.error_details is not None
+    assert run.error_details["canonical_url"] == urls[-1]
+    assert run.error_details["source_failure_code"] == "extraction_source_output_invalid"
     persisted_run, artifacts, item, batch = await _state(scenario)
     assert persisted_run.id == run.id
     assert item is not None and item.auto_recovery_count == 0
@@ -341,8 +337,6 @@ async def test_terminal_source_failure_does_not_schedule_a_next_generation(
     assert [artifact.stage for artifact in artifacts] == [ProductionArtifactStage.REFERENCES]
     await _assert_artifact_invariants(scenario, artifacts)
 
-    failures = run.error_details["source_failures"] if run.error_details else {}
-    assert failures["S14"]["retryable"] is False
     jobs = await _jobs_for_run(scenario)
     assert all(job.input_parameters["pipeline_generation"] == 0 for job in jobs)
     assert not any(job.input_parameters["pipeline_generation"] > 0 for job in jobs)
@@ -370,9 +364,9 @@ async def test_mixed_source_retryability_never_opens_global_recovery(
     )
 
     def mixed_failures(request: Any) -> str | Exception:
-        if request.metadata.get("source_url") == urls[-2]:
-            return "not Q2 markdown"
-        if request.metadata.get("source_url") == urls[-1]:
+        if _captured_url(scenario, request) == urls[-2]:
+            return "not a structured answer"
+        if _captured_url(scenario, request) == urls[-1]:
             return retryable_failure
         return original_response_for(request)
 
@@ -383,11 +377,16 @@ async def test_mixed_source_retryability_never_opens_global_recovery(
     assert run.status is ProductionRunStatus.NEEDS_REVIEW
     assert run.pipeline_generation == 0
     assert run.current_stage is ProductionStage.EXTRACTION
-    assert run.error_code == "bridge_unreachable"
+    # The terminal CORE content failure stops the stage before the retryable
+    # source is ever submitted, and it is never recovered automatically.
+    assert run.error_code == "extraction_core_source_failed"
     assert run.error_details is not None
-    failures = run.error_details["source_failures"]
-    assert failures["S13"]["retryable"] is False
-    assert failures["S14"]["retryable"] is True
+    assert run.error_details["canonical_url"] == urls[-2]
+    assert not any(
+        _captured_url(scenario, call.request) == urls[-1]
+        for call in scenario.model.calls
+        if call.stage == "extraction"
+    )
 
     persisted_run, artifacts, item, batch = await _state(scenario)
     assert persisted_run.pipeline_generation == 0
@@ -558,14 +557,14 @@ async def test_duplicate_job_delivery_has_one_business_effect(
 async def test_crash_after_durable_model_response_replays_without_resubmission(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
-    scenario, _ = _configured(production_scenario_factory, count=1)
-    original_execute = scenario.model.execute
+    scenario, urls = _configured(production_scenario_factory, count=1)
+    original_extract = scenario.model.extract
     failpoint_open = True
 
-    async def crash_after_response(request: Any, role: Any) -> Any:
+    async def crash_after_response(request: Any, output_schema: Any) -> Any:
         nonlocal failpoint_open
-        result = await original_execute(request, role)
-        if request.prompt_template_id == "production-q2-url" and failpoint_open:
+        result = await original_extract(request, output_schema)
+        if request.prompt_template_id == _EXTRACTION_TEMPLATE and failpoint_open:
             failpoint_open = False
             raise BridgeTransportError(
                 "bridge_unreachable",
@@ -576,7 +575,7 @@ async def test_crash_after_durable_model_response_replays_without_resubmission(
             )
         return result
 
-    with patch.object(scenario.model, "execute", side_effect=crash_after_response):
+    with patch.object(scenario.model, "extract", side_effect=crash_after_response):
         await scenario.start()
         run = await scenario.run_until_terminal()
 
@@ -587,10 +586,14 @@ async def test_crash_after_durable_model_response_replays_without_resubmission(
     assert q2_calls[0].model_run_id is not None
     async with scenario.uow_factory() as uow:
         model_run = await uow.model_runs.get(q2_calls[0].model_run_id)
+        checkpoints = await uow.source_extractions.list_for_url(urls[0])
     assert model_run is not None
     assert model_run.status is ModelRunStatus.SUCCEEDED
+    # The retry replayed the durable answer: the provider saw one submission.
     assert model_run.submission_attempt == 1
-    assert model_run.parameters["q2_checkpoint_keys"]
+    # The URL is shared with other scenarios; the capture's checkpoint is the one
+    # produced by this exact ModelRun.
+    assert [row for row in checkpoints if row.model_run_id == model_run.id]
     _, artifacts, _, _ = await _state(scenario)
     assert (
         len(
@@ -647,7 +650,6 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     scenario, urls = _configured(production_scenario_factory, count=1)
     scenario.model.script.q2(
         source_url=urls[0],
-        access_mode="live_url",
         response=BridgeTransportError(
             "bridge_timeout",
             "the provider may already have received the prompt",
@@ -666,7 +668,6 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     # probe itself only calls GET on the bridge and never invokes the model.
     scenario.model.script.q2(
         source_url=urls[0],
-        access_mode="live_url",
         response=_q2_response(1),
     )
     registry = JobRegistry()
@@ -722,12 +723,13 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
     scenario.model.use_chatgpt_bridge_identity()
-    # Keep the adopted bytes distinct from any plain-text model output already
-    # present in the content-addressed catalog while preserving Q2 semantics.
-    q2_response = f"{_q2_response(1)}\n"
+    # The operator adopts the structured answer the provider produced; the
+    # trailing newline keeps the adopted bytes distinct in the blob catalog.
+    parsed = parse_q2_proposals_markdown(_q2_response(1))
+    assert parsed.value is not None
+    q2_response = f"{parsed.value.model_dump_json()}\n"
     scenario.model.script.q2(
         source_url=urls[0],
-        access_mode="live_url",
         response=BridgeTransportError(
             "bridge_timeout",
             "the provider may already have received the prompt",
@@ -795,13 +797,10 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
 async def test_non_blocking_skipped_source_does_not_trigger_recovery(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
-    scenario, urls = _configured(production_scenario_factory, count=1)
-    scenario.sources[urls[0]]["body"] = ""
-    scenario.model.script.q2(
-        source_url=urls[0],
-        access_mode="live_url",
-        response="UNAVAILABLE",
-    )
+    scenario, urls = _configured(production_scenario_factory, count=2)
+    scenario.restrict_core_sources((urls[0],))
+    # The SUPPORTING capture is archived but carries no readable text.
+    scenario.sources[urls[1]]["body"] = ""
 
     await scenario.start()
     run = await scenario.run_until_terminal()
@@ -811,18 +810,29 @@ async def test_non_blocking_skipped_source_does_not_trigger_recovery(
     assert run.pipeline_generation == 0
     persisted_run, artifacts, item, batch = await _state(scenario)
     assert persisted_run.extraction_progress is not None
-    source_progress = persisted_run.extraction_progress["sources"]
-    assert source_progress[0]["status"] == "skipped"
+    statuses = {
+        source["canonical_url"]: source["status"]
+        for source in persisted_run.extraction_progress["sources"]
+    }
+    assert statuses == {urls[0]: "succeeded", urls[1]: "failed"}
     assert item is not None and item.auto_recovery_count == 0
     assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
     extraction = next(
         artifact for artifact in artifacts if artifact.stage is ProductionArtifactStage.EXTRACTION
     )
-    diagnostics = extraction.metadata["deterministic_verification"]
-    assert diagnostics["source_skips"]["S1"]["blocking"] is False
-    assert diagnostics["failed_source_ids"] == []
-    assert len([call for call in scenario.model.calls if call.stage == "extraction"]) == 1
-    assert not any(call.stage == "extraction" for call in scenario.model.calls[3:])
+    assert extraction.canonical_blob_id is not None
+    payload = await scenario.artifact_store.read_json(extraction.canonical_blob_id)
+    assert payload["omitted_sources"] == [
+        {
+            "canonical_url": urls[1],
+            "tier": "supporting",
+            "collection_state": "archived",
+            "reason": "source_extraction_failed",
+            "error_code": "extraction_source_text_unreadable",
+        }
+    ]
+    extraction_calls = [call for call in scenario.model.calls if call.stage == "extraction"]
+    assert [call.source_url for call in extraction_calls] == [urls[0]]
     await _assert_artifact_invariants(scenario, artifacts)
 
 

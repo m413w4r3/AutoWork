@@ -9,6 +9,7 @@ import { SubjectProduction } from "./SubjectProduction";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const EDITION_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const CORE_DOCUMENT_ID = "11111111-1111-4111-8111-111111111111";
 const ATTACHMENT_A_URL =
   "https://www.whisper.security/attachment-a-reserve-domains.csv";
 const ATTACHMENT_B_URL =
@@ -29,6 +30,9 @@ function extractionProgress(
     ioc_rules_completed: 0,
     cache_hits: sources.filter((source) => source.status === "cached").length,
     model_calls: 0,
+    skipped_sources: sources.filter((source) =>
+      ["failed", "omitted"].includes(source.status),
+    ).length,
     confirmed_iocs: 0,
     contextual_iocs: 0,
     rules_total: 0,
@@ -36,9 +40,6 @@ function extractionProgress(
     sigma_rules: 0,
     suricata_rules: 0,
     snort_rules: 0,
-    active_source_id: null,
-    active_source_title: null,
-    active_profile: null,
     sources,
   };
 }
@@ -243,31 +244,30 @@ describe("SubjectProduction retry from stage", () => {
     },
   );
 
-  it("place le bloqueur Q2 avant le warning Attachment B", async () => {
+  it("place la source CORE bloquante avant le warning Attachment B", async () => {
     const warning = `supplemental_collection_failed:url=${ATTACHMENT_B_URL}:code=source_collection_no_success:blocked=1`;
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
           ...status("needs_review"),
-          error_code: "q2_source_coverage_failed",
-          error_message: "One or more Q1 sources could not be analysed",
+          error_code: "extraction_core_source_failed",
+          error_message: "A CORE source has no verified FULL extraction",
           error_details: {
-            failed_source_ids: ["S14"],
-            source_failures: {
-              S14: {
-                source_url: ATTACHMENT_A_URL,
-                error_code: "q2_source_unavailable",
-              },
-            },
+            source_document_id: CORE_DOCUMENT_ID,
+            canonical_url: ATTACHMENT_A_URL,
+            source_failure_code: "extraction_source_output_invalid",
           },
           warnings: [warning],
           extraction_progress: extractionProgress([
             {
-              source_id: "S14",
+              source_id: CORE_DOCUMENT_ID,
               title: "attachment-a-reserve-domains.csv",
+              canonical_url: ATTACHMENT_A_URL,
+              tier: "core",
               profile: "full",
               status: "failed",
+              reuse_state: null,
               ioc_count: 0,
               rule_count: 0,
             },
@@ -315,26 +315,17 @@ describe("SubjectProduction retry from stage", () => {
     expect(diagnostics).not.toHaveAttribute("open");
   });
 
-  it("liste plusieurs sources bloquantes sans restituer le dump JSON", async () => {
-    const sourceBUrl = "https://www.whisper.security/attachment-b.csv";
+  it("nomme la source CORE bloquante sans restituer le dump JSON", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
-          ...status("failed"),
-          error_code: "q2_source_coverage_failed",
+          ...status("needs_review"),
+          error_code: "extraction_core_source_failed",
           error_details: {
-            failed_source_ids: ["S14", "S15"],
-            source_failures: {
-              S14: {
-                source_url: ATTACHMENT_A_URL,
-                error_code: "source_content_invalid",
-              },
-              S15: {
-                source_url: sourceBUrl,
-                error_code: "q2_source_unavailable",
-              },
-            },
+            source_document_id: CORE_DOCUMENT_ID,
+            canonical_url: ATTACHMENT_A_URL,
+            source_failure_code: "extraction_source_text_unreadable",
           },
         }),
       ),
@@ -342,51 +333,53 @@ describe("SubjectProduction retry from stage", () => {
     renderProduction();
 
     const alert = await screen.findByRole("alert");
-    expect(alert).toHaveTextContent("S14");
+    expect(alert).toHaveTextContent("source CORE non analysée");
     expect(alert).toHaveTextContent(ATTACHMENT_A_URL);
-    expect(alert).toHaveTextContent("S15");
-    expect(alert).toHaveTextContent(sourceBUrl);
-    expect(alert).not.toHaveTextContent('"source_failures"');
-    expect(alert.querySelectorAll("li")).toHaveLength(2);
+    expect(alert).toHaveTextContent("extraction_source_text_unreadable");
+    expect(alert).not.toHaveTextContent('"source_document_id"');
+    expect(alert.querySelectorAll("li")).toHaveLength(1);
   });
 
-  it("affiche un skip Q2 comme warning non bloquant", async () => {
-    const progress = extractionProgress([
-      {
-        source_id: "S14",
-        title: "attachment-a-reserve-domains.csv",
-        profile: "full",
-        status: "skipped",
-        ioc_count: 0,
-        rule_count: 0,
-        skip: {
-          source_url: ATTACHMENT_A_URL,
-          reason_code: "live_unavailable_archive_unusable",
-          blocking: false,
-        },
-      },
-    ]);
-    progress.skipped_sources = 1;
-    progress.skipped_source_ids = ["S14"];
-    progress.source_skips = {
-      S14: progress.sources[0]?.skip ?? { blocking: false },
-    };
+  it("affiche une source complémentaire en échec comme warning non bloquant", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
         Response.json({
           ...status("running"),
-          extraction_progress: progress,
+          extraction_progress: extractionProgress([
+            {
+              source_id: CORE_DOCUMENT_ID,
+              title: "Rapport CORE",
+              canonical_url: "https://core.example/report",
+              tier: "core",
+              profile: "full",
+              status: "succeeded",
+              reuse_state: "fresh",
+              ioc_count: 1,
+              rule_count: 0,
+            },
+            {
+              source_id: "22222222-2222-4222-8222-222222222222",
+              title: "attachment-a-reserve-domains.csv",
+              canonical_url: ATTACHMENT_A_URL,
+              tier: "supporting",
+              profile: "ioc_rules",
+              status: "failed",
+              reuse_state: null,
+              ioc_count: 0,
+              rule_count: 0,
+            },
+          ]),
         }),
       ),
     );
     renderProduction();
 
     expect(
-      await screen.findByText("S14 — source ignorée pour l’extraction"),
+      await screen.findByText("Source complémentaire omise de l’extraction"),
     ).toBeInTheDocument();
     expect(screen.getByRole("note")).toHaveTextContent(
-      "aucune archive exploitable n’était disponible",
+      "attachment-a-reserve-domains.csv",
     );
     expect(screen.queryByRole("alert")).toBeNull();
   });
@@ -452,34 +445,6 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.getByRole("table")).toHaveTextContent(
       "source_evidence_missing",
     );
-  });
-
-  it("présente un succès avec le label d’archive de secours", async () => {
-    const progress = extractionProgress([
-      {
-        source_id: "S14",
-        title: "attachment-a-reserve-domains.csv",
-        profile: "full",
-        status: "succeeded",
-        ioc_count: 1,
-        rule_count: 0,
-        access_mode: "archive_fallback",
-      },
-    ]);
-    vi.stubGlobal(
-      "fetch",
-      vi.fn().mockResolvedValue(
-        Response.json({
-          ...status("running"),
-          extraction_progress: progress,
-        }),
-      ),
-    );
-    renderProduction();
-
-    const fallback = await screen.findByText(/Archive de secours/);
-    expect(fallback.closest("li")).toHaveClass("is-succeeded");
-    expect(screen.queryByRole("alert")).toBeNull();
   });
 
   it("ne plante pas avec des détails d’erreur nuls ou malformés", async () => {

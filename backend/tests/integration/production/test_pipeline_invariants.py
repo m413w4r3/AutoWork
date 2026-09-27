@@ -82,9 +82,9 @@ def _marker(index: int) -> str:
     return f"source-{index}.security-lab.io"
 
 
-def _source_body(index: int) -> str:
+def _source_body(index: int, *, salt: str = "") -> str:
     return (
-        f"ExampleRAT source {index} was archived on 2026-08-15\n"
+        f"{salt}ExampleRAT source {index} was archived on 2026-08-15\n"
         f"The implant beaconed to {_marker(index)}, and the loader persisted.\n"
         f"ExampleRAT is the tracked malware family of source {index}.\n"
         f"{_RULE_BODY}\n"
@@ -235,19 +235,21 @@ def _configure(
     core_urls: Sequence[str],
     technical: frozenset[str] = frozenset(),
     unavailable: frozenset[str] = frozenset(),
+    body_salt: str = "",
 ) -> tuple[ProductionScenario, CanonicalExtractionScript]:
     specs = {
         url: {
             "status": 404 if url in unavailable else 200,
             "mime": "text/plain",
-            "body": _source_body(index),
+            "body": _source_body(index, salt=body_salt),
         }
         for index, url in enumerate(urls, start=1)
     }
     scenario = factory(specs)
     scenario.restrict_core_sources(core_urls)
     scenario.model.script.references(_references(urls, technical=technical))
-    scenario.model.script.synthesis(_synthesis(urls))
+    # REFERENCES only projects the sources eligible for extraction.
+    scenario.model.script.synthesis(_synthesis([url for url in urls if url not in unavailable]))
     core = set(core_urls)
     script = CanonicalExtractionScript(
         outputs={
@@ -331,7 +333,7 @@ async def test_extraction_follows_the_frozen_corpus_tier_policy(
 
     await scenario.start()
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_details)
 
     profiles = sorted(request.metadata["profile"] for request in script.calls)
     assert profiles == ["full", "full", "ioc_rules"]
@@ -372,7 +374,16 @@ async def test_extraction_follows_the_frozen_corpus_tier_policy(
     assert [event.event_date for event in full.events] == [_EVENT_DATE]
     assert [indicator.value for indicator in full.indicators] == [_marker(1)]
     assert [rule.body for rule in full.rules] == [_RULE_BODY]
-    assert all(fact.source_document_ids == (full.source_document_id,) for fact in full.facts)
+    # ExampleRAT is published by both CORE documents: each source keeps its own
+    # entry and the fact names the union of the publishing documents.
+    both_core = tuple(
+        sorted((full.source_document_id, by_url[core[1]].source_document_id), key=str)
+    )
+    assert [fact.source_document_ids for fact in full.facts] == [both_core]
+    assert [fact.source_document_ids for fact in by_url[core[1]].facts] == [both_core]
+    assert [indicator.source_document_ids for indicator in full.indicators] == [
+        (full.source_document_id,)
+    ]
     light = by_url[supporting]
     assert light.tier is ProductionReferenceTier.SUPPORTING
     assert light.profile is ExtractionProfile.IOC_RULES
@@ -442,7 +453,7 @@ async def test_extraction_runs_without_any_network_access(
     scenario.collection_transport.request = _forbidden  # type: ignore[method-assign]
 
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_details)
     assert len(script.calls) == 2
 
 
@@ -453,8 +464,13 @@ async def test_two_providers_produce_the_same_canonical_contract(
     first_urls = _urls(2, namespace="provider-one")
     first, first_script = _configure(production_scenario_factory, first_urls, core_urls=first_urls)
     second_urls = _urls(2, namespace="provider-two")
+    # Distinct bytes: identical captures would reuse the first provider's
+    # content-addressed checkpoints instead of reaching the second provider.
     second, second_script = _configure(
-        production_scenario_factory, second_urls, core_urls=second_urls
+        production_scenario_factory,
+        second_urls,
+        core_urls=second_urls,
+        body_salt="Second provider capture. ",
     )
     second.model.use_chatgpt_bridge_identity()
 
@@ -473,8 +489,8 @@ async def test_two_providers_produce_the_same_canonical_contract(
             (
                 source.tier.value,
                 source.profile.value,
-                source.content_sha256,
                 tuple(fact.value for fact in source.facts),
+                tuple(event.event_date for event in source.events),
                 tuple(indicator.value for indicator in source.indicators),
                 tuple(rule.body for rule in source.rules),
             )
@@ -498,7 +514,7 @@ async def test_duplicate_content_keeps_two_sources_and_calls_the_model_once(
 
     await scenario.start()
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_details)
     assert len(script.calls) == 1
 
     extraction = await _canonical_extraction(scenario, run.id)
@@ -564,7 +580,7 @@ async def test_retry_without_change_reuses_the_extraction_artifact(
     scenario, script = _configure(production_scenario_factory, urls, core_urls=urls)
     await scenario.start()
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_details)
     calls = len(script.calls)
     initial = await _current_artifact(scenario, ProductionArtifactStage.EXTRACTION)
     assert initial is not None

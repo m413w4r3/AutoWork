@@ -35,10 +35,11 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "6"
+    assert SOURCE_EVIDENCE_VERSION == "7"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
-    assert result.output.artifacts[0].evidence_quote == ""
+    # The quote is the local source area, never the model-supplied quote.
+    assert result.output.artifacts[0].evidence_quote == "The domain is evil.com."
     assert result.rejections == ()
 
 
@@ -61,7 +62,10 @@ def test_full_gate_preserves_facts_but_filters_artifacts_and_rules() -> None:
         "ExampleRAT\ntitle: Kept\nlogsource:\n  product: windows",
     )
 
-    assert result.output.facts == [fact]
+    assert [(item.value, item.context) for item in result.output.facts] == [
+        (fact.value, fact.context)
+    ]
+    assert "ExampleRAT" in result.output.facts[0].evidence_quote
     assert result.output.artifacts == []
     assert len(result.output.rules) == 1
     assert result.rejections[0].reason_code == "source_evidence_missing"
@@ -366,7 +370,8 @@ def test_exact_rule_is_kept_and_narrative_fields_are_removed() -> None:
 
     assert result.output.rules[0].body == rule.body
     assert result.output.rules[0].context == ""
-    assert result.output.rules[0].evidence_quote == ""
+    assert "title: Example logsource: product: windows" in result.output.rules[0].evidence_quote
+    assert result.output.rules[0].evidence_quote != "model quote"
     assert result.rejections == ()
 
 

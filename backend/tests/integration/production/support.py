@@ -18,6 +18,8 @@ from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
+from pydantic import BaseModel
+
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
@@ -62,6 +64,8 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.production_parsers import Q2SourceOutput, parse_q2_proposals_markdown
+from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
 from cti_app.application.subject_production import ProductionBatchService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -161,58 +165,63 @@ class ScriptedModelCall:
     request: ModelRequest
 
 
+@dataclass(frozen=True, slots=True)
+class _UnstructuredAnswer:
+    text: str
+
+
 class ScriptedModelScript:
-    """Functional scenario routing for the fake model boundary."""
+    """Functional scenario routing for the fake model boundary.
+
+    Extraction requests carry no URL: they are routed by the SHA-256 of the
+    archived capture they analyse, resolved against the scripted HTTP bodies.
+    """
 
     def __init__(self) -> None:
         self._references: str | None = None
         self._synthesis: str | None = None
-        self._q2: dict[tuple[str, str], str | Exception] = {}
+        self._q2: dict[str, str | Q2SourceOutput | Exception] = {}
+        self._url_by_sha256: dict[str, str] = {}
+
+    def bind_sources(self, sources: Mapping[str, Mapping[str, object]]) -> None:
+        for url, spec in sources.items():
+            body = spec["body"]
+            encoded = body if isinstance(body, bytes) else str(body).encode("utf-8")
+            self._url_by_sha256[sha256(encoded).hexdigest()] = url
 
     def references(self, response: str) -> None:
         self._references = response
 
-    def q2(
-        self,
-        *,
-        source_url: str,
-        access_mode: str,
-        response: str | Exception,
-    ) -> None:
-        self._q2[(source_url, access_mode)] = response
+    def q2(self, *, source_url: str, response: str | Q2SourceOutput | Exception) -> None:
+        """Script the extraction of one source; Markdown is the readable Q2 dialect."""
+        self._q2[_canonical_url(source_url)] = response
 
     def synthesis(self, response: str) -> None:
         self._synthesis = response
 
-    def response_for(self, request: SafeModelRequest) -> str | Exception:
-        if request.prompt_template_id in {
-            "production-q2-url",
-            "production-q2-url-archive-fallback",
-        }:
-            source_url = request.metadata.get("source_url")
-            if not isinstance(source_url, str):
-                raise AssertionError("Q2 request has no source_url metadata")
-            access_mode = request.metadata.get("access_mode", "live_url")
-            if not isinstance(access_mode, str):
-                raise AssertionError("Q2 request has an invalid access_mode metadata")
-            return self._q2_response(source_url, access_mode)
+    def source_url_for(self, content_sha256: object) -> str | None:
+        return self._url_by_sha256.get(str(content_sha256))
 
-        if request.prompt_template_id == "production-q2-ioc-batch":
-            source_urls = request.metadata.get("batch_source_urls")
-            if not isinstance(source_urls, list) or not all(
-                isinstance(url, str) for url in source_urls
-            ):
-                raise AssertionError("Q2 batch request has no source URL metadata")
-            batch_sources = request.parameters.get("q2_batch_sources")
-            if not isinstance(batch_sources, list):
-                raise AssertionError("Q2 batch request has no B# mapping")
-            blocks = []
-            for index, source_url in enumerate(source_urls, start=1):
-                response = self._q2_response(source_url, "live_url")
-                if isinstance(response, Exception):
-                    raise response
-                blocks.append(f"@@Q2:B{index}@@\n{response}")
-            return "\n\n".join(blocks)
+    def response_for(self, request: SafeModelRequest) -> str | Exception:
+        if request.prompt_template_id == "production-extraction-archive-source":
+            response = self._q2_output(request.metadata.get("source_content_sha256"))
+            if isinstance(response, _UnstructuredAnswer):
+                return response.text
+            return response if isinstance(response, Exception) else response.model_dump_json()
+
+        if request.prompt_template_id == "production-extraction-archive-batch":
+            entries = request.metadata.get("batch_sources")
+            if not isinstance(entries, list):
+                raise AssertionError("Extraction batch request has no handle mapping")
+            outputs = []
+            for entry in entries:
+                output = self._q2_output(entry["source_content_sha256"])
+                if isinstance(output, _UnstructuredAnswer):
+                    return output.text
+                if isinstance(output, Exception):
+                    return output
+                outputs.append(Q2BatchSourceOutput(batch_id=entry["batch_id"], output=output))
+            return Q2BatchResponse(sources=outputs).model_dump_json()
 
         if request.prompt_template_id == "production-references":
             if self._references is None:
@@ -230,18 +239,29 @@ class ScriptedModelScript:
             f"{request.prompt_template_id}/{request.routing_hint.value}"
         )
 
-    def _q2_response(self, source_url: str, access_mode: str) -> str | Exception:
-        try:
-            return self._q2[(source_url, access_mode)]
-        except KeyError as exc:
-            raise AssertionError(f"No scripted Q2 response for {source_url}") from exc
+    def _q2_output(
+        self, content_sha256: object
+    ) -> Q2SourceOutput | _UnstructuredAnswer | Exception:
+        source_url = self.source_url_for(content_sha256)
+        if source_url is None or source_url not in self._q2:
+            raise AssertionError(f"No scripted Q2 response for capture {content_sha256}")
+        response = self._q2[source_url]
+        if isinstance(response, (Exception, Q2SourceOutput)):
+            return response
+        parsed = parse_q2_proposals_markdown(response)
+        if not parsed.usable or parsed.value is None:
+            # An answer that is not a Q2 source output at all.
+            return _UnstructuredAnswer(response)
+        return parsed.value
 
 
 class _ScriptedModelAdapter:
     provider = ModelProvider.FAKE
     backend = ModelBackend.FAKE
     transport = ModelTransport.FAKE
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
+    capabilities = ModelCapabilities(
+        web_search=True, background=True, conversation=True, structured_output=True
+    )
     requested_model = "scripted-production-model"
     is_external = False
 
@@ -264,11 +284,18 @@ class _ScriptedModelAdapter:
         role: ModelRole,
         output_schema: type[Any] | None = None,
     ) -> AdapterResult:
-        del role, output_schema
+        del role
         self._provider_calls.append(request)
         output_text = self._script.response_for(request)
         if isinstance(output_text, Exception):
             raise output_text
+        # Like the real adapters: validate against the schema unless the caller
+        # defers validation to its own boundary.
+        structured = (
+            output_schema.model_validate_json(output_text)
+            if output_schema is not None and request.metadata.get("defer_validation") is not True
+            else None
+        )
         conversation = request.conversation
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
@@ -278,6 +305,7 @@ class _ScriptedModelAdapter:
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
             response_id=f"scripted-response-{request.request_id or uuid4()}",
             output_text=output_text,
+            structured_output=structured,
             conversation=(
                 ConversationResult(
                     id=str(conversation.id),
@@ -345,9 +373,15 @@ class ScriptedModelGateway(ModelGateway):
         self._record_call(request)
         return await super().research(request)
 
+    async def extract(
+        self, request: ModelRequest, output_schema: type[BaseModel]
+    ) -> ModelExecution:
+        self._record_call(request)
+        return await super().extract(request, output_schema)
+
     def _record_call(self, request: ModelRequest) -> None:
-        source_urls = _request_source_urls(request)
-        if request.prompt_template_id.startswith("production-q2"):
+        source_urls = self._request_source_urls(request)
+        if request.prompt_template_id.startswith("production-extraction"):
             stage = "extraction"
         elif request.routing_hint is ModelRoutingHint.WEB_RESEARCH:
             stage = "references"
@@ -368,15 +402,17 @@ class ScriptedModelGateway(ModelGateway):
             )
         )
 
-
-def _request_source_urls(request: ModelRequest) -> tuple[str, ...]:
-    source_url = request.metadata.get("source_url")
-    if isinstance(source_url, str):
-        return (source_url,)
-    source_urls = request.metadata.get("batch_source_urls")
-    if isinstance(source_urls, list) and all(isinstance(url, str) for url in source_urls):
-        return tuple(source_urls)
-    return ()
+    def _request_source_urls(self, request: ModelRequest) -> tuple[str, ...]:
+        """The scripted URLs behind the captures of one extraction request."""
+        batch = request.metadata.get("batch_sources")
+        hashes = (
+            [entry["source_content_sha256"] for entry in batch]
+            if isinstance(batch, list)
+            else [request.metadata.get("source_content_sha256")]
+        )
+        return tuple(
+            url for url in (self.script.source_url_for(digest) for digest in hashes) if url
+        )
 
 
 class DeterministicProductionJobRunner(JobDispatcher):
@@ -522,6 +558,7 @@ class ProductionScenario:
             self.model_output_store,
             diagnostics=self.diagnostics,
         )
+        self.model.script.bind_sources(canonical_sources)
         self.model_service = ModelConversationService(
             self.uow_factory,
             self.model,

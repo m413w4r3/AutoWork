@@ -6,7 +6,6 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -16,19 +15,19 @@ from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_extraction import (
+    legacy_technical_extraction_from_payload,
     production_extraction_metadata,
-    project_legacy_technical_extraction,
 )
 from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
-    technical_extraction_from_json,
 )
 from cti_app.application.production_references import (
     PRODUCTION_REFERENCE_PARSER_VERSION,
     load_reference_projection,
     production_reference_corpus_metadata,
     production_reference_corpus_to_json,
+    report_source_labels,
 )
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.publication_builder import build_publication_document
@@ -41,52 +40,12 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
-    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
 )
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractionCompatibilityView:
-    """One extraction payload decoded through the single AW-011 boundary.
-
-    ``legacy`` is the ``TechnicalExtraction`` view every not-yet-migrated
-    consumer keeps reading: an AW-011 ``ProductionExtractionV1`` payload is
-    projected one way through ``project_legacy_technical_extraction``, while a
-    payload that is genuinely the pre-AW-011 contract is already legacy data.
-
-    ``canonical`` is the loaded ``ProductionExtractionV1`` when the payload is
-    the canonical contract and ``None`` otherwise.  The reverse direction --
-    rebuilding the canonical contract from a legacy extraction -- deliberately
-    does not exist.
-    """
-
-    legacy: TechnicalExtraction
-    canonical: ProductionExtractionV1 | None
-
-
-def extraction_compatibility_view(payload: Mapping[str, Any]) -> ExtractionCompatibilityView:
-    """Decode one extraction payload through the compatibility boundary."""
-    try:
-        canonical = production_extraction_from_json(payload)
-    except ValueError:
-        return ExtractionCompatibilityView(
-            legacy=technical_extraction_from_json(dict(payload)),
-            canonical=None,
-        )
-    return ExtractionCompatibilityView(
-        legacy=project_legacy_technical_extraction(canonical),
-        canonical=canonical,
-    )
-
-
-def legacy_technical_extraction_from_payload(payload: Mapping[str, Any]) -> TechnicalExtraction:
-    """Return only the legacy view of one extraction payload."""
-    return extraction_compatibility_view(payload).legacy
 
 
 def compute_input_hash(input_data: dict[str, Any]) -> str:
@@ -212,15 +171,11 @@ class ExtractionService(_ArtifactPayloadMixin):
 
     async def store_extraction_result(
         self,
+        *,
         run_id: UUID,
         subject_id: UUID,
         input_hash: str,
-        extraction: ProductionExtractionV1 | None = None,
-        *,
-        canonical_json: dict[str, Any] | None = None,
-        raw_result: str | None = None,
-        model_run_id: UUID | None = None,
-        conversation_turn_id: UUID | None = None,
+        extraction: ProductionExtractionV1,
         warnings: list[str] | None = None,
         verification_diagnostics: dict[str, Any] | None = None,
         repair_evidence_blob_id: UUID | None = None,
@@ -229,38 +184,15 @@ class ExtractionService(_ArtifactPayloadMixin):
     ) -> ProductionArtifact:
         """Persist one EXTRACTION artifact from the canonical V1 contract.
 
-        The service owns the serialization: it accepts a
-        :class:`ProductionExtractionV1`, writes it as the canonical blob and
-        records only a bounded counter/version projection in PostgreSQL.  A
-        pre-AW-011 ``canonical_json`` payload is still accepted so historical
-        callers keep persisting the contract they were written in; the two
-        inputs are mutually exclusive and the canonical one is the only one the
-        live workflow uses.
+        The service owns the serialization: the canonical blob is the
+        ``ProductionExtractionV1`` payload and PostgreSQL only stores a bounded
+        counter/version projection.  An extraction may need several model
+        calls, so the run-level artifact names no single model run and keeps no
+        RAW: model provenance lives on the source checkpoints.
         """
 
-        canonical_payload: dict[str, Any]
-        canonical_contract = extraction is not None
-        if extraction is not None:
-            if canonical_json is not None:
-                raise ValueError(
-                    "store_extraction_result accepts either a ProductionExtractionV1 "
-                    "or a legacy canonical_json payload, never both"
-                )
-            canonical_payload = production_extraction_to_json(extraction)
-            bounded_metadata: dict[str, Any] = production_extraction_metadata(extraction)
-        elif canonical_json is not None:
-            canonical_payload = dict(canonical_json)
-            bounded_metadata = {
-                "element_counts": {
-                    category: len(items)
-                    for category, items in canonical_payload.items()
-                    if isinstance(items, list)
-                },
-                "parser_version": canonical_payload.get("parser_version"),
-            }
-        else:
-            raise ValueError("store_extraction_result requires a canonical ProductionExtractionV1")
-
+        canonical_payload = production_extraction_to_json(extraction)
+        bounded_metadata = production_extraction_metadata(extraction)
         async with self._uow_factory() as uow:
             prior_versions = [
                 artifact.version
@@ -270,8 +202,7 @@ class ExtractionService(_ArtifactPayloadMixin):
             version = max(prior_versions, default=0) + 1
 
             raw_id, canonical_id, _ = await self._store_payloads(
-                raw=raw_result if not canonical_contract else None,
-                canonical=canonical_payload,
+                raw=None, canonical=canonical_payload
             )
             repair_evidence_metadata = None
             if repair_evidence_blob_id is not None:
@@ -297,11 +228,6 @@ class ExtractionService(_ArtifactPayloadMixin):
                 status=ProductionArtifactStatus.VERIFIED,
                 raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
-                # A canonical extraction may need several model calls: the
-                # run-level provenance lives on the source checkpoints, never
-                # on one arbitrary model run.
-                model_run_id=None if canonical_contract else model_run_id,
-                conversation_turn_id=conversation_turn_id,
                 metadata={
                     **bounded_metadata,
                     "warnings": warnings or [],
@@ -740,7 +666,8 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
         if report is None:
             raise ValueError("References payload is not readable")
         extraction = legacy_technical_extraction_from_payload(
-            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id),
+            source_labels=report_source_labels(report),
         )
         synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)
         return report, extraction, synthesis_text

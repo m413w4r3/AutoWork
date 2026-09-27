@@ -9,16 +9,13 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
-from enum import StrEnum
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from datetime import UTC, date, datetime
+from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.extraction import _html_encoding, parse_document
-from cti_app.application.iana_tlds_snapshot import IANA_TLD_SNAPSHOT_VERSION
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
@@ -40,59 +37,30 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
-from cti_app.application.production_artifact_verification import (
-    ARTIFACT_VERIFIER_VERSION,
-    Q2ProposalSubmission,
-    verify_q2_proposals,
-)
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_extraction import (
     PRODUCTION_EXTRACTION_SERVICE_VERSION,
-    ExtractionExecutionStatus,
     ExtractionPlan,
+    ExtractionRejection,
     ProductionExtractionControlError,
     ProductionExtractionService,
-    build_extraction_plan,
+    legacy_technical_extraction_from_payload,
     load_legacy_technical_extraction,
-    load_reference_corpus,
+    production_extraction_metadata,
     source_text_contract_version,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
-    Q2_EXTRACTION_CONTRACT_VERSION,
-    Q2_MARKDOWN_PARSER_VERSION,
-    IndicatorStatus,
-    ParsedSource,
     ParseResult,
-    Q2SourceOutput,
     ReferenceReport,
-    parse_q2_proposals_markdown,
-    q2_source_output_from_json,
-    q2_source_output_to_json,
     reference_report_to_json,
-    technical_extraction_to_json,
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
-    ARCHIVE_FALLBACK_PROMPT_VERSION,
-    ARCHIVED_SOURCE_ACCESS_VERSION,
-    EXTRACTION_PROMPT_VERSION,
-    EXTRACTION_PROMPT_VERSION_BY_PROFILE,
-    IOC_RULES_BATCH_PROMPT_VERSION,
-    IOC_RULES_PROMPT_VERSION,
     REFERENCES_PROMPT_VERSION,
     SYNTHESIS_FORMAT_REPAIR_VERSION,
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
-)
-from cti_app.application.production_q2_batch import (
-    Q2_BATCH_PARSER_VERSION,
-    Q2BatchCandidate,
-    Q2BatchSource,
-    make_q2_batch,
-    parse_q2_batch_response,
-    partition_q2_batch_candidates,
-    q2_batch_model_run_id,
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_references import (
@@ -106,6 +74,7 @@ from cti_app.application.production_references import (
     parse_production_reference_proposals,
     production_reference_corpus_from_json,
     production_reference_corpus_metadata,
+    report_source_labels,
 )
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
@@ -117,14 +86,6 @@ from cti_app.application.production_repairs import (
     synthesis_projection_payload,
 )
 from cti_app.application.production_resume import EXTRACTION_PROGRESS_COMPLETED_STATUSES
-from cti_app.application.production_source_evidence import (
-    SOURCE_EVIDENCE_VERSION,
-    SourceEvidenceDocument,
-    SourceEvidenceResult,
-    source_evidence_document_from_html,
-    verify_ioc_rules_output_against_source,
-    verify_q2_output_against_source,
-)
 from cti_app.application.production_stages import (
     ExtractionService,
     ProductionQAService,
@@ -132,7 +93,6 @@ from cti_app.application.production_stages import (
     ReferenceResearchService,
     SynthesisService,
     compute_input_hash,
-    legacy_technical_extraction_from_payload,
 )
 from cti_app.application.production_synthesis_revision import (
     MAX_SYNTHESIS_REVISION_CONTEXT_BYTES,
@@ -146,8 +106,7 @@ from cti_app.application.production_synthesis_revision import (
     synthesis_semantic_source_ids,
 )
 from cti_app.config import get_settings
-from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
-from cti_app.domain.discovery import SourceRole
+from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -155,9 +114,9 @@ from cti_app.domain.model_conversations import (
     ConversationTransport,
     ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRunStatus
+from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.production import (
-    ExtractionImpactPlan,
+    DetectionRuleType,
     ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
@@ -167,18 +126,12 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
-    Q2ReuseDecision,
-    Q2ReuseReason,
-    Q2ReuseStatus,
-    Q2SourceDisposition,
-    Q2SourceImpact,
-    SourceExtraction,
-    SourceExtractionStatus,
     SynthesisMode,
 )
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionReuseState,
+    ProductionExtractionOmissionReason,
     ProductionExtractionV1,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
@@ -191,18 +144,6 @@ if TYPE_CHECKING:
 # Collection states that count as "the source is available for analysis".
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 
-# Version routing decision separately from prompt/schema: changing provider policy
-# must produce a distinct persisted Q2 checkpoint.
-# "4": Q2 uses direct stateless ModelGateway requests against the live
-# publication; IOC_RULES may group several exact URLs in one web batch. Its
-# deterministic ModelRun identities include this routing policy, so changing it
-# creates fresh executions without conversations or repair turns.
-Q2_ROUTING_POLICY_VERSION = "4"
-# The provider/model selection is part of the run-local checkpoint contract.
-# Keep this separate from the routing policy so a model-policy change can
-# invalidate Q2 reuse without changing the live-web request format.
-Q2_MODEL_POLICY_VERSION = "openai-web-research-v1"
-Q2_SUCCESSFUL_CHECKPOINT_VERSION = "q2-cross-run-v2"
 # REFERENCES names only the role and routing hint; the ModelRouter owns the
 # backend choice, so this version carries no provider.
 REFERENCES_ROUTING_POLICY_VERSION = "model-router-web-research-v1"
@@ -216,9 +157,6 @@ _CONVERSATION_CLOSE_RETRY_DELAY_SECONDS = 5.0
 # deterministic source processing. This is a local proof read, never prompt
 # material.
 MAX_ARCHIVED_SOURCE_BYTES = 25 * 1024 * 1024
-# The gateway's persisted text contract is capped at 10 MB. An archive
-# fallback is either sent as one complete request or not sent at all.
-MAX_Q2_ARCHIVE_FALLBACK_PROMPT_BYTES = 10_000_000
 
 # Bridge and network hiccups are worth retrying; anything else is a dead end
 # for this attempt and must not silently burn the subject.
@@ -243,190 +181,6 @@ _REVIEW_CODES = {
 }
 
 _MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_required"
-_SOURCE_CONTENT_CODES = frozenset({"source_content_invalid", "q2_source_evidence_unavailable"})
-
-
-def _gate_archived_q2_output(
-    output: Q2SourceOutput,
-    *,
-    source_text: str | SourceEvidenceDocument,
-    profile: ExtractionProfile,
-) -> SourceEvidenceResult:
-    """Apply the profile-specific source-local gate to one parsed output."""
-    if profile is ExtractionProfile.FULL:
-        return verify_q2_output_against_source(output, source_text)
-    if profile is ExtractionProfile.IOC_RULES:
-        return verify_ioc_rules_output_against_source(output, source_text)
-    raise ValueError(f"Unsupported extraction profile: {profile}")
-
-
-class _Q2FailureClass(StrEnum):
-    GLOBAL_TRANSIENT_PRE_SUBMISSION = "global_transient_pre_submission"
-    RECONCILIATION_REQUIRED = "reconciliation_required"
-    SOURCE_CONTENT_FAILURE = "source_content_failure"
-    CONTROL_INVARIANT_FAILURE = "control_invariant_failure"
-
-
-@dataclass(frozen=True, slots=True)
-class _Q2FailureClassification:
-    failure_class: _Q2FailureClass
-    status: str
-    error_code: str
-    retryable: bool
-    phase: str
-    submission_state: str
-    contributes_to_coverage: bool
-
-
-class _Q2SourceContentFailure(ValueError):
-    code = "source_content_invalid"
-    retryable = False
-    phase = "response_validation"
-    submission_state = "post_submission"
-
-
-class _Q2SourceEvidenceUnavailable(_Q2SourceContentFailure):
-    """A live Q2 response cannot be locally validated for its source."""
-
-    code = "q2_source_evidence_unavailable"
-
-    def __init__(
-        self,
-        reason: str,
-        *,
-        expected_sha256: str | None = None,
-        blob_id: UUID | None = None,
-        code: str | None = None,
-    ) -> None:
-        super().__init__(reason)
-        if code:
-            self.code = code[:64]
-        self.details = {
-            "reason": reason,
-            **({"expected_decoded_sha256": expected_sha256} if expected_sha256 is not None else {}),
-            **({"decoded_blob_id": str(blob_id)} if blob_id is not None else {}),
-        }
-
-
-class _Q2LiveSourceUnavailable(_Q2SourceContentFailure):
-    """The model explicitly reported that the exact live source was unavailable."""
-
-    code = "q2_source_unavailable"
-
-
-def _is_q2_source_unavailable(errors: Sequence[str]) -> bool:
-    """Recognize only the parser's explicit terminal live-source response."""
-    return tuple(errors) == ("q2_source_unavailable",)
-
-
-class _Q2ControlFailure(RuntimeError):
-    code = "q2_provider_response_missing"
-    retryable = False
-    phase = "model_call"
-    submission_state = "post_submission"
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        code: str | None = None,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        super().__init__(message)
-        if code:
-            self.code = code[:64]
-        self.details = details or {}
-
-
-def _classify_q2_failure(
-    exc: Exception,
-    *,
-    provider_response_produced: bool = False,
-) -> _Q2FailureClassification:
-    """Classify one Q2 source failure before it can affect coverage.
-
-    The caller supplies only the fact that a provider response was available;
-    submission safety remains the ModelGateway's responsibility.  In
-    particular, a previously persisted ModelRun error is always a control or
-    reconciliation outcome, never a source-content failure.
-    """
-    details = getattr(exc, "details", None)
-    detail_state = details.get("submission_state") if isinstance(details, dict) else None
-    detail_phase = details.get("phase") if isinstance(details, dict) else None
-    code = str(getattr(exc, "code", "") or "")
-    retryable = bool(getattr(exc, "retryable", False))
-    phase = str(getattr(exc, "phase", None) or detail_phase or "model_call")[:64]
-    submission_state = str(getattr(exc, "submission_state", None) or detail_state or "unknown")[:32]
-
-    if code == _MODEL_SUBMISSION_RECONCILIATION_CODE:
-        return _Q2FailureClassification(
-            _Q2FailureClass.RECONCILIATION_REQUIRED,
-            "needs_review",
-            code,
-            False,
-            "reconciliation",
-            submission_state,
-            False,
-        )
-
-    # The HTTP client raises bridge_unreachable on a failed connection before
-    # it can send bytes, so this code is a safe pre-submit transport signal
-    # even though that low-level exception has no explicit state field.  The
-    # gateway remains the authority that persists NOT_SUBMITTED.
-    if (
-        submission_state == "pre_submission"
-        or (submission_state == "unknown" and code == "bridge_unreachable")
-    ) and (retryable or code in _TRANSIENT_CODES):
-        return _Q2FailureClassification(
-            _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION,
-            "transient_error",
-            code or "q2_global_transient",
-            True,
-            phase,
-            submission_state,
-            False,
-        )
-
-    # An explicit source-content code is accepted only after submission.  A
-    # ModelGatewayError from a checkpoint state has no such proof and falls
-    # through to the control/invariant class below.
-    if (
-        not retryable
-        and code in _SOURCE_CONTENT_CODES
-        and submission_state in {"post_submission", "submitted_or_unknown"}
-    ) or (provider_response_produced and not retryable and not isinstance(exc, ModelGatewayError)):
-        return _Q2FailureClassification(
-            _Q2FailureClass.SOURCE_CONTENT_FAILURE,
-            "source_failure",
-            code if code in _SOURCE_CONTENT_CODES else "source_content_invalid",
-            False,
-            phase,
-            submission_state,
-            True,
-        )
-
-    if submission_state in {"submission_attempted", "submitted_or_unknown", "post_submission"} and (
-        retryable or code in _TRANSIENT_CODES
-    ):
-        return _Q2FailureClassification(
-            _Q2FailureClass.RECONCILIATION_REQUIRED,
-            "needs_review",
-            _MODEL_SUBMISSION_RECONCILIATION_CODE,
-            False,
-            "reconciliation",
-            submission_state,
-            False,
-        )
-
-    return _Q2FailureClassification(
-        _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
-        "needs_review",
-        code or "q2_control_failure",
-        False,
-        phase,
-        submission_state,
-        False,
-    )
 
 
 def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
@@ -547,264 +301,17 @@ def _repair_problem_descriptions(result: Any) -> list[str]:
     return list(getattr(result, "errors", ()) or ())
 
 
-@dataclass(frozen=True, slots=True)
-class Q2SourcePlan:
-    """Deterministic profile assignment for one Q1 publication."""
-
-    source_id: str
-    canonical_url: str
-    profile: ExtractionProfile
-    reason: str
-
-
-def plan_q2_extraction_profiles(
-    report: ReferenceReport,
-    *,
-    snapshot: ProductionInputSnapshot | None = None,
-    period_start: date | str | None = None,
-    period_end: date | str | None = None,
-) -> tuple[Q2SourcePlan, ...]:
-    """Assign FULL only to PRIMARY discovery sources; everything else IOC_RULES.
-
-    The scope of a reading is an editorial property of the source, decided
-    once by discovery and carried on ``ProductionInputSource.role``. Only a
-    primary publication -- the one reporting first hand -- earns the expensive
-    narrative reading the synthesis quotes from.
-
-    Membership in ``core_sources`` is deliberately NOT the criterion: the
-    snapshot captures *every* discovered source, so testing membership made
-    every source FULL, silently disabled batching, and discarded the role
-    discovery had already computed.
-    """
-
-    if snapshot is None:
-        raise ValueError("q2_extraction_plan_missing_snapshot")
-
-    roles_by_url = {source.canonical_url: source.role for source in snapshot.core_sources}
-
-    def plan_for(canonical_url: str) -> tuple[ExtractionProfile, str]:
-        role = roles_by_url.get(canonical_url)
-        if role is None:
-            # Not in the frozen snapshot at all: a supplemental source the Q1
-            # report introduced. It has no editorial role, so it stays light.
-            return ExtractionProfile.IOC_RULES, "supporting_source"
-        if role is SourceRole.PRIMARY:
-            return ExtractionProfile.FULL, "primary_source"
-        return ExtractionProfile.IOC_RULES, f"non_primary_source:{role.value}"
-
-    plans: list[Q2SourcePlan] = []
-    for source in report.sources:
-        profile, reason = plan_for(source.canonical_url)
-        plans.append(
-            Q2SourcePlan(
-                source_id=source.local_id,
-                canonical_url=source.canonical_url,
-                profile=profile,
-                reason=reason,
-            )
-        )
-    return tuple(plans)
-
-
-# A descriptive alias keeps the policy easy to discover from callers/tests.
-select_q2_extraction_profiles = plan_q2_extraction_profiles
-
-
-# Shared with the resume planner, which reads these entries back to decide how
-# many sources a resumed extraction still owes a model call.
-_EXTRACTION_PROGRESS_COMPLETED_STATUSES = EXTRACTION_PROGRESS_COMPLETED_STATUSES
-
-
-def _extraction_reason(
-    decision: Q2ReuseDecision | None,
-    fallback: Q2ReuseReason,
-) -> str:
-    """The reuse probe's own verdict, or the default when it never ran."""
-    return (decision.reason if decision is not None else fallback).value
-
-
-def _build_extraction_impact_plan(
-    *,
-    report: ReferenceReport,
-    plans_by_url: dict[str, Q2SourcePlan],
-    duplicate_source_ids: dict[str, str],
-    individual_source_ids: set[str],
-    batched_source_ids: dict[str, int],
-    batches: tuple[tuple[str, ...], ...],
-    reuse_decisions: dict[str, Q2ReuseDecision],
-) -> ExtractionImpactPlan:
-    """Assemble the planner's decisions into the single auditable plan.
-
-    Every source in the Q1 report appears exactly once, and every disposition
-    carries the reuse probe's own verdict as its justification -- a hit names
-    the checkpoint that was accepted, a miss names why one could not be.
-    """
-    impacts: list[Q2SourceImpact] = []
-    for source in report.sources:
-        source_id = source.local_id
-        profile = plans_by_url[source.canonical_url].profile
-        decision = reuse_decisions.get(source_id)
-        primary = duplicate_source_ids.get(source_id)
-        if primary is not None:
-            disposition = Q2SourceDisposition.CONTENT_DUPLICATE
-            reason = "same_content_as_primary_source"
-        elif source_id in batched_source_ids:
-            disposition = Q2SourceDisposition.EXTRACT_BATCHED
-            reason = _extraction_reason(decision, Q2ReuseReason.NO_CHECKPOINT)
-        elif source_id in individual_source_ids:
-            disposition = Q2SourceDisposition.EXTRACT_INDIVIDUAL
-            reason = _extraction_reason(decision, Q2ReuseReason.NO_CHECKPOINT)
-        else:
-            disposition = Q2SourceDisposition.REUSED
-            reason = _extraction_reason(decision, Q2ReuseReason.REUSABLE_CHECKPOINT)
-        impacts.append(
-            Q2SourceImpact(
-                source_id=source_id,
-                canonical_url=source.canonical_url,
-                disposition=disposition,
-                profile=profile,
-                reason=reason,
-                primary_source_id=primary,
-                batch_index=batched_source_ids.get(source_id),
-            )
-        )
-    return ExtractionImpactPlan(sources=tuple(impacts), batches=batches)
-
-
-def _apply_impact_plan_to_progress(
-    progress: dict[str, Any],
-    plan: ExtractionImpactPlan,
-) -> None:
-    """Publish the planner's verdict on the progress the desk reads.
-
-    The desk showed a cost ("Résultats existants : 0") without its cause, so an
-    analyst could not tell a legitimate first extraction from a lost
-    checkpoint. Every source now carries the reason the planner recorded.
-    """
-    by_source = {item.source_id: item for item in plan.sources}
-    for entry in progress.get("sources", ()):
-        impact = by_source.get(entry.get("source_id"))
-        if impact is None:
-            continue
-        entry["plan_disposition"] = impact.disposition.value
-        entry["plan_reason"] = impact.reason
-        if impact.primary_source_id is not None:
-            entry["plan_primary_source_id"] = impact.primary_source_id
-    progress["planned_model_calls"] = plan.estimated_model_calls
-    progress["planned_reuses"] = len(plan.reused)
-    progress["planned_duplicates"] = len(plan.content_duplicates)
-
-
-def _batch_candidate(source: ParsedSource) -> Q2BatchCandidate | None:
-    """Return the batch candidate for an IOC_RULES source, when it has a URL."""
-    try:
-        return Q2BatchCandidate(source=source)
-    except ValueError:
-        # Without an exact HTTP(S) URL there is nothing to open: the source
-        # keeps its own individual request.
-        return None
-
-
-def _new_extraction_progress(
-    report: ReferenceReport,
-    plans: tuple[Q2SourcePlan, ...],
-) -> dict[str, Any]:
-    plans_by_url = {plan.canonical_url: plan for plan in plans}
-    sources = [
-        {
-            "source_id": source.local_id,
-            "title": source.title,
-            "profile": plans_by_url[source.canonical_url].profile.value,
-            "status": "pending",
-            "ioc_count": 0,
-            "rule_count": 0,
-        }
-        for source in report.sources
-    ]
-    full_total = sum(source["profile"] == ExtractionProfile.FULL.value for source in sources)
-    ioc_rules_total = sum(
-        source["profile"] == ExtractionProfile.IOC_RULES.value for source in sources
-    )
-    return {
-        "total_sources": len(sources),
-        "completed_sources": 0,
-        "full_total": full_total,
-        "full_completed": 0,
-        "ioc_rules_total": ioc_rules_total,
-        "ioc_rules_completed": 0,
-        "cache_hits": 0,
-        "model_calls": 0,
-        "skipped_sources": 0,
-        "light_batches": 0,
-        "light_sources_batched": 0,
-        "confirmed_iocs": 0,
-        "contextual_iocs": 0,
-        "rules_total": 0,
-        "yara_rules": 0,
-        "sigma_rules": 0,
-        "suricata_rules": 0,
-        "snort_rules": 0,
-        "active_source_id": None,
-        "active_source_title": None,
-        "active_profile": None,
-        "source_skips": {},
-        "sources": sources,
-    }
-
-
-def _enforce_q2_profile(
-    output: Q2SourceOutput,
-    profile: ExtractionProfile,
-) -> tuple[Q2SourceOutput, tuple[str, ...]]:
-    """Apply the planner's output contract before canonical verification."""
-    if profile is ExtractionProfile.FULL:
-        return output, ()
-    if profile is not ExtractionProfile.IOC_RULES:
-        raise ValueError(f"Unsupported extraction profile: {profile}")
-    if not output.facts:
-        return output, ()
-    return (
-        Q2SourceOutput(
-            facts=[],
-            artifacts=list(output.artifacts),
-            rules=list(output.rules),
-            uncertainties=list(output.uncertainties),
-        ),
-        ("q2_ioc_rules_fact_dropped",),
-    )
-
-
-def _canonical_extraction_progress_counts(extraction: Any) -> dict[str, int]:
-    """Count only deterministic canonical extraction objects."""
-    items = getattr(extraction, "items", ())
-    rules = getattr(extraction, "rules", ())
-    counts = {
-        "confirmed_iocs": sum(
-            item.artifact_type is not None
-            and item.indicator_status is IndicatorStatus.CONFIRMED_IOC
-            for item in items
-        ),
-        "contextual_iocs": sum(
-            item.artifact_type is not None and item.indicator_status is IndicatorStatus.CONTEXTUAL
-            for item in items
-        ),
-        "rules_total": len(rules),
-        "yara_rules": sum(rule.rule_type.value == "yara" for rule in rules),
-        "sigma_rules": sum(rule.rule_type.value == "sigma" for rule in rules),
-        "suricata_rules": sum(rule.rule_type.value == "suricata" for rule in rules),
-        "snort_rules": sum(rule.rule_type.value == "snort" for rule in rules),
-    }
-    return counts
-
-
 def _canonical_extraction_progress(
     plan: ExtractionPlan,
+    *,
     extraction: ProductionExtractionV1 | None = None,
+    model_calls: int = 0,
+    failed_source_id: str | None = None,
 ) -> dict[str, Any]:
     """Publish the canonical per-source verdict the desk and resume planner read.
 
     The corpus is the authority on which sources the stage owned: every planned
-    source and every source the plan omitted stays visible, with the status the
+    source and every omitted source stays visible, with the status the
     canonical execution recorded for it.
     """
 
@@ -813,16 +320,23 @@ def _canonical_extraction_progress(
         if extraction is not None
         else {}
     )
+    failed_urls = {
+        omission.canonical_url
+        for omission in (extraction.omitted_sources if extraction is not None else ())
+        if omission.reason is ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+    }
     sources: list[dict[str, Any]] = []
     for planned in plan.sources:
         source = produced.get(planned.source_document_id)
-        reuse_state = source.reuse_state if source is not None else None
-        if source is None:
+        if source is not None:
+            status = "succeeded" if source.reuse_state is ExtractionReuseState.FRESH else "cached"
+        elif (
+            planned.canonical_url in failed_urls
+            or str(planned.source_document_id) == failed_source_id
+        ):
             status = "failed"
-        elif reuse_state is ExtractionReuseState.FRESH:
-            status = "succeeded"
         else:
-            status = "cached"
+            status = "pending"
         sources.append(
             {
                 "source_id": str(planned.source_document_id),
@@ -831,7 +345,7 @@ def _canonical_extraction_progress(
                 "tier": planned.tier.value,
                 "profile": planned.profile.value,
                 "status": status,
-                "reuse_state": reuse_state.value if reuse_state is not None else None,
+                "reuse_state": source.reuse_state.value if source is not None else None,
                 "ioc_count": len(source.indicators) if source is not None else 0,
                 "rule_count": len(source.rules) if source is not None else 0,
             }
@@ -853,26 +367,22 @@ def _canonical_extraction_progress(
     rules = [rule for source in produced.values() for rule in source.rules]
     indicators = [item for source in produced.values() for item in source.indicators]
     completed = [
-        entry for entry in sources if entry["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+        entry for entry in sources if entry["status"] in EXTRACTION_PROGRESS_COMPLETED_STATUSES
     ]
+
+    def profile_count(entries: list[dict[str, Any]], profile: ExtractionProfile) -> int:
+        return sum(entry["profile"] == profile.value for entry in entries)
+
     return {
         "total_sources": len(sources),
         "completed_sources": len(completed),
-        "full_total": sum(entry["profile"] == ExtractionProfile.FULL.value for entry in sources),
-        "full_completed": sum(
-            entry["profile"] == ExtractionProfile.FULL.value for entry in completed
-        ),
-        "ioc_rules_total": sum(
-            entry["profile"] == ExtractionProfile.IOC_RULES.value for entry in sources
-        ),
-        "ioc_rules_completed": sum(
-            entry["profile"] == ExtractionProfile.IOC_RULES.value for entry in completed
-        ),
+        "full_total": profile_count(sources, ExtractionProfile.FULL),
+        "full_completed": profile_count(completed, ExtractionProfile.FULL),
+        "ioc_rules_total": profile_count(sources, ExtractionProfile.IOC_RULES),
+        "ioc_rules_completed": profile_count(completed, ExtractionProfile.IOC_RULES),
         "cache_hits": sum(entry["status"] == "cached" for entry in sources),
-        "model_calls": sum(entry["status"] == "succeeded" for entry in sources),
+        "model_calls": model_calls,
         "skipped_sources": sum(entry["status"] in {"omitted", "failed"} for entry in sources),
-        "light_batches": 0,
-        "light_sources_batched": 0,
         "confirmed_iocs": sum(
             item.indicator_status is ExtractionIndicatorStatus.CONFIRMED_IOC for item in indicators
         ),
@@ -880,133 +390,62 @@ def _canonical_extraction_progress(
             item.indicator_status is ExtractionIndicatorStatus.CONTEXTUAL for item in indicators
         ),
         "rules_total": len(rules),
-        "yara_rules": sum(rule.rule_type.value == "yara" for rule in rules),
-        "sigma_rules": sum(rule.rule_type.value == "sigma" for rule in rules),
-        "suricata_rules": sum(rule.rule_type.value == "suricata" for rule in rules),
-        "snort_rules": sum(rule.rule_type.value == "snort" for rule in rules),
-        "active_source_id": None,
-        "active_source_title": None,
-        "active_profile": None,
-        "source_skips": {},
+        **{
+            f"{rule_type.value}_rules": sum(rule.rule_type is rule_type for rule in rules)
+            for rule_type in DetectionRuleType
+        },
         "sources": sources,
         "profile_policy_version": plan.profile_policy_version,
         "references_corpus_hash": plan.references_corpus_hash,
     }
 
 
-def _source_progress_counts(output: Any, source_id: str) -> dict[str, int]:
-    """Count deterministically accepted proposals from one parsed source."""
-    verified = verify_q2_proposals([Q2ProposalSubmission(output=output, source_ids=(source_id,))])
-    counts = _canonical_extraction_progress_counts(verified.canonical)
-    return {
-        **counts,
-        "ioc_count": counts["confirmed_iocs"] + counts["contextual_iocs"],
-        "rule_count": counts["rules_total"],
-    }
+def _repair_evidence(
+    run: ProductionRun, rejections: Sequence[ExtractionRejection]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn evidence-gate rejections into the inert Repair Desk evidence.
 
-
-def _progress_source(
-    progress: dict[str, Any],
-    source_id: str,
-) -> dict[str, Any]:
-    for source in cast(list[dict[str, Any]], progress["sources"]):
-        if source["source_id"] == source_id:
-            return source
-    raise ValueError(f"Unknown extraction progress source {source_id}")
-
-
-def _mark_extraction_source_running(
-    progress: dict[str, Any],
-    source: ParsedSource,
-    plan: Q2SourcePlan,
-) -> None:
-    entry = _progress_source(progress, source.local_id)
-    entry["status"] = "running"
-    progress["active_source_id"] = source.local_id
-    progress["active_source_title"] = source.title
-    progress["active_profile"] = plan.profile.value
-
-
-def _mark_extraction_source_complete(
-    progress: dict[str, Any],
-    source: ParsedSource,
-    *,
-    status: str,
-    counts: dict[str, int],
-    cache_hit: bool = False,
-) -> None:
-    entry = _progress_source(progress, source.local_id)
-    was_complete = entry["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
-    entry["status"] = status
-    entry["ioc_count"] = counts["ioc_count"]
-    entry["rule_count"] = counts["rule_count"]
-    if not was_complete:
-        progress["confirmed_iocs"] += counts.get("confirmed_iocs", 0)
-        progress["contextual_iocs"] += counts.get("contextual_iocs", 0)
-        progress["rules_total"] += counts.get("rules_total", 0)
-        progress["yara_rules"] += counts.get("yara_rules", 0)
-        progress["sigma_rules"] += counts.get("sigma_rules", 0)
-        progress["suricata_rules"] += counts.get("suricata_rules", 0)
-        progress["snort_rules"] += counts.get("snort_rules", 0)
-    if cache_hit:
-        progress["cache_hits"] += 1
-    progress["completed_sources"] = sum(
-        item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
-        for item in cast(list[dict[str, Any]], progress["sources"])
-    )
-    progress["full_completed"] = sum(
-        item["profile"] == ExtractionProfile.FULL.value
-        and item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
-        for item in cast(list[dict[str, Any]], progress["sources"])
-    )
-    progress["ioc_rules_completed"] = sum(
-        item["profile"] == ExtractionProfile.IOC_RULES.value
-        and item["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
-        for item in cast(list[dict[str, Any]], progress["sources"])
-    )
-
-
-def _recount_skipped_sources(progress: dict[str, Any]) -> None:
-    """Derive the skip counter from the source entries, never incrementally.
-
-    Every writer of a `skipped` entry status goes through this, so a caller
-    that sets the status by another route cannot leave the aggregate behind.
+    Returns the complete repair entries (stored in the evidence pack blob) and
+    the bounded diagnostics kept in the artifact metadata.
     """
-    progress["skipped_sources"] = sum(
-        item["status"] == "skipped" for item in cast(list[dict[str, Any]], progress["sources"])
-    )
 
-
-def _mark_extraction_source_failed(
-    progress: dict[str, Any],
-    source_id: str,
-    status: str,
-) -> None:
-    _progress_source(progress, source_id)["status"] = status
-    _recount_skipped_sources(progress)
-
-
-def _mark_extraction_source_skipped(
-    progress: dict[str, Any],
-    source_id: str,
-    details: dict[str, Any],
-) -> None:
-    """Record a non-blocking source skip without changing failure counters."""
-    _progress_source(progress, source_id)["status"] = "skipped"
-    _progress_source(progress, source_id)["skip"] = details
-    source_skips = progress.setdefault("source_skips", {})
-    if isinstance(source_skips, dict) and source_id not in source_skips:
-        source_skips[source_id] = details
-    _recount_skipped_sources(progress)
-
-
-@dataclass(frozen=True, slots=True)
-class _ArchivedSource:
-    """The archived capture backing one Q1 source, as held by this system."""
-
-    content_sha256: str
-    decoded_blob_id: UUID | None = None
-    mime_type: str | None = None
+    entries: list[dict[str, Any]] = []
+    diagnostics: list[dict[str, Any]] = []
+    for item in rejections:
+        rejection = item.rejection
+        value_sha256 = hashlib.sha256(rejection.value.encode("utf-8")).hexdigest()
+        identity = {
+            "source_id": str(item.source.source_document_id),
+            "source_url": item.source.canonical_url,
+            "batch_id": None,
+            "model_run_id": str(item.model_run_id) if item.model_run_id is not None else None,
+            "proposal_index": rejection.proposal_index,
+            "proposal_kind": rejection.proposal_kind,
+            "artifact_type": rejection.artifact_type,
+            "reason_code": rejection.reason_code,
+        }
+        entries.append(
+            {
+                "repair_key": repair_key_for_rejection(
+                    edition_id=run.edition_id,
+                    subject_id=run.subject_id,
+                    kind=(
+                        ProductionRepairIssueKind.REJECTED_RULE
+                        if rejection.proposal_kind == "rule"
+                        else ProductionRepairIssueKind.REJECTED_INDICATOR
+                    ),
+                    source_url=item.source.canonical_url,
+                    artifact_type=rejection.artifact_type,
+                    value=rejection.value,
+                ),
+                "source_title": item.source.title,
+                **identity,
+                "value": rejection.value,
+                "value_sha256": value_sha256,
+            }
+        )
+        diagnostics.append({**identity, "value": rejection.value[:512], "value_hash": value_sha256})
+    return entries, diagnostics
 
 
 @dataclass(frozen=True, slots=True)
@@ -1016,76 +455,6 @@ class _ReferenceCollectionOutcome:
     new_sources: int = 0
     warnings: tuple[str, ...] = ()
     failures: tuple[dict[str, Any], ...] = ()
-
-
-@dataclass(frozen=True, slots=True)
-class _Q2SourceWork:
-    """One planned Q2 source, with its collection provenance for diagnostics."""
-
-    source: ParsedSource
-    plan: Q2SourcePlan
-    source_content_sha256: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class _Q2ReusableSource:
-    """A source-local view of a successful run-local Q2 response."""
-
-    output: Q2SourceOutput
-    raw: str
-    model_run_id: UUID
-    warnings: tuple[str, ...] = ()
-
-
-class BlobContentReader(Protocol):
-    """Narrow read port over the canonical blob catalog."""
-
-    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes: ...
-
-
-async def _archived_sources_by_url(
-    uow: UnitOfWork, subject_id: UUID, report: ReferenceReport
-) -> dict[str, _ArchivedSource]:
-    """Resolve the local capture identity needed by the post-response gate."""
-    collections_repository = getattr(uow, "source_collections", None)
-    documents_repository = getattr(uow, "source_documents", None)
-    if collections_repository is None or documents_repository is None:
-        return {}
-
-    collections = await collections_repository.list_for_subject(subject_id)
-    documents = await documents_repository.list_for_subject(subject_id)
-    by_id = {document.id: document for document in documents}
-    by_url = {
-        document.final_url: document
-        for document in documents
-        if getattr(document, "final_url", None)
-    }
-    archived: dict[str, _ArchivedSource] = {}
-    for source in report.sources:
-        collection = next(
-            (item for item in collections if item.canonical_url == source.canonical_url),
-            None,
-        )
-        document = (
-            by_id.get(collection.source_document_id)
-            if collection is not None and collection.source_document_id is not None
-            else by_url.get(source.canonical_url)
-        )
-        content_hash = getattr(document, "decoded_sha256", None)
-        if not isinstance(content_hash, str):
-            continue
-        normalized_hash = content_hash.casefold()
-        if not re.fullmatch(r"[0-9a-f]{64}", normalized_hash):
-            continue
-        decoded_blob_id = getattr(collection, "decoded_blob_id", None) or getattr(
-            document, "decoded_blob_id", None
-        )
-        archived[source.canonical_url] = _ArchivedSource(
-            content_sha256=normalized_hash,
-            decoded_blob_id=decoded_blob_id if isinstance(decoded_blob_id, UUID) else None,
-            mime_type=getattr(document, "detected_mime_type", None),
-        )
-    return archived
 
 
 def _reference_corpus_result(
@@ -1136,17 +505,8 @@ class ProductionWorkflowOrchestrator:
         diagnostics: DiagnosticsLog | None = None,
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
         pacing: ProductionPacingPolicy | None = None,
-        blob_reader: BlobContentReader | None = None,
-        q2_reuse_max_age_days: float = 14.0,
     ) -> None:
         self._uow_factory = uow_factory
-        # The collection service owns the canonical blob catalog used for
-        # archived captures. The artifact store is the equivalent fallback for
-        # callers that do not construct a collection service. Q2 only reads
-        # from either after a live model response.
-        self._blob_reader: BlobContentReader | None = blob_reader or cast(
-            "BlobContentReader | None", collection_service or artifact_store
-        )
         self._model_service = model_service
         self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
         self._repair_payloads = ProductionRepairPayloadResolver(self._model_gateway)
@@ -1157,19 +517,16 @@ class ProductionWorkflowOrchestrator:
         production_uow_factory = cast(Any, uow_factory)
         self._references = ReferenceResearchService(production_uow_factory, artifact_store)
         self._extraction = ExtractionService(production_uow_factory, artifact_store)
-        # AW-011: the live EXTRACTION stage is the canonical, archive-backed
-        # service. It needs the gateway (to ask for one structured capability)
-        # and the payload store (to read the exact archived documents). Without
-        # both, the stage fails explicitly instead of falling back to the
-        # retired live-URL path.
-        canonical_gateway = self._model_gateway
+        # The EXTRACTION stage asks the gateway for one structured capability
+        # and reads the exact archived documents; without both it fails
+        # explicitly.
         self._canonical_extraction: ProductionExtractionService | None = (
             ProductionExtractionService(
                 uow_factory=production_uow_factory,
-                model_gateway=canonical_gateway,
+                model_gateway=self._model_gateway,
                 artifact_store=artifact_store,
             )
-            if canonical_gateway is not None and artifact_store is not None
+            if self._model_gateway is not None and artifact_store is not None
             else None
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
@@ -1180,7 +537,6 @@ class ProductionWorkflowOrchestrator:
         self._qa = ProductionQAService(production_uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
-        self._q2_reuse_max_age_days = q2_reuse_max_age_days
         self._settings = get_settings()
 
     async def _check_cancellation(self, run_id: UUID, context: JobExecutionContext | None) -> None:
@@ -1474,7 +830,8 @@ class ProductionWorkflowOrchestrator:
                     historical = legacy_technical_extraction_from_payload(
                         await self._artifact_store.read_json(
                             cast(UUID, historical_extraction.canonical_blob_id)
-                        )
+                        ),
+                        source_labels=report_source_labels(report),
                     )
                 except Exception:
                     continue
@@ -1519,6 +876,7 @@ class ProductionWorkflowOrchestrator:
         *,
         candidate: ProductionArtifact,
         artifacts: Sequence[ProductionArtifact],
+        report: ReferenceReport,
     ) -> tuple[ProductionArtifact, Any] | None:
         """Load the latest extraction that predates one historical Q4 row."""
         if self._artifact_store is None:
@@ -1541,7 +899,8 @@ class ProductionWorkflowOrchestrator:
                 extraction = legacy_technical_extraction_from_payload(
                     await self._artifact_store.read_json(
                         cast(UUID, extraction_artifact.canonical_blob_id)
-                    )
+                    ),
+                    source_labels=report_source_labels(report),
                 )
             except Exception:
                 continue
@@ -1606,7 +965,7 @@ class ProductionWorkflowOrchestrator:
                 )
             else:
                 historical = await self._historical_extraction_for_synthesis(
-                    candidate=candidate, artifacts=artifacts
+                    candidate=candidate, artifacts=artifacts, report=report
                 )
                 if historical is not None:
                     _, historical_extraction = historical
@@ -1630,7 +989,7 @@ class ProductionWorkflowOrchestrator:
                 )
             else:
                 historical = await self._historical_extraction_for_synthesis(
-                    candidate=candidate, artifacts=artifacts
+                    candidate=candidate, artifacts=artifacts, report=report
                 )
                 previous_repair_keys = (
                     narrative_repair_keys(
@@ -1652,7 +1011,7 @@ class ProductionWorkflowOrchestrator:
             if not isinstance(previous_semantic_hash, str):
                 if previous_pack is None:
                     historical = await self._historical_extraction_for_synthesis(
-                        candidate=candidate, artifacts=artifacts
+                        candidate=candidate, artifacts=artifacts, report=report
                     )
                     if historical is not None:
                         previous_pack = self._build_synthesis_evidence_pack(
@@ -1955,7 +1314,8 @@ class ProductionWorkflowOrchestrator:
                     loaded["report"] = report
             if extraction.canonical_blob_id is not None:
                 loaded["extraction"] = legacy_technical_extraction_from_payload(
-                    await store.read_json(extraction.canonical_blob_id)
+                    await store.read_json(extraction.canonical_blob_id),
+                    source_labels=report_source_labels(report) if report is not None else None,
                 )
             if synthesis.rendered_blob_id is not None:
                 loaded["synthesis_text"] = await store.read_text(synthesis.rendered_blob_id)
@@ -2379,7 +1739,7 @@ class ProductionWorkflowOrchestrator:
         """
 
         await self._check_cancellation(run.id, context)
-        service = getattr(self, "_canonical_extraction", None)
+        service = self._canonical_extraction
         if service is None or self._artifact_store is None:
             return {
                 "stage": "extraction",
@@ -2389,14 +1749,7 @@ class ProductionWorkflowOrchestrator:
             }
 
         try:
-            async with self._uow_factory() as uow:
-                corpus = await load_reference_corpus(
-                    uow=uow,
-                    run=run,
-                    snapshot=snapshot,
-                    artifact_store=self._artifact_store,
-                )
-            plan = build_extraction_plan(corpus)
+            plan = await service.plan(run=run, snapshot=snapshot)
         except ProductionExtractionControlError as control:
             # A control invariant failed: no silent recovery through the legacy
             # REFERENCES RAW, and no model call.
@@ -2412,25 +1765,52 @@ class ProductionWorkflowOrchestrator:
         if reused is not None:
             return reused
 
-        execution = await service.execute(run=run, snapshot=snapshot)
-        if execution.status is not ExtractionExecutionStatus.SUCCEEDED:
+        calls = 0
+
+        async def before_model_call() -> None:
+            nonlocal calls
+            await self._check_cancellation(run.id, context)
+            if calls:
+                await asyncio.sleep(self._pacing.model_delay_seconds())
+            calls += 1
+
+        try:
+            execution = await service.execute(
+                run=run, snapshot=snapshot, plan=plan, before_model_call=before_model_call
+            )
+        except ModelGatewayError as exc:
+            # Only a proven pre-submission failure is retryable; the retry
+            # reuses the same deterministic ModelRun identities.
+            return self._handle_stage_exception(run, "extraction", exc)
+        extraction = execution.extraction
+        if not execution.succeeded or extraction is None:
+            failed_source_id = execution.details.get("source_document_id")
+            await self._persist_extraction_progress(
+                run.id,
+                _canonical_extraction_progress(
+                    plan,
+                    model_calls=execution.model_calls,
+                    failed_source_id=(
+                        failed_source_id if isinstance(failed_source_id, str) else None
+                    ),
+                ),
+            )
             return {
                 "stage": "extraction",
                 "status": "needs_review",
                 "error_code": execution.error_code,
                 "error": execution.error,
-                "details": execution.details,
-            }
-        extraction = execution.extraction
-        if extraction is None:  # pragma: no cover - defensive invariant
-            return {
-                "stage": "extraction",
-                "status": "terminal_error",
-                "error_code": "extraction_result_missing",
-                "error": "Canonical extraction reported success without a contract",
+                "details": dict(execution.details),
             }
 
         await self._check_cancellation(run.id, context)
+        repair_entries, rejection_diagnostics = _repair_evidence(run, execution.rejections)
+        rejected_rules = [
+            entry for entry in rejection_diagnostics if entry["proposal_kind"] == "rule"
+        ]
+        repair_evidence_blob_id = await self._artifact_store.put_repair_evidence(
+            build_repair_evidence_pack(repair_entries)
+        )
         artifact = await self._extraction.store_extraction_result(
             run_id=run.id,
             subject_id=run.subject_id,
@@ -2439,2979 +1819,67 @@ class ProductionWorkflowOrchestrator:
             warnings=list(extraction.warnings),
             verification_diagnostics={
                 "extraction_service_version": PRODUCTION_EXTRACTION_SERVICE_VERSION,
-                "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
                 "source_text_contract_version": source_text_contract_version(),
                 "references_corpus_hash": extraction.references_corpus_hash,
-                "profile_policy_version": extraction.profile_policy_version,
-                **{
-                    key: value
-                    for key, value in execution.details.items()
-                    if key
-                    in {
-                        "schema_version",
-                        "source_count",
-                        "full_source_count",
-                        "ioc_rules_source_count",
-                        "reused_source_count",
-                        "fresh_source_count",
-                        "duplicate_source_count",
-                        "omitted_source_count",
-                        "fact_count",
-                        "event_count",
-                        "indicator_count",
-                        "rule_count",
-                        "warning_count",
-                        "contract_version",
-                        "profile_policy_version",
-                    }
-                },
+                "model_calls": execution.model_calls,
+                "q2_source_evidence_rejections": rejection_diagnostics[:200],
+                "q2_rejected_rules": rejected_rules,
+                "q2_rejected_rule_count": len(rejected_rules),
+                "q2_rejected_artifact_count": len(rejection_diagnostics) - len(rejected_rules),
+                "q2_rejected_ioc_count": sum(
+                    is_publication_ioc_artifact_type(entry.get("artifact_type"))
+                    for entry in rejection_diagnostics
+                    if entry["proposal_kind"] == "artifact"
+                ),
             },
+            repair_evidence_blob_id=repair_evidence_blob_id,
+            repair_evidence_entry_count=len(repair_entries),
+            repair_evidence_index=[
+                {key: value for key, value in entry.items() if key != "value"}
+                | {"preview": str(entry["value"])[:512]}
+                for entry in repair_entries
+            ],
         )
         # The extraction is durable before the Repair Desk overlay is replayed
         # over it: a repair projection is a derivative of this exact artifact.
         effective_artifact_id: str | None = None
-        if artifact.canonical_blob_id is not None:
-            async with self._uow_factory() as replay_uow:
-                decisions_repository = getattr(replay_uow, "production_repair_decisions", None)
-                decisions_getter = getattr(decisions_repository, "effective_decisions", None)
-                effective_decisions = (
-                    tuple(
-                        decision
-                        for decision in await decisions_getter(run.edition_id, run.subject_id)
-                        if getattr(decision.issue_kind, "value", decision.issue_kind)
-                        in {"rejected_indicator", "rejected_rule"}
-                    )
-                    if callable(decisions_getter)
-                    else ()
-                )
-                if effective_decisions:
-                    replay_run = await replay_uow.production_runs.get(run.id)
-                    if replay_run is None:
-                        replay_run = run
-                    effective_artifact = await reconcile_effective_repairs_in_uow(
-                        replay_uow,
-                        run=replay_run,
-                        base_extraction_artifact=artifact,
-                        artifact_store=self._artifact_store,
-                        payload_resolver=getattr(
-                            self,
-                            "_repair_payloads",
-                            ProductionRepairPayloadResolver(self._model_gateway),
-                        ),
-                    )
-                    if effective_artifact is not None:
-                        effective_artifact_id = str(effective_artifact.id)
-                    commit = getattr(replay_uow, "commit", None)
-                    if callable(commit):
-                        await commit()
-
-        progress = _canonical_extraction_progress(plan, extraction)
-        await self._persist_extraction_progress(run.id, progress)
-        return {
-            "stage": "extraction",
-            "status": "success",
-            "artifact_id": str(artifact.id),
-            "effective_artifact_id": effective_artifact_id,
-            "source_count": len(extraction.sources),
-            "full_source_count": progress["full_total"],
-            "ioc_rules_source_count": progress["ioc_rules_total"],
-            "reused_source_count": progress["cache_hits"],
-            "fresh_source_count": progress["model_calls"],
-            "omitted_source_count": len(extraction.omitted_sources),
-            "fact_count": sum(len(source.facts) for source in extraction.sources),
-            "event_count": sum(len(source.events) for source in extraction.sources),
-            "indicator_count": len(
-                [item for source in extraction.sources for item in source.indicators]
-            ),
-            "rule_count": progress["rules_total"],
-            "warning_count": len(extraction.warnings),
-            "model_calls": progress["model_calls"],
-            "cache_hits": progress["cache_hits"],
-            "profile_policy_version": extraction.profile_policy_version,
-            "references_corpus_hash": extraction.references_corpus_hash,
-        }
-
-    async def _load_archived_source_text(
-        self, archived: _ArchivedSource | None
-    ) -> SourceEvidenceDocument:
-        """Read and integrity-check one decoded archive for local validation.
-
-        The returned local evidence views are never put in a ModelRequest. They
-        are read only after a live Q2 response exists, and the digest is checked
-        before parsing them.
-        """
-        if archived is None:
-            raise _Q2SourceEvidenceUnavailable("Archived source is missing")
-        if archived.decoded_blob_id is None:
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived decoded blob is missing",
-                expected_sha256=archived.content_sha256,
-            )
-
-        reader = getattr(self, "_blob_reader", None)
-        read_blob = getattr(reader, "read_blob", None)
-        if not callable(read_blob):
-            # ProductionArtifactStore exposes the same canonical catalog via
-            # read_bytes; accepting it keeps the workflow easy to exercise in
-            # isolation while the collection service remains the normal port.
-            read_blob = getattr(reader, "read_bytes", None)
-        if not callable(read_blob):
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived blob reader is unavailable",
-                expected_sha256=archived.content_sha256,
-                blob_id=archived.decoded_blob_id,
-            )
-
-        try:
-            content = await read_blob(
-                archived.decoded_blob_id,
-                max_bytes=MAX_ARCHIVED_SOURCE_BYTES,
-            )
-        except Exception as exc:
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived decoded blob is unreadable",
-                expected_sha256=archived.content_sha256,
-                blob_id=archived.decoded_blob_id,
-            ) from exc
-        if not isinstance(content, bytes):
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived decoded blob did not return bytes",
-                expected_sha256=archived.content_sha256,
-                blob_id=archived.decoded_blob_id,
-            )
-        actual_sha256 = hashlib.sha256(content).hexdigest()
-        if actual_sha256 != archived.content_sha256:
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived decoded blob integrity check failed",
-                expected_sha256=archived.content_sha256,
-                blob_id=archived.decoded_blob_id,
-            )
-
-        try:
-            mime_type = DetectedMimeType(archived.mime_type or DetectedMimeType.HTML.value)
-            parsed = parse_document(content, mime_type)
-            if mime_type is DetectedMimeType.HTML:
-                return source_evidence_document_from_html(
-                    parsed.text,
-                    content.decode(_html_encoding(content), errors="replace"),
-                )
-            return SourceEvidenceDocument(parsed_text=parsed.text)
-        except Exception as exc:
-            raise _Q2SourceEvidenceUnavailable(
-                "Archived source text is unreadable",
-                expected_sha256=archived.content_sha256,
-                blob_id=archived.decoded_blob_id,
-            ) from exc
-
-    async def _execute_direct_url_extraction(
-        self,
-        run: ProductionRun,
-        context: JobExecutionContext | None = None,
-        snapshot: ProductionInputSnapshot | None = None,
-    ) -> dict[str, Any]:
-        """Q2: at most one source-level, web-enabled request per Q1 source."""
-        await self._check_cancellation(run.id, context)
-        if snapshot is None:
-            return {
-                "stage": "extraction",
-                "status": "needs_review",
-                "error_code": "q2_extraction_plan_missing_snapshot",
-                "error": "Q2 extraction requires the frozen production input snapshot",
-            }
-        async with self._uow_factory() as uow:
-            references = await uow.production_artifacts.get_current(run.id, "references")
-            if references is None:
-                return {
-                    "stage": "extraction",
-                    "status": "error",
-                    "error": "References artifact not found",
-                }
-            report = await self._load_reference_report(references)
-            if report is None:
-                return {
-                    "stage": "extraction",
-                    "status": "terminal_error",
-                    "error_code": "references_payload_missing",
-                    "error": "Reference report content is not readable",
-                }
-            policy = await build_subject_production_context(
-                uow,
-                run.subject_id,
-                snapshot=snapshot,
-                relevant_source_urls={source.canonical_url for source in report.sources},
-            )
-            source_plans = plan_q2_extraction_profiles(
-                report,
-                snapshot=snapshot,
-                period_start=getattr(policy, "period_start", None),
-                period_end=getattr(policy, "period_end", None),
-            )
-            archived_sources = await _archived_sources_by_url(uow, run.subject_id, report)
-            input_hash = _extraction_input_hash(
-                subject_id=run.subject_id,
-                references_hash=references.input_hash,
-                source_urls=[source.canonical_url for source in report.sources],
-                references_payload_hash=compute_input_hash(reference_report_to_json(report)),
-            )
-            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
-            progress = _new_extraction_progress(report, source_plans)
-
-        # The plan is visible before cache lookup or the first provider call.
-        await self._persist_extraction_progress(run.id, progress)
-
-        reused = await self._reuse_artifact(run, "extraction", input_hash)
-        if reused is not None:
-            return reused
-        if self._model_gateway is None:
-            return {
-                "stage": "extraction",
-                "status": "error",
-                "error": "ModelGateway not configured",
-            }
-        model_gateway = cast(ModelGateway, self._model_gateway)
-        if not policy.external_llm_allowed:
-            return {
-                "stage": "extraction",
-                "status": "needs_review",
-                "error_code": "external_llm_blocked",
-                "error": "Diffusion policy forbids sending this subject to an external model",
-            }
-
-        submissions: list[Q2ProposalSubmission] = []
-        url_raw_parts: list[str] = []
-        warnings: list[str] = []
-        completed: list[str] = []
-        skipped: list[str] = []
-        failed: list[str] = []
-        failed_attempts: list[str] = []
-        failures: dict[str, dict[str, Any]] = {}
-        source_skips: dict[str, dict[str, Any]] = {}
-        source_evidence_rejections: list[dict[str, Any]] = []
-        repair_evidence_entries: list[dict[str, Any]] = []
-        source_evidence_rejection_counts: dict[tuple[str, str | None, str, str], int] = {}
-        plans_by_url = {plan.canonical_url: plan for plan in source_plans}
-        full_calls = 0
-        light_calls = 0
-        light_batches = 0
-        light_sources_batched = 0
-        cache_hits = 0
-        model_calls_avoided = 0
-        # Each entry carries the batch and its ModelRun identity, all decided
-        # before any prompt exists.
-        light_batches_by_first_source: dict[str, tuple[tuple[Q2BatchSource, ...], UUID]] = {}
-        individual_source_ids: set[str] = set()
-        batch_candidates: list[Q2BatchCandidate] = []
-        pending: dict[str, _Q2SourceWork] = {}
-        # The last reuse decision taken for each source. It is the
-        # justification the impact plan publishes: on a hit, why the checkpoint
-        # was accepted; on a miss, the business event that owes the call.
-        reuse_decisions: dict[str, Q2ReuseDecision] = {}
-
-        requested_model = "unknown"
-        router = getattr(model_gateway, "_router", None)
-        if router is not None:
-            try:
-                requested_model = str(
-                    router.by_provider(ModelProvider.OPENAI, ModelRole.RESEARCH).requested_model
-                )
-            except (AttributeError, KeyError):
-                pass
-
-        def metrics() -> dict[str, int]:
-            return {
-                "model_calls": progress["model_calls"],
-                "full_calls": full_calls,
-                "light_calls": light_calls,
-                "light_batches": light_batches,
-                "light_sources_batched": light_sources_batched,
-                "cache_hits": cache_hits,
-                "model_calls_avoided": model_calls_avoided,
-            }
-
-        reuse_max_age_days = float(getattr(self, "_q2_reuse_max_age_days", 14.0))
-        q2_reuse_not_before = (
-            datetime.now(UTC) - timedelta(days=reuse_max_age_days)
-            if reuse_max_age_days > 0
-            else None
-        )
-        archive_fallback_min_chars = int(
-            getattr(
-                getattr(self, "_settings", None),
-                "production_archive_fallback_min_chars",
-                1200,
-            )
-        )
-
-        async def find_q2_checkpoint(checkpoint_key: str) -> Any | None:
-            async with self._uow_factory() as uow:
-                model_runs = getattr(uow, "model_runs", None)
-                finder = getattr(model_runs, "find_successful_q2_checkpoint", None)
-                if finder is None:
-                    return None
-                checkpoint = await finder(checkpoint_key, not_before=q2_reuse_not_before)
-                if checkpoint is None or checkpoint.status is not ModelRunStatus.SUCCEEDED:
-                    return None
-                return checkpoint
-
-        async def find_legacy_q2_checkpoint(work: _Q2SourceWork) -> Any | None:
-            if work.source_content_sha256 is None:
-                return None
-            async with self._uow_factory() as uow:
-                model_runs = getattr(uow, "model_runs", None)
-                finder = getattr(model_runs, "find_legacy_q2_checkpoint", None)
-                if not callable(finder):
-                    return None
-                checkpoint = await finder(
-                    source_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    not_before=q2_reuse_not_before,
-                )
-                if checkpoint is None or checkpoint.status is not ModelRunStatus.SUCCEEDED:
-                    return None
-                return checkpoint
-
-        async def read_q2_checkpoint(checkpoint: Any) -> str | None:
-            reference = getattr(checkpoint, "raw_output_reference", None) or (
-                checkpoint.output_references[0]
-                if getattr(checkpoint, "output_references", ())
-                else None
-            )
-            reader = getattr(model_gateway, "read_output", None)
-            if reference is None or not callable(reader):
-                return None
-            try:
-                content = await reader(reference)
-            except Exception as exc:
-                self._diagnostics.record(
-                    event="q2.checkpoint.read_failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    model_run_id=str(checkpoint.id),
-                    error_code="q2_checkpoint_read_failed",
-                    error=str(exc),
-                )
-                return None
-            if not isinstance(content, bytes):
-                return None
-            return content.decode("utf-8", errors="replace")
-
-        def q2_identity_versions(
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str,
-        ) -> dict[str, str | None]:
-            if access_mode == "archive_fallback":
-                return {
-                    "prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
-                    "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                    "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                    "access_mode": access_mode,
-                }
-            return {
-                "prompt_version": (
-                    IOC_RULES_BATCH_PROMPT_VERSION
-                    if batched
-                    else EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
-                ),
-                "parser_version": (
-                    Q2_BATCH_PARSER_VERSION if batched else Q2_MARKDOWN_PARSER_VERSION
-                ),
-                "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                "access_mode": access_mode,
-            }
-
-        async def source_extraction_rows_for_url(canonical_url: str) -> tuple[Any, ...]:
-            async with self._uow_factory() as uow:
-                repository = getattr(uow, "source_extractions", None)
-                finder = getattr(repository, "list_for_url", None)
-                if not callable(finder):
-                    return ()
-                rows = await finder(canonical_url)
-                return tuple(rows) if rows is not None else ()
-
-        async def source_extraction_by_identity(
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str,
-        ) -> Any | None:
-            if work.source_content_sha256 is None:
-                return None
-            versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
-            async with self._uow_factory() as uow:
-                repository = getattr(uow, "source_extractions", None)
-                finder = getattr(repository, "get_by_identity", None)
-                if not callable(finder):
-                    return None
-                return await finder(
-                    source_content_sha256=work.source_content_sha256,
-                    profile=work.plan.profile.value,
-                    contract_version=str(versions["contract_version"]),
-                    prompt_version=str(versions["prompt_version"]),
-                    parser_version=str(versions["parser_version"]),
-                    verifier_version=ARTIFACT_VERIFIER_VERSION,
-                    source_text_contract_version=(
-                        ARCHIVED_SOURCE_ACCESS_VERSION
-                        if access_mode == "archive_fallback"
-                        else SOURCE_EVIDENCE_VERSION
-                    ),
-                    model_policy_version=Q2_MODEL_POLICY_VERSION,
-                    routing_policy_version=Q2_ROUTING_POLICY_VERSION,
-                )
-
-        async def read_source_extraction_checkpoint(
-            checkpoint: Any,
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str,
-        ) -> _Q2ReusableSource | None:
-            canonical_blob_id = getattr(checkpoint, "canonical_blob_id", None)
-            if canonical_blob_id is None:
-                return None
-            reader = getattr(self._artifact_store, "read_json", None)
-            if not callable(reader):
-                return None
-            try:
-                payload = await reader(canonical_blob_id)
-                if not isinstance(payload, dict):
-                    return None
-                output = q2_source_output_from_json(payload)
-            except Exception:
-                return None
-
-            raw = ""
-            raw_blob_id = getattr(checkpoint, "raw_blob_id", None)
-            text_reader = getattr(self._artifact_store, "read_text", None)
-            if raw_blob_id is not None and callable(text_reader):
-                try:
-                    raw_value = await text_reader(raw_blob_id)
-                    if isinstance(raw_value, str):
-                        raw = raw_value
-                except Exception:
-                    # The canonical source-local output is enough to reuse the
-                    # checkpoint; retain a deterministic JSON representation
-                    # when the optional raw archive is unavailable.
-                    raw = ""
-            if not raw:
-                raw = json.dumps(q2_source_output_to_json(output), sort_keys=True)
-            model_run_id = getattr(checkpoint, "model_run_id", None)
-            if not isinstance(model_run_id, UUID):
-                model_run_id = UUID(str(model_run_id)) if model_run_id is not None else None
-            if model_run_id is None:
-                return _Q2ReusableSource(output=output, raw=raw, model_run_id=UUID(int=0))
-            return _Q2ReusableSource(output=output, raw=raw, model_run_id=model_run_id)
-
-        async def model_run_parameters(model_run_id: UUID | None) -> dict[str, Any] | None:
-            if model_run_id is None:
-                return None
-            async with self._uow_factory() as uow:
-                repository = getattr(uow, "model_runs", None)
-                if repository is None:
-                    # Lightweight callers may persist a source checkpoint
-                    # without exposing the ModelRun repository. The source
-                    # checkpoint contains its own validated canonical output.
-                    return {"_source_checkpoint_metadata_only": True}
-                getter = getattr(repository, "get", None)
-                if not callable(getter):
-                    return None
-                model_run = await getter(model_run_id)
-                parameters = getattr(model_run, "parameters", None)
-                if not isinstance(parameters, dict):
-                    return None
-                enriched = dict(parameters)
-                enriched.setdefault(
-                    "prompt_version", getattr(model_run, "prompt_template_version", None)
-                )
-                enriched.setdefault("requested_model", getattr(model_run, "requested_model", None))
-                provider = getattr(model_run, "provider", None)
-                enriched.setdefault("provider", getattr(provider, "value", provider))
-                return enriched
-
-        def parameter_reason(
-            parameters: dict[str, Any] | None,
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str,
-        ) -> Q2ReuseReason | None:
-            if parameters is None:
-                return Q2ReuseReason.NO_CHECKPOINT
-            if parameters.get("_source_checkpoint_metadata_only") is True:
-                return None
-            target: dict[str, Any] = parameters
-            execution_kind = parameters.get("q2_execution_kind")
-            if execution_kind is None:
-                if isinstance(parameters.get("q2_batch_sources"), list):
-                    execution_kind = "batch"
-                elif isinstance(parameters.get("source_url"), str):
-                    execution_kind = "individual"
-            if execution_kind == "batch":
-                sources = parameters.get("q2_batch_sources")
-                if not isinstance(sources, list):
-                    return Q2ReuseReason.NO_CHECKPOINT
-                match = next(
-                    (
-                        item
-                        for item in sources
-                        if isinstance(item, dict)
-                        and item.get("canonical_url") == work.source.canonical_url
-                    ),
-                    None,
-                )
-                if not isinstance(match, dict):
-                    return Q2ReuseReason.NO_CHECKPOINT
-                target = {
-                    **parameters,
-                    **match,
-                    "source_url": match.get("canonical_url"),
-                }
-
-            expected = {
-                "source_url": work.source.canonical_url,
-                "source_content_sha256": work.source_content_sha256,
-                "profile": work.plan.profile.value,
-                "q2_access_mode": access_mode,
-                "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-            }
-            if batched:
-                expected["q2_batch_parser_version"] = Q2_BATCH_PARSER_VERSION
-            else:
-                expected["prompt_version"] = (
-                    ARCHIVE_FALLBACK_PROMPT_VERSION
-                    if access_mode == "archive_fallback"
-                    else EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
-                )
-            for key, value in expected.items():
-                if value is None:
-                    continue
-                actual = target.get(key)
-                if actual is None:
-                    # A missing identity field is insufficient historical
-                    # metadata, not proof that a particular policy changed.
-                    return Q2ReuseReason.NO_CHECKPOINT
-                if str(actual) != str(value):
-                    if key == "source_content_sha256":
-                        return Q2ReuseReason.SOURCE_CONTENT_CHANGED
-                    if key == "profile":
-                        return Q2ReuseReason.EXTRACTION_PROFILE_CHANGED
-                    if key in {"prompt_version"}:
-                        return Q2ReuseReason.PROMPT_VERSION_CHANGED
-                    if key == "q2_model_policy_version":
-                        return Q2ReuseReason.MODEL_POLICY_CHANGED
-                    if key == "q2_routing_policy_version":
-                        return Q2ReuseReason.ROUTING_POLICY_CHANGED
-                    if key == "source_evidence_version":
-                        return Q2ReuseReason.EVIDENCE_GATE_VERSION_CHANGED
-                    if key == "q2_access_mode":
-                        return Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE
-                    return Q2ReuseReason.PARSER_CONTRACT_CHANGED
-            return None
-
-        async def persist_source_extraction_checkpoint(
-            work: _Q2SourceWork,
-            output: Q2SourceOutput,
-            raw: str,
-            *,
-            model_run_id: UUID,
-            batched: bool,
-            access_mode: str,
-            legacy_recovery: bool = False,
-        ) -> None:
-            if work.source_content_sha256 is None or self._artifact_store is None:
-                return
-            store_payloads = getattr(self._artifact_store, "store_source_extraction_payloads", None)
-            if not callable(store_payloads):
-                return
-            try:
-                raw_blob_id, canonical_blob_id = await store_payloads(
-                    raw=raw,
-                    canonical=q2_source_output_to_json(output),
-                )
-                versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
-                extraction = SourceExtraction(
-                    canonical_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    profile=work.plan.profile,
-                    contract_version=Q2_EXTRACTION_CONTRACT_VERSION,
-                    prompt_version=str(versions["prompt_version"]),
-                    parser_version=str(versions["parser_version"]),
-                    verifier_version=ARTIFACT_VERIFIER_VERSION,
-                    source_text_contract_version=(
-                        ARCHIVED_SOURCE_ACCESS_VERSION
-                        if access_mode == "archive_fallback"
-                        else SOURCE_EVIDENCE_VERSION
-                    ),
-                    model_policy_version=Q2_MODEL_POLICY_VERSION,
-                    routing_policy_version=Q2_ROUTING_POLICY_VERSION,
-                    status=SourceExtractionStatus.VERIFIED,
-                    canonical_blob_id=canonical_blob_id,
-                    raw_blob_id=raw_blob_id,
-                    model_run_id=model_run_id if model_run_id.int else None,
-                )
-                async with self._uow_factory() as uow:
-                    repository = getattr(uow, "source_extractions", None)
-                    claim = getattr(repository, "claim", None)
-                    commit = getattr(uow, "commit", None)
-                    if not callable(claim):
-                        return
-                    await claim(extraction)
-                    if callable(commit):
-                        await commit()
-                if legacy_recovery:
-                    self._diagnostics.record(
-                        event="q2.source.legacy_checkpoint_recovered",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        source_id=work.source.local_id,
-                        source_url=work.source.canonical_url,
-                        source_content_sha256=work.source_content_sha256,
-                        model_run_id=(str(model_run_id) if model_run_id.int else None),
-                    )
-            except Exception as exc:
-                self._diagnostics.record(
-                    event="q2.checkpoint.persist_failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=work.source.local_id,
-                    source_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    model_run_id=(str(model_run_id) if model_run_id.int else None),
-                    error=str(exc)[:512],
-                )
-
-        def checkpoint_key(
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str = "live_url",
-        ) -> str:
-            if access_mode == "archive_fallback":
-                if work.source_content_sha256 is None:
-                    raise ValueError("Archive fallback checkpoints require a source hash")
-                return _q2_archive_fallback_checkpoint_key(
-                    canonical_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    profile=work.plan.profile,
-                    provider=ModelProvider.OPENAI,
-                    requested_model=requested_model,
-                )
-            if access_mode != "live_url":
-                raise ValueError(f"Unsupported Q2 access mode: {access_mode}")
-            if batched:
-                prompt_version = IOC_RULES_BATCH_PROMPT_VERSION
-                batch_parser_version: str | None = Q2_BATCH_PARSER_VERSION
-            else:
-                prompt_version = EXTRACTION_PROMPT_VERSION_BY_PROFILE[work.plan.profile]
-                batch_parser_version = None
-            return _q2_checkpoint_key(
-                canonical_url=work.source.canonical_url,
-                profile=work.plan.profile,
-                prompt_version=prompt_version,
-                batch_parser_version=batch_parser_version,
-                provider=ModelProvider.OPENAI,
-                requested_model=requested_model,
-                source_content_sha256=work.source_content_sha256,
-            )
-
-        def clear_active_source() -> None:
-            progress["active_source_id"] = None
-            progress["active_source_title"] = None
-            progress["active_profile"] = None
-
-        async def gate_source_output(
-            work: _Q2SourceWork,
-            output: Q2SourceOutput,
-            *,
-            model_run_id: UUID,
-            batch_id: str | None = None,
-            source_text: SourceEvidenceDocument | None = None,
-        ) -> Q2SourceOutput:
-            """Validate one source output against only that source's archive."""
-            archived = archived_sources.get(work.source.canonical_url)
-            archived_text = (
-                source_text
-                if source_text is not None
-                else await self._load_archived_source_text(archived)
-            )
-            evidence = _gate_archived_q2_output(
-                output,
-                source_text=archived_text,
-                profile=work.plan.profile,
-            )
-            warnings.extend(evidence.warnings)
-            for rejection in evidence.rejections:
-                issue_kind = (
-                    "rejected_rule" if rejection.proposal_kind == "rule" else "rejected_indicator"
-                )
-                value_sha256 = hashlib.sha256(rejection.value.encode("utf-8")).hexdigest()
-                repair_key = repair_key_for_rejection(
-                    edition_id=run.edition_id,
-                    subject_id=run.subject_id,
-                    kind=issue_kind,
-                    source_url=work.source.canonical_url,
-                    artifact_type=rejection.artifact_type,
-                    value=rejection.value,
-                )
-                repair_evidence_entries.append(
-                    {
-                        "repair_key": repair_key,
-                        "source_id": work.source.local_id,
-                        "source_title": work.source.title,
-                        "source_url": work.source.canonical_url,
-                        "batch_id": batch_id,
-                        "model_run_id": str(model_run_id),
-                        "proposal_index": rejection.proposal_index,
-                        "proposal_kind": rejection.proposal_kind,
-                        "artifact_type": rejection.artifact_type,
-                        "reason_code": rejection.reason_code,
-                        "value": rejection.value,
-                        "value_sha256": value_sha256,
-                    }
-                )
-                # La valeur rejetée vient de la sortie du modèle, déjà archivée
-                # en clair dans le blob de résultat brut : la conserver ici
-                # n'expose rien de neuf et c'est la seule façon pour
-                # l'analyste de savoir quel IOC a été écarté avant de
-                # publier. L'empreinte reste, elle sert au recoupement.
-                source_evidence_rejections.append(
-                    {
-                        "source_id": work.source.local_id,
-                        "source_url": work.source.canonical_url,
-                        "batch_id": batch_id,
-                        "model_run_id": str(model_run_id),
-                        "proposal_index": rejection.proposal_index,
-                        "proposal_kind": rejection.proposal_kind,
-                        "artifact_type": rejection.artifact_type,
-                        "reason_code": rejection.reason_code,
-                        "value": rejection.value[:512],
-                        "value_hash": value_sha256,
-                    }
-                )
-                group_key = (
-                    work.source.local_id,
-                    batch_id,
-                    rejection.artifact_type or rejection.proposal_kind,
-                    rejection.reason_code,
-                )
-                source_evidence_rejection_counts[group_key] = (
-                    source_evidence_rejection_counts.get(group_key, 0) + 1
-                )
-                self._diagnostics.record(
-                    event="q2.source.evidence_rejected",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=work.source.local_id,
-                    source_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    model_run_id=str(model_run_id),
-                    batch_id=batch_id,
-                    profile=work.plan.profile.value,
-                    proposal_index=rejection.proposal_index,
-                    proposal_kind=rejection.proposal_kind,
-                    artifact_type=rejection.artifact_type,
-                    reason_code=rejection.reason_code,
-                    value=rejection.value[:512],
-                )
-            return evidence.filtered_output
-
-        async def load_reusable_source(
-            work: _Q2SourceWork,
-            *,
-            batched: bool,
-            access_mode: str = "live_url",
-        ) -> _Q2ReusableSource | None:
-            key = checkpoint_key(work, batched=batched, access_mode=access_mode)
-
-            async def evaluate(
-                decision: Q2ReuseDecision,
-            ) -> None:
-                reuse_decisions[work.source.local_id] = decision
-                self._diagnostics.record(
-                    event="q2.source.reuse_evaluated",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    status=decision.status.value,
-                    reason=decision.reason.value,
-                    source_id=work.source.local_id,
-                    source_url=decision.source_url,
-                    current_source_sha256=decision.current_source_sha256,
-                    previous_source_sha256=decision.previous_source_sha256,
-                    candidate_model_run_id=(
-                        str(decision.candidate_model_run_id)
-                        if decision.candidate_model_run_id is not None
-                        else None
-                    ),
-                    profile=work.plan.profile.value,
-                    access_mode=access_mode,
-                    batched=batched,
-                )
-
-            rows = await source_extraction_rows_for_url(work.source.canonical_url)
-            versions = q2_identity_versions(work, batched=batched, access_mode=access_mode)
-            exact: Any | None = None
-            for row in rows:
-                if (
-                    getattr(row, "status", None) is SourceExtractionStatus.VERIFIED
-                    and getattr(row, "source_content_sha256", None) == work.source_content_sha256
-                    and getattr(row, "profile", None) is work.plan.profile
-                    and getattr(row, "contract_version", None) == versions["contract_version"]
-                    and getattr(row, "prompt_version", None) == versions["prompt_version"]
-                    and getattr(row, "parser_version", None) == versions["parser_version"]
-                    and getattr(row, "verifier_version", None) == ARTIFACT_VERIFIER_VERSION
-                ):
-                    exact = row
-                    break
-            if exact is None:
-                exact = await source_extraction_by_identity(
-                    work, batched=batched, access_mode=access_mode
-                )
-                if (
-                    exact is not None
-                    and getattr(exact, "status", None) is not SourceExtractionStatus.VERIFIED
-                ):
-                    exact = None
-
-            if exact is not None:
-                candidate_id = getattr(exact, "model_run_id", None)
-                candidate_uuid = candidate_id if isinstance(candidate_id, UUID) else None
-                parameter_mismatch = parameter_reason(
-                    await model_run_parameters(candidate_uuid),
-                    work,
-                    batched=batched,
-                    access_mode=access_mode,
-                )
-                if parameter_mismatch is None:
-                    reusable = await read_source_extraction_checkpoint(
-                        exact,
-                        work,
-                        batched=batched,
-                        access_mode=access_mode,
-                    )
-                    if reusable is not None:
-                        await evaluate(
-                            Q2ReuseDecision(
-                                status=Q2ReuseStatus.HIT,
-                                reason=Q2ReuseReason.REUSABLE_CHECKPOINT,
-                                source_url=work.source.canonical_url,
-                                current_source_sha256=work.source_content_sha256,
-                                previous_source_sha256=work.source_content_sha256,
-                                candidate_model_run_id=candidate_uuid,
-                            )
-                        )
-                        return reusable
-                    await evaluate(
-                        Q2ReuseDecision(
-                            status=Q2ReuseStatus.MISS,
-                            reason=(
-                                Q2ReuseReason.ARCHIVED_OUTPUT_MISSING
-                                if getattr(exact, "canonical_blob_id", None) is None
-                                else Q2ReuseReason.CHECKPOINT_CORRUPT
-                            ),
-                            source_url=work.source.canonical_url,
-                            current_source_sha256=work.source_content_sha256,
-                            previous_source_sha256=work.source_content_sha256,
-                            candidate_model_run_id=candidate_uuid,
-                        )
-                    )
-                    return None
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=parameter_mismatch,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=getattr(exact, "source_content_sha256", None),
-                        candidate_model_run_id=candidate_uuid,
-                    )
-                )
-                return None
-
-            previous = next(
-                (
-                    row
-                    for row in rows
-                    if isinstance(getattr(row, "source_content_sha256", None), str)
-                    and getattr(row, "source_content_sha256", None) != work.source_content_sha256
-                ),
-                None,
-            )
-            previous_sha = getattr(previous, "source_content_sha256", None)
-            reason: Q2ReuseReason = (
-                Q2ReuseReason.SOURCE_CONTENT_CHANGED
-                if previous is not None
-                else Q2ReuseReason.NO_CHECKPOINT
-            )
-            previous_candidate_id = getattr(previous, "model_run_id", None)
-            previous_candidate_uuid = (
-                previous_candidate_id if isinstance(previous_candidate_id, UUID) else None
-            )
-            if previous is not None and previous_sha == work.source_content_sha256:
-                if getattr(previous, "profile", None) is not work.plan.profile:
-                    reason = Q2ReuseReason.EXTRACTION_PROFILE_CHANGED
-                elif getattr(previous, "prompt_version", None) != versions["prompt_version"]:
-                    reason = Q2ReuseReason.PROMPT_VERSION_CHANGED
-                elif any(
-                    getattr(previous, name, None) != expected
-                    for name, expected in (
-                        ("contract_version", versions["contract_version"]),
-                        ("parser_version", versions["parser_version"]),
-                        ("verifier_version", ARTIFACT_VERIFIER_VERSION),
-                    )
-                ):
-                    reason = Q2ReuseReason.PARSER_CONTRACT_CHANGED
-                else:
-                    parameter_mismatch = parameter_reason(
-                        await model_run_parameters(previous_candidate_uuid),
-                        work,
-                        batched=batched,
-                        access_mode=access_mode,
-                    )
-                    if (
-                        parameter_mismatch is not None
-                        and parameter_mismatch is not Q2ReuseReason.NO_CHECKPOINT
-                    ):
-                        reason = parameter_mismatch
-
-            # ModelRun checkpoint keys remain a recovery path for deployments
-            # that crashed after the provider output was durable but before the
-            # new source_extractions row was committed. This path only reads
-            # persisted bytes; it never calls the provider to rebuild a cache.
-            checkpoint = await find_q2_checkpoint(key)
-            legacy_recovery = False
-            if checkpoint is None:
-                legacy_key = _q2_checkpoint_key(
-                    canonical_url=work.source.canonical_url,
-                    profile=work.plan.profile,
-                    prompt_version=str(versions["prompt_version"]),
-                    batch_parser_version=(str(versions["parser_version"]) if batched else None),
-                    provider=ModelProvider.OPENAI,
-                    requested_model=requested_model,
-                    source_content_sha256=None,
-                )
-                if legacy_key != key:
-                    checkpoint = await find_q2_checkpoint(legacy_key)
-                    legacy_recovery = checkpoint is not None
-            if checkpoint is None:
-                checkpoint = await find_legacy_q2_checkpoint(work)
-                legacy_recovery = checkpoint is not None
-            if checkpoint is None:
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=reason,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=previous_sha,
-                        candidate_model_run_id=previous_candidate_uuid,
-                    )
-                )
-                return None
-            raw = await read_q2_checkpoint(checkpoint)
-            if raw is None or not raw.strip():
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=Q2ReuseReason.ARCHIVED_OUTPUT_MISSING,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=previous_sha,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                return None
-
-            parameters = getattr(checkpoint, "parameters", {})
-            kind = parameters.get("q2_execution_kind") if isinstance(parameters, dict) else None
-            if kind is None and isinstance(parameters, dict):
-                # Older successful Q2 ModelRuns predate the explicit execution
-                # kind. Their source URL/hash metadata is enough to identify
-                # the individual response deterministically.
-                if isinstance(parameters.get("source_url"), str):
-                    kind = "individual"
-                elif isinstance(parameters.get("q2_batch_sources"), list):
-                    kind = "batch"
-            checkpoint_mismatch = parameter_reason(
-                parameters if isinstance(parameters, dict) else None,
-                work,
-                batched=(kind == "batch"),
-                access_mode=access_mode,
-            )
-            if checkpoint_mismatch is not None:
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=checkpoint_mismatch,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=previous_sha,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                return None
-            persisted_access_mode = (
-                parameters.get("q2_access_mode") if isinstance(parameters, dict) else None
-            )
-            if access_mode == "archive_fallback" and persisted_access_mode != "archive_fallback":
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=previous_sha,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                return None
-            if access_mode == "live_url" and persisted_access_mode == "archive_fallback":
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.MISS,
-                        reason=Q2ReuseReason.ACCESS_MODE_INCOMPATIBLE,
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=previous_sha,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                return None
-            if kind == "batch":
-                batch_sources = parameters.get("q2_batch_sources", [])
-                target = next(
-                    (
-                        item
-                        for item in batch_sources
-                        if isinstance(item, dict)
-                        and item.get("canonical_url") == work.source.canonical_url
-                    ),
-                    None,
-                )
-                if not isinstance(target, dict) or not isinstance(target.get("batch_id"), str):
-                    await evaluate(
-                        Q2ReuseDecision(
-                            status=Q2ReuseStatus.MISS,
-                            reason=Q2ReuseReason.NO_CHECKPOINT,
-                            source_url=work.source.canonical_url,
-                            current_source_sha256=work.source_content_sha256,
-                            previous_source_sha256=previous_sha,
-                            candidate_model_run_id=checkpoint.id,
-                        )
-                    )
-                    return None
-                parsed_batch = parse_q2_batch_response(
-                    raw,
-                    {target["batch_id"]: work.source},
-                )
-                if (
-                    not parsed_batch.usable
-                    or not parsed_batch.sources
-                    or not parsed_batch.sources[0].usable
-                ):
-                    await evaluate(
-                        Q2ReuseDecision(
-                            status=Q2ReuseStatus.MISS,
-                            reason=Q2ReuseReason.CHECKPOINT_CORRUPT,
-                            source_url=work.source.canonical_url,
-                            current_source_sha256=work.source_content_sha256,
-                            previous_source_sha256=previous_sha,
-                            candidate_model_run_id=checkpoint.id,
-                        )
-                    )
-                    return None
-                source_result = parsed_batch.sources[0]
-                assert source_result.output is not None
-                reusable = _Q2ReusableSource(
-                    output=source_result.output,
-                    raw=source_result.raw_block,
-                    model_run_id=checkpoint.id,
-                    warnings=(*parsed_batch.warnings, *source_result.warnings),
-                )
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.HIT,
-                        reason=(
-                            Q2ReuseReason.LEGACY_CHECKPOINT_RECOVERED
-                            if legacy_recovery
-                            else Q2ReuseReason.REUSABLE_CHECKPOINT
-                        ),
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=work.source_content_sha256,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                if legacy_recovery:
-                    await persist_source_extraction_checkpoint(
-                        work,
-                        reusable.output,
-                        reusable.raw,
-                        model_run_id=checkpoint.id,
-                        batched=batched,
-                        access_mode=access_mode,
-                        legacy_recovery=True,
-                    )
-                return reusable
-            if kind == "individual":
-                parsed_individual = parse_q2_proposals_markdown(raw)
-                if not parsed_individual.usable or parsed_individual.value is None:
-                    await evaluate(
-                        Q2ReuseDecision(
-                            status=Q2ReuseStatus.MISS,
-                            reason=Q2ReuseReason.CHECKPOINT_CORRUPT,
-                            source_url=work.source.canonical_url,
-                            current_source_sha256=work.source_content_sha256,
-                            previous_source_sha256=previous_sha,
-                            candidate_model_run_id=checkpoint.id,
-                        )
-                    )
-                    return None
-                reusable = _Q2ReusableSource(
-                    output=parsed_individual.value,
-                    raw=raw,
-                    model_run_id=checkpoint.id,
-                    warnings=tuple(parsed_individual.warnings),
-                )
-                await evaluate(
-                    Q2ReuseDecision(
-                        status=Q2ReuseStatus.HIT,
-                        reason=(
-                            Q2ReuseReason.LEGACY_CHECKPOINT_RECOVERED
-                            if legacy_recovery
-                            else Q2ReuseReason.REUSABLE_CHECKPOINT
-                        ),
-                        source_url=work.source.canonical_url,
-                        current_source_sha256=work.source_content_sha256,
-                        previous_source_sha256=work.source_content_sha256,
-                        candidate_model_run_id=checkpoint.id,
-                    )
-                )
-                if legacy_recovery:
-                    await persist_source_extraction_checkpoint(
-                        work,
-                        reusable.output,
-                        reusable.raw,
-                        model_run_id=checkpoint.id,
-                        batched=batched,
-                        access_mode=access_mode,
-                        legacy_recovery=True,
-                    )
-                return reusable
-            await evaluate(
-                Q2ReuseDecision(
-                    status=Q2ReuseStatus.MISS,
-                    reason=Q2ReuseReason.NO_CHECKPOINT,
-                    source_url=work.source.canonical_url,
-                    current_source_sha256=work.source_content_sha256,
-                    previous_source_sha256=previous_sha,
-                    candidate_model_run_id=checkpoint.id,
-                )
-            )
-            return None
-
-        async def persist_q2_checkpoint_keys(model_run_id: UUID, keys: Sequence[str]) -> None:
-            """Record only source results that passed the Q2 source parser."""
-            async with self._uow_factory() as uow:
-                model_runs = getattr(uow, "model_runs", None)
-                get_for_update = getattr(model_runs, "get_for_update", None)
-                save = getattr(model_runs, "save", None)
-                if get_for_update is None or save is None:
-                    return
-                model_run = await get_for_update(model_run_id)
-                if model_run is None or model_run.status is not ModelRunStatus.SUCCEEDED:
-                    return
-                parameters = dict(getattr(model_run, "parameters", {}) or {})
-                parameters["q2_checkpoint_keys"] = list(dict.fromkeys(keys))
-                model_run.parameters = parameters
-                await save(model_run)
-                commit = getattr(uow, "commit", None)
-                if commit is not None:
-                    await commit()
-
-        async def remove_q2_checkpoint_keys(model_run_id: UUID, keys: Sequence[str]) -> None:
-            """Remove source keys that failed local archive validation."""
-            if not keys:
-                return
-            async with self._uow_factory() as uow:
-                model_runs = getattr(uow, "model_runs", None)
-                get_for_update = getattr(model_runs, "get_for_update", None)
-                save = getattr(model_runs, "save", None)
-                if get_for_update is None or save is None:
-                    return
-                model_run = await get_for_update(model_run_id)
-                if model_run is None or model_run.status is not ModelRunStatus.SUCCEEDED:
-                    return
-                parameters = dict(getattr(model_run, "parameters", {}) or {})
-                current_keys = parameters.get("q2_checkpoint_keys", [])
-                if not isinstance(current_keys, list):
-                    return
-                parameters["q2_checkpoint_keys"] = [
-                    key for key in current_keys if key not in set(keys)
-                ]
-                model_run.parameters = parameters
-                await save(model_run)
-                commit = getattr(uow, "commit", None)
-                if commit is not None:
-                    await commit()
-
-        async def record_reused_source(
-            work: _Q2SourceWork,
-            reusable: _Q2ReusableSource,
-            *,
-            access_mode: str = "live_url",
-            source_text: SourceEvidenceDocument | None = None,
-            live_failure_code: str | None = None,
-        ) -> None:
-            nonlocal cache_hits, model_calls_avoided
-            try:
-                profiled_output, profile_warnings = _enforce_q2_profile(
-                    reusable.output, work.plan.profile
-                )
-                filtered_output = await gate_source_output(
-                    work,
-                    profiled_output,
-                    model_run_id=reusable.model_run_id,
-                    source_text=source_text,
-                )
-            except _Q2SourceEvidenceUnavailable as exc:
-                await remove_q2_checkpoint_keys(
-                    reusable.model_run_id,
-                    (
-                        checkpoint_key(work, batched=False, access_mode=access_mode),
-                        checkpoint_key(work, batched=True, access_mode="live_url")
-                        if access_mode == "live_url"
-                        else checkpoint_key(work, batched=False, access_mode="live_url"),
-                    ),
-                )
-                await record_source_failure(
-                    work.source,
-                    error_code=exc.code,
-                    model_run_id=reusable.model_run_id,
-                    details=exc.details,
-                    profile=work.plan.profile,
-                )
-                return
-            warnings.extend((*reusable.warnings, *profile_warnings))
-            submissions.append(
-                Q2ProposalSubmission(
-                    output=filtered_output,
-                    source_ids=(work.source.local_id,),
-                    model_run_id=str(reusable.model_run_id),
-                )
-            )
-            completed.append(work.source.local_id)
-            _mark_extraction_source_complete(
-                progress,
-                work.source,
-                status="cached",
-                counts=_source_progress_counts(filtered_output, work.source.local_id),
-                cache_hit=True,
-            )
-            cache_hits += 1
-            model_calls_avoided += 1
-            await self._persist_extraction_progress(run.id, progress)
-            url_raw_parts.append(reusable.raw)
-            self._diagnostics.record(
-                event="q2.source.reused",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=work.source.local_id,
-                source_url=work.source.canonical_url,
-                model_run_id=str(reusable.model_run_id),
-                profile=work.plan.profile.value,
-                checkpoint_version=Q2_SUCCESSFUL_CHECKPOINT_VERSION,
-                access_mode=access_mode,
-            )
-            if access_mode == "archive_fallback":
-                self._diagnostics.record(
-                    event="q2.source.archive_fallback_completed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=work.source.local_id,
-                    source_url=work.source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    profile=work.plan.profile.value,
-                    live_failure_code=live_failure_code,
-                    fallback_model_run_id=str(reusable.model_run_id),
-                    duration_ms=0,
-                    reused=True,
-                )
-
-        async def pace_before_model_call() -> None:
-            if progress["model_calls"]:
-                await self._check_cancellation(run.id, context)
-                await asyncio.sleep(self._pacing.model_delay_seconds())
-
-        def remove_persisted_model_call(
-            execution: Any,
-            *,
-            profile: ExtractionProfile,
-            batched_source_count: int = 0,
-        ) -> None:
-            """Do not count a ModelRun registry hit as a provider call."""
-            nonlocal full_calls, light_calls, light_batches, light_sources_batched
-            if execution.metadata.get("checkpoint") != "hit":
-                return
-            progress["model_calls"] = max(0, progress["model_calls"] - 1)
-            if profile is ExtractionProfile.FULL:
-                full_calls -= 1
-            else:
-                light_calls -= 1
-                if batched_source_count:
-                    light_batches -= 1
-                    light_sources_batched -= batched_source_count
-                    progress["light_batches"] = light_batches
-                    progress["light_sources_batched"] = light_sources_batched
-
-        async def record_source_failure(
-            source: ParsedSource,
-            *,
-            error_code: str,
-            model_run_id: UUID,
-            details: dict[str, Any] | None = None,
-            profile: ExtractionProfile,
-            batch_id: str | None = None,
-        ) -> None:
-            _mark_extraction_source_failed(progress, source.local_id, "failed")
-            await self._persist_extraction_progress(run.id, progress)
-            failed_attempts.append(source.local_id)
-            failed.append(source.local_id)
-            failure_details = details or {}
-            failures[source.local_id] = {
-                "model_run_id": str(model_run_id),
-                "batch_id": batch_id,
-                "source_url": source.canonical_url,
-                "error_code": error_code,
-                "error": error_code,
-                "details": failure_details,
-                "retryable": False,
-                "phase": "response_validation",
-                "submission_state": "post_submission",
-                "access_mode": "live_url",
-                "failure_class": _Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
-                "contributes_to_coverage": True,
-                "duration_ms": 0,
-            }
-            self._diagnostics.record(
-                event="q2.source.failed",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                model_run_id=str(model_run_id),
-                batch_id=batch_id,
-                profile=profile.value,
-                error_code=error_code,
-                error=error_code,
-                retryable=False,
-                phase="response_validation",
-                submission_state="post_submission",
-                failure_class=_Q2FailureClass.SOURCE_CONTENT_FAILURE.value,
-                access_mode="live_url",
-                duration_ms=0,
-            )
-
-        async def record_source_skip(
-            work: _Q2SourceWork,
-            *,
-            live_error_code: str,
-            archive_error_code: str,
-            archive_reason: str | None,
-            profile: ExtractionProfile,
-            live_model_run_id: UUID | None = None,
-            batch_id: str | None = None,
-        ) -> None:
-            details: dict[str, Any] = {
-                "source_url": work.source.canonical_url,
-                "reason_code": "live_unavailable_archive_unusable",
-                "live_error_code": live_error_code,
-                "archive_error_code": archive_error_code,
-                "blocking": False,
-            }
-            if archive_reason:
-                details["archive_reason"] = archive_reason
-            if batch_id is not None:
-                details["batch_id"] = batch_id
-            source_skips[work.source.local_id] = details
-            if work.source.local_id not in skipped:
-                skipped.append(work.source.local_id)
-            _mark_extraction_source_skipped(progress, work.source.local_id, details)
-            clear_active_source()
-            await self._persist_extraction_progress(run.id, progress)
-            self._diagnostics.record(
-                event="q2.source.skipped",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=work.source.local_id,
-                source_url=work.source.canonical_url,
-                source_content_sha256=work.source_content_sha256,
-                profile=profile.value,
-                live_error_code=live_error_code,
-                archive_error_code=archive_error_code,
-                archive_reason=archive_reason,
-                live_model_run_id=(str(live_model_run_id) if live_model_run_id else None),
-                batch_id=batch_id,
-                blocking=False,
-            )
-
-        async def record_batch_source_failure(
-            item: Q2BatchSource,
-            *,
-            error_code: str,
-            model_run_id: UUID,
-            details: dict[str, Any] | None = None,
-        ) -> None:
-            await record_source_failure(
-                item.source,
-                error_code=error_code,
-                model_run_id=model_run_id,
-                details=details,
-                profile=ExtractionProfile.IOC_RULES,
-                batch_id=item.batch_id,
-            )
-
-        async def execute_archive_fallback(
-            work: _Q2SourceWork,
-            *,
-            live_failure_code: str,
-            live_model_run_id: UUID | None = None,
-            batch_id: str | None = None,
-        ) -> dict[str, Any] | None:
-            """Run the archive-only path after an explicit live UNAVAILABLE."""
-            nonlocal full_calls, light_calls
-            source = work.source
-            plan = work.plan
-            archived = archived_sources.get(source.canonical_url)
-            try:
-                archived_text = await self._load_archived_source_text(archived)
-                # The evidence document is also the object passed to the gate.
-                # Prefer the safe complete rendered view when available, and
-                # never slice either representation.
-                source_text = (
-                    archived_text.decoded_source_view or archived_text.parsed_text
-                ).strip()
-                if not source_text:
-                    raise _Q2SourceEvidenceUnavailable(
-                        "Archived source text is empty",
-                        expected_sha256=archived.content_sha256 if archived else None,
-                        blob_id=archived.decoded_blob_id if archived else None,
-                    )
-                if len(source_text) < archive_fallback_min_chars:
-                    # Coquille anti-bot ou page de blocage : un appel modèle
-                    # dessus coûte 45 s et ne produit rien.
-                    raise _Q2SourceEvidenceUnavailable(
-                        "Archived source text is not substantive",
-                        expected_sha256=archived.content_sha256 if archived else None,
-                        blob_id=archived.decoded_blob_id if archived else None,
-                        code="archive_source_not_substantive",
-                    )
-            except _Q2SourceEvidenceUnavailable as exc:
-                details = exc.details if isinstance(exc.details, dict) else {}
-                await record_source_skip(
-                    work,
-                    live_error_code=live_failure_code,
-                    archive_error_code=exc.code,
-                    archive_reason=(
-                        str(details["reason"]) if isinstance(details.get("reason"), str) else None
-                    ),
-                    profile=plan.profile,
-                    live_model_run_id=live_model_run_id,
-                    batch_id=batch_id,
-                )
-                return None
-
-            # The fallback is a distinct Q2 access mode. Evaluate its own
-            # checkpoint immediately before the fallback provider call; a
-            # live miss must never silently authorize a second model call.
-            # Probed exactly once: a second identical probe would repeat the
-            # lookup and emit a duplicate `q2.source.reuse_evaluated` miss,
-            # double-counting the same decision in the reuse ledger.
-            reusable = await load_reusable_source(
-                work,
-                batched=False,
-                access_mode="archive_fallback",
-            )
-            if reusable is not None:
-                await record_reused_source(
-                    work,
-                    reusable,
-                    access_mode="archive_fallback",
-                    source_text=archived_text,
-                    live_failure_code=live_failure_code,
-                )
-                return None
-
-            archive_model_run_id = _q2_archive_fallback_model_run_id(
-                production_run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                canonical_url=source.canonical_url,
-                source_content_sha256=work.source_content_sha256 or "",
-                profile=plan.profile,
-                provider=ModelProvider.OPENAI,
-                requested_model=requested_model,
-            )
-
-            prompt = ProductionPromptTemplates.get_archived_extraction_prompt(
-                subject_title,
-                source.local_id,
-                source.title,
-                source.canonical_url,
-                source_text,
-                profile=plan.profile,
-            )
-            if len(prompt.encode("utf-8")) > MAX_Q2_ARCHIVE_FALLBACK_PROMPT_BYTES:
-                await record_source_skip(
-                    work,
-                    live_error_code=live_failure_code,
-                    archive_error_code="q2_archive_prompt_too_large",
-                    archive_reason="archive_fallback_prompt_exceeds_gateway_limit",
-                    profile=plan.profile,
-                    live_model_run_id=live_model_run_id,
-                    batch_id=batch_id,
-                )
-                return None
-            if plan.profile is ExtractionProfile.FULL:
-                full_calls += 1
-            else:
-                light_calls += 1
-            await pace_before_model_call()
-            _mark_extraction_source_running(progress, source, plan)
-            progress["model_calls"] += 1
-            await self._persist_extraction_progress(run.id, progress)
-            self._diagnostics.record(
-                event="q2.source.archive_fallback_started",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                source_content_sha256=work.source_content_sha256,
-                profile=plan.profile.value,
-                live_failure_code=live_failure_code,
-                fallback_model_run_id=str(archive_model_run_id),
-                web_search=False,
-            )
-            started_at = time.monotonic()
-            raw = ""
-            execution: Any | None = None
-            try:
-                execution = await model_gateway.execute(
-                    ModelRequest(
-                        text=prompt,
-                        prompt_template_id="production-q2-url-archive-fallback",
-                        prompt_template_version=ARCHIVE_FALLBACK_PROMPT_VERSION,
-                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
-                        external_llm_allowed=True,
-                        routing_hint=ModelRoutingHint.WEB_RESEARCH,
-                        web_search=False,
-                        run_id=archive_model_run_id,
-                        allow_failed_resubmit=True,
-                        metadata={
-                            "source_id": source.local_id,
-                            "source_url": source.canonical_url,
-                            "profile": plan.profile.value,
-                            "access_mode": "archive_fallback",
-                            "source_content_sha256": work.source_content_sha256,
-                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                            "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
-                            "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
-                        },
-                        parameters={
-                            "q2_execution_kind": "individual",
-                            "source_url": source.canonical_url,
-                            "source_content_sha256": work.source_content_sha256,
-                            "profile": plan.profile.value,
-                            "q2_access_mode": "archive_fallback",
-                            "prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
-                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-                            "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
-                            "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
-                        },
-                    ),
-                    ModelRole.RESEARCH,
-                )
-                remove_persisted_model_call(execution, profile=plan.profile)
-                await self._check_cancellation(run.id, context)
-                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
-                    review_details = dict(execution.run.error_details or {})
-                    review_details.update(execution.metadata)
-                    raise _Q2ControlFailure(
-                        execution.run.error_message or "Model run needs review",
-                        code=execution.run.error_code or "q2_control_failure",
-                        details=review_details,
-                    )
-                if execution.run.status is not ModelRunStatus.SUCCEEDED:
-                    run_status = execution.run.status.value
-                    raise _Q2ControlFailure(
-                        f"Model run reached unexpected status {run_status}",
-                        code=execution.run.error_code or "q2_model_run_not_succeeded",
-                        details={
-                            **(execution.run.error_details or {}),
-                            **execution.metadata,
-                            "model_run_status": run_status,
-                        },
-                    )
-                raw = execution.output_text or ""
-                if not raw.strip():
-                    raise _Q2ControlFailure("Provider returned no Q2 response")
-                parsed = parse_q2_proposals_markdown(raw)
-                self._log_parse(run, "extraction", parsed)
-                if not parsed.usable or parsed.value is None:
-                    # An archive was actually supplied: this is a normal
-                    # fallback output failure, not another source skip.
-                    raise _Q2SourceContentFailure(
-                        "; ".join(parsed.errors) or "archive_fallback_output_invalid"
-                    )
-                filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
-                filtered_output = await gate_source_output(
-                    work,
-                    filtered_output,
-                    model_run_id=execution.run.id,
-                    source_text=archived_text,
-                )
-                warnings.extend(profile_warnings)
-                submissions.append(
-                    Q2ProposalSubmission(
-                        output=filtered_output,
-                        source_ids=(source.local_id,),
-                        model_run_id=str(execution.run.id),
-                    )
-                )
-                completed.append(source.local_id)
-                _mark_extraction_source_complete(
-                    progress,
-                    source,
-                    status="succeeded",
-                    counts=_source_progress_counts(filtered_output, source.local_id),
-                )
-                await persist_q2_checkpoint_keys(
-                    execution.run.id,
-                    [checkpoint_key(work, batched=False, access_mode="archive_fallback")],
-                )
-                await persist_source_extraction_checkpoint(
-                    work,
-                    filtered_output,
-                    raw,
-                    model_run_id=execution.run.id,
-                    batched=False,
-                    access_mode="archive_fallback",
-                )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                url_raw_parts.append(raw)
-                warnings.extend(parsed.warnings)
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                self._diagnostics.record(
-                    event="q2.source.completed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_url=source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    model_run_id=str(execution.run.id),
-                    profile=plan.profile.value,
-                    access_mode="archive_fallback",
-                    answer_chars=len(raw),
-                    facts_count=len(filtered_output.facts),
-                    artifacts_count=len(filtered_output.artifacts),
-                    rules_count=len(filtered_output.rules),
-                    duration_ms=duration_ms,
-                )
-                self._diagnostics.record(
-                    event="q2.source.archive_fallback_completed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_url=source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    profile=plan.profile.value,
-                    live_failure_code=live_failure_code,
-                    fallback_model_run_id=str(execution.run.id),
-                    duration_ms=duration_ms,
-                )
-                return None
-            except JobCancelledError:
-                raise
-            except Exception as exc:
-                await self._check_cancellation(run.id, context)
-                if (
-                    execution is not None
-                    and getattr(execution, "run", None) is not None
-                    and execution.run.status is ModelRunStatus.SUCCEEDED
-                ):
-                    await persist_q2_checkpoint_keys(execution.run.id, [])
-                classification = _classify_q2_failure(
-                    exc,
-                    provider_response_produced=bool(raw),
-                )
-                _mark_extraction_source_failed(
-                    progress,
-                    source.local_id,
-                    "needs_review" if classification.status == "needs_review" else "failed",
-                )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                error = str(exc)[:1000]
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                failed_attempts.append(source.local_id)
-                if classification.contributes_to_coverage:
-                    failed.append(source.local_id)
-                exception_details = getattr(exc, "details", None)
-                failures[source.local_id] = {
-                    "model_run_id": str(archive_model_run_id),
-                    "source_url": source.canonical_url,
-                    "error_code": classification.error_code,
-                    "error": error,
-                    "details": (
-                        dict(exception_details) if isinstance(exception_details, dict) else {}
-                    ),
-                    "retryable": classification.retryable,
-                    "phase": classification.phase,
-                    "submission_state": classification.submission_state,
-                    "failure_class": classification.failure_class.value,
-                    "contributes_to_coverage": classification.contributes_to_coverage,
-                    "access_mode": "archive_fallback",
-                    "duration_ms": duration_ms,
-                }
-                self._diagnostics.record(
-                    event="q2.source.failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_url=source.canonical_url,
-                    source_content_sha256=work.source_content_sha256,
-                    model_run_id=str(archive_model_run_id),
-                    profile=plan.profile.value,
-                    access_mode="archive_fallback",
-                    error_code=classification.error_code,
-                    error=error,
-                    retryable=classification.retryable,
-                    phase=classification.phase,
-                    submission_state=classification.submission_state,
-                    failure_class=classification.failure_class.value,
-                    duration_ms=duration_ms,
-                )
-                if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
-                    return {
-                        "stage": "extraction",
-                        "status": "transient_error",
-                        "error_code": classification.error_code,
-                        "error": error,
-                        "details": {
-                            "completed_source_ids": completed,
-                            "skipped_source_ids": skipped,
-                            "failed_source_ids": failed_attempts,
-                            "source_skips": source_skips,
-                            "source_failures": failures,
-                            "failure_class": classification.failure_class.value,
-                        },
-                        "completed_source_ids": completed,
-                        "skipped_source_ids": skipped,
-                        "failed_source_ids": failed_attempts,
-                        "source_skips": source_skips,
-                        "source_failures": failures,
-                        **metrics(),
-                    }
-                if classification.failure_class in {
-                    _Q2FailureClass.RECONCILIATION_REQUIRED,
-                    _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
-                }:
-                    return {
-                        "stage": "extraction",
-                        "status": classification.status,
-                        "error_code": classification.error_code,
-                        "error": error,
-                        "details": {
-                            "completed_source_ids": completed,
-                            "skipped_source_ids": skipped,
-                            "failed_source_ids": failed_attempts,
-                            "source_skips": source_skips,
-                            "source_failures": failures,
-                            "failure_class": classification.failure_class.value,
-                        },
-                        "completed_source_ids": completed,
-                        "skipped_source_ids": skipped,
-                        "failed_source_ids": failed_attempts,
-                        "source_skips": source_skips,
-                        "source_failures": failures,
-                        **metrics(),
-                    }
-                return None
-
-        async def execute_individual(work: _Q2SourceWork) -> dict[str, Any] | None:
-            nonlocal full_calls, light_calls
-            source = work.source
-            plan = work.plan
-            source_content_sha256 = work.source_content_sha256
-            model_run_id = _q2_source_model_run_id(
-                production_run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                canonical_url=source.canonical_url,
-                profile=plan.profile,
-            )
-            prompt_version = EXTRACTION_PROMPT_VERSION_BY_PROFILE[plan.profile]
-            prompt = ProductionPromptTemplates.get_extraction_prompt(
-                subject_title,
-                source.local_id,
-                source.title,
-                source.canonical_url,
-                profile=plan.profile,
-            )
-            if plan.profile is ExtractionProfile.FULL:
-                full_calls += 1
-            else:
-                light_calls += 1
-            await pace_before_model_call()
-            # The progress snapshot immediately before submission is the first
-            # state that may claim this source is running.
-            _mark_extraction_source_running(progress, source, plan)
-            progress["model_calls"] += 1
-            await self._persist_extraction_progress(run.id, progress)
-            self._diagnostics.record(
-                event="q2.source.started",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                source_content_sha256=source_content_sha256,
-                model_run_id=str(model_run_id),
-                profile=plan.profile.value,
-                access_mode="live_url",
-                web_search=True,
-            )
-            started_at = time.monotonic()
-            raw = ""
-            execution: Any | None = None
-            try:
-                execution = await model_gateway.execute(
-                    ModelRequest(
-                        text=prompt,
-                        prompt_template_id="production-q2-url",
-                        prompt_template_version=prompt_version,
-                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
-                        external_llm_allowed=True,
-                        routing_hint=ModelRoutingHint.WEB_RESEARCH,
-                        web_search=True,
-                        run_id=model_run_id,
-                        allow_failed_resubmit=True,
-                        metadata={
-                            # The collection hash is provenance, not identity:
-                            # a re-archived source must not break the reuse of
-                            # this run's ModelRun.
-                            "source_id": source.local_id,
-                            "source_url": source.canonical_url,
-                            "profile": plan.profile.value,
-                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                            "parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                        },
-                        parameters={
-                            "q2_execution_kind": "individual",
-                            "source_url": source.canonical_url,
-                            "source_content_sha256": source_content_sha256,
-                            "profile": plan.profile.value,
-                            "q2_access_mode": "live_url",
-                            "prompt_version": prompt_version,
-                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-                        },
-                    ),
-                    ModelRole.RESEARCH,
-                )
-                remove_persisted_model_call(execution, profile=plan.profile)
-                await self._check_cancellation(run.id, context)
-                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
-                    review_details = dict(execution.run.error_details or {})
-                    review_details.update(execution.metadata)
-                    raise _Q2ControlFailure(
-                        execution.run.error_message or "Model run needs review",
-                        code=execution.run.error_code or "q2_control_failure",
-                        details=review_details,
-                    )
-                if execution.run.status is not ModelRunStatus.SUCCEEDED:
-                    run_status = execution.run.status.value
-                    raise _Q2ControlFailure(
-                        f"Model run reached unexpected status {run_status}",
-                        code=execution.run.error_code or "q2_model_run_not_succeeded",
-                        details={
-                            **(execution.run.error_details or {}),
-                            **execution.metadata,
-                            "model_run_status": run_status,
-                        },
-                    )
-                raw = execution.output_text or ""
-                if not raw.strip():
-                    raise _Q2ControlFailure("Provider returned no Q2 response")
-                parsed = parse_q2_proposals_markdown(raw)
-                self._log_parse(run, "extraction", parsed)
-                if not parsed.usable or parsed.value is None:
-                    if _is_q2_source_unavailable(parsed.errors):
-                        return await execute_archive_fallback(
-                            work,
-                            live_failure_code="q2_source_unavailable",
-                            live_model_run_id=execution.run.id,
-                        )
-                    raise _Q2SourceContentFailure(
-                        "; ".join(parsed.errors) or "source_content_invalid"
-                    )
-                filtered_output, profile_warnings = _enforce_q2_profile(parsed.value, plan.profile)
-                filtered_output = await gate_source_output(
-                    work,
-                    filtered_output,
-                    model_run_id=execution.run.id,
-                )
-                warnings.extend(profile_warnings)
-                submissions.append(
-                    Q2ProposalSubmission(
-                        output=filtered_output,
-                        source_ids=(source.local_id,),
-                        model_run_id=str(execution.run.id),
-                    )
-                )
-                completed.append(source.local_id)
-                _mark_extraction_source_complete(
-                    progress,
-                    source,
-                    status="succeeded",
-                    counts=_source_progress_counts(filtered_output, source.local_id),
-                )
-                await persist_q2_checkpoint_keys(
-                    execution.run.id,
-                    [checkpoint_key(work, batched=False)],
-                )
-                await persist_source_extraction_checkpoint(
-                    work,
-                    filtered_output,
-                    raw,
-                    model_run_id=execution.run.id,
-                    batched=False,
-                    access_mode="live_url",
-                )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                url_raw_parts.append(raw)
-                warnings.extend(parsed.warnings)
-                self._diagnostics.record(
-                    event="q2.source.completed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_content_sha256=source_content_sha256,
-                    model_run_id=str(model_run_id),
-                    profile=plan.profile.value,
-                    access_mode="live_url",
-                    answer_chars=len(raw),
-                    facts_count=len(filtered_output.facts),
-                    artifacts_count=len(filtered_output.artifacts),
-                    rules_count=len(filtered_output.rules),
-                    duration_ms=int((time.monotonic() - started_at) * 1000),
-                )
-                return None
-            except JobCancelledError:
-                raise
-            except Exception as exc:
-                await self._check_cancellation(run.id, context)
-                if (
-                    execution is not None
-                    and getattr(execution, "run", None) is not None
-                    and execution.run.status is ModelRunStatus.SUCCEEDED
-                ):
-                    await persist_q2_checkpoint_keys(execution.run.id, [])
-                classification = _classify_q2_failure(
-                    exc,
-                    provider_response_produced=bool(raw),
-                )
-                _mark_extraction_source_failed(
-                    progress,
-                    source.local_id,
-                    "needs_review" if classification.status == "needs_review" else "failed",
-                )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                error = str(exc)[:1000]
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                failed_attempts.append(source.local_id)
-                if classification.contributes_to_coverage:
-                    failed.append(source.local_id)
-                exception_details = getattr(exc, "details", None)
-                failures[source.local_id] = {
-                    "model_run_id": str(model_run_id),
-                    "source_url": source.canonical_url,
-                    "error_code": classification.error_code,
-                    "error": error,
-                    "details": (
-                        dict(exception_details) if isinstance(exception_details, dict) else {}
-                    ),
-                    "retryable": classification.retryable,
-                    "phase": classification.phase,
-                    "submission_state": classification.submission_state,
-                    "failure_class": classification.failure_class.value,
-                    "access_mode": "live_url",
-                    "contributes_to_coverage": classification.contributes_to_coverage,
-                    "duration_ms": duration_ms,
-                }
-                self._diagnostics.record(
-                    event="q2.source.failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    source_id=source.local_id,
-                    source_url=source.canonical_url,
-                    source_content_sha256=source_content_sha256,
-                    model_run_id=str(model_run_id),
-                    profile=plan.profile.value,
-                    error_code=classification.error_code,
-                    error=error,
-                    retryable=classification.retryable,
-                    phase=classification.phase,
-                    submission_state=classification.submission_state,
-                    failure_class=classification.failure_class.value,
-                    access_mode="live_url",
-                    duration_ms=duration_ms,
-                )
-                if classification.failure_class is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION:
-                    return {
-                        "stage": "extraction",
-                        "status": "transient_error",
-                        "error_code": classification.error_code,
-                        "error": error,
-                        "details": {
-                            "completed_source_ids": completed,
-                            "failed_source_ids": failed_attempts,
-                            "source_failures": failures,
-                            "failure_class": classification.failure_class.value,
-                        },
-                        "completed_source_ids": completed,
-                        "failed_source_ids": failed_attempts,
-                        "source_failures": failures,
-                        **metrics(),
-                    }
-                if classification.failure_class in {
-                    _Q2FailureClass.RECONCILIATION_REQUIRED,
-                    _Q2FailureClass.CONTROL_INVARIANT_FAILURE,
-                }:
-                    return {
-                        "stage": "extraction",
-                        "status": classification.status,
-                        "error_code": classification.error_code,
-                        "error": error,
-                        "details": {
-                            "completed_source_ids": completed,
-                            "failed_source_ids": failed_attempts,
-                            "source_failures": failures,
-                            "failure_class": classification.failure_class.value,
-                        },
-                        "completed_source_ids": completed,
-                        "failed_source_ids": failed_attempts,
-                        "source_failures": failures,
-                        **metrics(),
-                    }
-                return None
-
-        async def execute_batch(
-            batch_sources: tuple[Q2BatchSource, ...],
-            *,
-            model_run_id: UUID,
-        ) -> dict[str, Any] | None:
-            nonlocal light_calls, light_batches, light_sources_batched
-            batch = make_q2_batch(tuple(item.candidate for item in batch_sources))
-            # ``batch_sources`` already carries B# labels; rebuild only guards
-            # that a caller cannot accidentally submit a differently labelled
-            # batch to the parser.
-            if tuple(item.batch_id for item in batch.sources) != tuple(
-                item.batch_id for item in batch_sources
-            ):
-                raise _Q2ControlFailure("Batch source mapping is not deterministic")
-            prompt = ProductionPromptTemplates.get_ioc_rules_batch_prompt(
-                subject_title,
-                [(item.batch_id, item.canonical_url) for item in batch_sources],
-            )
-            light_calls += 1
-            light_batches += 1
-            light_sources_batched += len(batch_sources)
-            await pace_before_model_call()
-            # Only this batch is in flight. Future batches remain pending until
-            # their own provider submission is about to start.
-            for item in batch_sources:
-                _mark_extraction_source_running(
-                    progress,
-                    item.source,
-                    pending[item.source.local_id].plan,
-                )
-            progress["model_calls"] += 1
-            progress["light_batches"] = light_batches
-            progress["light_sources_batched"] = light_sources_batched
-            await self._persist_extraction_progress(run.id, progress)
-            self._diagnostics.record(
-                event="q2.batch.started",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                batch_model_run_id=str(model_run_id),
-                batch_source_ids=[item.source.local_id for item in batch_sources],
-                batch_source_urls=[item.canonical_url for item in batch_sources],
-                source_count=len(batch_sources),
-                access_mode="live_url",
-            )
-            started_at = time.monotonic()
-            raw = ""
-            execution: Any | None = None
-            try:
-                execution = await model_gateway.execute(
-                    ModelRequest(
-                        text=prompt,
-                        prompt_template_id="production-q2-ioc-batch",
-                        prompt_template_version=IOC_RULES_BATCH_PROMPT_VERSION,
-                        evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
-                        external_llm_allowed=True,
-                        routing_hint=ModelRoutingHint.WEB_RESEARCH,
-                        web_search=True,
-                        run_id=model_run_id,
-                        allow_failed_resubmit=True,
-                        metadata={
-                            # Only what the batch identity already carries
-                            # belongs here: the gateway hashes this metadata, so
-                            # anything else would break the reuse of this run's
-                            # ModelRun on a retry.
-                            "source_id": f"batch:{model_run_id!s}",
-                            "batch_id": str(model_run_id),
-                            "batch_source_count": len(batch_sources),
-                            "batch_source_urls": [item.canonical_url for item in batch_sources],
-                            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
-                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
-                        },
-                        parameters={
-                            "q2_execution_kind": "batch",
-                            "q2_access_mode": "live_url",
-                            "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-                            "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-                            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                            "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-                            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-                            "verifier_version": ARTIFACT_VERIFIER_VERSION,
-                            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
-                            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
-                            "q2_batch_sources": [
-                                {
-                                    "batch_id": item.batch_id,
-                                    "canonical_url": item.canonical_url,
-                                    "source_content_sha256": pending[
-                                        item.source.local_id
-                                    ].source_content_sha256,
-                                    "profile": ExtractionProfile.IOC_RULES.value,
-                                }
-                                for item in batch_sources
-                            ],
-                        },
-                    ),
-                    ModelRole.RESEARCH,
-                )
-                remove_persisted_model_call(
-                    execution,
-                    profile=ExtractionProfile.IOC_RULES,
-                    batched_source_count=len(batch_sources),
-                )
-                await self._check_cancellation(run.id, context)
-                if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
-                    review_details = dict(execution.run.error_details or {})
-                    review_details.update(execution.metadata)
-                    raise _Q2ControlFailure(
-                        execution.run.error_message or "Model run needs review",
-                        code=execution.run.error_code or "q2_control_failure",
-                        details=review_details,
-                    )
-                if execution.run.status is not ModelRunStatus.SUCCEEDED:
-                    run_status = execution.run.status.value
-                    raise _Q2ControlFailure(
-                        f"Model run reached unexpected status {run_status}",
-                        code=execution.run.error_code or "q2_model_run_not_succeeded",
-                        details={
-                            **(execution.run.error_details or {}),
-                            **execution.metadata,
-                            "model_run_status": run_status,
-                        },
-                    )
-                raw = execution.output_text or ""
-                if not raw.strip():
-                    raise _Q2ControlFailure("Provider returned no Q2 response")
-                url_raw_parts.append(raw)
-                parsed = parse_q2_batch_response(raw, batch.source_mapping)
-                self._diagnostics.record(
-                    event="q2.batch.parsed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    batch_model_run_id=str(execution.run.id),
-                    warnings=list(parsed.warnings),
-                    errors=list(parsed.errors),
-                )
-                warnings.extend(parsed.warnings)
-                if not parsed.usable:
-                    raise _Q2ControlFailure(
-                        "Batch response did not contain a readable expected source",
-                        code="batch_response_failure",
-                        details={"errors": list(parsed.errors)},
-                    )
-                by_id = {item.batch_id: item for item in batch_sources}
-                archive_fallback_items: list[Q2BatchSource] = []
-                for source_result in parsed.sources:
-                    item = by_id[source_result.batch_id]
-                    warnings.extend(source_result.warnings)
-                    if not source_result.usable or source_result.output is None:
-                        if source_result.error_code == "batch_source_unavailable":
-                            archive_fallback_items.append(item)
-                            continue
-                        await record_batch_source_failure(
-                            item,
-                            error_code=source_result.error_code or "batch_source_invalid",
-                            model_run_id=execution.run.id,
-                            details={"errors": list(source_result.errors)},
-                        )
-                        continue
-                    # Provenance stays local: the model only ever saw B# and
-                    # this block is checked against only its own archive.
-                    filtered_output, profile_warnings = _enforce_q2_profile(
-                        source_result.output, ExtractionProfile.IOC_RULES
-                    )
-                    try:
-                        filtered_output = await gate_source_output(
-                            pending[item.source.local_id],
-                            filtered_output,
-                            model_run_id=execution.run.id,
-                            batch_id=item.batch_id,
-                        )
-                    except _Q2SourceEvidenceUnavailable as exc:
-                        await record_batch_source_failure(
-                            item,
-                            error_code=exc.code,
-                            model_run_id=execution.run.id,
-                            details=exc.details,
-                        )
-                        continue
-                    warnings.extend(profile_warnings)
-                    submissions.append(
-                        Q2ProposalSubmission(
-                            output=filtered_output,
-                            source_ids=(item.source.local_id,),
-                            model_run_id=str(execution.run.id),
-                        )
-                    )
-                    completed.append(item.source.local_id)
-                    _mark_extraction_source_complete(
-                        progress,
-                        item.source,
-                        status="succeeded",
-                        counts=_source_progress_counts(filtered_output, item.source.local_id),
-                    )
-                    await persist_source_extraction_checkpoint(
-                        pending[item.source.local_id],
-                        filtered_output,
-                        source_result.raw_block,
-                        model_run_id=execution.run.id,
-                        batched=True,
-                        access_mode="live_url",
-                    )
-                    await self._persist_extraction_progress(run.id, progress)
-                    self._diagnostics.record(
-                        event="q2.source.completed",
-                        run_id=run.id,
-                        subject_id=run.subject_id,
-                        stage="extraction",
-                        correlation_id=self._correlation_id,
-                        source_id=item.source.local_id,
-                        source_url=item.canonical_url,
-                        model_run_id=str(execution.run.id),
-                        batch_model_run_id=str(model_run_id),
-                        batch_id=item.batch_id,
-                        profile=ExtractionProfile.IOC_RULES.value,
-                        answer_chars=len(source_result.raw_block),
-                        facts_count=0,
-                        artifacts_count=len(filtered_output.artifacts),
-                        rules_count=len(filtered_output.rules),
-                        duration_ms=int((time.monotonic() - started_at) * 1000),
-                    )
-                await persist_q2_checkpoint_keys(
-                    execution.run.id,
-                    [
-                        checkpoint_key(pending[item.source.local_id], batched=True)
-                        for item in batch_sources
-                        if item.source.local_id in completed
-                    ],
-                )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                for item in archive_fallback_items:
-                    fallback_result = await execute_archive_fallback(
-                        pending[item.source.local_id],
-                        live_failure_code="batch_source_unavailable",
-                        live_model_run_id=execution.run.id,
-                        batch_id=item.batch_id,
-                    )
-                    if fallback_result is not None:
-                        return fallback_result
-                return None
-            except JobCancelledError:
-                raise
-            except Exception as exc:
-                await self._check_cancellation(run.id, context)
-                if (
-                    execution is not None
-                    and getattr(execution, "run", None) is not None
-                    and execution.run.status is ModelRunStatus.SUCCEEDED
-                ):
-                    await persist_q2_checkpoint_keys(execution.run.id, [])
-                classification = _classify_q2_failure(exc, provider_response_produced=False)
-                error = str(exc)[:1000]
-                duration_ms = int((time.monotonic() - started_at) * 1000)
-                exception_details = getattr(exc, "details", None)
-                batch_failure = {
-                    "batch_model_run_id": str(model_run_id),
-                    "source_ids": [item.source.local_id for item in batch_sources],
-                    "error_code": classification.error_code,
-                    "error": error,
-                    "details": (
-                        dict(exception_details) if isinstance(exception_details, dict) else {}
-                    ),
-                    "retryable": classification.retryable,
-                    "phase": classification.phase,
-                    "submission_state": classification.submission_state,
-                    "failure_class": classification.failure_class.value,
-                    "duration_ms": duration_ms,
-                }
-                for item in batch_sources:
-                    if _progress_source(progress, item.source.local_id)["status"] not in {
-                        "cached",
-                        "succeeded",
-                    }:
-                        _mark_extraction_source_failed(
-                            progress,
-                            item.source.local_id,
-                            "needs_review",
-                        )
-                clear_active_source()
-                await self._persist_extraction_progress(run.id, progress)
-                self._diagnostics.record(
-                    event="q2.batch.failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage="extraction",
-                    correlation_id=self._correlation_id,
-                    batch_model_run_id=batch_failure["batch_model_run_id"],
-                    source_ids=batch_failure["source_ids"],
-                    error_code=batch_failure["error_code"],
-                    error=error,
-                    details=batch_failure["details"],
-                    retryable=classification.retryable,
-                    phase=classification.phase,
-                    submission_state=classification.submission_state,
-                    failure_class=classification.failure_class.value,
-                    access_mode="live_url",
-                    duration_ms=duration_ms,
-                )
-                return {
-                    "stage": "extraction",
-                    "status": (
-                        "transient_error"
-                        if classification.failure_class
-                        is _Q2FailureClass.GLOBAL_TRANSIENT_PRE_SUBMISSION
-                        else classification.status
-                    ),
-                    "error_code": classification.error_code,
-                    "error": error,
-                    "details": {
-                        "completed_source_ids": completed,
-                        "failed_source_ids": failed_attempts,
-                        "source_failures": failures,
-                        "batch_failure": batch_failure,
-                        "failure_class": classification.failure_class.value,
-                    },
-                    "completed_source_ids": completed,
-                    "failed_source_ids": failed_attempts,
-                    "source_failures": failures,
-                    **metrics(),
-                }
-
-        # Q1 ids are provenance keys.  Refuse the whole extraction before a
-        # batch can make two indistinguishable submissions.
-        if len({source.local_id for source in report.sources}) != len(report.sources):
-            return {
-                "stage": "extraction",
-                "status": "needs_review",
-                "error_code": "duplicate_reference_source_id",
-                "error": "Q1 source ids must be unique before Q2 extraction",
-                "completed_source_ids": [],
-                "failed_source_ids": [],
-                **metrics(),
-            }
-
-        # First pass: plan every source. Planning must not claim work is in
-        # flight: all sources were persisted as pending above, and only the
-        # request immediately before a provider call changes that state.
-        for source in report.sources:
-            plan = plans_by_url[source.canonical_url]
-            await self._check_cancellation(run.id, context)
-            archived = archived_sources.get(source.canonical_url)
-            source_content_sha256 = archived.content_sha256 if archived is not None else None
-            self._diagnostics.record(
-                event="q2.source.plan",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                pipeline_generation=run.pipeline_generation,
-                source_id=source.local_id,
-                source_url=source.canonical_url,
-                source_content_sha256=source_content_sha256,
-                profile=plan.profile.value,
-                reason=plan.reason,
-            )
-            work = _Q2SourceWork(
-                source=source,
-                plan=plan,
-                source_content_sha256=source_content_sha256,
-            )
-            pending[source.local_id] = work
-
-        # Deux sources différentes peuvent avoir archivé exactement le même
-        # contenu (page anti-bot, shell JavaScript, redirection). Une seule
-        # extraction est nécessaire ; les autres réutilisent son résultat.
-        content_twins: dict[str, str] = {}
-        duplicate_source_ids: dict[str, str] = {}
-        for source_id, work in pending.items():
-            digest = work.source_content_sha256
-            if not digest:
-                continue
-            primary = content_twins.get(digest)
-            if primary is None:
-                content_twins[digest] = source_id
-                continue
-            duplicate_source_ids[source_id] = primary
-            self._diagnostics.record(
-                event="q2.source.content_duplicate",
-                run_id=run.id,
-                subject_id=run.subject_id,
-                stage="extraction",
-                correlation_id=self._correlation_id,
-                source_id=source_id,
-                source_url=work.source.canonical_url,
-                primary_source_id=primary,
-                source_content_sha256=digest,
-            )
-
-        # Select reusable results and live candidates only after every source
-        # has been planned, so content twins can be excluded consistently.
-        for source in report.sources:
-            if source.local_id in duplicate_source_ids:
-                continue
-            plan = plans_by_url[source.canonical_url]
-            work = pending[source.local_id]
-            candidate = (
-                _batch_candidate(source) if plan.profile is ExtractionProfile.IOC_RULES else None
-            )
-            if candidate is not None:
-                batch_candidates.append(candidate)
-            else:
-                reusable = await load_reusable_source(work, batched=False)
-                if reusable is not None:
-                    await record_reused_source(work, reusable)
-                else:
-                    individual_source_ids.add(source.local_id)
-
-        # Every batch candidate's checkpoint is probed BEFORE the candidates are
-        # partitioned. Reuse is a per-source decision -- it does not depend on
-        # which batch a source lands in -- so partitioning first only fragments
-        # the residual work: with MAX_Q2_BATCH_SOURCES sources per group, two
-        # groups each left with a single unreusable source become two
-        # individual calls where one shared batch would do. Filtering first
-        # keeps the residue contiguous and bills the minimum number of calls.
-        unreusable: list[Q2BatchCandidate] = []
-        for candidate in batch_candidates:
-            work = pending[candidate.source.local_id]
-            reusable = await load_reusable_source(work, batched=True)
-            if reusable is None:
-                # An earlier individual IOC_RULES response is also a valid
-                # source checkpoint; it is parsed without batch framing.
-                reusable = await load_reusable_source(work, batched=False)
-            if reusable is not None:
-                await record_reused_source(work, reusable)
-            else:
-                unreusable.append(candidate)
-
-        batched_source_ids: dict[str, int] = {}
-        planned_batches: list[tuple[str, ...]] = []
-        for candidate_group in partition_q2_batch_candidates(unreusable):
-            if len(candidate_group) < 2:
-                # A one-source residue is always the individual IOC_RULES path.
-                individual_source_ids.update(item.source.local_id for item in candidate_group)
-                continue
-            local_batch = make_q2_batch(candidate_group)
-            batch_run_id = _q2_batch_model_run_id(
-                production_run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                canonical_urls=local_batch.canonical_urls,
-            )
-            light_batches_by_first_source[local_batch.sources[0].source.local_id] = (
-                local_batch.sources,
-                batch_run_id,
-            )
-            batch_index = len(planned_batches)
-            planned_batches.append(tuple(item.source.local_id for item in local_batch.sources))
-            for item in local_batch.sources:
-                batched_source_ids[item.source.local_id] = batch_index
-
-        impact_plan = _build_extraction_impact_plan(
-            report=report,
-            plans_by_url=plans_by_url,
-            duplicate_source_ids=duplicate_source_ids,
-            individual_source_ids=individual_source_ids,
-            batched_source_ids=batched_source_ids,
-            batches=tuple(planned_batches),
-            reuse_decisions=reuse_decisions,
-        )
-        _apply_impact_plan_to_progress(progress, impact_plan)
-        await self._persist_extraction_progress(run.id, progress)
-        # The complete cost decision is readable before the first provider call.
-        self._diagnostics.record(
-            event="q2.extraction.plan",
-            run_id=run.id,
-            subject_id=run.subject_id,
-            stage="extraction",
-            correlation_id=self._correlation_id,
-            pipeline_generation=run.pipeline_generation,
-            **impact_plan.as_event_payload(),
-        )
-
-        handled_source_ids = set(completed)
-        for source in report.sources:
-            if source.local_id in handled_source_ids:
-                continue
-            prepared_batch = light_batches_by_first_source.get(source.local_id)
-            if prepared_batch is not None:
-                batch_sources, batch_run_id = prepared_batch
-                early_result = await execute_batch(
-                    batch_sources,
-                    model_run_id=batch_run_id,
-                )
-                if early_result is not None:
-                    return early_result
-                handled_source_ids.update(item.source.local_id for item in batch_sources)
-                continue
-            if source.local_id in individual_source_ids:
-                early_result = await execute_individual(pending[source.local_id])
-                if early_result is not None:
-                    return early_result
-                handled_source_ids.add(source.local_id)
-
-        # Chaque doublon de contenu hérite du résultat de sa source primaire :
-        # les artefacts restent attribués à la source qui les publie.
-        for duplicate_id, primary_id in duplicate_source_ids.items():
-            primary_submission = next(
-                (item for item in submissions if primary_id in item.source_ids),
-                None,
-            )
-            if primary_submission is None:
-                # The duplicate carries the very same bytes as its primary, so
-                # it inherits the primary's disposition whole. When the primary
-                # was skipped, the duplicate is a skip too and must appear in
-                # the skip ledger the read models expose, not only as a status.
-                primary_skip = source_skips.get(primary_id)
-                if primary_skip is None:
-                    _mark_extraction_source_failed(progress, duplicate_id, "skipped")
-                    continue
-                inherited = dict(primary_skip)
-                inherited["source_url"] = pending[duplicate_id].source.canonical_url
-                inherited["duplicate_of_source_id"] = primary_id
-                source_skips[duplicate_id] = inherited
-                if duplicate_id not in skipped:
-                    skipped.append(duplicate_id)
-                _mark_extraction_source_skipped(progress, duplicate_id, inherited)
-                continue
-            submissions.append(
-                Q2ProposalSubmission(
-                    output=primary_submission.output,
-                    source_ids=(duplicate_id,),
-                    model_run_id=primary_submission.model_run_id,
-                )
-            )
-            completed.append(duplicate_id)
-            _mark_extraction_source_complete(
-                progress,
-                pending[duplicate_id].source,
-                status="cached",
-                counts=_source_progress_counts(primary_submission.output, duplicate_id),
-                cache_hit=True,
-            )
-            cache_hits += 1
-            model_calls_avoided += 1
-        await self._persist_extraction_progress(run.id, progress)
-
-        if failed:
-            return {
-                "stage": "extraction",
-                "status": "needs_review",
-                "error_code": "q2_source_coverage_failed",
-                "error": "One or more Q1 sources could not be analysed",
-                "details": {
-                    "completed_source_ids": completed,
-                    "skipped_source_ids": skipped,
-                    "failed_source_ids": failed,
-                    "source_skips": source_skips,
-                    "source_failures": failures,
-                },
-                "completed_source_ids": completed,
-                "skipped_source_ids": skipped,
-                "failed_source_ids": failed,
-                "source_skips": source_skips,
-                "source_failures": failures,
-                "model_calls": progress["model_calls"],
-                "full_calls": full_calls,
-                "light_calls": light_calls,
-                "light_batches": light_batches,
-                "light_sources_batched": light_sources_batched,
-                "cache_hits": cache_hits,
-                "model_calls_avoided": model_calls_avoided,
-            }
-        self._diagnostics.record(
-            event="q2.extraction.metrics",
-            run_id=run.id,
-            subject_id=run.subject_id,
-            stage="extraction",
-            correlation_id=self._correlation_id,
-            model_calls=progress["model_calls"],
-            full_calls=full_calls,
-            light_calls=light_calls,
-            light_batches=light_batches,
-            light_sources_batched=light_sources_batched,
-            cache_hits=cache_hits,
-            model_calls_avoided=model_calls_avoided,
-        )
-        verification = verify_q2_proposals(submissions)
-        extraction = verification.canonical
-        # Source-gate rejections have already been captured while each Q2
-        # response was framed. Capture the second rejection boundary too:
-        # malformed/placeholder artifacts must be arbitrable with their exact
-        # model value, not only with a diagnostic hash.
-        source_by_id = {source.local_id: source for source in report.sources}
-        diagnostic_offset = 0
-        for submission in submissions:
-            proposals = [
-                *submission.output.facts,
-                *submission.output.artifacts,
-                *submission.output.rules,
-            ]
-            submission_diagnostics = verification.diagnostics[
-                diagnostic_offset : diagnostic_offset + len(proposals)
-            ]
-            diagnostic_offset += len(proposals)
-            submission_source_id = submission.source_ids[0] if submission.source_ids else None
-            submission_source = (
-                source_by_id.get(submission_source_id) if submission_source_id is not None else None
-            )
-            if submission_source is None:
-                continue
-            for diagnostic, proposal in zip(submission_diagnostics, proposals, strict=True):
-                if diagnostic.status.value != "rejected" or diagnostic.proposal_kind not in {
-                    "artifact",
-                    "rule",
-                }:
-                    continue
-                value = getattr(proposal, "body", None) or getattr(proposal, "value", None)
-                if not isinstance(value, str):
-                    continue
-                issue_kind = (
-                    ProductionRepairIssueKind.REJECTED_RULE.value
-                    if diagnostic.proposal_kind == "rule"
-                    else ProductionRepairIssueKind.REJECTED_INDICATOR.value
-                )
-                value_sha256 = hashlib.sha256(value.encode("utf-8")).hexdigest()
-                repair_key = repair_key_for_rejection(
-                    edition_id=run.edition_id,
-                    subject_id=run.subject_id,
-                    kind=issue_kind,
-                    source_url=submission_source.canonical_url,
-                    artifact_type=diagnostic.artifact_type,
-                    value=value,
-                )
-                repair_evidence_entries.append(
-                    {
-                        "repair_key": repair_key,
-                        "source_id": submission_source.local_id,
-                        "source_title": submission_source.title,
-                        "source_url": submission_source.canonical_url,
-                        "batch_id": None,
-                        "model_run_id": submission.model_run_id,
-                        "proposal_index": diagnostic.proposal_index,
-                        "proposal_kind": diagnostic.proposal_kind,
-                        "artifact_type": diagnostic.artifact_type,
-                        "reason_code": diagnostic.reason_code or "rejected",
-                        "value": value,
-                        "value_sha256": value_sha256,
-                    }
-                )
-                source_evidence_rejections.append(
-                    {
-                        "source_id": submission_source.local_id,
-                        "source_url": submission_source.canonical_url,
-                        "batch_id": None,
-                        "model_run_id": submission.model_run_id,
-                        "proposal_index": diagnostic.proposal_index,
-                        "proposal_kind": diagnostic.proposal_kind,
-                        "artifact_type": diagnostic.artifact_type,
-                        "reason_code": diagnostic.reason_code or "rejected",
-                        "value": value[:512],
-                        "value_hash": value_sha256,
-                    }
-                )
-        progress.update(_canonical_extraction_progress_counts(extraction))
-        progress["active_source_id"] = None
-        progress["active_source_title"] = None
-        progress["active_profile"] = None
-        status_totals = {
-            status.value: sum(item.indicator_status is status for item in extraction.items)
-            for status in IndicatorStatus
-        }
-        source_evidence_rejection_groups = [
-            {
-                "source_id": source_id,
-                "batch_id": batch_id,
-                "artifact_type": artifact_type,
-                "rejection_count": count,
-                "reason_code": reason_code,
-            }
-            for (source_id, batch_id, artifact_type, reason_code), count in (
-                source_evidence_rejection_counts.items()
-            )
-        ]
-        # Une règle de détection perdue est un incident éditorial, pas un
-        # avertissement de plus : elle ne se retrouve pas, contrairement à un
-        # IOC qu'une autre source republiera.
-        rejected_rules = [
-            rejection
-            for rejection in source_evidence_rejections
-            if rejection["proposal_kind"] == "rule"
-        ]
-        rejected_ioc_count = sum(
-            is_publication_ioc_artifact_type(rejection.get("artifact_type"))
-            for rejection in source_evidence_rejections
-            if rejection.get("proposal_kind") == "artifact"
-        )
-        source_evidence_warnings = [
-            (
-                f"q2_batch_source_evidence_rejected:{batch_id}:{source_id}:"
-                f"{artifact_type}:count={count}:reason={reason_code}"
-                if batch_id
-                else (
-                    f"q2_source_evidence_rejected:{source_id}:{artifact_type}:"
-                    f"count={count}:reason={reason_code}"
-                )
-            )
-            for (source_id, batch_id, artifact_type, reason_code), count in (
-                source_evidence_rejection_counts.items()
-            )
-        ]
-        if rejected_rules:
-            source_evidence_warnings.insert(
-                0,
-                f"q2_detection_rules_lost:count={len(rejected_rules)}",
-            )
-        await self._check_cancellation(run.id, context)
-        repair_evidence_blob_id = None
-        put_repair_evidence = getattr(self._artifact_store, "put_repair_evidence", None)
-        if callable(put_repair_evidence):
-            repair_evidence_blob_id = await put_repair_evidence(
-                build_repair_evidence_pack(repair_evidence_entries)
-            )
-        repair_evidence_index = [
-            {key: value for key, value in entry.items() if key != "value"}
-            | {
-                "preview": str(entry.get("value", ""))[:512],
-            }
-            for entry in repair_evidence_entries
-        ]
-        artifact = await self._extraction.store_extraction_result(
-            run_id=run.id,
-            subject_id=run.subject_id,
-            input_hash=input_hash,
-            raw_result="\n\n".join(url_raw_parts),
-            canonical_json=technical_extraction_to_json(extraction),
-            warnings=[
-                *warnings,
-                *verification.warnings,
-                *source_evidence_warnings,
-                *(f"q2_rejected:{item.reason_code}" for item in verification.rejected),
-            ],
-            verification_diagnostics={
-                "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-                "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-                "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
-                "extraction_profiles": {
-                    plan.canonical_url: plan.profile.value for plan in source_plans
-                },
-                "model_calls": progress["model_calls"],
-                "full_calls": full_calls,
-                "light_calls": light_calls,
-                "light_batches": light_batches,
-                "light_sources_batched": light_sources_batched,
-                "cache_hits": cache_hits,
-                "model_calls_avoided": model_calls_avoided,
-                "completed_source_ids": completed,
-                "skipped_source_ids": skipped,
-                "failed_source_ids": failed,
-                "source_skips": source_skips,
-                "q2_proposal_diagnostics": [
-                    {
-                        "status": item.status.value,
-                        "proposal_index": item.proposal_index,
-                        "proposal_kind": item.proposal_kind,
-                        "artifact_type": item.artifact_type,
-                        "value_hash": item.value_hash,
-                        "reason_code": item.reason_code,
-                    }
-                    for item in verification.diagnostics
-                ],
-                "q2_source_evidence_rejections": source_evidence_rejections,
-                "q2_source_evidence_rejection_groups": source_evidence_rejection_groups,
-                "q2_rejected_rules": rejected_rules,
-                "q2_rejected_rule_count": len(rejected_rules),
-                "q2_rejected_ioc_count": rejected_ioc_count,
-                "q2_rejected_artifact_count": len(source_evidence_rejections) - len(rejected_rules),
-                "q2_rejected_other_artifact_count": max(
-                    0,
-                    len(source_evidence_rejections) - len(rejected_rules) - rejected_ioc_count,
-                ),
-                "semantic_status_conflicts": [
-                    {
-                        "artifact_type": item.artifact_type,
-                        "value_hash": item.value_hash,
-                        "statuses": list(item.statuses),
-                        "source_ids": list(item.source_ids),
-                    }
-                    for item in verification.semantic_status_conflicts
-                ],
-            },
-            repair_evidence_blob_id=repair_evidence_blob_id,
-            repair_evidence_entry_count=len(repair_evidence_entries),
-            repair_evidence_index=repair_evidence_index,
-        )
-        # Q2 is now durable.  Replay the still-applicable Repair Desk
-        # decisions before the stage chain advances to SYNTHESIS.  This uses a
-        # fresh transaction because ExtractionService's historical persistence
-        # API commits its artifact, but it deliberately bypasses review fences:
-        # the workflow is allowed to reconcile a RUNNING run without changing
-        # its generation or opening another model turn.
-        effective_artifact_id: str | None = None
-        decisions_repository = getattr(uow, "production_repair_decisions", None)
-        decisions_getter = getattr(decisions_repository, "effective_decisions", None)
-        effective_decisions = (
-            tuple(
+        async with self._uow_factory() as replay_uow:
+            effective_decisions = [
                 decision
-                for decision in await decisions_getter(run.edition_id, run.subject_id)
-                if getattr(decision.issue_kind, "value", decision.issue_kind)
-                in {"rejected_indicator", "rejected_rule"}
-            )
-            if callable(decisions_getter)
-            else ()
-        )
-        if (
-            self._artifact_store is not None
-            and getattr(artifact, "canonical_blob_id", None) is not None
-            and effective_decisions
-        ):
-            async with self._uow_factory() as replay_uow:
-                replay_run = await replay_uow.production_runs.get(run.id)
-                if replay_run is None:
-                    replay_run = run
+                for decision in await replay_uow.production_repair_decisions.effective_decisions(
+                    run.edition_id, run.subject_id
+                )
+                if decision.issue_kind
+                in {
+                    ProductionRepairIssueKind.REJECTED_INDICATOR,
+                    ProductionRepairIssueKind.REJECTED_RULE,
+                }
+            ]
+            if effective_decisions:
+                replay_run = await replay_uow.production_runs.get(run.id) or run
                 effective_artifact = await reconcile_effective_repairs_in_uow(
                     replay_uow,
                     run=replay_run,
                     base_extraction_artifact=artifact,
                     artifact_store=self._artifact_store,
-                    payload_resolver=getattr(
-                        self,
-                        "_repair_payloads",
-                        ProductionRepairPayloadResolver(getattr(self, "_model_gateway", None)),
-                    ),
+                    payload_resolver=self._repair_payloads,
                 )
                 if effective_artifact is not None:
                     effective_artifact_id = str(effective_artifact.id)
-                commit = getattr(replay_uow, "commit", None)
-                if callable(commit):
-                    await commit()
+                await replay_uow.commit()
+
+        progress = _canonical_extraction_progress(
+            plan, extraction=extraction, model_calls=execution.model_calls
+        )
         await self._persist_extraction_progress(run.id, progress)
         return {
             "stage": "extraction",
             "status": "success",
             "artifact_id": str(artifact.id),
             "effective_artifact_id": effective_artifact_id,
-            "items_count": len(extraction.items),
-            "rules_count": len(extraction.rules),
-            "supported_items": len(extraction.supported_items()),
-            "status_totals": status_totals,
-            "completed_source_ids": completed,
-            "skipped_source_ids": skipped,
-            "failed_source_ids": failed,
-            "source_skips": source_skips,
-            "model_calls": progress["model_calls"],
-            "full_calls": full_calls,
-            "light_calls": light_calls,
-            "light_batches": light_batches,
-            "light_sources_batched": light_sources_batched,
-            "cache_hits": cache_hits,
-            "model_calls_avoided": model_calls_avoided,
+            **production_extraction_metadata(extraction),
+            "model_calls": execution.model_calls,
+            "references_corpus_hash": extraction.references_corpus_hash,
         }
 
     @staticmethod
@@ -5469,6 +1937,7 @@ class ProductionWorkflowOrchestrator:
                 uow_factory=self._uow_factory,
                 artifact_store=self._artifact_store,
                 run_id=run.id,
+                source_labels=report_source_labels(report),
             )
             if extraction_payload is None:
                 return {
@@ -5958,199 +2427,6 @@ class ProductionWorkflowOrchestrator:
                 }
 
 
-def _q2_checkpoint_key(
-    *,
-    canonical_url: str,
-    profile: ExtractionProfile,
-    prompt_version: str,
-    batch_parser_version: str | None,
-    provider: ModelProvider,
-    requested_model: str,
-    source_content_sha256: str | None = None,
-) -> str:
-    """Return the identity of a reusable successful Q2 source response.
-
-    The identity is deliberately cross-run: the same canonical URL and
-    archived content capture extracted with the same profile, contract and
-    prompt versions yields the same result. Freshness is bounded at lookup
-    time, not in the key. A batch
-    response carries one key for every source it was asked to process; the
-    parser decides which of those source results actually succeeded.
-    """
-    identity = {
-        "checkpoint_version": Q2_SUCCESSFUL_CHECKPOINT_VERSION,
-        "canonical_url": canonical_url,
-        "profile": profile.value,
-        "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-        "verifier_version": ARTIFACT_VERIFIER_VERSION,
-        "prompt_version": prompt_version,
-        "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-        "q2_batch_parser_version": batch_parser_version,
-        "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-        "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-        "provider": provider.value,
-        "requested_model": requested_model,
-        "source_content_sha256": source_content_sha256,
-    }
-    return hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _q2_source_model_run_id(
-    *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    source_id: str,
-    canonical_url: str,
-    prompt_version: str | None = None,
-    parser_version: str = Q2_MARKDOWN_PARSER_VERSION,
-    profile: ExtractionProfile = ExtractionProfile.FULL,
-    provider: ModelProvider = ModelProvider.OPENAI,
-) -> UUID:
-    """Stable ModelRun identity for one Q1 source in a Q2 generation."""
-    identity = json.dumps(
-        {
-            "production_run_id": str(production_run_id),
-            "pipeline_generation": pipeline_generation,
-            "source_id": source_id,
-            "canonical_url": canonical_url,
-            "profile": profile.value,
-            "prompt_version": prompt_version or EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
-            "parser_version": parser_version,
-            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-            "provider": provider.value,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return uuid5(NAMESPACE_URL, f"production-q2-source:{identity}")
-
-
-def _q2_archive_fallback_identity(
-    *,
-    canonical_url: str,
-    source_content_sha256: str,
-    profile: ExtractionProfile,
-    provider: ModelProvider,
-    requested_model: str,
-) -> dict[str, Any]:
-    """Return the complete functional identity of an archive fallback."""
-    return {
-        "access_mode": "archive_fallback",
-        "canonical_url": canonical_url,
-        "source_content_sha256": source_content_sha256,
-        "profile": profile.value,
-        "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
-        "prompt_version": EXTRACTION_PROMPT_VERSION_BY_PROFILE[profile],
-        "archive_fallback_prompt_version": ARCHIVE_FALLBACK_PROMPT_VERSION,
-        "archived_source_access_version": ARCHIVED_SOURCE_ACCESS_VERSION,
-        "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-        "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-        "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-        "q2_routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-        "q2_model_policy_version": Q2_MODEL_POLICY_VERSION,
-        "provider": provider.value,
-        "requested_model": requested_model,
-    }
-
-
-def _q2_archive_fallback_run_identity(
-    *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    source_id: str,
-    canonical_url: str,
-    source_content_sha256: str,
-    profile: ExtractionProfile,
-    provider: ModelProvider,
-    requested_model: str,
-) -> dict[str, Any]:
-    """Return the run-local identity used for archive ModelRun IDs."""
-    return {
-        "production_run_id": str(production_run_id),
-        "pipeline_generation": pipeline_generation,
-        "source_id": source_id,
-        **_q2_archive_fallback_identity(
-            canonical_url=canonical_url,
-            source_content_sha256=source_content_sha256,
-            profile=profile,
-            provider=provider,
-            requested_model=requested_model,
-        ),
-    }
-
-
-def _q2_archive_fallback_model_run_id(
-    *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    source_id: str,
-    canonical_url: str,
-    source_content_sha256: str,
-    profile: ExtractionProfile,
-    provider: ModelProvider = ModelProvider.OPENAI,
-    requested_model: str = "unknown",
-) -> UUID:
-    """Return an ID that can never collide with the live URL ModelRun."""
-    identity = json.dumps(
-        _q2_archive_fallback_run_identity(
-            production_run_id=production_run_id,
-            pipeline_generation=pipeline_generation,
-            source_id=source_id,
-            canonical_url=canonical_url,
-            source_content_sha256=source_content_sha256,
-            profile=profile,
-            provider=provider,
-            requested_model=requested_model,
-        ),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return uuid5(NAMESPACE_URL, f"production-q2-archive-fallback:{identity}")
-
-
-def _q2_archive_fallback_checkpoint_key(
-    *,
-    canonical_url: str,
-    source_content_sha256: str,
-    profile: ExtractionProfile,
-    provider: ModelProvider = ModelProvider.OPENAI,
-    requested_model: str = "unknown",
-) -> str:
-    """Return the reusable checkpoint key for one exact archived capture."""
-    identity = _q2_archive_fallback_identity(
-        canonical_url=canonical_url,
-        source_content_sha256=source_content_sha256,
-        profile=profile,
-        provider=provider,
-        requested_model=requested_model,
-    )
-    return hashlib.sha256(
-        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
-
-
-def _q2_batch_model_run_id(
-    *,
-    production_run_id: UUID,
-    pipeline_generation: int,
-    canonical_urls: Sequence[str],
-    provider: ModelProvider = ModelProvider.OPENAI,
-) -> UUID:
-    """Stable identity for one IOC_RULES web batch inside one production run."""
-    return q2_batch_model_run_id(
-        production_run_id=production_run_id,
-        pipeline_generation=pipeline_generation,
-        canonical_urls=canonical_urls,
-        routing_policy_version=Q2_ROUTING_POLICY_VERSION,
-        provider=provider,
-        ioc_rules_batch_prompt_version=IOC_RULES_BATCH_PROMPT_VERSION,
-        q2_markdown_parser_version=Q2_MARKDOWN_PARSER_VERSION,
-        q2_batch_parser_version=Q2_BATCH_PARSER_VERSION,
-    )
-
-
 def _references_input_hash(
     *,
     snapshot: ProductionInputSnapshot,
@@ -6188,36 +2464,6 @@ def production_references_model_run_id(
     return uuid5(
         NAMESPACE_URL,
         f"production-references-model:{production_run_id}:{references_input_hash}",
-    )
-
-
-def _extraction_input_hash(
-    *,
-    subject_id: UUID,
-    references_hash: str,
-    source_urls: list[str],
-    references_payload_hash: str | None = None,
-    pipeline_generation: int | None = None,
-) -> str:
-    """Q2 canonical identity, distinct from per-source model-run identities."""
-    # ``pipeline_generation`` remains accepted for callers using the old
-    # helper signature, but is intentionally not part of this hash.
-    return compute_input_hash(
-        {
-            "subject_id": str(subject_id),
-            "references_hash": references_hash,
-            "references_payload_hash": references_payload_hash or references_hash,
-            "source_urls": sorted(source_urls),
-            "full_prompt_version": EXTRACTION_PROMPT_VERSION,
-            "ioc_rules_prompt_version": IOC_RULES_PROMPT_VERSION,
-            "ioc_rules_batch_prompt_version": IOC_RULES_BATCH_PROMPT_VERSION,
-            "q2_markdown_parser_version": Q2_MARKDOWN_PARSER_VERSION,
-            "q2_batch_parser_version": Q2_BATCH_PARSER_VERSION,
-            "artifact_verifier_version": ARTIFACT_VERIFIER_VERSION,
-            "source_evidence_version": SOURCE_EVIDENCE_VERSION,
-            "iana_tld_snapshot_version": IANA_TLD_SNAPSHOT_VERSION,
-            "routing_policy_version": Q2_ROUTING_POLICY_VERSION,
-        }
     )
 
 

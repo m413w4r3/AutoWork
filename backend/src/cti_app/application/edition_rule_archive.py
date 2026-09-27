@@ -24,7 +24,7 @@ from uuid import UUID
 from cti_app.application.edition_workspace import detection_rule_filename
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_stages import legacy_technical_extraction_from_payload
+from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
     DetectionRule,

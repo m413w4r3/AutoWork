@@ -266,6 +266,12 @@ it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique",
 it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", async () => {
   const fullDocumentId = "11111111-1111-4111-8111-111111111111";
   const iocDocumentId = "22222222-2222-4222-8222-222222222222";
+  const evidence = (quote: string, ...documents: string[]) => ({
+    context: "",
+    evidence_quote: quote,
+    evidence_basis: "source_verified",
+    source_document_ids: documents,
+  });
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
@@ -286,7 +292,6 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
             {
               source_document_id: fullDocumentId,
               canonical_url: "https://vendor.example/report",
-              title: "Vendor threat report",
               content_sha256: "c".repeat(64),
               tier: "core",
               kind: "publication",
@@ -296,22 +301,25 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
               reuse_state: "fresh",
               facts: [
                 {
-                  category: "actor",
+                  category: "actors",
                   value: "Cavern Manticore",
-                  context: "Le groupe conduit la campagne.",
-                  evidence_quote: "Cavern Manticore launched the campaign.",
-                  evidence_basis: "exact_quote",
+                  attack_id: null,
+                  ...evidence(
+                    "Cavern Manticore launched the campaign.",
+                    fullDocumentId,
+                    iocDocumentId,
+                  ),
                 },
               ],
               events: [
                 {
                   event_date: "2026-08-20",
-                  date_text: "20 August 2026",
+                  date_text: null,
                   text: "The campaign began.",
-                  context: "Première activité observée.",
-                  source_document_id: fullDocumentId,
-                  evidence_quote: "The campaign began on 20 August 2026.",
-                  evidence_basis: "date_and_event_quote",
+                  ...evidence(
+                    "The campaign began on 20 August 2026.",
+                    fullDocumentId,
+                  ),
                 },
               ],
               indicators: [],
@@ -321,7 +329,6 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
             {
               source_document_id: iocDocumentId,
               canonical_url: "https://research.example/iocs",
-              title: "Research IOC note",
               content_sha256: "d".repeat(64),
               tier: "technical",
               kind: "technical_resource",
@@ -333,12 +340,10 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
               events: [],
               indicators: [
                 {
-                  artifact_type: "domain",
                   value: "c2.example",
-                  normalized_value: "c2.example",
-                  context: "Command and control domain.",
-                  evidence_quote: "C2 domain: c2.example",
-                  evidence_basis: "exact_quote",
+                  artifact_type: "domain",
+                  indicator_status: "confirmed_ioc",
+                  ...evidence("C2 domain: c2.example", iocDocumentId),
                 },
               ],
               rules: [
@@ -346,8 +351,11 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
                   rule_type: "sigma",
                   name: "Suspicious process launch",
                   body: "title: Suspicious process launch\nlogsource:\n  product: windows",
-                  evidence_quote: "title: Suspicious process launch",
-                  evidence_basis: "published_rule_body",
+                  sha256: "e".repeat(64),
+                  ...evidence(
+                    "title: Suspicious process launch",
+                    iocDocumentId,
+                  ),
                 },
               ],
               uncertainties: [
@@ -358,11 +366,17 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
           omitted_sources: [
             {
               canonical_url: "https://reports.example/unavailable",
-              title: "Unavailable report",
               tier: "supporting",
               collection_state: "unavailable",
               reason: "reference_not_eligible",
-              source_document_id: null,
+              error_code: null,
+            },
+            {
+              canonical_url: "https://reports.example/unreadable",
+              tier: "supporting",
+              collection_state: "archived",
+              reason: "source_extraction_failed",
+              error_code: "extraction_source_text_unreadable",
             },
           ],
           warnings: ["Une source complémentaire a été omise."],
@@ -380,57 +394,47 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
     </QueryClientProvider>,
   );
 
-  expect(
-    await screen.findByRole("heading", { name: "Sources FULL" }),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Sources IOC_RULES" }),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Vendor threat report" }),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Research IOC note" }),
-  ).toBeInTheDocument();
-  expect(screen.getByText("Réutilisée")).toBeInTheDocument();
+  for (const heading of [
+    "Sources FULL",
+    "Sources IOC_RULES",
+    "Sources réutilisées",
+    "Sources omises / en erreur",
+    "Chronologie",
+    "Faits",
+    "IOC / artefacts",
+    "Règles publiées",
+    "Incertitudes",
+    "Warnings",
+  ]) {
+    expect(
+      await screen.findByRole("heading", { name: heading }),
+    ).toBeInTheDocument();
+  }
   expect(screen.getByText("Calculée")).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Sources omises / en erreur" }),
-  ).toBeInTheDocument();
-  expect(screen.getByText("reference_not_eligible")).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Chronologie" }),
-  ).toBeInTheDocument();
+  expect(screen.getAllByText(/Réutilisée/)).toHaveLength(2);
   expect(screen.getByText("The campaign began.")).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "Faits" })).toBeInTheDocument();
   expect(
     screen.getByText("Cavern Manticore", { exact: true }),
   ).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "IOC / artefacts" }),
-  ).toBeInTheDocument();
   expect(screen.getByText("c2.example")).toBeInTheDocument();
-  expect(
-    screen.getByRole("heading", { name: "Règles publiées" }),
-  ).toBeInTheDocument();
   expect(container.querySelector("pre")).toHaveTextContent(
     "title: Suspicious process launch",
   );
   expect(
-    screen.getByRole("heading", { name: "Incertitudes" }),
-  ).toBeInTheDocument();
-  expect(
     screen.getByText("Le domaine peut être partagé avec un autre outil."),
   ).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "Warnings" })).toBeInTheDocument();
   expect(
     screen.getByText("Une source complémentaire a été omise."),
   ).toBeInTheDocument();
-  expect(container.querySelector(".extraction-provenance")).toHaveTextContent(
-    fullDocumentId,
-  );
+  // A fact published by two documents names both of them.
+  const factProvenance = screen
+    .getByText("Cavern Manticore", { exact: true })
+    .closest("li")
+    ?.querySelector(".extraction-provenance");
+  expect(factProvenance).toHaveTextContent("https://vendor.example/report");
+  expect(factProvenance).toHaveTextContent("https://research.example/iocs");
   expect(
-    container.querySelector(".extraction-evidence-basis"),
-  ).toHaveTextContent("date_and_event_quote");
+    screen.getByText("extraction_source_text_unreadable"),
+  ).toBeInTheDocument();
   expect(screen.queryByText(/schema_version/)).not.toBeInTheDocument();
 });

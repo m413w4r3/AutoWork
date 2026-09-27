@@ -261,7 +261,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_checkpoint=production_checkpoint,
         publication_assembly=publication_assembly,
         bridge_transport=bridge_provider,
-        production_q2_reuse_max_age_days=settings.production_q2_reuse_max_age_days,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory

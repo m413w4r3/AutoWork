@@ -356,7 +356,6 @@ def register_production_jobs(
     checkpoint: EditionProductionCheckpointService | None = None,
     bridge_transport: ReconciliationTransport | None = None,
     reconciliation_resolver: ProductionReconciliationResolver | None = None,
-    q2_reuse_max_age_days: float = 14.0,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
@@ -631,7 +630,6 @@ def register_production_jobs(
             diagnostics=diagnostics,
             seed_enrichment=seed_enrichment,
             pacing=production_pacing,
-            q2_reuse_max_age_days=q2_reuse_max_age_days,
         )
 
         correlation_id = await context.correlation_id()

@@ -155,9 +155,7 @@ def test_plan_and_input_hash_do_not_depend_on_python_or_execution_identity() -> 
     assert forwards.input_hash == backwards.input_hash
     assert forwards.references_corpus_hash == references_corpus_hash(_corpus(first, second))
     assert (
-        extraction_input_hash(
-            references_corpus_hash=forwards.references_corpus_hash, sources=forwards.sources
-        )
+        extraction_input_hash(references_corpus_hash=forwards.references_corpus_hash)
         == forwards.input_hash
     )
 
@@ -233,12 +231,13 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
                 tier=ProductionReferenceTier.TECHNICAL,
                 collection_state=CollectionState.UNAVAILABLE,
                 reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+                error_code=None,
             ),
         ),
         warnings=(),
     )
 
-    progress = _canonical_extraction_progress(plan, extraction)
+    progress = _canonical_extraction_progress(plan, extraction=extraction, model_calls=1)
     statuses = {entry["canonical_url"]: entry["status"] for entry in progress["sources"]}
 
     # No corpus source disappears, and no source is reported twice.
@@ -262,13 +261,17 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
     assert progress["profile_policy_version"] == "production-reference-tier-v1"
 
 
-def test_missing_source_result_is_reported_as_failed() -> None:
+def test_a_blocking_source_is_failed_and_the_others_stay_pending() -> None:
     fresh = _full_source(url="https://example.test/core-a")
     missing = _full_source(url="https://example.test/core-b", document_id=uuid4(), sha256="3" * 64)
     plan = build_extraction_plan(_corpus(fresh, missing))
+    blocking = next(source for source in plan.sources if source.canonical_url.endswith("core-b"))
 
-    progress = _canonical_extraction_progress(plan, None)
+    progress = _canonical_extraction_progress(
+        plan, failed_source_id=str(blocking.source_document_id)
+    )
     statuses = {entry["canonical_url"]: entry["status"] for entry in progress["sources"]}
 
     assert statuses["https://example.test/core-b"] == "failed"
+    assert statuses["https://example.test/core-a"] == "pending"
     assert progress["completed_sources"] == 0

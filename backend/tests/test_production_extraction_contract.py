@@ -369,6 +369,7 @@ def test_omitted_sources_keep_their_diagnostic() -> None:
         tier=ProductionReferenceTier.TECHNICAL,
         collection_state=CollectionState.UNAVAILABLE,
         reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+        error_code=None,
     )
     extraction = _extraction()
     payload = production_extraction_to_json(extraction)
@@ -378,6 +379,7 @@ def test_omitted_sources_keep_their_diagnostic() -> None:
             "tier": omission.tier.value,
             "collection_state": omission.collection_state.value,
             "reason": omission.reason.value,
+            "error_code": None,
         }
     ]
 
@@ -386,12 +388,40 @@ def test_omitted_sources_keep_their_diagnostic() -> None:
     assert reloaded.omitted_sources == (omission,)
 
 
+def test_a_failed_source_omission_carries_its_code_and_never_concerns_core() -> None:
+    failed = ProductionExtractionOmissionV1(
+        canonical_url="https://example.test/supporting",
+        tier=ProductionReferenceTier.SUPPORTING,
+        collection_state=CollectionState.ARCHIVED,
+        reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+        error_code="extraction_source_output_invalid",
+    )
+    assert failed.error_code == "extraction_source_output_invalid"
+    with pytest.raises(ValueError):
+        ProductionExtractionOmissionV1(
+            canonical_url="https://example.test/supporting",
+            tier=ProductionReferenceTier.SUPPORTING,
+            collection_state=CollectionState.ARCHIVED,
+            reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+            error_code=None,
+        )
+    with pytest.raises(ValueError):
+        ProductionExtractionOmissionV1(
+            canonical_url="https://example.test/core",
+            tier=ProductionReferenceTier.CORE,
+            collection_state=CollectionState.ARCHIVED,
+            reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+            error_code="extraction_source_output_invalid",
+        )
+
+
 def test_a_source_cannot_be_extracted_and_omitted() -> None:
     omission = ProductionExtractionOmissionV1(
         canonical_url="https://example.test/report",
         tier=ProductionReferenceTier.CORE,
         collection_state=CollectionState.UNAVAILABLE,
         reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+        error_code=None,
     )
 
     with pytest.raises(ValueError, match="both extracted and omitted"):

@@ -18,7 +18,7 @@ from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_stages import legacy_technical_extraction_from_payload
+from cti_app.application.production_extraction import legacy_technical_extraction_from_payload
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,

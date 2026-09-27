@@ -113,31 +113,38 @@ describe("ProductionConsole", () => {
             sigma_rules: 1,
             suricata_rules: 1,
             snort_rules: 0,
-            active_source_id: "S3",
-            active_source_title: "Third source",
-            active_profile: "ioc_rules",
+            skipped_sources: 0,
             sources: [
               {
-                source_id: "S1",
+                source_id: "11111111-1111-4111-8111-111111111111",
                 title: "First source",
+                canonical_url: "https://first.example/report",
+                tier: "core",
                 profile: "full",
                 status: "succeeded",
+                reuse_state: "fresh",
                 ioc_count: 100,
                 rule_count: 3,
               },
               {
-                source_id: "S2",
+                source_id: "22222222-2222-4222-8222-222222222222",
                 title: "Second source",
+                canonical_url: "https://second.example/report",
+                tier: "supporting",
                 profile: "ioc_rules",
                 status: "cached",
+                reuse_state: "reused",
                 ioc_count: 96,
                 rule_count: 2,
               },
               {
-                source_id: "S3",
+                source_id: "33333333-3333-4333-8333-333333333333",
                 title: "Third source",
+                canonical_url: "https://third.example/report",
+                tier: "technical",
                 profile: "ioc_rules",
-                status: "running",
+                status: "pending",
+                reuse_state: null,
                 ioc_count: 0,
                 rule_count: 0,
               },
@@ -158,9 +165,6 @@ describe("ProductionConsole", () => {
     expect(await screen.findByText("Extraction 2 / 3")).toBeInTheDocument();
     expect(screen.getByText("FULL 1 / 1")).toBeInTheDocument();
     expect(screen.getByText("IOC uniquement 1 / 2")).toBeInTheDocument();
-    expect(progress).toHaveTextContent(
-      "Active : S3 — Third source · IOC uniquement",
-    );
     expect(progress).toHaveTextContent("IOCs : 184 confirmés · 12 contextuels");
     expect(progress).toHaveTextContent(
       "Règles : 5 · YARA 3 · Sigma 1 · Suricata 1 · Snort 0",
@@ -168,9 +172,9 @@ describe("ProductionConsole", () => {
     expect(progress).toHaveTextContent(
       "Résultats existants : 1 · Appels modèle : 1",
     );
-    expect(screen.getByText("S2")).toBeInTheDocument();
+    expect(screen.getByText("Second source")).toBeInTheDocument();
     expect(progress).toHaveTextContent("Résultat existant");
-    expect(progress).toHaveTextContent("En cours");
+    expect(progress).toHaveTextContent("En attente");
   });
 
   it("affiche la phase, les compteurs, les récupérations et les erreurs", async () => {

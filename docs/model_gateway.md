@@ -107,6 +107,14 @@ locale), attribution déterministe de provenance et agrégation. Le modèle ne f
 `source_document_id`, `subject_id`, `production_run_id`, `checkpoint_id`, `model_run_id`, ni
 provenance interne : ces identités sont attachées par AutoWork.
 
+Chaque appel porte une identité de `ModelRun` déterministe, fonction du run, de sa génération et
+du travail demandé (contenu, profil, versions de prompt et de texte source, fragment). Un rejeu de
+la même génération retrouve donc la réponse durable au lieu de resoumettre, ne resoumet qu’après
+un échec prouvé avant envoi (`allow_failed_resubmit`), et une nouvelle génération obtient de
+nouvelles identités. La validation du schéma est différée à la frontière d’extraction
+(`defer_validation`) : une réponse hors schéma est un échec source-local, jamais une ambiguïté de
+soumission.
+
 Classification des erreurs : une connexion impossible avant envoi reste retryable ; un timeout
 après envoi ou une réponse non réconciliée devient `NEEDS_REVIEW` avec identité de réconciliation
 et sans replay automatique ; une réponse incompatible ou une preuve locale absente est un échec

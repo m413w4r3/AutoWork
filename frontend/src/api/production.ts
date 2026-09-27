@@ -10,44 +10,23 @@ export type ProductionBatchPhase = "initial" | "recovery" | "review";
 export type ProductionRecoveryDisposition = "auto" | "manual_only";
 
 export type ExtractionProgressProfile = "full" | "ioc_rules";
+/** Per-source verdict of the canonical EXTRACTION stage. */
 export type ExtractionProgressSourceStatus =
-  | "pending"
-  | "running"
-  | "cached"
-  | "succeeded"
-  | "needs_review"
-  | "failed"
-  | "skipped";
-
-export interface ExtractionProgressSourceSkip {
-  source_url?: string | null;
-  reason_code?: string | null;
-  live_error_code?: string | null;
-  archive_error_code?: string | null;
-  archive_reason?: string | null;
-  blocking?: boolean;
-  [key: string]: unknown;
-}
+  "pending" | "cached" | "succeeded" | "failed" | "omitted";
 
 export interface ExtractionProgressSource {
+  /** The exact ``source_document_id``, or the URL of an omitted source. */
   source_id: string;
-  title: string;
-  profile: ExtractionProgressProfile;
+  title: string | null;
+  canonical_url: string;
+  tier: "core" | "supporting" | "technical";
+  /** ``null`` for a source the REFERENCES corpus left out of the plan. */
+  profile: ExtractionProgressProfile | null;
   status: ExtractionProgressSourceStatus;
+  reuse_state: "fresh" | "reused" | "content_duplicate" | null;
   ioc_count: number;
   rule_count: number;
-  source_url?: string | null;
-  url?: string | null;
-  skip?: ExtractionProgressSourceSkip | null;
-  access_mode?: "live_url" | "archive_fallback" | null;
-  archive_fallback?: boolean;
-  plan_disposition?: Q2SourceDisposition | null;
-  plan_reason?: string | null;
-  plan_primary_source_id?: string | null;
 }
-
-export type Q2SourceDisposition =
-  "reused" | "content_duplicate" | "extract_individual" | "extract_batched";
 
 export interface ExtractionProgress {
   total_sources: number;
@@ -58,6 +37,7 @@ export interface ExtractionProgress {
   ioc_rules_completed: number;
   cache_hits: number;
   model_calls: number;
+  skipped_sources: number;
   confirmed_iocs: number;
   contextual_iocs: number;
   rules_total: number;
@@ -65,16 +45,7 @@ export interface ExtractionProgress {
   sigma_rules: number;
   suricata_rules: number;
   snort_rules: number;
-  active_source_id: string | null;
-  active_source_title: string | null;
-  active_profile: ExtractionProgressProfile | null;
   sources: ExtractionProgressSource[];
-  skipped_sources?: number;
-  skipped_source_ids?: string[];
-  source_skips?: Record<string, ExtractionProgressSourceSkip>;
-  planned_model_calls?: number;
-  planned_reuses?: number;
-  planned_duplicates?: number;
 }
 
 export interface ExtractionRejection {
@@ -312,40 +283,44 @@ export interface ArtifactResponse {
 
 export type ProductionExtractionTierV1 = "core" | "supporting" | "technical";
 export type ProductionExtractionProfileV1 = "full" | "ioc_rules";
-export type ProductionExtractionReuseStateV1 = "fresh" | "reused";
+export type ProductionExtractionReuseStateV1 =
+  "fresh" | "reused" | "content_duplicate";
+export type ProductionExtractionOmissionReasonV1 =
+  "reference_not_eligible" | "source_extraction_failed";
 export const PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION =
   "production-reference-tier-v1" as const;
 
+/** Every canonical element is proven by a local quote of its documents. */
 export interface ProductionExtractionEvidenceV1 {
+  context: string;
   evidence_quote: string;
   evidence_basis: string;
+  source_document_ids: string[];
 }
 
 export interface ProductionExtractionFactV1 extends ProductionExtractionEvidenceV1 {
   category: string;
   value: string;
-  context: string;
+  attack_id: string | null;
 }
 
 export interface ProductionExtractionEventV1 extends ProductionExtractionEvidenceV1 {
   event_date: string | null;
   date_text: string | null;
   text: string;
-  context: string;
-  source_document_id: string;
 }
 
-export interface ProductionExtractionArtifactV1 extends ProductionExtractionEvidenceV1 {
-  artifact_type: string;
+export interface ProductionExtractionIndicatorV1 extends ProductionExtractionEvidenceV1 {
   value: string;
-  normalized_value: string | null;
-  context: string;
+  artifact_type: string;
+  indicator_status: "confirmed_ioc" | "contextual";
 }
 
 export interface ProductionExtractionRuleV1 extends ProductionExtractionEvidenceV1 {
   rule_type: string;
   name: string | null;
   body: string;
+  sha256: string;
 }
 
 export interface ProductionSourceExtractionV1 {
@@ -356,25 +331,24 @@ export interface ProductionSourceExtractionV1 {
   kind: "publication" | "technical_resource";
   role: string;
   profile: ProductionExtractionProfileV1;
-  checkpoint_id: string;
+  checkpoint_id: string | null;
   reuse_state: ProductionExtractionReuseStateV1;
   facts: ProductionExtractionFactV1[];
   events: ProductionExtractionEventV1[];
-  indicators: ProductionExtractionArtifactV1[];
+  indicators: ProductionExtractionIndicatorV1[];
   rules: ProductionExtractionRuleV1[];
   uncertainties: string[];
-  title?: string | null;
 }
 
 export interface ProductionExtractionOmissionV1 {
   canonical_url: string;
   tier: ProductionExtractionTierV1;
   collection_state: string;
-  reason: string;
-  source_document_id?: string | null;
-  title?: string | null;
+  reason: ProductionExtractionOmissionReasonV1;
+  error_code: string | null;
 }
 
+/** Mirror of the backend ``ProductionExtractionV1`` canonical payload. */
 export interface ProductionExtractionV1 {
   schema_version: 1;
   subject_id: string;
@@ -390,119 +364,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function hasOnlyKeys(
+function hasExactKeys(
   value: Record<string, unknown>,
   keys: readonly string[],
 ): boolean {
-  return Object.keys(value).every((key) => keys.includes(key));
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length && actual.every((key) => keys.includes(key))
+  );
 }
 
 function isNonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value.length > 0;
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isNullableString(value: unknown): value is string | null {
+  return value === null || typeof value === "string";
 }
 
 function isUuid(value: unknown): value is string {
   return (
     typeof value === "string" &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      value,
-    )
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
   );
 }
 
 function isSha256(value: unknown): value is string {
-  return typeof value === "string" && /^[0-9a-f]{64}$/i.test(value);
-}
-
-function isProductionExtractionTierV1(
-  value: unknown,
-): value is ProductionExtractionTierV1 {
-  return value === "core" || value === "supporting" || value === "technical";
-}
-
-function isEvidenceV1(value: unknown): value is ProductionExtractionEvidenceV1 {
-  return (
-    isRecord(value) &&
-    isNonEmptyString(value.evidence_quote) &&
-    isNonEmptyString(value.evidence_basis)
-  );
-}
-
-function isFactV1(value: unknown): value is ProductionExtractionFactV1 {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, [
-      "category",
-      "value",
-      "context",
-      "evidence_quote",
-      "evidence_basis",
-    ]) &&
-    isNonEmptyString(value.category) &&
-    isNonEmptyString(value.value) &&
-    typeof value.context === "string" &&
-    isEvidenceV1(value)
-  );
-}
-
-function isEventV1(value: unknown): value is ProductionExtractionEventV1 {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, [
-      "event_date",
-      "date_text",
-      "text",
-      "context",
-      "source_document_id",
-      "evidence_quote",
-      "evidence_basis",
-    ]) &&
-    (value.event_date === null ||
-      (typeof value.event_date === "string" &&
-        /^\d{4}-\d{2}-\d{2}$/.test(value.event_date))) &&
-    (value.date_text === null || typeof value.date_text === "string") &&
-    isNonEmptyString(value.text) &&
-    typeof value.context === "string" &&
-    isUuid(value.source_document_id) &&
-    isEvidenceV1(value)
-  );
-}
-
-function isArtifactV1(value: unknown): value is ProductionExtractionArtifactV1 {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, [
-      "artifact_type",
-      "value",
-      "normalized_value",
-      "context",
-      "evidence_quote",
-      "evidence_basis",
-    ]) &&
-    isNonEmptyString(value.artifact_type) &&
-    isNonEmptyString(value.value) &&
-    (value.normalized_value === null ||
-      typeof value.normalized_value === "string") &&
-    typeof value.context === "string" &&
-    isEvidenceV1(value)
-  );
-}
-
-function isRuleV1(value: unknown): value is ProductionExtractionRuleV1 {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, [
-      "rule_type",
-      "name",
-      "body",
-      "evidence_quote",
-      "evidence_basis",
-    ]) &&
-    isNonEmptyString(value.rule_type) &&
-    (value.name === null || typeof value.name === "string") &&
-    isNonEmptyString(value.body) &&
-    isEvidenceV1(value)
-  );
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
 }
 
 function isStringArray(value: unknown): value is string[] {
@@ -511,12 +399,96 @@ function isStringArray(value: unknown): value is string[] {
   );
 }
 
-function isProductionSourceExtractionV1(
-  value: unknown,
-): value is ProductionSourceExtractionV1 {
-  if (
-    !isRecord(value) ||
-    !hasOnlyKeys(value, [
+function isTier(value: unknown): value is ProductionExtractionTierV1 {
+  return value === "core" || value === "supporting" || value === "technical";
+}
+
+const EVIDENCE_KEYS = [
+  "context",
+  "evidence_quote",
+  "evidence_basis",
+  "source_document_ids",
+] as const;
+
+function hasEvidence(value: Record<string, unknown>): boolean {
+  return (
+    typeof value.context === "string" &&
+    isNonEmptyString(value.evidence_quote) &&
+    isNonEmptyString(value.evidence_basis) &&
+    Array.isArray(value.source_document_ids) &&
+    value.source_document_ids.length > 0 &&
+    value.source_document_ids.every(isUuid)
+  );
+}
+
+function isFact(value: unknown): value is ProductionExtractionFactV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["category", "value", "attack_id", ...EVIDENCE_KEYS]) &&
+    isNonEmptyString(value.category) &&
+    isNonEmptyString(value.value) &&
+    isNullableString(value.attack_id) &&
+    hasEvidence(value)
+  );
+}
+
+function isEvent(value: unknown): value is ProductionExtractionEventV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "event_date",
+      "date_text",
+      "text",
+      ...EVIDENCE_KEYS,
+    ]) &&
+    (value.event_date === null ||
+      (typeof value.event_date === "string" &&
+        /^\d{4}-\d{2}-\d{2}$/.test(value.event_date))) &&
+    isNullableString(value.date_text) &&
+    isNonEmptyString(value.text) &&
+    hasEvidence(value)
+  );
+}
+
+function isIndicator(value: unknown): value is ProductionExtractionIndicatorV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "value",
+      "artifact_type",
+      "indicator_status",
+      ...EVIDENCE_KEYS,
+    ]) &&
+    isNonEmptyString(value.value) &&
+    isNonEmptyString(value.artifact_type) &&
+    (value.indicator_status === "confirmed_ioc" ||
+      value.indicator_status === "contextual") &&
+    hasEvidence(value)
+  );
+}
+
+function isRule(value: unknown): value is ProductionExtractionRuleV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "rule_type",
+      "name",
+      "body",
+      "sha256",
+      ...EVIDENCE_KEYS,
+    ]) &&
+    isNonEmptyString(value.rule_type) &&
+    isNullableString(value.name) &&
+    isNonEmptyString(value.body) &&
+    isSha256(value.sha256) &&
+    hasEvidence(value)
+  );
+}
+
+function isSource(value: unknown): value is ProductionSourceExtractionV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
       "source_document_id",
       "canonical_url",
       "content_sha256",
@@ -531,63 +503,53 @@ function isProductionSourceExtractionV1(
       "indicators",
       "rules",
       "uncertainties",
-      "title",
-    ]) ||
-    !isUuid(value.source_document_id) ||
-    !isNonEmptyString(value.canonical_url) ||
-    !isSha256(value.content_sha256) ||
-    !isProductionExtractionTierV1(value.tier) ||
-    (value.kind !== "publication" && value.kind !== "technical_resource") ||
-    !isNonEmptyString(value.role) ||
-    (value.profile !== "full" && value.profile !== "ioc_rules") ||
-    !isUuid(value.checkpoint_id) ||
-    (value.reuse_state !== "fresh" && value.reuse_state !== "reused") ||
-    !Array.isArray(value.facts) ||
-    !value.facts.every(isFactV1) ||
-    !Array.isArray(value.events) ||
-    !value.events.every(isEventV1) ||
-    !Array.isArray(value.indicators) ||
-    !value.indicators.every(isArtifactV1) ||
-    !Array.isArray(value.rules) ||
-    !value.rules.every(isRuleV1) ||
-    !isStringArray(value.uncertainties) ||
-    ("title" in value &&
-      value.title !== null &&
-      typeof value.title !== "string")
-  ) {
-    return false;
-  }
-  return (
+    ]) &&
+    isUuid(value.source_document_id) &&
+    isNonEmptyString(value.canonical_url) &&
+    isSha256(value.content_sha256) &&
+    isTier(value.tier) &&
+    (value.kind === "publication" || value.kind === "technical_resource") &&
+    isNonEmptyString(value.role) &&
+    // The frozen REFERENCES tier alone decides the profile.
     value.profile === (value.tier === "core" ? "full" : "ioc_rules") &&
-    value.events.every(
-      (event) => event.source_document_id === value.source_document_id,
-    )
+    (value.checkpoint_id === null || isUuid(value.checkpoint_id)) &&
+    (value.reuse_state === "fresh" ||
+      value.reuse_state === "reused" ||
+      value.reuse_state === "content_duplicate") &&
+    Array.isArray(value.facts) &&
+    value.facts.every(isFact) &&
+    Array.isArray(value.events) &&
+    value.events.every(isEvent) &&
+    Array.isArray(value.indicators) &&
+    value.indicators.every(isIndicator) &&
+    Array.isArray(value.rules) &&
+    value.rules.every(isRule) &&
+    isStringArray(value.uncertainties)
   );
 }
 
-function isProductionExtractionOmissionV1(
-  value: unknown,
-): value is ProductionExtractionOmissionV1 {
-  return (
-    isRecord(value) &&
-    hasOnlyKeys(value, [
+function isOmission(value: unknown): value is ProductionExtractionOmissionV1 {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, [
       "canonical_url",
       "tier",
       "collection_state",
       "reason",
-      "source_document_id",
-      "title",
-    ]) &&
-    isNonEmptyString(value.canonical_url) &&
-    isProductionExtractionTierV1(value.tier) &&
-    isNonEmptyString(value.collection_state) &&
-    isNonEmptyString(value.reason) &&
-    (!("source_document_id" in value) ||
-      value.source_document_id === null ||
-      isUuid(value.source_document_id)) &&
-    (!("title" in value) ||
-      value.title === null ||
-      typeof value.title === "string")
+      "error_code",
+    ]) ||
+    !isNonEmptyString(value.canonical_url) ||
+    !isTier(value.tier) ||
+    !isNonEmptyString(value.collection_state)
+  ) {
+    return false;
+  }
+  if (value.reason === "reference_not_eligible") {
+    return value.error_code === null;
+  }
+  return (
+    value.reason === "source_extraction_failed" &&
+    isNonEmptyString(value.error_code)
   );
 }
 
@@ -596,7 +558,7 @@ export function isProductionExtractionV1(
 ): value is ProductionExtractionV1 {
   if (
     !isRecord(value) ||
-    !hasOnlyKeys(value, [
+    !hasExactKeys(value, [
       "schema_version",
       "subject_id",
       "production_input_hash",
@@ -613,9 +575,9 @@ export function isProductionExtractionV1(
     value.profile_policy_version !==
       PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION ||
     !Array.isArray(value.sources) ||
-    !value.sources.every(isProductionSourceExtractionV1) ||
+    !value.sources.every(isSource) ||
     !Array.isArray(value.omitted_sources) ||
-    !value.omitted_sources.every(isProductionExtractionOmissionV1) ||
+    !value.omitted_sources.every(isOmission) ||
     !isStringArray(value.warnings)
   ) {
     return false;

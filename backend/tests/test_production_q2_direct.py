@@ -17,6 +17,7 @@ from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import BaseModel
 
 from cti_app.application.model_gateway import (
     ModelRequest,
@@ -176,6 +177,10 @@ class _BlobStore:
         canonical_id = self.put_json(canonical) if canonical is not None else None
         return raw_id, canonical_id, None
 
+    async def put_repair_evidence(self, payload: dict[str, Any]) -> UUID:
+        self.repair_evidence = payload
+        return self.put_json(payload)
+
     async def store_source_extraction_payloads(
         self, *, raw: str, canonical: dict[str, Any]
     ) -> tuple[UUID | None, UUID]:
@@ -284,6 +289,12 @@ class _Extractions:
         self.rows[self._row_key(extraction)] = extraction
 
 
+class _NoRepairDecisions:
+    async def effective_decisions(self, edition_id: UUID, subject_id: UUID) -> tuple[()]:
+        del edition_id, subject_id
+        return ()
+
+
 class _Uow:
     def __init__(self, world: _World) -> None:
         self.world = world
@@ -292,6 +303,7 @@ class _Uow:
         self.source_documents = world.documents
         self.source_collections = world.collections
         self.source_extractions = world.extractions
+        self.production_repair_decisions = _NoRepairDecisions()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -375,42 +387,12 @@ def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
     return tuple(blocks)
 
 
-def _to_markdown(output: Q2SourceOutput) -> str:
-    lines: list[str] = []
-    for fact in output.facts:
-        lines.append(f"FACT {fact.category}")
-        lines.append(f"- {fact.value}")
-    for event in output.events:
-        header = "EVENT"
-        if event.event_date is not None:
-            header = f"EVENT {event.event_date.isoformat()}"
-        lines.append(header)
-        lines.append(f"- {event.text}")
-    for artifact in output.artifacts:
-        status = "confirmed" if artifact.indicator_status == "confirmed_ioc" else "contextual"
-        lines.append(f"IOC {status} {artifact.artifact_type}")
-        lines.append(f"- {artifact.value}")
-    for rule in output.rules:
-        specification = rule.rule_type.value
-        if rule.name:
-            specification = f"{specification}: {rule.name}"
-        lines.append(f"RULE {specification}")
-        lines.append(f"```{rule.rule_type.value}")
-        lines.append(rule.body)
-        lines.append("```")
-    if output.uncertainties:
-        lines.append("UNCERTAINTIES")
-        for uncertainty in output.uncertainties:
-            lines.append(f"- {uncertainty}")
-    return "\n".join(lines) + "\n"
-
-
-class _MarkdownGateway(_Gateway):
-    """A second provider answering the same capability as Q2 markdown."""
+class _JsonTextGateway(_Gateway):
+    """A second provider answering in text, validated against the schema."""
 
     def _execution(self, output: object) -> SimpleNamespace:
-        if not isinstance(output, Q2SourceOutput):
-            raise AssertionError("The markdown adapter only answers source captures")
+        assert isinstance(output, BaseModel)
+        text = output.model_dump_json()
         return SimpleNamespace(
             run=SimpleNamespace(
                 id=uuid4(),
@@ -419,8 +401,8 @@ class _MarkdownGateway(_Gateway):
                 error_message=None,
                 error_details=None,
             ),
-            structured_output=None,
-            output_text=_to_markdown(output),
+            structured_output=type(output).model_validate_json(text),
+            output_text=text,
             metadata={},
         )
 
@@ -711,7 +693,7 @@ async def test_two_providers_produce_the_same_canonical_contract() -> None:
         second_world,
         second_run,
         snapshot=second_snapshot,
-        gateway=_MarkdownGateway({"ExampleRAT": _full_output(), "loader": _support_output()}),
+        gateway=_JsonTextGateway({"ExampleRAT": _full_output(), "loader": _support_output()}),
     )
 
     first_payload = await first_world.store.read_json(

@@ -99,6 +99,8 @@ class ProductionExtractionOmissionReason(StrEnum):
 
     #: ``eligible_for_extraction`` was False in the REFERENCES corpus.
     REFERENCE_NOT_ELIGIBLE = "reference_not_eligible"
+    #: A SUPPORTING/TECHNICAL source failed source-locally; CORE never omits.
+    SOURCE_EXTRACTION_FAILED = "source_extraction_failed"
 
 
 def extraction_profile_for_tier(tier: ProductionReferenceTier) -> ExtractionProfile:
@@ -350,12 +352,14 @@ class ProductionSourceExtractionV1:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProductionExtractionOmissionV1:
-    """One corpus source deliberately left out of the extraction plan."""
+    """One corpus source without a canonical extraction, and why."""
 
     canonical_url: str
     tier: ProductionReferenceTier
     collection_state: CollectionState
     reason: ProductionExtractionOmissionReason
+    #: The source-local failure code; set only for a failed extraction.
+    error_code: str | None
 
     def __post_init__(self) -> None:
         try:
@@ -370,6 +374,11 @@ class ProductionExtractionOmissionV1:
             raise ValueError("Omitted source collection state is invalid")
         if not isinstance(self.reason, ProductionExtractionOmissionReason):
             raise ValueError("Omitted source reason is invalid")
+        failed = self.reason is ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+        if failed and self.tier is ProductionReferenceTier.CORE:
+            raise ValueError("A CORE source failure blocks the stage and is never omitted")
+        if failed != (isinstance(self.error_code, str) and bool(self.error_code.strip())):
+            raise ValueError("Only a failed source omission carries an error code")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -425,6 +434,17 @@ class ProductionExtractionV1:
             raise ValueError("Production extraction must not repeat an omitted source")
         if set(urls) & set(omitted_urls):
             raise ValueError("A source cannot be both extracted and omitted")
+        known_documents = set(document_ids)
+        for source in self.sources:
+            provenances = (
+                *(fact.source_document_ids for fact in source.facts),
+                *(event.source_document_ids for event in source.events),
+                *(indicator.source_document_ids for indicator in source.indicators),
+                *(rule.source_document_ids for rule in source.rules),
+            )
+            for provenance in provenances:
+                if not set(provenance) <= known_documents:
+                    raise ValueError("Extraction provenance must name extracted source documents")
 
         object.__setattr__(
             self,
@@ -533,7 +553,7 @@ _RULE_KEYS = frozenset(
         "source_document_ids",
     }
 )
-_OMISSION_KEYS = frozenset({"canonical_url", "tier", "collection_state", "reason"})
+_OMISSION_KEYS = frozenset({"canonical_url", "tier", "collection_state", "reason", "error_code"})
 
 
 def _uuid(raw: Any, field: str) -> UUID:
@@ -669,6 +689,7 @@ def _omission_to_json(omission: ProductionExtractionOmissionV1) -> dict[str, Any
         "tier": omission.tier.value,
         "collection_state": omission.collection_state.value,
         "reason": omission.reason.value,
+        "error_code": omission.error_code,
     }
 
 
@@ -787,6 +808,7 @@ def _omission_from_json(raw: Any) -> ProductionExtractionOmissionV1:
         tier=_enum(ProductionReferenceTier, payload["tier"], "tier"),
         collection_state=_enum(CollectionState, payload["collection_state"], "collection_state"),
         reason=_enum(ProductionExtractionOmissionReason, payload["reason"], "reason"),
+        error_code=_optional_text(payload["error_code"], label="Omission error code"),
     )
 
 

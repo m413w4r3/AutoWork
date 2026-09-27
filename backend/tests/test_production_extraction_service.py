@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from cti_app.application import production_extraction
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
+    ModelGatewayError,
     ModelRequest,
     ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
@@ -28,7 +29,6 @@ from cti_app.application.production_extraction import (
     ProductionExtractionService,
     build_extraction_plan,
     load_legacy_technical_extraction,
-    load_production_extraction,
     load_reference_corpus,
     project_legacy_technical_extraction,
 )
@@ -284,8 +284,7 @@ class _Uow:
         self.production_artifacts = world.artifacts
         self.source_documents = world.documents
         self.source_collections = world.collections
-        if world.extractions is not None:
-            self.source_extractions = world.extractions
+        self.source_extractions = world.extractions
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -298,15 +297,20 @@ class _Uow:
 
 
 class _World:
-    def __init__(self, *, checkpoints: bool = True) -> None:
+    def __init__(self) -> None:
         self.blobs = _BlobStore()
         self.artifacts = _ArtifactRepository()
         self.documents = _DocumentRepository()
         self.collections = _CollectionRepository()
-        self.extractions = _CheckpointRepository() if checkpoints else None
+        self.extractions = _CheckpointRepository()
 
     def uow(self) -> _Uow:
         return _Uow(self)
+
+
+class _PreSubmissionFailure(ModelGatewayError):
+    code = "bridge_unreachable"
+    retryable = True
 
 
 class _StructuredGateway:
@@ -320,6 +324,7 @@ class _StructuredGateway:
         self.schemas: list[type[BaseModel]] = []
         self.ambiguity = False
         self.fail_markers: set[str] = set()
+        self.transient_markers: set[str] = set()
 
     def output_for(self, text: str) -> Q2SourceOutput:
         for marker, output in self.outputs.items():
@@ -337,6 +342,8 @@ class _StructuredGateway:
                 "The submission state is unknown",
                 details={"provider_reference": "opaque"},
             )
+        if any(marker in request.text for marker in self.transient_markers):
+            raise _PreSubmissionFailure("the provider was not reached")
         if any(marker in request.text for marker in self.fail_markers):
             return self._unreadable()
         if output_schema is Q2BatchResponse:
@@ -379,14 +386,14 @@ class _StructuredGateway:
         )
 
 
-class _MarkdownGateway(_StructuredGateway):
-    """Provider B: answers with the same contract rendered as Q2 markdown."""
+class _JsonTextGateway(_StructuredGateway):
+    """Provider B: answers in text; the gateway validates it against the schema."""
 
-    name = "provider-b-markdown"
+    name = "provider-b-json-text"
 
     def _execution(self, output: object) -> object:
-        if not isinstance(output, Q2SourceOutput):
-            raise AssertionError("The markdown adapter only answers single captures")
+        assert isinstance(output, BaseModel)
+        text = output.model_dump_json()
         return SimpleNamespace(
             run=SimpleNamespace(
                 id=uuid4(),
@@ -395,8 +402,8 @@ class _MarkdownGateway(_StructuredGateway):
                 error_message=None,
                 error_details=None,
             ),
-            structured_output=None,
-            output_text=_to_markdown(output),
+            structured_output=type(output).model_validate_json(text),
+            output_text=text,
             metadata={},
         )
 
@@ -429,36 +436,6 @@ def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
         end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
         blocks.append((match.group(1), prompt[match.end() : end]))
     return tuple(blocks)
-
-
-def _to_markdown(output: Q2SourceOutput) -> str:
-    lines: list[str] = []
-    for fact in output.facts:
-        lines.append(f"FACT {fact.category}")
-        lines.append(f"- {fact.value}")
-    for event in output.events:
-        header = "EVENT"
-        if event.event_date is not None:
-            header = f"EVENT {event.event_date.isoformat()}"
-        lines.append(header)
-        lines.append(f"- {event.text}")
-    for artifact in output.artifacts:
-        status = "confirmed" if artifact.indicator_status == "confirmed_ioc" else "contextual"
-        lines.append(f"IOC {status} {artifact.artifact_type}")
-        lines.append(f"- {artifact.value}")
-    for rule in output.rules:
-        specification = rule.rule_type.value
-        if rule.name:
-            specification = f"{specification}: {rule.name}"
-        lines.append(f"RULE {specification}")
-        lines.append(f"```{rule.rule_type.value}")
-        lines.append(rule.body)
-        lines.append("```")
-    if output.uncertainties:
-        lines.append("UNCERTAINTIES")
-        for uncertainty in output.uncertainties:
-            lines.append(f"- {uncertainty}")
-    return "\n".join(lines) + "\n"
 
 
 # --- scenario helpers -------------------------------------------------------
@@ -868,6 +845,7 @@ async def test_ineligible_source_is_omitted_without_any_model_call() -> None:
             tier=ProductionReferenceTier.TECHNICAL,
             collection_state=CollectionState.UNAVAILABLE,
             reason=ProductionExtractionOmissionReason.REFERENCE_NOT_ELIGIBLE,
+            error_code=None,
         ),
     )
     assert any("reference_not_eligible" in warning for warning in execution.extraction.warnings)
@@ -967,10 +945,8 @@ async def test_two_providers_produce_the_same_canonical_contract() -> None:
     outputs = {"ExampleRAT": _full_output()}
     first_world, first_snapshot, first_corpus = _core_world()
     second_world, second_snapshot, second_corpus = _core_world()
-    first_world.extractions = None
-    second_world.extractions = None
     first_gateway = _StructuredGateway(outputs)
-    second_gateway = _MarkdownGateway(outputs)
+    second_gateway = _JsonTextGateway(outputs)
 
     first = await _execute(
         first_world,
@@ -1390,7 +1366,7 @@ async def test_ioc_rules_batch_keeps_an_unambiguous_source_mapping() -> None:
     batch_calls = [request for request in gateway.calls if "@@Q2:B1@@" in request.text]
     assert len(batch_calls) == 1
     assert len(gateway.calls) == 2
-    assert batch_calls[0].metadata["batch_source_count"] == 3
+    assert len(batch_calls[0].metadata["batch_sources"]) == 3
     assert execution.extraction is not None
     by_url = {source.canonical_url: source for source in execution.extraction.sources}
     for index in range(1, 4):
@@ -1475,7 +1451,8 @@ async def test_ambiguous_batch_handle_falls_back_to_individual_readings() -> Non
         ]
     assert execution.extraction is not None
     assert any(
-        "extraction_batch_source_retry" in warning for warning in execution.extraction.warnings
+        "extraction_batch_source_unattributed" in warning
+        for warning in execution.extraction.warnings
     )
 
 
@@ -1495,6 +1472,8 @@ async def test_submission_ambiguity_returns_needs_review_without_replay() -> Non
     assert execution.extraction is None
     assert execution.error_code == "model_submission_reconciliation_required"
     assert execution.details["provider_reference"] == "opaque"
+    # The job handler records exactly this ModelRun as the one to reconcile.
+    assert execution.details["model_run_id"] == str(gateway.calls[0].run_id)
     assert len(gateway.calls) == 1
 
 
@@ -1560,6 +1539,15 @@ async def test_non_core_failure_is_a_controlled_omission() -> None:
     assert any(
         f"extraction_source_skipped:{SUPPORT_URL}:extraction_source_output_invalid" in warning
         for warning in execution.extraction.warnings
+    )
+    assert execution.extraction.omitted_sources == (
+        production_extraction.ProductionExtractionOmissionV1(
+            canonical_url=SUPPORT_URL,
+            tier=ProductionReferenceTier.SUPPORTING,
+            collection_state=CollectionState.ARCHIVED,
+            reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+            error_code="extraction_source_output_invalid",
+        ),
     )
 
 
@@ -1657,11 +1645,180 @@ async def test_legacy_projection_is_one_way_and_reproducible() -> None:
     world.artifacts.artifact = SimpleNamespace(
         id=uuid4(), status=ProductionArtifactStatus.VERIFIED, canonical_blob_id=blob_id
     )
-    loaded = await load_production_extraction(
-        uow_factory=world.uow, artifact_store=world.blobs, run_id=uuid4()
-    )
-    assert loaded == canonical
     legacy = await load_legacy_technical_extraction(
         uow_factory=world.uow, artifact_store=world.blobs, run_id=uuid4()
     )
     assert legacy == projected
+
+
+# --- execution identities and safety ----------------------------------------
+
+
+def _two_source_world(
+    *,
+    support_tier: ProductionReferenceTier = ProductionReferenceTier.SUPPORTING,
+    support_external: bool = True,
+    support_text: str = SUPPORT_TEXT,
+) -> tuple[_World, ProductionInputSnapshot, ProductionReferenceCorpusV1]:
+    world = _World()
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    core_document, core_sha = _register_source(
+        world, subject_id=subject_id, url=CORE_URL, text=CORE_TEXT
+    )
+    support_document, support_sha = _register_source(
+        world,
+        subject_id=subject_id,
+        url=SUPPORT_URL,
+        text=support_text,
+        external=support_external,
+    )
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core_document,
+                sha256=core_sha,
+            ),
+            _reference(
+                url=SUPPORT_URL,
+                tier=support_tier,
+                document_id=support_document,
+                sha256=support_sha,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    return world, snapshot, corpus
+
+
+async def test_model_run_identity_is_stable_within_a_generation_only() -> None:
+    world, snapshot, _ = _core_world()
+    world.extractions = _CheckpointRepository()
+    run = ProductionRun(subject_id=snapshot.subject_id, edition_id=uuid4())
+
+    async def run_ids(target: ProductionRun) -> list[UUID | None]:
+        world.extractions.rows.clear()
+        gateway = _StructuredGateway({"ExampleRAT": _full_output()})
+        service = ProductionExtractionService(
+            uow_factory=world.uow,
+            model_gateway=gateway,  # type: ignore[arg-type]
+            artifact_store=world.blobs,
+        )
+        await service.execute(run=target, snapshot=snapshot)
+        assert all(request.allow_failed_resubmit for request in gateway.calls)
+        return [request.run_id for request in gateway.calls]
+
+    first = await run_ids(run)
+    assert first == await run_ids(run)
+    assert all(run_id is not None for run_id in first)
+    run.pipeline_generation += 1
+    assert set(first).isdisjoint(await run_ids(run))
+
+
+async def test_a_batch_never_mixes_diffusion_policies() -> None:
+    world, snapshot, corpus = _two_source_world(
+        support_tier=ProductionReferenceTier.SUPPORTING, support_external=False
+    )
+    tech_document, tech_sha = _register_source(
+        world, subject_id=snapshot.subject_id, url=TECH_URL, text=TECH_TEXT
+    )
+    corpus = _corpus(
+        subject_id=snapshot.subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            *corpus.sources,
+            _reference(
+                url=TECH_URL,
+                tier=ProductionReferenceTier.TECHNICAL,
+                document_id=tech_document,
+                sha256=tech_sha,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    gateway = _StructuredGateway(
+        {
+            "ExampleRAT": _full_output(),
+            "loader.security-lab.io": _support_output(),
+            "d41d8cd98f00b204e9800998ecf8427e": _tech_output(),
+        }
+    )
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+    )
+
+    # The restricted SUPPORTING capture is never batched with the TECHNICAL
+    # one that may leave: each is sent alone, under its own policy.
+    assert all(schema is Q2SourceOutput for schema in gateway.schemas)
+    restricted = [call for call in gateway.calls if "loader.security-lab.io" in call.text]
+    assert [call.external_llm_allowed for call in restricted] == [False]
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.extraction is not None
+    assert [omission.canonical_url for omission in execution.extraction.omitted_sources] == [
+        SUPPORT_URL
+    ]
+
+
+async def test_evidence_rejections_are_reported_for_the_repair_desk() -> None:
+    world, snapshot, corpus = _core_world()
+    gateway = _StructuredGateway({"ExampleRAT": _full_output()})
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+    )
+
+    assert execution.succeeded
+    rejected = [
+        (item.rejection.proposal_kind, item.rejection.value) for item in execution.rejections
+    ]
+    # Only repair-addressable kinds (artifacts, rules) reach the Repair Desk.
+    assert rejected == [("artifact", "ghost.security-lab.io")]
+    assert execution.rejections[0].source.canonical_url == CORE_URL
+    assert execution.rejections[0].model_run_id is not None
+
+
+async def test_a_transient_failure_defers_only_its_own_source() -> None:
+    world, snapshot, corpus = _two_source_world(support_tier=ProductionReferenceTier.CORE)
+    gateway = _StructuredGateway(
+        {"ExampleRAT": _full_output(), "loader.security-lab.io": _support_output()}
+    )
+    gateway.transient_markers = {"ExampleRAT"}
+
+    with pytest.raises(ModelGatewayError):
+        await _execute(
+            world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+        )
+
+    # The other CORE capture still reached its durable checkpoint.
+    assert [row.canonical_url for row in world.extractions.rows.values()] == [SUPPORT_URL]
+
+
+async def test_a_full_extraction_carries_facts_events_and_union_provenance() -> None:
+    world, snapshot, corpus = _two_source_world(
+        support_tier=ProductionReferenceTier.CORE,
+        support_text=CORE_TEXT.replace("evil.security-lab.io", "other.security-lab.io"),
+    )
+    gateway = _StructuredGateway({"ExampleRAT": _full_output()})
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+    )
+
+    assert execution.extraction is not None
+    sources = {source.canonical_url: source for source in execution.extraction.sources}
+    both = tuple(sorted((source.source_document_id for source in sources.values()), key=str))
+    core = sources[CORE_URL]
+    assert [event.event_date for event in core.events] == [date(2026, 7, 10)]
+    # ExampleRAT is published by both documents; the domain only by one.
+    malware = next(fact for fact in core.facts if fact.value == "ExampleRAT")
+    assert malware.source_document_ids == both
+    assert [
+        indicator.source_document_ids
+        for indicator in core.indicators
+        if indicator.value == "evil.security-lab.io"
+    ] == [(core.source_document_id,)]

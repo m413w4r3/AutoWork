@@ -133,12 +133,10 @@ function issueCopy(
   if (errorCode === "imported_production_state") {
     return "État restauré — références, extraction et synthèse sont disponibles. L’assemblage n’a pas été rejoué.";
   }
-  if (errorCode === "q2_source_coverage_failed") {
+  if (errorCode === "extraction_core_source_failed") {
     return blockingSourceCount > 0
-      ? blockingSourceCount > 1
-        ? "sources non analysées"
-        : "source non analysée"
-      : "Couverture des sources incomplète — certaines sources n’ont pas été analysées.";
+      ? "source CORE non analysée"
+      : "Une source CORE n’a pas d’extraction vérifiée.";
   }
   if (errorCode === "model_needs_review") {
     return "Le modèle demande une revue avant poursuite.";
@@ -352,20 +350,17 @@ export function SubjectProduction({
   const blockingSources = showIssue
     ? getBlockingSources(status.error_details, status.extraction_progress)
     : [];
-  const skippedSources = getSkippedSources(
-    status.error_details,
-    status.extraction_progress,
-  );
+  const skippedSources = getSkippedSources(status.extraction_progress);
   const presentedWarnings = warnings
     .map((warning) => formatProductionWarning(warning))
     .concat(
       skippedSources.map((source) => ({
         code: "source_skip",
-        title: `${source.sourceId} — source ignorée pour l’extraction`,
+        title: "Source complémentaire omise de l’extraction",
         source: source.title,
         url: source.url,
         message:
-          "L’analyse live était indisponible et aucune archive exploitable n’était disponible.",
+          "Son archive n’a pas pu être analysée ; la production continue sans elle.",
         raw: "",
       })),
     );
@@ -474,14 +469,15 @@ export function SubjectProduction({
             <ul aria-label="Sources responsables">
               {blockingSources.map((source) => (
                 <li key={source.sourceId}>
-                  <strong>{source.sourceId}</strong>
-                  {source.title ? <span> — {source.title}</span> : null}
+                  {source.title ? <strong>{source.title}</strong> : null}
                   {source.url ? (
                     <>
-                      <br />
+                      {source.title ? <br /> : null}
                       <a href={source.url}>{source.url}</a>
                     </>
-                  ) : null}
+                  ) : (
+                    <strong>{source.sourceId}</strong>
+                  )}
                   {source.errorCode ? (
                     <>
                       <br />

@@ -263,10 +263,9 @@ def _bridge_id_in(source: dict[str, Any]) -> str | None:
 def _bridge_id_for_model_run(value: object, model_run_id: UUID) -> str | None:
     """Find the bridge identity recorded beside one exact ModelRun id.
 
-    Q2 records its reconciliation per source, under ``source_failures.<S#>``,
-    so the identity sits deeper than the run's own error details.  Anchoring on
-    the ModelRun the reconciliation names keeps a multi-source failure from
-    handing back another source's bridge identity.
+    The identity may sit deeper than the run's own error details.  Anchoring
+    on the ModelRun the reconciliation names keeps a failure carrying several
+    model runs from handing back another run's bridge identity.
     """
     if isinstance(value, list):
         for child in value:

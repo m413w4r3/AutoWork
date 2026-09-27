@@ -223,8 +223,7 @@ async def test_extraction_metadata_keeps_only_bounded_repair_pointer() -> None:
         run_id=RUN_ID,
         subject_id=SUBJECT_ID,
         input_hash="a" * 64,
-        raw_result="raw",
-        canonical_json={"items": []},
+        extraction=production_extraction_from_json(_v1_base_payload()),
         verification_diagnostics={"q2_rejected_rule_count": 201},
         repair_evidence_blob_id=UUID("00000000-0000-0000-0000-000000000099"),
         repair_evidence_entry_count=201,
@@ -236,6 +235,10 @@ async def test_extraction_metadata_keeps_only_bounded_repair_pointer() -> None:
         "entry_count": 201,
     }
     assert artifact.metadata["deterministic_verification"] == {"q2_rejected_rule_count": 201}
+    # A canonical extraction names no single model run and keeps no run-level RAW.
+    assert artifact.model_run_id is None
+    assert artifact.raw_blob_id is None
+    assert artifact.metadata["source_count"] == 1
 
 
 class _DecisionRepository:

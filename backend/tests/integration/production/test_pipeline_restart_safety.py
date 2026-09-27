@@ -8,11 +8,13 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
+from pydantic import BaseModel
 
-from cti_app.application.model_gateway import ModelRequest, ModelRole
+from cti_app.application.model_gateway import ModelRequest
+from cti_app.application.production_parsers import parse_q2_proposals_markdown
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState
@@ -102,12 +104,8 @@ def _urls(source_count: int) -> tuple[str, ...]:
 def _source_body(index: int) -> str:
     """Build an archived body a real report would plausibly have.
 
-    ``production_archive_fallback_min_chars`` (1200 by default) stops the
-    pipeline from paying for an archive-fallback model call on a stub, an
-    anti-bot notice or a JavaScript shell.  A one-line fixture is exactly such a
-    stub, so it silently skipped the archive fallback these restart tests exist
-    to cover.  The filler carries no indicator: the evidence gate still only
-    ever sees ``source-<index>.security-lab.io`` and ``ExampleRAT``.
+    The filler carries no indicator: the evidence gate still only ever sees
+    ``source-<index>.security-lab.io`` and ``ExampleRAT``.
     """
     head = f"ExampleRAT source {index} source-{index}.security-lab.io was archived."
     filler = (
@@ -125,11 +123,14 @@ def _source_specs(
     *,
     bodies: dict[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
+    # Source checkpoints are content-addressed and the integration database is
+    # session-scoped: a per-scenario capture keeps each test's model calls its own.
+    capture = f" Capture {uuid4().hex}."
     return {
         url: {
             "status": 200,
             "mime": "text/plain",
-            "body": (bodies or {}).get(url, _source_body(index)),
+            "body": (bodies or {}).get(url, _source_body(index) + capture),
         }
         for index, url in enumerate(urls, start=1)
     }
@@ -181,8 +182,7 @@ def _configure_gateway(
     *,
     references: bool = True,
     synthesis: bool = True,
-    live_q2: dict[str, str | Exception] | None = None,
-    fallback_q2: dict[str, str | Exception] | None = None,
+    q2: dict[str, str | Exception] | None = None,
 ) -> None:
     if references:
         scenario.model.script.references(_references(urls))
@@ -191,15 +191,8 @@ def _configure_gateway(
     for index, url in enumerate(urls, start=1):
         scenario.model.script.q2(
             source_url=url,
-            access_mode="live_url",
-            response=(live_q2 or {}).get(url, _q2(index)),
+            response=(q2 or {}).get(url, _q2(index)),
         )
-        if fallback_q2 and url in fallback_q2:
-            scenario.model.script.q2(
-                source_url=url,
-                access_mode="archive_fallback",
-                response=fallback_q2[url],
-            )
 
 
 def _configured(
@@ -279,26 +272,20 @@ def _assert_refetched(before: DurableState, after: DurableState) -> None:
             assert job.input_parameters["pipeline_generation"] == after.run.pipeline_generation
 
 
-def _q2_provider_calls(model: ScriptedModelGateway) -> list[tuple[str, str]]:
-    calls: list[tuple[str, str]] = []
-    for request in model.provider_calls:
-        if request.prompt_template_id not in {
-            "production-q2-url",
-            "production-q2-url-archive-fallback",
-        }:
-            continue
-        source_url = request.metadata.get("source_url")
-        if not isinstance(source_url, str):
-            continue
-        access_mode = request.metadata.get("access_mode")
-        calls.append((source_url, access_mode if isinstance(access_mode, str) else "live_url"))
-    return calls
+def _q2_provider_calls(model: ScriptedModelGateway) -> list[str]:
+    """The scripted source URLs whose archived capture reached the provider."""
+    return [
+        url
+        for request in model.provider_calls
+        if request.prompt_template_id == "production-extraction-archive-source"
+        and (url := model.script.source_url_for(request.metadata.get("source_content_sha256")))
+    ]
 
 
 def _provider_stages(model: ScriptedModelGateway) -> list[str]:
     stages: list[str] = []
     for request in model.provider_calls:
-        if request.prompt_template_id.startswith("production-q2"):
+        if request.prompt_template_id.startswith("production-extraction"):
             stages.append("extraction")
         elif request.routing_hint.value == "web_research":
             stages.append("references")
@@ -401,37 +388,36 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
     await scenario.start()
     await _run_prefix(scenario, 2)
 
-    original_persist = ProductionWorkflowOrchestrator._persist_extraction_progress
-    crashed = False
+    original_extract = scenario.model.extract
+    extraction_calls = 0
 
-    async def persist_then_crash(
-        orchestrator: ProductionWorkflowOrchestrator,
-        run_id: UUID,
-        progress: dict[str, Any],
-    ) -> None:
-        nonlocal crashed
-        await original_persist(orchestrator, run_id, progress)
-        statuses = {item["source_id"]: item["status"] for item in progress["sources"]}
-        if not crashed and statuses.get("S1") == "succeeded" and statuses.get("S2") == "succeeded":
-            crashed = True
-            raise ProcessCrash("process lost before S3")
+    async def crash_before_third_source(
+        request: ModelRequest, output_schema: type[BaseModel]
+    ) -> Any:
+        nonlocal extraction_calls
+        extraction_calls += 1
+        if extraction_calls == 3:
+            raise ProcessCrash("process lost before the third source")
+        return await original_extract(request, output_schema)
 
-    with patch.object(
-        ProductionWorkflowOrchestrator,
-        "_persist_extraction_progress",
-        new=persist_then_crash,
-    ):
+    with patch.object(scenario.model, "extract", new=crash_before_third_source):
         with pytest.raises(ProcessCrash):
             await scenario.runner.run_next()
 
     before = await _reload(scenario)
-    assert crashed
-    assert before.run.extraction_progress is not None
-    assert {
-        item["source_id"]: item["status"] for item in before.run.extraction_progress["sources"]
-    } == {"S1": "succeeded", "S2": "succeeded", "S3": "pending"}
-    q2_before = [call for call in scenario.model.calls if call.stage == "extraction"]
-    assert [call.source_url for call in q2_before] == list(urls[:2])
+    assert _q2_provider_calls(scenario.model) == list(urls[:2])
+    completed_runs = {
+        call.model_run_id for call in scenario.model.calls if call.stage == "extraction"
+    }
+    async with scenario.uow_factory() as uow:
+        checkpoints = [
+            row
+            for url in urls[:2]
+            for row in await uow.source_extractions.list_for_url(url)
+            if row.model_run_id in completed_runs
+        ]
+    # Only the two answered captures reached a durable checkpoint.
+    assert len(checkpoints) == 2
 
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
         _configure_gateway(restarted, urls, references=False)
@@ -441,8 +427,8 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
 
     _assert_refetched(before, after)
     assert final.status is ProductionRunStatus.READY
-    assert _q2_provider_calls(restarted.model) == [(urls[2], "live_url")]
-    assert _q2_provider_calls(scenario.model) == [(urls[0], "live_url"), (urls[1], "live_url")]
+    # The two durable checkpoints are reused; only the third capture is sent.
+    assert _q2_provider_calls(restarted.model) == [urls[2]]
 
     extraction = next(
         artifact
@@ -451,103 +437,12 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
     )
     assert extraction.canonical_blob_id is not None
     payload = json.loads(after.blobs[extraction.canonical_blob_id])
-    values = {
-        item["value"]: tuple(item["source_ids"])
-        for item in payload["items"]
-        if isinstance(item, dict) and "value" in item
-    }
-    for index in range(1, 4):
-        assert values[f"source-{index}.security-lab.io"] == (f"S{index}",)
-
-    async with restarted.uow_factory() as uow:
-        for call in q2_before:
-            assert call.model_run_id is not None
-            checkpoint = await uow.model_runs.get(call.model_run_id)
-            assert checkpoint is not None
-            assert checkpoint.status is ModelRunStatus.SUCCEEDED
-            assert checkpoint.parameters.get("q2_checkpoint_keys")
-
-
-@pytest.mark.asyncio
-async def test_restart_between_live_unavailable_and_archive_fallback(
-    production_scenario_factory: ScenarioFactory,
-    migrated_postgres_url: str,
-) -> None:
-    scenario, urls = _configured(production_scenario_factory, 2, all_primary=True)
-    _configure_gateway(
-        scenario,
-        urls,
-        live_q2={urls[0]: "UNAVAILABLE", urls[1]: _q2(2)},
-        fallback_q2={urls[0]: _q2(1)},
-    )
-    await scenario.start()
-    await _run_prefix(scenario, 2)
-
-    original_execute = scenario.model.execute
-    crashed = False
-
-    async def execute_then_crash(request: ModelRequest, role: ModelRole) -> Any:
-        nonlocal crashed
-        execution = await original_execute(request, role)
-        if (
-            not crashed
-            and request.prompt_template_id == "production-q2-url"
-            and request.metadata.get("source_url") == urls[0]
-        ):
-            crashed = True
-            raise ProcessCrash("process lost before archive fallback")
-        return execution
-
-    with patch.object(scenario.model, "execute", new=execute_then_crash):
-        with pytest.raises(ProcessCrash):
-            await scenario.runner.run_next()
-
-    before = await _reload(scenario)
-    assert crashed
-    assert before.run.extraction_progress is not None
-    assert before.run.extraction_progress["sources"][0]["status"] == "running"
-
-    async with scenario.uow_factory() as uow:
-        live_model_run_id = next(
-            call.model_run_id
-            for call in scenario.model.calls
-            if call.stage == "extraction" and call.source_url == urls[0]
-        )
-        assert live_model_run_id is not None
-        live_run = await uow.model_runs.get(live_model_run_id)
-        assert live_run is not None
-        assert live_run.status is ModelRunStatus.SUCCEEDED
-        assert live_run.raw_output_reference is not None
-
-    async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
-        _configure_gateway(
-            restarted,
-            urls,
-            references=False,
-            live_q2={urls[0]: "UNAVAILABLE", urls[1]: _q2(2)},
-            fallback_q2={urls[0]: _q2(1)},
-        )
-        await restarted.enqueue_persisted_jobs(recover_abandoned=True)
-        final = await restarted.run_until_terminal()
-        after = await _reload(restarted)
-
-    _assert_refetched(before, after)
-    assert final.status is ProductionRunStatus.READY
-    assert _q2_provider_calls(restarted.model) == [
-        (urls[0], "archive_fallback"),
-        (urls[1], "live_url"),
-    ]
-    extraction = next(
-        artifact
-        for artifact in after.artifacts
-        if artifact.stage is ProductionArtifactStage.EXTRACTION
-    )
-    assert extraction.canonical_blob_id is not None
-    payload = json.loads(after.blobs[extraction.canonical_blob_id])
-    assert {item["value"] for item in payload["items"]} >= {
-        "source-1.security-lab.io",
-        "source-2.security-lab.io",
-    }
+    by_url = {source["canonical_url"]: source for source in payload["sources"]}
+    for index, url in enumerate(urls, start=1):
+        assert [item["value"] for item in by_url[url]["indicators"]] == [
+            f"source-{index}.security-lab.io"
+        ]
+    assert [by_url[url]["reuse_state"] for url in urls] == ["reused", "reused", "fresh"]
 
 
 @pytest.mark.asyncio
@@ -654,7 +549,6 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     bridge_run_id = "bridge-restart-reconciliation"
     scenario.model.script.q2(
         source_url=urls[0],
-        access_mode="live_url",
         response=BridgeTransportError(
             "bridge_timeout",
             "provider received the prompt but no final answer was returned",
@@ -680,10 +574,15 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     assert model_run.status is ModelRunStatus.NEEDS_REVIEW
     assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
 
-    visible_text = _q2(1).replace(
-        "Infrastructure observed in source 1.",
-        "Infrastructure observed in source 1 during visible recovery.",
+    # The operator adopts the structured answer the provider produced.
+    parsed = parse_q2_proposals_markdown(
+        _q2(1).replace(
+            "Infrastructure observed in source 1.",
+            "Infrastructure observed in source 1 during visible recovery.",
+        )
     )
+    assert parsed.value is not None
+    visible_text = parsed.value.model_dump_json()
     visible = VisibleRecovery(bridge_run_id, visible_text)
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
         _configure_gateway(restarted, urls, references=False, synthesis=True)
@@ -732,24 +631,20 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     migrated_postgres_url: str,
 ) -> None:
     urls = _urls(2)
-    scenario = production_scenario_factory(
-        _source_specs(urls, bodies={urls[0]: "", urls[1]: "ExampleRAT source-2.security-lab.io"})
-    )
-    scenario.restrict_core_sources(urls)
+    # The SUPPORTING capture is archived without readable text.
+    scenario = production_scenario_factory(_source_specs(urls, bodies={urls[0]: ""}))
+    scenario.restrict_core_sources((urls[1],))
     scenario.edition.country = f"Restart Safety {scenario.edition.country_code}"
-    _configure_gateway(
-        scenario,
-        urls,
-        live_q2={urls[0]: "UNAVAILABLE", urls[1]: _q2(2)},
-    )
+    _configure_gateway(scenario, urls)
     await scenario.start()
     await _run_prefix(scenario, 3)
     before = await _reload(scenario)
     assert before.run.current_stage is ProductionStage.SYNTHESIS
     assert before.run.extraction_progress is not None
+    statuses = {urls[0]: "failed", urls[1]: "succeeded"}
     assert {
-        item["source_id"]: item["status"] for item in before.run.extraction_progress["sources"]
-    } == {"S1": "skipped", "S2": "succeeded"}
+        item["canonical_url"]: item["status"] for item in before.run.extraction_progress["sources"]
+    } == statuses
     extraction_id = next(
         artifact.id
         for artifact in before.artifacts
@@ -771,5 +666,5 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     )
     assert after.run.extraction_progress is not None
     assert {
-        item["source_id"]: item["status"] for item in after.run.extraction_progress["sources"]
-    } == {"S1": "skipped", "S2": "succeeded"}
+        item["canonical_url"]: item["status"] for item in after.run.extraction_progress["sources"]
+    } == statuses
