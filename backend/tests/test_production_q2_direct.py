@@ -1,1284 +1,917 @@
+"""AW-011 cutover: the live EXTRACTION stage is the canonical service.
+
+These tests drive ``ProductionWorkflowOrchestrator._execute_extraction_stage``
+against a fake world: the stage reads the frozen corpus, resolves the exact
+archived documents, asks the gateway for one structured capability, verifies
+the proposals locally and persists a single ``ProductionExtractionV1``.
+"""
+
+from __future__ import annotations
+
 import hashlib
-from dataclasses import replace
-from datetime import UTC, date, datetime, timedelta
+import json
+import re
+from datetime import date
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
-import httpx
 import pytest
 
-from cti_app.application import production_workflow
 from cti_app.application.model_gateway import (
-    AdapterResult,
-    AdapterResultStatus,
-    ModelCapabilities,
-    ModelGateway,
-    ModelGatewayError,
     ModelRequest,
-    ModelRouter,
-    ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
 )
+from cti_app.application.production_extraction import build_extraction_plan
 from cti_app.application.production_parsers import (
-    ParsedSource,
-    ReferenceReport,
-    parse_q2_proposals_markdown,
+    Q2ArtifactProposal,
+    Q2EventProposal,
+    Q2FactProposal,
+    Q2RuleProposal,
+    Q2SourceOutput,
 )
-from cti_app.application.production_q2_batch import q2_batch_output_marker
-from cti_app.application.production_workflow import (
-    _extraction_input_hash,
-    _q2_archive_fallback_checkpoint_key,
-    _q2_archive_fallback_model_run_id,
-    _q2_checkpoint_key,
-    _q2_source_model_run_id,
-)
+from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
+from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_runs import (
-    ModelBackend,
-    ModelProvider,
-    ModelRole,
-    ModelRunStatus,
-    ModelSubmissionState,
-    ModelTransport,
-    ModelUsage,
-)
+from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
+    DetectionRuleType,
+    ExtractionProfile,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionInputSnapshot,
-    ProductionInputSource,
     ProductionRun,
-    ProductionRunStatus,
-    ProductionStage,
+    SourceExtraction,
+    SourceExtractionStatus,
 )
-from cti_app.integrations.models import (
-    BridgeTransportError,
-    FakeModelAdapter,
-    InMemoryModelOutputStore,
-    _bridge_http_error,
+from cti_app.domain.production_extraction import (
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    production_extraction_from_json,
 )
-from tests.model_support import InMemoryModelRunRepository, InMemoryModelRunUnitOfWorkFactory
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+    is_eligible_for_extraction,
+)
+
+CORE_A_URL = "https://example.test/core-a"
+CORE_B_URL = "https://example.test/core-b"
+SUPPORT_URL = "https://example.test/support"
+UNAVAILABLE_URL = "https://example.test/unavailable"
+
+CORE_TEXT = (
+    "ExampleRAT was deployed by Actor-X on 2026-07-10.\n"
+    "The operator ran the command powershell -enc ZXhhbXBsZQ== during the intrusion.\n"
+    "The implant beaconed to evil.security-lab.io and exploited CVE-2026-12345.\n"
+    "rule ExampleRAT { condition: true }\n"
+)
+SUPPORT_TEXT = (
+    "The loader beaconed to loader.security-lab.io on 2026-07-11.\n"
+    "rule SupportRule { condition: true }\n"
+)
 
 
-def test_q2_source_model_run_id_is_stable_per_generation_and_source() -> None:
-    run_id = uuid4()
-    first = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-    assert first == _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-    assert first != _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=1,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-
-
-def test_q2_source_model_run_id_changes_when_routing_policy_changes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = uuid4()
-    before = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-
-    monkeypatch.setattr(production_workflow, "Q2_ROUTING_POLICY_VERSION", "next")
-
-    after = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-    assert after != before
-
-
-def test_archive_fallback_identity_is_distinct_from_live_checkpoint() -> None:
-    run_id = uuid4()
-    live_model_run_id = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-    archive_model_run_id = _q2_archive_fallback_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-        source_content_sha256="a" * 64,
-        profile=production_workflow.ExtractionProfile.FULL,
-    )
-    live_key = _q2_checkpoint_key(
-        canonical_url="https://example.test/report",
-        profile=production_workflow.ExtractionProfile.FULL,
-        prompt_version="18",
-        batch_parser_version=None,
-        provider=ModelProvider.OPENAI,
-        requested_model="unknown",
-    )
-    archive_key = _q2_archive_fallback_checkpoint_key(
-        canonical_url="https://example.test/report",
-        source_content_sha256="a" * 64,
-        profile=production_workflow.ExtractionProfile.FULL,
-    )
-
-    assert live_model_run_id != archive_model_run_id
-    assert live_key != archive_key
-
-
-def test_q2_failure_classification_keeps_checkpoint_errors_out_of_coverage() -> None:
-    transient = production_workflow._classify_q2_failure(
-        BridgeTransportError(
-            "bridge_ui_timeout",
-            "transport failure",
-            retryable=True,
-            phase="pre_submission",
-            submission_state="pre_submission",
-        )
-    )
-    reconciliation = production_workflow._classify_q2_failure(
-        ModelSubmissionReconciliationRequiredError()
-    )
-    content = production_workflow._classify_q2_failure(
-        BridgeTransportError(
-            "source_content_invalid",
-            "source response is unusable",
-            retryable=False,
-            phase="response_validation",
-            submission_state="post_submission",
-        )
-    )
-    control = production_workflow._classify_q2_failure(
-        ModelGatewayError("Failed ModelRun is not safe to resubmit")
-    )
-
-    assert transient.status == "transient_error"
-    assert transient.failure_class.value == "global_transient_pre_submission"
-    assert not transient.contributes_to_coverage
-    assert reconciliation.error_code == "model_submission_reconciliation_required"
-    assert reconciliation.failure_class.value == "reconciliation_required"
-    assert content.failure_class.value == "source_content_failure"
-    assert content.contributes_to_coverage
-    assert control.failure_class.value == "control_invariant_failure"
-    assert not control.contributes_to_coverage
-
-
-def test_iana_snapshot_bump_recomputes_extraction_without_new_q2_provider_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    run_id = uuid4()
-    before_artifact = _extraction_input_hash(
-        subject_id=run_id,
-        references_hash="references",
-        source_urls=["https://example.test/report"],
-        pipeline_generation=0,
-    )
-    before_q2_run = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-
-    monkeypatch.setattr(production_workflow, "IANA_TLD_SNAPSHOT_VERSION", "next-snapshot")
-
-    after_artifact = _extraction_input_hash(
-        subject_id=run_id,
-        references_hash="references",
-        source_urls=["https://example.test/report"],
-        pipeline_generation=0,
-    )
-    after_q2_run = _q2_source_model_run_id(
-        production_run_id=run_id,
-        pipeline_generation=0,
-        source_id="S1",
-        canonical_url="https://example.test/report",
-    )
-
-    assert after_artifact != before_artifact
-    assert after_q2_run == before_q2_run
-
-
-async def test_q2_model_gateway_reuses_persisted_model_run_across_worker_replay() -> None:
-    """A Q2 worker replay before artifact storage must not post a second request."""
-    adapter = FakeModelAdapter()
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=FakeModelAdapter(),
-            openai_structured=FakeModelAdapter(),
-            qwen=FakeModelAdapter(),
-            fake=adapter,
-        ),
-        model_uow,
-        InMemoryModelOutputStore(),
-    )
-    production_run_id = uuid4()
-
-    def q2_request(generation: int) -> ModelRequest:
-        return ModelRequest(
-            text="Extract the source",
-            prompt_template_id="production-q2-url",
-            prompt_template_version="1",
-            evidence_pack_hash="a" * 64,
-            external_llm_allowed=False,
-            routing_hint=ModelRoutingHint.WEB_RESEARCH,
-            provider=ModelProvider.FAKE,
-            web_search=True,
-            run_id=_q2_source_model_run_id(
-                production_run_id=production_run_id,
-                pipeline_generation=generation,
-                source_id="S1",
-                canonical_url="https://example.test/report",
+def _full_output() -> Q2SourceOutput:
+    return Q2SourceOutput(
+        facts=[
+            Q2FactProposal(category="malware", value="ExampleRAT"),
+            Q2FactProposal(category="commands", value="powershell -enc ZXhhbXBsZQ=="),
+        ],
+        events=[
+            Q2EventProposal(
+                event_date=date(2026, 7, 10),
+                text="ExampleRAT was deployed by Actor-X on 2026-07-10.",
+            )
+        ],
+        artifacts=[
+            Q2ArtifactProposal(
+                value="evil.security-lab.io",
+                artifact_type="domain",
+                indicator_status="confirmed_ioc",
             ),
-        )
-
-    first = await gateway.execute(q2_request(0), ModelRole.RESEARCH)
-    same_generation = await gateway.execute(q2_request(0), ModelRole.RESEARCH)
-    next_generation = await gateway.execute(q2_request(1), ModelRole.RESEARCH)
-    replay_before_artifact = await gateway.execute(q2_request(1), ModelRole.RESEARCH)
-
-    assert first.run.status is ModelRunStatus.SUCCEEDED
-    assert same_generation.run.id == first.run.id
-    assert next_generation.run.id != first.run.id
-    assert replay_before_artifact.run.status is ModelRunStatus.SUCCEEDED
-    assert len(adapter.calls) == 2
-
-
-def test_q2_markdown_parses_compact_facts_without_changing_windows_paths() -> None:
-    parsed = parse_q2_proposals_markdown(
-        """FACT infection_chain
-- C:\\Windows uses other_technical and count_success
-"""
+            Q2ArtifactProposal(
+                value="ghost.security-lab.io",
+                artifact_type="domain",
+                indicator_status="confirmed_ioc",
+            ),
+        ],
+        rules=[
+            Q2RuleProposal(
+                rule_type=DetectionRuleType.YARA,
+                name="ExampleRAT",
+                body="rule ExampleRAT { condition: true }",
+            )
+        ],
+        uncertainties=["Attribution of Actor-X remains unconfirmed."],
     )
-    assert parsed.usable
-    assert parsed.value is not None
-    fact = parsed.value.facts[0]
-    assert fact.category == "infection_chain"
-    assert fact.value == "C:\\Windows uses other_technical and count_success"
-    assert fact.evidence_quote == ""
 
 
-def test_bridge_timeout_codes_are_preserved() -> None:
-    request = httpx.Request("POST", "https://bridge.test/v1/responses")
-    for code in ("bridge_idle_timeout", "bridge_total_timeout"):
-        error = _bridge_http_error(
-            httpx.Response(502, request=request, json={"error": {"code": code}}), 1
-        )
-        assert error.code == code
+def _support_output() -> Q2SourceOutput:
+    return Q2SourceOutput(
+        artifacts=[
+            Q2ArtifactProposal(
+                value="loader.security-lab.io",
+                artifact_type="domain",
+                indicator_status="confirmed_ioc",
+            )
+        ],
+        rules=[
+            Q2RuleProposal(
+                rule_type=DetectionRuleType.YARA,
+                name="SupportRule",
+                body="rule SupportRule { condition: true }",
+            )
+        ],
+        uncertainties=["The loader family is unconfirmed."],
+    )
 
 
-class _Q2Artifacts:
-    async def get_current(self, run_id: object, stage: str) -> object:
-        del run_id, stage
-        return type(
-            "ReferenceArtifact",
-            (),
-            {"canonical_blob_id": uuid4(), "input_hash": "a" * 64},
-        )()
+# --- fake world -------------------------------------------------------------
 
 
-class _Q2Runs:
+class _BlobStore:
     def __init__(self) -> None:
-        self.run: ProductionRun | None = None
+        self.bytes: dict[UUID, bytes] = {}
+        self.payloads: dict[UUID, dict[str, Any]] = {}
+        self.stage_writes: list[tuple[str | None, dict[str, Any] | None]] = []
+        self.source_writes = 0
 
-    async def get(self, run_id: object) -> ProductionRun | None:
-        return self.run if self.run is not None and run_id == self.run.id else None
+    def put_bytes(self, content: bytes) -> tuple[UUID, str]:
+        blob_id = uuid4()
+        self.bytes[blob_id] = content
+        return blob_id, hashlib.sha256(content).hexdigest()
 
+    def put_json(self, payload: dict[str, Any]) -> UUID:
+        blob_id = uuid4()
+        self.payloads[blob_id] = payload
+        return blob_id
 
-class _Q2Snapshots:
-    def __init__(self) -> None:
-        self.snapshot: ProductionInputSnapshot | None = None
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int | None = None) -> bytes:
+        del max_bytes
+        if blob_id in self.bytes:
+            return self.bytes[blob_id]
+        return json.dumps(self.payloads[blob_id]).encode("utf-8")
 
-    async def get_by_run(self, run_id: object) -> ProductionInputSnapshot | None:
-        del run_id
-        return self.snapshot
+    async def read_json(self, blob_id: UUID) -> dict[str, Any]:
+        return self.payloads[blob_id]
 
-
-class _Q2UnitOfWork:
-    def __init__(
+    async def store_stage_payloads(
         self,
-        model_run_state: dict[Any, Any] | None = None,
-        report: ReferenceReport | None = None,
         *,
-        source_contents: dict[str, bytes] | None = None,
-    ) -> None:
-        self.production_artifacts = _Q2Artifacts()
-        self.production_runs = _Q2Runs()
-        self.production_input_snapshots = _Q2Snapshots()
-        self.model_runs = InMemoryModelRunRepository(
-            model_run_state if model_run_state is not None else {}
-        )
-        self.archive_reader = _Q2ArchiveReader()
-        self.source_documents = _Q2SourceDocuments(
-            report, self.archive_reader, source_contents=source_contents
-        )
-        self.source_collections = _Q2SourceCollections(self.source_documents.documents)
+        raw: str | None = None,
+        canonical: dict[str, Any] | None = None,
+        rendered: str | None = None,
+    ) -> tuple[UUID | None, UUID | None, UUID | None]:
+        del rendered
+        self.stage_writes.append((raw, canonical))
+        raw_id = self.put_bytes(raw.encode("utf-8"))[0] if raw is not None else None
+        canonical_id = self.put_json(canonical) if canonical is not None else None
+        return raw_id, canonical_id, None
 
-    async def __aenter__(self) -> "_Q2UnitOfWork":
+    async def store_source_extraction_payloads(
+        self, *, raw: str, canonical: dict[str, Any]
+    ) -> tuple[UUID | None, UUID]:
+        self.source_writes += 1
+        raw_id = self.put_bytes(raw.encode("utf-8"))[0] if raw else None
+        return raw_id, self.put_json(canonical)
+
+
+class _Artifacts:
+    def __init__(self) -> None:
+        self.current: dict[tuple[UUID, str], ProductionArtifact] = {}
+        self.items: list[ProductionArtifact] = []
+        self.stale: list[tuple[UUID, str]] = []
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        return self.current.get((run_id, stage))
+
+    async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
+        return [artifact for artifact in self.items if artifact.production_run_id == run_id]
+
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.items.append(artifact)
+        self.current[(artifact.production_run_id, artifact.stage.value)] = artifact
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        self.stale.append((run_id, stage))
+
+
+class _Runs:
+    def __init__(self, run: ProductionRun) -> None:
+        self.run = run
+        self.saved = 0
+
+    async def get(self, run_id: UUID) -> ProductionRun | None:
+        return self.run if self.run.id == run_id else None
+
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
+        return await self.get(run_id)
+
+    async def save(self, run: ProductionRun) -> None:
+        self.run = run
+        self.saved += 1
+
+
+class _Documents:
+    def __init__(self) -> None:
+        self.rows: dict[UUID, Any] = {}
+
+    async def get(self, document_id: UUID) -> Any | None:
+        return self.rows.get(document_id)
+
+
+class _Collections(_Documents):
+    pass
+
+
+class _Extractions:
+    FIELDS = (
+        "source_content_sha256",
+        "profile",
+        "contract_version",
+        "prompt_version",
+        "parser_version",
+        "verifier_version",
+        "source_text_contract_version",
+        "model_policy_version",
+        "routing_policy_version",
+    )
+
+    def __init__(self) -> None:
+        self.rows: dict[tuple[str, ...], SourceExtraction] = {}
+
+    @classmethod
+    def _key(cls, values: dict[str, str]) -> tuple[str, ...]:
+        return tuple(values[field] for field in cls.FIELDS)
+
+    @classmethod
+    def _row_key(cls, row: SourceExtraction) -> tuple[str, ...]:
+        return cls._key(
+            {
+                "source_content_sha256": row.source_content_sha256,
+                "profile": row.profile.value,
+                "contract_version": row.contract_version,
+                "prompt_version": row.prompt_version,
+                "parser_version": row.parser_version,
+                "verifier_version": row.verifier_version,
+                "source_text_contract_version": row.source_text_contract_version,
+                "model_policy_version": row.model_policy_version,
+                "routing_policy_version": row.routing_policy_version,
+            }
+        )
+
+    async def get_by_identity(self, **values: str) -> SourceExtraction | None:
+        return self.rows.get(self._key(dict(values)))
+
+    async def claim(self, extraction: SourceExtraction, *, force: bool = False) -> bool:
+        key = self._row_key(extraction)
+        existing = self.rows.get(key)
+        verified = existing is not None and existing.status is SourceExtractionStatus.VERIFIED
+        if verified and not force:
+            return False
+        self.rows[key] = extraction
+        return True
+
+    async def save(self, extraction: SourceExtraction) -> None:
+        self.rows[self._row_key(extraction)] = extraction
+
+
+class _Uow:
+    def __init__(self, world: _World) -> None:
+        self.world = world
+        self.production_artifacts = world.artifacts
+        self.production_runs = world.runs
+        self.source_documents = world.documents
+        self.source_collections = world.collections
+        self.source_extractions = world.extractions
+
+    async def __aenter__(self) -> _Uow:
         return self
 
     async def __aexit__(self, *args: object) -> None:
         del args
 
-
-class _Q2ArchiveReader:
-    def __init__(self) -> None:
-        self.contents: dict[UUID, bytes] = {}
-
-    async def read_blob(self, blob_id: UUID, *, max_bytes: int) -> bytes:
-        del max_bytes
-        return self.contents[blob_id]
+    async def commit(self) -> None:
+        return None
 
 
-class _Q2SourceDocuments:
-    def __init__(
-        self,
-        report: ReferenceReport | None,
-        reader: _Q2ArchiveReader,
-        *,
-        source_contents: dict[str, bytes] | None = None,
-    ) -> None:
-        self.documents: list[SimpleNamespace] = []
-        for source in report.sources if report is not None else ():
-            default_content = b"ExampleRAT" if source.local_id == "S1" else b""
-            content = (
-                source_contents.get(source.local_id, default_content)
-                if source_contents is not None
-                else default_content
+class _World:
+    def __init__(self, run: ProductionRun) -> None:
+        self.store = _BlobStore()
+        self.artifacts = _Artifacts()
+        self.runs = _Runs(run)
+        self.documents = _Documents()
+        self.collections = _Collections()
+        self.extractions = _Extractions()
+
+    def uow(self) -> _Uow:
+        return _Uow(self)
+
+
+class _Gateway:
+    """One fake provider answering the requested structured capability."""
+
+    def __init__(self, outputs: dict[str, Q2SourceOutput] | None = None) -> None:
+        self.outputs = dict(outputs or {})
+        self.calls: list[ModelRequest] = []
+        self.schemas: list[type[Any]] = []
+        self.ambiguous = False
+
+    def output_for(self, text: str) -> Q2SourceOutput:
+        for marker, output in self.outputs.items():
+            if marker in text:
+                return output
+        return Q2SourceOutput()
+
+    def _execution(self, output: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                id=uuid4(),
+                status=ModelRunStatus.SUCCEEDED,
+                error_code=None,
+                error_message=None,
+                error_details=None,
+            ),
+            structured_output=output,
+            output_text=None,
+            metadata={},
+        )
+
+    async def extract(self, request: ModelRequest, output_schema: type[Any]) -> SimpleNamespace:
+        self.calls.append(request)
+        self.schemas.append(output_schema)
+        if self.ambiguous:
+            raise ModelSubmissionReconciliationRequiredError(
+                "The submission state is unknown",
+                details={"provider_reference": "opaque"},
             )
-            blob_id = uuid4()
-            reader.contents[blob_id] = content
-            self.documents.append(
-                SimpleNamespace(
-                    id=uuid4(),
-                    final_url=source.canonical_url,
-                    decoded_sha256=hashlib.sha256(content).hexdigest(),
-                    decoded_blob_id=blob_id,
-                    detected_mime_type="text/plain",
+        if output_schema is Q2BatchResponse:
+            blocks = _batch_blocks(request.text)
+            return self._execution(
+                Q2BatchResponse(
+                    sources=[
+                        Q2BatchSourceOutput(batch_id=handle, output=self.output_for(body))
+                        for handle, body in blocks
+                    ]
                 )
             )
-
-    async def list_for_subject(self, subject_id: UUID) -> list[SimpleNamespace]:
-        del subject_id
-        return self.documents
+        return self._execution(self.output_for(request.text))
 
 
-class _Q2SourceCollections:
-    def __init__(self, documents: list[SimpleNamespace]) -> None:
-        self.collections = [
-            SimpleNamespace(
-                canonical_url=document.final_url,
-                source_document_id=document.id,
-                decoded_blob_id=document.decoded_blob_id,
-            )
-            for document in documents
-        ]
-
-    async def list_for_subject(self, subject_id: UUID) -> list[SimpleNamespace]:
-        del subject_id
-        return self.collections
+def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
+    matches = list(re.finditer(r"@@Q2:(B\d+)@@", prompt))
+    blocks: list[tuple[str, str]] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
+        blocks.append((match.group(1), prompt[match.end() : end]))
+    return tuple(blocks)
 
 
-class _Q2Gateway:
-    def __init__(self, failure: Exception | None, *, output_text: str | None = None) -> None:
-        self.failure = failure
-        self.output_text = output_text
-        self.calls: list[str] = []
-
-    async def execute(self, request: ModelRequest, role: ModelRole) -> object:
-        del role
-        source_id = str(request.metadata["source_id"])
-        self.calls.append(source_id)
-        if self.failure is not None:
-            raise self.failure
-        return type(
-            "Execution",
-            (),
-            {
-                "output_text": self.output_text
-                if self.output_text is not None
-                else ("FACT malware\n- ExampleRAT :: outil observe\n"),
-                "run": type(
-                    "Run",
-                    (),
-                    {
-                        "id": uuid4(),
-                        "status": ModelRunStatus.SUCCEEDED,
-                        "error_code": None,
-                        "error_message": None,
-                        "error_details": None,
-                    },
-                )(),
-                "metadata": {},
-            },
-        )()
+def _to_markdown(output: Q2SourceOutput) -> str:
+    lines: list[str] = []
+    for fact in output.facts:
+        lines.append(f"FACT {fact.category}")
+        lines.append(f"- {fact.value}")
+    for event in output.events:
+        header = "EVENT"
+        if event.event_date is not None:
+            header = f"EVENT {event.event_date.isoformat()}"
+        lines.append(header)
+        lines.append(f"- {event.text}")
+    for artifact in output.artifacts:
+        status = "confirmed" if artifact.indicator_status == "confirmed_ioc" else "contextual"
+        lines.append(f"IOC {status} {artifact.artifact_type}")
+        lines.append(f"- {artifact.value}")
+    for rule in output.rules:
+        specification = rule.rule_type.value
+        if rule.name:
+            specification = f"{specification}: {rule.name}"
+        lines.append(f"RULE {specification}")
+        lines.append(f"```{rule.rule_type.value}")
+        lines.append(rule.body)
+        lines.append("```")
+    if output.uncertainties:
+        lines.append("UNCERTAINTIES")
+        for uncertainty in output.uncertainties:
+            lines.append(f"- {uncertainty}")
+    return "\n".join(lines) + "\n"
 
 
-class _ArchiveFallbackAdapter:
-    provider = ModelProvider.OPENAI
-    backend = ModelBackend.CHATGPT_BRIDGE
-    transport = ModelTransport.OPENAI_RESPONSES
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
-    requested_model = "chatgpt-web-fake"
-    is_external = True
+class _MarkdownGateway(_Gateway):
+    """A second provider answering the same capability as Q2 markdown."""
 
-    def __init__(self) -> None:
-        self.calls: list[Any] = []
-        self.responses = [
-            "UNAVAILABLE",
-            "FACT malware\n- ExampleRAT\n",
-            "UNAVAILABLE",
-        ]
-
-    async def invoke(
-        self, request: Any, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del role, output_schema
-        self.calls.append(request)
-        return AdapterResult(
-            status=AdapterResultStatus.COMPLETED,
-            provider=self.provider,
-            requested_model=self.requested_model,
-            actual_model_version=self.requested_model,
-            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            output_text=self.responses.pop(0),
+    def _execution(self, output: object) -> SimpleNamespace:
+        if not isinstance(output, Q2SourceOutput):
+            raise AssertionError("The markdown adapter only answers source captures")
+        return SimpleNamespace(
+            run=SimpleNamespace(
+                id=uuid4(),
+                status=ModelRunStatus.SUCCEEDED,
+                error_code=None,
+                error_message=None,
+                error_details=None,
+            ),
+            structured_output=None,
+            output_text=_to_markdown(output),
+            metadata={},
         )
 
-    async def resume(
-        self, response_id: str, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del response_id, role, output_schema
-        raise AssertionError("not used")
+
+# --- scenario helpers -------------------------------------------------------
 
 
-class _NeedsReviewQ2Adapter:
-    provider = ModelProvider.OPENAI
-    backend = ModelBackend.CHATGPT_BRIDGE
-    transport = ModelTransport.OPENAI_RESPONSES
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
-    requested_model = "chatgpt-web-fake"
-    is_external = True
-
-    def __init__(self) -> None:
-        self.calls: list[Any] = []
-
-    async def invoke(
-        self, request: Any, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del role, output_schema
-        self.calls.append(request)
-        return AdapterResult(
-            status=AdapterResultStatus.NEEDS_REVIEW,
-            provider=self.provider,
-            requested_model=self.requested_model,
-            actual_model_version=self.requested_model,
-            usage=ModelUsage(input_tokens=1, output_tokens=0, total_tokens=1),
-            metadata={
-                "reason": "active_signal_stalled",
-                "completion_signal": "streaming",
-            },
-        )
-
-    async def resume(
-        self, response_id: str, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del response_id, role, output_schema
-        raise AssertionError("not used")
-
-
-class _Q2Diagnostics:
-    def __init__(self) -> None:
-        self.events: list[dict[str, object]] = []
-
-    def record(self, **fields: object) -> None:
-        self.events.append(fields)
-
-    def record_parse(self, **fields: object) -> None:
-        del fields
-
-    def record_stage_outcome(self, **fields: object) -> None:
-        self.events.append(fields)
-
-
-class _Q2Extraction:
-    def __init__(self) -> None:
-        self.store_calls: list[dict[str, object]] = []
-
-    async def store_extraction_result(self, **fields: object) -> object:
-        self.store_calls.append(fields)
-        return type("ExtractionArtifact", (), {"id": uuid4()})()
-
-
-def _q2_report(source_count: int = 5) -> ReferenceReport:
-    return ReferenceReport(
-        sources=tuple(
-            ParsedSource(
-                local_id=f"S{index}",
-                title=f"Source {index}",
-                url=f"https://example.test/{index}",
-                canonical_url=f"https://example.test/{index}",
-                publisher="Example",
-                published_at=None,
-                role=SourceRole.PRIMARY,
-            )
-            for index in range(1, source_count + 1)
-        ),
-        events=(),
-    )
-
-
-def _q2_snapshot() -> ProductionInputSnapshot:
-    candidate_id = uuid4()
+def _snapshot(subject_id: UUID) -> ProductionInputSnapshot:
     return ProductionInputSnapshot(
         production_run_id=uuid4(),
-        subject_id=uuid4(),
         edition_id=uuid4(),
+        subject_id=subject_id,
         subject_version=1,
-        subject_title="Article",
+        subject_title="Subject",
         subject_tlp=TLP.CLEAR,
         selection_decision_id=uuid4(),
         origin_discovery_subject_id=uuid4(),
         canonical_discovery_subject_id=uuid4(),
         discovery_snapshot_id=uuid4(),
         discovery_snapshot_version=1,
-        member_candidate_ids=(candidate_id,),
-        discovery_summary="",
-        actor_or_campaign="",
+        member_candidate_ids=(),
+        discovery_summary="Summary",
+        actor_or_campaign="Actor-X",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
         research_date=date(2026, 8, 1),
-        core_sources=(
-            ProductionInputSource(
-                discovery_candidate_id=candidate_id,
-                source_candidate_id=uuid4(),
-                canonical_url="https://example.test/1",
-                role=SourceRole.PRIMARY,
-                title="Source 1",
-                publisher="Example",
-                published_at=None,
-                tlp=TLP.CLEAR,
-                sensitivity="public",
-                external_llm_allowed=True,
+    )
+
+
+def _register_source(
+    world: _World,
+    *,
+    subject_id: UUID,
+    url: str,
+    text: str,
+    corrupt: bool = False,
+) -> tuple[UUID, str]:
+    encoded = text.encode("utf-8")
+    blob_id, sha256 = world.store.put_bytes(encoded)
+    if corrupt:
+        world.store.bytes[blob_id] = b"the archive changed after REFERENCES froze it"
+    document_id, collection_id = uuid4(), uuid4()
+    world.documents.rows[document_id] = SimpleNamespace(
+        id=document_id,
+        subject_id=subject_id,
+        source_collection_id=collection_id,
+        decoded_blob_id=blob_id,
+        detected_mime_type="text/plain",
+        tlp=TLP.CLEAR,
+        external_llm_allowed=True,
+        do_not_submit=False,
+    )
+    world.collections.rows[collection_id] = SimpleNamespace(
+        id=collection_id,
+        subject_id=subject_id,
+        canonical_url=url,
+        source_document_id=document_id,
+        source_tlp=TLP.CLEAR,
+        sensitivity="public",
+        external_llm_allowed=True,
+        do_not_submit=False,
+    )
+    return document_id, sha256
+
+
+def _reference(
+    *,
+    url: str,
+    tier: ProductionReferenceTier,
+    document_id: UUID | None,
+    sha256: str | None,
+    state: CollectionState = CollectionState.ARCHIVED,
+) -> ProductionReferenceSourceV1:
+    return ProductionReferenceSourceV1(
+        canonical_url=url,
+        tier=tier,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.PRIMARY,
+        title=f"Archived {url}",
+        publisher="Publisher",
+        published_at=date(2026, 7, 10),
+        source_collection_id=None,
+        source_document_id=document_id,
+        discovery_candidate_ids=(),
+        collection_state=state,
+        content_sha256=sha256,
+        relevance_reason=None,
+        proposed_by_model=False,
+        eligible_for_extraction=is_eligible_for_extraction(
+            collection_state=state,
+            source_document_id=document_id,
+            content_sha256=sha256,
+        ),
+    )
+
+
+def _corpus(
+    *,
+    subject_id: UUID,
+    input_hash: str,
+    sources: tuple[ProductionReferenceSourceV1, ...],
+) -> ProductionReferenceCorpusV1:
+    return ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject_id,
+        research_date=date(2026, 8, 1),
+        production_input_hash=input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
+    )
+
+
+def _publish(world: _World, run: ProductionRun, corpus: ProductionReferenceCorpusV1) -> None:
+    blob_id = world.store.put_json(production_reference_corpus_to_json(corpus))
+    artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash=corpus.production_input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=blob_id,
+    )
+    world.artifacts.current[(run.id, ProductionArtifactStage.REFERENCES.value)] = artifact
+    world.artifacts.items.append(artifact)
+
+
+async def _run_stage(
+    world: _World,
+    run: ProductionRun,
+    *,
+    snapshot: ProductionInputSnapshot,
+    gateway: _Gateway,
+) -> dict[str, Any]:
+    orchestrator = ProductionWorkflowOrchestrator(
+        cast(Any, world.uow),
+        model_gateway=cast(Any, gateway),
+        artifact_store=cast(Any, world.store),
+    )
+    return await orchestrator._execute_extraction_stage(run, None, snapshot)
+
+
+def _tiered_world() -> tuple[_World, ProductionRun, ProductionInputSnapshot]:
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=snapshot.edition_id)
+    world = _World(run)
+    core_a, core_a_sha = _register_source(
+        world, subject_id=subject_id, url=CORE_A_URL, text=CORE_TEXT
+    )
+    core_b, core_b_sha = _register_source(
+        world, subject_id=subject_id, url=CORE_B_URL, text=CORE_TEXT
+    )
+    support, support_sha = _register_source(
+        world, subject_id=subject_id, url=SUPPORT_URL, text=SUPPORT_TEXT
+    )
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_A_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core_a,
+                sha256=core_a_sha,
+            ),
+            _reference(
+                url=CORE_B_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core_b,
+                sha256=core_b_sha,
+            ),
+            _reference(
+                url=SUPPORT_URL,
+                tier=ProductionReferenceTier.SUPPORTING,
+                document_id=support,
+                sha256=support_sha,
             ),
         ),
-        captured_at=datetime.now().astimezone(),
     )
+    _publish(world, run, corpus)
+    return world, run, snapshot
 
 
-def _q2_orchestrator(
-    monkeypatch: pytest.MonkeyPatch,
-    gateway: Any,
-    report: ReferenceReport,
-    *,
-    model_run_state: dict[Any, Any] | None = None,
-    source_contents: dict[str, bytes] | None = None,
-) -> tuple[production_workflow.ProductionWorkflowOrchestrator, ProductionRun, _Q2Diagnostics]:
-    uow = _Q2UnitOfWork(model_run_state, report, source_contents=source_contents)
-    diagnostics = _Q2Diagnostics()
-    orchestrator = production_workflow.ProductionWorkflowOrchestrator.__new__(
-        production_workflow.ProductionWorkflowOrchestrator
-    )
-    orchestrator._uow_factory = lambda: uow
-    orchestrator._artifact_store = None
-    orchestrator._diagnostics = diagnostics
-    orchestrator._correlation_id = "test"
-    orchestrator._model_gateway = gateway
-    orchestrator._blob_reader = uow.archive_reader
-    orchestrator._pacing = type("Pacing", (), {"model_delay_seconds": lambda self: 0.0})()
-    orchestrator._extraction = _Q2Extraction()
-    orchestrator._settings = SimpleNamespace(production_archive_fallback_min_chars=1200)
+def _gateway() -> _Gateway:
+    return _Gateway({"ExampleRAT": _full_output(), "loader": _support_output()})
 
-    async def load_reference(*args: object) -> ReferenceReport:
-        del args
-        return report
 
-    async def no_reuse(*args: object) -> None:
-        del args
-        return None
-
-    async def subject_context(*args: object) -> tuple[str, str]:
-        del args
-        return "Article", ""
-
-    async def production_context(*args: object, **kwargs: object) -> object:
-        del args, kwargs
-        return type("Context", (), {"external_llm_allowed": True, "subject_title": "Article"})()
-
-    monkeypatch.setattr(orchestrator, "_load_reference_report", load_reference)
-    monkeypatch.setattr(orchestrator, "_reuse_artifact", no_reuse)
-    monkeypatch.setattr(orchestrator, "_subject_context", subject_context)
-    monkeypatch.setattr(production_workflow, "build_subject_production_context", production_context)
-    run = ProductionRun(
-        subject_id=uuid4(),
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    uow.production_runs.run = run
-    uow.production_input_snapshots.snapshot = _q2_snapshot()
-    return orchestrator, run, diagnostics
+# --- cutover ----------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_q2_extraction_missing_snapshot_fails_before_any_model_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _Q2Gateway(None)
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(100))
+async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
+    world, run, snapshot = _tiered_world()
+    gateway = _gateway()
 
-    result = await orchestrator._execute_direct_url_extraction(run)
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
 
-    assert result["status"] == "needs_review"
-    assert result["error_code"] == "q2_extraction_plan_missing_snapshot"
-    assert gateway.calls == []
+    assert result["status"] == "success"
+    assert world.artifacts.stale == [(run.id, "extraction")]
+    artifact = world.artifacts.items[-1]
+    assert artifact.stage is ProductionArtifactStage.EXTRACTION
+    assert artifact.status is ProductionArtifactStatus.VERIFIED
+    assert artifact.model_run_id is None
+    assert artifact.raw_blob_id is None
+    assert artifact.canonical_blob_id is not None
+    payload = await world.store.read_json(artifact.canonical_blob_id)
+    extraction = production_extraction_from_json(payload)
+
+    profiles = {source.canonical_url: source.profile for source in extraction.sources}
+    assert profiles[CORE_A_URL] is ExtractionProfile.FULL
+    assert profiles[CORE_B_URL] is ExtractionProfile.FULL
+    assert profiles[SUPPORT_URL] is ExtractionProfile.IOC_RULES
+    assert [source.tier for source in extraction.sources] == [
+        ProductionReferenceTier.CORE,
+        ProductionReferenceTier.CORE,
+        ProductionReferenceTier.SUPPORTING,
+    ]
+    # Every canonical element keeps the exact document it came from.
+    for source in extraction.sources:
+        for item in (*source.facts, *source.events, *source.indicators, *source.rules):
+            assert source.source_document_id in item.source_document_ids
+
+    # The metadata stays a bounded projection: counts and versions only.
+    assert "facts" not in artifact.metadata
+    assert artifact.metadata["source_count"] == 3
+    assert artifact.metadata["full_source_count"] == 2
+    assert artifact.metadata["ioc_rules_source_count"] == 1
+    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-v1"
+    assert artifact.metadata["contract_version"]
+    assert "ExampleRAT" not in repr(artifact.metadata)
+
+    # No provider ever received a web instruction: the archive was the input.
+    assert gateway.calls
+    for request in gateway.calls:
+        assert request.web_search is False
+        assert request.prompt_template_id.startswith("production-extraction-archive")
+    assert any("evil.security-lab.io" in request.text for request in gateway.calls)
 
 
 @pytest.mark.asyncio
-async def test_q2_duplicate_reference_source_id_fails_closed_before_batching(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _Q2Gateway(None)
-    report = _q2_report(2)
-    duplicate_report = replace(
-        report,
+async def test_ineligible_core_source_is_omitted_without_any_model_call() -> None:
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=snapshot.edition_id)
+    world = _World(run)
+    core, core_sha = _register_source(world, subject_id=subject_id, url=CORE_A_URL, text=CORE_TEXT)
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
         sources=(
-            report.sources[0],
-            replace(report.sources[1], local_id=report.sources[0].local_id),
+            _reference(
+                url=CORE_A_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core,
+                sha256=core_sha,
+            ),
+            _reference(
+                url=UNAVAILABLE_URL,
+                tier=ProductionReferenceTier.SUPPORTING,
+                document_id=None,
+                sha256=None,
+                state=CollectionState.UNAVAILABLE,
+            ),
         ),
     )
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, duplicate_report)
+    _publish(world, run, corpus)
+    gateway = _gateway()
 
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
+
+    payload = await world.store.read_json(cast(UUID, world.artifacts.items[-1].canonical_blob_id))
+    extraction = production_extraction_from_json(payload)
+    assert result["omitted_source_count"] == 1
+    assert [source.canonical_url for source in extraction.sources] == [CORE_A_URL]
+    assert [omission.canonical_url for omission in extraction.omitted_sources] == [UNAVAILABLE_URL]
+    assert all(request.web_search is False for request in gateway.calls)
+
+
+@pytest.mark.asyncio
+async def test_two_providers_produce_the_same_canonical_contract() -> None:
+    first_world, first_run, snapshot = _tiered_world()
+    second_world, second_run, second_snapshot = _tiered_world()
+
+    await _run_stage(first_world, first_run, snapshot=snapshot, gateway=_gateway())
+    await _run_stage(
+        second_world,
+        second_run,
+        snapshot=second_snapshot,
+        gateway=_MarkdownGateway({"ExampleRAT": _full_output(), "loader": _support_output()}),
+    )
+
+    first_payload = await first_world.store.read_json(
+        cast(UUID, first_world.artifacts.items[-1].canonical_blob_id)
+    )
+    second_payload = await second_world.store.read_json(
+        cast(UUID, second_world.artifacts.items[-1].canonical_blob_id)
+    )
+    first = production_extraction_from_json(first_payload)
+    second = production_extraction_from_json(second_payload)
+
+    assert _canonical_shape(first) == _canonical_shape(second)
+
+
+def _canonical_shape(extraction: ProductionExtractionV1) -> list[tuple[Any, ...]]:
+    """The provider-independent content of one extraction, without world UUIDs."""
+
+    return [
+        (
+            source.canonical_url,
+            source.profile,
+            tuple((fact.category, fact.value, fact.evidence_quote) for fact in source.facts),
+            tuple((event.text, event.event_date) for event in source.events),
+            tuple(
+                (item.artifact_type.value, item.value, item.indicator_status.value)
+                for item in source.indicators
+            ),
+            tuple((rule.rule_type.value, rule.body) for rule in source.rules),
+            source.uncertainties,
+        )
+        for source in extraction.sources
+    ]
+
+
+@pytest.mark.asyncio
+async def test_sha_mismatch_blocks_before_any_model_call() -> None:
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=snapshot.edition_id)
+    world = _World(run)
+    document_id, sha256 = _register_source(
+        world, subject_id=subject_id, url=CORE_A_URL, text=CORE_TEXT, corrupt=True
+    )
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_A_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=document_id,
+                sha256=sha256,
+            ),
+        ),
+    )
+    _publish(world, run, corpus)
+    gateway = _gateway()
+
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
 
     assert result["status"] == "needs_review"
-    assert result["error_code"] == "duplicate_reference_source_id"
+    assert result["error_code"] == "extraction_source_content_mismatch"
     assert gateway.calls == []
+    assert world.artifacts.stale == []
+    assert [
+        artifact
+        for artifact in world.artifacts.items
+        if artifact.stage is ProductionArtifactStage.EXTRACTION
+    ] == []
 
 
 @pytest.mark.asyncio
-async def test_q2_content_duplicates_share_one_model_call_and_complete_both_sources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _Q2Gateway(None)
-    orchestrator, run, diagnostics = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(2),
-        source_contents={"S1": b"ExampleRAT", "S2": b"ExampleRAT"},
-    )
-
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert result["status"] == "success", result
-    assert gateway.calls == ["S1"]
-    assert result["completed_source_ids"] == ["S1", "S2"]
-    assert result["model_calls"] == 1
-    assert result["model_calls_avoided"] == 1
-    duplicate_events = [
-        event for event in diagnostics.events if event.get("event") == "q2.source.content_duplicate"
-    ]
-    assert len(duplicate_events) == 1
-    assert duplicate_events[0]["source_id"] == "S2"
-    assert duplicate_events[0]["primary_source_id"] == "S1"
-    assert duplicate_events[0]["source_content_sha256"] == hashlib.sha256(b"ExampleRAT").hexdigest()
-
-
-@pytest.mark.parametrize("error_code", ["bridge_ui_timeout", "transport_glitch"])
-async def test_q2_retryable_source_failure_stops_before_s2_and_does_not_create_artifact(
-    monkeypatch: pytest.MonkeyPatch, error_code: str
-) -> None:
-    """A global retryable bridge failure must not become source coverage loss."""
-    gateway = _Q2Gateway(
-        BridgeTransportError(
-            error_code,
-            "transport failure",
-            retryable=True,
-            phase="pre_submission",
-            submission_state="pre_submission",
-        )
-    )
-    orchestrator, run, diagnostics = _q2_orchestrator(monkeypatch, gateway, _q2_report())
-
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert gateway.calls == ["S1"]
-    assert result["status"] == "transient_error"
-    assert result["error_code"] == error_code
-    assert result["error_code"] != "q2_source_coverage_failed"
-    assert result["failed_source_ids"] == ["S1"]
-    assert result["source_failures"]["S1"]["submission_state"] == "pre_submission"
-    assert result["source_failures"]["S1"]["phase"] == "pre_submission"
-    assert result["source_failures"]["S1"]["failure_class"] == "global_transient_pre_submission"
-    assert orchestrator._extraction.store_calls == []
-    failed_events = [
-        event for event in diagnostics.events if event.get("event") == "q2.source.failed"
-    ]
-    assert failed_events[0]["source_id"] == "S1"
-    assert failed_events[0]["model_run_id"]
-    assert failed_events[0]["retryable"] is True
-    assert isinstance(failed_events[0]["duration_ms"], int)
-    assert failed_events[0]["duration_ms"] >= 0
-
-
-class _PersistentQ2Adapter:
-    provider = ModelProvider.OPENAI
-    backend = ModelBackend.CHATGPT_BRIDGE
-    transport = ModelTransport.OPENAI_RESPONSES
-    capabilities = ModelCapabilities(web_search=True, background=True, conversation=True)
-    requested_model = "chatgpt-web-fake"
-    is_external = True
-
-    def __init__(
-        self,
-        *,
-        first_error_code: str = "bridge_ui_timeout",
-        first_submission_state: str | None = "pre_submission",
-    ) -> None:
-        self.first_error_code = first_error_code
-        self.first_submission_state = first_submission_state
-        self.calls: list[Any] = []
-
-    async def invoke(
-        self, request: Any, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del role, output_schema
-        self.calls.append(request)
-        if len(self.calls) == 1:
-            raise BridgeTransportError(
-                self.first_error_code,
-                "fake bridge failure",
-                retryable=True,
-                phase=(
-                    "pre_submission"
-                    if self.first_submission_state == "pre_submission"
-                    else "generation"
-                ),
-                submission_state=self.first_submission_state,
-            )
-        return AdapterResult(
-            status=AdapterResultStatus.COMPLETED,
-            provider=self.provider,
-            requested_model=self.requested_model,
-            actual_model_version=self.requested_model,
-            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            output_text=("FACT malware\n- ExampleRAT :: outil observe\n"),
-        )
-
-    async def resume(
-        self, response_id: str, *, role: ModelRole, output_schema: Any = None
-    ) -> AdapterResult:
-        del response_id, role, output_schema
-        raise AssertionError("not used")
-
-
-def _persistent_q2_gateway(
-    adapter: Any,
-) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=adapter,
-            openai_structured=adapter,
-            qwen=adapter,
-            fake=adapter,
-        ),
-        model_uow,
-        InMemoryModelOutputStore(),
-    )
-    return gateway, model_uow
-
-
-@pytest.mark.asyncio
-async def test_q2_pre_submission_retry_reuses_model_run_across_job_attempts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A persisted pre-submit failure is retried by the same Q2 checkpoint."""
-    adapter = _PersistentQ2Adapter()
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
-    s1_model_run_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-
-    first = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
-
-    assert first["status"] == "transient_error"
-    assert first["failed_source_ids"] == ["S1"]
-    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
-    first_run = model_uow.state[s1_model_run_id]
-    assert first_run.status is ModelRunStatus.FAILED
-    assert first_run.submission_state is ModelSubmissionState.NOT_SUBMITTED
-    assert first_run.submission_attempt == 1
-    assert adapter.calls[0].request_id == f"{s1_model_run_id}:a1"
-
-    second = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
-
-    assert second["status"] == "success"
-    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1", "S1", "S2"]
-    assert adapter.calls[1].request_id == f"{s1_model_run_id}:a2"
-    assert model_uow.state[s1_model_run_id].id == s1_model_run_id
-    assert model_uow.state[s1_model_run_id].status is ModelRunStatus.SUCCEEDED
-    assert model_uow.state[s1_model_run_id].submission_attempt == 2
-    assert "Failed ModelRun is not safe to resubmit" not in str(second)
-
-
-@pytest.mark.asyncio
-async def test_manual_extraction_retry_reuses_successful_batch_members_only(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    response = "\n\n".join(
-        f"{q2_batch_output_marker(f'B{index}')}\n"
-        + (f"IOC confirmed domain\n- retry-{index}.example" if index < 4 else "UNAVAILABLE")
-        for index in range(1, 5)
-    )
-    adapter = FakeModelAdapter(research_text=response)
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    output_store = InMemoryModelOutputStore()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=adapter,
-            openai_structured=adapter,
-            qwen=adapter,
-            fake=adapter,
-        ),
-        model_uow,
-        output_store,
-    )
-    orchestrator, run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(4),
-        model_run_state=model_uow.state,
-        source_contents={f"S{index}": f"archive-{index}".encode() for index in range(1, 5)},
-    )
-    snapshot = replace(_q2_snapshot(), core_sources=(), reuse_basis_hash="", input_hash="")
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert first["status"] == "success"
-    assert first["completed_source_ids"] == ["S1", "S2", "S3"]
-    assert first["skipped_source_ids"] == ["S4"]
-    assert len(adapter.calls) == 1
-
-    adapter._research_text = "UNAVAILABLE"
-    run.status = ProductionRunStatus.NEEDS_REVIEW
-    run.retry_from_stage(ProductionStage.EXTRACTION)
-
-    second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 3
-    assert second["model_calls"] == 1
-    assert second["light_batches"] == 0
-    assert len(adapter.calls) == 2
-    assert adapter.calls[-1].metadata["source_id"] == "S4"
-
-
-@pytest.mark.asyncio
-async def test_manual_extraction_retry_reuses_successful_full_source(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=adapter,
-            openai_structured=adapter,
-            qwen=adapter,
-            fake=adapter,
-        ),
-        model_uow,
-        InMemoryModelOutputStore(),
-    )
-    orchestrator, run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(1),
-        model_run_state=model_uow.state,
-    )
-    snapshot = _q2_snapshot()
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert first["status"] == "success"
-    run.status = ProductionRunStatus.NEEDS_REVIEW
-    run.retry_from_stage(ProductionStage.EXTRACTION)
-
-    second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 1
-    assert second["model_calls"] == 0
-    assert len(adapter.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_legacy_q2_model_run_is_recovered_without_provider_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=adapter,
-            openai_structured=adapter,
-            qwen=adapter,
-            fake=adapter,
-        ),
-        model_uow,
-        InMemoryModelOutputStore(),
-    )
-    orchestrator, run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(1),
-        model_run_state=model_uow.state,
-    )
-    snapshot = _q2_snapshot()
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-    assert first["status"] == "success", first
-    assert len(adapter.calls) == 1
-
-    model_run = next(iter(model_uow.state.values()))
-    model_run.parameters.pop("q2_checkpoint_keys", None)
-    model_run.parameters.pop("q2_execution_kind", None)
-
-    second = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["model_calls"] == 0
-    assert second["cache_hits"] == 1
-    assert len(adapter.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_q2_checkpoint_is_reused_by_another_production_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    report = _q2_report(1)
-    snapshot = _q2_snapshot()
-
-    first_orchestrator, first_run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        report,
-        model_run_state=model_uow.state,
-    )
-    first = await first_orchestrator._execute_direct_url_extraction(first_run, snapshot=snapshot)
-
-    second_orchestrator, second_run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        report,
-        model_run_state=model_uow.state,
-    )
-    second = await second_orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
-
-    assert first["status"] == "success", first
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 1
-    assert second["model_calls"] == 0
-    assert len(adapter.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_q2_checkpoint_reuse_excludes_stale_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    report = _q2_report(1)
-    snapshot = _q2_snapshot()
-
-    first_orchestrator, first_run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        report,
-        model_run_state=model_uow.state,
-    )
-    first = await first_orchestrator._execute_direct_url_extraction(first_run, snapshot=snapshot)
-    assert first["status"] == "success", first
-
-    stored_run = next(iter(model_uow.state.values()))
-    stored_run.updated_at = datetime.now(UTC) - timedelta(days=15)
-
-    second_orchestrator, second_run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        report,
-        model_run_state=model_uow.state,
-    )
-    second = await second_orchestrator._execute_direct_url_extraction(second_run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 0
-    assert second["model_calls"] == 1
-    assert len(adapter.calls) == 2
-
-
-@pytest.mark.asyncio
-async def test_q2_checkpoint_is_created_only_after_local_archive_gate(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = FakeModelAdapter(research_text="FACT malware\n- ExampleRAT\n")
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(1),
-        model_run_state=model_uow.state,
-    )
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert first["status"] == "success", first
-    model_run_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-    assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys")
-
-    orchestrator._blob_reader.contents.clear()  # type: ignore[attr-defined]
-    second = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert second["status"] == "needs_review", second
-    assert second["source_failures"]["S1"]["error_code"] == ("q2_source_evidence_unavailable")
-    assert model_uow.state[model_run_id].parameters.get("q2_checkpoint_keys") == []
-    assert len(adapter.calls) == 1
-
-
-@pytest.mark.asyncio
-async def test_archive_fallback_checkpoint_is_reused_on_idempotent_replay(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    archive_content = b"ExampleRAT " * 200
-    adapter = _ArchiveFallbackAdapter()
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(1),
-        model_run_state=model_uow.state,
-        source_contents={"S1": archive_content},
-    )
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-    second = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert first["status"] == "success", first
-    assert second["status"] == "success", second
-    assert len(adapter.calls) == 2
-    assert adapter.calls[0].web_search is True
-    assert adapter.calls[1].web_search is False
-    assert adapter.calls[1].metadata["access_mode"] == "archive_fallback"
-    assert second["cache_hits"] == 1
-    assert second["model_calls_avoided"] == 1
-    live_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-    archive_id = _q2_archive_fallback_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-        source_content_sha256=hashlib.sha256(archive_content).hexdigest(),
-        profile=production_workflow.ExtractionProfile.FULL,
-        requested_model="chatgpt-web-fake",
-    )
-    assert live_id in model_uow.state
-    assert archive_id in model_uow.state
-    assert live_id != archive_id
-
-
-@pytest.mark.asyncio
-async def test_archive_fallback_skips_short_archived_text_without_model_call(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = _ArchiveFallbackAdapter()
-    gateway, _ = _persistent_q2_gateway(adapter)
-    orchestrator, run, diagnostics = _q2_orchestrator(
-        monkeypatch,
-        gateway,
-        _q2_report(1),
-        source_contents={"S1": b"x" * 200},
-    )
-
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
-
-    assert result["status"] == "success", result
-    assert result["skipped_source_ids"] == ["S1"]
-    assert len(adapter.calls) == 1
-    assert adapter.calls[0].web_search is True
-    skipped_event = next(
-        event for event in diagnostics.events if event.get("event") == "q2.source.skipped"
-    )
-    assert skipped_event["archive_error_code"] == "archive_source_not_substantive"
-
-
-@pytest.mark.asyncio
-async def test_q2_submission_attempted_requires_reconciliation_and_stops(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = _PersistentQ2Adapter(first_submission_state="submission_attempted")
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
-
-    result = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
+async def test_submission_ambiguity_needs_review_without_replay() -> None:
+    world, run, snapshot = _tiered_world()
+    gateway = _gateway()
+    gateway.ambiguous = True
+
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
 
     assert result["status"] == "needs_review"
     assert result["error_code"] == "model_submission_reconciliation_required"
-    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
-    s1_model_run_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-    assert model_uow.state[s1_model_run_id].status is ModelRunStatus.NEEDS_REVIEW
-    assert model_uow.state[s1_model_run_id].error_code == (
-        "model_submission_reconciliation_required"
-    )
-    assert result["source_failures"]["S1"]["failure_class"] == "reconciliation_required"
+    assert len(gateway.calls) == 1
+    assert [
+        artifact
+        for artifact in world.artifacts.items
+        if artifact.stage is ProductionArtifactStage.EXTRACTION
+    ] == []
 
 
 @pytest.mark.asyncio
-async def test_q2_needs_review_preserves_active_signal_reason_and_never_calls_s2(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = _NeedsReviewQ2Adapter()
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+async def test_stage_fails_explicitly_without_the_canonical_dependencies() -> None:
+    world, run, snapshot = _tiered_world()
+    orchestrator = ProductionWorkflowOrchestrator(cast(Any, world.uow))
 
-    result = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
+    result = await orchestrator._execute_extraction_stage(run, None, snapshot)
 
-    model_run_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-    failure = result["source_failures"]["S1"]
-    assert result["status"] == "needs_review"
-    assert result["error_code"] == "active_signal_stalled"
-    assert result["error"] == "ChatGPT s'est arrêté sans produire de réponse finale."
-    assert result["details"]["failure_class"] == "control_invariant_failure"
-    assert failure["error_code"] == "active_signal_stalled"
-    assert failure["retryable"] is False
-    assert failure["submission_state"] == "post_submission"
-    assert failure["failure_class"] == "control_invariant_failure"
-    assert failure["details"]["reason"] == "active_signal_stalled"
-    assert "q2_provider_response_missing" not in str(result)
-    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1"]
-    assert model_uow.state[model_run_id].status is ModelRunStatus.NEEDS_REVIEW
-    assert model_uow.state[model_run_id].error_code == "active_signal_stalled"
+    assert result["status"] == "terminal_error"
+    assert result["error_code"] == "extraction_service_unavailable"
+    assert world.artifacts.stale == []
 
 
 @pytest.mark.asyncio
-async def test_q2_succeeded_empty_output_keeps_provider_response_guard(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _Q2Gateway(None, output_text="")
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+async def test_corpus_without_a_canonical_references_artifact_is_a_control_error() -> None:
+    world, run, snapshot = _tiered_world()
+    world.artifacts.current.clear()
 
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=_gateway())
 
     assert result["status"] == "needs_review"
-    assert result["error_code"] == "q2_provider_response_missing"
-    assert result["source_failures"]["S1"]["failure_class"] == ("control_invariant_failure")
-    assert gateway.calls == ["S1"]
+    assert result["error_code"] == "extraction_reference_corpus_missing"
 
 
 @pytest.mark.asyncio
-async def test_q2_bridge_unreachable_before_submit_is_retryable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    adapter = _PersistentQ2Adapter(
-        first_error_code="bridge_unreachable", first_submission_state=None
-    )
-    gateway, model_uow = _persistent_q2_gateway(adapter)
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(1))
-
-    first = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
-    model_run_id = _q2_source_model_run_id(
-        production_run_id=run.id,
-        pipeline_generation=run.pipeline_generation,
-        source_id="S1",
-        canonical_url="https://example.test/1",
-    )
-    assert model_uow.state[model_run_id].submission_state is ModelSubmissionState.NOT_SUBMITTED
-    second = await orchestrator.execute_stage(
-        run.id, ProductionStage.EXTRACTION, correlation_id="test"
-    )
-
-    assert first["status"] == "transient_error"
-    assert second["status"] == "success"
-    assert [call.metadata["source_id"] for call in adapter.calls] == ["S1", "S1"]
-    assert model_uow.state[model_run_id].status is ModelRunStatus.SUCCEEDED
-
-
-async def test_q2_nonretryable_source_failure_keeps_source_coverage_behavior(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    gateway = _Q2Gateway(
-        BridgeTransportError(
-            "source_content_invalid",
-            "source-specific response is unusable",
-            retryable=False,
-            phase="model_call",
-            submission_state="post_submission",
+async def test_identical_input_reuses_the_run_artifact_without_a_model_call() -> None:
+    world, run, snapshot = _tiered_world()
+    corpus_payload = await world.store.read_json(
+        cast(
+            UUID,
+            world.artifacts.current[
+                (run.id, ProductionArtifactStage.REFERENCES.value)
+            ].canonical_blob_id,
         )
     )
-    # The fake gateway fails only S1; S2 must still be requested and parsed.
-    original_execute = gateway.execute
+    from cti_app.application.production_references import production_reference_corpus_from_json
 
-    async def execute(request: ModelRequest, role: ModelRole) -> object:
-        if request.metadata["source_id"] != "S1":
-            gateway.failure = None
-        return await original_execute(request, role)
+    plan = build_extraction_plan(production_reference_corpus_from_json(corpus_payload))
+    existing = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=plan.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=world.store.put_json({"schema_version": 1}),
+    )
+    world.artifacts.current[(run.id, ProductionArtifactStage.EXTRACTION.value)] = existing
+    world.artifacts.items.append(existing)
+    gateway = _gateway()
 
-    gateway.execute = execute  # type: ignore[method-assign]
-    orchestrator, run, _ = _q2_orchestrator(monkeypatch, gateway, _q2_report(2))
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
 
-    result = await orchestrator._execute_direct_url_extraction(run, snapshot=_q2_snapshot())
+    assert result["status"] == "cached"
+    assert result["artifact_id"] == str(existing.id)
+    assert gateway.calls == []
 
-    assert gateway.calls == ["S1", "S2"]
-    assert result["status"] == "needs_review"
-    assert result["error_code"] == "q2_source_coverage_failed"
-    assert result["completed_source_ids"] == ["S2"]
-    assert result["failed_source_ids"] == ["S1"]
-    assert result["details"]["source_failures"]["S1"]["error_code"] == "source_content_invalid"
-    assert result["details"]["source_failures"]["S1"]["failure_class"] == ("source_content_failure")
-    assert orchestrator._extraction.store_calls == []
+
+@pytest.mark.asyncio
+async def test_same_content_under_two_urls_keeps_two_sources_with_one_call() -> None:
+    world, run, snapshot = _tiered_world()
+    gateway = _gateway()
+
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
+    payload = await world.store.read_json(cast(UUID, world.artifacts.items[-1].canonical_blob_id))
+    extraction = production_extraction_from_json(payload)
+    reuse_states = {source.canonical_url: source.reuse_state for source in extraction.sources}
+
+    # A and B carry the exact same bytes: one computation, two canonical sources.
+    assert reuse_states[CORE_A_URL] is ExtractionReuseState.FRESH
+    assert reuse_states[CORE_B_URL] is ExtractionReuseState.CONTENT_DUPLICATE
+    assert result["source_count"] == 3
+    # The duplicate bytes were computed once: only one request carried them.
+    assert sum("ExampleRAT was deployed" in call.text for call in gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_cross_run_reuse_hits_the_source_checkpoint_without_a_call() -> None:
+    first_world, first_run, snapshot = _tiered_world()
+    await _run_stage(first_world, first_run, snapshot=snapshot, gateway=_gateway())
+    second_run = ProductionRun(subject_id=first_run.subject_id, edition_id=snapshot.edition_id)
+    second_world = _World(second_run)
+    second_world.extractions = first_world.extractions
+    second_world.store = first_world.store
+    second_world.documents = first_world.documents
+    second_world.collections = first_world.collections
+    corpus_payload = await first_world.store.read_json(
+        cast(
+            UUID,
+            first_world.artifacts.current[
+                (first_run.id, ProductionArtifactStage.REFERENCES.value)
+            ].canonical_blob_id,
+        )
+    )
+    from cti_app.application.production_references import production_reference_corpus_from_json
+
+    _publish(second_world, second_run, production_reference_corpus_from_json(corpus_payload))
+    gateway = _gateway()
+
+    result = await _run_stage(second_world, second_run, snapshot=snapshot, gateway=gateway)
+
+    assert result["status"] == "success"
+    assert gateway.calls == []
+    payload = await second_world.store.read_json(
+        cast(UUID, second_world.artifacts.items[-1].canonical_blob_id)
+    )
+    extraction = production_extraction_from_json(payload)
+    assert all(
+        source.reuse_state in {ExtractionReuseState.REUSED, ExtractionReuseState.CONTENT_DUPLICATE}
+        for source in extraction.sources
+    )
+    reuse_states = {source.canonical_url: source.reuse_state for source in extraction.sources}
+    assert reuse_states[CORE_A_URL] is ExtractionReuseState.REUSED
+    assert reuse_states[SUPPORT_URL] is ExtractionReuseState.REUSED
+    assert isinstance(extraction, ProductionExtractionV1)

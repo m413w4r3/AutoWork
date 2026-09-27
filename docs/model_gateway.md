@@ -85,6 +85,36 @@ actuels. L'artifact canonique reste `ProductionReferenceCorpusV1`; une réutilis
 est fondée sur le hash fonctionnel d'entrée, indépendamment de l'identité d'exécution. Le run de
 modèle et ses identifiants de reprise restent dans leurs propres enregistrements de traçabilité.
 
+### EXTRACTION archive-only et provider-agnostic
+
+`EXTRACTION` ne collecte rien : il lit exclusivement les documents archivés référencés par
+`ProductionReferenceCorpusV1` et envoie au modèle le contenu extrait de l'archive, jamais
+l'instruction de rouvrir une URL. Le stage appelle `ModelGateway.extract(request, schema)` et
+décrit seulement la capacité demandée : profil (`FULL`/`IOC_RULES`), TLP, `external_llm_allowed`,
+`do_not_submit`, sensibilité, taille et `web_search=false`. Le domaine ne contient aucune branche
+`provider == ...`, aucun nom de modèle et aucune URL de fournisseur : le `ModelRouter` choisit
+l'adaptateur autorisé, et le même scénario fonctionnel produit le même contrat canonique
+`ProductionExtractionV1` derrière deux adaptateurs différents.
+
+Une source interdite à un provider externe ne lui est jamais soumise « pour terminer le lot » :
+le router utilise un provider autorisé ou l'extraction de cette source échoue localement. Pour une
+source `CORE`, cet échec bloque la progression vers Synthesis tant qu'aucune extraction conforme
+n'existe ; pour `SUPPORTING`/`TECHNICAL`, il devient une omission contrôlée avec warning.
+
+La sortie d'un modèle reste une proposition source-local. Le contrat canonique n'est construit
+qu'après parsing, validation de schéma, vérification contre l'archive exacte (SHA-256 puis preuve
+locale), attribution déterministe de provenance et agrégation. Le modèle ne fournit jamais
+`source_document_id`, `subject_id`, `production_run_id`, `checkpoint_id`, `model_run_id`, ni
+provenance interne : ces identités sont attachées par AutoWork.
+
+Classification des erreurs : une connexion impossible avant envoi reste retryable ; un timeout
+après envoi ou une réponse non réconciliée devient `NEEDS_REVIEW` avec identité de réconciliation
+et sans replay automatique ; une réponse incompatible ou une preuve locale absente est un échec
+source-local ; un SHA divergent du corpus est une erreur d'intégrité explicite, sans fallback Web.
+Les versions `model_policy_version` et `routing_policy_version` font partie de l'identité
+fonctionnelle des checkpoints `source_extractions` : une politique différente crée un nouveau
+checkpoint au lieu de réutiliser silencieusement l'ancien.
+
 ## Responses API et bridge ChatGPT
 
 Les adaptateurs construisent une requête Responses standard. `ChatGPTBridgeClient`, qui hérite

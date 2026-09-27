@@ -1,41 +1,247 @@
+"""AW-011 extraction policy: tier-driven profiles and the architecture cutover.
+
+The tier of the frozen ``ProductionReferenceCorpusV1`` is the only authority
+for FULL vs IOC_RULES. These tests lock that policy and the architecture guard
+that keeps the canonical extraction module free of the retired REFERENCES
+wire-format dependencies.
+"""
+
 from __future__ import annotations
 
+import ast
 import hashlib
+import inspect
+import re
 from dataclasses import replace
 from datetime import date, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application import production_workflow
-from cti_app.application.model_gateway import ModelGateway, ModelRouter
+from cti_app.application import production_extraction, production_workflow
+from cti_app.application.production_extraction import (
+    build_extraction_plan,
+    extraction_profile_for_tier,
+)
 from cti_app.application.production_parsers import (
     ParsedSource,
-    Q2ArtifactProposal,
-    Q2FactProposal,
-    Q2SourceOutput,
-    ReferenceReport,
-    project_q2_source_output,
-)
-from cti_app.application.production_references import load_reference_projection
-from cti_app.application.production_workflow import (
-    _enforce_q2_profile,
-    plan_q2_extraction_profiles,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ExtractionProfile,
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionRun,
-    ProductionStage,
     SourceExtraction,
     SourceExtractionStatus,
 )
-from cti_app.integrations.models import FakeModelAdapter, InMemoryModelOutputStore
-from tests.model_support import InMemoryModelRunUnitOfWorkFactory
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+    is_eligible_for_extraction,
+)
+
+CANONICAL_MODULE = Path(production_extraction.__file__)
+
+
+def _record(
+    url: str,
+    *,
+    tier: ProductionReferenceTier,
+    role: SourceRole,
+    document_id: UUID | None,
+    sha256: str | None,
+    state: CollectionState = CollectionState.ARCHIVED,
+) -> ProductionReferenceSourceV1:
+    return ProductionReferenceSourceV1(
+        canonical_url=url,
+        tier=tier,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=role,
+        title=f"Archived {url}",
+        publisher="Publisher",
+        published_at=date(2026, 7, 10),
+        source_collection_id=None,
+        source_document_id=document_id,
+        discovery_candidate_ids=(),
+        collection_state=state,
+        content_sha256=sha256,
+        relevance_reason=None,
+        proposed_by_model=False,
+        eligible_for_extraction=is_eligible_for_extraction(
+            collection_state=state,
+            source_document_id=document_id,
+            content_sha256=sha256,
+        ),
+    )
+
+
+def _corpus(*sources: ProductionReferenceSourceV1) -> ProductionReferenceCorpusV1:
+    return ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=uuid4(),
+        research_date=date(2026, 8, 1),
+        production_input_hash="a" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=sources,
+        warnings=(),
+    )
+
+
+TIER_POLICY = (
+    (ProductionReferenceTier.CORE, SourceRole.PRIMARY, ExtractionProfile.FULL),
+    (ProductionReferenceTier.CORE, SourceRole.INDEPENDENT, ExtractionProfile.FULL),
+    (ProductionReferenceTier.CORE, SourceRole.RELAY, ExtractionProfile.FULL),
+    (ProductionReferenceTier.CORE, SourceRole.AGGREGATOR, ExtractionProfile.FULL),
+    (ProductionReferenceTier.CORE, SourceRole.UNKNOWN, ExtractionProfile.FULL),
+    (ProductionReferenceTier.SUPPORTING, SourceRole.PRIMARY, ExtractionProfile.IOC_RULES),
+    (ProductionReferenceTier.SUPPORTING, SourceRole.INDEPENDENT, ExtractionProfile.IOC_RULES),
+    (ProductionReferenceTier.TECHNICAL, SourceRole.PRIMARY, ExtractionProfile.IOC_RULES),
+    (ProductionReferenceTier.TECHNICAL, SourceRole.UNKNOWN, ExtractionProfile.IOC_RULES),
+)
+
+
+@pytest.mark.parametrize(("tier", "role", "expected"), TIER_POLICY)
+def test_profile_is_decided_by_tier_never_by_role(
+    tier: ProductionReferenceTier,
+    role: SourceRole,
+    expected: ExtractionProfile,
+) -> None:
+    assert extraction_profile_for_tier(tier) is expected
+
+    corpus = _corpus(
+        _record(
+            "https://example.test/declared-core",
+            tier=ProductionReferenceTier.CORE,
+            role=SourceRole.PRIMARY,
+            document_id=uuid4(),
+            sha256="c" * 64,
+        ),
+        _record(
+            f"https://example.test/{tier.value}-{role.value}",
+            tier=tier,
+            role=role,
+            document_id=uuid4(),
+            sha256="b" * 64,
+        ),
+    )
+    plan = build_extraction_plan(corpus)
+
+    profiles = {source.canonical_url: source.profile for source in plan.sources}
+
+    assert profiles[f"https://example.test/{tier.value}-{role.value}"] is expected
+
+
+def test_policy_version_participates_in_the_plan() -> None:
+    corpus = _corpus(
+        _record(
+            "https://example.test/core",
+            tier=ProductionReferenceTier.CORE,
+            role=SourceRole.PRIMARY,
+            document_id=uuid4(),
+            sha256="b" * 64,
+        )
+    )
+
+    plan = build_extraction_plan(corpus)
+
+    assert plan.profile_policy_version == "production-reference-tier-v1"
+
+
+def test_ineligible_source_never_reaches_the_plan() -> None:
+    corpus = _corpus(
+        _record(
+            "https://example.test/core",
+            tier=ProductionReferenceTier.CORE,
+            role=SourceRole.PRIMARY,
+            document_id=uuid4(),
+            sha256="b" * 64,
+        ),
+        _record(
+            "https://example.test/unavailable",
+            tier=ProductionReferenceTier.SUPPORTING,
+            role=SourceRole.PRIMARY,
+            document_id=None,
+            sha256=None,
+            state=CollectionState.UNAVAILABLE,
+        ),
+    )
+
+    plan = build_extraction_plan(corpus)
+
+    assert [source.canonical_url for source in plan.sources] == ["https://example.test/core"]
+    assert [omission.reason.value for omission in plan.omitted_sources] == [
+        "reference_not_eligible"
+    ]
+    assert plan.omitted_sources[0].canonical_url == "https://example.test/unavailable"
+    assert plan.omitted_sources[0].tier is ProductionReferenceTier.SUPPORTING
+    assert plan.omitted_sources[0].collection_state is CollectionState.UNAVAILABLE
+
+
+# --- architecture guards ----------------------------------------------------
+
+
+def _canonical_source() -> str:
+    return CANONICAL_MODULE.read_text(encoding="utf-8")
+
+
+def test_canonical_module_has_no_legacy_references_dependency() -> None:
+    source = _canonical_source()
+    imported: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            imported.update(alias.asname or alias.name for alias in node.names)
+    forbidden = {
+        "ReferenceReport",
+        "ParsedSource",
+        "parse_reference_report",
+        "load_reference_projection",
+    }
+
+    assert imported.isdisjoint(forbidden)
+    for name in forbidden:
+        assert re.search(rf"\b{name}\b", source) is None
+
+
+def test_canonical_module_never_decides_the_profile_from_source_role() -> None:
+    source = _canonical_source()
+
+    # No role-keyed FULL decision may exist: the tier is the only authority.
+    assert re.search(r"SourceRole\.PRIMARY\s*(?:is|==)\s*", source) is None
+    assert re.search(r"role\s*(?:is|==)\s*SourceRole\.PRIMARY", source) is None
+    assert "extraction_profile_for_tier" in source
+
+
+def test_live_extraction_stage_no_longer_calls_the_legacy_planner() -> None:
+    stage = inspect.getsource(
+        production_workflow.ProductionWorkflowOrchestrator._execute_extraction_stage
+    )
+
+    assert "plan_q2_extraction_profiles" not in stage
+    assert "_execute_direct_url_extraction" not in stage
+    assert "load_reference_projection" not in stage
+    assert "_canonical_extraction" in stage
+    assert "service.execute" in stage
+
+
+def test_canonical_service_contract_helpers_exist() -> None:
+    assert callable(production_extraction.production_extraction_metadata)
+    assert production_extraction.source_text_contract_version().startswith(
+        production_extraction.SOURCE_TEXT_CONTRACT_VERSION
+    )
+
+
+# --- legacy Q2 harness shared with test_production_q2_batch and
+# test_production_q2_source_gate --------------------------------------
+# These helpers drive the retired live-URL Q2 path directly; they are kept
+# because those suites still exercise it in isolation.
 
 
 def _source(url: str, published_at: date | None) -> ParsedSource:
@@ -87,174 +293,6 @@ def _snapshot(core_sources: tuple[ProductionInputSource, ...]) -> ProductionInpu
         core_sources=core_sources,
         captured_at=datetime.now().astimezone(),
     )
-
-
-def test_policy_assigns_full_only_to_frozen_core_sources() -> None:
-    core_urls = ["https://example.test/core-1", "https://example.test/core-2"]
-    support_urls = [f"https://example.test/support-{index}" for index in range(1, 8)]
-    report = ReferenceReport(
-        sources=tuple(
-            [_source(core_urls[0], date(2026, 7, 10)), _source(core_urls[1], date(2026, 7, 11))]
-            + [_source(url, date(2026, 7, 12 + index)) for index, url in enumerate(support_urls)]
-        ),
-        events=(),
-    )
-    snapshot = _snapshot(
-        (
-            _input_source(core_urls[0], date(2026, 7, 10)),
-            _input_source(core_urls[1], date(2026, 7, 11)),
-        )
-    )
-
-    plans = plan_q2_extraction_profiles(report, snapshot=snapshot)
-
-    assert all(
-        plan.profile is ExtractionProfile.FULL for plan in plans if plan.canonical_url in core_urls
-    )
-    assert all(
-        plan.profile is ExtractionProfile.IOC_RULES
-        for plan in plans
-        if plan.canonical_url not in core_urls
-    )
-    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == len(core_urls)
-
-
-def test_large_corpus_never_falls_back_to_all_full() -> None:
-    core_url = "https://example.test/core"
-    support_urls = [f"https://example.test/support-{index}" for index in range(100)]
-    report = ReferenceReport(
-        sources=tuple(
-            [_source(core_url, date(2026, 7, 10))]
-            + [_source(url, date(2026, 7, 11)) for url in support_urls]
-        ),
-        events=(),
-    )
-
-    plans = plan_q2_extraction_profiles(
-        report,
-        snapshot=_snapshot((_input_source(core_url, date(2026, 7, 10)),)),
-    )
-
-    assert sum(plan.profile is ExtractionProfile.FULL for plan in plans) == 1
-    assert sum(plan.profile is ExtractionProfile.IOC_RULES for plan in plans) == 100
-
-
-def test_missing_snapshot_fails_q2_planning_instead_of_selecting_all_full() -> None:
-    report = ReferenceReport(
-        sources=(_source("https://example.test/source", date(2026, 7, 10)),),
-        events=(),
-    )
-
-    with pytest.raises(ValueError, match="q2_extraction_plan_missing_snapshot"):
-        plan_q2_extraction_profiles(report)
-
-
-def test_policy_sends_old_and_undated_supporting_to_ioc_rules() -> None:
-    report = ReferenceReport(
-        sources=(
-            _source("https://example.test/core", date(2026, 7, 10)),
-            _source("https://example.test/old", date(2025, 1, 1)),
-            _source("https://example.test/undated", None),
-        ),
-        events=(),
-    )
-    plans = plan_q2_extraction_profiles(
-        report,
-        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
-    )
-
-    assert plans[1].profile is ExtractionProfile.IOC_RULES
-    assert plans[2].profile is ExtractionProfile.IOC_RULES
-    assert plans[1].reason == "supporting_source"
-    assert plans[2].reason == "supporting_source"
-
-
-def test_policy_keeps_dated_supporting_sources_on_ioc_rules() -> None:
-    urls = [
-        "https://example.test/z",
-        "https://example.test/a",
-        "https://example.test/b",
-        "https://example.test/c",
-    ]
-    report = ReferenceReport(
-        sources=tuple(
-            [_source("https://example.test/core", date(2026, 7, 10))]
-            + [_source(url, date(2026, 7, 10)) for url in urls]
-        ),
-        events=(),
-    )
-    plans = plan_q2_extraction_profiles(
-        report,
-        snapshot=_snapshot((_input_source("https://example.test/core", date(2026, 7, 10)),)),
-    )
-
-    assert plans[0].profile is ExtractionProfile.FULL
-    assert all(plan.profile is ExtractionProfile.IOC_RULES for plan in plans[1:])
-
-
-def test_full_output_projection_for_ioc_rules_drops_narrative_facts() -> None:
-    output = Q2SourceOutput(
-        facts=[
-            Q2FactProposal(
-                category="malware",
-                value="ExampleRAT",
-                context="narrative",
-                evidence_quote="ExampleRAT appears",
-            ),
-            Q2FactProposal(
-                category="files",
-                value="dropper.exe",
-                context="IOC file",
-                evidence_quote="dropper.exe is listed",
-            ),
-        ],
-        artifacts=[
-            Q2ArtifactProposal(
-                artifact_type="domain",
-                value="c2.example.org",
-                indicator_status="confirmed_ioc",
-                context="C2",
-                evidence_quote="c2.example.org",
-            )
-        ],
-    )
-
-    projected = project_q2_source_output(output, ExtractionProfile.IOC_RULES)
-
-    assert [fact.category for fact in projected.facts] == ["files"]
-    assert len(projected.artifacts) == 1
-
-
-def test_enforce_q2_profile_drops_all_ioc_rules_facts_and_preserves_full() -> None:
-    output = Q2SourceOutput(
-        facts=[
-            Q2FactProposal(
-                category="actors",
-                value="Should not survive",
-                context="narrative",
-                evidence_quote="Should not survive",
-            )
-        ],
-        artifacts=[
-            Q2ArtifactProposal(
-                artifact_type="domain",
-                value="evil.example",
-                indicator_status="confirmed_ioc",
-            )
-        ],
-        uncertainties=["uncertain"],
-    )
-
-    enforced, warnings = _enforce_q2_profile(output, ExtractionProfile.IOC_RULES)
-    assert enforced.facts == []
-    assert enforced.artifacts == output.artifacts
-    assert enforced.rules == output.rules
-    assert enforced.uncertainties == output.uncertainties
-    assert warnings == ("q2_ioc_rules_fact_dropped",)
-
-    full, full_warnings = _enforce_q2_profile(output, ExtractionProfile.FULL)
-    assert full is output
-    assert full_warnings == ()
 
 
 class _CacheRepository:
@@ -541,544 +579,3 @@ def _cached_orchestrator(
         production_context,
     )
     return orchestrator
-
-
-def _individual_setup(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    url: str,
-    archived_text: bytes,
-    gateway: object,
-    published_at: date = date(2026, 7, 10),
-) -> tuple[
-    production_workflow.ProductionWorkflowOrchestrator,
-    ProductionRun,
-    _CacheState,
-    _ExtractionSink,
-]:
-    """One archived Q1 source analysed through the individual Q2 path."""
-    subject = uuid4()
-    blobs = _ArchivedBlobs()
-    document = _archived_document(
-        subject_id=subject,
-        url=url,
-        content=archived_text,
-        blobs=blobs,
-    )
-    state = _CacheState({document.id: document}, {uuid4(): _collection_for(document, url)})
-    sink = _ExtractionSink()
-    orchestrator = _cached_orchestrator(
-        state,
-        gateway,  # type: ignore[arg-type]
-        _CacheStore(),
-        sink,
-        monkeypatch,
-        blobs,
-    )
-
-    async def load_report(*args: object) -> ReferenceReport:
-        del args
-        return ReferenceReport(sources=(_source(url, published_at),), events=())
-
-    orchestrator._load_reference_report = load_report
-    run = ProductionRun(
-        subject_id=subject,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[run.id] = run
-    return orchestrator, run, state, sink
-
-
-def _multi_individual_setup(
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    urls: list[str],
-    gateway: _CacheGateway,
-) -> tuple[
-    production_workflow.ProductionWorkflowOrchestrator,
-    ProductionRun,
-    _CacheState,
-]:
-    subject = uuid4()
-    blobs = _ArchivedBlobs()
-    documents: dict[UUID, SimpleNamespace] = {}
-    collections: dict[UUID, SimpleNamespace] = {}
-    for index, url in enumerate(urls, start=1):
-        document = _archived_document(
-            subject_id=subject,
-            url=url,
-            content=f"ARCHIVED BODY S{index} c2.example.org".encode(),
-            blobs=blobs,
-        )
-        documents[document.id] = document
-        collections[uuid4()] = _collection_for(document, url)
-
-    state = _CacheState(documents, collections)
-    state._report_sources = [_source(url, date(2026, 7, 10)) for url in urls]
-    orchestrator = _cached_orchestrator(
-        state,
-        gateway,
-        _CacheStore(),
-        _ExtractionSink(),
-        monkeypatch,
-        blobs,
-    )
-
-    async def load_report(*args: object) -> ReferenceReport:
-        del args
-        return ReferenceReport(sources=tuple(state._report_sources), events=())
-
-    orchestrator._load_reference_report = load_report
-    run = ProductionRun(
-        subject_id=subject,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[run.id] = run
-    return orchestrator, run, state
-
-
-@pytest.mark.asyncio
-async def test_individual_request_carries_the_exact_url_and_never_the_archive(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    url = "https://example.test/live"
-    gateway = _CacheGateway()
-    orchestrator, run, state, _ = _individual_setup(
-        monkeypatch,
-        url=url,
-        archived_text=b"ARCHIVED BODY that Q2 must never be handed",
-        gateway=gateway,
-    )
-
-    result = await orchestrator._execute_direct_url_extraction(
-        run, snapshot=_snapshot((_input_source(url, date(2026, 7, 10)),))
-    )
-
-    assert result["status"] == "success", result
-    prompt = gateway.prompts[0]
-    assert url in prompt
-    assert "ARCHIVED BODY" not in prompt
-    assert "<ARCHIVED_SOURCE>" not in prompt
-    assert "@@Q2IN" not in prompt
-    for expected in ("tables", "code blocks", "images/screenshots"):
-        assert expected in prompt
-    request = gateway.requests[0]
-    assert request.web_search is True
-    assert request.routing_hint is production_workflow.ModelRoutingHint.WEB_RESEARCH
-    assert "source_content_sha256" not in request.metadata
-    # The validated live response is now a reusable source checkpoint. The
-    # archive remains local evidence only; its body never entered the prompt.
-    assert len(state.extractions.rows) == 1
-    assert state.extractions.lookups == 1
-
-
-@pytest.mark.asyncio
-async def test_ioc_missing_from_the_archive_is_filtered_after_live_extraction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The archived text is not a complete representation of the publication."""
-    url = "https://example.test/screenshot-report"
-    gateway = _CacheGateway("IOC confirmed domain\n- visual-ioc.security-lab.io\n")
-    orchestrator, run, _state, sink = _individual_setup(
-        monkeypatch,
-        url=url,
-        archived_text=b"This report contains indicators in the screenshot below.",
-        gateway=gateway,
-        published_at=date(2025, 1, 1),
-    )
-
-    result = await orchestrator._execute_direct_url_extraction(
-        run,
-        snapshot=_snapshot((_input_source("https://example.test/other", date(2026, 7, 10)),)),
-    )
-
-    assert result["status"] == "success", result
-    canonical = sink.calls[-1]["canonical_json"]
-    assert canonical["items"] == []
-
-
-@pytest.mark.asyncio
-async def test_individual_ioc_rules_drops_facts_before_canonical_extraction(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    url = "https://example.test/ioc-rules"
-    gateway = _CacheGateway(
-        "FACT actors\n- Should not survive\nIOC confirmed domain\n- evil.security-lab.io\n"
-    )
-    orchestrator, run, _state, sink = _individual_setup(
-        monkeypatch,
-        url=url,
-        archived_text=b"ARCHIVED BODY",
-        gateway=gateway,
-        published_at=date(2025, 1, 1),
-    )
-
-    result = await orchestrator._execute_direct_url_extraction(
-        run,
-        snapshot=_snapshot((_input_source("https://example.test/other", date(2026, 7, 10)),)),
-    )
-
-    assert result["status"] == "success", result
-    canonical = sink.calls[-1]["canonical_json"]
-    assert canonical["items"] == []
-    warnings = sink.calls[-1]["warnings"]
-    assert isinstance(warnings, list)
-    assert warnings.count("q2_ioc_rules_fact_dropped") == 1
-
-
-@pytest.mark.asyncio
-async def test_retry_and_new_run_reuse_the_unchanged_source_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    url = "https://example.test/idempotent"
-    adapter = FakeModelAdapter(research_text="IOC confirmed domain\n- c2.example.org\n")
-    model_uow = InMemoryModelRunUnitOfWorkFactory()
-    gateway = ModelGateway(
-        ModelRouter(
-            openai_research=adapter,
-            openai_structured=adapter,
-            qwen=adapter,
-            fake=adapter,
-        ),
-        model_uow,
-        InMemoryModelOutputStore(),
-    )
-    orchestrator, run, state, _ = _individual_setup(
-        monkeypatch,
-        url=url,
-        archived_text=b"ARCHIVED BODY",
-        gateway=gateway,
-    )
-    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
-
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-    retry = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-
-    assert first["status"] == "success", first
-    assert retry["status"] == "success", retry
-    assert len(adapter.calls) == 1
-    assert len(model_uow.state) == 1
-    assert retry["model_calls"] == 0
-
-    # A new production run with the same archived capture reuses the same
-    # source checkpoint too; a changed decoded SHA is what authorizes a read.
-    next_run = ProductionRun(
-        subject_id=run.subject_id,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[next_run.id] = next_run
-    third = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
-
-    assert third["status"] == "success", third
-    assert len(adapter.calls) == 1
-    assert len(model_uow.state) == 1
-    assert len(state.extractions.rows) == 1
-
-
-@pytest.mark.asyncio
-async def test_changed_source_hash_is_a_q2_miss_with_explainable_events(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    url = "https://example.test/changed"
-    gateway = _CacheGateway()
-    orchestrator, run, state, _sink = _individual_setup(
-        monkeypatch,
-        url=url,
-        archived_text=b"ARCHIVED BODY c2.example.org v1",
-        gateway=gateway,
-    )
-    snapshot = _snapshot((_input_source(url, date(2026, 7, 10)),))
-    first = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-    assert first["status"] == "success", first
-
-    document = next(iter(state._docs_by_id.values()))
-    collection = next(iter(state._collections_by_id.values()))
-    blob_reader = orchestrator._blob_reader
-    assert isinstance(blob_reader, _ArchivedBlobs)
-    blob_id, digest = blob_reader.add(b"ARCHIVED BODY c2.example.org v2")
-    document.decoded_blob_id = blob_id
-    document.decoded_sha256 = digest
-    collection.decoded_blob_id = blob_id
-
-    next_run = ProductionRun(
-        subject_id=run.subject_id,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[next_run.id] = next_run
-    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert len(gateway.calls) == 2
-    reuse = [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.reuse_evaluated" and event.get("run_id") == next_run.id
-    ]
-    assert len(reuse) == 1
-    assert reuse[0]["status"] == "miss"
-    assert reuse[0]["reason"] == "source_content_changed"
-    started = [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
-    ]
-    assert len(started) == 1
-
-
-@pytest.mark.asyncio
-async def test_five_source_rebuild_reuses_unchanged_q2_and_calls_once_for_s6(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    urls = [f"https://example.test/s{index}" for index in range(1, 7)]
-    gateway = _CacheGateway()
-    orchestrator, run, state = _multi_individual_setup(
-        monkeypatch,
-        urls=urls[:5],
-        gateway=gateway,
-    )
-    snapshot = _snapshot(tuple(_input_source(url, date(2026, 7, 10)) for url in urls[:5]))
-
-    initial = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-    assert initial["status"] == "success", initial
-    assert len(gateway.calls) == 5
-
-    # S6 is archived after the initial extraction. Its supporting-source
-    # profile still uses one individual call when it is the only uncached IOC
-    # source in the rebuild.
-    s6 = _archived_document(
-        subject_id=run.subject_id,
-        url=urls[5],
-        content=b"ARCHIVED BODY S6 c2.example.org",
-        blobs=orchestrator._blob_reader,
-    )
-    assert isinstance(orchestrator._blob_reader, _ArchivedBlobs)
-    state._docs_by_id[s6.id] = s6
-    state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
-    state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
-
-    next_run = ProductionRun(
-        subject_id=run.subject_id,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[next_run.id] = next_run
-    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 5
-    assert second["model_calls"] == 1
-    assert len(gateway.calls) == 6
-
-    evaluated = [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.reuse_evaluated" and event.get("run_id") == next_run.id
-    ]
-    # S6 is first checked against the IOC batch checkpoint and then against
-    # the individual checkpoint because it is the only remaining IOC source.
-    assert len(evaluated) == 7
-    assert sum(event["status"] == "hit" for event in evaluated) == 5
-    assert sum(event["status"] == "miss" for event in evaluated) == 2
-    started = [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
-    ]
-    assert len(started) == 1
-    assert started[0]["source_url"] == urls[5]
-    assert not [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q4.started" and event.get("run_id") == next_run.id
-    ]
-
-
-@pytest.mark.asyncio
-async def test_changed_s3_plus_new_s6_only_call_two_q2_sources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    urls = [f"https://example.test/s{index}" for index in range(1, 7)]
-    gateway = _CacheGateway()
-    orchestrator, run, state = _multi_individual_setup(
-        monkeypatch,
-        urls=urls[:5],
-        gateway=gateway,
-    )
-    snapshot = _snapshot(tuple(_input_source(url, date(2026, 7, 10)) for url in urls[:5]))
-    initial = await orchestrator._execute_direct_url_extraction(run, snapshot=snapshot)
-    assert initial["status"] == "success", initial
-    assert len(gateway.calls) == 5
-
-    document = next(
-        document for document in state._docs_by_id.values() if document.final_url == urls[2]
-    )
-    assert isinstance(orchestrator._blob_reader, _ArchivedBlobs)
-    blob_id, digest = orchestrator._blob_reader.add(b"ARCHIVED BODY S3 c2.example.org changed")
-    document.decoded_blob_id = blob_id
-    document.decoded_sha256 = digest
-    next_collection = next(
-        collection
-        for collection in state._collections_by_id.values()
-        if collection.canonical_url == urls[2]
-    )
-    next_collection.decoded_blob_id = blob_id
-
-    s6 = _archived_document(
-        subject_id=run.subject_id,
-        url=urls[5],
-        content=b"ARCHIVED BODY S6 c2.example.org",
-        blobs=orchestrator._blob_reader,
-    )
-    state._docs_by_id[s6.id] = s6
-    state._collections_by_id[uuid4()] = _collection_for(s6, urls[5])
-    state._report_sources.append(_source(urls[5], date(2026, 7, 10)))
-    next_run = ProductionRun(
-        subject_id=run.subject_id,
-        edition_id=uuid4(),
-        current_stage=ProductionStage.EXTRACTION,
-    )
-    state._runs[next_run.id] = next_run
-    second = await orchestrator._execute_direct_url_extraction(next_run, snapshot=snapshot)
-
-    assert second["status"] == "success", second
-    assert second["cache_hits"] == 4
-    assert second["model_calls"] == 2
-    assert len(gateway.calls) == 7
-    started = [
-        event
-        for event in orchestrator._diagnostics.events
-        if event.get("event") == "q2.source.started" and event.get("run_id") == next_run.id
-    ]
-    assert {event["source_url"] for event in started} == {urls[2], urls[5]}
-
-
-class _ProjectionStore:
-    """A store serving one canonical corpus payload and one RAW answer."""
-
-    def __init__(self, *, canonical: dict[str, object], raw: str) -> None:
-        self.canonical = canonical
-        self.raw = raw
-
-    async def read_json(self, blob_id: UUID) -> dict[str, object]:
-        del blob_id
-        return self.canonical
-
-    async def read_text(self, blob_id: UUID) -> str:
-        del blob_id
-        return self.raw
-
-
-_LEGACY_RAW = """# REFERENCES
-editorial-title: Legacy title
-
-## SOURCE S1
-
-title: Kept
-url: https://example.test/kept
-publisher: Publisher
-published-at: 2026-07-10
-role: independent
-
-## SOURCE S2
-
-title: Unavailable
-url: https://example.test/unavailable
-publisher: Publisher
-published-at: 2026-07-11
-role: independent
-
-## EVENT R1
-
-date: 2026-07-12
-sources: S1
-text: Kept event
-
-## EVENT R2
-
-date: 2026-07-13
-sources: S2
-text: Unavailable event
-
-# UNCERTAINTIES
-- none
-"""
-
-
-@pytest.mark.asyncio
-async def test_q2_legacy_projection_keeps_only_extractable_corpus_sources() -> None:
-    corpus_payload = {
-        "schema_version": 1,
-        "subject_id": str(uuid4()),
-        "research_date": "2026-08-01",
-        "production_input_hash": "a" * 64,
-        "research_status": "completed",
-        "sources": [
-            {
-                "canonical_url": "https://example.test/kept",
-                "tier": "core",
-                "kind": "publication",
-                "role": "primary",
-                "title": "Kept",
-                "publisher": "Publisher",
-                "published_at": "2026-07-10",
-                "source_collection_id": str(uuid4()),
-                "source_document_id": str(uuid4()),
-                "discovery_candidate_ids": [],
-                "collection_state": "archived",
-                "content_sha256": "b" * 64,
-                "relevance_reason": None,
-                "proposed_by_model": False,
-                "eligible_for_extraction": True,
-            },
-            {
-                "canonical_url": "https://example.test/unavailable",
-                "tier": "supporting",
-                "kind": "publication",
-                "role": "independent",
-                "title": "Unavailable",
-                "publisher": "Publisher",
-                "published_at": "2026-07-11",
-                "source_collection_id": None,
-                "source_document_id": None,
-                "discovery_candidate_ids": [],
-                "collection_state": "unavailable",
-                "content_sha256": None,
-                "relevance_reason": "Additional coverage",
-                "proposed_by_model": True,
-                "eligible_for_extraction": False,
-            },
-        ],
-        "warnings": ["supporting_source_unavailable:https://example.test/unavailable"],
-    }
-    store = _ProjectionStore(canonical=corpus_payload, raw=_LEGACY_RAW)
-    artifact = SimpleNamespace(canonical_blob_id=uuid4(), raw_blob_id=uuid4())
-
-    report = await load_reference_projection(store, artifact)
-
-    assert report is not None
-    assert [source.canonical_url for source in report.sources] == ["https://example.test/kept"]
-    assert report.editorial_title == "Legacy title"
-    assert [event.local_id for event in report.events] == ["R1"]
-    assert report.uncertainties
-
-    # A V4-style legacy payload is never upgraded or reshaped.
-    legacy = await load_reference_projection(
-        _ProjectionStore(
-            canonical={
-                "parser_version": "production-markdown-v4",
-                "schema_version": "2",
-                "editorial_title": None,
-                "sources": [],
-                "events": [],
-                "uncertainties": [],
-            },
-            raw="# REFERENCES\n",
-        ),
-        artifact,
-    )
-    assert legacy is not None
-    assert legacy.sources == ()

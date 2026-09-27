@@ -15,7 +15,10 @@ from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render_publication_pandoc
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_extraction import project_legacy_technical_extraction
+from cti_app.application.production_extraction import (
+    production_extraction_metadata,
+    project_legacy_technical_extraction,
+)
 from cti_app.application.production_parsers import (
     ReferenceReport,
     TechnicalExtraction,
@@ -39,6 +42,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_from_json,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -211,8 +215,10 @@ class ExtractionService(_ArtifactPayloadMixin):
         run_id: UUID,
         subject_id: UUID,
         input_hash: str,
-        raw_result: str,
-        canonical_json: dict[str, Any],
+        extraction: ProductionExtractionV1 | None = None,
+        *,
+        canonical_json: dict[str, Any] | None = None,
+        raw_result: str | None = None,
         model_run_id: UUID | None = None,
         conversation_turn_id: UUID | None = None,
         warnings: list[str] | None = None,
@@ -221,6 +227,40 @@ class ExtractionService(_ArtifactPayloadMixin):
         repair_evidence_entry_count: int | None = None,
         repair_evidence_index: list[dict[str, Any]] | None = None,
     ) -> ProductionArtifact:
+        """Persist one EXTRACTION artifact from the canonical V1 contract.
+
+        The service owns the serialization: it accepts a
+        :class:`ProductionExtractionV1`, writes it as the canonical blob and
+        records only a bounded counter/version projection in PostgreSQL.  A
+        pre-AW-011 ``canonical_json`` payload is still accepted so historical
+        callers keep persisting the contract they were written in; the two
+        inputs are mutually exclusive and the canonical one is the only one the
+        live workflow uses.
+        """
+
+        canonical_payload: dict[str, Any]
+        canonical_contract = extraction is not None
+        if extraction is not None:
+            if canonical_json is not None:
+                raise ValueError(
+                    "store_extraction_result accepts either a ProductionExtractionV1 "
+                    "or a legacy canonical_json payload, never both"
+                )
+            canonical_payload = production_extraction_to_json(extraction)
+            bounded_metadata: dict[str, Any] = production_extraction_metadata(extraction)
+        elif canonical_json is not None:
+            canonical_payload = dict(canonical_json)
+            bounded_metadata = {
+                "element_counts": {
+                    category: len(items)
+                    for category, items in canonical_payload.items()
+                    if isinstance(items, list)
+                },
+                "parser_version": canonical_payload.get("parser_version"),
+            }
+        else:
+            raise ValueError("store_extraction_result requires a canonical ProductionExtractionV1")
+
         async with self._uow_factory() as uow:
             prior_versions = [
                 artifact.version
@@ -229,14 +269,9 @@ class ExtractionService(_ArtifactPayloadMixin):
             ]
             version = max(prior_versions, default=0) + 1
 
-            element_counts = {
-                category: len(items)
-                for category, items in canonical_json.items()
-                if isinstance(items, list)
-            }
-
             raw_id, canonical_id, _ = await self._store_payloads(
-                raw=raw_result, canonical=canonical_json
+                raw=raw_result if not canonical_contract else None,
+                canonical=canonical_payload,
             )
             repair_evidence_metadata = None
             if repair_evidence_blob_id is not None:
@@ -262,12 +297,14 @@ class ExtractionService(_ArtifactPayloadMixin):
                 status=ProductionArtifactStatus.VERIFIED,
                 raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
-                model_run_id=model_run_id,
+                # A canonical extraction may need several model calls: the
+                # run-level provenance lives on the source checkpoints, never
+                # on one arbitrary model run.
+                model_run_id=None if canonical_contract else model_run_id,
                 conversation_turn_id=conversation_turn_id,
                 metadata={
-                    "element_counts": element_counts,
+                    **bounded_metadata,
                     "warnings": warnings or [],
-                    "parser_version": canonical_json.get("parser_version"),
                     "generated_at": datetime.now(UTC).isoformat(),
                     "deterministic_verification": verification_diagnostics or {},
                     **(

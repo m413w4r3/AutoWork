@@ -46,7 +46,17 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_context import build_subject_production_context
-from cti_app.application.production_extraction import load_legacy_technical_extraction
+from cti_app.application.production_extraction import (
+    PRODUCTION_EXTRACTION_SERVICE_VERSION,
+    ExtractionExecutionStatus,
+    ExtractionPlan,
+    ProductionExtractionControlError,
+    ProductionExtractionService,
+    build_extraction_plan,
+    load_legacy_technical_extraction,
+    load_reference_corpus,
+    source_text_contract_version,
+)
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
@@ -165,6 +175,11 @@ from cti_app.domain.production import (
     SourceExtraction,
     SourceExtractionStatus,
     SynthesisMode,
+)
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ExtractionReuseState,
+    ProductionExtractionV1,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.publication import is_publication_ioc_artifact_type
@@ -782,6 +797,103 @@ def _canonical_extraction_progress_counts(extraction: Any) -> dict[str, int]:
     return counts
 
 
+def _canonical_extraction_progress(
+    plan: ExtractionPlan,
+    extraction: ProductionExtractionV1 | None = None,
+) -> dict[str, Any]:
+    """Publish the canonical per-source verdict the desk and resume planner read.
+
+    The corpus is the authority on which sources the stage owned: every planned
+    source and every source the plan omitted stays visible, with the status the
+    canonical execution recorded for it.
+    """
+
+    produced = (
+        {source.source_document_id: source for source in extraction.sources}
+        if extraction is not None
+        else {}
+    )
+    sources: list[dict[str, Any]] = []
+    for planned in plan.sources:
+        source = produced.get(planned.source_document_id)
+        reuse_state = source.reuse_state if source is not None else None
+        if source is None:
+            status = "failed"
+        elif reuse_state is ExtractionReuseState.FRESH:
+            status = "succeeded"
+        else:
+            status = "cached"
+        sources.append(
+            {
+                "source_id": str(planned.source_document_id),
+                "title": planned.title,
+                "canonical_url": planned.canonical_url,
+                "tier": planned.tier.value,
+                "profile": planned.profile.value,
+                "status": status,
+                "reuse_state": reuse_state.value if reuse_state is not None else None,
+                "ioc_count": len(source.indicators) if source is not None else 0,
+                "rule_count": len(source.rules) if source is not None else 0,
+            }
+        )
+    for omitted in plan.omitted_sources:
+        sources.append(
+            {
+                "source_id": omitted.canonical_url,
+                "title": None,
+                "canonical_url": omitted.canonical_url,
+                "tier": omitted.tier.value,
+                "profile": None,
+                "status": "omitted",
+                "reuse_state": None,
+                "ioc_count": 0,
+                "rule_count": 0,
+            }
+        )
+    rules = [rule for source in produced.values() for rule in source.rules]
+    indicators = [item for source in produced.values() for item in source.indicators]
+    completed = [
+        entry for entry in sources if entry["status"] in _EXTRACTION_PROGRESS_COMPLETED_STATUSES
+    ]
+    return {
+        "total_sources": len(sources),
+        "completed_sources": len(completed),
+        "full_total": sum(entry["profile"] == ExtractionProfile.FULL.value for entry in sources),
+        "full_completed": sum(
+            entry["profile"] == ExtractionProfile.FULL.value for entry in completed
+        ),
+        "ioc_rules_total": sum(
+            entry["profile"] == ExtractionProfile.IOC_RULES.value for entry in sources
+        ),
+        "ioc_rules_completed": sum(
+            entry["profile"] == ExtractionProfile.IOC_RULES.value for entry in completed
+        ),
+        "cache_hits": sum(entry["status"] == "cached" for entry in sources),
+        "model_calls": sum(entry["status"] == "succeeded" for entry in sources),
+        "skipped_sources": sum(entry["status"] in {"omitted", "failed"} for entry in sources),
+        "light_batches": 0,
+        "light_sources_batched": 0,
+        "confirmed_iocs": sum(
+            item.indicator_status is ExtractionIndicatorStatus.CONFIRMED_IOC for item in indicators
+        ),
+        "contextual_iocs": sum(
+            item.indicator_status is ExtractionIndicatorStatus.CONTEXTUAL for item in indicators
+        ),
+        "rules_total": len(rules),
+        "yara_rules": sum(rule.rule_type.value == "yara" for rule in rules),
+        "sigma_rules": sum(rule.rule_type.value == "sigma" for rule in rules),
+        "suricata_rules": sum(rule.rule_type.value == "suricata" for rule in rules),
+        "snort_rules": sum(rule.rule_type.value == "snort" for rule in rules),
+        "active_source_id": None,
+        "active_source_title": None,
+        "active_profile": None,
+        "source_skips": {},
+        "sources": sources,
+        "profile_policy_version": plan.profile_policy_version,
+        "references_corpus_hash": plan.references_corpus_hash,
+    }
+
+
 def _source_progress_counts(output: Any, source_id: str) -> dict[str, int]:
     """Count deterministically accepted proposals from one parsed source."""
     verified = verify_q2_proposals([Q2ProposalSubmission(output=output, source_ids=(source_id,))])
@@ -1045,6 +1157,21 @@ class ProductionWorkflowOrchestrator:
         production_uow_factory = cast(Any, uow_factory)
         self._references = ReferenceResearchService(production_uow_factory, artifact_store)
         self._extraction = ExtractionService(production_uow_factory, artifact_store)
+        # AW-011: the live EXTRACTION stage is the canonical, archive-backed
+        # service. It needs the gateway (to ask for one structured capability)
+        # and the payload store (to read the exact archived documents). Without
+        # both, the stage fails explicitly instead of falling back to the
+        # retired live-URL path.
+        canonical_gateway = self._model_gateway
+        self._canonical_extraction: ProductionExtractionService | None = (
+            ProductionExtractionService(
+                uow_factory=production_uow_factory,
+                model_gateway=canonical_gateway,
+                artifact_store=artifact_store,
+            )
+            if canonical_gateway is not None and artifact_store is not None
+            else None
+        )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
         self._assembly = PublicationAssemblyService(production_uow_factory, artifact_store)
         self._artifact_reuse = ProductionArtifactReuseService(
@@ -2243,7 +2370,166 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        return await self._execute_direct_url_extraction(run, context, snapshot)
+        """Run the canonical, archive-backed EXTRACTION stage (AW-011).
+
+        The stage consumes the frozen ``ProductionReferenceCorpusV1`` of
+        REFERENCES, resolves every eligible source by its exact archived
+        document, and never opens the network: acquiring and archiving sources
+        belongs to SOURCES/REFERENCES.
+        """
+
+        await self._check_cancellation(run.id, context)
+        service = getattr(self, "_canonical_extraction", None)
+        if service is None or self._artifact_store is None:
+            return {
+                "stage": "extraction",
+                "status": "terminal_error",
+                "error_code": "extraction_service_unavailable",
+                "error": "Canonical extraction requires a ModelGateway and an artifact store",
+            }
+
+        try:
+            async with self._uow_factory() as uow:
+                corpus = await load_reference_corpus(
+                    uow=uow,
+                    run=run,
+                    snapshot=snapshot,
+                    artifact_store=self._artifact_store,
+                )
+            plan = build_extraction_plan(corpus)
+        except ProductionExtractionControlError as control:
+            # A control invariant failed: no silent recovery through the legacy
+            # REFERENCES RAW, and no model call.
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": control.code,
+                "error": str(control),
+                "details": dict(control.details),
+            }
+
+        reused = await self._reuse_artifact(run, "extraction", plan.input_hash)
+        if reused is not None:
+            return reused
+
+        execution = await service.execute(run=run, snapshot=snapshot)
+        if execution.status is not ExtractionExecutionStatus.SUCCEEDED:
+            return {
+                "stage": "extraction",
+                "status": "needs_review",
+                "error_code": execution.error_code,
+                "error": execution.error,
+                "details": execution.details,
+            }
+        extraction = execution.extraction
+        if extraction is None:  # pragma: no cover - defensive invariant
+            return {
+                "stage": "extraction",
+                "status": "terminal_error",
+                "error_code": "extraction_result_missing",
+                "error": "Canonical extraction reported success without a contract",
+            }
+
+        await self._check_cancellation(run.id, context)
+        artifact = await self._extraction.store_extraction_result(
+            run_id=run.id,
+            subject_id=run.subject_id,
+            input_hash=plan.input_hash,
+            extraction=extraction,
+            warnings=list(extraction.warnings),
+            verification_diagnostics={
+                "extraction_service_version": PRODUCTION_EXTRACTION_SERVICE_VERSION,
+                "extraction_contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
+                "source_text_contract_version": source_text_contract_version(),
+                "references_corpus_hash": extraction.references_corpus_hash,
+                "profile_policy_version": extraction.profile_policy_version,
+                **{
+                    key: value
+                    for key, value in execution.details.items()
+                    if key
+                    in {
+                        "schema_version",
+                        "source_count",
+                        "full_source_count",
+                        "ioc_rules_source_count",
+                        "reused_source_count",
+                        "fresh_source_count",
+                        "duplicate_source_count",
+                        "omitted_source_count",
+                        "fact_count",
+                        "event_count",
+                        "indicator_count",
+                        "rule_count",
+                        "warning_count",
+                        "contract_version",
+                        "profile_policy_version",
+                    }
+                },
+            },
+        )
+        # The extraction is durable before the Repair Desk overlay is replayed
+        # over it: a repair projection is a derivative of this exact artifact.
+        effective_artifact_id: str | None = None
+        if artifact.canonical_blob_id is not None:
+            async with self._uow_factory() as replay_uow:
+                decisions_repository = getattr(replay_uow, "production_repair_decisions", None)
+                decisions_getter = getattr(decisions_repository, "effective_decisions", None)
+                effective_decisions = (
+                    tuple(
+                        decision
+                        for decision in await decisions_getter(run.edition_id, run.subject_id)
+                        if getattr(decision.issue_kind, "value", decision.issue_kind)
+                        in {"rejected_indicator", "rejected_rule"}
+                    )
+                    if callable(decisions_getter)
+                    else ()
+                )
+                if effective_decisions:
+                    replay_run = await replay_uow.production_runs.get(run.id)
+                    if replay_run is None:
+                        replay_run = run
+                    effective_artifact = await reconcile_effective_repairs_in_uow(
+                        replay_uow,
+                        run=replay_run,
+                        base_extraction_artifact=artifact,
+                        artifact_store=self._artifact_store,
+                        payload_resolver=getattr(
+                            self,
+                            "_repair_payloads",
+                            ProductionRepairPayloadResolver(self._model_gateway),
+                        ),
+                    )
+                    if effective_artifact is not None:
+                        effective_artifact_id = str(effective_artifact.id)
+                    commit = getattr(replay_uow, "commit", None)
+                    if callable(commit):
+                        await commit()
+
+        progress = _canonical_extraction_progress(plan, extraction)
+        await self._persist_extraction_progress(run.id, progress)
+        return {
+            "stage": "extraction",
+            "status": "success",
+            "artifact_id": str(artifact.id),
+            "effective_artifact_id": effective_artifact_id,
+            "source_count": len(extraction.sources),
+            "full_source_count": progress["full_total"],
+            "ioc_rules_source_count": progress["ioc_rules_total"],
+            "reused_source_count": progress["cache_hits"],
+            "fresh_source_count": progress["model_calls"],
+            "omitted_source_count": len(extraction.omitted_sources),
+            "fact_count": sum(len(source.facts) for source in extraction.sources),
+            "event_count": sum(len(source.events) for source in extraction.sources),
+            "indicator_count": len(
+                [item for source in extraction.sources for item in source.indicators]
+            ),
+            "rule_count": progress["rules_total"],
+            "warning_count": len(extraction.warnings),
+            "model_calls": progress["model_calls"],
+            "cache_hits": progress["cache_hits"],
+            "profile_policy_version": extraction.profile_policy_version,
+            "references_corpus_hash": extraction.references_corpus_hash,
+        }
 
     async def _load_archived_source_text(
         self, archived: _ArchivedSource | None
