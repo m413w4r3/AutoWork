@@ -1,24 +1,40 @@
-"""Deterministic prompt evidence projections for production synthesis."""
+"""Deterministic inputs and canonical orchestration for production synthesis."""
 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import BaseModel
 
-from cti_app.application.model_gateway import ModelRoutingHint
+from cti_app.application.model_gateway import (
+    ExternalModelBlockedError,
+    ModelExecution,
+    ModelGatewayError,
+    ModelRequest,
+    ModelRoutingHint,
+    ModelSubmissionReconciliationRequiredError,
+    StructuredOutputError,
+)
+from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
 from cti_app.application.production_synthesis import (
     MAX_TECHNICAL_EVIDENCE_V1,
     SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION,
+    SYNTHESIS_MODEL_POLICY_VERSION,
+    SYNTHESIS_ROUTING_POLICY_VERSION,
+    ProductionSynthesisService,
     SynthesisClaimProposalV1,
+    SynthesisExecutionStatus,
     SynthesisProposalControlError,
+    SynthesisProposalErrorCode,
     SynthesisProposalV1,
     SynthesisSectionProposalV1,
+    SynthesisStageErrorCode,
     build_synthesis_access_policy,
     build_synthesis_delta,
     build_synthesis_evidence_pack,
@@ -36,9 +52,14 @@ from cti_app.application.production_synthesis import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     DetectionRuleType,
     ExtractionProfile,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionRun,
@@ -54,12 +75,17 @@ from cti_app.domain.production_extraction import (
     ExtractionRuleV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import (
+    SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
     SynthesisSectionKind,
     extraction_evidence_refs_v1,
+    production_synthesis_to_json,
 )
 from cti_app.domain.publication import ArtifactType
 
@@ -890,3 +916,640 @@ async def test_model_gateway_receives_synthesis_proposal_as_structured_schema():
     assert result == "drafted"
     assert gateway.request_seen is request
     assert gateway.schema_seen is SynthesisProposalV1
+
+
+# --- canonical synthesis application service --------------------------------
+
+
+EXTRACTION_ARTIFACT_HASH = "d" * 64
+
+
+class _MemoryArtifactStore:
+    """Only canonical JSON is readable; reading a source body fails the test."""
+
+    def __init__(self, payloads: dict[UUID, dict[str, object]]) -> None:
+        self.payloads = dict(payloads)
+        self.json_reads: list[UUID] = []
+        self.body_reads: list[UUID] = []
+
+    async def read_json(self, blob_id: UUID) -> dict[str, object]:
+        self.json_reads.append(blob_id)
+        return self.payloads[blob_id]
+
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        self.body_reads.append(blob_id)
+        raise AssertionError("Synthesis must never read an archived source body")
+
+
+class _Uow:
+    def __init__(self, documents: MemorySourceDocuments) -> None:
+        self.source_documents = documents
+
+    async def __aenter__(self) -> _Uow:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+
+class _RecordingGateway:
+    """One programmed ModelGateway.draft outcome; every call is recorded."""
+
+    def __init__(self, responder: Callable[[ModelRequest], ModelExecution] | Exception) -> None:
+        self._responder = responder
+        self.calls: list[tuple[ModelRequest, object]] = []
+
+    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+        self.calls.append((request, output_schema))
+        if isinstance(self._responder, Exception):
+            raise self._responder
+        return self._responder(request)
+
+
+class _RecordingSynthesisWriter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    async def store_synthesis_result(self, **kwargs: object) -> ProductionArtifact:
+        self.calls.append(kwargs)
+        return ProductionArtifact(
+            production_run_id=kwargs["run_id"],  # type: ignore[arg-type]
+            subject_id=kwargs["subject_id"],  # type: ignore[arg-type]
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=len(self.calls),
+            input_hash=kwargs["input_hash"],  # type: ignore[arg-type]
+            canonical_blob_id=uuid4(),
+            model_run_id=kwargs["model_run_id"],  # type: ignore[arg-type]
+        )
+
+
+class _ReuseStub:
+    def __init__(self, result: ProductionArtifactReuseResult | None = None) -> None:
+        self.result = result
+        self.calls: list[dict[str, object]] = []
+
+    async def find_or_reuse(self, **kwargs: object) -> ProductionArtifactReuseResult | None:
+        self.calls.append(kwargs)
+        return self.result
+
+
+class _PreSubmissionFailure(ModelGatewayError):
+    """A proven pre-submission failure: the caller retries the same ModelRun."""
+
+    code = "bridge_unreachable"
+    retryable = True
+
+
+def _succeeded(
+    request: ModelRequest, proposal: BaseModel | None, *, text: str | None = "raw answer"
+) -> ModelExecution:
+    run = ModelRun(
+        provider=ModelProvider.OPENAI,
+        model_role=ModelRole.DRAFTING,
+        requested_model="gpt-5",
+        prompt_template_id=request.prompt_template_id,
+        prompt_template_version=request.prompt_template_version,
+        authorized_input_hash=hashlib.sha256(request.text.encode()).hexdigest(),
+        evidence_pack_hash=request.evidence_pack_hash,
+        parameters=dict(request.parameters),
+        # The durable ModelRun identity is the one the request already carries.
+        id=request.run_id or uuid4(),
+    )
+    run.succeed(
+        actual_model_version="gpt-5",
+        duration_ms=3,
+        usage=ModelUsage(total_tokens=7),
+        output_references=("model-output://1",),
+        response_id=None,
+    )
+    return ModelExecution(run=run, output_text=text, structured_output=proposal)
+
+
+def _matched_extraction(
+    snapshot: ProductionInputSnapshot, *sources: ProductionSourceExtractionV1
+) -> ProductionExtractionV1:
+    return replace(
+        make_extraction(snapshot.subject_id, tuple(sources)),
+        production_input_hash=snapshot.input_hash,
+    )
+
+
+def _service_world(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    documents: tuple[SourceDocument, ...],
+    gateway: _RecordingGateway,
+    *,
+    reuse: _ReuseStub | None = None,
+    extraction_blob_id: UUID | None = None,
+    extra_payloads: Mapping[UUID, dict[str, object]] | None = None,
+) -> SimpleNamespace:
+    blob_id = extraction_blob_id or uuid4()
+    payloads = dict(extra_payloads or {})
+    payloads[blob_id] = production_extraction_to_json(extraction)
+    store = _MemoryArtifactStore(payloads)
+    writer = _RecordingSynthesisWriter()
+    document_repository = MemorySourceDocuments(documents)
+    service = ProductionSynthesisService(
+        uow_factory=lambda: _Uow(document_repository),  # type: ignore[arg-type]
+        artifact_store=store,  # type: ignore[arg-type]
+        model_gateway=gateway,  # type: ignore[arg-type]
+        synthesis_service=writer,  # type: ignore[arg-type]
+        artifact_reuse=reuse,  # type: ignore[arg-type]
+    )
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+        pipeline_generation=3,
+    )
+    artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=snapshot.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=EXTRACTION_ARTIFACT_HASH,
+        canonical_blob_id=blob_id,
+    )
+    return SimpleNamespace(
+        service=service,
+        store=store,
+        writer=writer,
+        docs=document_repository,
+        run=run,
+        artifact=artifact,
+    )
+
+
+def _fresh_setup() -> SimpleNamespace:
+    """One CORE source, one event and one fact, already extracted canonically."""
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT"),),
+        events=(make_event(source_id, "The campaign began.", date(2026, 7, 2)),),
+        uncertainties=("Attribution remains uncertain.",),
+    )
+    extraction = _matched_extraction(snapshot, source)
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    proposal = SynthesisProposalV1.model_validate(
+        make_proposal("FooRAT was identified in the report.", handle)
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, proposal))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+    world.snapshot = snapshot
+    world.extraction = extraction
+    world.source_id = source_id
+    world.pack = pack
+    world.handle = handle
+    world.proposal = proposal
+    world.gateway = gateway
+    return world
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["missing_blob", "unreadable_blob", "invalid_payload", "wrong_stage", "not_verified"],
+)
+async def test_service_requires_readable_verified_canonical_extraction(failure: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    extraction = _matched_extraction(snapshot, make_source(source_id))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+    artifact = world.artifact
+    if failure == "missing_blob":
+        artifact = replace(artifact, canonical_blob_id=None)
+    elif failure == "unreadable_blob":
+        artifact = replace(artifact, canonical_blob_id=uuid4())
+    elif failure == "invalid_payload":
+        world.store.payloads[artifact.canonical_blob_id] = {"schema_version": 1}
+    elif failure == "wrong_stage":
+        artifact = replace(artifact, stage=ProductionArtifactStage.REFERENCES)
+    else:
+        artifact = replace(artifact, status=ProductionArtifactStatus.NEEDS_REVIEW)
+
+    result = await world.service.execute(world.run, snapshot, artifact)
+
+    assert result.status is SynthesisExecutionStatus.BLOCKED
+    assert result.error_code == SynthesisStageErrorCode.INPUTS_MISSING.value
+    assert result.model_calls == 0
+    assert gateway.calls == []
+    assert world.writer.calls == []
+    assert world.docs.requested == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    ["extraction_subject", "extraction_input_hash", "artifact_run", "run_snapshot"],
+)
+async def test_service_stops_on_lineage_mismatch_before_drafting(failure: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    if failure == "extraction_subject":
+        extraction = _matched_extraction(snapshot, make_source(source_id))
+        extraction = replace(extraction, subject_id=uuid4())
+    elif failure == "extraction_input_hash":
+        extraction = replace(
+            _matched_extraction(snapshot, make_source(source_id)),
+            production_input_hash="a" * 64,
+        )
+    else:
+        extraction = _matched_extraction(snapshot, make_source(source_id))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+    run = world.run
+    artifact = world.artifact
+    if failure == "artifact_run":
+        artifact = replace(artifact, production_run_id=uuid4())
+    elif failure == "run_snapshot":
+        run = replace(run, id=uuid4())
+
+    result = await world.service.execute(run, snapshot, artifact)
+
+    assert result.status is SynthesisExecutionStatus.BLOCKED
+    assert result.error_code == SynthesisStageErrorCode.INPUTS_MISMATCH.value
+    assert result.model_calls == 0
+    assert gateway.calls == []
+    assert world.writer.calls == []
+    assert world.docs.requested == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
+    world = _fresh_setup()
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.mode is SynthesisMode.FRESH
+    assert result.model_calls == 1
+    assert result.error_code is None
+    assert result.extraction_hash == canonical_extraction_hash(world.extraction)
+    assert len(world.gateway.calls) == 1
+    request, schema = world.gateway.calls[0]
+    assert schema is SynthesisProposalV1
+    assert request.web_search is False
+    assert request.conversation is None
+    assert request.allow_failed_resubmit is True
+    assert request.run_id == result.model_run_id
+    assert result.input_hash == request.metadata["synthesis_input_hash"]
+
+    # Only the canonical extraction JSON is read; no archived source body is.
+    assert world.store.body_reads == []
+    assert world.store.json_reads == [world.artifact.canonical_blob_id]
+    assert world.docs.requested == [world.source_id]
+    assert str(world.source_id) not in request.text
+    assert "source.pdf" not in request.text
+
+    assert len(world.writer.calls) == 1
+    stored = world.writer.calls[0]
+    synthesis = stored["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert stored["run_id"] == world.run.id
+    assert stored["subject_id"] == world.snapshot.subject_id
+    assert stored["input_hash"] == result.input_hash
+    # The canonical extraction is the deserialized artifact blob, never a raw input.
+    assert stored["extraction"] == world.extraction
+    assert stored["raw_result"] == "raw answer"
+    assert stored["model_run_id"] == result.model_run_id
+    assert stored["mode"] is SynthesisMode.FRESH
+    assert stored["model_policy_version"] == SYNTHESIS_MODEL_POLICY_VERSION
+    assert stored["routing_policy_version"] == SYNTHESIS_ROUTING_POLICY_VERSION
+
+    # Title, timeline and uncertainties are deterministic, never model output.
+    assert synthesis.title == world.snapshot.subject_title
+    assert synthesis.publication_language == world.snapshot.publication_language == "fr"
+    assert synthesis.production_input_hash == world.snapshot.input_hash
+    assert synthesis.extraction_hash == result.extraction_hash
+    assert [entry.event_date for entry in synthesis.timeline] == [date(2026, 7, 2)]
+    assert [item.text for item in synthesis.uncertainties] == ["Attribution remains uncertain."]
+    assert synthesis.lead[0].text == "FooRAT was identified in the report."
+    assert synthesis.lead[0].evidence_refs == (world.pack.resolve_handle(world.handle),)
+    assert [section.kind for section in synthesis.sections] == [SynthesisSectionKind.OVERVIEW]
+
+    # The stage result stays bounded: counters only, never the narrative body.
+    assert result.details["section_count"] == 1
+    assert result.details["timeline_entry_count"] == 1
+    assert "FooRAT was identified in the report." not in str(result.details)
+    assert result.artifact_id is not None
+
+
+@pytest.mark.asyncio
+async def test_do_not_submit_source_policy_stops_before_drafting():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    world = _service_world(
+        snapshot,
+        extraction,
+        (
+            make_document(
+                subject_id,
+                source_id,
+                tlp=TLP.RED,
+                external_llm_allowed=False,
+                do_not_submit=True,
+            ),
+        ),
+        gateway,
+    )
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.POLICY_BLOCKED.value
+    assert result.model_calls == 0
+    assert result.extraction_hash == canonical_extraction_hash(extraction)
+    assert result.details["do_not_submit"] is True
+    assert gateway.calls == []
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_external_model_block_from_gateway_is_needs_review():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    gateway = _RecordingGateway(ExternalModelBlockedError("external route blocked"))
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id, external_llm_allowed=False),),
+        gateway,
+    )
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.POLICY_BLOCKED.value
+    assert result.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["absent", "wrong_schema", "gateway_error"])
+async def test_invalid_structured_output_needs_review_without_repair_call(failure: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    proposal = SynthesisProposalV1.model_validate(make_proposal("FooRAT was identified.", handle))
+    responder: Callable[[ModelRequest], ModelExecution] | Exception
+    if failure == "absent":
+        # Valid JSON text is present, but no validated structured output is.
+        responder = lambda request: _succeeded(  # noqa: E731
+            request, None, text=proposal.model_dump_json()
+        )
+    elif failure == "wrong_schema":
+        responder = lambda request: _succeeded(  # noqa: E731
+            request,
+            SynthesisClaimProposalV1(text="FooRAT was identified.", evidence_handles=(handle,)),
+        )
+    else:
+        responder = StructuredOutputError("schema mismatch")
+    gateway = _RecordingGateway(responder)
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.OUTPUT_INVALID.value
+    assert result.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_evidence_handle_reaches_needs_review_without_repair_call():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    proposal = SynthesisProposalV1.model_validate(make_proposal("FooRAT was identified.", "E999"))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, proposal))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_EVIDENCE.value
+    assert result.error_code == "synthesis_unknown_evidence"
+    assert result.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert result.model_run_id == gateway.calls[0][0].run_id
+    assert result.input_hash == gateway.calls[0][0].metadata["synthesis_input_hash"]
+    assert result.extraction_hash == canonical_extraction_hash(extraction)
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_unavailable_source_access_policy_blocks_before_drafting():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    # No archived document exists for the exact extraction source.
+    world = _service_world(snapshot, extraction, (), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.BLOCKED
+    assert result.error_code == SynthesisStageErrorCode.ACCESS_POLICY_UNAVAILABLE.value
+    assert result.model_calls == 0
+    assert world.docs.requested == [source_id]
+    assert gateway.calls == []
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retryable_pre_submission_failure_propagates_without_persisting():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    gateway = _RecordingGateway(_PreSubmissionFailure("the bridge was never reached"))
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    with pytest.raises(_PreSubmissionFailure):
+        await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert len(gateway.calls) == 1
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["raised", "returned"])
+async def test_ambiguous_submission_is_never_resubmitted(outcome: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    reconciliation_run_id = uuid4()
+    reconciliation_details = {"bridge_reason": "active_signal_stalled"}
+    if outcome == "raised":
+        gateway: _RecordingGateway = _RecordingGateway(
+            ModelSubmissionReconciliationRequiredError(
+                details=reconciliation_details, model_run_id=reconciliation_run_id
+            )
+        )
+    else:
+
+        def responder(request: ModelRequest) -> ModelExecution:
+            run = ModelRun(
+                provider=ModelProvider.OPENAI,
+                model_role=ModelRole.DRAFTING,
+                requested_model="gpt-5",
+                prompt_template_id=request.prompt_template_id,
+                prompt_template_version=request.prompt_template_version,
+                authorized_input_hash=hashlib.sha256(request.text.encode()).hexdigest(),
+                evidence_pack_hash=request.evidence_pack_hash,
+                parameters={},
+                id=reconciliation_run_id,
+            )
+            run.require_review(
+                PRODUCTION_RECONCILIATION_ERROR_CODE,
+                "submission state is unknown",
+                details=reconciliation_details,
+            )
+            return ModelExecution(run=run)
+
+        gateway = _RecordingGateway(responder)
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+    assert result.error_code == SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value
+    assert result.model_run_id == reconciliation_run_id
+    assert result.model_calls == 1
+    assert result.details["error_code"] == PRODUCTION_RECONCILIATION_ERROR_CODE
+    assert result.details["model_run_id"] == str(reconciliation_run_id)
+    assert result.details["bridge_reason"] == "active_signal_stalled"
+    assert len(gateway.calls) == 1
+    assert world.writer.calls == []
+
+
+def _canonical_synthesis(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    *,
+    title: str | None = None,
+) -> ProductionSynthesisV1:
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    ref = pack.resolve_handle(str(pack.narrative_evidence[0]["handle"]))
+    return ProductionSynthesisV1(
+        schema_version=1,
+        subject_id=snapshot.subject_id,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language=snapshot.publication_language,
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=title or snapshot.subject_title,
+        lead=(SynthesisParagraphV1(text="FooRAT was identified.", evidence_refs=(ref,)),),
+        sections=(),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_exact_canonical_reuse_avoids_the_model_call():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    canonical_blob_id = uuid4()
+    previous = _canonical_synthesis(snapshot, extraction)
+    reuse_artifact = ProductionArtifact(
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=2,
+        input_hash="a" * 64,
+        canonical_blob_id=canonical_blob_id,
+        model_run_id=uuid4(),
+        reused_from_artifact_id=uuid4(),
+    )
+    reuse = _ReuseStub(ProductionArtifactReuseResult(artifact=reuse_artifact, reused=True))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id),),
+        gateway,
+        reuse=reuse,
+        extra_payloads={canonical_blob_id: production_synthesis_to_json(previous)},
+    )
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.REUSED
+    assert result.mode is SynthesisMode.REUSE_EXACT
+    assert result.model_calls == 0
+    assert result.artifact_id == reuse_artifact.id
+    assert result.model_run_id == reuse_artifact.model_run_id
+    assert result.extraction_hash == canonical_extraction_hash(extraction)
+    assert reuse.calls[0]["stage"] is ProductionArtifactStage.SYNTHESIS
+    assert reuse.calls[0]["input_hash"] == result.input_hash
+    assert gateway.calls == []
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_reuse_candidate_with_wrong_lineage_needs_review_without_drafting():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    canonical_blob_id = uuid4()
+    stale = _canonical_synthesis(snapshot, extraction, title="An unfrozen editorial title")
+    reuse_artifact = ProductionArtifact(
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=2,
+        input_hash="a" * 64,
+        canonical_blob_id=canonical_blob_id,
+        model_run_id=uuid4(),
+    )
+    reuse = _ReuseStub(ProductionArtifactReuseResult(artifact=reuse_artifact, reused=False))
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    world = _service_world(
+        snapshot,
+        extraction,
+        (make_document(subject_id, source_id),),
+        gateway,
+        reuse=reuse,
+        extra_payloads={canonical_blob_id: production_synthesis_to_json(stale)},
+    )
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.REUSE_INVALID.value
+    assert result.model_calls == 0
+    assert gateway.calls == []
+    assert world.writer.calls == []

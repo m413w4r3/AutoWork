@@ -1,4 +1,4 @@
-"""Deterministic evidence inputs and preview for canonical synthesis."""
+"""Canonical synthesis: deterministic evidence inputs, validation and service."""
 
 from __future__ import annotations
 
@@ -12,29 +12,44 @@ from dataclasses import dataclass, field
 from datetime import date
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 
 from cti_app.application.model_gateway import (
+    ExternalModelBlockedError,
     ModelExecution,
     ModelGateway,
+    ModelGatewayError,
     ModelRequest,
     ModelRoutingHint,
+    ModelSubmissionReconciliationRequiredError,
+    StructuredOutputError,
 )
-from cti_app.application.persistence import SourceDocumentRepository
+from cti_app.application.persistence import ProductionUnitOfWorkFactory, SourceDocumentRepository
+from cti_app.application.production_artifact_store import (
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.domain.classification import TLP
+from cti_app.domain.model_runs import ModelRun, ModelRunStatus
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ExtractionProfile,
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionInputSnapshot,
     ProductionRun,
     SynthesisMode,
+    model_run_awaits_reconciliation,
 )
 from cti_app.domain.production_extraction import (
     PRODUCTION_EXTRACTION_SCHEMA_VERSION,
     ProductionExtractionV1,
+    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import ProductionReferenceTier
@@ -51,7 +66,13 @@ from cti_app.domain.production_synthesis import (
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
     extraction_evidence_refs_v1,
+    production_synthesis_from_json,
+    validate_synthesis_lineage,
 )
+
+if TYPE_CHECKING:
+    from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
+    from cti_app.application.production_stages import SynthesisService
 
 SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v1-technical-cap-128"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
@@ -742,6 +763,9 @@ def build_synthesis_model_request(
         background=False,
         conversation=None,
         run_id=synthesis_model_run_id(run, functional_hash, mode),
+        # The gateway only resubmits a FAILED run whose submission state
+        # proves the provider was never reached.
+        allow_failed_resubmit=True,
     )
 
 
@@ -1224,3 +1248,540 @@ def render_synthesis_markdown(
         lines.extend(f"- {warning}" for warning in synthesis.warnings)
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+# --- Canonical application service -----------------------------------------
+
+# The evidence pack already bounds what reaches the drafter; these caps only
+# keep the canonical warning projection small and deterministic.
+MAX_SYNTHESIS_WARNINGS = 16
+MAX_SYNTHESIS_WARNING_CHARS = 500
+
+
+class SynthesisExecutionStatus(StrEnum):
+    """Outcome of one canonical synthesis execution."""
+
+    SUCCEEDED = "succeeded"
+    #: An exact canonical synthesis already existed; no model call was made.
+    REUSED = "reused"
+    #: A human decision is required; nothing is resubmitted automatically.
+    NEEDS_REVIEW = "needs_review"
+    #: A canonical input is absent or inconsistent; drafting never started.
+    BLOCKED = "blocked"
+
+
+class SynthesisStageErrorCode(StrEnum):
+    """Control codes of the canonical synthesis boundary."""
+
+    INPUTS_MISSING = "synthesis_inputs_missing"
+    INPUTS_MISMATCH = "synthesis_inputs_mismatch"
+    ACCESS_POLICY_UNAVAILABLE = "synthesis_access_policy_unavailable"
+    POLICY_BLOCKED = "synthesis_policy_blocked"
+    REUSE_INVALID = "synthesis_reuse_invalid"
+    MODEL_CALL_FAILED = "synthesis_model_call_failed"
+    RECONCILIATION_REQUIRED = PRODUCTION_RECONCILIATION_ERROR_CODE
+
+
+@dataclass(frozen=True, slots=True)
+class ProductionSynthesisExecution:
+    """The bounded stage result of one canonical synthesis execution."""
+
+    status: SynthesisExecutionStatus
+    stage: ProductionArtifactStage = ProductionArtifactStage.SYNTHESIS
+    mode: SynthesisMode = SynthesisMode.FRESH
+    artifact_id: UUID | None = None
+    model_run_id: UUID | None = None
+    input_hash: str | None = None
+    extraction_hash: str | None = None
+    model_calls: int = 0
+    error_code: str | None = None
+    error: str | None = None
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.status, SynthesisExecutionStatus):
+            raise ValueError("Synthesis execution status is invalid")
+        if self.model_calls < 0:
+            raise ValueError("Synthesis model call count cannot be negative")
+
+    @property
+    def succeeded(self) -> bool:
+        return self.status in {
+            SynthesisExecutionStatus.SUCCEEDED,
+            SynthesisExecutionStatus.REUSED,
+        }
+
+
+class _SynthesisControlError(RuntimeError):
+    """One control invariant failed; no drafting fallback may be attempted."""
+
+    def __init__(
+        self,
+        code: SynthesisStageErrorCode,
+        message: str,
+        *,
+        status: SynthesisExecutionStatus = SynthesisExecutionStatus.BLOCKED,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+        self.details: dict[str, Any] = dict(details or {})
+
+    def result(self) -> ProductionSynthesisExecution:
+        return ProductionSynthesisExecution(
+            status=self.status,
+            error_code=self.code.value,
+            error=str(self),
+            details=self.details,
+        )
+
+
+def _bounded_synthesis_warnings(extraction: ProductionExtractionV1) -> tuple[str, ...]:
+    """Project extraction warnings deterministically, with an explicit bound."""
+    warnings = sorted({warning.strip() for warning in extraction.warnings if warning.strip()})
+    bounded = [
+        warning
+        if len(warning) <= MAX_SYNTHESIS_WARNING_CHARS
+        else warning[: MAX_SYNTHESIS_WARNING_CHARS - 1] + "…"
+        for warning in warnings[:MAX_SYNTHESIS_WARNINGS]
+    ]
+    omitted = len(warnings) - len(bounded)
+    if omitted > 0:
+        bounded.append(f"{omitted} extraction warning(s) omitted from this synthesis projection")
+    return tuple(bounded)
+
+
+def _synthesis_counts(synthesis: ProductionSynthesisV1) -> dict[str, Any]:
+    """Bounded stage metadata; the canonical body itself is never returned."""
+    paragraphs = (
+        *synthesis.lead,
+        *(item for section in synthesis.sections for item in section.paragraphs),
+    )
+    evidence_refs = {ref for paragraph in paragraphs for ref in paragraph.evidence_refs}
+    evidence_refs.update(ref for entry in synthesis.timeline for ref in entry.evidence_refs)
+    return {
+        "schema_version": synthesis.schema_version,
+        "section_count": len(synthesis.sections),
+        "paragraph_count": len(paragraphs),
+        "timeline_entry_count": len(synthesis.timeline),
+        "evidence_ref_count": len(evidence_refs),
+        "uncertainty_count": len(synthesis.uncertainties),
+        "warnings_count": len(synthesis.warnings),
+    }
+
+
+class ProductionSynthesisService:
+    """The canonical, provider-agnostic SYNTHESIS service (AW-012).
+
+    It consumes only the frozen ``ProductionInputSnapshot`` and the canonical
+    ``ProductionExtractionV1`` artifact: no reference report, no legacy
+    technical extraction, no source body and no web research exist here.  A
+    retryable ``ModelGatewayError`` (a proven pre-submission failure) is raised
+    to the caller, which retries with the same deterministic ModelRun identity;
+    a possibly-submitted request is never replayed and becomes NEEDS_REVIEW.
+    """
+
+    def __init__(
+        self,
+        *,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore,
+        model_gateway: ModelGateway,
+        synthesis_service: SynthesisService,
+        artifact_reuse: ProductionArtifactReuseService | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+        self._model_gateway = model_gateway
+        self._synthesis_service = synthesis_service
+        self._artifact_reuse = artifact_reuse
+
+    async def execute(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction_artifact: ProductionArtifact,
+    ) -> ProductionSynthesisExecution:
+        """Run at most one durable drafting submission for this generation."""
+        try:
+            extraction, extraction_hash = await self._load_extraction(
+                run, snapshot, extraction_artifact
+            )
+            policy = await self._load_access_policy(snapshot, extraction)
+            evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+            input_hash = synthesis_input_hash(
+                snapshot, extraction, evidence_pack, synthesis_access_policy_hash(policy)
+            )
+            reused = await self._reuse_exact(
+                run=run,
+                snapshot=snapshot,
+                extraction_hash=extraction_hash,
+                input_hash=input_hash,
+            )
+        except _SynthesisControlError as control:
+            return control.result()
+        if reused is not None:
+            return reused
+        if policy.do_not_submit:
+            # A do_not_submit source forbids every model submission; only the
+            # model gateway route could turn this evidence into a draft.
+            return ProductionSynthesisExecution(
+                status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                mode=SynthesisMode.FRESH,
+                input_hash=input_hash,
+                extraction_hash=extraction_hash,
+                model_calls=0,
+                error_code=SynthesisStageErrorCode.POLICY_BLOCKED.value,
+                error="The source access policy forbids any model submission.",
+                details={
+                    "do_not_submit": True,
+                    "external_llm_allowed": policy.external_llm_allowed,
+                    "effective_tlp": policy.effective_tlp.value,
+                    "synthesis_access_policy_hash": synthesis_access_policy_hash(policy),
+                },
+            )
+        return await self._draft(
+            run=run,
+            snapshot=snapshot,
+            extraction=extraction,
+            evidence_pack=evidence_pack,
+            policy=policy,
+            extraction_hash=extraction_hash,
+            input_hash=input_hash,
+        )
+
+    async def _load_extraction(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction_artifact: ProductionArtifact,
+    ) -> tuple[ProductionExtractionV1, str]:
+        """Read the canonical EXTRACTION artifact and prove its frozen lineage."""
+        if not isinstance(extraction_artifact, ProductionArtifact):
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The canonical EXTRACTION artifact of this run is missing",
+                details={"run_id": str(run.id)},
+            )
+        if extraction_artifact.stage is not ProductionArtifactStage.EXTRACTION:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The supplied artifact is not an EXTRACTION artifact",
+                details={
+                    "artifact_id": str(extraction_artifact.id),
+                    "stage": extraction_artifact.stage.value,
+                },
+            )
+        if (
+            run.id != snapshot.production_run_id
+            or run.subject_id != snapshot.subject_id
+            or extraction_artifact.production_run_id != run.id
+            or extraction_artifact.subject_id != snapshot.subject_id
+        ):
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISMATCH,
+                "The production run, snapshot and extraction artifact identities differ",
+                details={
+                    "run_id": str(run.id),
+                    "snapshot_run_id": str(snapshot.production_run_id),
+                    "artifact_run_id": str(extraction_artifact.production_run_id),
+                    "artifact_id": str(extraction_artifact.id),
+                },
+            )
+        if extraction_artifact.status is not ProductionArtifactStatus.VERIFIED:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The EXTRACTION artifact is not verified",
+                details={
+                    "artifact_id": str(extraction_artifact.id),
+                    "status": extraction_artifact.status.value,
+                },
+            )
+        if extraction_artifact.canonical_blob_id is None:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The EXTRACTION artifact carries no canonical extraction",
+                details={"artifact_id": str(extraction_artifact.id)},
+            )
+        try:
+            payload = await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except Exception as exc:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The canonical EXTRACTION payload is not readable",
+                details={"artifact_id": str(extraction_artifact.id)},
+            ) from exc
+        try:
+            extraction = production_extraction_from_json(payload)
+        except (TypeError, ValueError) as exc:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The canonical EXTRACTION payload is invalid",
+                details={"artifact_id": str(extraction_artifact.id), "reason": str(exc)},
+            ) from exc
+        if extraction.subject_id != snapshot.subject_id:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISMATCH,
+                "The canonical extraction belongs to another Subject",
+                details={
+                    "extraction_subject_id": str(extraction.subject_id),
+                    "subject_id": str(snapshot.subject_id),
+                },
+            )
+        if extraction.production_input_hash != snapshot.input_hash:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISMATCH,
+                "The canonical extraction does not match the production input snapshot",
+                details={
+                    "extraction_input_hash": extraction.production_input_hash,
+                    "snapshot_input_hash": snapshot.input_hash,
+                },
+            )
+        return extraction, canonical_extraction_hash(extraction)
+
+    async def _load_access_policy(
+        self, snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
+    ) -> SynthesisAccessPolicyV1:
+        """Resolve the exact archived sources' metadata; never their bodies."""
+        async with self._uow_factory() as uow:
+            try:
+                return await build_synthesis_access_policy(
+                    snapshot, extraction, uow.source_documents
+                )
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except (TypeError, ValueError) as exc:
+                raise _SynthesisControlError(
+                    SynthesisStageErrorCode.ACCESS_POLICY_UNAVAILABLE,
+                    "The exact source access policy of this extraction is unavailable",
+                    details={"reason": str(exc)},
+                ) from exc
+
+    async def _reuse_exact(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction_hash: str,
+        input_hash: str,
+    ) -> ProductionSynthesisExecution | None:
+        """Reuse a verified canonical synthesis of the same functional inputs."""
+        if self._artifact_reuse is None:
+            return None
+        reuse = await self._artifact_reuse.find_or_reuse(
+            run=run,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            input_hash=input_hash,
+        )
+        if reuse is None:
+            return None
+        artifact = reuse.artifact
+        if artifact.canonical_blob_id is None:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.REUSE_INVALID,
+                "The reusable synthesis artifact carries no canonical synthesis",
+                status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                details={"artifact_id": str(artifact.id)},
+            )
+        try:
+            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+            synthesis = production_synthesis_from_json(payload)
+            validate_synthesis_lineage(synthesis, snapshot, extraction_hash)
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except (TypeError, ValueError) as exc:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.REUSE_INVALID,
+                "The reusable synthesis artifact is not canonical for this run",
+                status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                details={"artifact_id": str(artifact.id), "reason": str(exc)},
+            ) from exc
+        reused_from = artifact.reused_from_artifact_id
+        return ProductionSynthesisExecution(
+            status=SynthesisExecutionStatus.REUSED,
+            mode=SynthesisMode.REUSE_EXACT,
+            artifact_id=artifact.id,
+            model_run_id=artifact.model_run_id,
+            input_hash=input_hash,
+            extraction_hash=extraction_hash,
+            model_calls=0,
+            details={
+                "reused": reuse.reused,
+                "reused_from_artifact_id": str(reused_from) if reused_from is not None else None,
+            },
+        )
+
+    async def _draft(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction: ProductionExtractionV1,
+        evidence_pack: SynthesisEvidencePackV1,
+        policy: SynthesisAccessPolicyV1,
+        extraction_hash: str,
+        input_hash: str,
+    ) -> ProductionSynthesisExecution:
+        """Submit once, validate deterministically, then persist the canonical result."""
+        mode = SynthesisMode.FRESH
+        request = build_synthesis_model_request(
+            run, snapshot, extraction, evidence_pack, policy, mode
+        )
+        if request.metadata.get("synthesis_input_hash") != input_hash:
+            raise ValueError("Synthesis request identity is inconsistent with its inputs")
+        model_run_id = request.run_id
+
+        def reviewed(
+            error_code: str,
+            error: str,
+            *,
+            run_id: UUID | None,
+            details: Mapping[str, Any],
+            reconciliation: bool = False,
+        ) -> ProductionSynthesisExecution:
+            """A terminal outcome of the single submission, never a retry."""
+            payload = dict(details)
+            if reconciliation:
+                payload["error_code"] = SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value
+                payload["model_run_id"] = str(run_id) if run_id is not None else None
+            return ProductionSynthesisExecution(
+                status=SynthesisExecutionStatus.NEEDS_REVIEW,
+                mode=mode,
+                model_run_id=run_id,
+                input_hash=input_hash,
+                extraction_hash=extraction_hash,
+                model_calls=1,
+                error_code=error_code,
+                error=error,
+                details=payload,
+            )
+
+        try:
+            execution = await draft_synthesis_proposal(self._model_gateway, request)
+        except ModelSubmissionReconciliationRequiredError as exc:
+            return reviewed(
+                SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value,
+                "A provider submission may have been accepted and must be reconciled",
+                run_id=exc.model_run_id or model_run_id,
+                details=exc.details,
+                reconciliation=True,
+            )
+        except ExternalModelBlockedError as exc:
+            return reviewed(
+                SynthesisStageErrorCode.POLICY_BLOCKED.value,
+                "The source access policy blocked the selected model route.",
+                run_id=model_run_id,
+                details={"error_code": exc.code},
+            )
+        except StructuredOutputError as exc:
+            return reviewed(
+                SynthesisProposalErrorCode.OUTPUT_INVALID.value,
+                "The provider answer is not a structured synthesis proposal.",
+                run_id=model_run_id,
+                details={"error_code": exc.code},
+            )
+        except ModelGatewayError as exc:
+            if exc.retryable:
+                # A proven pre-submission failure: the caller retries with the
+                # same deterministic ModelRun identity.
+                raise
+            return reviewed(
+                SynthesisStageErrorCode.MODEL_CALL_FAILED.value,
+                "The synthesis model call failed.",
+                run_id=model_run_id,
+                details={"error_code": exc.code},
+            )
+
+        model_run = execution.run
+        if model_run.status is ModelRunStatus.NEEDS_REVIEW:
+            if model_run_awaits_reconciliation(model_run.error_code):
+                return reviewed(
+                    SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value,
+                    "A provider submission may have been accepted and must be reconciled",
+                    run_id=model_run.id,
+                    details=dict(model_run.error_details or {}),
+                    reconciliation=True,
+                )
+            return reviewed(
+                SynthesisProposalErrorCode.OUTPUT_INVALID.value,
+                "The synthesis model run needs review without a usable answer.",
+                run_id=model_run.id,
+                details=self._model_evidence(model_run),
+            )
+        if model_run.status is not ModelRunStatus.SUCCEEDED:
+            return reviewed(
+                SynthesisStageErrorCode.MODEL_CALL_FAILED.value,
+                f"The synthesis model run reached status {model_run.status.value}.",
+                run_id=model_run.id,
+                details=self._model_evidence(model_run),
+            )
+
+        proposal = execution.structured_output
+        if not isinstance(proposal, SynthesisProposalV1):
+            # A malformed answer is never re-asked and never parsed loosely.
+            return reviewed(
+                SynthesisProposalErrorCode.OUTPUT_INVALID.value,
+                "The provider answer lacks a validated synthesis proposal.",
+                run_id=model_run.id,
+                details=self._model_evidence(model_run),
+            )
+        try:
+            lead, sections = validate_synthesis_proposal(proposal, evidence_pack, extraction)
+        except SynthesisProposalControlError as exc:
+            return reviewed(
+                exc.code.value,
+                f"The synthesis proposal failed {exc.code.value}.",
+                run_id=model_run.id,
+                details=self._model_evidence(model_run),
+            )
+
+        synthesis = ProductionSynthesisV1(
+            schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+            subject_id=snapshot.subject_id,
+            production_input_hash=snapshot.input_hash,
+            extraction_hash=extraction_hash,
+            publication_language=snapshot.publication_language,
+            synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+            title=snapshot.subject_title,
+            lead=lead,
+            sections=sections,
+            timeline=build_synthesis_timeline(extraction),
+            uncertainties=build_synthesis_uncertainties(extraction),
+            warnings=_bounded_synthesis_warnings(extraction),
+        )
+        validate_synthesis_lineage(synthesis, snapshot, extraction_hash)
+        artifact = await self._synthesis_service.store_synthesis_result(
+            run_id=run.id,
+            subject_id=snapshot.subject_id,
+            input_hash=input_hash,
+            synthesis=synthesis,
+            extraction=extraction,
+            raw_result=execution.output_text,
+            model_run_id=model_run.id,
+            mode=mode,
+            model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
+            routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
+        )
+        return ProductionSynthesisExecution(
+            status=SynthesisExecutionStatus.SUCCEEDED,
+            mode=mode,
+            artifact_id=artifact.id,
+            model_run_id=model_run.id,
+            input_hash=input_hash,
+            extraction_hash=extraction_hash,
+            model_calls=1,
+            details=_synthesis_counts(synthesis),
+        )
+
+    @staticmethod
+    def _model_evidence(model_run: ModelRun) -> dict[str, Any]:
+        """Bounded ModelRun evidence; the raw body stays in the model archive."""
+        return {
+            "model_run_id": str(model_run.id),
+            "status": model_run.status.value,
+            "error_code": model_run.error_code,
+            "raw_output_sha256": model_run.raw_output_sha256,
+        }
