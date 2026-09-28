@@ -135,6 +135,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 if TYPE_CHECKING:
@@ -762,14 +763,7 @@ class ProductionWorkflowOrchestrator:
         source_tiers_by_url: dict[str, str],
         semantic_projection_hash: str,
     ) -> ProductionArtifact | None:
-        """Find an old valid Q4 draft whose semantic input is unchanged.
-
-        Older synthesis rows used a broader extraction identity and therefore
-        cannot match the current input hash.  They remain reusable when the
-        planner proves that the before/after semantic evidence projection is
-        identical.  The old row is never updated; the caller appends a new
-        current row pointing to its rendered blob.
-        """
+        """Find a verified canonical draft with compatible semantic input."""
         if self._artifact_store is None:
             return None
         artifacts = await uow.production_artifacts.list_for_run(run.id)
@@ -778,9 +772,9 @@ class ProductionWorkflowOrchestrator:
                 artifact
                 for artifact in artifacts
                 if artifact.stage is ProductionArtifactStage.SYNTHESIS
+                and artifact.canonical_blob_id is not None
                 and artifact.rendered_blob_id is not None
-                and artifact.status
-                in {ProductionArtifactStatus.VERIFIED, ProductionArtifactStatus.STALE}
+                and artifact.status is ProductionArtifactStatus.VERIFIED
             ),
             key=lambda artifact: (artifact.created_at, str(artifact.id)),
             reverse=True,
@@ -799,6 +793,11 @@ class ProductionWorkflowOrchestrator:
         )
         for candidate in candidates:
             try:
+                canonical = production_synthesis_from_json(
+                    await self._artifact_store.read_json(cast(UUID, candidate.canonical_blob_id))
+                )
+                if canonical.subject_id != run.subject_id:
+                    continue
                 candidate_text = await self._artifact_store.read_text(
                     cast(UUID, candidate.rendered_blob_id)
                 )
@@ -2063,6 +2062,7 @@ class ProductionWorkflowOrchestrator:
                     run_id=run.id,
                     subject_id=run.subject_id,
                     source_artifact=compatible,
+                    input_hash=input_hash,
                     semantic_projection_hash=semantic_synthesis_hash,
                     metadata_extra=(
                         {
