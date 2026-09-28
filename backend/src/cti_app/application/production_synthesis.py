@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -28,7 +28,11 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
     StructuredOutputError,
 )
-from cti_app.application.persistence import ProductionUnitOfWorkFactory, SourceDocumentRepository
+from cti_app.application.persistence import (
+    ProductionUnitOfWork,
+    ProductionUnitOfWorkFactory,
+    SourceDocumentRepository,
+)
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
@@ -572,6 +576,9 @@ class SynthesisEvidencePackV1:
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
         default_factory=dict, repr=False, compare=False
     )
+    _handle_for_ref: Mapping[ExtractionEvidenceRefV1, str] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
     def resolve_handle(self, handle: str) -> ExtractionEvidenceRefV1:
         """Resolve only an exact prompt handle; no fuzzy or prefix matching."""
@@ -579,6 +586,14 @@ class SynthesisEvidencePackV1:
             return self._handle_to_ref[handle]
         except KeyError as exc:
             raise ValueError("synthesis_unknown_evidence") from exc
+
+    def handle_for(self, ref: ExtractionEvidenceRefV1) -> str | None:
+        """Return the temporary prompt handle of a ref, or ``None`` when absent.
+
+        A ref that left the current extraction has no handle: revision context
+        can never hand a previous, removed evidence identity back to the model.
+        """
+        return self._handle_for_ref.get(ref)
 
 
 def build_synthesis_evidence_pack(
@@ -638,6 +653,7 @@ def build_synthesis_evidence_pack(
         technical_evidence=technical_evidence,
         uncertainties=tuple(item.text for item in uncertainties),
         _handle_to_ref=MappingProxyType(handle_to_ref),
+        _handle_for_ref=MappingProxyType(dict(handle_for_ref)),
     )
 
 
@@ -668,8 +684,21 @@ def build_synthesis_model_request(
     evidence_pack: SynthesisEvidencePackV1,
     access_policy: SynthesisAccessPolicyV1,
     mode: SynthesisMode,
+    *,
+    revision: SynthesisRevisionContextV1 | None = None,
 ) -> ModelRequest:
     """Build a complete stateless, web-disabled Synthesis drafting request."""
+    if not isinstance(mode, SynthesisMode):
+        raise ValueError("Synthesis request mode is invalid")
+    if revision is not None and mode is not SynthesisMode.REVISE_PREVIOUS:
+        raise ValueError("Synthesis revision context requires REVISE_PREVIOUS mode")
+    if revision is None and mode is SynthesisMode.REVISE_PREVIOUS:
+        raise ValueError("REVISE_PREVIOUS mode requires a canonical previous synthesis")
+    if revision is not None:
+        if revision.previous_synthesis.subject_id != snapshot.subject_id:
+            raise ValueError("Synthesis revision context belongs to another Subject")
+        if revision.previous_extraction.subject_id != snapshot.subject_id:
+            raise ValueError("Synthesis revision context extraction belongs to another Subject")
     if (
         run.id != snapshot.production_run_id
         or run.subject_id != snapshot.subject_id
@@ -696,16 +725,24 @@ def build_synthesis_model_request(
     policy_hash = synthesis_access_policy_hash(access_policy)
     functional_hash = synthesis_input_hash(snapshot, extraction, evidence_pack, policy_hash)
     pack_hash = synthesis_evidence_pack_hash(evidence_pack)
+    instructions = (
+        "Write in the requested publication language. Paraphrase and organize "
+        "only the supplied "
+        "evidence; invent no facts, dates, identifiers, causal links, or source details. Omit "
+        "unsupported information. Cite every factual claim using one or more exact evidence "
+        "handles from this pack. Handles are temporary references; never output handles in "
+        "claim text. Keep claims atomic, use plain text without Markdown or HTML, and return "
+        "only the requested structured proposal."
+    )
+    if revision is not None:
+        instructions += (
+            " A previous synthesis is supplied as non-authoritative context only: the current "
+            "evidence pack is the sole factual authority. Reuse a previous claim only when the "
+            "current pack still supports it, cite it with current handles, and drop or rewrite "
+            "every claim whose evidence was removed."
+        )
     prompt_payload = {
-        "instructions": (
-            "Write in the requested publication language. Paraphrase and organize "
-            "only the supplied "
-            "evidence; invent no facts, dates, identifiers, causal links, or source details. Omit "
-            "unsupported information. Cite every factual claim using one or more exact evidence "
-            "handles from this pack. Handles are temporary references; never output handles in "
-            "claim text. Keep claims atomic, use plain text without Markdown or HTML, and return "
-            "only the requested structured proposal."
-        ),
+        "instructions": instructions,
         "publication_language": snapshot.publication_language,
         "frozen_subject_context": {
             "title": snapshot.subject_title,
@@ -735,6 +772,8 @@ def build_synthesis_model_request(
             "allowed_section_kinds": [kind.value for kind in SynthesisSectionKind],
         },
     }
+    if revision is not None:
+        prompt_payload.update(build_synthesis_revision_payload(revision, evidence_pack))
     prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if any(str(record.source_document_id) in prompt for record in access_policy.sources):
         raise ValueError("Source document identities cannot appear in the Synthesis prompt")
@@ -751,6 +790,7 @@ def build_synthesis_model_request(
         sensitivity=access_policy.effective_tlp.value,
         metadata={
             "synthesis_input_hash": functional_hash,
+            "synthesis_mode": mode.value,
             "synthesis_access_policy_hash": policy_hash,
             "effective_tlp": access_policy.effective_tlp.value,
             "external_llm_allowed": access_policy.external_llm_allowed,
@@ -1210,6 +1250,133 @@ def build_synthesis_delta(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class SynthesisRevisionContextV1:
+    """Non-authoritative previous synthesis plus its exact evidence delta.
+
+    The previous document and its extraction are context only: the current
+    evidence pack stays the single factual authority of the revision draft and
+    removed evidence can never be cited again.
+    """
+
+    previous_artifact_id: UUID
+    previous_synthesis: ProductionSynthesisV1
+    previous_extraction: ProductionExtractionV1
+    delta: SynthesisDeltaV1
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.previous_artifact_id, UUID):
+            raise ValueError("Revision context requires a previous artifact identity")
+        if not isinstance(self.previous_synthesis, ProductionSynthesisV1):
+            raise ValueError("Revision context requires a canonical previous synthesis")
+        if not isinstance(self.previous_extraction, ProductionExtractionV1):
+            raise ValueError("Revision context requires the previous canonical extraction")
+        if not isinstance(self.delta, SynthesisDeltaV1):
+            raise ValueError("Revision context requires a synthesis evidence delta")
+        if (
+            self.previous_synthesis.subject_id != self.previous_extraction.subject_id
+            or self.previous_synthesis.extraction_hash
+            != canonical_extraction_hash(self.previous_extraction)
+        ):
+            raise ValueError("Revision context previous synthesis lineage is inconsistent")
+
+
+def _revision_claim_payload(
+    paragraph: SynthesisParagraphV1, evidence_pack: SynthesisEvidencePackV1
+) -> dict[str, Any]:
+    """Project one previous claim with only currently citable prompt handles."""
+    handles = [
+        handle
+        for handle in (evidence_pack.handle_for(ref) for ref in paragraph.evidence_refs)
+        if handle is not None
+    ]
+    return {
+        "text": paragraph.text,
+        "evidence_handles": handles,
+        "unsupported_evidence_count": len(paragraph.evidence_refs) - len(handles),
+    }
+
+
+def build_synthesis_revision_payload(
+    context: SynthesisRevisionContextV1, evidence_pack: SynthesisEvidencePackV1
+) -> dict[str, Any]:
+    """Project the previous document and delta for the revision prompt.
+
+    Previous evidence identities are never sent: a claim keeps only the
+    handles that still exist in the current pack, and removed evidence is
+    reported as a count so no internal identity can be echoed back.
+    """
+    previous = context.previous_synthesis
+    return {
+        "previous_synthesis_non_authoritative": {
+            "non_authoritative": True,
+            "publication_language": previous.publication_language,
+            "title": previous.title,
+            "lead": [
+                _revision_claim_payload(paragraph, evidence_pack) for paragraph in previous.lead
+            ],
+            "sections": [
+                {
+                    "kind": section.kind.value,
+                    "heading": section.heading,
+                    "claims": [
+                        _revision_claim_payload(paragraph, evidence_pack)
+                        for paragraph in section.paragraphs
+                    ],
+                }
+                for section in previous.sections
+            ],
+            "timeline": [
+                {
+                    "event_date": entry.event_date.isoformat()
+                    if entry.event_date is not None
+                    else None,
+                    "date_text": entry.date_text,
+                    "text": entry.text,
+                }
+                for entry in previous.timeline
+            ],
+            "uncertainties": [item.text for item in previous.uncertainties],
+        },
+        "evidence_delta": {
+            "added": {
+                "count": len(context.delta.added_evidence),
+                "handles": [
+                    handle
+                    for handle in (
+                        evidence_pack.handle_for(ref) for ref in context.delta.added_evidence
+                    )
+                    if handle is not None
+                ],
+            },
+            "removed": {
+                "count": len(context.delta.removed_evidence),
+                "kinds": sorted({ref.kind.value for ref in context.delta.removed_evidence}),
+            },
+            "unchanged": {
+                "count": len(context.delta.unchanged_evidence),
+                "handles": [
+                    handle
+                    for handle in (
+                        evidence_pack.handle_for(ref) for ref in context.delta.unchanged_evidence
+                    )
+                    if handle is not None
+                ],
+            },
+        },
+    }
+
+
+def _revision_details(context: SynthesisRevisionContextV1) -> dict[str, Any]:
+    """Bounded revision provenance for the stage result."""
+    return {
+        "previous_synthesis_artifact_id": str(context.previous_artifact_id),
+        "added_evidence_count": len(context.delta.added_evidence),
+        "removed_evidence_count": len(context.delta.removed_evidence),
+        "unchanged_evidence_count": len(context.delta.unchanged_evidence),
+    }
+
+
 def render_synthesis_markdown(
     synthesis: ProductionSynthesisV1, extraction: ProductionExtractionV1
 ) -> str:
@@ -1441,6 +1608,7 @@ class ProductionSynthesisService:
                     "synthesis_access_policy_hash": synthesis_access_policy_hash(policy),
                 },
             )
+        revision = await self._find_revision_context(run, snapshot, extraction, input_hash)
         return await self._draft(
             run=run,
             snapshot=snapshot,
@@ -1449,6 +1617,7 @@ class ProductionSynthesisService:
             policy=policy,
             extraction_hash=extraction_hash,
             input_hash=input_hash,
+            revision=revision,
         )
 
     async def _load_extraction(
@@ -1579,12 +1748,22 @@ class ProductionSynthesisService:
         if reuse is None:
             return None
         artifact = reuse.artifact
-        if artifact.canonical_blob_id is None:
+        if (
+            artifact.stage is not ProductionArtifactStage.SYNTHESIS
+            or artifact.status is not ProductionArtifactStatus.VERIFIED
+            or artifact.subject_id != snapshot.subject_id
+            or artifact.input_hash != input_hash
+            or artifact.canonical_blob_id is None
+        ):
             raise _SynthesisControlError(
                 SynthesisStageErrorCode.REUSE_INVALID,
-                "The reusable synthesis artifact carries no canonical synthesis",
+                "The reusable synthesis artifact is not an exact verified canonical synthesis",
                 status=SynthesisExecutionStatus.NEEDS_REVIEW,
-                details={"artifact_id": str(artifact.id)},
+                details={
+                    "artifact_id": str(artifact.id),
+                    "status": artifact.status.value,
+                    "input_hash_match": artifact.input_hash == input_hash,
+                },
             )
         try:
             payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
@@ -1614,6 +1793,150 @@ class ProductionSynthesisService:
             },
         )
 
+    async def _find_revision_context(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction: ProductionExtractionV1,
+        input_hash: str,
+    ) -> SynthesisRevisionContextV1 | None:
+        """Locate the most recent eligible prior canonical synthesis, if any.
+
+        Only a verified canonical ``ProductionSynthesisV1`` whose associated
+        canonical extraction is still decodable can become non-authoritative
+        revision context; rendered-only legacy artifacts never qualify.
+        """
+        async with self._uow_factory() as uow:
+            candidates = await self._revision_candidates(uow, run, snapshot)
+            for artifact in candidates:
+                context = await self._decode_revision_candidate(
+                    uow, artifact, extraction, input_hash
+                )
+                if context is not None:
+                    return context
+        return None
+
+    async def _revision_candidates(
+        self,
+        uow: ProductionUnitOfWork,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+    ) -> list[ProductionArtifact]:
+        """Return eligible prior canonical synthesis artifacts, most recent first."""
+        # Imported locally: production_artifact_reuse imports this module.
+        from cti_app.application.production_artifact_reuse import cross_run_reuse_allowed
+
+        artifacts_repo = getattr(uow, "production_artifacts", None)
+        list_current = getattr(artifacts_repo, "list_current_for_edition", None)
+        if list_current is None:
+            return []
+
+        cross_run_allowed = cross_run_reuse_allowed(run, ProductionArtifactStage.SYNTHESIS)
+        cutoff = await self._revision_invalidation_cutoff(uow, run)
+        artifacts = await list_current(run.edition_id, ProductionArtifactStage.SYNTHESIS.value)
+        eligible = [
+            artifact
+            for artifact in artifacts
+            if artifact.stage is ProductionArtifactStage.SYNTHESIS
+            and artifact.status is ProductionArtifactStatus.VERIFIED
+            and artifact.canonical_blob_id is not None
+            and artifact.subject_id == snapshot.subject_id
+            and (
+                artifact.production_run_id == run.id
+                or (cross_run_allowed and (cutoff is None or artifact.created_at > cutoff))
+            )
+        ]
+        return sorted(eligible, key=lambda item: (item.created_at, str(item.id)), reverse=True)
+
+    @staticmethod
+    async def _revision_invalidation_cutoff(
+        uow: ProductionUnitOfWork, run: ProductionRun
+    ) -> datetime | None:
+        """Latest reuse invalidation that also invalidates a prior synthesis."""
+        repository = getattr(uow, "production_reuse_invalidations", None)
+        list_for_subject = getattr(repository, "list_for_subject", None)
+        if list_for_subject is None:
+            return None
+        invalidations = await list_for_subject(run.edition_id, run.subject_id)
+        applicable = [
+            item.occurred_at
+            for item in invalidations
+            if getattr(getattr(item, "from_stage", None), "value", None)
+            in {"references", "extraction", "synthesis"}
+        ]
+        return max(applicable) if applicable else None
+
+    async def _decode_revision_candidate(
+        self,
+        uow: ProductionUnitOfWork,
+        artifact: ProductionArtifact,
+        extraction: ProductionExtractionV1,
+        input_hash: str,
+    ) -> SynthesisRevisionContextV1 | None:
+        """Decode a candidate and its associated extraction evidence identity."""
+        if artifact.canonical_blob_id is None:
+            return None
+        if artifact.input_hash == input_hash:
+            # Functionally identical to the current request: the exact-reuse
+            # boundary owns it, and a refusal there must not be smuggled in as
+            # a revision draft.
+            return None
+        try:
+            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except Exception:
+            return None
+        try:
+            previous_synthesis = production_synthesis_from_json(payload)
+        except (TypeError, ValueError):
+            return None
+        if previous_synthesis.subject_id != extraction.subject_id:
+            return None
+        previous_extraction = await self._associated_extraction(
+            uow, artifact.production_run_id, previous_synthesis.extraction_hash
+        )
+        if previous_extraction is None or previous_extraction.subject_id != extraction.subject_id:
+            return None
+        delta = build_synthesis_delta(previous_extraction, extraction)
+        return SynthesisRevisionContextV1(
+            previous_artifact_id=artifact.id,
+            previous_synthesis=previous_synthesis,
+            previous_extraction=previous_extraction,
+            delta=delta,
+        )
+
+    async def _associated_extraction(
+        self, uow: ProductionUnitOfWork, run_id: UUID, extraction_hash: str
+    ) -> ProductionExtractionV1 | None:
+        """Decode the canonical extraction that produced one prior synthesis."""
+        artifacts_repo = getattr(uow, "production_artifacts", None)
+        list_for_run = getattr(artifacts_repo, "list_for_run", None)
+        if list_for_run is None:
+            return None
+        artifacts = await list_for_run(run_id)
+        ordered = sorted(
+            (
+                artifact
+                for artifact in artifacts
+                if artifact.stage is ProductionArtifactStage.EXTRACTION
+                and artifact.canonical_blob_id is not None
+            ),
+            key=lambda item: item.version,
+            reverse=True,
+        )
+        for artifact in ordered:
+            try:
+                payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+                candidate = production_extraction_from_json(payload)
+            except ProductionReuseStorageUnavailableError:
+                raise
+            except Exception:
+                continue
+            if canonical_extraction_hash(candidate) == extraction_hash:
+                return candidate
+        return None
+
     async def _draft(
         self,
         *,
@@ -1624,11 +1947,12 @@ class ProductionSynthesisService:
         policy: SynthesisAccessPolicyV1,
         extraction_hash: str,
         input_hash: str,
+        revision: SynthesisRevisionContextV1 | None,
     ) -> ProductionSynthesisExecution:
         """Submit once, validate deterministically, then persist the canonical result."""
-        mode = SynthesisMode.FRESH
+        mode = SynthesisMode.REVISE_PREVIOUS if revision is not None else SynthesisMode.FRESH
         request = build_synthesis_model_request(
-            run, snapshot, extraction, evidence_pack, policy, mode
+            run, snapshot, extraction, evidence_pack, policy, mode, revision=revision
         )
         if request.metadata.get("synthesis_input_hash") != input_hash:
             raise ValueError("Synthesis request identity is inconsistent with its inputs")
@@ -1644,6 +1968,8 @@ class ProductionSynthesisService:
         ) -> ProductionSynthesisExecution:
             """A terminal outcome of the single submission, never a retry."""
             payload = dict(details)
+            if revision is not None:
+                payload.update(_revision_details(revision))
             if reconciliation:
                 payload["error_code"] = SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value
                 payload["model_run_id"] = str(run_id) if run_id is not None else None
@@ -1729,7 +2055,12 @@ class ProductionSynthesisService:
                 details=self._model_evidence(model_run),
             )
         try:
-            lead, sections = validate_synthesis_proposal(proposal, evidence_pack, extraction)
+            lead, sections = validate_synthesis_proposal(
+                proposal,
+                evidence_pack,
+                extraction,
+                removed_evidence=() if revision is None else revision.delta.removed_evidence,
+            )
         except SynthesisProposalControlError as exc:
             return reviewed(
                 exc.code.value,
@@ -1773,7 +2104,10 @@ class ProductionSynthesisService:
             input_hash=input_hash,
             extraction_hash=extraction_hash,
             model_calls=1,
-            details=_synthesis_counts(synthesis),
+            details={
+                **_synthesis_counts(synthesis),
+                **({} if revision is None else _revision_details(revision)),
+            },
         )
 
     @staticmethod
