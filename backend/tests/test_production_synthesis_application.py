@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import date
 from uuid import UUID, uuid4
 
+import pytest
+
 from cti_app.application.production_synthesis import (
     MAX_TECHNICAL_EVIDENCE_V1,
     SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION,
+    SynthesisClaimProposalV1,
+    SynthesisProposalControlError,
+    SynthesisSectionProposalV1,
     build_synthesis_delta,
     build_synthesis_evidence_pack,
     build_synthesis_timeline,
     build_synthesis_uncertainties,
     canonical_extraction_hash,
+    validate_synthesis_proposal,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
@@ -36,7 +43,11 @@ from cti_app.domain.production_extraction import (
     ProductionSourceExtractionV1,
 )
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
-from cti_app.domain.production_synthesis import EvidenceKind, extraction_evidence_refs_v1
+from cti_app.domain.production_synthesis import (
+    EvidenceKind,
+    SynthesisSectionKind,
+    extraction_evidence_refs_v1,
+)
 from cti_app.domain.publication import ArtifactType
 
 
@@ -152,6 +163,31 @@ def make_extraction(
         omitted_sources=(),
         warnings=(),
     )
+
+
+def make_proposal(
+    text: str,
+    handle: str,
+    *,
+    section_kind: str = "overview",
+    heading: str = "Overview",
+) -> dict[str, object]:
+    return {
+        "lead": [{"text": text, "evidence_handles": [handle]}],
+        "sections": [
+            {
+                "kind": section_kind,
+                "heading": heading,
+                "claims": [{"text": text, "evidence_handles": [handle]}],
+            }
+        ],
+    }
+
+
+def assert_proposal_error(call: Callable[[], object], expected_code: str) -> None:
+    with pytest.raises(SynthesisProposalControlError) as error:
+        call()
+    assert error.value.code == expected_code
 
 
 def test_refs_hash_and_prompt_handles_are_stable_across_source_load_order():
@@ -347,3 +383,264 @@ def test_uncertainties_union_provenance_and_delta_compares_exact_refs():
     assert set(delta.added_evidence) == current_refs - previous_refs
     assert set(delta.removed_evidence) == previous_refs - current_refs
     assert set(delta.unchanged_evidence) == previous_refs & current_refs
+
+
+def test_proposal_resolves_exact_handles_to_canonical_evidence_refs():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    lead, sections = validate_synthesis_proposal(
+        make_proposal("FooRAT was identified in the report.", handle), pack, extraction
+    )
+
+    assert lead[0].text == "FooRAT was identified in the report."
+    assert lead[0].evidence_refs == (pack.resolve_handle(handle),)
+    assert sections[0].kind is SynthesisSectionKind.OVERVIEW
+    assert not hasattr(lead[0], "evidence_handles")
+
+
+def test_proposal_rejects_unknown_handle_and_malformed_schema():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("FooRAT was identified.", "E999"), pack, extraction
+        ),
+        "synthesis_unknown_evidence",
+    )
+    malformed = make_proposal("FooRAT was identified.", str(pack.narrative_evidence[0]["handle"]))
+    malformed["subject_id"] = str(subject_id)
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(malformed, pack, extraction),
+        "synthesis_output_invalid",
+    )
+    empty_refs = make_proposal("FooRAT was identified.", "unused")
+    empty_refs["lead"] = [{"text": "FooRAT was identified.", "evidence_handles": []}]
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(empty_refs, pack, extraction),
+        "synthesis_output_invalid",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "# Campaign overview",
+        "| Source | Value |\n| --- | --- |",
+        "A claim [S1] was reported.",
+        "<p>A claim was reported.</p>",
+        "---\ntitle: Campaign\n---",
+    ),
+)
+def test_proposal_rejects_markdown_html_and_source_markers(text: str):
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(make_proposal(text, handle), pack, extraction),
+        "synthesis_output_invalid",
+    )
+
+
+def test_proposal_rejects_markup_in_section_heading():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("FooRAT was identified.", handle, heading="# Overview"),
+            pack,
+            extraction,
+        ),
+        "synthesis_output_invalid",
+    )
+
+
+def test_proposal_rejects_technical_literals_missing_from_extraction():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("FooRAT exploits CVE-2026-9999.", handle), pack, extraction
+        ),
+        "synthesis_unknown_technical_value",
+    )
+
+
+def test_technical_literal_scanner_accepts_extracted_value_classes():
+    subject_id, source_id = uuid4(), uuid4()
+    extracted_values = (
+        "CVE-2026-1234",
+        "192.0.2.7",
+        "2001:db8::1",
+        "evil.example",
+        "https://evil.example/path",
+        "a" * 64,
+        "analyst@evil.example",
+        "T1059.001",
+    )
+    text = "The report lists " + ", ".join(extracted_values) + "."
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, " ".join(extracted_values)),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    lead, _ = validate_synthesis_proposal(make_proposal(text, handle), pack, extraction)
+
+    assert lead[0].text == text
+
+
+def test_proposal_requires_technical_literal_to_be_covered_by_claim_refs():
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        facts=(make_fact(source_id, "FooRAT"),),
+        indicators=(make_indicator(source_id, "evil.example"),),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    proposal = make_proposal(
+        "The domain evil.example supports the operation.",
+        fact_handle,
+        section_kind="technical",
+        heading="Technical findings",
+    )
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(proposal, pack, extraction),
+        "synthesis_unknown_technical_value",
+    )
+
+
+def test_proposal_rejects_technical_only_evidence_for_campaign_narrative():
+    subject_id, source_id = uuid4(), uuid4()
+    source = make_source(
+        source_id,
+        tier=ProductionReferenceTier.TECHNICAL,
+        indicators=(make_indicator(source_id, "evil.example"),),
+    )
+    extraction = make_extraction(subject_id, (source,))
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.technical_evidence[0]["handle"])
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("The campaign used evil.example.", handle, section_kind="campaign"),
+            pack,
+            extraction,
+        ),
+        "synthesis_output_invalid",
+    )
+
+
+def test_proposal_accepts_event_and_fact_supported_dates_and_rejects_unsupported_dates():
+    subject_id, source_id = uuid4(), uuid4()
+    event = make_event(source_id, "The campaign began.", date(2026, 7, 2))
+    textual_date_event = make_event(
+        source_id, "Another operation was reported.", None, date_text="4 July 2026"
+    )
+    dated_fact = make_fact(source_id, "FooRAT was reported on 2 July 2026")
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(dated_fact,), events=(event, textual_date_event)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    event_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value
+    )
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    textual_date_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.EVENT.value and record["date_text"] == "4 July 2026"
+    )
+    event_result = validate_synthesis_proposal(
+        make_proposal("The campaign began on 2026-07-02.", event_handle), pack, extraction
+    )
+    fact_result = validate_synthesis_proposal(
+        make_proposal("FooRAT was reported on 2 July 2026.", fact_handle), pack, extraction
+    )
+    textual_date_result = validate_synthesis_proposal(
+        make_proposal("Another operation was reported on 4 July 2026.", textual_date_handle),
+        pack,
+        extraction,
+    )
+    assert event_result[0][0].evidence_refs == (pack.resolve_handle(event_handle),)
+    assert fact_result[0][0].evidence_refs == (pack.resolve_handle(fact_handle),)
+    assert textual_date_result[0][0].evidence_refs == (pack.resolve_handle(textual_date_handle),)
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("The campaign began on 2026-07-03.", event_handle), pack, extraction
+        ),
+        "synthesis_unknown_date",
+    )
+
+
+def test_proposal_rejects_removed_revision_evidence():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    removed_ref = pack.resolve_handle(handle)
+
+    assert_proposal_error(
+        lambda: validate_synthesis_proposal(
+            make_proposal("FooRAT was identified.", handle),
+            pack,
+            extraction,
+            removed_evidence=(removed_ref,),
+        ),
+        "synthesis_unknown_evidence",
+    )
+
+
+def test_proposal_schema_objects_are_strict_and_validate_section_kinds():
+    claim = SynthesisClaimProposalV1("FooRAT was reported.", ("E001",))
+    section = SynthesisSectionProposalV1(SynthesisSectionKind.OVERVIEW, "Overview", (claim,))
+    assert section.claims == (claim,)
+    with pytest.raises(ValueError):
+        SynthesisClaimProposalV1("Claim", ())
+    with pytest.raises(ValueError):
+        SynthesisSectionProposalV1("unknown", "Heading", (claim,))  # type: ignore[arg-type]
