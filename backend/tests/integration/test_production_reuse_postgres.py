@@ -51,6 +51,7 @@ from cti_app.application.production_stages import (
     PublicationAssemblyService,
     compute_input_hash,
 )
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _references_input_hash,
@@ -97,6 +98,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionReuseInvalidation,
     ProductionRun,
@@ -107,6 +109,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionEventV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
@@ -118,6 +121,18 @@ from cti_app.domain.production_references import (
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+)
+from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+    SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    SynthesisTimelineEntryV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
 )
 from cti_app.domain.selection import (
     SelectionAction,
@@ -579,6 +594,44 @@ async def _prepare_reusable_article(
     return batch, source
 
 
+def _canonical_synthesis(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    text: str,
+) -> ProductionSynthesisV1:
+    event_ref = next(
+        ref for ref in extraction_evidence_refs_v1(extraction) if ref.kind is EvidenceKind.EVENT
+    )
+    paragraph = SynthesisParagraphV1(text=text, evidence_refs=(event_ref,))
+    return ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=extraction.subject_id,
+        production_input_hash=extraction.production_input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language=snapshot.publication_language,
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=snapshot.subject_title,
+        lead=(paragraph,),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="Campaign overview",
+                paragraphs=(paragraph,),
+            ),
+        ),
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=date(2026, 8, 5),
+                date_text=None,
+                text=text,
+                evidence_refs=(event_ref,),
+            ),
+        ),
+        uncertainties=(),
+        warnings=(),
+    )
+
+
 async def _store_canonical_first_pass(
     store: ProductionArtifactStore,
     *,
@@ -661,7 +714,17 @@ async def _store_canonical_first_pass(
                 checkpoint_id=None,
                 reuse_state=ExtractionReuseState.FRESH,
                 facts=(),
-                events=(),
+                events=(
+                    ExtractionEventV1(
+                        event_date=date(2026, 8, 5),
+                        date_text=None,
+                        text=event_text,
+                        context="Campaign chronology.",
+                        evidence_quote=event_text,
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(document_id,),
+                    ),
+                ),
                 indicators=(),
                 rules=(),
                 uncertainties=(),
@@ -693,6 +756,7 @@ async def _store_canonical_first_pass(
         extraction_hash=extraction_input_hash(
             references_corpus_hash=references_corpus_hash(corpus)
         ),
+        extraction=extraction,
         extraction_blob_id=extraction_blob_id,
         synthesis_hash=_synthesis_input_hash(
             subject_id=subject.id,
@@ -747,8 +811,11 @@ async def _seed_reusable_article(
     synthesis_hash = first_pass.synthesis_hash
     refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
     extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
-    _, _, synthesis_blob_id = await store.store_stage_payloads(
-        raw=f"{title} synthesis", rendered=f"{title} was reported [S1]."
+    synthesis = _canonical_synthesis(snapshot, first_pass.extraction, f"{title} was reported.")
+    _, synthesis_canonical_id, synthesis_blob_id = await store.store_stage_payloads(
+        raw=f"{title} synthesis",
+        canonical=production_synthesis_to_json(synthesis),
+        rendered="Deliberately unrelated preview [S99].",
     )
     source_artifacts = {
         ProductionArtifactStage.REFERENCES: ProductionArtifact(
@@ -778,6 +845,7 @@ async def _seed_reusable_article(
             version=1,
             input_hash=synthesis_hash,
             status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
         ),
     }
@@ -1079,8 +1147,13 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     synthesis_hash = first_pass.synthesis_hash
     refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
     extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
-    _, _, synthesis_blob_id = await store.store_stage_payloads(
-        raw="synthesis A", rendered="The selected campaign was reported [S1]."
+    synthesis = _canonical_synthesis(
+        snapshot_a, first_pass.extraction, "The selected campaign was reported."
+    )
+    _, synthesis_canonical_id, synthesis_blob_id = await store.store_stage_payloads(
+        raw="synthesis A",
+        canonical=production_synthesis_to_json(synthesis),
+        rendered="Deliberately unrelated preview [S99].",
     )
     source_artifacts = {
         ProductionArtifactStage.REFERENCES: ProductionArtifact(
@@ -1107,6 +1180,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             stage=ProductionArtifactStage.SYNTHESIS,
             version=1,
             input_hash=synthesis_hash,
+            canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
         ),
     }
@@ -1116,6 +1190,36 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         await uow.commit()
 
     assembly = PublicationAssemblyService(uow_factory, store)
+    assembly_inputs = (
+        source_artifacts[ProductionArtifactStage.REFERENCES],
+        source_artifacts[ProductionArtifactStage.EXTRACTION],
+        source_artifacts[ProductionArtifactStage.SYNTHESIS],
+    )
+    first_projection = (await assembly._load_inputs(*assembly_inputs))[2]
+    repeated_projection = (await assembly._load_inputs(*assembly_inputs))[2]
+    assert first_projection.encode("utf-8") == repeated_projection.encode("utf-8")
+    assert first_projection.count("[S1]") == 3
+    assert "The selected campaign was reported." in first_projection
+    assert "[S99]" not in first_projection
+
+    unmapped_ref = replace(synthesis.lead[0].evidence_refs[0], source_document_id=uuid4())
+    unmapped_paragraph = replace(synthesis.lead[0], evidence_refs=(unmapped_ref,))
+    unmapped_synthesis = replace(
+        synthesis,
+        lead=(unmapped_paragraph,),
+        sections=(replace(synthesis.sections[0], paragraphs=(unmapped_paragraph,)),),
+        timeline=(replace(synthesis.timeline[0], evidence_refs=(unmapped_ref,)),),
+    )
+    _, unmapped_canonical_id, _ = await store.store_stage_payloads(
+        canonical=production_synthesis_to_json(unmapped_synthesis)
+    )
+    with pytest.raises(ValueError, match="absent from canonical extraction"):
+        await assembly._load_inputs(
+            assembly_inputs[0],
+            assembly_inputs[1],
+            replace(assembly_inputs[2], canonical_blob_id=unmapped_canonical_id),
+        )
+
     publication_a = await assembly.assemble_publication(
         run_id=run_a.id,
         subject_id=subject.id,

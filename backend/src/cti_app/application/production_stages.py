@@ -32,6 +32,7 @@ from cti_app.application.production_references import (
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.production_synthesis import (
     SYNTHESIS_METADATA_KEYS,
+    project_legacy_synthesis_markdown,
     render_synthesis_markdown,
 )
 from cti_app.application.publication_builder import build_publication_document
@@ -45,6 +46,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
+    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -710,16 +712,53 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             raise ValueError("References artifact has no canonical payload")
         if extraction_artifact.canonical_blob_id is None:
             raise ValueError("Extraction artifact has no canonical payload")
-        if synthesis_artifact.rendered_blob_id is None:
-            raise ValueError("Synthesis artifact has no rendered payload")
+        if synthesis_artifact.canonical_blob_id is None:
+            raise ValueError("Synthesis artifact has no canonical payload")
         report = await load_reference_projection(self._artifact_store, references_artifact)
         if report is None:
             raise ValueError("References payload is not readable")
+        extraction_payload = await self._artifact_store.read_json(
+            extraction_artifact.canonical_blob_id
+        )
+        canonical_extraction = production_extraction_from_json(extraction_payload)
         extraction = legacy_technical_extraction_from_payload(
-            await self._artifact_store.read_json(extraction_artifact.canonical_blob_id),
+            extraction_payload,
             source_labels=report_source_labels(report),
         )
-        synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)
+        synthesis = production_synthesis_from_json(
+            await self._artifact_store.read_json(synthesis_artifact.canonical_blob_id)
+        )
+        document_urls = {
+            source.source_document_id: source.canonical_url
+            for source in canonical_extraction.sources
+        }
+        legacy_labels_by_url = report_source_labels(report)
+        evidence_refs = {ref for paragraph in synthesis.lead for ref in paragraph.evidence_refs}
+        evidence_refs.update(
+            ref
+            for section in synthesis.sections
+            for paragraph in section.paragraphs
+            for ref in paragraph.evidence_refs
+        )
+        evidence_refs.update(ref for entry in synthesis.timeline for ref in entry.evidence_refs)
+        source_labels: dict[UUID, str] = {}
+        for ref in evidence_refs:
+            canonical_url = document_urls.get(ref.source_document_id)
+            if canonical_url is None:
+                raise ValueError(
+                    "Canonical synthesis evidence source is absent from canonical extraction: "
+                    f"{ref.source_document_id}"
+                )
+            local_id = legacy_labels_by_url.get(canonical_url)
+            if local_id is None:
+                raise ValueError(
+                    "Canonical synthesis evidence source cannot be mapped to the legacy "
+                    f"ReferenceReport by exact canonical URL: {canonical_url}"
+                )
+            source_labels[ref.source_document_id] = local_id
+        synthesis_text = project_legacy_synthesis_markdown(
+            synthesis, canonical_extraction, source_labels
+        )
         return report, extraction, synthesis_text
 
 

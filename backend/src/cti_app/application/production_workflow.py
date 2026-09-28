@@ -1323,17 +1323,16 @@ class ProductionWorkflowOrchestrator:
         store = self._artifact_store
         loaded: dict[str, Any] = {}
         try:
-            if references.canonical_blob_id is not None:
-                report = await load_reference_projection(store, references)
-                if report is not None:
-                    loaded["report"] = report
-            if extraction.canonical_blob_id is not None:
-                loaded["extraction"] = legacy_technical_extraction_from_payload(
-                    await store.read_json(extraction.canonical_blob_id),
-                    source_labels=report_source_labels(report) if report is not None else None,
-                )
-            if synthesis.rendered_blob_id is not None:
-                loaded["synthesis_text"] = await store.read_text(synthesis.rendered_blob_id)
+            report, legacy_extraction, synthesis_text = await self._assembly._load_inputs(
+                references, extraction, synthesis
+            )
+            loaded.update(
+                {
+                    "report": report,
+                    "extraction": legacy_extraction,
+                    "synthesis_text": synthesis_text,
+                }
+            )
             if publication.rendered_blob_id is not None:
                 loaded["publication_markdown"] = await store.read_text(publication.rendered_blob_id)
         except Exception:
