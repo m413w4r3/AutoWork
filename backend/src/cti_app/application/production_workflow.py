@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -45,7 +44,6 @@ from cti_app.application.production_extraction import (
     ProductionExtractionControlError,
     ProductionExtractionService,
     legacy_technical_extraction_from_payload,
-    load_legacy_technical_extraction,
     production_extraction_metadata,
     source_text_contract_version,
 )
@@ -53,7 +51,6 @@ from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import (
     ParseResult,
     ReferenceReport,
-    reference_report_to_json,
     validate_synthesis,
 )
 from cti_app.application.production_prompts import (
@@ -94,6 +91,11 @@ from cti_app.application.production_stages import (
     SynthesisService,
     compute_input_hash,
 )
+from cti_app.application.production_synthesis import (
+    ProductionSynthesisExecution,
+    ProductionSynthesisService,
+    SynthesisExecutionStatus,
+)
 from cti_app.application.production_synthesis_revision import (
     MAX_SYNTHESIS_REVISION_CONTEXT_BYTES,
     MAX_SYNTHESIS_REVISION_TEXT_BYTES,
@@ -106,7 +108,7 @@ from cti_app.application.production_synthesis_revision import (
     synthesis_semantic_source_ids,
 )
 from cti_app.config import get_settings
-from cti_app.domain.collection import CollectionState, SourceOriginKind
+from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
@@ -534,6 +536,20 @@ class ProductionWorkflowOrchestrator:
         self._assembly = PublicationAssemblyService(production_uow_factory, artifact_store)
         self._artifact_reuse = ProductionArtifactReuseService(
             production_uow_factory, artifact_store, self._diagnostics
+        )
+        # The canonical SYNTHESIS stage consumes only the frozen snapshot and
+        # the current canonical EXTRACTION artifact. Without a gateway and a
+        # store it fails explicitly instead of falling back to the legacy path.
+        self._canonical_synthesis: ProductionSynthesisService | None = (
+            ProductionSynthesisService(
+                uow_factory=production_uow_factory,
+                artifact_store=artifact_store,
+                model_gateway=self._model_gateway,
+                synthesis_service=self._synthesis,
+                artifact_reuse=self._artifact_reuse,
+            )
+            if self._model_gateway is not None and artifact_store is not None
+            else None
         )
         self._qa = ProductionQAService(production_uow_factory)
         self._seed_enrichment = seed_enrichment
@@ -1896,416 +1912,110 @@ class ProductionWorkflowOrchestrator:
         context: JobExecutionContext | None = None,
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
-        await self._check_cancellation(run.id, context)
-        async with self._uow_factory() as uow:
-            extraction = await uow.production_artifacts.get_current(run.id, "extraction")
-            references = await uow.production_artifacts.get_current(run.id, "references")
-            if not extraction:
-                return {
-                    "stage": "synthesis",
-                    "status": "error",
-                    "error": "Extraction artifact not found",
-                }
-            if references is None:
-                return {
-                    "stage": "synthesis",
-                    "status": "error",
-                    "error": "References artifact not found",
-                }
+        """Canonical SYNTHESIS: frozen snapshot plus current EXTRACTION artifact.
 
-            report = await self._load_reference_report(references)
-            if (
-                report is None
-                or self._artifact_store is None
-                or extraction.canonical_blob_id is None
-            ):
-                return {
-                    "stage": "synthesis",
-                    "status": "terminal_error",
-                    "error_code": "synthesis_inputs_missing",
-                    "error": "Reference or extraction payload is not readable",
-                }
-            synthesis_ctx = await build_subject_production_context(
-                uow,
-                run.subject_id,
-                snapshot=snapshot,
-                relevant_source_urls={source.canonical_url for source in report.sources},
-            )
-            synthesis_policy_allows = synthesis_ctx.external_llm_allowed
-            extraction_payload = await load_legacy_technical_extraction(
-                uow_factory=self._uow_factory,
-                artifact_store=self._artifact_store,
-                run_id=run.id,
-                source_labels=report_source_labels(report),
-            )
-            if extraction_payload is None:
-                return {
-                    "stage": "synthesis",
-                    "status": "terminal_error",
-                    "error_code": "synthesis_inputs_missing",
-                    "error": "Extraction payload is not readable",
-                }
-            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
-            collections = await uow.source_collections.list_for_subject(run.subject_id)
-            source_tiers_by_url: dict[str, str] = {}
-            if snapshot is not None:
-                core_urls = {source.canonical_url for source in snapshot.core_sources}
-                relevant_urls = {source.canonical_url for source in report.sources}
-                source_tiers_by_url.update({url: "core" for url in core_urls})
-                source_tiers_by_url.update({url: "supporting" for url in relevant_urls - core_urls})
-            else:
-                for collection in collections:
-                    if collection.origin_kind in {
-                        SourceOriginKind.DISCOVERY,
-                        SourceOriginKind.MANUAL,
-                    }:
-                        source_tiers_by_url[collection.canonical_url] = "core"
-                    elif collection.origin_kind is SourceOriginKind.REFERENCE_RESEARCH:
-                        source_tiers_by_url[collection.canonical_url] = "supporting"
-            synthesis_pack = self._build_synthesis_evidence_pack(
-                report, extraction_payload, source_tiers_by_url
-            )
-            # Q4 identity follows the semantic evidence pack.  Detection-rule
-            # repairs and publication-only IOC overrides are intentionally not
-            # part of that pack, so replaying them cannot manufacture a second
-            # synthesis call after a source-driven Q2.
-            semantic_synthesis_hash = compute_input_hash(synthesis_pack)
-            synthesis_source_ids = synthesis_semantic_source_ids(synthesis_pack)
-            synthesis_repair_keys = narrative_repair_keys(
-                extraction_payload,
-                extraction.metadata if isinstance(extraction.metadata, dict) else None,
-            )
-            input_hash = _synthesis_input_hash(
-                subject_id=run.subject_id,
-                references_hash=references.input_hash,
-                reference_report_hash=compute_input_hash(reference_report_to_json(report)),
-                extraction_hash=semantic_synthesis_hash,
-                technical_extraction_hash=semantic_synthesis_hash,
-                synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
-                revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
-                current_synthesis_semantic_hash=semantic_synthesis_hash,
-            )
-            current_synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
-            reused = await self._reuse_artifact(run, "synthesis", input_hash)
-            if reused is not None:
-                reused_id = reused.get("reused_from_artifact_id") or reused.get("artifact_id")
-                current_metadata = (
-                    current_synthesis.metadata
-                    if current_synthesis is not None
-                    and isinstance(current_synthesis.metadata, dict)
-                    else {}
-                )
-                self._record_synthesis_mode(
-                    run=run,
-                    mode=SynthesisMode.REUSE_EXACT,
-                    previous_artifact_id=UUID(str(reused_id)) if reused_id else None,
-                    previous_word_count=int(current_metadata.get("word_count", 0) or 0),
-                    context=None,
-                )
-                reused["mode"] = SynthesisMode.REUSE_EXACT.value
-                return reused
-            compatible = await self._find_compatible_historical_synthesis(
-                uow=uow,
-                run=run,
-                report=report,
-                extraction_payload=extraction_payload,
-                source_tiers_by_url=source_tiers_by_url,
-                semantic_projection_hash=semantic_synthesis_hash,
-            )
-            if (
-                compatible is not None
-                and current_synthesis is not None
-                and compatible.id == current_synthesis.id
-                and current_synthesis.status is ProductionArtifactStatus.VERIFIED
-            ):
-                # Technical replay of an unchanged stage. A draft written in
-                # REVISE_PREVIOUS mode carries the revision identity, which the
-                # pre-revision probe hash above can never match, so the same-run
-                # cache check misses it. The run already holds this exact row as
-                # its current artifact: cloning it onto itself would make the
-                # replay append a row and report a reuse it did not perform.
-                current_metadata = (
-                    current_synthesis.metadata
-                    if isinstance(current_synthesis.metadata, dict)
-                    else {}
-                )
-                self._record_synthesis_mode(
-                    run=run,
-                    mode=SynthesisMode.REUSE_EXACT,
-                    previous_artifact_id=current_synthesis.id,
-                    previous_word_count=int(current_metadata.get("word_count", 0) or 0),
-                    context=None,
-                )
-                return {
-                    "stage": "synthesis",
-                    "status": "cached",
-                    "mode": SynthesisMode.REUSE_EXACT.value,
-                    "artifact_id": str(current_synthesis.id),
+        AW-012 removed REFERENCES, the reference report, the legacy technical
+        extraction and the conversational transport from this stage.
+        ``ProductionSynthesisService`` owns the deterministic evidence pack, the
+        single stateless ``ModelGateway.draft`` submission, the grounding
+        validation, the reuse and the revision; this boundary only loads the
+        current canonical EXTRACTION artifact and maps the bounded execution
+        outcome onto the durable job state transitions.
+        """
+        await self._check_cancellation(run.id, context)
+        if snapshot is None:
+            return {
+                "stage": "synthesis",
+                "status": "terminal_error",
+                "error_code": "synthesis_inputs_missing",
+                "error": "Production input snapshot is not readable",
+            }
+        service = self._canonical_synthesis
+        if service is None:
+            return {
+                "stage": "synthesis",
+                "status": "error",
+                "error": "Canonical synthesis service is not configured",
+            }
+        async with self._uow_factory() as uow:
+            # Only the current EXTRACTION artifact is read: REFERENCES is no
+            # longer loaded, hashed or projected by the canonical branch.
+            extraction_artifact = await uow.production_artifacts.get_current(run.id, "extraction")
+        if extraction_artifact is None:
+            return {
+                "stage": "synthesis",
+                "status": "error",
+                "error": "Extraction artifact not found",
+            }
+        try:
+            execution = await service.execute(run, snapshot, extraction_artifact)
+        except JobCancelledError:
+            raise
+        except Exception as exc:
+            await self._check_cancellation(run.id, context)
+            return self._handle_stage_exception(run, "synthesis", exc)
+        await self._check_cancellation(run.id, context)
+        return self._synthesis_execution_result(execution)
+
+    @staticmethod
+    def _synthesis_execution_result(
+        execution: ProductionSynthesisExecution,
+    ) -> dict[str, Any]:
+        """Map the canonical execution onto the durable stage-result contract."""
+        details = dict(execution.details)
+        result: dict[str, Any] = {
+            "stage": "synthesis",
+            "mode": execution.mode.value,
+            "input_hash": execution.input_hash,
+            "extraction_hash": execution.extraction_hash,
+            "model_calls": execution.model_calls,
+        }
+        if execution.model_run_id is not None:
+            result["model_run_id"] = str(execution.model_run_id)
+        artifact_id = str(execution.artifact_id) if execution.artifact_id is not None else None
+        if execution.status is SynthesisExecutionStatus.SUCCEEDED:
+            result.update(
+                {
+                    "status": "success",
+                    "artifact_id": artifact_id,
                     "reused": False,
                     "reused_from_artifact_id": None,
+                    **details,
                 }
-            if compatible is not None:
-                repair_marker = (
-                    extraction.metadata.get("repair_materialization")
-                    if isinstance(extraction.metadata, dict)
-                    else None
-                )
-                repair_materialization = (
-                    dict(cast(dict[str, Any], repair_marker))
-                    if isinstance(repair_marker, dict)
-                    else None
-                )
-                if repair_materialization is not None:
-                    repair_materialization["reused_synthesis_artifact_id"] = str(compatible.id)
-                artifact = await self._synthesis.reuse_synthesis_result_in_uow(
-                    uow,
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    source_artifact=compatible,
-                    input_hash=input_hash,
-                    semantic_projection_hash=semantic_synthesis_hash,
-                    metadata_extra=(
-                        {
-                            "synthesis_mode": SynthesisMode.REUSE_EXACT.value,
-                            "semantic_source_ids": list(synthesis_source_ids),
-                            "semantic_repair_keys": list(synthesis_repair_keys),
-                            "semantic_projection_hash": semantic_synthesis_hash,
-                            "repair_materialization": repair_materialization,
-                            "semantic_projection_before": semantic_synthesis_hash,
-                            "semantic_projection_after": semantic_synthesis_hash,
-                        }
-                        if repair_materialization is not None
-                        else {
-                            "synthesis_mode": SynthesisMode.REUSE_EXACT.value,
-                            "semantic_source_ids": list(synthesis_source_ids),
-                            "semantic_repair_keys": list(synthesis_repair_keys),
-                            "semantic_projection_hash": semantic_synthesis_hash,
-                            "semantic_projection_before": semantic_synthesis_hash,
-                            "semantic_projection_after": semantic_synthesis_hash,
-                        }
-                    ),
-                )
-                await uow.commit()
-                compatible_text = ""
-                try:
-                    compatible_text = await self._artifact_store.read_text(
-                        cast(UUID, compatible.rendered_blob_id)
-                    )
-                except Exception:
-                    pass
-                self._record_synthesis_mode(
-                    run=run,
-                    mode=SynthesisMode.REUSE_EXACT,
-                    previous_artifact_id=compatible.id,
-                    previous_word_count=len(compatible_text.split()),
-                    context=None,
-                )
-                return {
-                    "stage": "synthesis",
-                    "status": "reused",
-                    "mode": SynthesisMode.REUSE_EXACT.value,
-                    "artifact_id": str(artifact.id),
-                    "reused": True,
-                    "reused_from_artifact_id": str(compatible.id),
-                    "compatibility": "semantic_projection_unchanged",
+            )
+            return result
+        if execution.status is SynthesisExecutionStatus.REUSED:
+            reused = bool(details.get("reused"))
+            result.update(
+                {
+                    "status": "reused" if reused else "cached",
+                    "artifact_id": artifact_id,
+                    "reused": reused,
+                    "reused_from_artifact_id": details.get("reused_from_artifact_id"),
                 }
-            revision_candidate = await self._find_revision_candidate(
-                uow=uow,
-                run=run,
-                report=report,
-                extraction_artifact=extraction,
-                extraction_payload=extraction_payload,
-                synthesis_pack=synthesis_pack,
-                source_tiers_by_url=source_tiers_by_url,
-                current_semantic_hash=semantic_synthesis_hash,
             )
-            revision_context = revision_candidate[1] if revision_candidate is not None else None
-            synthesis_mode = (
-                SynthesisMode.REVISE_PREVIOUS
-                if revision_context is not None
-                else SynthesisMode.FRESH
-            )
-            if revision_context is not None:
-                input_hash = _synthesis_input_hash(
-                    subject_id=run.subject_id,
-                    references_hash=references.input_hash,
-                    reference_report_hash=compute_input_hash(reference_report_to_json(report)),
-                    extraction_hash=semantic_synthesis_hash,
-                    technical_extraction_hash=semantic_synthesis_hash,
-                    synthesis_evidence_pack_hash=compute_input_hash(synthesis_pack),
-                    revision_prompt_version=SYNTHESIS_REVISION_PROMPT_VERSION,
-                    previous_synthesis_content_hash=synthesis_content_hash(
-                        revision_context.previous_text
-                    ),
-                    current_synthesis_semantic_hash=semantic_synthesis_hash,
-                )
-            self._record_synthesis_mode(
-                run=run,
-                mode=synthesis_mode,
-                previous_artifact_id=(
-                    revision_context.previous_artifact_id if revision_context is not None else None
-                ),
-                previous_word_count=(
-                    len(revision_context.previous_text.split())
-                    if revision_context is not None
-                    else 0
-                ),
-                context=revision_context,
-            )
-            if not self._model_service:
-                return {
-                    "stage": "synthesis",
-                    "status": "error",
-                    "mode": synthesis_mode.value,
-                    "error": "ModelConversationService not configured",
-                }
-            if not synthesis_policy_allows:
-                return {
-                    "stage": "synthesis",
+            return result
+        if execution.status is SynthesisExecutionStatus.NEEDS_REVIEW:
+            result.update(
+                {
                     "status": "needs_review",
-                    "mode": synthesis_mode.value,
-                    "error_code": "external_llm_blocked",
-                    "error": "Diffusion policy forbids sending this subject to an external model",
+                    "error_code": execution.error_code or "synthesis_validation_failed",
+                    "error": execution.error or "Synthesis requires review",
+                    "details": details,
                 }
-
-            if run.synthesis_conversation_id is None:
-                conversation = await self._open_synthesis_conversation(run, subject_title)
-                run.synthesis_conversation_id = conversation.id
-                persisted = await uow.production_runs.get_for_update(run.id)
-                if persisted is not None:
-                    persisted.synthesis_conversation_id = conversation.id
-                    await uow.production_runs.save(persisted)
-                    await uow.commit()
-            prompt = ProductionPromptTemplates.get_synthesis_prompt(
-                subject_title=subject_title,
-                synthesis_evidence_pack=json.dumps(
-                    synthesis_pack,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                revision_context=revision_context,
             )
-
-            try:
-                parsed, output_text, turn_id, _ = await self._ask_with_format_repair(
-                    run=run,
-                    conversation_id=run.synthesis_conversation_id,
-                    stage="synthesis",
-                    prompt=prompt,
-                    prompt_version=SYNTHESIS_PROMPT_VERSION,
-                    repair_version=SYNTHESIS_FORMAT_REPAIR_VERSION,
-                    mode=ConversationMode.FRESH,
-                    parse=lambda text: validate_synthesis(text, report, extraction_payload),
-                    external_llm_allowed=synthesis_policy_allows,
-                    web_search=True,
-                    request_identity=f"g{run.pipeline_generation}",
-                    context=context,
-                )
-                await self._check_cancellation(run.id, context)
-                if parsed is None:
-                    return {
-                        "stage": "synthesis",
-                        "status": "needs_review",
-                        "error_code": "no_model_response",
-                        "error": "No response from model",
-                    }
-                if not parsed.usable:
-                    return {
-                        "stage": "synthesis",
-                        "status": "needs_review",
-                        "error_code": "synthesis_validation_failed",
-                        "error": "; ".join(parsed.errors),
-                        "details": {
-                            "violations": [
-                                {
-                                    "code": violation.code,
-                                    "detail": violation.detail,
-                                    "span": violation.span,
-                                }
-                                for violation in parsed.violations
-                            ],
-                            "repair_actions": parsed.repair_actions,
-                        },
-                        "violations": [
-                            {
-                                "code": violation.code,
-                                "detail": violation.detail,
-                                "span": violation.span,
-                            }
-                            for violation in parsed.violations
-                        ],
-                        "repair_actions": parsed.repair_actions,
-                    }
-
-                source_tiers_by_id = {
-                    source["id"]: source["tier"]
-                    for source in synthesis_pack["reference_report"]["sources"]
-                }
-                citation_counts = {"core": 0, "supporting": 0, "unknown": 0}
-                for source_id in re.findall(r"\[S(\d+)\]", output_text):
-                    citation_counts[source_tiers_by_id.get(f"S{source_id}", "unknown")] += 1
-                repair_marker = (
-                    extraction.metadata.get("repair_materialization")
-                    if isinstance(extraction.metadata, dict)
-                    else None
-                )
-                artifact = await self._synthesis.store_synthesis_result(
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    input_hash=input_hash,
-                    raw_result=output_text,
-                    markdown_content=output_text,
-                    conversation_turn_id=turn_id,
-                    diagnostics={
-                        "core_citation_count": citation_counts["core"],
-                        "supporting_citation_count": citation_counts["supporting"],
-                        "unknown_citation_count": citation_counts["unknown"],
-                        "semantic_projection_hash": semantic_synthesis_hash,
-                    },
-                    metadata_extra={
-                        "synthesis_mode": synthesis_mode.value,
-                        "semantic_projection_hash": semantic_synthesis_hash,
-                        "semantic_source_ids": list(synthesis_source_ids),
-                        "semantic_repair_keys": list(synthesis_repair_keys),
-                        **(
-                            {"repair_materialization": dict(cast(dict[str, Any], repair_marker))}
-                            if isinstance(repair_marker, dict)
-                            else {}
-                        ),
-                        **(
-                            {
-                                "previous_synthesis_artifact_id": str(
-                                    revision_context.previous_artifact_id
-                                ),
-                                "previous_synthesis_content_hash": synthesis_content_hash(
-                                    revision_context.previous_text
-                                ),
-                            }
-                            if revision_context is not None
-                            else {}
-                        ),
-                    },
-                )
-
-                result = {
-                    "stage": "synthesis",
-                    "status": "success",
-                    "mode": synthesis_mode.value,
-                    "artifact_id": str(artifact.id),
-                    "word_count": len(output_text.split()),
-                    "previous_synthesis_artifact_id": (
-                        str(revision_context.previous_artifact_id)
-                        if revision_context is not None
-                        else None
-                    ),
-                    "repair_actions": parsed.repair_actions,
-                }
-                return result
-            except JobCancelledError:
-                raise
-            except Exception as e:
-                await self._check_cancellation(run.id, context)
-                return self._handle_stage_exception(run, "synthesis", e)
+            return result
+        # BLOCKED: a canonical input is absent or inconsistent and drafting
+        # never started, so the run fails instead of pretending a draft exists.
+        result.update(
+            {
+                "status": "terminal_error",
+                "error_code": execution.error_code or "synthesis_inputs_missing",
+                "error": execution.error or "Canonical synthesis inputs are missing",
+                "details": details,
+            }
+        )
+        return result
 
     async def _execute_assembly_stage(
         self,

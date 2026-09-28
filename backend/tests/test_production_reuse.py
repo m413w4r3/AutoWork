@@ -2,18 +2,19 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 from uuid import UUID, uuid4
 
 import pytest
 
 from cti_app.application import production_extraction, production_workflow
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_gateway import ModelGatewayError
+from cti_app.application.model_gateway import ModelExecution, ModelGatewayError, ModelRequest
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
     cross_run_reuse_allowed,
@@ -27,6 +28,12 @@ from cti_app.application.production_references import (
     production_reference_corpus_from_json,
 )
 from cti_app.application.production_stages import ReferenceResearchService
+from cti_app.application.production_synthesis import (
+    ProductionSynthesisExecution,
+    SynthesisExecutionStatus,
+    SynthesisProposalV1,
+    build_synthesis_evidence_pack,
+)
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _references_input_hash,
@@ -36,20 +43,37 @@ from cti_app.application.production_workflow import (
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection, SourceOriginKind
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.entities import SourceDocument
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionInputSource,
     ProductionReuseInvalidation,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SynthesisMode,
+)
+from cti_app.domain.production_extraction import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionEventV1,
+    ExtractionFactV1,
+    ExtractionReuseState,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    ProductionReferenceKind,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_synthesis import production_synthesis_from_json
 
 
 class _Artifacts:
@@ -1187,3 +1211,485 @@ async def test_references_retry_reuses_the_same_model_run_identity(
     # persisted ModelRun instead of posting the prompt twice.
     assert gateway.requests[0].run_id == gateway.requests[1].run_id
     assert len(artifacts.items) == 1
+
+
+# --- canonical Synthesis orchestration (AW-012 cutover) ----------------------
+
+
+class _SynthesisArtifacts:
+    """Artifact repository double: the REFERENCES stage is never readable."""
+
+    _READABLE_STAGES: ClassVar[frozenset[str]] = frozenset({"extraction", "synthesis"})
+
+    def __init__(self, items: list[ProductionArtifact] | None = None) -> None:
+        self.items = list(items or [])
+        self.requested: list[tuple[UUID, str]] = []
+        self.appended: list[ProductionArtifact] = []
+        self.stale: list[tuple[UUID, str]] = []
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        self.requested.append((run_id, stage))
+        if stage not in self._READABLE_STAGES:
+            raise AssertionError(f"canonical synthesis must not read the {stage} artifact")
+        matches = [
+            item
+            for item in self.items
+            if item.production_run_id == run_id
+            and item.stage.value == stage
+            and item.status is not ProductionArtifactStatus.STALE
+        ]
+        return max(matches, key=lambda item: item.version, default=None)
+
+    async def find_reusable(
+        self,
+        *,
+        edition_id: UUID,
+        subject_id: UUID,
+        stage: str,
+        input_hash: str,
+        not_before: datetime | None = None,
+    ) -> ProductionArtifact | None:
+        del edition_id
+        matches = [
+            item
+            for item in self.items
+            if item.subject_id == subject_id
+            and item.stage.value == stage
+            and item.input_hash == input_hash
+            and item.status is ProductionArtifactStatus.VERIFIED
+            and item.canonical_blob_id is not None
+            and (not_before is None or item.created_at > not_before)
+        ]
+        return max(matches, key=lambda item: item.created_at, default=None)
+
+    async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
+        return [item for item in self.items if item.production_run_id == run_id]
+
+    async def append(self, item: ProductionArtifact) -> None:
+        self.appended.append(item)
+        self.items.append(item)
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        self.stale.append((run_id, stage))
+
+
+class _SynthesisRuns:
+    def __init__(self, runs: dict[UUID, ProductionRun]) -> None:
+        self.runs = runs
+
+    async def get(self, run_id: UUID) -> ProductionRun | None:
+        return self.runs.get(run_id)
+
+    async def get_for_update(self, run_id: UUID) -> ProductionRun | None:
+        return self.runs.get(run_id)
+
+
+class _SynthesisSnapshots:
+    def __init__(self, snapshots: dict[UUID, ProductionInputSnapshot]) -> None:
+        self.snapshots = snapshots
+
+    async def get_by_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
+        return self.snapshots.get(run_id)
+
+
+class _SynthesisDocuments:
+    def __init__(self, documents: list[SourceDocument]) -> None:
+        self.documents = {document.id: document for document in documents}
+
+    async def get(self, document_id: UUID) -> SourceDocument | None:
+        return self.documents.get(document_id)
+
+
+class _SynthesisUow:
+    """Only the frozen snapshot, the extraction and its documents are reachable."""
+
+    def __init__(
+        self,
+        *,
+        runs: dict[UUID, ProductionRun],
+        snapshots: dict[UUID, ProductionInputSnapshot],
+        artifacts: _SynthesisArtifacts,
+        documents: list[SourceDocument] | None = None,
+    ) -> None:
+        self.production_runs = _SynthesisRuns(runs)
+        self.production_input_snapshots = _SynthesisSnapshots(snapshots)
+        self.production_artifacts = artifacts
+        self.production_reuse_invalidations = _Invalidations()
+        self.source_documents = _SynthesisDocuments(list(documents or []))
+        self.commits = 0
+
+    async def __aenter__(self) -> _SynthesisUow:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class _SynthesisGateway:
+    """A drafting gateway double; every request is recorded."""
+
+    def __init__(self, proposal: dict[str, object]) -> None:
+        self.proposal = proposal
+        self.requests: list[ModelRequest] = []
+
+    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+        self.requests.append(request)
+        run = ModelRun(
+            provider=ModelProvider.OPENAI,
+            model_role=ModelRole.DRAFTING,
+            requested_model="gpt-5",
+            prompt_template_id=request.prompt_template_id,
+            prompt_template_version=request.prompt_template_version,
+            authorized_input_hash=hashlib.sha256(request.text.encode("utf-8")).hexdigest(),
+            evidence_pack_hash=request.evidence_pack_hash,
+            parameters=dict(request.parameters),
+            id=request.run_id or uuid4(),
+        )
+        run.succeed(
+            actual_model_version="gpt-5",
+            duration_ms=3,
+            usage=ModelUsage(total_tokens=7),
+            output_references=("model-output://1",),
+            response_id=None,
+        )
+        return ModelExecution(
+            run=run,
+            output_text="raw answer",
+            structured_output=SynthesisProposalV1.model_validate(self.proposal),
+        )
+
+
+class _RefusingDraftGateway:
+    """Exact reuse must never reach the model, so any draft call fails the test."""
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+        self.requests.append(request)
+        raise AssertionError("exact synthesis reuse must not submit a drafting request")
+
+
+class _RecordingConversationService:
+    """Any legacy conversation call would be recorded and must stay empty."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def archive(
+        self, conversation_id: UUID, *, context_subject_id: UUID | None = None
+    ) -> None:
+        self.calls.append(f"archive:{conversation_id}")
+
+
+def _synthesis_run(
+    *, subject_id: UUID | None = None, edition_id: UUID | None = None
+) -> ProductionRun:
+    run = ProductionRun(
+        subject_id=subject_id or uuid4(),
+        edition_id=edition_id or uuid4(),
+        status=ProductionRunStatus.RUNNING,
+    )
+    run.current_stage = ProductionStage.SYNTHESIS
+    return run
+
+
+def _synthesis_snapshot(run: ProductionRun) -> ProductionInputSnapshot:
+    return ProductionInputSnapshot(
+        production_run_id=run.id,
+        edition_id=run.edition_id,
+        subject_id=run.subject_id,
+        subject_version=1,
+        subject_title="Frozen subject title",
+        subject_tlp=TLP.CLEAR,
+        selection_decision_id=uuid4(),
+        origin_discovery_subject_id=run.subject_id,
+        canonical_discovery_subject_id=run.subject_id,
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+        member_candidate_ids=(uuid4(),),
+        discovery_summary="A discovery summary.",
+        actor_or_campaign="Example actor",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 2, 1),
+        publication_language="fr",
+        research_date=date(2026, 3, 1),
+    )
+
+
+def _synthesis_source_document(subject_id: UUID, source_id: UUID) -> SourceDocument:
+    return SourceDocument(
+        id=source_id,
+        subject_id=subject_id,
+        blob_id=uuid4(),
+        original_name="vendor-report.pdf",
+        origin="test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.CLEAR,
+        external_llm_allowed=True,
+        do_not_submit=False,
+    )
+
+
+def _synthesis_extraction(
+    snapshot: ProductionInputSnapshot, source_id: UUID
+) -> ProductionExtractionV1:
+    source = ProductionSourceExtractionV1(
+        source_document_id=source_id,
+        canonical_url="https://vendor.example/report",
+        content_sha256=hashlib.sha256(b"vendor report").hexdigest(),
+        tier=ProductionReferenceTier.CORE,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.PRIMARY,
+        profile=ExtractionProfile.FULL,
+        checkpoint_id=None,
+        reuse_state=ExtractionReuseState.FRESH,
+        facts=(
+            ExtractionFactV1(
+                category="malware",
+                value="FooRAT",
+                attack_id=None,
+                context="Initial access",
+                evidence_quote="The report identifies FooRAT.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(source_id,),
+            ),
+        ),
+        events=(
+            ExtractionEventV1(
+                event_date=date(2026, 7, 2),
+                date_text=None,
+                text="The campaign began.",
+                context="Campaign chronology.",
+                evidence_quote="On 2026-07-02 the campaign began.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(source_id,),
+            ),
+        ),
+        indicators=(),
+        rules=(),
+        uncertainties=("Attribution remains uncertain.",),
+    )
+    return ProductionExtractionV1(
+        schema_version=1,
+        subject_id=snapshot.subject_id,
+        production_input_hash=snapshot.input_hash,
+        references_corpus_hash="b" * 64,
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(source,),
+        omitted_sources=(),
+        warnings=(),
+    )
+
+
+def _synthesis_proposal(handles: dict[str, str]) -> dict[str, object]:
+    return {
+        "lead": [
+            {
+                "text": "FooRAT was identified.",
+                "evidence_handles": [handles["fact"], handles["event"]],
+            }
+        ],
+        "sections": [],
+    }
+
+
+def _synthesis_world() -> SimpleNamespace:
+    """One canonical extraction, ready for the SYNTHESIS stage."""
+    run = _synthesis_run()
+    snapshot = _synthesis_snapshot(run)
+    source_id = uuid4()
+    extraction = _synthesis_extraction(snapshot, source_id)
+    document = _synthesis_source_document(run.subject_id, source_id)
+    store = _BlobStore()
+    extraction_blob_id = store.put(
+        ProductionArtifactStore.canonical_json_bytes(production_extraction_to_json(extraction))
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="c" * 64,
+        canonical_blob_id=extraction_blob_id,
+    )
+    artifacts = _SynthesisArtifacts([extraction_artifact])
+    uow = _SynthesisUow(
+        runs={run.id: run},
+        snapshots={run.id: snapshot},
+        artifacts=artifacts,
+        documents=[document],
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    handles = {str(entry["kind"]): str(entry["handle"]) for entry in pack.narrative_evidence}
+    gateway = _SynthesisGateway(_synthesis_proposal(handles))
+    model_service = _RecordingConversationService()
+    orchestrator = ProductionWorkflowOrchestrator(
+        cast(Any, lambda: uow),
+        model_service=cast(Any, model_service),
+        model_gateway=cast(Any, gateway),
+        artifact_store=cast(Any, store),
+    )
+    return SimpleNamespace(
+        run=run,
+        snapshot=snapshot,
+        extraction=extraction,
+        source_id=source_id,
+        document=document,
+        extraction_blob_id=extraction_blob_id,
+        extraction_artifact=extraction_artifact,
+        artifacts=artifacts,
+        uow=uow,
+        store=store,
+        pack=pack,
+        gateway=gateway,
+        model_service=model_service,
+        orchestrator=orchestrator,
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _synthesis_world()
+
+    def forbidden(*args: object, **kwargs: object) -> Any:
+        raise AssertionError("the canonical synthesis stage must not project legacy inputs")
+
+    monkeypatch.setattr(production_workflow, "load_reference_projection", forbidden)
+    monkeypatch.setattr(production_workflow, "legacy_technical_extraction_from_payload", forbidden)
+    assert not hasattr(production_workflow, "load_legacy_technical_extraction")
+    assert not hasattr(production_workflow, "reference_report_to_json")
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "success"
+    assert result["mode"] == "fresh"
+    assert {stage for _, stage in world.artifacts.requested} == {"extraction", "synthesis"}
+    assert world.model_service.calls == []
+    assert world.run.synthesis_conversation_id is None
+    assert len(world.gateway.requests) == 1
+    request = world.gateway.requests[0]
+    assert request.web_search is False
+    assert request.conversation is None
+    assert request.run_id is not None
+    stored = world.artifacts.appended[-1]
+    assert stored.stage is ProductionArtifactStage.SYNTHESIS
+    assert stored.model_run_id is not None
+    assert stored.canonical_blob_id is not None
+    canonical = production_synthesis_from_json(
+        await world.store.read_json(stored.canonical_blob_id)
+    )
+    assert canonical.title == world.snapshot.subject_title
+    assert canonical.publication_language == "fr"
+    assert canonical.lead[0].text == "FooRAT was identified."
+    assert canonical.timeline[0].event_date == date(2026, 7, 2)
+
+
+@pytest.mark.asyncio
+async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None:
+    first = _synthesis_world()
+    result = await first.orchestrator.execute_stage(first.run.id, ProductionStage.SYNTHESIS)
+    assert result["status"] == "success"
+    source_artifact = first.artifacts.appended[-1]
+
+    run_b = _synthesis_run(subject_id=first.run.subject_id, edition_id=first.run.edition_id)
+    snapshot_b = replace(first.snapshot, production_run_id=run_b.id)
+    extraction_artifact_b = ProductionArtifact(
+        production_run_id=run_b.id,
+        subject_id=run_b.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="d" * 64,
+        canonical_blob_id=first.extraction_blob_id,
+    )
+    artifacts_b = _SynthesisArtifacts([extraction_artifact_b, source_artifact])
+    uow_b = _SynthesisUow(
+        runs={run_b.id: run_b},
+        snapshots={run_b.id: snapshot_b},
+        artifacts=artifacts_b,
+        documents=[first.document],
+    )
+    gateway_b = _RefusingDraftGateway()
+    orchestrator_b = ProductionWorkflowOrchestrator(
+        cast(Any, lambda: uow_b),
+        model_gateway=cast(Any, gateway_b),
+        artifact_store=cast(Any, first.store),
+    )
+
+    reused = await orchestrator_b.execute_stage(run_b.id, ProductionStage.SYNTHESIS)
+
+    assert reused["status"] == "reused"
+    assert reused["reused"] is True
+    assert reused["reused_from_artifact_id"] == str(source_artifact.id)
+    assert gateway_b.requests == []
+    cloned = artifacts_b.appended[-1]
+    assert cloned.reused_from_artifact_id == source_artifact.id
+    assert cloned.canonical_blob_id == source_artifact.canonical_blob_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["invalid_payload", "not_verified"])
+async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(failure: str) -> None:
+    world = _synthesis_world()
+    if failure == "invalid_payload":
+        world.store.blobs[world.extraction_blob_id] = b'{"schema_version": 1}'
+    else:
+        world.artifacts.items = [
+            replace(world.extraction_artifact, status=ProductionArtifactStatus.NEEDS_REVIEW)
+        ]
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "terminal_error"
+    assert result["error_code"] == "synthesis_inputs_missing"
+    assert world.gateway.requests == []
+    assert world.artifacts.appended == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_stage_returns_needs_review_without_format_repair() -> None:
+    world = _synthesis_world()
+    world.gateway.proposal = {
+        "lead": [{"text": "FooRAT was identified.", "evidence_handles": ["E999"]}],
+        "sections": [],
+    }
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "synthesis_unknown_evidence"
+    # Exactly one submission: an invalid answer is never re-asked.
+    assert len(world.gateway.requests) == 1
+    assert world.model_service.calls == []
+    assert world.artifacts.appended == []
+
+
+def test_synthesis_stage_result_preserves_submission_reconciliation() -> None:
+    model_run_id = uuid4()
+    execution = ProductionSynthesisExecution(
+        status=SynthesisExecutionStatus.NEEDS_REVIEW,
+        mode=SynthesisMode.FRESH,
+        model_run_id=model_run_id,
+        input_hash="a" * 64,
+        extraction_hash="b" * 64,
+        model_calls=1,
+        error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
+        error="A provider submission may have been accepted and must be reconciled",
+        details={
+            "error_code": PRODUCTION_RECONCILIATION_ERROR_CODE,
+            "model_run_id": str(model_run_id),
+        },
+    )
+
+    result = ProductionWorkflowOrchestrator._synthesis_execution_result(execution)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == PRODUCTION_RECONCILIATION_ERROR_CODE
+    assert result["details"]["model_run_id"] == str(model_run_id)
+    assert result["model_calls"] == 1
