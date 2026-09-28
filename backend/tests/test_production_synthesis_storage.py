@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 from contextlib import asynccontextmanager
 from typing import Any, cast
@@ -12,7 +11,10 @@ import pytest
 
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
 from cti_app.application.production_stages import SynthesisService
-from cti_app.application.production_synthesis import render_synthesis_markdown
+from cti_app.application.production_synthesis import (
+    canonical_extraction_hash,
+    render_synthesis_markdown,
+)
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ExtractionProfile,
@@ -29,7 +31,6 @@ from cti_app.domain.production_extraction import (
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
-    production_extraction_to_json,
 )
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import (
@@ -165,14 +166,7 @@ def canonical_pair(subject_id: UUID):
         omitted_sources=(),
         warnings=(),
     )
-    extraction_hash = hashlib.sha256(
-        json.dumps(
-            production_extraction_to_json(extraction),
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    extraction_hash = canonical_extraction_hash(extraction)
     paragraph = SynthesisParagraphV1(
         text="FooRAT was observed.", evidence_refs=extraction_evidence_refs_v1(extraction)
     )
