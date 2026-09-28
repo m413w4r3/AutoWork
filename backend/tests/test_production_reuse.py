@@ -449,6 +449,7 @@ def test_snapshot_reuse_basis_excludes_research_date() -> None:
         "actor_or_campaign": "Actor",
         "period_start": date(2026, 8, 1),
         "period_end": date(2026, 8, 31),
+        "publication_language": "fr",
         "core_sources": (),
         "captured_at": datetime.now(UTC),
     }
@@ -461,6 +462,12 @@ def test_snapshot_reuse_basis_excludes_research_date() -> None:
     )
     assert first.reuse_basis_hash == second.reuse_basis_hash
     assert first.input_hash != second.input_hash
+    changed_language = ProductionInputSnapshot(
+        **{**values, "production_run_id": uuid4(), "publication_language": "en"},
+        research_date=date(2026, 8, 30),
+    )
+    assert first.reuse_basis_hash != changed_language.reuse_basis_hash
+    assert first.input_hash != changed_language.input_hash
 
 
 def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
@@ -496,6 +503,7 @@ def test_references_hash_tracks_functional_snapshot_and_ignores_run_identity(
         actor_or_campaign="Actor",
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 29),
         core_sources=(source,),
         captured_at=datetime.now(UTC),
@@ -783,6 +791,7 @@ def _core_snapshot(subject_id: UUID, *urls: str) -> ProductionInputSnapshot:
         actor_or_campaign="Actor",
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 29),
         core_sources=core_sources,
         captured_at=datetime.now(UTC),

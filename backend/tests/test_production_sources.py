@@ -143,6 +143,7 @@ def _snapshot(subject_id: UUID, urls: tuple[str, ...]) -> ProductionInputSnapsho
         actor_or_campaign="TAG-182",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 1),
         core_sources=tuple(_input_source(url, candidate_id) for url in urls),
     )

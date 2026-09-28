@@ -121,6 +121,7 @@ def _snapshot(subject_id: UUID, url: str, *, allowed: bool = True) -> Production
         actor_or_campaign="Actor",
         period_start=date(2026, 8, 1),
         period_end=date(2026, 8, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 28),
         core_sources=(
             ProductionInputSource(
@@ -203,7 +204,11 @@ async def test_new_snapshot_freezes_the_active_discovery_lineage() -> None:
             ),
         ),
     )
-    edition = SimpleNamespace(period_start=date(2026, 8, 1), period_end=date(2026, 8, 31))
+    edition = SimpleNamespace(
+        period_start=date(2026, 8, 1),
+        period_end=date(2026, 8, 31),
+        languages=("fr", "en"),
+    )
     uow = _LineageUow(
         subject=SimpleNamespace(
             id=subject_id,
@@ -236,6 +241,7 @@ async def test_new_snapshot_freezes_the_active_discovery_lineage() -> None:
     assert snapshot.subject_title == "Titre canonique du Subject"
     assert snapshot.subject_version == 3
     assert snapshot.subject_tlp is TLP.AMBER
+    assert snapshot.publication_language == "fr"
     assert snapshot.edition_id == edition_id
     assert snapshot.period_start == edition.period_start
     assert snapshot.period_end == edition.period_end
@@ -249,6 +255,19 @@ async def test_new_snapshot_freezes_the_active_discovery_lineage() -> None:
     assert snapshot.actor_or_campaign == "Campaign X · Actor Y"
     assert [item.canonical_url for item in snapshot.core_sources] == [source.canonical_url]
     assert snapshot.core_sources[0].discovery_candidate_id == candidate_id
+
+    edition.languages = ("en", "fr")
+    next_snapshot = await capture_production_input_snapshot(
+        cast(Any, uow),
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        edition_id=edition_id,
+        research_date=date(2026, 8, 29),
+        captured_at=datetime(2026, 8, 29, tzinfo=UTC),
+    )
+
+    assert snapshot.publication_language == "fr"
+    assert next_snapshot.publication_language == "en"
 
 
 @pytest.mark.asyncio

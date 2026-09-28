@@ -163,6 +163,12 @@ async def capture_production_input_snapshot(
     edition = await uow.editions.get(subject.edition_id)
     if edition is None:
         raise ValueError("production_snapshot_edition_missing")
+    languages = edition.languages
+    if not languages:
+        raise ValueError("production_snapshot_publication_language_missing")
+    publication_language = languages[0]
+    if not isinstance(publication_language, str) or not publication_language.strip():
+        raise ValueError("production_snapshot_publication_language_missing")
 
     by_url: dict[str, tuple[tuple[object, ...], ProductionInputSource]] = {}
     actor_values: dict[str, str] = {}
@@ -221,6 +227,7 @@ async def capture_production_input_snapshot(
         actor_or_campaign=" · ".join(actor_values.values()),
         period_start=edition.period_start,
         period_end=edition.period_end,
+        publication_language=publication_language,
         research_date=research_date,
         core_sources=core_sources,
         captured_at=captured_at,

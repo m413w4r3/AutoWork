@@ -543,6 +543,7 @@ class ProductionInputSnapshot:
     actor_or_campaign: str
     period_start: date
     period_end: date
+    publication_language: str
     research_date: date
     core_sources: tuple[ProductionInputSource, ...] = ()
     input_hash: str = ""
@@ -588,6 +589,8 @@ class ProductionInputSnapshot:
             raise ValueError("Production input period must be ordered")
         if not self.subject_title.strip():
             raise ValueError("A production input snapshot requires a subject title")
+        if not self.publication_language.strip():
+            raise ValueError("A production input snapshot requires a publication language")
         if self.captured_at.tzinfo is None or self.captured_at.utcoffset() is None:
             raise ValueError("captured_at must be timezone-aware")
         computed_basis = self.compute_reuse_basis_hash()
@@ -627,6 +630,7 @@ class ProductionInputSnapshot:
             "actor_or_campaign": self.actor_or_campaign,
             "period_start": self.period_start.isoformat(),
             "period_end": self.period_end.isoformat(),
+            "publication_language": self.publication_language,
             "core_sources": [source.functional_payload() for source in self.core_sources],
         }
 

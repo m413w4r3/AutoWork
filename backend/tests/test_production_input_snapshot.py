@@ -61,6 +61,7 @@ def _snapshot(**overrides: Any) -> ProductionInputSnapshot:
         "actor_or_campaign": "MuddyWater",
         "period_start": date(2026, 8, 1),
         "period_end": date(2026, 8, 31),
+        "publication_language": "fr",
         "research_date": date(2026, 8, 20),
         "core_sources": _SOURCES,
     }
@@ -125,6 +126,7 @@ def test_hashes_ignore_technical_identities() -> None:
     "overrides",
     [
         {"subject_title": "Campagne MuddyWater 2026"},
+        {"publication_language": "en"},
         {"subject_version": 3},
         {"subject_tlp": TLP.RED},
         {"discovery_snapshot_version": 8},
@@ -163,6 +165,7 @@ def test_research_date_is_part_of_the_input_but_not_the_reuse_basis() -> None:
         ({"discovery_snapshot_version": 0}, "discovery_snapshot_version"),
         ({"period_start": date(2026, 9, 1)}, "period must be ordered"),
         ({"subject_title": "  "}, "subject title"),
+        ({"publication_language": "  "}, "publication language"),
         ({"captured_at": datetime(2026, 8, 20)}, "timezone-aware"),
         ({"member_candidate_ids": (_CANDIDATE_A, _CANDIDATE_A)}, "duplicates"),
         ({"member_candidate_ids": (_CANDIDATE_A,)}, "belong to member_candidate_ids"),

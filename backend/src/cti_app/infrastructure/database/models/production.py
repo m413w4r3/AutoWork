@@ -588,6 +588,7 @@ class ProductionInputSnapshotRow(Base):
     actor_or_campaign: Mapped[str] = mapped_column(Text, nullable=False)
     period_start: Mapped[date] = mapped_column(Date, nullable=False)
     period_end: Mapped[date] = mapped_column(Date, nullable=False)
+    publication_language: Mapped[str] = mapped_column(Text, nullable=False)
     research_date: Mapped[date] = mapped_column(Date, nullable=False)
     core_sources: Mapped[list[dict[str, object]]] = mapped_column(JSONB, nullable=False)
     input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
