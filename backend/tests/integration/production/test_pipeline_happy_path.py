@@ -3,11 +3,27 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Mapping
+from typing import Any
 
 import pytest
 
+from cti_app.application.model_gateway import (
+    AdapterResult,
+    AdapterResultStatus,
+    ModelRole,
+    ModelUsage,
+    SafeModelRequest,
+)
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_synthesis import (
+    SynthesisClaimProposalV1,
+    SynthesisProposalV1,
+    SynthesisSectionProposalV1,
+    canonical_extraction_hash,
+    production_synthesis_from_json,
+)
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
@@ -16,6 +32,8 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_extraction import production_extraction_from_json
+from cti_app.domain.production_synthesis import SynthesisSectionKind
 
 from .support import ProductionScenario
 
@@ -66,11 +84,6 @@ Q2_SECONDARY_RESPONSE = """IOC contextual domain
 - secondary-c2.security-lab.io :: A related infrastructure domain is discussed.
 """
 
-Q4_RESPONSE = (
-    "ExampleRAT is launched through a script and reaches core-c2.security-lab.io [S1]. "
-    "The secondary analysis corroborates secondary-c2.security-lab.io and the execution chain [S2]."
-)
-
 
 def _sources() -> dict[str, dict[str, object]]:
     return {
@@ -102,8 +115,72 @@ async def _configured_scenario(
     scenario.model.script.references(Q1_RESPONSE)
     scenario.model.script.q2(source_url=SOURCE_URLS[0], response=Q2_CORE_RESPONSE)
     scenario.model.script.q2(source_url=SOURCE_URLS[1], response=Q2_SECONDARY_RESPONSE)
-    scenario.model.script.synthesis(Q4_RESPONSE)
     return scenario
+
+
+def _canonical_proposal(request_text: str) -> SynthesisProposalV1:
+    """Answer the canonical structured draft with grounded, atomic claims."""
+    payload = json.loads(request_text)
+    pack = payload["current_evidence_pack"]
+    facts = [record for record in pack["narrative_evidence"] if record["kind"] == "fact"]
+    assert facts, "The canonical evidence pack must expose the narrative fact"
+    fact = facts[0]
+    lead = SynthesisClaimProposalV1(
+        text=f"{fact['value']} is documented by the selected publications.",
+        evidence_handles=(fact["handle"],),
+    )
+    domains = tuple(
+        SynthesisClaimProposalV1(
+            text=f"The publications list the infrastructure domain {record['value']}.",
+            evidence_handles=(record["handle"],),
+        )
+        for record in pack["technical_evidence"]
+        if record["kind"] == "indicator"
+    )
+    sections = (
+        SynthesisSectionProposalV1(
+            kind=SynthesisSectionKind.INFRASTRUCTURE,
+            heading="Infrastructure",
+            claims=domains or (lead,),
+        ),
+    )
+    return SynthesisProposalV1(lead=(lead,), sections=sections)
+
+
+def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModelRequest]:
+    """Answer canonical drafting requests and fail on any forbidden request."""
+    adapter = scenario.model._adapter
+    requests: list[SafeModelRequest] = []
+    base_invoke = adapter.invoke
+
+    async def invoke(
+        request: SafeModelRequest,
+        *,
+        role: ModelRole,
+        output_schema: type[Any] | None = None,
+    ) -> AdapterResult:
+        if request.prompt_template_id != "production-synthesis":
+            return await base_invoke(request, role=role, output_schema=output_schema)
+        if request.web_search:
+            raise AssertionError("Canonical Synthesis must never enable web search")
+        if request.conversation is not None:
+            raise AssertionError("Canonical Synthesis must be stateless")
+        requests.append(request)
+        scenario.model.provider_calls.append(request)
+        proposal = _canonical_proposal(request.text)
+        return AdapterResult(
+            status=AdapterResultStatus.COMPLETED,
+            provider=adapter.provider,
+            requested_model=str(adapter.requested_model),
+            actual_model_version=str(adapter.requested_model),
+            usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+            response_id=f"canonical-synthesis-{len(requests)}",
+            output_text=proposal.model_dump_json(),
+            structured_output=proposal,
+        )
+
+    adapter.invoke = invoke  # type: ignore[method-assign]
+    return requests
 
 
 @pytest.mark.asyncio
@@ -111,12 +188,14 @@ async def test_complete_production_pipeline_reaches_ready(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
+    drafts = _install_canonical_synthesis(scenario)
     initial = await scenario.start()
     assert initial.status is ProductionRunStatus.RUNNING
     assert initial.current_stage is ProductionStage.SOURCES
 
     run = await scenario.run_until_terminal()
 
+    assert len(drafts) == 1
     assert run.status is ProductionRunStatus.READY
     assert run.current_stage is ProductionStage.ASSEMBLY
     assert run.reconciliation is None
@@ -174,12 +253,13 @@ async def test_complete_production_pipeline_reaches_ready(
     assert all(len(artifact.input_hash) == 64 for artifact in artifacts)
     assert by_stage[ProductionArtifactStage.REFERENCES].metadata["warnings"] == []
     assert by_stage[ProductionArtifactStage.EXTRACTION].metadata["warnings"] == []
-    assert (
-        by_stage[ProductionArtifactStage.SYNTHESIS].metadata["diagnostics"][
-            "unknown_citation_count"
-        ]
-        == 0
-    )
+    synthesis_artifact = by_stage[ProductionArtifactStage.SYNTHESIS]
+    assert synthesis_artifact.canonical_blob_id is not None
+    assert synthesis_artifact.rendered_blob_id is not None
+    assert synthesis_artifact.conversation_turn_id is None
+    assert synthesis_artifact.metadata["schema_version"] == 1
+    assert synthesis_artifact.metadata["language"] == "fr"
+    assert synthesis_artifact.metadata["mode"] == "fresh"
     extraction_metadata = by_stage[ProductionArtifactStage.EXTRACTION].metadata
     assert extraction_metadata["source_count"] == 2
     assert extraction_metadata["full_source_count"] == 2
@@ -210,18 +290,28 @@ async def test_complete_production_pipeline_reaches_ready(
 
     model_calls = scenario.model.calls
     q2_calls = [call for call in model_calls if call.stage == "extraction"]
+    synthesis_requests = [
+        call
+        for call in scenario.model.provider_calls
+        if call.prompt_template_id == "production-synthesis"
+    ]
     assert model_calls[0].stage == "references"
-    assert model_calls[-1].stage == "synthesis"
-    assert all(call.stage == "extraction" for call in model_calls[1:-1])
+    # Drafting is not a public gateway override here: the scripted calls record
+    # the researching and extracting stages, and the drafting request is read
+    # from the provider boundary below.
+    assert all(call.stage == "extraction" for call in model_calls[1:])
+    # Canonical Synthesis is one stateless structured draft through the gateway.
+    assert len(synthesis_requests) == 1
+    assert synthesis_requests[0].web_search is False
+    assert synthesis_requests[0].conversation is None
     covered_q2_urls = tuple(url for call in q2_calls for url in call.source_urls)
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
-    assert len(model_calls) == 2 + len(q2_calls)
-    # Extraction analyses the archived capture and never searches the web.
+    assert len(model_calls) == 1 + len(q2_calls)
+    # Only the References stage searches the web; the archived capture is
+    # analysed statelessly.
     assert all(call.web_search is (call.stage != "extraction") for call in model_calls)
     assert model_calls[0].conversation_id is None
-    # Synthesis is stateless: the durable ModelRun owns submission identity.
-    assert model_calls[-1].conversation_id is None
     assert all(call.conversation_id is None for call in q2_calls)
     assert all(call.prompt_version for call in model_calls)
     assert all(call.model_run_id is not None for call in model_calls)
@@ -232,6 +322,9 @@ async def test_complete_production_pipeline_reaches_ready(
             for call in model_calls
             if call.model_run_id is not None
         }
+        assert synthesis_artifact.model_run_id is not None
+        synthesis_draft_run = await uow.model_runs.get(synthesis_artifact.model_run_id)
+        model_runs[synthesis_artifact.model_run_id] = synthesis_draft_run
         references_payload = await scenario.artifact_store.read_json(
             by_stage[ProductionArtifactStage.REFERENCES].canonical_blob_id  # type: ignore[arg-type]
         )
@@ -239,7 +332,10 @@ async def test_complete_production_pipeline_reaches_ready(
             by_stage[ProductionArtifactStage.EXTRACTION].canonical_blob_id  # type: ignore[arg-type]
         )
         synthesis_text = await scenario.artifact_store.read_text(
-            by_stage[ProductionArtifactStage.SYNTHESIS].rendered_blob_id  # type: ignore[arg-type]
+            synthesis_artifact.rendered_blob_id  # type: ignore[arg-type]
+        )
+        synthesis_payload = await scenario.artifact_store.read_json(
+            synthesis_artifact.canonical_blob_id  # type: ignore[arg-type]
         )
         publication_payload = await scenario.artifact_store.read_json(
             by_stage[ProductionArtifactStage.PUBLICATION].canonical_blob_id  # type: ignore[arg-type]
@@ -286,8 +382,21 @@ async def test_complete_production_pipeline_reaches_ready(
         value["value"] for group in publication_payload["indicators"] for value in group["values"]
     }
     assert publication_indicator_values == extraction_indicator_values
-    assert all(source_id in model_calls[-1].request.text for source_id in reference_source_ids)
-    assert all(value in model_calls[-1].request.text for value in extraction_indicator_values)
+    synthesis = production_synthesis_from_json(synthesis_payload)
+    extraction = production_extraction_from_json(extraction_payload)
+    assert synthesis.title == snapshot.subject_title
+    assert synthesis.publication_language == snapshot.publication_language == "fr"
+    assert synthesis.production_input_hash == snapshot.input_hash
+    assert synthesis.extraction_hash == canonical_extraction_hash(extraction)
+    assert synthesis.lead and all(paragraph.evidence_refs for paragraph in synthesis.lead)
+    assert synthesis_draft_run is not None
+    assert synthesis_draft_run.prompt_template_id == "production-synthesis"
+    # The canonical prompt is evidence-only: no legacy local source ids survive.
+    synthesis_prompt = synthesis_requests[0].text
+    assert all(value in synthesis_prompt for value in extraction_indicator_values)
+    assert "[S1]" not in synthesis_prompt
+    for source in extraction_payload["sources"]:
+        assert source["source_document_id"] not in synthesis_prompt
 
     async with scenario.uow_factory() as uow:
         refreshed = await uow.production_runs.get(run.id)
@@ -320,7 +429,9 @@ async def test_invalid_q2_response_cannot_reach_ready(
     assert run.error_details["source_failure_code"] == "extraction_source_output_invalid"
     assert run.reconciliation is None
     assert scenario.model.calls[-1].stage == "extraction"
-    assert not any(call.stage == "synthesis" for call in scenario.model.calls)
+    assert not any(
+        call.prompt_template_id == "production-synthesis" for call in scenario.model.provider_calls
+    )
 
     async with scenario.uow_factory() as uow:
         extraction = await uow.production_artifacts.get_current(run.id, "extraction")
