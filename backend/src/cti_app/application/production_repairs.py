@@ -28,7 +28,6 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_extraction import (
     extraction_compatibility_view,
     is_current_source_checkpoint,
-    legacy_technical_extraction_from_payload,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
@@ -78,7 +77,8 @@ from cti_app.application.production_stages import (
     PublicationAssemblyService,
     compute_input_hash,
 )
-from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceOriginKind
+from cti_app.application.production_synthesis import build_synthesis_evidence_pack
+from cti_app.domain.collection import CollectionState, DetectedMimeType
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
 from cti_app.domain.production import (
@@ -91,6 +91,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionDerivedOutput,
     ProductionEvidenceBasis,
+    ProductionInputSnapshot,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
     ProductionRepairCorrection,
@@ -117,6 +118,11 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
+)
+from cti_app.domain.production_synthesis import (
+    ExtractionEvidenceRefV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_from_json,
 )
 from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
 
@@ -248,32 +254,23 @@ def build_repair_evidence_pack(entries: Sequence[Mapping[str, Any]]) -> dict[str
     }
 
 
-# This version is part of the functional Q4 input.  Keep it alongside the
-# pure projection so callers cannot accidentally hash a different pack from
-# the one sent to the synthesis stage.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
-
-
 def _projection_enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
+# Kept only for the historical synthesis lookup in the compatibility workflow.
+# Repair materialization uses canonical ExtractionEvidenceRefV1 identities below.
+SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
+
+
 def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
-    """Return whether one extraction item belongs in the Q4 evidence pack."""
+    """Return whether one legacy extraction item belonged in the old Q4 pack."""
     if not item.supported:
         return False
     if item.indicator_status is IndicatorStatus.EXCLUDED:
         return False
     if item.display_policy is DisplayPolicy.HIDDEN:
         return False
-
-    # A value re-admitted by a repair carries no narrative evidence: the
-    # projection builds it with an empty context and no evidence quote, so it
-    # belongs to a deterministic publication list -- the IOC section for a
-    # publication IOC, the technical body otherwise -- and never to the Q4
-    # evidence pack.  Restricting this carve-out to ``IOC_SECTION`` made a
-    # filename/filepath/CVE repair change the Q4 projection, which classified
-    # the whole article as NARRATIVE and charged it a synthesis model call.
     if (
         not item.context.strip()
         and not item.evidence_quote.strip()
@@ -283,7 +280,6 @@ def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
         )
     ):
         return False
-
     return True
 
 
@@ -292,7 +288,7 @@ def synthesis_projection_payload(
     extraction: TechnicalExtraction,
     source_tiers_by_url: Mapping[str, str],
 ) -> dict[str, Any]:
-    """Build the exact deterministic evidence projection consumed by Q4."""
+    """Build the legacy projection used only by historical synthesis lookup."""
     merged: dict[tuple[str, str], dict[str, Any]] = {}
     for item in extraction.items:
         if not extraction_item_contributes_to_synthesis(item):
@@ -318,9 +314,6 @@ def synthesis_projection_payload(
             merged[dedup_key] = candidate
             continue
 
-        # These choices make duplicate extraction rows independent of their
-        # input order while preserving the historical preference for the most
-        # informative context.
         contexts = (str(existing["context"] or ""), str(candidate["context"] or ""))
         existing["context"] = max(contexts, key=lambda value: (len(value), value))
         existing["value"] = min(
@@ -328,7 +321,7 @@ def synthesis_projection_payload(
             key=lambda value: (value.casefold(), value),
         )
         existing["category"] = min(str(existing["category"]), str(candidate["category"]))
-        artifact_types: set[str] = {
+        artifact_types = {
             str(value)
             for value in (existing.get("artifact_type"), candidate.get("artifact_type"))
             if value is not None
@@ -337,11 +330,9 @@ def synthesis_projection_payload(
         existing["is_confirmed_indicator"] = bool(
             existing["is_confirmed_indicator"] or candidate["is_confirmed_indicator"]
         )
-        existing_source_ids = {
-            str(source_id) for source_id in cast(Sequence[Any], existing["source_ids"])
-        }
+        existing_source_ids = {str(value) for value in cast(Sequence[Any], existing["source_ids"])}
         candidate_source_ids = {
-            str(source_id) for source_id in cast(Sequence[Any], candidate["source_ids"])
+            str(value) for value in cast(Sequence[Any], candidate["source_ids"])
         }
         existing["source_ids"] = sorted(existing_source_ids | candidate_source_ids)
 
@@ -354,7 +345,6 @@ def synthesis_projection_payload(
             tuple(item["source_ids"]),
         ),
     )
-
     return {
         "version": SYNTHESIS_EVIDENCE_PACK_VERSION,
         "reference_report": {
@@ -2600,15 +2590,37 @@ def _repair_action_is_compatible(
     }
 
 
-def _fallback_synthesis_projection_hash(extraction: TechnicalExtraction) -> str:
-    """Hash extraction's contribution to Q4 when Q1 is unavailable.
-
-    The empty report is intentional: the report is identical before and
-    after a Q2 repair, so it is only used as a conservative equality test.
-    """
-    return _projection_hash(
-        synthesis_projection_payload(ReferenceReport(sources=(), events=()), extraction, {})
+def _synthesis_evidence_refs(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> frozenset[ExtractionEvidenceRefV1]:
+    """Return canonical refs actually admitted to the deterministic synthesis pack."""
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    canonical_refs = set(extraction_evidence_refs_v1(extraction))
+    handles = (
+        record["handle"]
+        for record in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence)
     )
+    return frozenset(
+        ref
+        for ref in (evidence_pack.resolve_handle(str(handle)) for handle in handles)
+        if ref in canonical_refs
+    )
+
+
+def _synthesis_evidence_hash(refs: frozenset[ExtractionEvidenceRefV1]) -> str:
+    ordered = sorted(
+        (
+            {
+                "source_document_id": str(ref.source_document_id),
+                "kind": ref.kind.value,
+                "evidence_key": ref.evidence_key,
+            }
+            for ref in refs
+        ),
+        key=lambda item: (item["source_document_id"], item["kind"], item["evidence_key"]),
+    )
+    return _projection_hash({"evidence_refs": ordered})
 
 
 def _fallback_publication_projection_hash(extraction: TechnicalExtraction) -> str:
@@ -2630,19 +2642,11 @@ def _impact_from_projection_hashes(
     new_rule_bundle_hash: str,
 ) -> ProductionRepairImpact:
     """Classify the actual functional before/after projection delta."""
-    if previous == projected:
-        return _repair_impact(
-            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
-            _NO_DELIVERABLE_OUTPUTS,
-            model_call_required=False,
-            reason="The effective extraction is unchanged.",
-        )
-
-    previous_synthesis = previous_synthesis_projection_hash or _fallback_synthesis_projection_hash(
-        previous
+    synthesis_changed = (
+        previous_synthesis_projection_hash is not None
+        and new_synthesis_projection_hash is not None
+        and previous_synthesis_projection_hash != new_synthesis_projection_hash
     )
-    new_synthesis = new_synthesis_projection_hash or _fallback_synthesis_projection_hash(projected)
-    synthesis_changed = previous_synthesis != new_synthesis
 
     previous_publication = (
         previous_publication_projection_hash or _fallback_publication_projection_hash(previous)
@@ -2652,6 +2656,19 @@ def _impact_from_projection_hashes(
     )
     publication_changed = previous_publication != new_publication
     rules_changed = previous_rule_bundle_hash != new_rule_bundle_hash
+
+    if (
+        previous == projected
+        and not synthesis_changed
+        and not publication_changed
+        and not rules_changed
+    ):
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            reason="The effective extraction is unchanged.",
+        )
 
     affected = {
         ProductionDerivedOutput.EXTRACTION,
@@ -2923,19 +2940,58 @@ class ProductionRepairProjectionService:
         run: Any,
         previous: TechnicalExtraction,
         projected: TechnicalExtraction,
+        previous_canonical: ProductionExtractionV1 | None,
+        projected_canonical: ProductionExtractionV1 | None,
     ) -> dict[str, str | None]:
         """Return functional hashes for the before/after effective outputs."""
         hashes: dict[str, str | None] = {
             "previous_rule_bundle": rule_bundle_projection_hash(previous),
             "new_rule_bundle": rule_bundle_projection_hash(projected),
-            "previous_synthesis": None,
-            "new_synthesis": None,
+            "previous_synthesis_evidence": None,
+            "new_synthesis_evidence": None,
             "previous_publication": None,
             "new_publication": None,
             "synthesis_artifact_id": None,
         }
         if self._artifact_store is None:
             return hashes
+
+        snapshots = getattr(uow, "production_input_snapshots", None)
+        snapshot = (
+            await snapshots.get_by_run(run.id)
+            if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
+            else None
+        )
+        if (
+            isinstance(snapshot, ProductionInputSnapshot)
+            and previous_canonical is not None
+            and projected_canonical is not None
+        ):
+            try:
+                hashes["previous_synthesis_evidence"] = _synthesis_evidence_hash(
+                    _synthesis_evidence_refs(snapshot, previous_canonical)
+                )
+                hashes["new_synthesis_evidence"] = _synthesis_evidence_hash(
+                    _synthesis_evidence_refs(snapshot, projected_canonical)
+                )
+            except (TypeError, ValueError):
+                # Missing or malformed canonical inputs cannot justify a
+                # Synthesis invalidation; the typed repair impact remains the
+                # authority for source-corpus and narrative work.
+                pass
+
+        synthesis = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+        if synthesis is not None and synthesis.canonical_blob_id is not None:
+            try:
+                production_synthesis_from_json(
+                    await self._artifact_store.read_json(synthesis.canonical_blob_id)
+                )
+            except Exception:
+                pass
+            else:
+                hashes["synthesis_artifact_id"] = str(synthesis.id)
 
         references = await uow.production_artifacts.get_current(
             run.id, ProductionArtifactStage.REFERENCES.value
@@ -2950,49 +3006,8 @@ class ProductionRepairProjectionService:
             return hashes
         if report is None:
             return hashes
-
-        source_tiers_by_url: dict[str, str] = {}
-        snapshots = getattr(uow, "production_input_snapshots", None)
-        snapshot = (
-            await snapshots.get_by_run(run.id)
-            if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
-            else None
-        )
-        relevant_urls = {source.canonical_url for source in report.sources}
-        if snapshot is not None:
-            core_urls = {
-                str(source.canonical_url)
-                for source in getattr(snapshot, "core_sources", ())
-                if getattr(source, "canonical_url", None)
-            }
-            source_tiers_by_url.update({url: "core" for url in core_urls})
-            source_tiers_by_url.update({url: "supporting" for url in relevant_urls - core_urls})
-        else:
-            collections = getattr(uow, "source_collections", None)
-            values = (
-                await collections.list_for_subject(run.subject_id)
-                if collections is not None
-                and callable(getattr(collections, "list_for_subject", None))
-                else ()
-            )
-            for collection in values:
-                origin = getattr(collection, "origin_kind", None)
-                if origin in {SourceOriginKind.DISCOVERY, SourceOriginKind.MANUAL}:
-                    source_tiers_by_url[collection.canonical_url] = "core"
-                elif origin is SourceOriginKind.REFERENCE_RESEARCH:
-                    source_tiers_by_url[collection.canonical_url] = "supporting"
-
-        hashes["previous_synthesis"] = synthesis_projection_hash(
-            report, previous, source_tiers_by_url
-        )
-        hashes["new_synthesis"] = synthesis_projection_hash(report, projected, source_tiers_by_url)
-
-        synthesis = await uow.production_artifacts.get_current(
-            run.id, ProductionArtifactStage.SYNTHESIS.value
-        )
         if synthesis is None or synthesis.rendered_blob_id is None:
             return hashes
-        hashes["synthesis_artifact_id"] = str(synthesis.id)
         try:
             synthesis_text = await self._artifact_store.read_text(synthesis.rendered_blob_id)
         except Exception:
@@ -3236,21 +3251,45 @@ class ProductionRepairProjectionService:
         )
         projected = projection.extraction
         current_extraction = base_extraction
+        current_canonical = base_view.canonical
         if current.id != base.id:
             try:
-                current_extraction = legacy_technical_extraction_from_payload(
+                current_view = extraction_compatibility_view(
                     await self._artifact_store.read_json(current.canonical_blob_id),
                     source_labels=labels,
                 )
+                current_extraction = current_view.legacy
+                current_canonical = current_view.canonical
             except Exception:
                 current_extraction = base_extraction
+                current_canonical = None
 
-        projection_hashes = await self._projection_hashes(uow, run, current_extraction, projected)
+        projected_canonical = (
+            _project_canonical_repair_overlay(
+                canonical=base_view.canonical,
+                projection=projection,
+                entries_by_key={
+                    repair_key: (kind, entry) for repair_key, kind, entry, _hash in active_entries
+                },
+                resolved_payloads=resolved_payloads,
+            )
+            if base_view.canonical is not None
+            else None
+        )
+
+        projection_hashes = await self._projection_hashes(
+            uow,
+            run,
+            current_extraction,
+            projected,
+            current_canonical,
+            projected_canonical,
+        )
         impact = _impact_from_projection_hashes(
             current_extraction,
             projected,
-            previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
-            new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+            previous_synthesis_projection_hash=projection_hashes["previous_synthesis_evidence"],
+            new_synthesis_projection_hash=projection_hashes["new_synthesis_evidence"],
             previous_publication_projection_hash=projection_hashes["previous_publication"],
             new_publication_projection_hash=projection_hashes["new_publication"],
             previous_rule_bundle_hash=str(projection_hashes["previous_rule_bundle"]),
@@ -3270,7 +3309,9 @@ class ProductionRepairProjectionService:
         )
         reused_synthesis_artifact_id: UUID | None = None
         if projection_hashes.get("synthesis_artifact_id") is not None and (
-            projection_hashes["previous_synthesis"] == projection_hashes["new_synthesis"]
+            projection_hashes["previous_synthesis_evidence"] is not None
+            and projection_hashes["previous_synthesis_evidence"]
+            == projection_hashes["new_synthesis_evidence"]
         ):
             reused_synthesis_artifact_id = UUID(str(projection_hashes["synthesis_artifact_id"]))
 
@@ -3292,8 +3333,8 @@ class ProductionRepairProjectionService:
                 artifact=current,
                 changed=False,
                 impact=impact,
-                previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
-                new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+                previous_synthesis_projection_hash=projection_hashes["previous_synthesis_evidence"],
+                new_synthesis_projection_hash=projection_hashes["new_synthesis_evidence"],
                 previous_publication_projection_hash=projection_hashes["previous_publication"],
                 new_publication_projection_hash=projection_hashes["new_publication"],
                 previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
@@ -3328,18 +3369,8 @@ class ProductionRepairProjectionService:
         )
         legacy_json = technical_extraction_to_json(projected)
         canonical_json = (
-            production_extraction_to_json(
-                _project_canonical_repair_overlay(
-                    canonical=base_view.canonical,
-                    projection=projection,
-                    entries_by_key={
-                        repair_key: (kind, entry)
-                        for repair_key, kind, entry, _hash in active_entries
-                    },
-                    resolved_payloads=resolved_payloads,
-                )
-            )
-            if base_view.canonical is not None
+            production_extraction_to_json(projected_canonical)
+            if projected_canonical is not None
             else legacy_json
         )
         base_metadata = dict(getattr(base, "metadata", {}) or {})
@@ -3404,8 +3435,8 @@ class ProductionRepairProjectionService:
             artifact=artifact,
             changed=True,
             impact=impact,
-            previous_synthesis_projection_hash=projection_hashes["previous_synthesis"],
-            new_synthesis_projection_hash=projection_hashes["new_synthesis"],
+            previous_synthesis_projection_hash=projection_hashes["previous_synthesis_evidence"],
+            new_synthesis_projection_hash=projection_hashes["new_synthesis_evidence"],
             previous_publication_projection_hash=projection_hashes["previous_publication"],
             new_publication_projection_hash=projection_hashes["new_publication"],
             previous_rule_bundle_hash=projection_hashes["previous_rule_bundle"],
@@ -3901,12 +3932,25 @@ class ProductionRepairMaterializationService:
                 )
 
             if impact.kind is ProductionRepairImpactKind.SOURCE_CORPUS:
+                await self._mark_stages_stale(
+                    uow,
+                    run.id,
+                    {
+                        ProductionArtifactStage.REFERENCES.value,
+                        ProductionArtifactStage.EXTRACTION.value,
+                        ProductionArtifactStage.SYNTHESIS.value,
+                        ProductionArtifactStage.PUBLICATION.value,
+                    },
+                )
                 self._record_repair_diagnostic(
                     event="production.repair.model_retry_requested",
                     run=run,
                     projection=projection,
                     started=started,
                     reused_synthesis=False,
+                )
+                await _require_publication_rebuild(
+                    uow, run, retry_stage=ProductionStage.REFERENCES.value
                 )
                 await uow.commit()
                 return ProductionRepairMaterializationResult(
