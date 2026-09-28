@@ -22,7 +22,6 @@ from cti_app.application.production_jobs import (
 from cti_app.application.production_reconciliation_resolver import (
     ProductionReconciliationResolver,
     ReconciliationOutcome,
-    _conversation_id,
 )
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import (
@@ -216,16 +215,6 @@ def _fixture(
     return resolver, run, model, bridge, gateway
 
 
-def test_conversation_id_is_only_available_for_synthesis() -> None:
-    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
-    run.current_stage = ProductionStage.REFERENCES
-    assert _conversation_id(run) is None
-
-    run.current_stage = ProductionStage.SYNTHESIS
-    run.synthesis_conversation_id = uuid4()
-    assert _conversation_id(run) == run.synthesis_conversation_id
-
-
 @pytest.mark.asyncio
 async def test_retryable_bridge_error_stays_undecided() -> None:
     resolver, run, _, bridge, gateway = _fixture(
@@ -275,7 +264,7 @@ async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
     assert run.reconciliation.provenance == "automatic_bridge_retrieval"
     assert model.status is ModelRunStatus.SUCCEEDED
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
 
 
 @pytest.mark.asyncio
@@ -291,7 +280,7 @@ async def test_archived_edition_keeps_resolver_undecided() -> None:
     assert run.requires_reconciliation
     assert model.status is ModelRunStatus.SUCCEEDED
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
 
 
 @pytest.mark.asyncio
@@ -304,7 +293,7 @@ async def test_terminal_failure_releases_without_adopting_output() -> None:
     assert run.requires_reconciliation is False
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
 
 
 @pytest.mark.asyncio
@@ -323,7 +312,7 @@ async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable
     assert run.requires_reconciliation is False
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
 
 
 @pytest.mark.asyncio
@@ -334,7 +323,7 @@ async def test_in_progress_bridge_run_stays_undecided() -> None:
     assert run.requires_reconciliation
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
 
 
 @pytest.mark.asyncio
@@ -352,7 +341,7 @@ async def test_declared_lost_releases_and_records_the_analyst_claim(tmp_path: Pa
     )
     assert run.requires_reconciliation is False
     assert run.error_code == "production_reconciliation_declared_lost"
-    assert _conversation_id(run) is None
+    assert not hasattr(run, "synthesis_conversation_id")
     assert gateway.calls == []
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     assert event == {

@@ -19,7 +19,6 @@ from cti_app.application.jobs import JobCancelledError, JobExecutionContext
 from cti_app.application.model_conversations import (
     ConversationTurnFailedError,
     ModelConversationService,
-    conversation_close_failure_fields,
 )
 from cti_app.application.model_gateway import (
     ModelGateway,
@@ -59,7 +58,6 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
-from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_references import (
     PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION,
     PRODUCTION_REFERENCE_PARSER_VERSION,
@@ -112,11 +110,7 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_conversations import (
     ConversationMode,
     ConversationPolicy,
-    ConversationPurpose,
-    ConversationTransport,
-    ModelConversation,
 )
-from cti_app.domain.model_runs import ModelProvider
 from cti_app.domain.production import (
     DetectionRuleType,
     ExtractionProfile,
@@ -151,10 +145,6 @@ _ARCHIVED_STATES = {"archived", "extracted", "completed"}
 # backend choice, so this version carries no provider.
 REFERENCES_ROUTING_POLICY_VERSION = "model-router-web-research-v1"
 REFERENCES_PROMPT_TEMPLATE_ID = "production-references"
-
-# Une fermeture d'onglet qui tombe pendant une éviction du service worker MV3
-# réussit quelques secondes plus tard.
-_CONVERSATION_CLOSE_RETRY_DELAY_SECONDS = 5.0
 
 # Keep archive reads within the same decoded-document limit as collection and
 # deterministic source processing. This is a local proof read, never prompt
@@ -596,77 +586,6 @@ class ProductionWorkflowOrchestrator:
             if commit is not None:
                 await commit()
 
-    async def _close_completed_stage_conversation_best_effort(
-        self,
-        run: ProductionRun,
-        stage: ProductionStage,
-    ) -> None:
-        """Archive the model conversation after a durable stage result.
-
-        Archiving also asks the bridge to close the exact bound browser tab.
-        Cleanup is deliberately best-effort: the stage artifact is already
-        durable, so a browser cleanup failure must not turn a successful stage
-        into a production failure.
-        """
-        model_service = getattr(self, "_model_service", None)
-        if model_service is None:
-            return
-
-        conversation_id: UUID | None = None
-        if stage is ProductionStage.SYNTHESIS:
-            conversation_id = run.synthesis_conversation_id
-
-        if conversation_id is None:
-            return
-
-        try:
-            await model_service.archive(
-                conversation_id,
-                context_subject_id=run.subject_id,
-            )
-        except Exception as first_failure:
-            first_failure_fields = conversation_close_failure_fields(first_failure)
-            failure_code = first_failure_fields.get("error_code")
-            # ModelConversationService wraps the bridge error to preserve the
-            # durable archive/close boundary; recover from its typed cause.
-            if failure_code == "conversation_session_close_failed":
-                failure_code = first_failure_fields.get("cause_code")
-            retry_allowed = ProductionRecoveryPolicyV1.is_auto_recoverable(failure_code)
-            exc: Exception | None = first_failure
-            if retry_allowed:
-                # Le service worker MV3 de l'extension est évincé environ
-                # toutes les trois minutes : une fermeture qui tombe dans
-                # cette fenêtre réussit à la tentative suivante.
-                await asyncio.sleep(_CONVERSATION_CLOSE_RETRY_DELAY_SECONDS)
-                try:
-                    await model_service.archive(
-                        conversation_id,
-                        context_subject_id=run.subject_id,
-                    )
-                    exc = None
-                except Exception as second_failure:
-                    exc = second_failure
-            if exc is not None:
-                failure = conversation_close_failure_fields(exc)
-                self._diagnostics.record(
-                    event="production.conversation_close_failed",
-                    run_id=run.id,
-                    subject_id=run.subject_id,
-                    stage=stage.value,
-                    correlation_id=self._correlation_id,
-                    conversation_id=str(conversation_id),
-                    error_type=type(exc).__name__,
-                    error_code=failure["error_code"],
-                    retryable=failure.get("retryable"),
-                    phase=failure.get("phase"),
-                    cause_code=failure.get("cause_code"),
-                    reason=failure.get("reason"),
-                    details=failure["details"],
-                    attempts=2 if retry_allowed else 1,
-                    error=str(exc)[:512],
-                    error_message=str(exc)[:512],
-                )
-
     async def execute_stage(
         self,
         run_id: UUID,
@@ -714,9 +633,6 @@ class ProductionWorkflowOrchestrator:
                 raise ValueError(f"Unknown stage: {expected_stage.value}")
         except ProductionReuseStorageUnavailableError as exc:
             result = self._handle_stage_exception(run, expected_stage.value, exc)
-
-        if result.get("status") in {"success", "cached", "reused"}:
-            await self._close_completed_stage_conversation_best_effort(run, expected_stage)
 
         self._diagnostics.record_stage_outcome(
             run_id=run.id,
@@ -1390,22 +1306,6 @@ class ProductionWorkflowOrchestrator:
             if content.turn.id == turn_id:
                 return content.output_text
         return None
-
-    async def _open_synthesis_conversation(
-        self, run: ProductionRun, subject_title: str
-    ) -> ModelConversation:
-        """Synthesis keeps its drafting conversation; REFERENCES is stateless."""
-        assert self._model_service is not None
-        return await self._model_service.create(
-            provider=ModelProvider.OPENAI,
-            transport=ConversationTransport.CHATGPT_BRIDGE,
-            purpose=ConversationPurpose.DRAFTING,
-            title=f"Production synthesis — {subject_title}",
-            edition_id=run.edition_id,
-            subject_id=run.subject_id,
-            expected_profile=None,
-            requested_model=None,
-        )
 
     async def _execute_sources_stage(
         self,

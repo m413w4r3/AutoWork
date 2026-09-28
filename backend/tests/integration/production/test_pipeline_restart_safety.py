@@ -16,10 +16,8 @@ from pydantic import BaseModel
 from cti_app.application.model_gateway import ModelRequest
 from cti_app.application.production_parsers import parse_q2_proposals_markdown
 from cti_app.application.production_reconciliation import ProductionReconciliationService
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.model_conversations import ConversationStatus
 from cti_app.domain.model_runs import (
     ModelBackend,
     ModelProvider,
@@ -59,18 +57,6 @@ class DurableState:
     documents: tuple[Any, ...]
     jobs: tuple[Any, ...]
     blobs: dict[UUID, bytes]
-
-
-@dataclass
-class BrowserTarget:
-    """External browser state needed only to exercise cleanup retry."""
-
-    present: set[UUID]
-    calls: list[UUID]
-
-    async def archive_conversation(self, conversation_id: UUID) -> None:
-        self.calls.append(conversation_id)
-        self.present.discard(conversation_id)
 
 
 @dataclass
@@ -479,64 +465,6 @@ async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
     )
     assert reloaded_synthesis.rendered_blob_id is not None
     assert after.blobs[reloaded_synthesis.rendered_blob_id] == synthesis_bytes
-
-
-@pytest.mark.asyncio
-async def test_restart_after_success_retries_only_browser_cleanup(
-    production_scenario_factory: ScenarioFactory,
-    migrated_postgres_url: str,
-) -> None:
-    scenario, _urls = _configured(production_scenario_factory, 1, all_primary=True)
-    browser = BrowserTarget(set(), [])
-    scenario.model_service._conversation_session_closer = browser
-    await scenario.start()
-    await _run_prefix(scenario, 3)
-
-    original_close = ProductionWorkflowOrchestrator._close_completed_stage_conversation_best_effort
-
-    async def crash_before_cleanup(
-        orchestrator: ProductionWorkflowOrchestrator,
-        run: Any,
-        stage: ProductionStage,
-    ) -> None:
-        if stage is ProductionStage.SYNTHESIS:
-            raise ProcessCrash("process lost before browser cleanup")
-        await original_close(orchestrator, run, stage)
-
-    with patch.object(
-        ProductionWorkflowOrchestrator,
-        "_close_completed_stage_conversation_best_effort",
-        new=crash_before_cleanup,
-    ):
-        with pytest.raises(ProcessCrash):
-            await scenario.runner.run_next()
-
-    before = await _reload(scenario)
-    conversation_id = before.run.synthesis_conversation_id
-    assert conversation_id is not None
-    browser.present.add(conversation_id)
-    async with scenario.uow_factory() as uow:
-        conversation = await uow.model_conversations.get(conversation_id)
-    assert conversation is not None
-    assert conversation.status is ConversationStatus.READY
-
-    async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
-        restarted.model_service._conversation_session_closer = browser
-        await restarted.enqueue_persisted_jobs(recover_abandoned=True)
-        final = await restarted.run_until_terminal()
-        after = await _reload(restarted)
-        # Retrying cleanup after the successful replay is safe and does not
-        # change the already successful production stage.
-        await restarted.model_service.archive(
-            conversation_id, context_subject_id=after.run.subject_id
-        )
-
-    _assert_refetched(before, after)
-    assert final.status is ProductionRunStatus.READY
-    assert restarted.model.provider_calls == []
-    # REFERENCES is stateless: the only browser session is Synthesis'.
-    assert browser.calls == [conversation_id, conversation_id]
-    assert browser.present == set()
 
 
 @pytest.mark.asyncio

@@ -145,14 +145,6 @@ async def test_complete_production_pipeline_reaches_ready(
             for attempt in await uow.collection_attempts.list_for_collection(collection.id)
         ]
         artifacts = list(await uow.production_artifacts.list_for_run(run.id))
-        turns = []
-        for conversation_id in (
-            persisted_run.synthesis_conversation_id if persisted_run else None,
-        ):
-            if conversation_id is not None:
-                turns.extend(
-                    await uow.model_conversation_turns.list_for_conversation(conversation_id)
-                )
 
     assert persisted_run is not None
     assert snapshot is not None
@@ -228,7 +220,8 @@ async def test_complete_production_pipeline_reaches_ready(
     # Extraction analyses the archived capture and never searches the web.
     assert all(call.web_search is (call.stage != "extraction") for call in model_calls)
     assert model_calls[0].conversation_id is None
-    assert model_calls[-1].conversation_id is not None
+    # Synthesis is stateless: the durable ModelRun owns submission identity.
+    assert model_calls[-1].conversation_id is None
     assert all(call.conversation_id is None for call in q2_calls)
     assert all(call.prompt_version for call in model_calls)
     assert all(call.model_run_id is not None for call in model_calls)
@@ -295,7 +288,6 @@ async def test_complete_production_pipeline_reaches_ready(
     assert publication_indicator_values == extraction_indicator_values
     assert all(source_id in model_calls[-1].request.text for source_id in reference_source_ids)
     assert all(value in model_calls[-1].request.text for value in extraction_indicator_values)
-    assert all(turn.status.value == "succeeded" for turn in turns)
 
     async with scenario.uow_factory() as uow:
         refreshed = await uow.production_runs.get(run.id)

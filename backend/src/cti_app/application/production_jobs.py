@@ -364,7 +364,6 @@ def register_production_jobs(
         uow_factory,
         transport=bridge_transport,
         model_gateway=model_gateway,
-        model_conversation_service=model_service,
         diagnostics=diagnostics,
     )
 

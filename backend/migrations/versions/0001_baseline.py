@@ -379,6 +379,8 @@ def upgrade() -> None:
     # Collection and evidence provenance is subject/discovery-lineage based.
     # The target production_input_snapshots schema includes its captured,
     # non-null publication_language column in the ORM metadata below.
+    # The target production_runs schema keeps no synthesis conversation
+    # identity: the durable ModelRun owns provider recovery.
     Base.metadata.create_all(bind=op.get_bind(), checkfirst=False)
     for _function_name, definition in _GUARD_FUNCTIONS:
         op.execute(definition)

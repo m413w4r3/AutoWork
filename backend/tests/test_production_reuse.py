@@ -1572,7 +1572,7 @@ async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact(
     assert result["mode"] == "fresh"
     assert {stage for _, stage in world.artifacts.requested} == {"extraction", "synthesis"}
     assert world.model_service.calls == []
-    assert world.run.synthesis_conversation_id is None
+    assert not hasattr(world.run, "synthesis_conversation_id")
     assert len(world.gateway.requests) == 1
     request = world.gateway.requests[0]
     assert request.web_search is False

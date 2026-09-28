@@ -77,7 +77,6 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             edition_id=edition_id,
             status=status,
             current_stage=stage,
-            synthesis_conversation_id=None,
             run_number=1,
             pipeline_generation=pipeline_generation,
             research_date=now.date(),

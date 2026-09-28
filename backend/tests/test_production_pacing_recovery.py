@@ -421,29 +421,16 @@ async def test_stage_dispatch_uses_model_jitter_and_subject_override() -> None:
     assert dispatcher.delays == [11000, 7000]
 
 
-@pytest.mark.parametrize(
-    ("stage", "keep_synthesis"),
-    (
-        (ProductionStage.SOURCES, False),
-        (ProductionStage.REFERENCES, False),
-        (ProductionStage.EXTRACTION, False),
-        (ProductionStage.SYNTHESIS, False),
-        (ProductionStage.ASSEMBLY, True),
-    ),
-)
-def test_business_retry_resets_synthesis_conversation_when_needed(
-    stage: ProductionStage, keep_synthesis: bool
+@pytest.mark.parametrize("stage", tuple(ProductionStage))
+def test_business_retry_opens_a_new_generation_without_conversation_state(
+    stage: ProductionStage,
 ) -> None:
-    synthesis_id = uuid4()
-    run = ProductionRun(
-        subject_id=uuid4(),
-        edition_id=uuid4(),
-        synthesis_conversation_id=synthesis_id,
-    )
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
     run.start_running()
     run.mark_failed(code="bridge_timeout", message="failure")
 
     run.retry_from_stage(stage)
 
-    assert run.synthesis_conversation_id == (synthesis_id if keep_synthesis else None)
+    # Durable ModelRun identity, never a conversation, owns submission recovery.
+    assert not hasattr(run, "synthesis_conversation_id")
     assert run.pipeline_generation == 1

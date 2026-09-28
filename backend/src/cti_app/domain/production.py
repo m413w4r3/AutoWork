@@ -826,7 +826,6 @@ class ProductionRun:
     edition_id: UUID
     status: ProductionRunStatus = ProductionRunStatus.QUEUED
     current_stage: ProductionStage = ProductionStage.SOURCES
-    synthesis_conversation_id: UUID | None = None
     run_number: int = 1
     # A manual retry is a new pipeline generation, distinct from a worker's
     # technical attempts.  It scopes every side effect identity in the chain.
@@ -1015,7 +1014,6 @@ class ProductionRun:
             }[stage]
         else:
             self.force_recompute_from_stage = None
-        self._reset_conversations_from(stage)
         self.error_code = None
         self.error_message = None
         self.error_details = None
@@ -1023,13 +1021,6 @@ class ProductionRun:
         self.finished_at = None
         self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
-
-    def _reset_conversations_from(self, stage: ProductionStage) -> None:
-        """Drop the model conversations the stages from ``stage`` on will rebuild."""
-        if stage in (ProductionStage.SOURCES, ProductionStage.REFERENCES):
-            self.synthesis_conversation_id = None
-        elif stage in (ProductionStage.EXTRACTION, ProductionStage.SYNTHESIS):
-            self.synthesis_conversation_id = None
 
     def resume_after_cancellation(
         self,
@@ -1062,7 +1053,6 @@ class ProductionRun:
         self.current_stage = stage
         self.pipeline_generation += 1
         self.force_recompute_from_stage = None
-        self._reset_conversations_from(stage)
         self.error_code = None
         self.error_message = None
         self.error_details = None

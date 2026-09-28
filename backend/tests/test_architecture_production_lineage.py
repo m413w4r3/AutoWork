@@ -134,9 +134,23 @@ def test_schema_stores_the_reference_corpus_only_as_an_artifact() -> None:
     tables = Base.metadata.tables
 
     assert "references_conversation_id" not in tables["production_runs"].columns.keys()
-    assert "synthesis_conversation_id" in tables["production_runs"].columns.keys()
+    assert "synthesis_conversation_id" not in tables["production_runs"].columns.keys()
     assert not {
         "production_reference_corpora",
         "production_reference_sources",
         "reference_events",
     } & set(tables)
+
+
+def test_backend_runtime_has_no_synthesis_conversation_identity() -> None:
+    """AW-012: the durable ModelRun owns Synthesis submission recovery."""
+    backend_root = _BACKEND / "src"
+    offenders = [
+        f"{path.relative_to(_REPOSITORY)}:{number}"
+        for path in _runtime_files()
+        if backend_root in path.parents
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if "synthesis_conversation_id" in line
+    ]
+
+    assert offenders == []

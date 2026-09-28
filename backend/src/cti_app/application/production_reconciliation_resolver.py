@@ -8,16 +8,12 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_review_recovery import prepare_batch_for_recovery
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.model_runs import ModelRunStatus
-from cti_app.domain.production import (
-    ProductionRun,
-    ProductionStage,
-)
+from cti_app.domain.production import ProductionRun
 from cti_app.integrations.models import BridgeTransportError
 
 
@@ -45,13 +41,11 @@ class ProductionReconciliationResolver:
         uow_factory: ProductionUnitOfWorkFactory,
         transport: ReconciliationTransport | None = None,
         model_gateway: ModelGateway | None = None,
-        model_conversation_service: ModelConversationService | None = None,
         diagnostics: DiagnosticsLog | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._transport = transport
         self._model_gateway = model_gateway
-        self._model_conversation_service = model_conversation_service
         self._diagnostics = diagnostics or DiagnosticsLog(None)
         self._last_bridge_run_id: str | None = None
         self._last_bridge_status: str | None = None
@@ -138,11 +132,6 @@ class ProductionReconciliationResolver:
         ):
             return ReconciliationOutcome.UNDECIDED
 
-        # ModelGateway closes a linked turn when it adopts the exact bytes. The
-        # conversation service is still the authority that reconciles its
-        # availability state, including test/legacy stores without that link.
-        await self._reconcile_conversation(original, available=True)
-
         try:
             async with self._uow_factory() as uow:
                 probe = await uow.production_runs.get(run_id)
@@ -182,7 +171,6 @@ class ProductionReconciliationResolver:
         actor_id: str | None = None,
     ) -> ReconciliationOutcome:
         bridge_run_id = _bridge_run_id(original)
-        await self._reconcile_conversation(original, available=False)
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_for_update(run_id)
             if run is None or not run.requires_reconciliation:
@@ -217,18 +205,6 @@ class ProductionReconciliationResolver:
             reason="production_reconciliation_declared_lost",
             audit_reason=reason,
             actor_id=actor_id,
-        )
-
-    async def _reconcile_conversation(self, run: ProductionRun, *, available: bool) -> None:
-        if self._model_conversation_service is None:
-            return
-        conversation_id = _conversation_id(run)
-        if conversation_id is None:
-            return
-        await self._model_conversation_service.reconcile(
-            conversation_id,
-            available=available,
-            context_subject_id=run.subject_id,
         )
 
     @staticmethod
@@ -335,12 +311,6 @@ def _verified_external_turn_id(payload: dict[str, Any]) -> str | None:
             value = candidate.strip()
             if value and len(value) <= 512:
                 return value
-    return None
-
-
-def _conversation_id(run: ProductionRun) -> UUID | None:
-    if run.current_stage is ProductionStage.SYNTHESIS:
-        return run.synthesis_conversation_id
     return None
 
 

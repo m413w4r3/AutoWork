@@ -96,9 +96,6 @@ class ProductionRunRow(Base):
     )
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     current_stage: Mapped[str] = mapped_column(String(32), nullable=False)
-    synthesis_conversation_id: Mapped[UUID | None] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("model_conversations.id", ondelete="SET NULL")
-    )
     run_number: Mapped[int] = mapped_column(nullable=False)
     pipeline_generation: Mapped[int] = mapped_column(nullable=False, server_default="0")
     research_date: Mapped[date] = mapped_column(Date, nullable=False)
