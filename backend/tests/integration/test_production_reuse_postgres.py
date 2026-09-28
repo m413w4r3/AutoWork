@@ -20,7 +20,6 @@ from cti_app.application.edition_publication import (
     EditionPublicationService,
 )
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
@@ -1425,10 +1424,8 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         uow_factory,
         BlobModelOutputStore(catalog),
     )
-    retry_conversations = ModelConversationService(uow_factory, retry_gateway, blob_store)
     retry_orchestrator = ProductionWorkflowOrchestrator(
         uow_factory,
-        model_service=retry_conversations,
         model_gateway=retry_gateway,
         artifact_store=store,
     )

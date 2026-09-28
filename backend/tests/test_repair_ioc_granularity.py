@@ -1,9 +1,9 @@
 """An IOC arbitration is surgical: publication only, never a model call.
 
 These tests are the executable statement of the granularity invariant. They
-work on the real functional projections -- the Q4 evidence pack hash and the
-publication input hash -- so they fail if a repair ever reaches the narrative
-again, whatever the classifier happens to claim.
+work on the real functional projections -- the publication input hash and the
+rule bundle hash -- and check that a repaired value carries no narrative
+context, so they fail if a repair ever reaches the narrative again.
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ from cti_app.application.production_repairs import (
     publication_projection_hash,
     repair_application_diagnostic,
     rule_bundle_projection_hash,
-    synthesis_projection_hash,
 )
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
@@ -143,11 +142,13 @@ def _project(
         .extraction
     )
     report = _report()
+    # A legacy extraction has no canonical Synthesis evidence identity: only the
+    # publication and rule projections decide the impact.
     impact = _impact_from_projection_hashes(
         previous,
         projected,
-        previous_synthesis_projection_hash=synthesis_projection_hash(report, previous, {}),
-        new_synthesis_projection_hash=synthesis_projection_hash(report, projected, {}),
+        previous_synthesis_projection_hash=None,
+        new_synthesis_projection_hash=None,
         previous_publication_projection_hash=publication_projection_hash(
             report, previous, SYNTHESIS_TEXT
         ),
@@ -165,10 +166,11 @@ def _assert_synthesis_untouched(
     projected: TechnicalExtraction,
     impact: ProductionRepairImpact,
 ) -> None:
-    report = _report()
-    assert synthesis_projection_hash(report, previous, {}) == synthesis_projection_hash(
-        report, projected, {}
-    ), "the Q4 evidence pack changed: the repair leaked into the narrative"
+    # A repaired IOC carries no narrative context, so it can never enter the
+    # canonical Synthesis evidence pack.
+    for item in projected.items:
+        if item not in previous.items:
+            assert not item.context.strip() and not item.evidence_quote.strip()
     assert not impact.model_call_required
     assert impact.kind is not ProductionRepairImpactKind.NARRATIVE
     assert ProductionDerivedOutput.SYNTHESIS not in impact.affected_outputs
@@ -260,8 +262,8 @@ def test_ioc_exclude_after_include_removes_it_from_the_publication_only() -> Non
     impact = _impact_from_projection_hashes(
         included,
         excluded,
-        previous_synthesis_projection_hash=synthesis_projection_hash(report, included, {}),
-        new_synthesis_projection_hash=synthesis_projection_hash(report, excluded, {}),
+        previous_synthesis_projection_hash=None,
+        new_synthesis_projection_hash=None,
         previous_publication_projection_hash=publication_projection_hash(
             report, included, SYNTHESIS_TEXT
         ),

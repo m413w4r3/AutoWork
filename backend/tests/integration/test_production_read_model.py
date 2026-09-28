@@ -242,6 +242,7 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
             actor_or_campaign="Actor",
             period_start=date(2026, 8, 1),
             period_end=date(2026, 8, 31),
+            publication_language="fr",
             research_date=date(2026, 8, 29),
             core_sources=[],
             input_hash="a" * 64,

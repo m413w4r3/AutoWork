@@ -222,36 +222,6 @@ async def test_canonical_storage_preview_metadata_versions_and_stale():
 
 
 @pytest.mark.asyncio
-async def test_exact_clone_uses_current_hash_and_canonical_blob():
-    uow, store = MemoryUow(), MemoryStore()
-    source_run, target_run, subject_id = uuid4(), uuid4(), uuid4()
-    synthesis, extraction = canonical_pair(subject_id)
-    service = SynthesisService(uow_factory(uow), store)
-    original = await service.store_synthesis_result(
-        run_id=source_run,
-        subject_id=subject_id,
-        input_hash="d" * 64,
-        synthesis=synthesis,
-        extraction=extraction,
-        raw_result=None,
-        model_run_id=None,
-    )
-    clone = await service.reuse_synthesis_result_in_uow(
-        uow,
-        run_id=target_run,
-        subject_id=subject_id,
-        input_hash="e" * 64,
-        source_artifact=original,
-    )
-    assert clone.input_hash == "e" * 64
-    assert clone.canonical_blob_id == original.canonical_blob_id
-    assert clone.rendered_blob_id == original.rendered_blob_id
-    assert clone.raw_blob_id == original.raw_blob_id
-    assert clone.reused_from_artifact_id == original.id
-    assert uow.production_artifacts.staled[-1] == (target_run, "synthesis")
-
-
-@pytest.mark.asyncio
 async def test_cross_run_reuse_requires_valid_canonical_blob():
     uow, store = MemoryUow(), MemoryStore()
     subject_id, edition_id = uuid4(), uuid4()
@@ -276,6 +246,9 @@ async def test_cross_run_reuse_requires_valid_canonical_blob():
     assert result is not None and result.reused
     assert result.artifact.canonical_blob_id == original.canonical_blob_id
     assert result.artifact.reused_from_artifact_id == original.id
+    assert result.artifact.rendered_blob_id == original.rendered_blob_id
+    assert result.artifact.metadata["mode"] == SynthesisMode.REUSE_EXACT.value
+    assert "FooRAT" not in str(result.artifact.metadata)
     assert len(store.blobs) == 2  # canonical and deterministic preview; no reconstruction
 
 
@@ -308,12 +281,4 @@ async def test_reuse_refuses_rendered_only_or_malformed_canonical(payload):
         allow_cross_run=False,
     )
     assert result is None
-    with pytest.raises(ValueError):
-        await SynthesisService(uow_factory(uow), store).reuse_synthesis_result_in_uow(
-            uow,
-            run_id=uuid4(),
-            subject_id=subject_id,
-            input_hash="a" * 64,
-            source_artifact=legacy,
-        )
     assert uow.production_artifacts.items == [legacy]

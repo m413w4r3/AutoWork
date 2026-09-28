@@ -75,6 +75,7 @@ from cti_app.application.production_stages import (
     ExtractionService,
     ProductionQAService,
     PublicationAssemblyService,
+    assembly_synthesis_text,
     compute_input_hash,
 )
 from cti_app.application.production_synthesis import build_synthesis_evidence_pack
@@ -258,136 +259,6 @@ def _projection_enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
 
-# Kept only for the historical synthesis lookup in the compatibility workflow.
-# Repair materialization uses canonical ExtractionEvidenceRefV1 identities below.
-SYNTHESIS_EVIDENCE_PACK_VERSION = "7"
-
-
-def extraction_item_contributes_to_synthesis(item: ExtractionItem) -> bool:
-    """Return whether one legacy extraction item belonged in the old Q4 pack."""
-    if not item.supported:
-        return False
-    if item.indicator_status is IndicatorStatus.EXCLUDED:
-        return False
-    if item.display_policy is DisplayPolicy.HIDDEN:
-        return False
-    if (
-        not item.context.strip()
-        and not item.evidence_quote.strip()
-        and (
-            item.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
-            or item.provenance is IndicatorProvenance.ANALYST
-        )
-    ):
-        return False
-    return True
-
-
-def synthesis_projection_payload(
-    report: ReferenceReport,
-    extraction: TechnicalExtraction,
-    source_tiers_by_url: Mapping[str, str],
-) -> dict[str, Any]:
-    """Build the legacy projection used only by historical synthesis lookup."""
-    merged: dict[tuple[str, str], dict[str, Any]] = {}
-    for item in extraction.items:
-        if not extraction_item_contributes_to_synthesis(item):
-            continue
-
-        category = item.category or ""
-        dedup_key = (category, item.value.strip().casefold())
-        artifact_type = (
-            item.artifact_type.value
-            if isinstance(item.artifact_type, ArtifactType)
-            else item.artifact_type
-        )
-        candidate = {
-            "category": category,
-            "value": item.value,
-            "context": item.context,
-            "source_ids": sorted(item.source_ids),
-            "is_confirmed_indicator": item.indicator_status is IndicatorStatus.CONFIRMED_IOC,
-            "artifact_type": artifact_type,
-        }
-        existing = merged.get(dedup_key)
-        if existing is None:
-            merged[dedup_key] = candidate
-            continue
-
-        contexts = (str(existing["context"] or ""), str(candidate["context"] or ""))
-        existing["context"] = max(contexts, key=lambda value: (len(value), value))
-        existing["value"] = min(
-            (str(existing["value"]), str(candidate["value"])),
-            key=lambda value: (value.casefold(), value),
-        )
-        existing["category"] = min(str(existing["category"]), str(candidate["category"]))
-        artifact_types = {
-            str(value)
-            for value in (existing.get("artifact_type"), candidate.get("artifact_type"))
-            if value is not None
-        }
-        existing["artifact_type"] = min(artifact_types) if artifact_types else None
-        existing["is_confirmed_indicator"] = bool(
-            existing["is_confirmed_indicator"] or candidate["is_confirmed_indicator"]
-        )
-        existing_source_ids = {str(value) for value in cast(Sequence[Any], existing["source_ids"])}
-        candidate_source_ids = {
-            str(value) for value in cast(Sequence[Any], candidate["source_ids"])
-        }
-        existing["source_ids"] = sorted(existing_source_ids | candidate_source_ids)
-
-    items = sorted(
-        merged.values(),
-        key=lambda item: (
-            str(item["category"]),
-            str(item["value"]),
-            str(item["context"]),
-            tuple(item["source_ids"]),
-        ),
-    )
-    return {
-        "version": SYNTHESIS_EVIDENCE_PACK_VERSION,
-        "reference_report": {
-            "sources": [
-                {
-                    "id": source.local_id,
-                    "tier": source_tiers_by_url.get(source.canonical_url, "unknown"),
-                    "title": source.title,
-                    "publisher": source.publisher,
-                    "published_at": (
-                        source.published_at.isoformat() if source.published_at else None
-                    ),
-                }
-                for source in sorted(report.sources, key=lambda source: source.local_id)
-            ],
-            "events": [
-                {
-                    "date": event.event_date.isoformat() if event.event_date else None,
-                    "source_ids": sorted(event.source_ids),
-                    "text": re.sub(
-                        r"\b(?:https?|hxxps?)://\S+",
-                        "[URL omitted]",
-                        event.text,
-                        flags=re.IGNORECASE,
-                    ),
-                }
-                for event in sorted(
-                    report.events,
-                    key=lambda event: (
-                        event.event_date.isoformat() if event.event_date else "",
-                        event.local_id,
-                    ),
-                )
-            ],
-            "uncertainties": sorted(report.uncertainties),
-        },
-        "technical_extraction": {
-            "items": items,
-            "uncertainties": sorted(extraction.uncertainties),
-        },
-    }
-
-
 def _publication_item_projection(item: ExtractionItem) -> dict[str, Any]:
     """Keep only fields consumed by the publication builder and annotator."""
     artifact_type = (
@@ -471,14 +342,6 @@ def rule_bundle_projection_payload(extraction: TechnicalExtraction) -> dict[str,
 
 def _projection_hash(payload: dict[str, Any]) -> str:
     return _sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-
-
-def synthesis_projection_hash(
-    report: ReferenceReport,
-    extraction: TechnicalExtraction,
-    source_tiers_by_url: Mapping[str, str],
-) -> str:
-    return _projection_hash(synthesis_projection_payload(report, extraction, source_tiers_by_url))
 
 
 def publication_projection_hash(
@@ -3004,12 +2867,13 @@ class ProductionRepairProjectionService:
             report = await load_reference_projection(self._artifact_store, references)
         except Exception:
             return hashes
-        if report is None:
-            return hashes
-        if synthesis is None or synthesis.rendered_blob_id is None:
+        if report is None or synthesis is None:
             return hashes
         try:
-            synthesis_text = await self._artifact_store.read_text(synthesis.rendered_blob_id)
+            # The exact text Assembly consumes, never the human preview.
+            synthesis_text = await assembly_synthesis_text(
+                self._artifact_store, report, previous_canonical, synthesis
+            )
         except Exception:
             return hashes
         hashes["previous_publication"] = publication_projection_hash(

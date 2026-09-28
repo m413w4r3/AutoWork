@@ -15,10 +15,6 @@ from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentSe
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
-from cti_app.application.model_conversations import (
-    ConversationTurnFailedError,
-    ModelConversationService,
-)
 from cti_app.application.model_gateway import (
     ModelGateway,
     ModelGatewayError,
@@ -151,9 +147,7 @@ _MODEL_SUBMISSION_RECONCILIATION_CODE = "model_submission_reconciliation_require
 def _transient_or_terminal(stage: str, exc: Exception) -> dict[str, Any]:
     code = str(getattr(exc, "code", "") or "")
     retryable = bool(getattr(exc, "retryable", False))
-    if isinstance(exc, ConversationTurnFailedError) and exc.status.value == "needs_review":
-        status = "needs_review"
-    elif code == _MODEL_SUBMISSION_RECONCILIATION_CODE or code in _REVIEW_CODES:
+    if code == _MODEL_SUBMISSION_RECONCILIATION_CODE or code in _REVIEW_CODES:
         # The conversation is gone or busy: an operator has to look, but the
         # subject is not corrupted and the batch must keep moving.
         status = "needs_review"
@@ -439,7 +433,6 @@ class ProductionWorkflowOrchestrator:
     def __init__(
         self,
         uow_factory: UnitOfWorkFactory,
-        model_service: ModelConversationService | None = None,
         model_gateway: ModelGateway | None = None,
         collection_service: SubjectCollectionService | None = None,
         artifact_store: ProductionArtifactStore | None = None,
@@ -448,8 +441,7 @@ class ProductionWorkflowOrchestrator:
         pacing: ProductionPacingPolicy | None = None,
     ) -> None:
         self._uow_factory = uow_factory
-        self._model_service = model_service
-        self._model_gateway = model_gateway or getattr(model_service, "_gateway", None)
+        self._model_gateway = model_gateway
         self._repair_payloads = ProductionRepairPayloadResolver(self._model_gateway)
         self._collection_service = collection_service
         self._artifact_store = artifact_store
@@ -801,18 +793,6 @@ class ProductionWorkflowOrchestrator:
         if snapshot.subject_id != subject_id:
             raise ValueError("production_input_snapshot_subject_mismatch")
         return snapshot.subject_title, snapshot.discovery_summary
-
-    async def _turn_output_text(self, conversation_id: UUID, turn_id: UUID) -> str | None:
-        """Read a turn's output text.
-
-        The turn entity only carries a blob reference; the conversation service
-        is what resolves it back to text.
-        """
-        assert self._model_service is not None
-        for content in await self._model_service.turns(conversation_id):
-            if content.turn.id == turn_id:
-                return content.output_text
-        return None
 
     async def _execute_sources_stage(
         self,

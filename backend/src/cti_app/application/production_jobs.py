@@ -22,7 +22,6 @@ from cti_app.application.jobs import (
     JobRegistry,
     JobService,
 )
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -346,7 +345,6 @@ def register_production_jobs(
     uow_factory: UnitOfWorkFactory,
     *,
     chain: ProductionStageChain | None = None,
-    model_service: ModelConversationService | None = None,
     model_gateway: ModelGateway | None = None,
     collection_service: SubjectCollectionService | None = None,
     artifact_store: ProductionArtifactStore | None = None,

@@ -296,10 +296,8 @@ async def test_complete_production_pipeline_reaches_ready(
         if call.prompt_template_id == "production-synthesis"
     ]
     assert model_calls[0].stage == "references"
-    # Drafting is not a public gateway override here: the scripted calls record
-    # the researching and extracting stages, and the drafting request is read
-    # from the provider boundary below.
-    assert all(call.stage == "extraction" for call in model_calls[1:])
+    assert model_calls[-1].stage == "synthesis"
+    assert all(call.stage == "extraction" for call in model_calls[1:-1])
     # Canonical Synthesis is one stateless structured draft through the gateway.
     assert len(synthesis_requests) == 1
     assert synthesis_requests[0].web_search is False
@@ -307,12 +305,11 @@ async def test_complete_production_pipeline_reaches_ready(
     covered_q2_urls = tuple(url for call in q2_calls for url in call.source_urls)
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
-    assert len(model_calls) == 1 + len(q2_calls)
-    # Only the References stage searches the web; the archived capture is
-    # analysed statelessly.
-    assert all(call.web_search is (call.stage != "extraction") for call in model_calls)
-    assert model_calls[0].conversation_id is None
-    assert all(call.conversation_id is None for call in q2_calls)
+    assert len(model_calls) == 2 + len(q2_calls)
+    # Only the References stage searches the web; extraction and synthesis are
+    # stateless and offline.
+    assert all(call.web_search is (call.stage == "references") for call in model_calls)
+    assert all(call.conversation_id is None for call in model_calls)
     assert all(call.prompt_version for call in model_calls)
     assert all(call.model_run_id is not None for call in model_calls)
 

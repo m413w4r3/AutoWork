@@ -127,7 +127,6 @@ async def test_one_unreachable_core_source_does_not_stop_the_other(
     scenario = production_scenario_factory(_specs({S1: 200, S2: 404}))
     scenario.model.script.references(_references((S1,)))
     scenario.model.script.q2(source_url=S1, response=_q2(1))
-    scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
     run = await scenario.run_until_terminal()
@@ -157,7 +156,6 @@ async def test_unreachable_q1_source_is_a_warning_and_never_reaches_q2(
     # Q1 proposes both: S2 is only reachable through supplemental collection.
     scenario.model.script.references(_references((S1, S2)))
     scenario.model.script.q2(source_url=S1, response=_q2(1))
-    scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
     run = await scenario.run_until_terminal()
@@ -214,7 +212,6 @@ async def test_retryable_collection_failure_is_attempted_once_and_left_recoverab
     scenario.restrict_core_sources((S1,))
     scenario.model.script.references(_references((S1, S2)))
     scenario.model.script.q2(source_url=S1, response=_q2(1))
-    scenario.model.script.synthesis("ExampleRAT activity is documented [S1].")
 
     await scenario.start()
     run = await scenario.run_until_terminal()

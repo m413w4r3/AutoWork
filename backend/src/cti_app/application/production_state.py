@@ -42,6 +42,7 @@ from cti_app.application.production_references import (
     report_source_labels,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
+from cti_app.application.production_stages import assembly_synthesis_text
 from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,
@@ -511,7 +512,7 @@ class ProductionStateService:
         if (
             refs.canonical_blob_id is None
             or extraction.canonical_blob_id is None
-            or synthesis.rendered_blob_id is None
+            or (synthesis.canonical_blob_id is None and synthesis.rendered_blob_id is None)
         ):
             raise ProductionStateError(
                 code="production_state_incomplete", message="Production artifact content is missing"
@@ -528,11 +529,17 @@ class ProductionStateService:
             refs_content = await _portable_references_content(
                 self._artifact_store, refs, refs_content
             )
-            extraction_content = _portable_extraction_content(
-                await self._artifact_store.read_json(extraction.canonical_blob_id),
-                reference_report_from_json(refs_content),
+            report = reference_report_from_json(refs_content)
+            extraction_payload = await self._artifact_store.read_json(extraction.canonical_blob_id)
+            extraction_content = _portable_extraction_content(extraction_payload, report)
+            # V4 carries the legacy Assembly text: the one-way projection of a
+            # canonical synthesis, never its human preview.
+            synthesis_content = await assembly_synthesis_text(
+                self._artifact_store,
+                report,
+                extraction_compatibility_view(extraction_payload).canonical,
+                synthesis,
             )
-            synthesis_content = await self._artifact_store.read_text(synthesis.rendered_blob_id)
         except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise _invalid("Production artifact content is invalid") from exc
 

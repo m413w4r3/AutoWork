@@ -114,6 +114,7 @@ class _Edition:
         today = datetime.now(UTC).date()
         self.period_start = today
         self.period_end = today
+        self.languages = ("fr",)
 
     def snapshot(self) -> dict[str, Any]:
         return {"id": str(self.id), "state": self.state.value, "version": self.version}

@@ -529,12 +529,12 @@ class SqlAlchemyProductionArtifactRepository:
         input_hash: str,
         not_before: datetime | None = None,
     ) -> ProductionArtifact | None:
-        required_blob = {
-            ProductionArtifactStage.REFERENCES.value: ProductionArtifactRow.canonical_blob_id,
-            ProductionArtifactStage.EXTRACTION.value: ProductionArtifactRow.canonical_blob_id,
-            ProductionArtifactStage.SYNTHESIS.value: ProductionArtifactRow.rendered_blob_id,
-        }.get(stage)
-        if required_blob is None:
+        # Every reusable stage is identified by its canonical payload only.
+        if stage not in {
+            ProductionArtifactStage.REFERENCES.value,
+            ProductionArtifactStage.EXTRACTION.value,
+            ProductionArtifactStage.SYNTHESIS.value,
+        }:
             return None
 
         query = (
@@ -558,7 +558,7 @@ class SqlAlchemyProductionArtifactRepository:
                 & (ProductionArtifactRow.stage == stage)
                 & (ProductionArtifactRow.input_hash == input_hash)
                 & (ProductionArtifactRow.status == ProductionArtifactStatus.VERIFIED.value)
-                & required_blob.is_not(None)
+                & ProductionArtifactRow.canonical_blob_id.is_not(None)
             )
             .order_by(ProductionArtifactRow.created_at.desc(), ProductionArtifactRow.id.desc())
             .limit(1)

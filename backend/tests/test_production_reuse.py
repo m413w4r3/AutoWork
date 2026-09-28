@@ -33,11 +33,11 @@ from cti_app.application.production_synthesis import (
     SynthesisExecutionStatus,
     SynthesisProposalV1,
     build_synthesis_evidence_pack,
+    synthesis_input_hash,
 )
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _references_input_hash,
-    _synthesis_input_hash,
     production_references_model_run_id,
 )
 from cti_app.domain.classification import TLP
@@ -112,15 +112,7 @@ class _Artifacts:
             and item.stage.value == stage
             and item.input_hash == input_hash
             and item.status is ProductionArtifactStatus.VERIFIED
-            and (
-                item.canonical_blob_id is not None
-                if stage
-                in {
-                    ProductionArtifactStage.REFERENCES.value,
-                    ProductionArtifactStage.EXTRACTION.value,
-                }
-                else item.rendered_blob_id is not None
-            )
+            and item.canonical_blob_id is not None
             and (not_before is None or item.created_at > not_before)
         ]
         return max(matches, key=lambda item: item.created_at, default=None)
@@ -623,31 +615,27 @@ def test_extraction_hash_tracks_the_corpus_and_functional_versions(
         monkeypatch.undo()
 
 
-def test_synthesis_hash_tracks_content_evidence_and_routing_identity() -> None:
-    kwargs = {
-        "subject_id": uuid4(),
-        "references_hash": "a" * 64,
-        "reference_report_hash": "b" * 64,
-        "extraction_hash": "c" * 64,
-        "technical_extraction_hash": "d" * 64,
-        "synthesis_evidence_pack_hash": "e" * 64,
-    }
-    base = _synthesis_input_hash(**kwargs)
-    assert base == _synthesis_input_hash(**kwargs)
-    for field in (
-        "technical_extraction_hash",
-        "synthesis_evidence_pack_hash",
+def test_synthesis_hash_tracks_extraction_and_every_policy_version() -> None:
+    run = _synthesis_run()
+    snapshot = _synthesis_snapshot(run)
+    extraction = _synthesis_extraction(snapshot, uuid4())
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    base = synthesis_input_hash(snapshot, extraction, pack, "a" * 64)
+
+    assert base == synthesis_input_hash(snapshot, extraction, pack, "a" * 64)
+    assert base != synthesis_input_hash(snapshot, extraction, pack, "b" * 64)
+    for version in (
         "prompt_version",
+        "validator_version",
+        "model_policy_version",
         "routing_policy_version",
     ):
-        changed = dict(kwargs)
-        if field == "prompt_version":
-            assert base != _synthesis_input_hash(**changed, prompt_version="changed")
-        elif field == "routing_policy_version":
-            assert base != _synthesis_input_hash(**changed, routing_policy_version="changed")
-        else:
-            changed[field] = "f" * 64
-            assert base != _synthesis_input_hash(**changed)
+        changed = synthesis_input_hash(
+            snapshot, extraction, pack, "a" * 64, **{version: "changed"}
+        )
+        assert base != changed, version
+    changed_extraction = replace(extraction, warnings=("changed",))
+    assert base != synthesis_input_hash(snapshot, changed_extraction, pack, "a" * 64)
 
 
 # --- AW-010 REFERENCES corpus production, persistence and rebuild -----------
@@ -868,7 +856,6 @@ def _corpus_orchestrator(
     orchestrator._uow_factory = factory
     orchestrator._artifact_store = cast(Any, store)
     orchestrator._model_gateway = gateway
-    orchestrator._model_service = None
     orchestrator._collection_service = collection_service
     orchestrator._diagnostics = DiagnosticsLog(None)
     orchestrator._correlation_id = "-"
@@ -1373,18 +1360,6 @@ class _RefusingDraftGateway:
         raise AssertionError("exact synthesis reuse must not submit a drafting request")
 
 
-class _RecordingConversationService:
-    """Any legacy conversation call would be recorded and must stay empty."""
-
-    def __init__(self) -> None:
-        self.calls: list[str] = []
-
-    async def archive(
-        self, conversation_id: UUID, *, context_subject_id: UUID | None = None
-    ) -> None:
-        self.calls.append(f"archive:{conversation_id}")
-
-
 def _synthesis_run(
     *, subject_id: UUID | None = None, edition_id: UUID | None = None
 ) -> ProductionRun:
@@ -1527,10 +1502,8 @@ def _synthesis_world() -> SimpleNamespace:
     pack = build_synthesis_evidence_pack(snapshot, extraction)
     handles = {str(entry["kind"]): str(entry["handle"]) for entry in pack.narrative_evidence}
     gateway = _SynthesisGateway(_synthesis_proposal(handles))
-    model_service = _RecordingConversationService()
     orchestrator = ProductionWorkflowOrchestrator(
         cast(Any, lambda: uow),
-        model_service=cast(Any, model_service),
         model_gateway=cast(Any, gateway),
         artifact_store=cast(Any, store),
     )
@@ -1547,31 +1520,25 @@ def _synthesis_world() -> SimpleNamespace:
         store=store,
         pack=pack,
         gateway=gateway,
-        model_service=model_service,
         orchestrator=orchestrator,
     )
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact() -> None:
     world = _synthesis_world()
-
-    def forbidden(*args: object, **kwargs: object) -> Any:
-        raise AssertionError("the canonical synthesis stage must not project legacy inputs")
-
-    monkeypatch.setattr(production_workflow, "load_reference_projection", forbidden)
-    monkeypatch.setattr(production_workflow, "legacy_technical_extraction_from_payload", forbidden)
-    assert not hasattr(production_workflow, "load_legacy_technical_extraction")
-    assert not hasattr(production_workflow, "reference_report_to_json")
+    for legacy_input in (
+        "load_reference_projection",
+        "legacy_technical_extraction_from_payload",
+        "reference_report_to_json",
+    ):
+        assert not hasattr(production_workflow, legacy_input)
 
     result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
 
     assert result["status"] == "success"
     assert result["mode"] == "fresh"
     assert {stage for _, stage in world.artifacts.requested} == {"extraction", "synthesis"}
-    assert world.model_service.calls == []
     assert not hasattr(world.run, "synthesis_conversation_id")
     assert len(world.gateway.requests) == 1
     request = world.gateway.requests[0]
@@ -1666,7 +1633,6 @@ async def test_synthesis_stage_returns_needs_review_without_format_repair() -> N
     assert result["error_code"] == "synthesis_unknown_evidence"
     # Exactly one submission: an invalid answer is never re-asked.
     assert len(world.gateway.requests) == 1
-    assert world.model_service.calls == []
     assert world.artifacts.appended == []
 
 

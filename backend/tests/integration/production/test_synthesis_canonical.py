@@ -199,8 +199,8 @@ _CORE_TWO_OUTPUT = Q2SourceOutput(
 
 def _sources() -> dict[str, dict[str, object]]:
     return {
-        SOURCE_URLS[0]: {"status": 200, "mime": "text/html", "body": _BODY_ONE},
-        SOURCE_URLS[1]: {"status": 200, "mime": "text/html", "body": _BODY_TWO},
+        SOURCE_URLS[0]: {"status": 200, "mime": "text/plain", "body": _BODY_ONE},
+        SOURCE_URLS[1]: {"status": 200, "mime": "text/plain", "body": _BODY_TWO},
     }
 
 
@@ -583,7 +583,8 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     )
     assert publication_payload["schema_version"] == "2"
     publication_text = json.dumps(publication_payload)
-    assert "ExampleRAT is documented by the selected publications." in publication_text
+    # The semantic annotator splits recognised entities into their own spans.
+    assert "is documented by the selected publications." in publication_text
     assert "alpha-c2.security-lab.io" in publication_text
     assert "beta-c2.security-lab.io" in publication_text
 

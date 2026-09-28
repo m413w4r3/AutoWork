@@ -20,6 +20,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
+    SynthesisMode,
 )
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 
@@ -147,15 +148,15 @@ class ProductionArtifactReuseService:
                 )
                 + 1
             )
-            metadata = (
-                {
+            if stage is ProductionArtifactStage.SYNTHESIS:
+                metadata = {
                     key: value
                     for key, value in candidate.metadata.items()
                     if key in SYNTHESIS_METADATA_KEYS
                 }
-                if stage is ProductionArtifactStage.SYNTHESIS
-                else dict(candidate.metadata)
-            )
+                metadata["mode"] = SynthesisMode.REUSE_EXACT.value
+            else:
+                metadata = dict(candidate.metadata)
             metadata.update(
                 {
                     "reused": True,
@@ -198,12 +199,9 @@ class ProductionArtifactReuseService:
 
     @staticmethod
     def _required_blob_id(artifact: ProductionArtifact) -> UUID | None:
-        if artifact.stage in {
-            ProductionArtifactStage.REFERENCES,
-            ProductionArtifactStage.EXTRACTION,
-        }:
-            return artifact.canonical_blob_id
-        if artifact.stage is ProductionArtifactStage.SYNTHESIS:
+        # Every costly stage is reusable only through its canonical payload;
+        # a rendered-only legacy synthesis is never a canonical candidate.
+        if artifact.stage in _COSTLY_STAGES:
             return artifact.canonical_blob_id
         return None
 

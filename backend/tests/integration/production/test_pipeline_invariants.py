@@ -155,11 +155,6 @@ def _references(urls: Sequence[str], *, technical: frozenset[str] = frozenset())
     return "\n".join(lines)
 
 
-def _synthesis(urls: Sequence[str]) -> str:
-    citations = " ".join(f"[S{index}]" for index in range(1, len(urls) + 1))
-    return f"ExampleRAT activity is documented by the selected reports {citations}."
-
-
 def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
     matches = list(_BATCH_MARKER.finditer(prompt))
     blocks: list[tuple[str, str]] = []
@@ -248,8 +243,6 @@ def _configure(
     scenario = factory(specs)
     scenario.restrict_core_sources(core_urls)
     scenario.model.script.references(_references(urls, technical=technical))
-    # REFERENCES only projects the sources eligible for extraction.
-    scenario.model.script.synthesis(_synthesis([url for url in urls if url not in unavailable]))
     core = set(core_urls)
     script = CanonicalExtractionScript(
         outputs={

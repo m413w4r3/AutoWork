@@ -50,7 +50,8 @@ def _require_semantic_text(value: Any, label: str) -> str:
     return value
 
 
-def _evidence_ref_key(ref: ExtractionEvidenceRefV1) -> tuple[str, str, str]:
+def evidence_ref_sort_key(ref: ExtractionEvidenceRefV1) -> tuple[str, str, str]:
+    """The one deterministic ordering of evidence refs."""
     return (str(ref.source_document_id), ref.kind.value, ref.evidence_key)
 
 
@@ -63,7 +64,7 @@ def _normalize_evidence_refs(
         raise ValueError(f"{label} evidence references have an invalid type")
     if len(set(refs)) != len(refs):
         raise ValueError(f"{label} must not repeat evidence references")
-    return tuple(sorted(refs, key=_evidence_ref_key))
+    return tuple(sorted(refs, key=evidence_ref_sort_key))
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,13 +150,14 @@ class SynthesisUncertaintyV1:
         )
 
 
-def _timeline_sort_key(
+def timeline_sort_key(
     entry: SynthesisTimelineEntryV1,
 ) -> tuple[bool, date, tuple[tuple[str, str, str], ...], str, str]:
+    """Dated entries by date then evidence identity, followed by undated entries."""
     return (
         entry.event_date is None,
         entry.event_date or date.max,
-        tuple(_evidence_ref_key(ref) for ref in entry.evidence_refs),
+        tuple(evidence_ref_sort_key(ref) for ref in entry.evidence_refs),
         entry.text,
         entry.date_text or "",
     )
@@ -209,7 +211,7 @@ class ProductionSynthesisV1:
         object.__setattr__(
             self,
             "timeline",
-            tuple(sorted(set(self.timeline), key=_timeline_sort_key)),
+            tuple(sorted(set(self.timeline), key=timeline_sort_key)),
         )
         normalized_uncertainties = tuple(
             sorted(
@@ -221,41 +223,68 @@ class ProductionSynthesisV1:
         object.__setattr__(self, "warnings", tuple(sorted(set(self.warnings))))
 
 
+def synthesis_evidence_refs(
+    synthesis: ProductionSynthesisV1,
+) -> frozenset[ExtractionEvidenceRefV1]:
+    """Return every evidence ref cited by the lead, the sections and the timeline."""
+    paragraphs = (
+        *synthesis.lead,
+        *(paragraph for section in synthesis.sections for paragraph in section.paragraphs),
+    )
+    return frozenset(
+        (
+            *(ref for paragraph in paragraphs for ref in paragraph.evidence_refs),
+            *(ref for entry in synthesis.timeline for ref in entry.evidence_refs),
+        )
+    )
+
+
 def extraction_evidence_refs_v1(
     extraction: ProductionExtractionV1,
 ) -> tuple[ExtractionEvidenceRefV1, ...]:
     """Build stable refs from each canonical source-local extraction element."""
+    refs = {ref for ref, _payload in extraction_evidence_elements(extraction)}
+    return tuple(sorted(refs, key=evidence_ref_sort_key))
+
+
+_EVIDENCE_PAYLOAD_KEYS = (
+    (EvidenceKind.FACT, "facts"),
+    (EvidenceKind.EVENT, "events"),
+    (EvidenceKind.INDICATOR, "indicators"),
+    (EvidenceKind.RULE, "rules"),
+)
+
+
+def extraction_evidence_ref(
+    source_document_id: UUID, kind: EvidenceKind, payload: Mapping[str, Any]
+) -> ExtractionEvidenceRefV1:
+    """Identify one element by its owning source, kind and canonical payload."""
+    encoded = json.dumps(
+        {"source_document_id": str(source_document_id), "kind": kind.value, "payload": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return ExtractionEvidenceRefV1(
+        source_document_id=source_document_id,
+        kind=kind,
+        evidence_key=hashlib.sha256(encoded).hexdigest(),
+    )
+
+
+def extraction_evidence_elements(
+    extraction: ProductionExtractionV1,
+) -> tuple[tuple[ExtractionEvidenceRefV1, Mapping[str, Any]], ...]:
+    """Pair each source-local element with its ref, in canonical extraction order."""
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
     payload = production_extraction_to_json(extraction)
-    refs: list[ExtractionEvidenceRefV1] = []
-    list_keys = {
-        EvidenceKind.FACT: "facts",
-        EvidenceKind.EVENT: "events",
-        EvidenceKind.INDICATOR: "indicators",
-        EvidenceKind.RULE: "rules",
-    }
-    for source, source_payload in zip(extraction.sources, payload["sources"], strict=True):
-        for kind, list_key in list_keys.items():
-            for element_payload in source_payload[list_key]:
-                encoded = json.dumps(
-                    {
-                        "source_document_id": str(source.source_document_id),
-                        "kind": kind.value,
-                        "payload": element_payload,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-                refs.append(
-                    ExtractionEvidenceRefV1(
-                        source_document_id=source.source_document_id,
-                        kind=kind,
-                        evidence_key=hashlib.sha256(encoded).hexdigest(),
-                    )
-                )
-    return tuple(sorted(set(refs), key=_evidence_ref_key))
+    return tuple(
+        (extraction_evidence_ref(source.source_document_id, kind, element), element)
+        for source, source_payload in zip(extraction.sources, payload["sources"], strict=True)
+        for kind, list_key in _EVIDENCE_PAYLOAD_KEYS
+        for element in source_payload[list_key]
+    )
 
 
 def _ref_to_json(ref: ExtractionEvidenceRefV1) -> dict[str, str]:

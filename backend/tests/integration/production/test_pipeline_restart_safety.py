@@ -157,23 +157,15 @@ def _q2(index: int) -> str:
     )
 
 
-def _synthesis(urls: tuple[str, ...]) -> str:
-    citations = " ".join(f"[S{index}]" for index in range(1, len(urls) + 1))
-    return f"ExampleRAT activity is documented by the restart safety reports {citations}."
-
-
 def _configure_gateway(
     scenario: ProductionScenario,
     urls: tuple[str, ...],
     *,
     references: bool = True,
-    synthesis: bool = True,
     q2: dict[str, str | Exception] | None = None,
 ) -> None:
     if references:
         scenario.model.script.references(_references(urls))
-    if synthesis:
-        scenario.model.script.synthesis(_synthesis(urls))
     for index, url in enumerate(urls, start=1):
         scenario.model.script.q2(
             source_url=url,
@@ -275,7 +267,7 @@ def _provider_stages(model: ScriptedModelGateway) -> list[str]:
             stages.append("extraction")
         elif request.routing_hint.value == "web_research":
             stages.append("references")
-        elif request.routing_hint.value == "standard_draft":
+        elif request.prompt_template_id == "production-synthesis":
             stages.append("synthesis")
     return stages
 
@@ -513,7 +505,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     visible_text = parsed.value.model_dump_json()
     visible = VisibleRecovery(bridge_run_id, visible_text)
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
-        _configure_gateway(restarted, urls, references=False, synthesis=True)
+        _configure_gateway(restarted, urls, references=False)
         restarted.model.use_chatgpt_bridge_identity()
         service = ProductionReconciliationService(
             restarted.uow_factory,
@@ -580,7 +572,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     )
 
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
-        _configure_gateway(restarted, urls, references=False, synthesis=True)
+        _configure_gateway(restarted, urls, references=False)
         await restarted.enqueue_persisted_jobs()
         final = await restarted.run_until_terminal()
         after = await _reload(restarted)

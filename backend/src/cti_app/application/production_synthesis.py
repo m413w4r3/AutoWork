@@ -69,8 +69,12 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionV1,
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
+    evidence_ref_sort_key,
+    extraction_evidence_elements,
     extraction_evidence_refs_v1,
     production_synthesis_from_json,
+    synthesis_evidence_refs,
+    timeline_sort_key,
     validate_synthesis_lineage,
 )
 
@@ -473,47 +477,13 @@ def synthesis_model_run_id(
     return uuid5(NAMESPACE_URL, identity)
 
 
-def _evidence_ref_key(ref: ExtractionEvidenceRefV1) -> tuple[str, str, str]:
-    return (str(ref.source_document_id), ref.kind.value, ref.evidence_key)
-
-
-def _element_ref(
-    source_document_id: UUID, kind: EvidenceKind, payload: Mapping[str, Any]
-) -> ExtractionEvidenceRefV1:
-    key_payload = {
-        "source_document_id": str(source_document_id),
-        "kind": kind.value,
-        "payload": payload,
-    }
-    return ExtractionEvidenceRefV1(
-        source_document_id=source_document_id,
-        kind=kind,
-        evidence_key=hashlib.sha256(_canonical_json_bytes(key_payload)).hexdigest(),
-    )
-
-
-@dataclass(frozen=True, slots=True)
-class _EvidenceEntry:
-    ref: ExtractionEvidenceRefV1
-    payload: Mapping[str, Any]
-
-
 def _all_evidence_entries(
     extraction: ProductionExtractionV1,
-) -> dict[ExtractionEvidenceRefV1, _EvidenceEntry]:
-    payload = production_extraction_to_json(extraction)
-    payload_keys = (
-        (EvidenceKind.FACT, "facts"),
-        (EvidenceKind.EVENT, "events"),
-        (EvidenceKind.INDICATOR, "indicators"),
-        (EvidenceKind.RULE, "rules"),
-    )
-    entries: dict[ExtractionEvidenceRefV1, _EvidenceEntry] = {}
-    for source, source_payload in zip(extraction.sources, payload["sources"], strict=True):
-        for kind, list_key in payload_keys:
-            for element_payload in source_payload[list_key]:
-                ref = _element_ref(source.source_document_id, kind, element_payload)
-                entries.setdefault(ref, _EvidenceEntry(ref, element_payload))
+) -> dict[ExtractionEvidenceRefV1, Mapping[str, Any]]:
+    """Map each canonical evidence ref to its element payload."""
+    entries: dict[ExtractionEvidenceRefV1, Mapping[str, Any]] = {}
+    for ref, payload in extraction_evidence_elements(extraction):
+        entries.setdefault(ref, payload)
     return entries
 
 
@@ -618,25 +588,25 @@ def build_synthesis_evidence_pack(
     }
     technical_candidates = [
         ref
-        for ref, entry in entries.items()
+        for ref, payload in entries.items()
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
-        and (str(entry.payload["context"]).strip() or str(entry.payload["evidence_quote"]).strip())
+        and (str(payload["context"]).strip() or str(payload["evidence_quote"]).strip())
     ]
     technical_refs = set(
-        sorted(technical_candidates, key=_evidence_ref_key)[:MAX_TECHNICAL_EVIDENCE_V1]
+        sorted(technical_candidates, key=evidence_ref_sort_key)[:MAX_TECHNICAL_EVIDENCE_V1]
     )
 
-    catalogue_refs = sorted(narrative_refs | technical_refs, key=_evidence_ref_key)
+    catalogue_refs = sorted(narrative_refs | technical_refs, key=evidence_ref_sort_key)
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(catalogue_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
 
     narrative_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref].payload)
+        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
         for ref in catalogue_refs
         if ref in narrative_refs
     )
     technical_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref].payload)
+        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
         for ref in catalogue_refs
         if ref in technical_refs
     )
@@ -1041,7 +1011,7 @@ def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> boo
 def _validate_grounded_text(
     text: str,
     refs: tuple[ExtractionEvidenceRefV1, ...],
-    entries: Mapping[ExtractionEvidenceRefV1, _EvidenceEntry],
+    entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
     known_technical: set[tuple[str, str]],
     technical_support: Mapping[tuple[str, str], set[ExtractionEvidenceRefV1]],
 ) -> None:
@@ -1053,7 +1023,7 @@ def _validate_grounded_text(
         if support and not support.intersection(ref_set):
             raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE)
     for date_key in _date_literals(text):
-        if not any(_date_supported_by_payload(entries[ref].payload, date_key) for ref in refs):
+        if not any(_date_supported_by_payload(entries[ref], date_key) for ref in refs):
             raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_DATE)
 
 
@@ -1093,8 +1063,8 @@ def validate_synthesis_proposal(
         technical_support_mutable: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = (
             defaultdict(set)
         )
-        for ref, entry in entries.items():
-            for value in _string_values(entry.payload):
+        for ref, payload in entries.items():
+            for value in _string_values(payload):
                 for literal in _technical_literals(value):
                     known_technical.add(literal)
                     technical_support_mutable[literal].add(ref)
@@ -1157,47 +1127,28 @@ def build_synthesis_timeline(
     """Normalize, deduplicate and order the canonical Extraction events."""
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
-    source_payloads = production_extraction_to_json(extraction)["sources"]
-    grouped: dict[bytes, dict[str, Any]] = {}
-    for source, source_payload in zip(extraction.sources, source_payloads, strict=True):
-        for event, event_payload in zip(source.events, source_payload["events"], strict=True):
-            normalized = {
-                key: value for key, value in event_payload.items() if key != "source_document_ids"
-            }
-            identity = _canonical_json_bytes(normalized)
-            group = grouped.setdefault(
-                identity,
-                {
-                    "event": event,
-                    "refs": set(),
-                },
-            )
-            group["refs"].add(
-                _element_ref(source.source_document_id, EvidenceKind.EVENT, event_payload)
-            )
+    # Identical events published by several sources collapse into one entry
+    # whose refs are the union of every publishing source's event.
+    grouped: dict[bytes, tuple[Mapping[str, Any], set[ExtractionEvidenceRefV1]]] = {}
+    for ref, payload in extraction_evidence_elements(extraction):
+        if ref.kind is not EvidenceKind.EVENT:
+            continue
+        normalized = {key: value for key, value in payload.items() if key != "source_document_ids"}
+        _payload, refs = grouped.setdefault(_canonical_json_bytes(normalized), (payload, set()))
+        refs.add(ref)
 
     entries = [
         SynthesisTimelineEntryV1(
-            event_date=group["event"].event_date,
-            date_text=group["event"].date_text,
-            text=group["event"].text,
-            evidence_refs=tuple(sorted(group["refs"], key=_evidence_ref_key)),
+            event_date=(
+                date.fromisoformat(payload["event_date"]) if payload["event_date"] else None
+            ),
+            date_text=payload["date_text"],
+            text=payload["text"],
+            evidence_refs=tuple(refs),
         )
-        for group in grouped.values()
+        for payload, refs in grouped.values()
     ]
-    return tuple(sorted(entries, key=_timeline_sort_key))
-
-
-def _timeline_sort_key(
-    entry: SynthesisTimelineEntryV1,
-) -> tuple[bool, date, tuple[tuple[str, str, str], ...], str, str]:
-    return (
-        entry.event_date is None,
-        entry.event_date or date.max,
-        tuple(_evidence_ref_key(ref) for ref in entry.evidence_refs),
-        entry.text,
-        entry.date_text or "",
-    )
+    return tuple(sorted(entries, key=timeline_sort_key))
 
 
 def build_synthesis_uncertainties(
@@ -1234,7 +1185,7 @@ class SynthesisDeltaV1:
                 raise ValueError(f"Synthesis delta {name} must be a tuple of evidence refs")
             if len(refs) != len(set(refs)):
                 raise ValueError(f"Synthesis delta {name} must not contain duplicates")
-            object.__setattr__(self, name, tuple(sorted(refs, key=_evidence_ref_key)))
+            object.__setattr__(self, name, tuple(sorted(refs, key=evidence_ref_sort_key)))
 
 
 def build_synthesis_delta(
@@ -1588,14 +1539,12 @@ def _synthesis_counts(synthesis: ProductionSynthesisV1) -> dict[str, Any]:
         *synthesis.lead,
         *(item for section in synthesis.sections for item in section.paragraphs),
     )
-    evidence_refs = {ref for paragraph in paragraphs for ref in paragraph.evidence_refs}
-    evidence_refs.update(ref for entry in synthesis.timeline for ref in entry.evidence_refs)
     return {
         "schema_version": synthesis.schema_version,
         "section_count": len(synthesis.sections),
         "paragraph_count": len(paragraphs),
         "timeline_entry_count": len(synthesis.timeline),
-        "evidence_ref_count": len(evidence_refs),
+        "evidence_ref_count": len(synthesis_evidence_refs(synthesis)),
         "uncertainty_count": len(synthesis.uncertainties),
         "warnings_count": len(synthesis.warnings),
     }

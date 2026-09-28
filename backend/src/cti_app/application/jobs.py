@@ -638,7 +638,6 @@ def create_job_registry(
     discovery_service: object | None = None,
     collection_service: object | None = None,
     uow_factory: object | None = None,
-    model_conversation_service: object | None = None,
     production_chain: object | None = None,
     production_artifact_store: object | None = None,
     production_diagnostics: object | None = None,
@@ -687,7 +686,6 @@ def create_job_registry(
     if uow_factory is not None:
         from cti_app.application.diagnostics import DiagnosticsLog
         from cti_app.application.edition_workspace import EditionProductionCheckpointService
-        from cti_app.application.model_conversations import ModelConversationService
         from cti_app.application.production_artifact_store import ProductionArtifactStore
         from cti_app.application.production_jobs import (
             ProductionStageChain,
@@ -696,10 +694,6 @@ def create_job_registry(
 
         if not callable(uow_factory):
             raise TypeError("uow_factory must be callable")
-        if model_conversation_service is not None and not isinstance(
-            model_conversation_service, ModelConversationService
-        ):
-            raise TypeError("model_conversation_service must be a ModelConversationService")
         if production_chain is not None and not isinstance(production_chain, ProductionStageChain):
             raise TypeError("production_chain must be a ProductionStageChain")
         if production_artifact_store is not None and not isinstance(
@@ -718,7 +712,6 @@ def create_job_registry(
             registry,
             uow_factory,
             chain=production_chain,
-            model_service=model_conversation_service,
             model_gateway=model_gateway,
             collection_service=collection_service,
             artifact_store=production_artifact_store,

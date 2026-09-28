@@ -19,7 +19,6 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueView,
     ProductionRepairValueNotVerifiableError,
     classify_repair_impact,
-    extraction_item_contributes_to_synthesis,
     production_repair_correction_identity,
 )
 from cti_app.application.production_source_evidence import SourceEvidenceSpanKind
@@ -155,7 +154,9 @@ def test_replace_projects_corrected_value_and_exclude_removes_it() -> None:
     assert [item.value for item in replaced.extraction.items] == [corrected]
     item = replaced.extraction.items[0]
     assert item.evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED
-    assert not extraction_item_contributes_to_synthesis(item)
+    # No narrative context: the value can never enter the Synthesis evidence pack.
+    assert not item.context.strip()
+    assert not item.evidence_quote.strip()
 
     excluded = EffectiveExtractionProjector().project(
         base=TechnicalExtraction(items=()),
