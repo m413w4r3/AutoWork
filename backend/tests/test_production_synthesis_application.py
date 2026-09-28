@@ -5,31 +5,44 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.model_gateway import ModelRoutingHint
 from cti_app.application.production_synthesis import (
     MAX_TECHNICAL_EVIDENCE_V1,
     SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION,
     SynthesisClaimProposalV1,
     SynthesisProposalControlError,
+    SynthesisProposalV1,
     SynthesisSectionProposalV1,
+    build_synthesis_access_policy,
     build_synthesis_delta,
     build_synthesis_evidence_pack,
+    build_synthesis_model_request,
     build_synthesis_timeline,
     build_synthesis_uncertainties,
     canonical_extraction_hash,
+    draft_synthesis_proposal,
+    synthesis_access_policy_hash,
+    synthesis_evidence_pack_hash,
+    synthesis_input_hash,
+    synthesis_model_run_id,
     validate_synthesis_proposal,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.entities import SourceDocument
 from cti_app.domain.production import (
     DetectionRuleType,
     ExtractionProfile,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
+    ProductionRun,
+    SynthesisMode,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -73,6 +86,38 @@ def make_snapshot(subject_id: UUID) -> ProductionInputSnapshot:
         publication_language="fr",
         research_date=date(2026, 3, 1),
     )
+
+
+def make_document(
+    subject_id: UUID,
+    source_id: UUID,
+    *,
+    tlp: TLP = TLP.CLEAR,
+    external_llm_allowed: bool = True,
+    do_not_submit: bool = False,
+) -> SourceDocument:
+    return SourceDocument(
+        id=source_id,
+        subject_id=subject_id,
+        blob_id=uuid4(),
+        original_name="source.pdf",
+        origin="test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=tlp,
+        external_llm_allowed=external_llm_allowed,
+        do_not_submit=do_not_submit,
+    )
+
+
+class MemorySourceDocuments:
+    def __init__(self, documents: tuple[SourceDocument, ...]) -> None:
+        self.documents = {document.id: document for document in documents}
+        self.requested: list[UUID] = []
+
+    async def get(self, document_id: UUID) -> SourceDocument | None:
+        self.requested.append(document_id)
+        return self.documents.get(document_id)
 
 
 def make_fact(source_id: UUID, value: str, *, context: str = "") -> ExtractionFactV1:
@@ -581,7 +626,7 @@ def test_proposal_accepts_event_and_fact_supported_dates_and_rejects_unsupported
     event_handle = next(
         str(record["handle"])
         for record in pack.narrative_evidence
-        if record["kind"] == EvidenceKind.EVENT.value
+        if record["kind"] == EvidenceKind.EVENT.value and record["event_date"] == "2026-07-02"
     )
     fact_handle = next(
         str(record["handle"])
@@ -637,10 +682,211 @@ def test_proposal_rejects_removed_revision_evidence():
 
 
 def test_proposal_schema_objects_are_strict_and_validate_section_kinds():
-    claim = SynthesisClaimProposalV1("FooRAT was reported.", ("E001",))
-    section = SynthesisSectionProposalV1(SynthesisSectionKind.OVERVIEW, "Overview", (claim,))
+    claim = SynthesisClaimProposalV1(text="FooRAT was reported.", evidence_handles=("E001",))
+    section = SynthesisSectionProposalV1(
+        kind=SynthesisSectionKind.OVERVIEW, heading="Overview", claims=(claim,)
+    )
     assert section.claims == (claim,)
     with pytest.raises(ValueError):
-        SynthesisClaimProposalV1("Claim", ())
+        SynthesisClaimProposalV1(text="Claim", evidence_handles=())
     with pytest.raises(ValueError):
-        SynthesisSectionProposalV1("unknown", "Heading", (claim,))  # type: ignore[arg-type]
+        SynthesisSectionProposalV1(kind="unknown", heading="Heading", claims=(claim,))  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_access_policy_folds_subject_and_exact_source_metadata_conservatively():
+    subject_id = uuid4()
+    snapshot = make_snapshot(subject_id)
+    source_ids = (uuid4(), uuid4(), uuid4())
+    extraction = make_extraction(
+        subject_id,
+        tuple(
+            make_source(source_id, url_suffix=f"source-{index}")
+            for index, source_id in enumerate(source_ids)
+        ),
+    )
+    docs = (
+        make_document(subject_id, source_ids[0], tlp=TLP.GREEN),
+        make_document(
+            subject_id,
+            source_ids[1],
+            tlp=TLP.RED,
+            external_llm_allowed=False,
+            do_not_submit=True,
+        ),
+        make_document(subject_id, source_ids[2], tlp=TLP.AMBER),
+    )
+    repo = MemorySourceDocuments(tuple(reversed(docs)))
+
+    policy = await build_synthesis_access_policy(snapshot, extraction, repo)
+    repeated = await build_synthesis_access_policy(
+        snapshot, extraction, MemorySourceDocuments(docs)
+    )
+
+    assert policy.effective_tlp is TLP.RED
+    assert policy.external_llm_allowed is False
+    assert policy.do_not_submit is True
+    assert tuple(item.source_document_id for item in policy.sources) == tuple(
+        sorted(source_ids, key=str)
+    )
+    assert repo.requested == sorted(source_ids, key=str)
+    assert synthesis_access_policy_hash(policy) == synthesis_access_policy_hash(repeated)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["missing", "wrong_subject", "missing_field"])
+async def test_access_policy_fails_closed_for_unavailable_or_invalid_exact_document(failure: str):
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(subject_id, (make_source(source_id),))
+    if failure == "missing":
+        document = None
+    elif failure == "wrong_subject":
+        document = make_document(uuid4(), source_id)
+    else:
+        document = SimpleNamespace(
+            id=source_id,
+            subject_id=subject_id,
+            tlp=TLP.CLEAR,
+            external_llm_allowed=True,
+        )
+
+    class Repository:
+        async def get(self, requested_id: UUID) -> object | None:
+            assert requested_id == source_id
+            return document
+
+    with pytest.raises(ValueError, match="synthesis_access_policy_unavailable"):
+        await build_synthesis_access_policy(snapshot, extraction, Repository())  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_synthesis_hash_request_and_model_identity_are_functional_and_stateless():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    document = make_document(
+        subject_id,
+        source_id,
+        tlp=TLP.AMBER,
+        external_llm_allowed=True,
+    )
+    policy = await build_synthesis_access_policy(
+        snapshot, extraction, MemorySourceDocuments((document,))
+    )
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=subject_id,
+        edition_id=snapshot.edition_id,
+        pipeline_generation=4,
+    )
+    request = build_synthesis_model_request(
+        run, snapshot, extraction, evidence_pack, policy, SynthesisMode.FRESH
+    )
+
+    assert request.web_search is False
+    assert request.conversation is None
+    assert request.background is False
+    assert request.external_llm_allowed is True
+    assert request.sensitivity == TLP.AMBER.value
+    assert request.routing_hint is ModelRoutingHint.PREMIUM_SYNTHESIS
+    assert request.evidence_pack_hash == synthesis_evidence_pack_hash(evidence_pack)
+    assert all(str(source_id) not in request.text for source_id in (source_id, document.blob_id))
+    assert all(record["handle"] in request.text for record in evidence_pack.narrative_evidence)
+    assert request.run_id == synthesis_model_run_id(
+        run,
+        synthesis_input_hash(
+            snapshot,
+            extraction,
+            evidence_pack,
+            synthesis_access_policy_hash(policy),
+        ),
+        SynthesisMode.FRESH,
+    )
+    assert request.run_id == synthesis_model_run_id(
+        run, request.metadata["synthesis_input_hash"], SynthesisMode.FRESH
+    )
+    changed_generation = replace(run, pipeline_generation=5)
+    assert request.run_id != synthesis_model_run_id(
+        changed_generation, request.metadata["synthesis_input_hash"], SynthesisMode.FRESH
+    )
+
+
+@pytest.mark.asyncio
+async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_timestamps():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    permissive = await build_synthesis_access_policy(
+        snapshot,
+        extraction,
+        MemorySourceDocuments((make_document(subject_id, source_id),)),
+    )
+    restricted = await build_synthesis_access_policy(
+        snapshot,
+        extraction,
+        MemorySourceDocuments((make_document(subject_id, source_id, external_llm_allowed=False),)),
+    )
+    original_hash = synthesis_input_hash(
+        snapshot, extraction, pack, synthesis_access_policy_hash(permissive)
+    )
+    changed_hash = synthesis_input_hash(
+        snapshot, extraction, pack, synthesis_access_policy_hash(restricted)
+    )
+    other_run_snapshot = replace(
+        snapshot,
+        production_run_id=uuid4(),
+        id=uuid4(),
+        captured_at=datetime(2030, 1, 1, tzinfo=UTC),
+    )
+    other_run_pack = build_synthesis_evidence_pack(other_run_snapshot, extraction)
+
+    assert original_hash != changed_hash
+    assert original_hash == synthesis_input_hash(
+        other_run_snapshot,
+        extraction,
+        other_run_pack,
+        synthesis_access_policy_hash(permissive),
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_gateway_receives_synthesis_proposal_as_structured_schema():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = make_extraction(
+        subject_id, (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),)
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    policy = await build_synthesis_access_policy(
+        snapshot, extraction, MemorySourceDocuments((make_document(subject_id, source_id),))
+    )
+    run = ProductionRun(
+        id=snapshot.production_run_id, subject_id=subject_id, edition_id=snapshot.edition_id
+    )
+    request = build_synthesis_model_request(
+        run, snapshot, extraction, pack, policy, SynthesisMode.FRESH
+    )
+
+    class Gateway:
+        request_seen: object | None = None
+        schema_seen: object | None = None
+
+        async def draft(self, model_request: object, output_schema: object) -> str:
+            self.request_seen = model_request
+            self.schema_seen = output_schema
+            return "drafted"
+
+    gateway = Gateway()
+    result = await draft_synthesis_proposal(gateway, request)  # type: ignore[arg-type]
+    assert result == "drafted"
+    assert gateway.request_seen is request
+    assert gateway.schema_seen is SynthesisProposalV1
