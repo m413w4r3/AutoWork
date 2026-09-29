@@ -19,6 +19,8 @@ from cti_app.domain.production import (
     ProductionStage,
 )
 
+from ..edition_codes import reserve_edition_code
+
 pytestmark = pytest.mark.integration
 
 
@@ -27,8 +29,8 @@ async def test_postgres_artifact_invalidation_uses_pipeline_dependencies(
     uow_factory: UnitOfWorkFactory,
 ) -> None:
     edition = Edition(
-        country="France",
-        country_code="FR",
+        country="Pipeline invalidation",
+        country_code=reserve_edition_code(),
         period_start=date(2026, 10, 1),
         period_end=date(2026, 10, 31),
         tlp=TLP.AMBER,
