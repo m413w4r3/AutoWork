@@ -9,6 +9,8 @@ from pathlib import Path
 BACKEND = Path(__file__).resolve().parents[1]
 SYNTHESIS = BACKEND / "src/cti_app/application/production_synthesis.py"
 WORKFLOW = BACKEND / "src/cti_app/application/production_workflow.py"
+FRONTEND = BACKEND.parent / "frontend"
+BASELINE = BACKEND / "migrations/versions/0001_baseline.py"
 
 LEGACY_SYNTHESIS_INPUTS = (
     "ReferenceReport",
@@ -41,13 +43,17 @@ def _canonical_workflow_branch() -> str:
     return ast.get_source_segment(WORKFLOW.read_text(), method) or ""
 
 
+def _assert_symbol_absent(path: Path, source: str, symbol: str) -> None:
+    assert symbol not in source, f"{path}: forbidden symbol {symbol}"
+
+
 def test_canonical_synthesis_has_no_legacy_evidence_or_conversation_path() -> None:
     synthesis_source = SYNTHESIS.read_text()
     workflow_branch = _canonical_workflow_branch()
 
     for forbidden in LEGACY_SYNTHESIS_INPUTS:
-        assert forbidden not in synthesis_source
-        assert forbidden not in workflow_branch
+        _assert_symbol_absent(SYNTHESIS, synthesis_source, forbidden)
+        _assert_symbol_absent(WORKFLOW, workflow_branch, forbidden)
 
     assert not re.search(r"web_search\s*=\s*True\b", synthesis_source + workflow_branch)
 
@@ -70,9 +76,15 @@ def test_canonical_synthesis_uses_gateway_structured_proposal_without_source_fet
 
 
 def test_backend_runtime_and_schema_have_no_synthesis_conversation_identity() -> None:
-    roots = (BACKEND / "src", BACKEND / "migrations")
-    for root in roots:
-        if not root.exists():
-            continue
-        for path in root.rglob("*.py"):
-            assert "synthesis_conversation_id" not in path.read_text(), str(path)
+    backend_src = BACKEND / "src"
+    frontend_src = FRONTEND / "src"
+    assert backend_src.is_dir(), f"missing runtime source directory: {backend_src}"
+    assert frontend_src.is_dir(), f"missing runtime source directory: {frontend_src}"
+
+    source_suffixes = {".py", ".js", ".jsx", ".ts", ".tsx", ".vue", ".svelte"}
+    for root in (backend_src, frontend_src):
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix in source_suffixes:
+                _assert_symbol_absent(path, path.read_text(), "synthesis_conversation_id")
+
+    _assert_symbol_absent(BASELINE, BASELINE.read_text(), "synthesis_conversation_id")
