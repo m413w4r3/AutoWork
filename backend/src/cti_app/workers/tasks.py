@@ -39,7 +39,6 @@ from cti_app.application.jobs import (
     JobService,
     create_job_registry,
 )
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import (
@@ -252,13 +251,6 @@ async def _execute_job(job_id: UUID) -> int | None:
             workspace_materializer=SubjectWorkspaceMaterializer(blob_store),
             workspace_root=settings.subject_workspace_root,
         )
-        model_conversation_service = ModelConversationService(
-            uow_factory,
-            model_gateway,
-            blob_store,
-            retention_days=settings.model_conversation_retention_days,
-            conversation_session_closer=bridge_provider,
-        )
         # Production stage jobs run here, so the worker needs the production
         # registrations and a bound chain to queue the following stage.
         production_artifact_store = ProductionArtifactStore(
@@ -286,7 +278,6 @@ async def _execute_job(job_id: UUID) -> int | None:
             discovery_service,
             collection_service,
             uow_factory,
-            model_conversation_service=model_conversation_service,
             production_chain=production_chain,
             production_artifact_store=production_artifact_store,
             production_diagnostics=production_diagnostics,

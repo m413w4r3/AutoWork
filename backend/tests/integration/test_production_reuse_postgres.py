@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
@@ -19,7 +20,6 @@ from cti_app.application.edition_publication import (
     EditionPublicationService,
 )
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
@@ -35,26 +35,24 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_extraction import (
     extraction_input_hash,
-    project_legacy_technical_extraction,
     references_corpus_hash,
 )
-from cti_app.application.production_parsers import (
-    Q2FactProposal,
-    Q2SourceOutput,
-    reference_report_to_json,
-)
-from cti_app.application.production_references import (
-    load_legacy_reference_report,
-    production_reference_corpus_to_json,
-)
-from cti_app.application.production_stages import (
-    PublicationAssemblyService,
-    compute_input_hash,
+from cti_app.application.production_parsers import Q2FactProposal, Q2SourceOutput
+from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_stages import PublicationAssemblyService
+from cti_app.application.production_synthesis import (
+    SynthesisClaimProposalV1,
+    SynthesisProposalV1,
+    SynthesisSectionProposalV1,
+    build_synthesis_access_policy,
+    build_synthesis_evidence_pack,
+    canonical_extraction_hash,
+    synthesis_access_policy_hash,
+    synthesis_input_hash,
 )
 from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _references_input_hash,
-    _synthesis_input_hash,
 )
 from cti_app.application.subject_production import (
     ProductionBatchService,
@@ -97,6 +95,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
+    ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionReuseInvalidation,
     ProductionRun,
@@ -107,6 +106,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionEventV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
@@ -118,6 +118,19 @@ from cti_app.domain.production_references import (
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+)
+from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+    SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    SynthesisTimelineEntryV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
 )
 from cti_app.domain.selection import (
     SelectionAction,
@@ -214,6 +227,27 @@ async def test_source_extraction_checkpoint_identity_is_durable(
         assert found is None
 
 
+def _proposal_from_canonical_synthesis_prompt(prompt_text: str) -> SynthesisProposalV1:
+    """Answer the canonical drafting prompt with one grounded claim."""
+    payload = json.loads(prompt_text)
+    records = payload["current_evidence_pack"]["narrative_evidence"]
+    fact = next(record for record in records if record["kind"] == "fact")
+    claim = SynthesisClaimProposalV1(
+        text=f"{fact['value']} is documented by the selected publication.",
+        evidence_handles=(fact["handle"],),
+    )
+    return SynthesisProposalV1(
+        lead=(claim,),
+        sections=(
+            SynthesisSectionProposalV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="Overview",
+                claims=(claim,),
+            ),
+        ),
+    )
+
+
 class _CountingRetryModelAdapter:
     """A deterministic bridge-shaped adapter for the real retry workflow."""
 
@@ -231,7 +265,6 @@ class _CountingRetryModelAdapter:
         self._extraction_text = Q2SourceOutput(
             facts=[Q2FactProposal(category="actors", value="Example actor")]
         ).model_dump_json()
-        self._synthesis_text = "The selected campaign was reported [S1]."
 
     async def invoke(
         self,
@@ -242,11 +275,19 @@ class _CountingRetryModelAdapter:
     ) -> AdapterResult:
         del output_schema
         self.calls.append(request)
-        output_text = (
-            self._extraction_text
-            if role is ModelRole.STRUCTURED_EXTRACTION
-            else self._synthesis_text
-        )
+        if request.prompt_template_id == "production-synthesis":
+            proposal = _proposal_from_canonical_synthesis_prompt(request.text)
+            return AdapterResult(
+                status=AdapterResultStatus.COMPLETED,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                response_id=f"retry-synthesis-{len(self.calls)}",
+                output_text=proposal.model_dump_json(),
+                structured_output=proposal,
+            )
+        output_text = self._extraction_text
         conversation = request.conversation
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
@@ -489,8 +530,33 @@ async def _seed_computed_run(
         raw="extraction raw",
         canonical={"stage": "extraction"},
     )
+    synthesis_ref = ExtractionEvidenceRefV1(
+        source_document_id=uuid4(),
+        kind=EvidenceKind.FACT,
+        evidence_key=hashlib.sha256(b"seeded-computed-run-fact").hexdigest(),
+    )
+    synthesis_paragraph = SynthesisParagraphV1(
+        text="The canonical synthesis of this run is seeded for reuse.",
+        evidence_refs=(synthesis_ref,),
+    )
     synthesis_blobs = await store.store_stage_payloads(
         raw="synthesis raw",
+        canonical=production_synthesis_to_json(
+            ProductionSynthesisV1(
+                schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+                subject_id=subject.id,
+                production_input_hash="a" * 64,
+                extraction_hash="b" * 64,
+                publication_language="fr",
+                synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+                title=subject.title,
+                lead=(synthesis_paragraph,),
+                sections=(),
+                timeline=(),
+                uncertainties=(),
+                warnings=(),
+            )
+        ),
         rendered="synthesis rendered",
     )
     blobs = {
@@ -579,7 +645,90 @@ async def _prepare_reusable_article(
     return batch, source
 
 
+def _canonical_synthesis(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    text: str,
+) -> ProductionSynthesisV1:
+    event_ref = next(
+        ref for ref in extraction_evidence_refs_v1(extraction) if ref.kind is EvidenceKind.EVENT
+    )
+    paragraph = SynthesisParagraphV1(text=text, evidence_refs=(event_ref,))
+    return ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=extraction.subject_id,
+        production_input_hash=extraction.production_input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language=snapshot.publication_language,
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=snapshot.subject_title,
+        lead=(paragraph,),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="Campaign overview",
+                paragraphs=(paragraph,),
+            ),
+        ),
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=date(2026, 8, 5),
+                date_text=None,
+                text=text,
+                evidence_refs=(event_ref,),
+            ),
+        ),
+        uncertainties=(),
+        warnings=(),
+    )
+
+
+async def _ensure_synthesis_source_document(
+    uow_factory: UnitOfWorkFactory,
+    store: ProductionArtifactStore,
+    *,
+    subject: Subject,
+    source: SourceCandidate,
+    extraction: ProductionExtractionV1,
+) -> None:
+    """Persist the exact archived-source metadata the access policy folds."""
+    document_id = extraction.sources[0].source_document_id
+    async with uow_factory() as uow:
+        if await uow.source_documents.get(document_id) is not None:
+            return
+        content = f"Canonical synthesis source {document_id}".encode()
+        content_sha256 = hashlib.sha256(content).hexdigest()
+        blob_id = await store.put_bytes(
+            content, bucket="integration-synthesis-source", mime_type="text/plain"
+        )
+        document = SourceDocument(
+            id=document_id,
+            subject_id=subject.id,
+            blob_id=blob_id,
+            original_name=f"{subject.slug}.txt",
+            origin=source.canonical_url,
+            acquired_at=datetime(2026, 8, 5, tzinfo=UTC),
+            license_restriction=None,
+            tlp=source.tlp,
+            do_not_submit=False,
+            external_llm_allowed=True,
+            decoded_blob_id=blob_id,
+            title=source.title,
+            publisher=source.publisher,
+            published_at=source.published_at,
+            final_url=source.canonical_url,
+            detected_mime_type="text/plain",
+            encoded_sha256=content_sha256,
+            decoded_sha256=content_sha256,
+            encoded_size=len(content),
+            decoded_size=len(content),
+        )
+        await uow.source_documents.add(document)
+        await uow.commit()
+
+
 async def _store_canonical_first_pass(
+    uow_factory: UnitOfWorkFactory,
     store: ProductionArtifactStore,
     *,
     snapshot: ProductionInputSnapshot,
@@ -661,7 +810,17 @@ async def _store_canonical_first_pass(
                 checkpoint_id=None,
                 reuse_state=ExtractionReuseState.FRESH,
                 facts=(),
-                events=(),
+                events=(
+                    ExtractionEventV1(
+                        event_date=date(2026, 8, 5),
+                        date_text=None,
+                        text=event_text,
+                        context="Campaign chronology.",
+                        evidence_quote=event_text,
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(document_id,),
+                    ),
+                ),
                 indicators=(),
                 rules=(),
                 uncertainties=(),
@@ -670,22 +829,22 @@ async def _store_canonical_first_pass(
         omitted_sources=(),
         warnings=(),
     )
-    report = load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
-    legacy = project_legacy_technical_extraction(extraction)
     refs_hash = _references_input_hash(snapshot=snapshot, research_date=snapshot.research_date)
-    synthesis_pack = ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(
-        report, legacy, {source.canonical_url: "core"}
-    )
-    # Q4 identity follows the semantic evidence pack, not the Q2 stage hash:
-    # the orchestrator feeds the pack hash into every extraction slot so a
-    # non-semantic Q2 replay cannot manufacture a second synthesis call.
-    semantic_synthesis_hash = compute_input_hash(synthesis_pack)
     refs_raw_id, refs_blob_id, _ = await store.store_stage_payloads(
         raw=raw, canonical=production_reference_corpus_to_json(corpus)
     )
     _, extraction_blob_id, _ = await store.store_stage_payloads(
         canonical=production_extraction_to_json(extraction)
     )
+    await _ensure_synthesis_source_document(
+        uow_factory, store, subject=subject, source=source, extraction=extraction
+    )
+    # The canonical synthesis identity is the frozen snapshot, the canonical
+    # extraction and the exact source access policy; no legacy report hash
+    # participates any more.
+    async with uow_factory() as uow:
+        policy = await build_synthesis_access_policy(snapshot, extraction, uow.source_documents)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
     return SimpleNamespace(
         refs_hash=refs_hash,
         refs_raw_id=refs_raw_id,
@@ -693,15 +852,13 @@ async def _store_canonical_first_pass(
         extraction_hash=extraction_input_hash(
             references_corpus_hash=references_corpus_hash(corpus)
         ),
+        extraction=extraction,
         extraction_blob_id=extraction_blob_id,
-        synthesis_hash=_synthesis_input_hash(
-            subject_id=subject.id,
-            references_hash=refs_hash,
-            reference_report_hash=compute_input_hash(reference_report_to_json(report)),
-            extraction_hash=semantic_synthesis_hash,
-            technical_extraction_hash=semantic_synthesis_hash,
-            synthesis_evidence_pack_hash=semantic_synthesis_hash,
-            current_synthesis_semantic_hash=semantic_synthesis_hash,
+        synthesis_hash=synthesis_input_hash(
+            snapshot,
+            extraction,
+            evidence_pack,
+            synthesis_access_policy_hash(policy),
         ),
     )
 
@@ -736,6 +893,7 @@ async def _seed_reusable_article(
     assert snapshot is not None
 
     first_pass = await _store_canonical_first_pass(
+        uow_factory,
         store,
         snapshot=snapshot,
         subject=subject,
@@ -747,8 +905,11 @@ async def _seed_reusable_article(
     synthesis_hash = first_pass.synthesis_hash
     refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
     extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
-    _, _, synthesis_blob_id = await store.store_stage_payloads(
-        raw=f"{title} synthesis", rendered=f"{title} was reported [S1]."
+    synthesis = _canonical_synthesis(snapshot, first_pass.extraction, f"{title} was reported.")
+    _, synthesis_canonical_id, synthesis_blob_id = await store.store_stage_payloads(
+        raw=f"{title} synthesis",
+        canonical=production_synthesis_to_json(synthesis),
+        rendered="Deliberately unrelated preview [S99].",
     )
     source_artifacts = {
         ProductionArtifactStage.REFERENCES: ProductionArtifact(
@@ -778,6 +939,7 @@ async def _seed_reusable_article(
             version=1,
             input_hash=synthesis_hash,
             status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
         ),
     }
@@ -1066,6 +1228,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert snapshot_a is not None
 
     first_pass = await _store_canonical_first_pass(
+        uow_factory,
         store,
         snapshot=snapshot_a,
         subject=subject,
@@ -1079,8 +1242,13 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     synthesis_hash = first_pass.synthesis_hash
     refs_raw_id, refs_blob_id = first_pass.refs_raw_id, first_pass.refs_blob_id
     extraction_raw_id, extraction_blob_id = None, first_pass.extraction_blob_id
-    _, _, synthesis_blob_id = await store.store_stage_payloads(
-        raw="synthesis A", rendered="The selected campaign was reported [S1]."
+    synthesis = _canonical_synthesis(
+        snapshot_a, first_pass.extraction, "The selected campaign was reported."
+    )
+    _, synthesis_canonical_id, synthesis_blob_id = await store.store_stage_payloads(
+        raw="synthesis A",
+        canonical=production_synthesis_to_json(synthesis),
+        rendered="Deliberately unrelated preview [S99].",
     )
     source_artifacts = {
         ProductionArtifactStage.REFERENCES: ProductionArtifact(
@@ -1107,6 +1275,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             stage=ProductionArtifactStage.SYNTHESIS,
             version=1,
             input_hash=synthesis_hash,
+            canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
         ),
     }
@@ -1116,6 +1285,36 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         await uow.commit()
 
     assembly = PublicationAssemblyService(uow_factory, store)
+    assembly_inputs = (
+        source_artifacts[ProductionArtifactStage.REFERENCES],
+        source_artifacts[ProductionArtifactStage.EXTRACTION],
+        source_artifacts[ProductionArtifactStage.SYNTHESIS],
+    )
+    first_projection = (await assembly._load_inputs(*assembly_inputs))[2]
+    repeated_projection = (await assembly._load_inputs(*assembly_inputs))[2]
+    assert first_projection.encode("utf-8") == repeated_projection.encode("utf-8")
+    assert first_projection.count("[S1]") == 3
+    assert "The selected campaign was reported." in first_projection
+    assert "[S99]" not in first_projection
+
+    unmapped_ref = replace(synthesis.lead[0].evidence_refs[0], source_document_id=uuid4())
+    unmapped_paragraph = replace(synthesis.lead[0], evidence_refs=(unmapped_ref,))
+    unmapped_synthesis = replace(
+        synthesis,
+        lead=(unmapped_paragraph,),
+        sections=(replace(synthesis.sections[0], paragraphs=(unmapped_paragraph,)),),
+        timeline=(replace(synthesis.timeline[0], evidence_refs=(unmapped_ref,)),),
+    )
+    _, unmapped_canonical_id, _ = await store.store_stage_payloads(
+        canonical=production_synthesis_to_json(unmapped_synthesis)
+    )
+    with pytest.raises(ValueError, match="absent from canonical extraction"):
+        await assembly._load_inputs(
+            assembly_inputs[0],
+            assembly_inputs[1],
+            replace(assembly_inputs[2], canonical_blob_id=unmapped_canonical_id),
+        )
+
     publication_a = await assembly.assemble_publication(
         run_id=run_a.id,
         subject_id=subject.id,
@@ -1225,10 +1424,8 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         uow_factory,
         BlobModelOutputStore(catalog),
     )
-    retry_conversations = ModelConversationService(uow_factory, retry_gateway, blob_store)
     retry_orchestrator = ProductionWorkflowOrchestrator(
         uow_factory,
-        model_service=retry_conversations,
         model_gateway=retry_gateway,
         artifact_store=store,
     )

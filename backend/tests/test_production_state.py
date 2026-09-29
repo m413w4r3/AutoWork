@@ -120,7 +120,9 @@ class _ImportUow:
             get_for_update=AsyncMock(return_value=SimpleNamespace(state=None)),
             get=AsyncMock(
                 return_value=SimpleNamespace(
-                    period_start=date(2026, 1, 1), period_end=date(2026, 12, 31)
+                    period_start=date(2026, 1, 1),
+                    period_end=date(2026, 12, 31),
+                    languages=("fr",),
                 )
             ),
         )

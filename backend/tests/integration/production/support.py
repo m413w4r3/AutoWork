@@ -7,6 +7,7 @@ workflow objects below are the application implementations.
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -37,7 +38,6 @@ from cti_app.application.jobs import (
     JobRegistry,
     JobService,
 )
-from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
@@ -179,7 +179,6 @@ class ScriptedModelScript:
 
     def __init__(self) -> None:
         self._references: str | None = None
-        self._synthesis: str | None = None
         self._q2: dict[str, str | Q2SourceOutput | Exception] = {}
         self._url_by_sha256: dict[str, str] = {}
 
@@ -195,9 +194,6 @@ class ScriptedModelScript:
     def q2(self, *, source_url: str, response: str | Q2SourceOutput | Exception) -> None:
         """Script the extraction of one source; Markdown is the readable Q2 dialect."""
         self._q2[_canonical_url(source_url)] = response
-
-    def synthesis(self, response: str) -> None:
-        self._synthesis = response
 
     def source_url_for(self, content_sha256: object) -> str | None:
         return self._url_by_sha256.get(str(content_sha256))
@@ -228,11 +224,8 @@ class ScriptedModelScript:
                 raise AssertionError("No scripted references response")
             return self._references
 
-        if request.prompt_template_id == "analyst-conversation":
-            if request.routing_hint is ModelRoutingHint.STANDARD_DRAFT:
-                if self._synthesis is None:
-                    raise AssertionError("No scripted synthesis response")
-                return self._synthesis
+        if request.prompt_template_id == "production-synthesis":
+            return _grounded_synthesis_proposal(request.text)
 
         raise AssertionError(
             "No scripted model response for "
@@ -379,13 +372,19 @@ class ScriptedModelGateway(ModelGateway):
         self._record_call(request)
         return await super().extract(request, output_schema)
 
+    async def draft(
+        self, request: ModelRequest, output_schema: type[BaseModel] | None = None
+    ) -> ModelExecution:
+        self._record_call(request)
+        return await super().draft(request, output_schema)
+
     def _record_call(self, request: ModelRequest) -> None:
         source_urls = self._request_source_urls(request)
         if request.prompt_template_id.startswith("production-extraction"):
             stage = "extraction"
         elif request.routing_hint is ModelRoutingHint.WEB_RESEARCH:
             stage = "references"
-        elif request.routing_hint is ModelRoutingHint.STANDARD_DRAFT:
+        elif request.prompt_template_id == "production-synthesis":
             stage = "synthesis"
         else:
             stage = request.routing_hint.value
@@ -464,7 +463,6 @@ class ProductionScenario:
     model_output_store: _CatalogModelOutputStore = field(init=False)
     model: ScriptedModelGateway = field(init=False)
     diagnostics: DiagnosticsLog = field(init=False)
-    model_service: ModelConversationService = field(init=False)
     collection_transport: DeterministicSourceTransport = field(init=False)
     collection_service: SubjectCollectionService = field(init=False)
     jobs: JobService = field(init=False)
@@ -559,11 +557,6 @@ class ProductionScenario:
             diagnostics=self.diagnostics,
         )
         self.model.script.bind_sources(canonical_sources)
-        self.model_service = ModelConversationService(
-            self.uow_factory,
-            self.model,
-            blob_store,
-        )
         allowed_domains = frozenset(urlsplit(url).hostname or "" for url in canonical_sources)
         policy = CollectionPolicy(allowed_domains=allowed_domains)
         self.collection_transport = DeterministicSourceTransport(canonical_sources)
@@ -587,7 +580,6 @@ class ProductionScenario:
             registry,
             self.uow_factory,
             chain=chain,
-            model_service=self.model_service,
             model_gateway=self.model,
             collection_service=self.collection_service,
             artifact_store=self.artifact_store,
@@ -833,6 +825,27 @@ class ProductionScenario:
         restarted.run_id = self.run_id
         restarted.batch_id = self.batch_id
         return restarted
+
+
+def _grounded_synthesis_proposal(prompt_text: str) -> str:
+    """Answer a canonical Synthesis draft with one claim grounded in the pack.
+
+    The claim carries no technical literal or date, so it is valid for any
+    evidence pack that exposes at least one narrative element.
+    """
+    narrative = json.loads(prompt_text)["current_evidence_pack"]["narrative_evidence"]
+    if not narrative:
+        raise AssertionError("The canonical evidence pack exposes no narrative evidence")
+    claim = {
+        "text": "The selected publications document this activity.",
+        "evidence_handles": [narrative[0]["handle"]],
+    }
+    return json.dumps(
+        {
+            "lead": [claim],
+            "sections": [{"kind": "overview", "heading": "Overview", "claims": [claim]}],
+        }
+    )
 
 
 def _canonical_url(url: str) -> str:

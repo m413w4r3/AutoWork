@@ -37,7 +37,7 @@ class TestProductionRun:
         assert run.created_at.tzinfo is not None
         assert run.updated_at.tzinfo is not None
         assert not hasattr(run, "references_conversation_id")
-        assert run.synthesis_conversation_id is None
+        assert not hasattr(run, "synthesis_conversation_id")
 
     @pytest.mark.parametrize("field", ["run_number", "version"])
     def test_run_number_and_version_must_be_positive(self, field: str) -> None:

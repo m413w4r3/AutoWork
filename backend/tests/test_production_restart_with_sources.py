@@ -120,6 +120,7 @@ class _Editions:
                 "version": self.version,
                 "period_start": today - timedelta(days=7),
                 "period_end": today,
+                "languages": ("fr",),
             },
         )()
 

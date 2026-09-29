@@ -234,7 +234,6 @@ async def test_references_rebuild_reuses_five_core_extractions_and_calls_six_onc
     scenario = production_scenario_factory(_sources())
     scenario.restrict_core_sources(URLS[:5])
     scenario.model.script.references(_references())
-    scenario.model.script.synthesis("ExampleRAT activity is documented by the core report [S1].")
     script = CanonicalExtractionScript(
         outputs={_marker(index): _output(index, full=index < 6) for index in range(1, 7)}
     )

@@ -15,7 +15,7 @@ from cti_app.application.pandoc_rendering import PANDOC_RENDERER_VERSION, render
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_extraction import (
-    legacy_technical_extraction_from_payload,
+    extraction_compatibility_view,
     production_extraction_metadata,
 )
 from cti_app.application.production_parsers import (
@@ -30,6 +30,11 @@ from cti_app.application.production_references import (
     report_source_labels,
 )
 from cti_app.application.production_rendering import collect_indicators
+from cti_app.application.production_synthesis import (
+    canonical_extraction_hash,
+    project_legacy_synthesis_markdown,
+    render_synthesis_markdown,
+)
 from cti_app.application.publication_builder import build_publication_document
 from cti_app.application.semantic_annotation import SEMANTIC_ANNOTATOR_VERSION
 from cti_app.domain.production import (
@@ -37,6 +42,7 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
+    SynthesisMode,
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
@@ -44,6 +50,13 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
+)
+from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_from_json,
+    production_synthesis_to_json,
+    synthesis_evidence_refs,
 )
 from cti_app.domain.publication import PUBLICATION_SCHEMA_VERSION
 
@@ -357,16 +370,53 @@ class SynthesisService(_ArtifactPayloadMixin):
 
     async def store_synthesis_result(
         self,
+        *,
         run_id: UUID,
         subject_id: UUID,
         input_hash: str,
-        raw_result: str,
-        markdown_content: str,
-        model_run_id: UUID | None = None,
-        conversation_turn_id: UUID | None = None,
-        diagnostics: dict[str, Any] | None = None,
-        metadata_extra: Mapping[str, Any] | None = None,
+        synthesis: ProductionSynthesisV1,
+        extraction: ProductionExtractionV1,
+        raw_result: str | None,
+        model_run_id: UUID | None,
+        mode: SynthesisMode = SynthesisMode.FRESH,
+        model_policy_version: str = "",
+        routing_policy_version: str = "",
     ) -> ProductionArtifact:
+        if self._artifact_store is None:
+            raise ValueError("Canonical synthesis requires an artifact store")
+        if synthesis.subject_id != subject_id or extraction.subject_id != subject_id:
+            raise ValueError("Synthesis subject does not match artifact subject")
+        if synthesis.extraction_hash != canonical_extraction_hash(extraction):
+            raise ValueError("Synthesis extraction hash does not match canonical extraction")
+        cited_refs = synthesis_evidence_refs(synthesis)
+        if not cited_refs <= set(extraction_evidence_refs_v1(extraction)):
+            raise ValueError("Synthesis cites evidence absent from extraction")
+        source_ids = {source.source_document_id for source in extraction.sources}
+        if any(
+            not set(item.source_document_ids) <= source_ids for item in synthesis.uncertainties
+        ):
+            raise ValueError("Synthesis uncertainty cites an absent source")
+        canonical_payload = production_synthesis_to_json(synthesis)
+        paragraphs = (*synthesis.lead, *(p for s in synthesis.sections for p in s.paragraphs))
+        preview = render_synthesis_markdown(synthesis, extraction)
+        narrative = [synthesis.title, *(p.text for p in paragraphs)]
+        narrative.extend(entry.text for entry in synthesis.timeline)
+        narrative.extend(item.text for item in synthesis.uncertainties)
+        metadata = {
+            "schema_version": synthesis.schema_version,
+            "language": synthesis.publication_language,
+            "mode": mode.value,
+            "section_count": len(synthesis.sections),
+            "paragraph_count": len(paragraphs),
+            "timeline_entry_count": len(synthesis.timeline),
+            "evidence_ref_count": len(cited_refs),
+            "uncertainty_count": len(synthesis.uncertainties),
+            "warnings_count": len(synthesis.warnings),
+            "word_count": sum(len(value.split()) for value in narrative),
+            "model_policy_version": model_policy_version,
+            "routing_policy_version": routing_policy_version,
+            "synthesis_policy_version": synthesis.synthesis_policy_version,
+        }
         async with self._uow_factory() as uow:
             # Not get_current: a synthesis retry stales every prior synthesis
             # artifact first, and get_current excludes STALE rows — using it
@@ -380,20 +430,11 @@ class SynthesisService(_ArtifactPayloadMixin):
             ]
             version = max(prior_versions) + 1 if prior_versions else 1
 
-            word_count = len(markdown_content.split())
-            reference_count = markdown_content.count("[S")
-
-            raw_id, _, rendered_id = await self._store_payloads(
-                raw=raw_result, rendered=markdown_content
+            raw_id, canonical_id, rendered_id = await self._store_payloads(
+                raw=raw_result, canonical=canonical_payload, rendered=preview
             )
-            metadata = {
-                "word_count": word_count,
-                "reference_count": reference_count,
-                "diagnostics": diagnostics or {},
-                "generated_at": datetime.now(UTC).isoformat(),
-            }
-            if metadata_extra:
-                metadata.update(dict(metadata_extra))
+            if canonical_id is None:
+                raise ValueError("Canonical synthesis blob was not stored")
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -402,9 +443,9 @@ class SynthesisService(_ArtifactPayloadMixin):
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
                 raw_blob_id=raw_id,
+                canonical_blob_id=canonical_id,
                 rendered_blob_id=rendered_id,
                 model_run_id=model_run_id,
-                conversation_turn_id=conversation_turn_id,
                 metadata=metadata,
             )
             await uow.production_artifacts.append(artifact)
@@ -415,67 +456,6 @@ class SynthesisService(_ArtifactPayloadMixin):
 
             await uow.commit()
             return artifact
-
-    async def reuse_synthesis_result_in_uow(
-        self,
-        uow: Any,
-        *,
-        run_id: UUID,
-        subject_id: UUID,
-        source_artifact: ProductionArtifact,
-        semantic_projection_hash: str,
-        metadata_extra: Mapping[str, Any] | None = None,
-    ) -> ProductionArtifact:
-        """Append a current Q4 version backed by a valid historical draft.
-
-        Compatibility reuse never changes the historical row or its input
-        hash.  The new row points at the old rendered blob and records the
-        compatibility basis so a later audit can distinguish it from a model
-        generation.
-        """
-        if source_artifact.rendered_blob_id is None:
-            raise ValueError("Historical synthesis artifact has no rendered payload")
-        existing = await uow.production_artifacts.list_for_run(run_id)
-        prior_versions = [
-            artifact.version
-            for artifact in existing
-            if artifact.stage is ProductionArtifactStage.SYNTHESIS
-        ]
-        metadata = dict(source_artifact.metadata)
-        metadata.update(
-            {
-                "reused": True,
-                "reused_from_artifact_id": str(source_artifact.id),
-                "reuse_basis": "semantic_projection_compatibility",
-                "semantic_projection_hash": semantic_projection_hash,
-                "historical_input_hash": source_artifact.input_hash,
-                "generated_at": datetime.now(UTC).isoformat(),
-            }
-        )
-        if metadata_extra:
-            metadata.update(dict(metadata_extra))
-        artifact = ProductionArtifact(
-            production_run_id=run_id,
-            subject_id=subject_id,
-            stage=ProductionArtifactStage.SYNTHESIS,
-            version=max(prior_versions, default=0) + 1,
-            # Preserve the historical identity.  It is an old valid input
-            # hash, not a rewritten claim about the new semantic projection.
-            input_hash=source_artifact.input_hash,
-            status=ProductionArtifactStatus.VERIFIED,
-            raw_blob_id=source_artifact.raw_blob_id,
-            rendered_blob_id=source_artifact.rendered_blob_id,
-            model_run_id=source_artifact.model_run_id,
-            conversation_turn_id=source_artifact.conversation_turn_id,
-            reused_from_artifact_id=source_artifact.id,
-            metadata=metadata,
-        )
-        await uow.production_artifacts.append(artifact)
-        await uow.production_artifacts.mark_downstream_stale(
-            run_id, ProductionArtifactStage.SYNTHESIS.value
-        )
-        return artifact
-
 
 class PublicationAssemblyService(_ArtifactPayloadMixin):
     """Manages publication assembly stage (deterministic)."""
@@ -660,17 +640,61 @@ class PublicationAssemblyService(_ArtifactPayloadMixin):
             raise ValueError("References artifact has no canonical payload")
         if extraction_artifact.canonical_blob_id is None:
             raise ValueError("Extraction artifact has no canonical payload")
-        if synthesis_artifact.rendered_blob_id is None:
-            raise ValueError("Synthesis artifact has no rendered payload")
         report = await load_reference_projection(self._artifact_store, references_artifact)
         if report is None:
             raise ValueError("References payload is not readable")
-        extraction = legacy_technical_extraction_from_payload(
+        view = extraction_compatibility_view(
             await self._artifact_store.read_json(extraction_artifact.canonical_blob_id),
             source_labels=report_source_labels(report),
         )
-        synthesis_text = await self._artifact_store.read_text(synthesis_artifact.rendered_blob_id)
-        return report, extraction, synthesis_text
+        synthesis_text = await assembly_synthesis_text(
+            self._artifact_store, report, view.canonical, synthesis_artifact
+        )
+        return report, view.legacy, synthesis_text
+
+
+async def assembly_synthesis_text(
+    artifact_store: ProductionArtifactStore,
+    report: ReferenceReport,
+    extraction: ProductionExtractionV1 | None,
+    synthesis_artifact: ProductionArtifact,
+) -> str:
+    """Return the legacy Assembly text of one SYNTHESIS artifact (until AW-013).
+
+    A canonical ``ProductionSynthesisV1`` goes through the one-way compatibility
+    projection, with each evidence source mapped to its legacy report label by
+    exact canonical URL. Only an imported V4 artifact, which has no canonical
+    payload, keeps its historical rendered Markdown.
+    """
+    if synthesis_artifact.canonical_blob_id is None:
+        if synthesis_artifact.rendered_blob_id is None:
+            raise ValueError("Synthesis artifact has no readable payload")
+        return await artifact_store.read_text(synthesis_artifact.rendered_blob_id)
+    if extraction is None:
+        raise ValueError("Canonical synthesis requires a canonical extraction")
+    synthesis = production_synthesis_from_json(
+        await artifact_store.read_json(synthesis_artifact.canonical_blob_id)
+    )
+    document_urls = {
+        source.source_document_id: source.canonical_url for source in extraction.sources
+    }
+    labels_by_url = report_source_labels(report)
+    source_labels: dict[UUID, str] = {}
+    for ref in synthesis_evidence_refs(synthesis):
+        canonical_url = document_urls.get(ref.source_document_id)
+        if canonical_url is None:
+            raise ValueError(
+                "Canonical synthesis evidence source is absent from canonical extraction: "
+                f"{ref.source_document_id}"
+            )
+        local_id = labels_by_url.get(canonical_url)
+        if local_id is None:
+            raise ValueError(
+                "Canonical synthesis evidence source cannot be mapped to the legacy "
+                f"ReferenceReport by exact canonical URL: {canonical_url}"
+            )
+        source_labels[ref.source_document_id] = local_id
+    return project_legacy_synthesis_markdown(synthesis, extraction, source_labels)
 
 
 class ProductionQAService:

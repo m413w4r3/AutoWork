@@ -226,7 +226,6 @@ class ProductionStatus(BaseModel):
     current_stage: str
     progress_current: int
     progress_total: int
-    synthesis_conversation_id: str | None = None
     run_id: str
     pipeline_generation: int = 0
     created_at: str
@@ -405,7 +404,6 @@ def _production_reconciliation_resolver(request: Request) -> ProductionReconcili
         request.app.state.uow_factory,
         transport=getattr(request.app.state, "bridge_capabilities_provider", None),
         model_gateway=getattr(request.app.state, "model_gateway", None),
-        model_conversation_service=getattr(request.app.state, "model_conversation_service", None),
         diagnostics=getattr(request.app.state, "production_diagnostics", None),
     )
 
@@ -1483,9 +1481,6 @@ async def get_subject_production(
             current_stage=run.current_stage.value,
             progress_current=completed_stages,
             progress_total=len(stages),
-            synthesis_conversation_id=(
-                str(run.synthesis_conversation_id) if run.synthesis_conversation_id else None
-            ),
             run_id=str(run.id),
             pipeline_generation=run.pipeline_generation,
             created_at=run.created_at.isoformat(),

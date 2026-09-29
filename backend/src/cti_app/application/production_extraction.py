@@ -1986,23 +1986,3 @@ def legacy_technical_extraction_from_payload(
     """Return only the legacy view of one EXTRACTION payload."""
 
     return extraction_compatibility_view(payload, source_labels=source_labels).legacy
-
-
-async def load_legacy_technical_extraction(
-    *,
-    uow_factory: ProductionUnitOfWorkFactory,
-    artifact_store: ExtractionArtifactStore,
-    run_id: UUID,
-    source_labels: Mapping[str, str] | None = None,
-) -> TechnicalExtraction | None:
-    """Load the legacy extraction view of a run's current EXTRACTION artifact."""
-
-    async with uow_factory() as uow:
-        artifact = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.EXTRACTION.value
-        )
-    if artifact is None or artifact.canonical_blob_id is None:
-        return None
-    return legacy_technical_extraction_from_payload(
-        await artifact_store.read_json(artifact.canonical_blob_id), source_labels=source_labels
-    )

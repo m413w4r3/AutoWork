@@ -28,7 +28,7 @@ from cti_app.application.production_extraction import (
     ProductionExtractionExecution,
     ProductionExtractionService,
     build_extraction_plan,
-    load_legacy_technical_extraction,
+    extraction_compatibility_view,
     load_reference_corpus,
     project_legacy_technical_extraction,
 )
@@ -459,6 +459,7 @@ def _snapshot(subject_id: UUID) -> ProductionInputSnapshot:
         actor_or_campaign="Actor-X",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 1),
     )
 
@@ -1641,14 +1642,9 @@ async def test_legacy_projection_is_one_way_and_reproducible() -> None:
         for item in projected.items
     )
 
-    blob_id = world.blobs.put_json(production_extraction_to_json(canonical))
-    world.artifacts.artifact = SimpleNamespace(
-        id=uuid4(), status=ProductionArtifactStatus.VERIFIED, canonical_blob_id=blob_id
-    )
-    legacy = await load_legacy_technical_extraction(
-        uow_factory=world.uow, artifact_store=world.blobs, run_id=uuid4()
-    )
-    assert legacy == projected
+    view = extraction_compatibility_view(production_extraction_to_json(canonical))
+    assert view.canonical == canonical
+    assert view.legacy == projected
 
 
 # --- execution identities and safety ----------------------------------------

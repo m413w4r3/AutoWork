@@ -207,7 +207,6 @@ class SqlAlchemyProductionRunRepository:
             edition_id=run.edition_id,
             status=run.status.value,
             current_stage=run.current_stage.value,
-            synthesis_conversation_id=run.synthesis_conversation_id,
             run_number=run.run_number,
             pipeline_generation=run.pipeline_generation,
             research_date=run.research_date,
@@ -278,7 +277,6 @@ class SqlAlchemyProductionRunRepository:
             .values(
                 status=run.status.value,
                 current_stage=run.current_stage.value,
-                synthesis_conversation_id=run.synthesis_conversation_id,
                 pipeline_generation=run.pipeline_generation,
                 research_date=run.research_date,
                 force_recompute_from_stage=(
@@ -418,6 +416,7 @@ class SqlAlchemyProductionInputSnapshotRepository:
                 actor_or_campaign=snapshot.actor_or_campaign,
                 period_start=snapshot.period_start,
                 period_end=snapshot.period_end,
+                publication_language=snapshot.publication_language,
                 research_date=snapshot.research_date,
                 core_sources=[source.payload() for source in snapshot.core_sources],
                 input_hash=snapshot.input_hash,
@@ -530,12 +529,12 @@ class SqlAlchemyProductionArtifactRepository:
         input_hash: str,
         not_before: datetime | None = None,
     ) -> ProductionArtifact | None:
-        required_blob = {
-            ProductionArtifactStage.REFERENCES.value: ProductionArtifactRow.canonical_blob_id,
-            ProductionArtifactStage.EXTRACTION.value: ProductionArtifactRow.canonical_blob_id,
-            ProductionArtifactStage.SYNTHESIS.value: ProductionArtifactRow.rendered_blob_id,
-        }.get(stage)
-        if required_blob is None:
+        # Every reusable stage is identified by its canonical payload only.
+        if stage not in {
+            ProductionArtifactStage.REFERENCES.value,
+            ProductionArtifactStage.EXTRACTION.value,
+            ProductionArtifactStage.SYNTHESIS.value,
+        }:
             return None
 
         query = (
@@ -559,7 +558,7 @@ class SqlAlchemyProductionArtifactRepository:
                 & (ProductionArtifactRow.stage == stage)
                 & (ProductionArtifactRow.input_hash == input_hash)
                 & (ProductionArtifactRow.status == ProductionArtifactStatus.VERIFIED.value)
-                & required_blob.is_not(None)
+                & ProductionArtifactRow.canonical_blob_id.is_not(None)
             )
             .order_by(ProductionArtifactRow.created_at.desc(), ProductionArtifactRow.id.desc())
             .limit(1)
@@ -1154,7 +1153,6 @@ def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
         edition_id=row.edition_id,
         status=ProductionRunStatus(row.status),
         current_stage=ProductionStage(row.current_stage),
-        synthesis_conversation_id=row.synthesis_conversation_id,
         run_number=row.run_number,
         pipeline_generation=row.pipeline_generation,
         research_date=row.research_date,
@@ -1446,6 +1444,7 @@ def _production_input_snapshot_from_row(
         actor_or_campaign=row.actor_or_campaign,
         period_start=row.period_start,
         period_end=row.period_end,
+        publication_language=row.publication_language,
         research_date=row.research_date,
         core_sources=tuple(ProductionInputSource.from_payload(item) for item in row.core_sources),
         input_hash=row.input_hash,

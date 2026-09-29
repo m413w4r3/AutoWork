@@ -157,7 +157,7 @@ async def test_q1_fresh_conversation_reaches_the_adapter_exactly_once(tmp_path: 
     updated = await service.get(conversation.id)
     assert updated.status is ConversationStatus.READY
 
-    # The exact read path _ask_with_format_repair uses in production.
+    # The turn output is read back through the conversation service.
     contents = await service.turns(conversation.id)
     matching = [item for item in contents if item.turn.id == turn.id]
     assert len(matching) == 1

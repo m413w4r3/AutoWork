@@ -428,6 +428,7 @@ def _snapshot(subject_id: UUID) -> ProductionInputSnapshot:
         actor_or_campaign="Actor-X",
         period_start=date(2026, 7, 1),
         period_end=date(2026, 7, 31),
+        publication_language="fr",
         research_date=date(2026, 8, 1),
     )
 

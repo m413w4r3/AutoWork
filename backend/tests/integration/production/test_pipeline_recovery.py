@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 from collections.abc import Callable, Mapping
 from typing import Any
 from unittest.mock import patch
@@ -116,11 +115,6 @@ def _q2_response(index: int) -> str:
     )
 
 
-def _synthesis_response(urls: tuple[str, ...]) -> str:
-    citations = " ".join(f"[S{index}]" for index in range(1, len(urls) + 1))
-    return f"ExampleRAT activity is documented by the selected reports {citations}."
-
-
 def _configured(
     factory: ScenarioFactory,
     count: int = 1,
@@ -133,7 +127,6 @@ def _configured(
     # here.
     scenario.edition.country = f"Recovery Test {scenario.edition.country_code}"
     scenario.model.script.references(_references_response(urls))
-    scenario.model.script.synthesis(_synthesis_response(urls))
     for index, url in enumerate(urls, start=1):
         scenario.model.script.q2(
             source_url=url,
@@ -202,13 +195,6 @@ async def _assert_artifact_invariants(
                 )
             assert current is not None
             assert current.id == active[0].id
-
-
-def _diagnostic_events(scenario: ProductionScenario) -> list[dict[str, Any]]:
-    path = scenario.blob_root.parent / "diagnostics" / "events.jsonl"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
 def _captured_url(scenario: ProductionScenario, request: Any) -> str | None:
@@ -680,7 +666,6 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
         registry,
         scenario.uow_factory,
         chain=chain,
-        model_service=scenario.model_service,
         model_gateway=scenario.model,
         collection_service=scenario.collection_service,
         artifact_store=scenario.artifact_store,
@@ -837,18 +822,13 @@ async def test_non_blocking_skipped_source_does_not_trigger_recovery(
 
 
 @pytest.mark.asyncio
-async def test_cleanup_failure_after_success_keeps_verified_artifact_and_progresses(
+async def test_successful_pipeline_drafts_synthesis_once_without_conversation(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, _ = _configured(production_scenario_factory, count=1)
 
-    async def fail_cleanup(*args: Any, **kwargs: Any) -> None:
-        del args, kwargs
-        raise RuntimeError("test browser close failure")
-
-    with patch.object(scenario.model_service, "archive", side_effect=fail_cleanup):
-        await scenario.start()
-        run = await scenario.run_until_terminal()
+    await scenario.start()
+    run = await scenario.run_until_terminal()
 
     assert run.status is ProductionRunStatus.READY
     persisted_run, artifacts, item, batch = await _state(scenario)
@@ -857,13 +837,9 @@ async def test_cleanup_failure_after_success_keeps_verified_artifact_and_progres
     assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
     assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
     assert len([call for call in scenario.model.calls if call.stage == "references"]) == 1
-    assert len([call for call in scenario.model.calls if call.stage == "synthesis"]) == 1
+    synthesis_calls = [call for call in scenario.model.calls if call.stage == "synthesis"]
+    assert len(synthesis_calls) == 1
+    assert synthesis_calls[0].conversation_id is None
+    assert synthesis_calls[0].web_search is False
     assert len(await _jobs_for_run(scenario)) == 5
-    cleanup_events = [
-        event
-        for event in _diagnostic_events(scenario)
-        if event.get("event") == "production.conversation_close_failed"
-    ]
-    # REFERENCES is stateless (no conversation); only Synthesis has one to close.
-    assert {event["stage"] for event in cleanup_events} == {"synthesis"}
     await _assert_artifact_invariants(scenario, artifacts)

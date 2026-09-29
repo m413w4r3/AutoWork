@@ -253,7 +253,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         discovery_service,
         collection_service,
         uow_factory,
-        model_conversation_service=model_conversation_service,
         production_chain=production_chain,
         production_artifact_store=production_artifact_store,
         production_diagnostics=production_diagnostics,

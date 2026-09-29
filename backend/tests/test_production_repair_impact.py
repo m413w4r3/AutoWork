@@ -19,14 +19,10 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueView,
     SupplementalSourceRepairIssue,
     classify_repair_impact,
-    extraction_item_contributes_to_synthesis,
     merge_repair_impacts,
     publication_projection_hash,
     rule_bundle_projection_hash,
-    synthesis_projection_hash,
-    synthesis_projection_payload,
 )
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     DetectionRule,
@@ -377,51 +373,6 @@ def _rule(body: str, name: str = "Example") -> DetectionRule:
     )
 
 
-def test_analyst_override_ioc_does_not_change_synthesis_projection() -> None:
-    manual_ioc = _item(
-        "override.example",
-        ArtifactType.DOMAIN,
-        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
-    )
-    base = TechnicalExtraction(items=())
-    with_override = TechnicalExtraction(items=(manual_ioc,))
-
-    assert not extraction_item_contributes_to_synthesis(manual_ioc)
-    assert synthesis_projection_hash(_report(), base, {}) == synthesis_projection_hash(
-        _report(), with_override, {}
-    )
-    assert (
-        ProductionWorkflowOrchestrator._build_synthesis_evidence_pack(_report(), with_override, {})[
-            "technical_extraction"
-        ]["items"]
-        == []
-    )
-
-
-def test_source_verified_ioc_with_context_contributes_to_q4() -> None:
-    contextual_ioc = _item(
-        "verified.example",
-        ArtifactType.DOMAIN,
-        context="serveur de commande et contrôle",
-    )
-    base = TechnicalExtraction(items=())
-    with_ioc = TechnicalExtraction(items=(contextual_ioc,))
-
-    assert extraction_item_contributes_to_synthesis(contextual_ioc)
-    assert synthesis_projection_hash(_report(), base, {}) != synthesis_projection_hash(
-        _report(), with_ioc, {}
-    )
-
-
-def test_synthesis_projection_never_contains_detection_rules() -> None:
-    extraction = TechnicalExtraction(items=(), rules=(_rule("rule A"),))
-
-    payload = synthesis_projection_payload(_report(), extraction, {})
-
-    assert "rules" not in payload
-    assert "detection_rules" not in payload["technical_extraction"]
-
-
 def test_rule_body_changes_rule_bundle_hash_but_not_publication_hash() -> None:
     report = _report()
     extraction_a = TechnicalExtraction(
@@ -463,9 +414,6 @@ def test_rule_and_ioc_order_does_not_change_projection_hashes() -> None:
     first = TechnicalExtraction(items=(item_a, item_b), rules=(rule_a, rule_b))
     reversed_order = TechnicalExtraction(items=(item_b, item_a), rules=(rule_b, rule_a))
 
-    assert synthesis_projection_hash(report, first, {}) == synthesis_projection_hash(
-        report, reversed_order, {}
-    )
     assert publication_projection_hash(report, first, "Texte [S1].") == publication_projection_hash(
         report, reversed_order, "Texte [S1]."
     )
@@ -479,12 +427,10 @@ def test_projection_hashes_are_stable_across_repeated_serialization() -> None:
     )
 
     first = (
-        synthesis_projection_hash(report, extraction, {"https://source.example/report": "core"}),
         publication_projection_hash(report, extraction, "Texte [S1]."),
         rule_bundle_projection_hash(extraction),
     )
     second = (
-        synthesis_projection_hash(report, extraction, {"https://source.example/report": "core"}),
         publication_projection_hash(report, extraction, "Texte [S1]."),
         rule_bundle_projection_hash(extraction),
     )

@@ -24,6 +24,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairDecisionService,
     ProductionRepairIssueService,
     ProductionRepairProjectionService,
+    _impact_from_projection_hashes,
     build_repair_evidence_pack,
     repair_key_for_rejection,
 )
@@ -35,9 +36,11 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionDerivedOutput,
     ProductionEvidenceBasis,
     ProductionRepairAction,
     ProductionRepairDecision,
+    ProductionRepairImpactKind,
     ProductionRepairIssueKind,
     ProductionRunStatus,
 )
@@ -883,3 +886,33 @@ async def test_v1_base_repair_projection_stays_canonical_and_keeps_provenance() 
     assert included[domain].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
     assert included[domain].source_ids == (str(V1_DOCUMENT_ID),)
     assert projected.rules[0].body == rule_body
+
+
+def test_materialization_keeps_publication_and_rule_repairs_out_of_synthesis() -> None:
+    base = TechnicalExtraction(items=())
+
+    publication_impact = _impact_from_projection_hashes(
+        base,
+        base,
+        previous_synthesis_projection_hash="a" * 64,
+        new_synthesis_projection_hash="a" * 64,
+        previous_publication_projection_hash="b" * 64,
+        new_publication_projection_hash="c" * 64,
+        previous_rule_bundle_hash="d" * 64,
+        new_rule_bundle_hash="d" * 64,
+    )
+    rule_impact = _impact_from_projection_hashes(
+        base,
+        base,
+        previous_synthesis_projection_hash="a" * 64,
+        new_synthesis_projection_hash="a" * 64,
+        previous_publication_projection_hash="b" * 64,
+        new_publication_projection_hash="b" * 64,
+        previous_rule_bundle_hash="d" * 64,
+        new_rule_bundle_hash="e" * 64,
+    )
+
+    assert publication_impact.kind is ProductionRepairImpactKind.PUBLICATION_ONLY
+    assert ProductionDerivedOutput.SYNTHESIS not in publication_impact.affected_outputs
+    assert rule_impact.kind is ProductionRepairImpactKind.RULE_BUNDLE_ONLY
+    assert ProductionDerivedOutput.SYNTHESIS not in rule_impact.affected_outputs

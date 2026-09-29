@@ -13,13 +13,16 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
+from cti_app.application.production_synthesis import SYNTHESIS_METADATA_KEYS
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
+    SynthesisMode,
 )
+from cti_app.domain.production_synthesis import production_synthesis_from_json
 
 _COSTLY_STAGES = (
     ProductionArtifactStage.REFERENCES,
@@ -116,6 +119,12 @@ class ProductionArtifactReuseService:
             if candidate is None:
                 return None
 
+            if candidate.status is not ProductionArtifactStatus.VERIFIED:
+                self._record_invalid_candidate(
+                    target_run, stage, candidate, ValueError("candidate is not verified")
+                )
+                return None
+
             try:
                 await self._verify_required_blob(candidate)
             except ProductionReuseStorageUnavailableError:
@@ -139,7 +148,15 @@ class ProductionArtifactReuseService:
                 )
                 + 1
             )
-            metadata = dict(candidate.metadata)
+            if stage is ProductionArtifactStage.SYNTHESIS:
+                metadata = {
+                    key: value
+                    for key, value in candidate.metadata.items()
+                    if key in SYNTHESIS_METADATA_KEYS
+                }
+                metadata["mode"] = SynthesisMode.REUSE_EXACT.value
+            else:
+                metadata = dict(candidate.metadata)
             metadata.update(
                 {
                     "reused": True,
@@ -172,17 +189,20 @@ class ProductionArtifactReuseService:
         blob_id = self._required_blob_id(artifact)
         if blob_id is None:
             raise ValueError("required artifact blob is missing")
-        await self._artifact_store.read_bytes(blob_id)
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS:
+            payload = await self._artifact_store.read_json(blob_id)
+            synthesis = production_synthesis_from_json(payload)
+            if synthesis.subject_id != artifact.subject_id:
+                raise ValueError("Synthesis subject does not match artifact subject")
+        else:
+            await self._artifact_store.read_bytes(blob_id)
 
     @staticmethod
     def _required_blob_id(artifact: ProductionArtifact) -> UUID | None:
-        if artifact.stage in {
-            ProductionArtifactStage.REFERENCES,
-            ProductionArtifactStage.EXTRACTION,
-        }:
+        # Every costly stage is reusable only through its canonical payload;
+        # a rendered-only legacy synthesis is never a canonical candidate.
+        if artifact.stage in _COSTLY_STAGES:
             return artifact.canonical_blob_id
-        if artifact.stage is ProductionArtifactStage.SYNTHESIS:
-            return artifact.rendered_blob_id
         return None
 
     def _record_invalid_candidate(
