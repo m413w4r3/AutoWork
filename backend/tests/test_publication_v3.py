@@ -3,14 +3,22 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.domain.discovery import SourceRole
+from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import EvidenceKind, SynthesisSectionKind
 from cti_app.domain.publication import (
+    PUBLICATION_IOC_ARTIFACT_TYPES,
+    ArtifactType,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
+    PublicationSourceV1,
     PublicationTimelineEntryV1,
+    PublicationUncertaintyV1,
 )
 
 
@@ -97,3 +105,136 @@ def test_timeline_validates_date_and_text_without_parsing_date_text() -> None:
     ):
         with pytest.raises(ValueError):
             PublicationTimelineEntryV1(event_date, date_text, text, (ref,))  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "artifact_type",
+    sorted(PUBLICATION_IOC_ARTIFACT_TYPES, key=lambda artifact_type: artifact_type.value),
+)
+def test_publication_indicator_accepts_all_publishable_ioc_types(
+    artifact_type: ArtifactType,
+) -> None:
+    indicator = PublicationIndicatorV1(
+        "indicator",
+        "normalized",
+        artifact_type,
+        (UUID(int=1),),
+    )
+    assert indicator.artifact_type is artifact_type
+
+
+@pytest.mark.parametrize(
+    "artifact_type",
+    (
+        ArtifactType.YARA_RULE,
+        ArtifactType.SIGMA_RULE,
+        ArtifactType.SURICATA_RULE,
+        ArtifactType.FILEPATH,
+        ArtifactType.FILENAME,
+        ArtifactType.CVE,
+        ArtifactType.OTHER,
+    ),
+)
+def test_publication_indicator_rejects_non_publication_types(artifact_type: ArtifactType) -> None:
+    with pytest.raises(ValueError, match="not publishable"):
+        PublicationIndicatorV1("indicator", "normalized", artifact_type, (UUID(int=1),))
+
+
+def test_publication_indicator_requires_text_and_unique_uuid_provenance() -> None:
+    first = UUID(int=1)
+    second = UUID(int=2)
+    indicator = PublicationIndicatorV1("value", "normalized", ArtifactType.IP, (second, first))
+    assert indicator.source_document_ids == (first, second)
+
+    for value, normalized_value, source_document_ids in (
+        (" ", "normalized", (first,)),
+        ("value", "\t", (first,)),
+        ("value", "normalized", ()),
+        ("value", "normalized", (first, first)),
+        ("value", "normalized", ("not-a-uuid",)),
+    ):
+        with pytest.raises(ValueError):
+            PublicationIndicatorV1(
+                value,
+                normalized_value,
+                ArtifactType.IP,
+                source_document_ids,  # type: ignore[arg-type]
+            )
+
+
+def test_publication_indicator_group_validates_and_sorts_indicators() -> None:
+    source_id = UUID(int=1)
+    zed = PublicationIndicatorV1("z", "z", ArtifactType.DOMAIN, (source_id,))
+    alpha = PublicationIndicatorV1("a", "a", ArtifactType.DOMAIN, (source_id,))
+    group = PublicationIndicatorGroupV1(ArtifactType.DOMAIN, (zed, alpha))
+    assert group.indicators == (alpha, zed)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        PublicationIndicatorGroupV1(ArtifactType.DOMAIN, ())
+    with pytest.raises(ValueError, match="match"):
+        PublicationIndicatorGroupV1(
+            ArtifactType.DOMAIN,
+            (PublicationIndicatorV1("1.2.3.4", "1.2.3.4", ArtifactType.IP, (source_id,)),),
+        )
+    with pytest.raises(ValueError, match="repeat normalized"):
+        PublicationIndicatorGroupV1(
+            ArtifactType.DOMAIN,
+            (
+                PublicationIndicatorV1("first", "same", ArtifactType.DOMAIN, (source_id,)),
+                PublicationIndicatorV1("second", "same", ArtifactType.DOMAIN, (source_id,)),
+            ),
+        )
+
+
+def _publication_source(**overrides: object) -> PublicationSourceV1:
+    values: dict[str, object] = {
+        "source_document_id": UUID(int=1),
+        "canonical_url": "https://example.com/article?a=1&b=2",
+        "title": "Article",
+        "publisher": "Example",
+        "published_at": date(2025, 1, 2),
+        "tier": ProductionReferenceTier.CORE,
+        "kind": ProductionReferenceKind.PUBLICATION,
+        "role": SourceRole.PRIMARY,
+    }
+    values.update(overrides)
+    return PublicationSourceV1(**values)  # type: ignore[arg-type]
+
+
+def test_publication_source_keeps_canonical_corpus_metadata() -> None:
+    source = _publication_source(title=None, publisher=None, published_at=None)
+    assert source.source_document_id == UUID(int=1)
+    assert source.title is None
+    assert source.publisher is None
+    assert source.published_at is None
+
+    for overrides in (
+        {"source_document_id": "not-a-uuid"},
+        {"canonical_url": "HTTPS://EXAMPLE.COM/article/"},
+        {"canonical_url": "https://example.com/article?b=2&a=1"},
+        {"canonical_url": 123},
+        {"title": 123},
+        {"publisher": 123},
+        {"published_at": datetime(2025, 1, 2)},
+        {"tier": "core"},
+        {"kind": "publication"},
+        {"role": "primary"},
+    ):
+        with pytest.raises(ValueError):
+            _publication_source(**overrides)
+
+
+def test_publication_uncertainty_requires_unique_sorted_uuid_provenance() -> None:
+    first = UUID(int=1)
+    second = UUID(int=2)
+    uncertainty = PublicationUncertaintyV1("Uncertain attribution", (second, first))
+    assert uncertainty.source_document_ids == (first, second)
+
+    for text, source_document_ids in (
+        (" ", (first,)),
+        ("Uncertain attribution", ()),
+        ("Uncertain attribution", (first, first)),
+        ("Uncertain attribution", ("not-a-uuid",)),
+    ):
+        with pytest.raises(ValueError):
+            PublicationUncertaintyV1(text, source_document_ids)  # type: ignore[arg-type]
