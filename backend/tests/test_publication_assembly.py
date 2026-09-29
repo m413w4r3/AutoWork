@@ -174,6 +174,9 @@ class _RecordingArtifacts:
     async def append(self, artifact: ProductionArtifact) -> None:
         self.appended.append(artifact)
 
+    async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
+        return [artifact for artifact in self.appended if artifact.production_run_id == run_id]
+
 
 def _service() -> tuple[PublicationAssemblyService, _MemoryBlobCatalog, _RecordingArtifacts]:
     catalog = _MemoryBlobCatalog()
@@ -217,6 +220,7 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
     assert len(artifacts.appended) == 1
     assert artifacts.appended[0] is artifact
     assert artifact.stage is ProductionArtifactStage.PUBLICATION
+    assert artifact.version == 1
     assert artifact.production_run_id == run.id
     assert artifact.subject_id == run.subject_id
     assert artifact.input_hash == compute_assembly_input_hash(
@@ -244,13 +248,40 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
     }
 
 
-@pytest.mark.parametrize("invalid_part", ("subject", "hash", "evidence", "source"))
+@pytest.mark.asyncio
+async def test_assembly_appends_next_publication_version_for_the_run() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    service, _, artifacts = _service()
+    inputs = {
+        "run": _run(snapshot),
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+    }
+
+    first = await service.assemble_publication(**inputs)
+    second = await service.assemble_publication(**inputs)
+
+    assert (first.version, second.version) == (1, 2)
+    assert first.input_hash == second.input_hash
+    assert artifacts.appended == [first, second]
+
+
+@pytest.mark.parametrize(
+    "invalid_part", ("run", "edition", "subject", "hash", "evidence", "source")
+)
 @pytest.mark.asyncio
 async def test_invalid_lineage_fails_before_body_or_artifact_persistence(
     invalid_part: str,
 ) -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    if invalid_part == "subject":
+    run = _run(snapshot)
+    if invalid_part == "run":
+        run = replace(run, id=UUID(int=99))
+    elif invalid_part == "edition":
+        run = replace(run, edition_id=UUID(int=99))
+    elif invalid_part == "subject":
         references = replace(references, subject_id=UUID(int=99))
     elif invalid_part == "hash":
         extraction = replace(extraction, production_input_hash="0" * 64)
@@ -271,7 +302,7 @@ async def test_invalid_lineage_fails_before_body_or_artifact_persistence(
     service, catalog, artifacts = _service()
     with pytest.raises(ValueError):
         await service.assemble_publication(
-            run=_run(snapshot),
+            run=run,
             snapshot=snapshot,
             references=references,
             extraction=extraction,

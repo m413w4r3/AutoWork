@@ -39,14 +39,18 @@ class PublicationAssemblyService:
         extraction: ProductionExtractionV1,
         synthesis: ProductionSynthesisV1,
     ) -> ProductionArtifact:
+        if (
+            snapshot.production_run_id != run.id
+            or snapshot.edition_id != run.edition_id
+            or snapshot.subject_id != run.subject_id
+        ):
+            raise ValueError("Production input snapshot must belong to the production run")
         document = build_publication_document_v3(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
             synthesis=synthesis,
         )
-        if document.subject_id != run.subject_id:
-            raise ValueError("Publication subject identity must match the production run")
 
         input_hash = compute_assembly_input_hash(
             snapshot=snapshot,
@@ -60,14 +64,18 @@ class PublicationAssemblyService:
         if canonical_blob_id is None:
             raise RuntimeError("Canonical publication body was not persisted")
 
+        prior_versions = [
+            artifact.version
+            for artifact in await self._production_artifacts.list_for_run(run.id)
+            if artifact.stage is ProductionArtifactStage.PUBLICATION
+        ]
         artifact = ProductionArtifact(
             production_run_id=run.id,
             subject_id=run.subject_id,
             stage=ProductionArtifactStage.PUBLICATION,
-            version=1,
+            version=max(prior_versions, default=0) + 1,
             input_hash=input_hash,
             canonical_blob_id=canonical_blob_id,
-            rendered_blob_id=None,
         )
         await self._production_artifacts.append(artifact)
         return artifact
