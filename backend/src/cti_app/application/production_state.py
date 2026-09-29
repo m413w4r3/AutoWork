@@ -27,6 +27,7 @@ from cti_app.application.production_extraction import (
     extraction_compatibility_view,
     legacy_technical_extraction_from_payload,
 )
+from cti_app.application.production_legacy_assembly import assembly_synthesis_text
 from cti_app.application.production_parsers import (
     ParseResult,
     ReferenceReport,
@@ -42,7 +43,6 @@ from cti_app.application.production_references import (
     report_source_labels,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
-from cti_app.application.production_stages import assembly_synthesis_text
 from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from cti_app.application.model_gateway import (
     SafeModelRequest,
 )
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
+from cti_app.application.production_repairs import ProductionRepairMaterializationService
 from cti_app.application.production_synthesis import (
     SynthesisClaimProposalV1,
     SynthesisProposalV1,
@@ -27,13 +29,21 @@ from cti_app.application.production_synthesis import (
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
+    ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionEvidenceBasis,
     ProductionRunStatus,
     ProductionStage,
 )
-from cti_app.domain.production_extraction import production_extraction_from_json
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    production_extraction_from_json,
+    production_extraction_to_json,
+)
 from cti_app.domain.production_synthesis import SynthesisSectionKind
+from cti_app.domain.publication import ArtifactType, PublicationDocumentV3
 
 from .support import ProductionScenario
 
@@ -346,8 +356,11 @@ async def test_complete_production_pipeline_reaches_ready(
     assert model_calls[0].model_run_id == by_stage[ProductionArtifactStage.REFERENCES].model_run_id
     assert len(references_payload["sources"]) == 2
     assert {source["canonical_url"] for source in references_payload["sources"]} == set(SOURCE_URLS)
-    # Canonical V1 stores corpus source metadata, not legacy Markdown local IDs.
-    reference_source_ids = {"S1", "S2"}
+    reference_source_ids = {
+        source["source_document_id"]
+        for source in references_payload["sources"]
+        if source["source_document_id"] is not None
+    }
     indicators = {
         indicator["value"]: indicator
         for source in extraction_payload["sources"]
@@ -369,16 +382,24 @@ async def test_complete_production_pipeline_reaches_ready(
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)
     assert "secondary-c2.security-lab.io" in str(publication_payload)
+    assert publication_payload["schema_version"] == "3"
+    assert publication_payload["title"] == synthesis_payload["title"]
+    assert publication_payload["lead"] == synthesis_payload["lead"]
+    assert publication_payload["sections"] == synthesis_payload["sections"]
+    assert publication_payload["timeline"] == synthesis_payload["timeline"]
     assert {
-        source["source_id"] for source in publication_payload["sources"]
+        source["source_document_id"] for source in publication_payload["sources"]
     } == reference_source_ids
+    assert "[S1]" not in str(publication_payload)
     extraction_indicator_values = {
         value
         for value, indicator in indicators.items()
         if indicator["indicator_status"] == "confirmed_ioc"
     }
     publication_indicator_values = {
-        value["value"] for group in publication_payload["indicators"] for value in group["values"]
+        value["value"]
+        for group in publication_payload["indicators"]
+        for value in group["indicators"]
     }
     assert publication_indicator_values == extraction_indicator_values
     synthesis = production_synthesis_from_json(synthesis_payload)
@@ -403,6 +424,95 @@ async def test_complete_production_pipeline_reaches_ready(
     assert refreshed is not None
     assert refreshed.status is ProductionRunStatus.READY
     assert {artifact.stage for artifact in refreshed_artifacts} == set(by_stage)
+
+
+@pytest.mark.asyncio
+async def test_ioc_only_repair_reuses_synthesis_and_rebuilds_publication(
+    production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
+) -> None:
+    scenario = await _configured_scenario(production_scenario_factory)
+    _install_canonical_synthesis(scenario)
+    await scenario.start()
+    run = await scenario.run_until_terminal()
+    assert run.status is ProductionRunStatus.READY
+    calls_before_repair = len(scenario.model.provider_calls)
+    async with scenario.uow_factory() as uow:
+        extraction_a = await uow.production_artifacts.get_current(run.id, "extraction")
+        synthesis_a = await uow.production_artifacts.get_current(run.id, "synthesis")
+        publication_a = await uow.production_artifacts.get_current(run.id, "publication")
+    assert extraction_a is not None and extraction_a.canonical_blob_id is not None
+    assert synthesis_a is not None
+    assert publication_a is not None and publication_a.canonical_blob_id is not None
+    document_a = PublicationDocumentV3.from_json(
+        await scenario.artifact_store.read_json(publication_a.canonical_blob_id)
+    )
+    extraction = production_extraction_from_json(
+        await scenario.artifact_store.read_json(extraction_a.canonical_blob_id)
+    )
+    source = extraction.sources[0]
+    added_ioc = ExtractionIndicatorV1(
+        value="new-c2.security-lab.io",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="",
+        evidence_quote="The source names the new command-and-control domain.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction_b = replace(
+        extraction,
+        sources=(
+            replace(source, indicators=(*source.indicators, added_ioc)),
+            *extraction.sources[1:],
+        ),
+    )
+    _, blob_id, _ = await scenario.artifact_store.store_stage_payloads(
+        canonical=production_extraction_to_json(extraction_b)
+    )
+    assert blob_id is not None
+    repaired_extraction = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=extraction_a.version + 1,
+        input_hash=canonical_extraction_hash(extraction_b),
+        canonical_blob_id=blob_id,
+    )
+    repair = ProductionRepairMaterializationService(
+        scenario.uow_factory,
+        artifact_store=scenario.artifact_store,
+    )
+    async with scenario.uow_factory() as uow:
+        await uow.production_artifacts.append(repaired_extraction)
+        publication_b, qa = await repair._materialize_canonical_publication_in_uow(
+            uow,
+            run=run,
+            extraction=repaired_extraction,
+            repair_materialization=None,
+        )
+        await uow.commit()
+    assert qa["passed"] is True
+    assert publication_b.id != publication_a.id
+    assert publication_b.input_hash != publication_a.input_hash
+    assert publication_b.canonical_blob_id is not None
+    document_b = PublicationDocumentV3.from_json(
+        await scenario.artifact_store.read_json(publication_b.canonical_blob_id)
+    )
+    assert (document_b.title, document_b.lead, document_b.sections, document_b.timeline) == (
+        document_a.title,
+        document_a.lead,
+        document_a.sections,
+        document_a.timeline,
+    )
+    assert {
+        item.normalized_value for group in document_b.indicators for item in group.indicators
+    } == {"core-c2.security-lab.io", "new-c2.security-lab.io"}
+    async with scenario.uow_factory() as uow:
+        synthesis_b = await uow.production_artifacts.get_current(run.id, "synthesis")
+    assert synthesis_b is not None
+    assert synthesis_b.id != synthesis_a.id
+    assert synthesis_b.reused_from_artifact_id == synthesis_a.id
+    assert len(scenario.model.provider_calls) == calls_before_repair
 
 
 @pytest.mark.asyncio

@@ -1,8 +1,8 @@
 """Canonical, renderer-independent publication models.
 
-``BriefDocumentV1`` remains a historical read model.  New production writes
-use ``PublicationDocumentV2`` and callers cross the V1/V2 boundary through
-``publication_document_from_json``.
+``BriefDocumentV1`` and ``PublicationDocumentV2`` remain historical read models.
+New Production writes use ``PublicationDocumentV3`` and readers dispatch by
+``schema_version``.
 """
 
 from __future__ import annotations
@@ -230,14 +230,16 @@ def _publication_document_fields(
 
 def publication_document_from_json(
     payload: Mapping[str, Any],
-) -> BriefDocumentV1 | PublicationDocumentV2:
-    """Read either the historical V1 or current V2 publication payload."""
+) -> BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3:
+    """Read canonical V3 and isolated historical publication payloads."""
 
     schema_version = str(payload.get("schema_version", LEGACY_PUBLICATION_SCHEMA_VERSION))
     if schema_version == LEGACY_PUBLICATION_SCHEMA_VERSION:
         return BriefDocumentV1.from_json(payload)
     if schema_version == PUBLICATION_SCHEMA_VERSION:
         return PublicationDocumentV2.from_json(payload)
+    if schema_version == PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION:
+        return PublicationDocumentV3.from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={schema_version!r}")
 
 
@@ -246,6 +248,14 @@ class PublicationEvidenceKind(StrEnum):
     EVENT = "event"
     INDICATOR = "indicator"
     RULE = "rule"
+
+
+class PublicationAssemblyErrorCode(StrEnum):
+    INPUTS_MISSING = "assembly_inputs_missing"
+    INPUTS_MISMATCH = "assembly_inputs_mismatch"
+    EVIDENCE_MISSING = "assembly_evidence_missing"
+    SOURCE_MISSING = "assembly_source_missing"
+    VALIDATION_FAILED = "assembly_validation_failed"
 
 
 class PublicationSectionKind(StrEnum):

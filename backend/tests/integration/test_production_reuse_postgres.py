@@ -37,9 +37,9 @@ from cti_app.application.production_extraction import (
     extraction_input_hash,
     references_corpus_hash,
 )
+from cti_app.application.production_legacy_assembly import LegacyPublicationAssemblyService
 from cti_app.application.production_parsers import Q2FactProposal, Q2SourceOutput
 from cti_app.application.production_references import production_reference_corpus_to_json
-from cti_app.application.production_stages import PublicationAssemblyService
 from cti_app.application.production_synthesis import (
     SynthesisClaimProposalV1,
     SynthesisProposalV1,
@@ -948,7 +948,7 @@ async def _seed_reusable_article(
             await uow.production_artifacts.append(artifact)
         await uow.commit()
 
-    publication = await PublicationAssemblyService(uow_factory, store).assemble_publication(
+    publication = await LegacyPublicationAssemblyService(uow_factory, store).assemble_publication(
         run_id=source_run.id,
         subject_id=subject.id,
         subject_title=title,
@@ -1284,7 +1284,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             await uow.production_artifacts.append(artifact)
         await uow.commit()
 
-    assembly = PublicationAssemblyService(uow_factory, store)
+    assembly = LegacyPublicationAssemblyService(uow_factory, store)
     assembly_inputs = (
         source_artifacts[ProductionArtifactStage.REFERENCES],
         source_artifacts[ProductionArtifactStage.EXTRACTION],
@@ -1673,9 +1673,10 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
     ).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
+    assert all(item["document"]["schema_version"] == "3" for item in edition_json["publications"])
     assert [item["document"]["title"] for item in edition_json["publications"]] == [
-        "[Publication] Article A",
-        "[Publication] Article B",
+        "Article A",
+        "Article B",
     ]
     docx = await store.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
     with zipfile.ZipFile(BytesIO(docx)) as archive:

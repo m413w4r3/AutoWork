@@ -940,7 +940,56 @@ export interface PublicationDocumentV2 extends Omit<
   schema_version: "2";
 }
 
-export type PublicationDocument = BriefDocumentV1 | PublicationDocumentV2;
+export interface PublicationEvidenceRefV1 {
+  source_document_id: string;
+  kind: "fact" | "event" | "indicator" | "rule";
+  evidence_key: string;
+}
+
+export interface PublicationDocumentV3 {
+  schema_version: "3";
+  subject_id: string;
+  publication_language: string;
+  title: string;
+  lead: Array<{ text: string; evidence_refs: PublicationEvidenceRefV1[] }>;
+  sections: Array<{
+    kind: string;
+    heading: string;
+    paragraphs: Array<{
+      text: string;
+      evidence_refs: PublicationEvidenceRefV1[];
+    }>;
+  }>;
+  timeline: Array<{
+    event_date: string | null;
+    date_text: string | null;
+    text: string;
+    evidence_refs: PublicationEvidenceRefV1[];
+  }>;
+  indicators: Array<{
+    artifact_type: string;
+    indicators: Array<{
+      value: string;
+      normalized_value: string;
+      artifact_type: string;
+      source_document_ids: string[];
+    }>;
+  }>;
+  sources: Array<{
+    source_document_id: string;
+    canonical_url: string;
+    title: string | null;
+    publisher: string | null;
+    published_at: string | null;
+    tier: string;
+    kind: string;
+    role: string;
+  }>;
+  uncertainties: Array<{ text: string; source_document_ids: string[] }>;
+}
+
+export type PublicationDocument =
+  BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3;
 
 export async function restartProductionWithNewSources(
   subjectId: string,

@@ -2,6 +2,12 @@
 
 Statut : accepté — 2026-08-28
 
+Mise à jour AW-013 : les mentions ci-dessous de `PublicationDocumentV2` comme cible future
+décrivent la décision initiale. Les nouvelles écritures Production produisent désormais
+`PublicationDocumentV3` depuis le snapshot, `ProductionReferenceCorpusV1`,
+`ProductionExtractionV1` et `ProductionSynthesisV1`. V1/V2 restent des lecteurs historiques.
+Le rendu Pandoc est un dérivé du document V3 et sa version n'entre pas dans le hash d'Assembly.
+
 ## Contexte
 
 AutoWork possède déjà des frontières robustes pour la persistance, les blobs, les jobs et la
@@ -80,11 +86,12 @@ opérationnelle.
 Les `SourceDocument`, les `Sample` et les observations VirusTotal restent des objets distincts.
 Partager un hash ou les mêmes octets ne leur donne pas la même sémantique.
 
-### 4. Le contrat éditorial futur est `PublicationDocumentV2`
+### 4. Le contrat éditorial versionné
 
 `BriefDocumentV1` reste un format sérialisé valide pour les productions existantes tant que leur
 lecture est nécessaire. La cible est un contrat renderer-independent nommé
-`PublicationDocumentV2`, qui représente l'unique type de contenu éditorial.
+`PublicationDocumentV2`, qui a servi de contrat intermédiaire. Depuis AW-013, les nouvelles
+écritures Production utilisent `PublicationDocumentV3` ; V1 et V2 restent des lecteurs historiques.
 
 Le passage à V2 est un changement de schéma explicite. Une nouvelle version ne doit pas être
 écrite sous le numéro de schéma V1 et les anciens artifacts ne doivent pas être réécrits en place.
@@ -212,9 +219,9 @@ champs éditoriaux et `EVENT`; ce RAW n'est pas le corpus canonique. Le `Referen
 domaine malware/investigation est un concept séparé de `ProductionReferenceCorpusV1` : aucun
 module ou service n'est partagé entre les deux.
 
-La transition s'effectuera par étapes : AW-011 fera consommer directement le corpus à Extraction;
-AW-012 retirera la dépendance de Synthesis aux `EVENT` legacy; AW-013 terminera la suppression de
-la projection `ReferenceReport`. Ces étapes ne sont pas déclarées réalisées par le présent ADR.
+AW-011 a fait consommer le corpus directement à Extraction ; AW-012 a retiré les `EVENT` legacy
+de Synthesis ; AW-013 a retiré `ReferenceReport` du chemin canonique Assembly/QA. La lecture
+historique V4 et certaines fonctions du Repair Desk conservent leur compatibilité isolée.
 
 À l'intérieur d'une édition, la production reste séquentielle pour garder un comportement
 prévisible vis-à-vis des modèles, des conversations, des quotas externes et du pacing. La
@@ -245,8 +252,8 @@ vocabulaire et changement de comportement.
 Le cutover futur suit quatre étapes conceptuelles.
 
 1. Les surfaces UI/API et les nouveaux use cases n'emploient plus la distinction.
-2. `PublicationDocumentV2` devient le seul format écrit pour les nouvelles productions ; V1 reste
-   uniquement un format historique lisible si nécessaire.
+2. `PublicationDocumentV2` a remplacé V1 comme format écrit, puis
+   `PublicationDocumentV3` l'a remplacé pour les nouvelles productions ; V1/V2 restent lisibles.
 3. La configuration éditoriale d'une édition passe d'objectifs distincts `major/brief` à un objectif
    unique d'items/articles, et la production passe à une seule pipeline déclarée.
 4. Les profils legacy et les composants exclusivement attachés à ce workflow restent limités à la

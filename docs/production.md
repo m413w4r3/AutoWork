@@ -56,7 +56,7 @@ Aucun titre normalisé, `local_ref` ou contenu de `DiscoveryBatch` ne sert de so
 comprise. `reuse_basis_hash` couvre la même entrée sans `research_date` : c’est la base
 d’égalité qui permet de réutiliser raisonnablement un stage coûteux entre deux runs. Aucun des
 deux n’inclut d’identité technique (run, snapshot, job, conversation, horodatages) ; les listes
-sont triées avant sérialisation. AW-010 à AW-013 préciseront les règles de réutilisation par stage.
+sont triées avant sérialisation. Chaque stage ajoute sa version de policy à son hash fonctionnel.
 
 Tous les stages construisent leur contexte depuis ce snapshot. Son absence est une erreur
 `production_input_snapshot_missing` ; il n’existe aucune lecture de repli.
@@ -69,24 +69,17 @@ exact, hash du contenu et éligibilité à l’extraction. Les sources du snapsh
 comme `CORE`; la recherche web peut ajouter des références `SUPPORTING` ou des ressources
 `TECHNICAL`. Une source inaccessible reste dans le corpus avec son état et n’est pas éligible.
 
-Le blob RAW conserve temporairement le wire format de recherche historique, notamment
-`editorial-title` et `EVENT`, pour les consommateurs legacy. Ces champs ne font pas partie du
+Le blob RAW conserve le wire format de recherche historique, notamment
+`editorial-title` et `EVENT`, pour la lecture des anciens imports. Ces champs ne font pas partie du
 corpus canonique. `REFERENCES` appelle `ModelGateway` sans conversation canonique. Le hash
 fonctionnel de l’étape permet la réutilisation d’un artifact compatible entre runs; le corpus
 réutilisé ne porte donc pas d’identité de `ProductionRun`.
 
 Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
 production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
-La projection legacy `ReferenceReport` demeure temporaire pour les stages qui n’ont pas encore
-migré. Elle n’a qu’une frontière, `application/production_references.py`
-(`load_legacy_reference_report` et `load_reference_projection`) : le RAW est re-parsé puis réduit
-aux sources du corpus éligibles à l’extraction, ce qui préserve le comportement historique de Q2
-(une source non archivée n’atteint jamais Q2). Aucun autre service n’appelle
-`parse_reference_report`.
-
-`ReferenceReport` et ses `EVENT` restent des formats de compatibilité legacy pour les stages qui
-n'ont pas encore migré. Depuis AW-012, Synthesis ne les utilise plus ; AW-013 terminera la
-suppression de la projection `ReferenceReport`.
+La projection historique `ReferenceReport` reste confinée aux imports V4 et à certaines fonctions
+du Repair Desk. Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → ASSEMBLY lit directement
+les contrats canoniques et n'utilise plus les `EVENT` Q1 comme identité de publication.
 
 ### EXTRACTION et contrat canonique
 
@@ -160,7 +153,7 @@ la source concernée, qui est relue seule, et aucun IOC n’est redistribué ent
 La progression publiée par le stage liste chaque source du corpus avec son tier, son profil et son
 verdict (`succeeded`, `cached`, `failed`, `omitted`).
 
-Les consommateurs non migrés (notamment QA, Assembly, l’export d’état et le Repair Desk) peuvent
+Les consommateurs historiques (export d’état et certaines fonctions du Repair Desk) peuvent
 encore lire `TechnicalExtraction` via la frontière legacy `application/production_extraction.py`.
 Cette frontière projette `ProductionExtractionV1` vers le contrat legacy, jamais l’inverse, et
 peut encore utiliser les labels `S1`… de REFERENCES. Synthesis ne passe plus par cette projection.
@@ -179,8 +172,10 @@ ProductionExtractionV1
 SYNTHESIS organise et rédige exclusivement à partir de cette vérité factuelle
         ↓
 ProductionSynthesisV1
+        +
+ProductionReferenceCorpusV1
         ↓
-adapter temporaire vers l’Assembly legacy d’AW-013
+PublicationDocumentV3 → QA canonique → rendu Pandoc dérivé → READY
 ```
 
 `ProductionExtractionV1` est l’unique vérité factuelle de Synthesis. Le stage construit un pack
@@ -203,9 +198,13 @@ dans les métadonnées de source de `ProductionExtractionV1` pour présenter les
 Elle ne résout pas les handles temporaires du prompt et ne prend pas le Markdown rendu pour
 source. `rendered_blob_id` peut contenir un aperçu Markdown déterministe optionnel.
 
-Jusqu’à AW-013, Assembly reçoit une projection legacy à sens unique de `ProductionSynthesisV1`.
-Le Markdown legacy n’est jamais reparsé en état canonique ; la refonte d’Assembly reste dans
-AW-013.
+Assembly vérifie le lineage du snapshot, des références, de l’extraction et de la synthèse avant
+de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la chronologie et les
+incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction. Les sources sont
+résolues par `source_document_id`. Le hash d’Assembly dépend des quatre entrées canoniques, de
+la version de document et de la policy, sans version de renderer. QA recalcule la projection
+canonique et compare le document exact. Pandoc produit ensuite un dérivé Markdown ; le document
+canonique ne dépend pas de Pandoc.
 
 ## ProductionBoard
 

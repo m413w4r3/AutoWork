@@ -747,9 +747,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
     )
 
 
-def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     source_a = extraction.sources[0]
     source_a_id = source_a.source_document_id
@@ -851,13 +849,6 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
             SynthesisUncertaintyV1("Attribution remains uncertain.", (source_b_id, source_a_id)),
         ),
     )
-
-    def forbidden_adapter(*_args: object, **_kwargs: object) -> None:
-        pytest.fail("V3 builder invoked a legacy model or renderer adapter")
-
-    monkeypatch.setattr(publication_builder, "SemanticAnnotator", forbidden_adapter)
-    monkeypatch.setattr(publication_builder, "collect_indicators", forbidden_adapter)
-    monkeypatch.setattr(publication_builder, "apply_french_spacing", forbidden_adapter)
 
     document = build_publication_document_v3(
         snapshot=snapshot,

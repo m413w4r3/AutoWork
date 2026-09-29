@@ -534,6 +534,7 @@ class SqlAlchemyProductionArtifactRepository:
             ProductionArtifactStage.REFERENCES.value,
             ProductionArtifactStage.EXTRACTION.value,
             ProductionArtifactStage.SYNTHESIS.value,
+            ProductionArtifactStage.PUBLICATION.value,
         }:
             return None
 

@@ -42,7 +42,7 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
-from cti_app.application.publication_builder import build_publication_document
+from cti_app.application.publication_builder_legacy import build_publication_document
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.publication import ArtifactType
 

@@ -517,5 +517,7 @@ def test_v3_addition_preserves_v2_schema_construction_serialization_and_reader()
         "original_indicators": (),
     }
     assert isinstance(publication_document_from_json(payload), PublicationDocumentV2)
-    with pytest.raises(ValueError, match="unsupported publication document"):
-        publication_document_from_json(_publication_v3_document().to_json())
+    assert isinstance(
+        publication_document_from_json(_publication_v3_document().to_json()),
+        PublicationDocumentV3,
+    )

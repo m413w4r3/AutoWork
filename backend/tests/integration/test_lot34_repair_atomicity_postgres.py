@@ -25,6 +25,7 @@ from cti_app.application.edition_publication import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_legacy_assembly import LegacyPublicationAssemblyService
 from cti_app.application.production_parsers import (
     ParsedSource,
     ReferenceReport,
@@ -39,7 +40,6 @@ from cti_app.application.production_repairs import (
     build_repair_evidence_pack,
     repair_key_for_rejection,
 )
-from cti_app.application.production_stages import PublicationAssemblyService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition, EditionStatus
@@ -90,7 +90,7 @@ class _PausingAssembly:
 
     def __init__(
         self,
-        inner: PublicationAssemblyService,
+        inner: LegacyPublicationAssemblyService,
         *,
         reached: asyncio.Event,
         release: asyncio.Event,
@@ -268,7 +268,7 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
 
     # The first document is built by the real assembly, so it carries the same
     # ``input_artifacts`` proof a production run would record.
-    publication = await PublicationAssemblyService(uow_factory, store).assemble_publication(
+    publication = await LegacyPublicationAssemblyService(uow_factory, store).assemble_publication(
         run.id,
         subject.id,
         "LOT 34",
@@ -326,7 +326,7 @@ def _service(
         uow_factory,
         projection_service=ProductionRepairProjectionService(uow_factory, fixture.store),
         publication_assembly_service=(
-            assembly or PublicationAssemblyService(uow_factory, fixture.store)
+            assembly or LegacyPublicationAssemblyService(uow_factory, fixture.store)
         ),
         qa_service=qa or _PassingQA(),
         checkpoint_service=None,
@@ -388,7 +388,7 @@ async def test_concurrent_accept_can_only_freeze_the_repaired_publication(
     reached = asyncio.Event()
     release = asyncio.Event()
     assembly = _PausingAssembly(
-        PublicationAssemblyService(uow_factory, fixture.store),
+        LegacyPublicationAssemblyService(uow_factory, fixture.store),
         reached=reached,
         release=release,
     )
@@ -438,7 +438,7 @@ async def test_a_failed_repair_leaves_the_pre_repair_article_freezable(
     reached = asyncio.Event()
     release = asyncio.Event()
     assembly = _PausingAssembly(
-        PublicationAssemblyService(uow_factory, fixture.store),
+        LegacyPublicationAssemblyService(uow_factory, fixture.store),
         reached=reached,
         release=release,
         error=RuntimeError("assembly exploded"),

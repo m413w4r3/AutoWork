@@ -27,6 +27,97 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   const evidenceFactKey = "d".repeat(64);
   const evidenceEventKey = "1".repeat(64);
   const evidenceIndicatorKey = "2".repeat(64);
+  const publicationV3 = {
+    schema_version: "3",
+    subject_id: subjectId,
+    publication_language: "fr",
+    title: synthesisTitle,
+    lead: [
+      {
+        text: leadText,
+        evidence_refs: [
+          {
+            source_document_id: vendorDocumentId,
+            kind: "fact",
+            evidence_key: evidenceFactKey,
+          },
+        ],
+      },
+    ],
+    sections: [
+      {
+        kind: "infection_chain",
+        heading: "Progression de l’attaque",
+        paragraphs: [
+          {
+            text: "Le leurre ouvre une chaîne PowerShell vers le domaine C2 identifié.",
+            evidence_refs: [
+              {
+                source_document_id: iocsDocumentId,
+                kind: "indicator",
+                evidence_key: evidenceIndicatorKey,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+    timeline: [
+      {
+        event_date: "2026-08-12",
+        date_text: null,
+        text: "Première activité observée.",
+        evidence_refs: [
+          {
+            source_document_id: vendorDocumentId,
+            kind: "event",
+            evidence_key: evidenceEventKey,
+          },
+        ],
+      },
+    ],
+    indicators: [
+      {
+        artifact_type: "domain",
+        indicators: [
+          {
+            value: "c2.iranian-proxy.example",
+            normalized_value: "c2.iranian-proxy.example",
+            artifact_type: "domain",
+            source_document_ids: [iocsDocumentId],
+          },
+        ],
+      },
+    ],
+    sources: [
+      {
+        source_document_id: vendorDocumentId,
+        canonical_url: vendorUrl,
+        title: "Rapport Vendor",
+        publisher: "Vendor",
+        published_at: null,
+        tier: "core",
+        kind: "publication",
+        role: "primary",
+      },
+      {
+        source_document_id: iocsDocumentId,
+        canonical_url: iocsUrl,
+        title: "Rapport IOC",
+        publisher: "Research",
+        published_at: null,
+        tier: "technical",
+        kind: "publication",
+        role: "independent",
+      },
+    ],
+    uncertainties: [
+      {
+        text: "L’attribution de la campagne reste provisoire.",
+        source_document_ids: [vendorDocumentId],
+      },
+    ],
+  };
   let batchReads = 0;
   let batchStarted = false;
   let selectionConfirmed = false;
@@ -291,18 +382,8 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
           artifact_version: 1,
           artifact_input_hash: hash,
           status: "verified",
-          schema_version: "2",
-          canonical_content: {
-            schema_version: "2",
-            title: "Article canonique Iranian Proxy",
-            timeline: [],
-            synthesis: [
-              [{ kind: "text", text: "Contenu vérifié.", source_ids: [] }],
-            ],
-            indicators: [],
-            sources: [],
-            uncertainties: [],
-          },
+          schema_version: "3",
+          canonical_content: publicationV3,
           rendered_content: null,
         },
       });
@@ -507,6 +588,22 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       });
       return;
     }
+    if (
+      path === `/api/subjects/${subjectId}/production/artifacts/publication`
+    ) {
+      await route.fulfill({
+        json: {
+          artifact_id: artifactId,
+          stage: "publication",
+          version: 1,
+          status: "verified",
+          metadata: {},
+          rendered_content: null,
+          canonical_content: publicationV3,
+        },
+      });
+      return;
+    }
     await route.fulfill({ status: 404, json: {} });
   });
 
@@ -558,15 +655,27 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   ).toBeVisible();
   await page.getByRole("link", { name: "Ouvrir" }).click();
   await expect(
-    page.getByRole("heading", { name: "Campagne Iranian Proxy" }),
+    page.getByRole("heading", { name: "Campagne Iranian Proxy", exact: true }),
   ).toBeVisible();
   await expect(page.getByText("TLP:AMBER")).toBeVisible();
   await expect(
     page.getByRole("link", { name: "Retour à l’édition" }),
   ).toHaveAttribute("href", `/editions/${editionId}`);
   await expect(
-    page.getByRole("heading", { name: "Article canonique Iranian Proxy" }),
+    page.getByRole("heading", { name: synthesisTitle }),
   ).toBeVisible();
+  await expect(page.getByText(leadText)).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Progression de l’attaque" }),
+  ).toBeVisible();
+  await expect(page.getByText("Première activité observée.")).toBeVisible();
+  await expect(page.getByText("c2.iranian-proxy.example")).toBeVisible();
+  await expect(
+    page.getByText("L’attribution de la campagne reste provisoire."),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Rapport Vendor" }).first(),
+  ).toHaveAttribute("href", vendorUrl);
   await expect(page.getByRole("button", { name: "Article" })).toHaveAttribute(
     "aria-pressed",
     "true",
@@ -686,6 +795,17 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   await expect(page.getByText(/E00\d/)).toHaveCount(0);
   await expect(synthesis.getByText(new RegExp(evidenceFactKey))).toHaveCount(0);
 
+  await page.goto(`/subjects/${subjectId}/production/artifacts/publication`);
+  await expect(
+    page.getByRole("heading", { name: synthesisTitle }),
+  ).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sources" })).toBeVisible();
+  await expect(
+    page.getByRole("link", { name: "Rapport IOC" }).first(),
+  ).toHaveAttribute("href", iocsUrl);
+  await expect(page.getByText(/\[S1\]/)).toHaveCount(0);
+  await expect(page.getByText(/schema_version/)).toHaveCount(0);
+
   // 5. Assembly stays reachable and operational after the canonical view.
   await page.goto(`/editions/${editionId}/review`);
   await expect(
@@ -717,6 +837,7 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       `GET /api/subjects/${subjectId}/content`,
       `GET /api/subjects/${subjectId}/production/artifacts/extraction`,
       `GET /api/subjects/${subjectId}/production/artifacts/synthesis`,
+      `GET /api/subjects/${subjectId}/production/artifacts/publication`,
     ]),
   );
   expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
