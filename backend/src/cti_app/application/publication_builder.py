@@ -5,10 +5,11 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Final
 from uuid import UUID
 
 from cti_app.application.french_typography import apply_french_spacing
-from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_extraction import _canonical_hash, references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import (
     ReferenceReport,
@@ -32,6 +33,7 @@ from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     extraction_evidence_refs_v1,
+    production_synthesis_to_json,
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
@@ -229,6 +231,28 @@ def _validate_publication_v3_lineage(
         raise ValueError("Synthesis does not match the production input snapshot")
     if synthesis.extraction_hash != canonical_extraction_hash(extraction):
         raise ValueError("Synthesis does not match the canonical extraction")
+
+
+ASSEMBLY_POLICY_VERSION: Final[str] = "1"
+
+
+def compute_assembly_input_hash(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> str:
+    """Return the deterministic functional identity of canonical Assembly inputs."""
+    payload = {
+        "snapshot_input_hash": snapshot.input_hash,
+        "references_hash": references_corpus_hash(references),
+        "extraction_hash": canonical_extraction_hash(extraction),
+        "synthesis_hash": _canonical_hash(production_synthesis_to_json(synthesis)),
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+    }
+    return _canonical_hash(payload)
 
 
 def _validate_synthesis_evidence_refs(

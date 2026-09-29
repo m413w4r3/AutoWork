@@ -1,12 +1,13 @@
 import json
 from dataclasses import replace
 from datetime import date
+from inspect import Parameter, signature
 from uuid import UUID
 
 import pytest
 
 import cti_app.application.publication_builder as publication_builder
-from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_extraction import _canonical_hash, references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
     _project_publication_iocs,
@@ -14,6 +15,7 @@ from cti_app.application.publication_builder import (
     _validate_publication_v3_lineage,
     _validate_synthesis_evidence_refs,
     build_publication_document_v3,
+    compute_assembly_input_hash,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
@@ -51,8 +53,10 @@ from cti_app.domain.production_synthesis import (
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
     extraction_evidence_refs_v1,
+    production_synthesis_to_json,
 )
 from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     ArtifactType,
     PublicationDocumentV3,
     PublicationEvidenceKind,
@@ -183,6 +187,147 @@ def _canonical_inputs() -> tuple[
         warnings=(),
     )
     return snapshot, references, extraction, synthesis
+
+
+def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    payload = {
+        "snapshot_input_hash": snapshot.input_hash,
+        "references_hash": references_corpus_hash(references),
+        "extraction_hash": canonical_extraction_hash(extraction),
+        "synthesis_hash": _canonical_hash(production_synthesis_to_json(synthesis)),
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
+    }
+
+    expected_hash = _canonical_hash(payload)
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        == expected_hash
+    )
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        == expected_hash
+    )
+
+    reconstructed_snapshot = replace(snapshot)
+    reconstructed_references = replace(references)
+    reconstructed_extraction = replace(extraction)
+    reconstructed_synthesis = replace(synthesis)
+    assert (
+        compute_assembly_input_hash(
+            snapshot=reconstructed_snapshot,
+            references=reconstructed_references,
+            extraction=reconstructed_extraction,
+            synthesis=reconstructed_synthesis,
+        )
+        == expected_hash
+    )
+
+
+def test_assembly_input_hash_changes_with_each_functional_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    original = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+
+    changed_snapshot = replace(
+        snapshot,
+        subject_title="Changed subject",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    assert changed_snapshot.input_hash != snapshot.input_hash
+    assert (
+        compute_assembly_input_hash(
+            snapshot=changed_snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        != original
+    )
+
+    changed_reference = replace(references.sources[0], title="Changed report")
+    changed_references = replace(references, sources=(changed_reference,))
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=changed_references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        != original
+    )
+
+    changed_extraction = replace(extraction, warnings=("Changed extraction",))
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=changed_extraction,
+            synthesis=synthesis,
+        )
+        != original
+    )
+
+    changed_synthesis = replace(synthesis, title="Changed synthesis")
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=changed_synthesis,
+        )
+        != original
+    )
+
+    monkeypatch.setattr(
+        publication_builder,
+        "PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION",
+        "changed-schema",
+    )
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        != original
+    )
+
+    monkeypatch.setattr(publication_builder, "ASSEMBLY_POLICY_VERSION", "2")
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+        != original
+    )
+
+
+def test_assembly_input_hash_api_excludes_runtime_and_renderer_inputs() -> None:
+    parameters = signature(compute_assembly_input_hash).parameters
+    assert tuple(parameters) == ("snapshot", "references", "extraction", "synthesis")
+    assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 
 
 def test_publication_v3_validators_accept_matching_canonical_inputs() -> None:
