@@ -23,7 +23,10 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
 )
-from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_references import (
+    ProductionReferenceCorpusV1,
+    ProductionReferenceSourceV1,
+)
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
@@ -38,6 +41,7 @@ from cti_app.domain.publication import (
     Indicator,
     IndicatorGroup,
     PublicationDocumentV2,
+    PublicationDocumentV3,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -46,6 +50,7 @@ from cti_app.domain.publication import (
     PublicationSectionKind,
     PublicationSectionV1,
     PublicationSource,
+    PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
     RichSpan,
@@ -303,6 +308,69 @@ def _with_event_citation(spans: RichText, source_ids: tuple[str, ...]) -> RichTe
             return tuple(merged)
     merged.append(RichSpan(RichSpanKind.CITATION, "", tuple(dict.fromkeys(source_ids))))
     return tuple(merged)
+
+
+def build_publication_document_v3(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> PublicationDocumentV3:
+    """Build a renderer-independent publication from canonical production inputs."""
+    _validate_publication_v3_lineage(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+    projection = _project_publication_iocs(extraction=extraction, narrative=narrative)
+
+    sources_by_id: dict[UUID, ProductionReferenceSourceV1] = {}
+    for source in references.sources:
+        source_document_id = source.source_document_id
+        if source_document_id is None:
+            continue
+        if source_document_id in sources_by_id:
+            raise ValueError(
+                f"Canonical reference corpus repeats source_document_id {source_document_id}"
+            )
+        sources_by_id[source_document_id] = source
+
+    publication_sources: list[PublicationSourceV1] = []
+    for source_document_id in sorted(projection.used_source_document_ids, key=str):
+        resolved_source = sources_by_id.get(source_document_id)
+        if resolved_source is None:
+            raise ValueError(
+                "Used publication source is absent from the canonical reference corpus: "
+                f"{source_document_id}"
+            )
+        publication_sources.append(
+            PublicationSourceV1(
+                source_document_id=source_document_id,
+                canonical_url=resolved_source.canonical_url,
+                title=resolved_source.title,
+                publisher=resolved_source.publisher,
+                published_at=resolved_source.published_at,
+                tier=resolved_source.tier,
+                kind=resolved_source.kind,
+                role=resolved_source.role,
+            )
+        )
+
+    return PublicationDocumentV3(
+        schema_version="3",
+        subject_id=snapshot.subject_id,
+        publication_language=synthesis.publication_language,
+        title=synthesis.title,
+        lead=projection.lead,
+        sections=projection.sections,
+        timeline=projection.timeline,
+        indicators=projection.indicators,
+        sources=tuple(publication_sources),
+        uncertainties=projection.uncertainties,
+    )
 
 
 def build_publication_document(

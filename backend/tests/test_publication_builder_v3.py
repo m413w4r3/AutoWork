@@ -1,9 +1,11 @@
+import json
 from dataclasses import replace
 from datetime import date
 from uuid import UUID
 
 import pytest
 
+import cti_app.application.publication_builder as publication_builder
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
@@ -11,6 +13,7 @@ from cti_app.application.publication_builder import (
     _project_synthesis_publication,
     _validate_publication_v3_lineage,
     _validate_synthesis_evidence_refs,
+    build_publication_document_v3,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
@@ -51,6 +54,7 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import (
     ArtifactType,
+    PublicationDocumentV3,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -58,6 +62,7 @@ from cti_app.domain.publication import (
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
+    PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
@@ -589,3 +594,234 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
         )
         == projection
     )
+
+
+def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source_a = extraction.sources[0]
+    source_a_id = source_a.source_document_id
+    source_b_id = UUID(int=20)
+    unused_source_id = UUID(int=30)
+
+    def indicator(source_document_id: UUID) -> ExtractionIndicatorV1:
+        return ExtractionIndicatorV1(
+            value="shared.example",
+            artifact_type=ArtifactType.DOMAIN,
+            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+            context="",
+            evidence_quote="The report identifies shared.example.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source_document_id,),
+        )
+
+    source_a = replace(source_a, indicators=(indicator(source_a_id),))
+    source_b = replace(
+        source_a,
+        source_document_id=source_b_id,
+        canonical_url="https://example.com/second-report",
+        content_sha256="d" * 64,
+        role=SourceRole.INDEPENDENT,
+        facts=(
+            replace(
+                source_a.facts[0],
+                value="Another actor",
+                source_document_ids=(source_b_id,),
+            ),
+        ),
+        indicators=(indicator(source_b_id),),
+    )
+    reference_a = references.sources[0]
+    reference_b = replace(
+        reference_a,
+        canonical_url=source_b.canonical_url,
+        role=SourceRole.INDEPENDENT,
+        title=None,
+        publisher=None,
+        published_at=date(2025, 1, 12),
+        source_collection_id=UUID(int=10),
+        source_document_id=source_b_id,
+        content_sha256="d" * 64,
+    )
+    unused_reference = replace(
+        reference_a,
+        canonical_url="https://example.com/unused-report",
+        source_collection_id=UUID(int=11),
+        source_document_id=unused_source_id,
+        content_sha256="e" * 64,
+    )
+    references = replace(
+        references,
+        sources=(reference_a, reference_b, unused_reference),
+    )
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(source_a, source_b),
+    )
+    evidence = extraction_evidence_refs_v1(extraction)
+    fact_a = next(
+        ref
+        for ref in evidence
+        if ref.source_document_id == source_a_id and ref.kind is EvidenceKind.FACT
+    )
+    fact_b = next(
+        ref
+        for ref in evidence
+        if ref.source_document_id == source_b_id and ref.kind is EvidenceKind.FACT
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        title="Exact canonical title",
+        lead=(
+            SynthesisParagraphV1("First lead.", (fact_a,)),
+            SynthesisParagraphV1("Second lead.", (fact_b,)),
+        ),
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Overview",
+                (SynthesisParagraphV1("Overview text.", (fact_a, fact_b)),),
+            ),
+            SynthesisSectionV1(
+                SynthesisSectionKind.TECHNICAL,
+                "Technical details",
+                (SynthesisParagraphV1("Technical text.", (fact_b,)),),
+            ),
+        ),
+        timeline=(
+            SynthesisTimelineEntryV1(date(2025, 1, 8), "8 January", "Dated event.", (fact_a,)),
+            SynthesisTimelineEntryV1(None, None, "Undated event.", (fact_b,)),
+        ),
+        uncertainties=(
+            SynthesisUncertaintyV1("Attribution remains uncertain.", (source_b_id, source_a_id)),
+        ),
+    )
+
+    def forbidden_adapter(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("V3 builder invoked a legacy model or renderer adapter")
+
+    monkeypatch.setattr(publication_builder, "SemanticAnnotator", forbidden_adapter)
+    monkeypatch.setattr(publication_builder, "collect_indicators", forbidden_adapter)
+    monkeypatch.setattr(publication_builder, "apply_french_spacing", forbidden_adapter)
+
+    document = build_publication_document_v3(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    ref_a = PublicationEvidenceRefV1(
+        fact_a.source_document_id,
+        PublicationEvidenceKind(fact_a.kind.value),
+        fact_a.evidence_key,
+    )
+    ref_b = PublicationEvidenceRefV1(
+        fact_b.source_document_id,
+        PublicationEvidenceKind(fact_b.kind.value),
+        fact_b.evidence_key,
+    )
+    expected = PublicationDocumentV3(
+        schema_version="3",
+        subject_id=snapshot.subject_id,
+        publication_language="fr",
+        title="Exact canonical title",
+        lead=(
+            PublicationParagraphV1("First lead.", (ref_a,)),
+            PublicationParagraphV1("Second lead.", (ref_b,)),
+        ),
+        sections=(
+            PublicationSectionV1(
+                PublicationSectionKind.OVERVIEW,
+                "Overview",
+                (PublicationParagraphV1("Overview text.", (ref_a, ref_b)),),
+            ),
+            PublicationSectionV1(
+                PublicationSectionKind.TECHNICAL,
+                "Technical details",
+                (PublicationParagraphV1("Technical text.", (ref_b,)),),
+            ),
+        ),
+        timeline=(
+            PublicationTimelineEntryV1(date(2025, 1, 8), "8 January", "Dated event.", (ref_a,)),
+            PublicationTimelineEntryV1(None, None, "Undated event.", (ref_b,)),
+        ),
+        indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.DOMAIN,
+                (
+                    PublicationIndicatorV1(
+                        "shared.example",
+                        "shared.example",
+                        ArtifactType.DOMAIN,
+                        (source_a_id, source_b_id),
+                    ),
+                ),
+            ),
+        ),
+        sources=(
+            PublicationSourceV1(
+                source_document_id=source_a_id,
+                canonical_url=reference_a.canonical_url,
+                title=reference_a.title,
+                publisher=reference_a.publisher,
+                published_at=reference_a.published_at,
+                tier=reference_a.tier,
+                kind=reference_a.kind,
+                role=reference_a.role,
+            ),
+            PublicationSourceV1(
+                source_document_id=source_b_id,
+                canonical_url=reference_b.canonical_url,
+                title=reference_b.title,
+                publisher=reference_b.publisher,
+                published_at=reference_b.published_at,
+                tier=reference_b.tier,
+                kind=reference_b.kind,
+                role=reference_b.role,
+            ),
+        ),
+        uncertainties=(
+            PublicationUncertaintyV1("Attribution remains uncertain.", (source_a_id, source_b_id)),
+        ),
+    )
+    assert document == expected
+
+    canonical_json = json.dumps(
+        document.to_json(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    repeated = build_publication_document_v3(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    assert (
+        json.dumps(repeated.to_json(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        == canonical_json
+    )
+
+    missing_references = replace(
+        references,
+        sources=tuple(
+            source for source in references.sources if source.source_document_id != source_b_id
+        ),
+    )
+    missing_extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(missing_references),
+    )
+    missing_synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(missing_extraction),
+    )
+    with pytest.raises(ValueError, match="absent from the canonical reference corpus"):
+        build_publication_document_v3(
+            snapshot=snapshot,
+            references=missing_references,
+            extraction=missing_extraction,
+            synthesis=missing_synthesis,
+        )
