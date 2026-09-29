@@ -7,11 +7,13 @@ use ``PublicationDocumentV2`` and callers cross the V1/V2 boundary through
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import date
 from enum import StrEnum
 from typing import Any
+from uuid import UUID
 
 LEGACY_PUBLICATION_SCHEMA_VERSION = "1"
 PUBLICATION_SCHEMA_VERSION = "2"
@@ -233,3 +235,119 @@ def publication_document_from_json(
     if schema_version == PUBLICATION_SCHEMA_VERSION:
         return PublicationDocumentV2.from_json(payload)
     raise ValueError(f"unsupported publication document schema_version={schema_version!r}")
+
+
+class PublicationEvidenceKind(StrEnum):
+    FACT = "fact"
+    EVENT = "event"
+    INDICATOR = "indicator"
+    RULE = "rule"
+
+
+class PublicationSectionKind(StrEnum):
+    OVERVIEW = "overview"
+    CAMPAIGN = "campaign"
+    INFECTION_CHAIN = "infection_chain"
+    TECHNICAL = "technical"
+    VICTIMOLOGY = "victimology"
+    INFRASTRUCTURE = "infrastructure"
+    DETECTION = "detection"
+    IMPACT = "impact"
+    OTHER = "other"
+
+
+_PUBLICATION_EVIDENCE_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _normalize_publication_evidence_refs(
+    refs: tuple[PublicationEvidenceRefV1, ...], label: str
+) -> tuple[PublicationEvidenceRefV1, ...]:
+    if not isinstance(refs, tuple) or not refs:
+        raise ValueError(f"{label} requires a tuple of evidence references")
+    if any(not isinstance(ref, PublicationEvidenceRefV1) for ref in refs):
+        raise ValueError(f"{label} evidence references have an invalid type")
+    if len(set(refs)) != len(refs):
+        raise ValueError(f"{label} must not repeat evidence references")
+    return tuple(
+        sorted(
+            refs,
+            key=lambda ref: (
+                str(ref.source_document_id),
+                ref.kind.value,
+                ref.evidence_key,
+            ),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationEvidenceRefV1:
+    source_document_id: UUID
+    kind: PublicationEvidenceKind
+    evidence_key: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_document_id, UUID):
+            raise ValueError("Evidence source document identity must be a UUID")
+        if not isinstance(self.kind, PublicationEvidenceKind):
+            raise ValueError("Evidence kind is invalid")
+        if (
+            not isinstance(self.evidence_key, str)
+            or _PUBLICATION_EVIDENCE_SHA256.fullmatch(self.evidence_key) is None
+        ):
+            raise ValueError("Evidence key must be a lowercase SHA-256")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationParagraphV1:
+    text: str
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Publication paragraph text must be non-empty text")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _normalize_publication_evidence_refs(self.evidence_refs, "Paragraph"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationSectionV1:
+    kind: PublicationSectionKind
+    heading: str
+    paragraphs: tuple[PublicationParagraphV1, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, PublicationSectionKind):
+            raise ValueError("Publication section kind is invalid")
+        if not isinstance(self.heading, str) or not self.heading.strip():
+            raise ValueError("Publication section heading must be non-empty text")
+        if not isinstance(self.paragraphs, tuple) or not self.paragraphs:
+            raise ValueError("Publication section paragraphs must be a non-empty tuple")
+        if any(not isinstance(paragraph, PublicationParagraphV1) for paragraph in self.paragraphs):
+            raise ValueError("Publication section paragraphs have an invalid type")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationTimelineEntryV1:
+    event_date: date | None
+    date_text: str | None
+    text: str
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        if self.event_date is not None and type(self.event_date) is not date:
+            raise ValueError("Timeline event date must be a date or None")
+        if self.date_text is not None and (
+            not isinstance(self.date_text, str) or not self.date_text.strip()
+        ):
+            raise ValueError("Timeline date text must be non-empty text")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Timeline text must be non-empty text")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _normalize_publication_evidence_refs(self.evidence_refs, "Timeline entry"),
+        )
