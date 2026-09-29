@@ -35,6 +35,7 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
     PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
@@ -360,7 +361,7 @@ def build_publication_document_v3(
         )
 
     return PublicationDocumentV3(
-        schema_version="3",
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
         subject_id=snapshot.subject_id,
         publication_language=synthesis.publication_language,
         title=synthesis.title,
