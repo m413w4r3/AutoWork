@@ -5,12 +5,19 @@ import {
   getSynthesisArtifact,
   getPublicationArtifact,
   isProductionExtractionV1,
+  isProductionSynthesisV1,
   type ArtifactResponse,
   type ProductionExtractionEvidenceV1,
   type ProductionExtractionOmissionReasonV1,
   type ProductionExtractionReuseStateV1,
   type ProductionExtractionV1,
   type ProductionSourceExtractionV1,
+  type ProductionSynthesisEvidenceKindV1,
+  type ProductionSynthesisEvidenceRefV1,
+  type ProductionSynthesisParagraphV1,
+  type ProductionSynthesisSectionKindV1,
+  type ProductionSynthesisTimelineEntryV1,
+  type ProductionSynthesisV1,
   type PublicationDocument,
   type ExtractionDocumentV2,
   type ExtractionItemV2,
@@ -752,6 +759,288 @@ function ProductionExtractionPreview({
   );
 }
 
+const SYNTHESIS_MODE_LABELS: Record<string, string> = {
+  fresh: "Rédaction initiale",
+  revise_previous: "Révision de la synthèse précédente",
+  reuse_exact: "Réutilisation d’une synthèse identique",
+};
+
+const SYNTHESIS_SECTION_KIND_LABELS: Record<
+  ProductionSynthesisSectionKindV1,
+  string
+> = {
+  overview: "Vue d’ensemble",
+  campaign: "Campagne",
+  infection_chain: "Chaîne d’infection",
+  technical: "Technique",
+  victimology: "Victimologie",
+  infrastructure: "Infrastructure",
+  detection: "Détection",
+  impact: "Impact",
+  other: "Autre",
+};
+
+const SYNTHESIS_EVIDENCE_KIND_LABELS: Record<
+  ProductionSynthesisEvidenceKindV1,
+  string
+> = {
+  fact: "fait",
+  event: "événement",
+  indicator: "indicateur",
+  rule: "règle",
+};
+
+/** Generation mode is artifact metadata, never a canonical synthesis field. */
+function synthesisModeLabel(metadata: Record<string, unknown>): string {
+  const mode = metadata.mode;
+  if (typeof mode !== "string" || mode.trim() === "") return "Non renseigné";
+  return SYNTHESIS_MODE_LABELS[mode] ?? mode;
+}
+
+function synthesisDateLabel(
+  entry: ProductionSynthesisTimelineEntryV1,
+): string | null {
+  if (entry.event_date) {
+    return new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(
+      new Date(`${entry.event_date}T00:00:00`),
+    );
+  }
+  return entry.date_text;
+}
+
+/**
+ * Resolve one document identity against the canonical extraction. Unknown
+ * identities keep their exact value available instead of being dropped.
+ */
+function SynthesisSource({
+  documentId,
+  sourcesById,
+}: {
+  documentId: string;
+  sourcesById: SourcesById;
+}) {
+  const source = sourcesById.get(documentId);
+  if (source) {
+    return <a href={source.canonical_url}>{source.canonical_url}</a>;
+  }
+  return (
+    <span
+      className="synthesis-unknown-source"
+      data-source-document-id={documentId}
+      title={documentId}
+    >
+      Source inconnue
+    </span>
+  );
+}
+
+function SynthesisSources({
+  documentIds,
+  sourcesById,
+}: {
+  documentIds: readonly string[];
+  sourcesById: SourcesById;
+}) {
+  return (
+    <ul className="synthesis-sources">
+      {documentIds.map((documentId) => (
+        <li key={documentId}>
+          <SynthesisSource documentId={documentId} sourcesById={sourcesById} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+/** Evidence count plus the exact documents, deduplicated for presentation. */
+function SynthesisEvidence({
+  evidenceRefs,
+  sourcesById,
+}: {
+  evidenceRefs: ProductionSynthesisEvidenceRefV1[];
+  sourcesById: SourcesById;
+}) {
+  const documents = new Map<string, ProductionSynthesisEvidenceKindV1[]>();
+  for (const ref of evidenceRefs) {
+    const kinds = documents.get(ref.source_document_id) ?? [];
+    if (!kinds.includes(ref.kind)) kinds.push(ref.kind);
+    documents.set(ref.source_document_id, kinds);
+  }
+  return (
+    <div className="synthesis-evidence">
+      <p className="synthesis-evidence__count">
+        {evidenceRefs.length} preuve{evidenceRefs.length > 1 ? "s" : ""}
+      </p>
+      <ul className="synthesis-evidence__documents">
+        {[...documents.entries()].map(([documentId, kinds]) => (
+          <li key={documentId}>
+            <SynthesisSource
+              documentId={documentId}
+              sourcesById={sourcesById}
+            />
+            <span className="synthesis-evidence__kinds">
+              {" "}
+              (
+              {kinds
+                .map((kind) => SYNTHESIS_EVIDENCE_KIND_LABELS[kind])
+                .join(", ")}
+              )
+            </span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SynthesisParagraph({
+  paragraph,
+  sourcesById,
+}: {
+  paragraph: ProductionSynthesisParagraphV1;
+  sourcesById: SourcesById;
+}) {
+  return (
+    <div className="synthesis-paragraph">
+      <p>{paragraph.text}</p>
+      <SynthesisEvidence
+        evidenceRefs={paragraph.evidence_refs}
+        sourcesById={sourcesById}
+      />
+    </div>
+  );
+}
+
+function ProductionSynthesisView({
+  document,
+  extraction,
+  metadata,
+}: {
+  document: ProductionSynthesisV1;
+  extraction: ProductionExtractionV1 | null;
+  metadata: Record<string, unknown>;
+}) {
+  const sourcesById: SourcesById = new Map(
+    (extraction?.sources ?? []).map((source) => [
+      source.source_document_id,
+      source,
+    ]),
+  );
+  return (
+    <article className="synthesis-preview synthesis-preview--canonical">
+      <h3>{document.title}</h3>
+      <dl className="synthesis-meta">
+        <div>
+          <dt>Langue de publication</dt>
+          <dd>{document.publication_language}</dd>
+        </div>
+        <div>
+          <dt>Mode de génération</dt>
+          <dd>{synthesisModeLabel(metadata)}</dd>
+        </div>
+        <div>
+          <dt>Politique de synthèse</dt>
+          <dd>{document.synthesis_policy_version}</dd>
+        </div>
+      </dl>
+      {extraction === null ? (
+        <p className="synthesis-meta__notice">
+          Extraction canonique indisponible : les documents sources ne peuvent
+          pas être résolus.
+        </p>
+      ) : null}
+
+      {document.lead.length > 0 ? (
+        <section className="synthesis-section">
+          <h4>Lead</h4>
+          {document.lead.map((paragraph, index) => (
+            <SynthesisParagraph
+              key={`lead-${index}`}
+              paragraph={paragraph}
+              sourcesById={sourcesById}
+            />
+          ))}
+        </section>
+      ) : null}
+
+      {document.sections.map((section, index) => (
+        <section className="synthesis-section" key={`${section.kind}-${index}`}>
+          <h4>
+            {section.heading}{" "}
+            <small className="synthesis-section__kind">
+              {SYNTHESIS_SECTION_KIND_LABELS[section.kind]}
+            </small>
+          </h4>
+          {section.paragraphs.map((paragraph, paragraphIndex) => (
+            <SynthesisParagraph
+              key={`${section.kind}-${index}-${paragraphIndex}`}
+              paragraph={paragraph}
+              sourcesById={sourcesById}
+            />
+          ))}
+        </section>
+      ))}
+
+      <section className="synthesis-section">
+        <h4>Chronologie</h4>
+        {document.timeline.length > 0 ? (
+          <ul className="synthesis-timeline">
+            {document.timeline.map((entry, index) => {
+              const dateLabel = synthesisDateLabel(entry);
+              return (
+                <li key={`timeline-${index}`}>
+                  {dateLabel ? (
+                    <strong className="semantic-date">{dateLabel} : </strong>
+                  ) : null}
+                  {entry.text}
+                  <SynthesisEvidence
+                    evidenceRefs={entry.evidence_refs}
+                    sourcesById={sourcesById}
+                  />
+                </li>
+              );
+            })}
+          </ul>
+        ) : (
+          <p>Aucun événement de chronologie.</p>
+        )}
+      </section>
+
+      <section className="synthesis-section">
+        <h4>Incertitudes</h4>
+        {document.uncertainties.length > 0 ? (
+          <ul>
+            {document.uncertainties.map((uncertainty, index) => (
+              <li key={`uncertainty-${index}`}>
+                {uncertainty.text}
+                <SynthesisSources
+                  documentIds={[...new Set(uncertainty.source_document_ids)]}
+                  sourcesById={sourcesById}
+                />
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucune incertitude signalée.</p>
+        )}
+      </section>
+
+      <section className="synthesis-section">
+        <h4>Warnings</h4>
+        {document.warnings.length > 0 ? (
+          <ul>
+            {document.warnings.map((warning, index) => (
+              <li key={`warning-${index}`}>{warning}</li>
+            ))}
+          </ul>
+        ) : (
+          <p>Aucun warning.</p>
+        )}
+      </section>
+    </article>
+  );
+}
+
 export function PublicationDocumentView({
   document,
 }: {
@@ -821,6 +1110,14 @@ export function ProductionArtifactView({
     queryFn: () => fetcher(subjectId),
   });
 
+  // Canonical evidence presentation needs the exact source metadata, never a
+  // positional or textual match against the synthesis narrative.
+  const { data: extractionArtifact } = useQuery({
+    queryKey: ["production-artifact", subjectId, "extraction"],
+    queryFn: () => getExtractionArtifact(subjectId),
+    enabled: stage === "synthesis",
+  });
+
   if (isLoading) {
     return (
       <section className="artifact-view">
@@ -855,6 +1152,17 @@ export function ProductionArtifactView({
     isProductionReferenceCorpus(artifact.canonical_content)
       ? artifact.canonical_content
       : null;
+
+  const canonicalContent: unknown = artifact.canonical_content;
+  const synthesisDocument =
+    stage === "synthesis" && isProductionSynthesisV1(canonicalContent)
+      ? canonicalContent
+      : null;
+
+  const extractionCanonical: unknown = extractionArtifact?.canonical_content;
+  const extractionDocument = isProductionExtractionV1(extractionCanonical)
+    ? extractionCanonical
+    : null;
 
   return (
     <section className="artifact-view">
@@ -917,6 +1225,14 @@ export function ProductionArtifactView({
         <ProductionReferenceCorpusView corpus={referencesCorpus} />
       ) : null}
 
+      {synthesisDocument ? (
+        <ProductionSynthesisView
+          document={synthesisDocument}
+          extraction={extractionDocument}
+          metadata={artifact.metadata}
+        />
+      ) : null}
+
       {stage === "publication" && artifact.rendered_content && (
         <p>
           <a
@@ -929,9 +1245,17 @@ export function ProductionArtifactView({
         </p>
       )}
 
+      {synthesisDocument && artifact.rendered_content ? (
+        <details className="artifact-rendered-preview">
+          <summary>Aperçu Markdown (projection temporaire)</summary>
+          <pre>{artifact.rendered_content}</pre>
+        </details>
+      ) : null}
+
       {stage !== "publication" &&
         stage !== "extraction" &&
         !referencesCorpus &&
+        !synthesisDocument &&
         artifact.rendered_content && (
           <div className="artifact-content">
             <div className="rendered-markdown">
@@ -943,6 +1267,7 @@ export function ProductionArtifactView({
       {stage !== "publication" &&
         stage !== "extraction" &&
         !referencesCorpus &&
+        !synthesisDocument &&
         artifact.canonical_content && (
           <div className="artifact-canonical">
             <details>

@@ -630,9 +630,7 @@ def test_synthesis_hash_tracks_extraction_and_every_policy_version() -> None:
         "model_policy_version",
         "routing_policy_version",
     ):
-        changed = synthesis_input_hash(
-            snapshot, extraction, pack, "a" * 64, **{version: "changed"}
-        )
+        changed = synthesis_input_hash(snapshot, extraction, pack, "a" * 64, **{version: "changed"})
         assert base != changed, version
     changed_extraction = replace(extraction, warnings=("changed",))
     assert base != synthesis_input_hash(snapshot, changed_extraction, pack, "a" * 64)

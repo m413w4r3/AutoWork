@@ -372,8 +372,6 @@ export function SubjectProduction({
   const rejectedArtifactCount =
     status.extraction_rejections?.q2_rejected_artifact_count ??
     rejectedItems.filter((entry) => entry.proposal_kind !== "rule").length;
-  const issueIsConversation =
-    issueCode !== null && CONVERSATION_ERROR_CODES.has(issueCode);
   const completedStages = stageList.filter(
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
@@ -445,9 +443,6 @@ export function SubjectProduction({
         <a href={`/subjects/${subjectId}/production/artifacts/synthesis`}>
           Voir la synthèse
         </a>
-        {status.synthesis_conversation_id ? (
-          <a href={`/subjects/${subjectId}#conversations`}>Voir la synthèse</a>
-        ) : null}
         {status.status === "ready" ? (
           <a href={`/subjects/${subjectId}/production/artifacts/publication`}>
             Aperçu
@@ -490,15 +485,9 @@ export function SubjectProduction({
           ) : null}
           <p>Code : {issueCode ?? "inconnu"}</p>
           {issueMessage ? <p>{issueMessage}</p> : null}
-          {issueIsConversation && status.synthesis_conversation_id ? (
-            <a href={`/subjects/${subjectId}#conversations`}>
-              Voir la conversation
-            </a>
-          ) : (
-            <a href={stageArtifactHref(subjectId, status.current_stage)}>
-              Voir les détails de l’étape
-            </a>
-          )}
+          <a href={stageArtifactHref(subjectId, status.current_stage)}>
+            Voir les détails de l’étape
+          </a>
         </div>
       )}
 

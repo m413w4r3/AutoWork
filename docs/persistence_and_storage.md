@@ -86,6 +86,28 @@ checkpoint `IOC_RULES` ne satisfait jamais `FULL` ; la projection `FULL` → `IO
 déterministe. Deux URLs au contenu identique partagent un calcul mais conservent chacune leur
 entrée canonique et leur provenance.
 
+### Synthesis : artifact canonique et compatibilité temporaire
+
+Pour `SYNTHESIS`, `canonical_blob_id` pointe sur le JSON validé de `ProductionSynthesisV1` ; c’est
+l’unique état canonique de l’étape. `raw_blob_id` peut référencer la réponse brute du modèle si
+elle est conservée. `rendered_blob_id` peut référencer un aperçu Markdown déterministe optionnel,
+qui reste une projection de présentation ou de compatibilité. `model_run_id` conserve la lineage
+de génération et l’identité durable de soumission. PostgreSQL garde les références, hashes et
+métadonnées bornées, pas le corps canonique complet.
+
+La réutilisation canonique exacte exige un artifact vérifié dont `canonical_blob_id` se décode en
+`ProductionSynthesisV1` valide et dont les hashes d’entrée et d’extraction correspondent. Un
+artifact legacy qui ne possède que `rendered_blob_id` n’est pas candidat à cette réutilisation.
+Pour une révision, la synthèse précédente n’est qu’un contexte non autoritatif : seules les
+évidences de l’extraction courante peuvent justifier le résultat. Toute référence à une évidence
+retirée de l’extraction courante est supprimée ou reformulée.
+
+Jusqu’à la refonte d’AW-013, l’adapter temporaire projette `ProductionSynthesisV1` vers la
+représentation Markdown/legacy attendue par Assembly. Ce passage est à sens unique : le Markdown
+legacy n’est jamais reparsé pour reconstruire un `ProductionSynthesisV1`. Les artifacts
+historiques rendus peuvent rester lisibles par compatibilité, sans devenir un état canonique ni
+une base de réutilisation.
+
 ## Blobs et workspaces
 
 Un blob est adressé par `<bucket>/<2 premiers caractères>/<sha256>`. L’écriture objet précède la

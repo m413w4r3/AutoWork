@@ -620,7 +620,6 @@ def register_production_jobs(
         await ProductionBatchService(uow_factory).clear_next_dispatch(parameters.run_id)
         orchestrator = ProductionWorkflowOrchestrator(
             uow_factory,
-            model_service=model_service,
             model_gateway=model_gateway,
             collection_service=collection_service,
             artifact_store=artifact_store,

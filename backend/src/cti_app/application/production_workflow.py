@@ -975,9 +975,8 @@ class ProductionWorkflowOrchestrator:
                 "routing_policy_version": REFERENCES_ROUTING_POLICY_VERSION,
             },
         )
-        model_gateway = cast(ModelGateway, self._model_gateway)
         try:
-            execution = await model_gateway.research(request)
+            execution = await self._model_gateway.research(request)
         except JobCancelledError:
             raise
         except Exception as e:

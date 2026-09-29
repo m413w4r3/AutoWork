@@ -17,6 +17,16 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   const manifestId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
   const hash = "a".repeat(64);
   const discoverySubjectId = "9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a";
+  const vendorDocumentId = "12121212-1212-4212-8212-121212121212";
+  const iocsDocumentId = "56565656-5656-4565-8565-565656565656";
+  const vendorUrl = "https://vendor.example/iranian-proxy";
+  const iocsUrl = "https://research.example/iranian-proxy-iocs";
+  const synthesisTitle = "Campagne Iranian Proxy — synthèse vérifiée";
+  const leadText =
+    "La campagne Iranian Proxy vise des infrastructures stratégiques.";
+  const evidenceFactKey = "d".repeat(64);
+  const evidenceEventKey = "1".repeat(64);
+  const evidenceIndicatorKey = "2".repeat(64);
   let batchReads = 0;
   let batchStarted = false;
   let selectionConfirmed = false;
@@ -315,8 +325,8 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
             profile_policy_version: "production-reference-tier-v1",
             sources: [
               {
-                source_document_id: "12121212-1212-4212-8212-121212121212",
-                canonical_url: "https://vendor.example/iranian-proxy",
+                source_document_id: vendorDocumentId,
+                canonical_url: vendorUrl,
                 content_sha256: "c".repeat(64),
                 tier: "core",
                 kind: "publication",
@@ -332,9 +342,7 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
                     context: "Campaign attribution.",
                     evidence_quote: "Iranian Proxy conducted the campaign.",
                     evidence_basis: "source_verified",
-                    source_document_ids: [
-                      "12121212-1212-4212-8212-121212121212",
-                    ],
+                    source_document_ids: [vendorDocumentId],
                   },
                 ],
                 events: [
@@ -345,18 +353,155 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
                     context: "Initial activity.",
                     evidence_quote: "First observed on 12 August 2026.",
                     evidence_basis: "source_verified",
-                    source_document_ids: [
-                      "12121212-1212-4212-8212-121212121212",
-                    ],
+                    source_document_ids: [vendorDocumentId],
                   },
                 ],
                 indicators: [],
                 rules: [],
+                uncertainties: [
+                  "La chronologie exacte du leurrage reste inconnue.",
+                ],
+              },
+              {
+                source_document_id: iocsDocumentId,
+                canonical_url: iocsUrl,
+                content_sha256: "e".repeat(64),
+                tier: "supporting",
+                kind: "publication",
+                role: "independent",
+                profile: "ioc_rules",
+                checkpoint_id: null,
+                reuse_state: "fresh",
+                facts: [],
+                events: [],
+                indicators: [
+                  {
+                    value: "c2.iranian-proxy.example",
+                    artifact_type: "domain",
+                    indicator_status: "confirmed_ioc",
+                    context: "C2 domain published by the technical source.",
+                    evidence_quote:
+                      "The loader contacted c2.iranian-proxy.example.",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [iocsDocumentId],
+                  },
+                ],
+                rules: [
+                  {
+                    rule_type: "yara",
+                    name: "Iranian_Proxy_Loader",
+                    body: "rule Iranian_Proxy_Loader { condition: true }",
+                    sha256: "f".repeat(64),
+                    context: "Detection rule published with the report.",
+                    evidence_quote:
+                      "rule Iranian_Proxy_Loader { condition: true }",
+                    evidence_basis: "source_verified",
+                    source_document_ids: [iocsDocumentId],
+                  },
+                ],
                 uncertainties: [],
               },
             ],
-            omitted_sources: [],
-            warnings: [],
+            omitted_sources: [
+              {
+                canonical_url: "https://aggregator.example/iranian-proxy",
+                tier: "technical",
+                collection_state: "unavailable",
+                reason: "reference_not_eligible",
+                error_code: null,
+              },
+            ],
+            warnings: ["Un événement sans date a été conservé."],
+          },
+        },
+      });
+      return;
+    }
+    if (path === `/api/subjects/${subjectId}/production/artifacts/synthesis`) {
+      await route.fulfill({
+        json: {
+          artifact_id: "synthesis-artifact-1",
+          stage: "synthesis",
+          version: 1,
+          status: "verified",
+          metadata: { mode: "fresh", language: "fr" },
+          rendered_content: null,
+          canonical_content: {
+            schema_version: 1,
+            subject_id: subjectId,
+            production_input_hash: hash,
+            extraction_hash: "9".repeat(64),
+            publication_language: "fr",
+            synthesis_policy_version: "production-synthesis-v1",
+            title: synthesisTitle,
+            lead: [
+              {
+                text: leadText,
+                evidence_refs: [
+                  {
+                    source_document_id: vendorDocumentId,
+                    kind: "fact",
+                    evidence_key: evidenceFactKey,
+                  },
+                  {
+                    source_document_id: vendorDocumentId,
+                    kind: "event",
+                    evidence_key: evidenceEventKey,
+                  },
+                ],
+              },
+            ],
+            sections: [
+              {
+                kind: "infection_chain",
+                heading: "Progression de l’attaque",
+                paragraphs: [
+                  {
+                    text: "Le leurre ouvre une chaîne PowerShell vers le domaine C2 identifié.",
+                    evidence_refs: [
+                      {
+                        source_document_id: iocsDocumentId,
+                        kind: "indicator",
+                        evidence_key: evidenceIndicatorKey,
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+            timeline: [
+              {
+                event_date: "2026-08-12",
+                date_text: null,
+                text: "Première activité observée.",
+                evidence_refs: [
+                  {
+                    source_document_id: vendorDocumentId,
+                    kind: "event",
+                    evidence_key: evidenceEventKey,
+                  },
+                ],
+              },
+              {
+                event_date: null,
+                date_text: null,
+                text: "La préparation de la campagne reste partiellement documentée.",
+                evidence_refs: [
+                  {
+                    source_document_id: vendorDocumentId,
+                    kind: "fact",
+                    evidence_key: evidenceFactKey,
+                  },
+                ],
+              },
+            ],
+            uncertainties: [
+              {
+                text: "L’attribution de la campagne reste provisoire.",
+                source_document_ids: [vendorDocumentId],
+              },
+            ],
+            warnings: ["Un fait mineur n’a pas pu être rattaché à une source."],
           },
         },
       });
@@ -428,6 +573,124 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   );
   await page.goBack();
 
+  // 3. The canonical Extraction artifact renders structured, sourced data
+  // instead of a JSON dump.
+  await page.goto(`/subjects/${subjectId}/production/artifacts/extraction`);
+  await expect(
+    page.getByRole("heading", { name: "Extraction CTI" }),
+  ).toBeVisible();
+  const fullSources = page
+    .getByRole("heading", { name: "Sources FULL" })
+    .locator("xpath=..");
+  await expect(
+    fullSources.getByRole("link", { name: vendorUrl }),
+  ).toBeVisible();
+  await expect(fullSources.getByText("Core", { exact: true })).toBeVisible();
+  await expect(fullSources.getByText("FULL", { exact: true })).toBeVisible();
+  const iocsSources = page
+    .getByRole("heading", { name: "Sources IOC_RULES" })
+    .locator("xpath=..");
+  await expect(iocsSources.getByRole("link", { name: iocsUrl })).toBeVisible();
+  await expect(
+    iocsSources.getByText("Référence complémentaire", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    iocsSources.getByText("IOC_RULES", { exact: true }),
+  ).toBeVisible();
+  const attributionFact = page.getByRole("listitem").filter({
+    hasText: "Campaign attribution.",
+  });
+  await expect(attributionFact).toContainText("actors : Iranian Proxy");
+  await expect(
+    attributionFact.getByRole("link", { name: vendorUrl }),
+  ).toHaveAttribute("href", vendorUrl);
+  await expect(
+    page.getByText("The campaign was first observed."),
+  ).toBeVisible();
+  await expect(page.getByText(/2026-08-12/).first()).toBeVisible();
+  await expect(
+    page.getByText("c2.iranian-proxy.example", { exact: true }),
+  ).toBeVisible();
+  await expect(page.getByText("IOC confirmé")).toBeVisible();
+  await expect(
+    page.getByText("Iranian_Proxy_Loader", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("La chronologie exacte du leurrage reste inconnue."),
+  ).toBeVisible();
+  await expect(
+    page.getByText("Un événement sans date a été conservé."),
+  ).toBeVisible();
+  await expect(page.getByText(/schema_version/)).toHaveCount(0);
+
+  // 4. The canonical Synthesis artifact renders the narrative, its timeline,
+  // its uncertainties and the exact evidence behind every claim.
+  await page.goto(`/subjects/${subjectId}/production/artifacts/synthesis`);
+  const synthesis = page.getByRole("article").filter({
+    has: page.getByRole("heading", { name: synthesisTitle }),
+  });
+  await expect(synthesis).toBeVisible();
+  await expect(synthesis.getByText("Rédaction initiale")).toBeVisible();
+  await expect(synthesis.getByRole("heading", { name: "Lead" })).toBeVisible();
+  const leadParagraph = synthesis.getByText(leadText);
+  await expect(leadParagraph).toBeVisible();
+  const leadEvidence = leadParagraph.locator("xpath=..");
+  await expect(leadEvidence.getByText("2 preuves")).toBeVisible();
+  // Two refs on the same document resolve to one canonical link.
+  await expect(leadEvidence.getByRole("link")).toHaveCount(1);
+  await expect(leadEvidence.getByRole("link")).toHaveAttribute(
+    "href",
+    vendorUrl,
+  );
+  await expect(
+    synthesis.getByRole("heading", { name: /Progression de l’attaque/ }),
+  ).toBeVisible();
+  const sectionParagraph = synthesis.getByText(
+    "Le leurre ouvre une chaîne PowerShell vers le domaine C2 identifié.",
+  );
+  await expect(sectionParagraph).toBeVisible();
+  await expect(
+    sectionParagraph.locator("xpath=..").getByRole("link", { name: iocsUrl }),
+  ).toHaveAttribute("href", iocsUrl);
+  await expect(
+    synthesis.getByRole("heading", { name: "Chronologie" }),
+  ).toBeVisible();
+  await expect(synthesis.getByText(/12 août 2026/).first()).toBeVisible();
+  await expect(
+    synthesis.getByText("Première activité observée."),
+  ).toBeVisible();
+  await expect(
+    synthesis.getByText(
+      "La préparation de la campagne reste partiellement documentée.",
+    ),
+  ).toBeVisible();
+  await expect(
+    synthesis.getByRole("heading", { name: "Incertitudes" }),
+  ).toBeVisible();
+  const uncertainty = synthesis.getByRole("listitem").filter({
+    hasText: "L’attribution de la campagne reste provisoire.",
+  });
+  await expect(uncertainty).toBeVisible();
+  await expect(
+    uncertainty.getByRole("link", { name: vendorUrl }),
+  ).toHaveAttribute("href", vendorUrl);
+  await expect(
+    synthesis.getByRole("heading", { name: "Warnings" }),
+  ).toBeVisible();
+  await expect(
+    synthesis.getByText(
+      "Un fait mineur n’a pas pu être rattaché à une source.",
+    ),
+  ).toBeVisible();
+  // Temporary prompt handles and internal evidence identities stay invisible.
+  await expect(page.getByText(/E00\d/)).toHaveCount(0);
+  await expect(synthesis.getByText(new RegExp(evidenceFactKey))).toHaveCount(0);
+
+  // 5. Assembly stays reachable and operational after the canonical view.
+  await page.goto(`/editions/${editionId}/review`);
+  await expect(
+    page.getByRole("heading", { name: "Revue de publication" }),
+  ).toBeVisible();
   await expect(
     page.getByRole("button", { name: "Accepter la production" }),
   ).toBeEnabled();
@@ -452,24 +715,24 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
       `POST /api/editions/${editionId}/publication/accept`,
       `GET /api/editions/${editionId}/release`,
       `GET /api/subjects/${subjectId}/content`,
+      `GET /api/subjects/${subjectId}/production/artifacts/extraction`,
+      `GET /api/subjects/${subjectId}/production/artifacts/synthesis`,
     ]),
   );
   expect(seenPaths).not.toContain(`POST /api/editions/${editionId}/production`);
-
-  // The canonical extraction artifact is rendered, not dumped as JSON.
-  await page.goto(`/subjects/${subjectId}/production/artifacts/extraction`);
-  await expect(
-    page.getByRole("heading", { name: "Sources FULL" }),
-  ).toBeVisible();
-  await expect(
-    page
-      .getByRole("link", { name: "https://vendor.example/iranian-proxy" })
-      .first(),
-  ).toBeVisible();
-  await expect(
-    page.getByText("The campaign was first observed."),
-  ).toBeVisible();
-  await expect(page.getByText(/schema_version/)).toHaveCount(0);
-
+  // The synthesis surface only reads the canonical artifact: no conversation
+  // identity is requested, and the evidence refs re-read the Extraction.
+  expect(
+    seenPaths.filter(
+      (path) => path.includes("/synthesis") && path.includes("conversation"),
+    ),
+  ).toEqual([]);
+  expect(
+    seenPaths.filter(
+      (path) =>
+        path ===
+        `GET /api/subjects/${subjectId}/production/artifacts/extraction`,
+    ).length,
+  ).toBeGreaterThan(1);
   expect(seenPaths.join("\n")).not.toContain("EditorialGroup");
 });

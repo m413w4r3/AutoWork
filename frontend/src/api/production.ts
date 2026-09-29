@@ -109,7 +109,6 @@ export interface ProductionStatus {
   current_stage: ProductionStage;
   progress_current: number;
   progress_total: number;
-  synthesis_conversation_id: string | null;
   run_id: string;
   pipeline_generation: number;
   created_at: string;
@@ -276,6 +275,7 @@ export interface ArtifactResponse {
   canonical_content:
     | PublicationDocument
     | ProductionExtractionV1
+    | ProductionSynthesisV1
     | ExtractionDocumentV2
     | Record<string, unknown>
     | null;
@@ -584,6 +584,218 @@ export function isProductionExtractionV1(
   }
   const documentIds = value.sources.map((source) => source.source_document_id);
   return new Set(documentIds).size === documentIds.length;
+}
+
+export type ProductionSynthesisEvidenceKindV1 =
+  "fact" | "event" | "indicator" | "rule";
+
+/** Structural identity of a synthesis section, never a style name. */
+export type ProductionSynthesisSectionKindV1 =
+  | "overview"
+  | "campaign"
+  | "infection_chain"
+  | "technical"
+  | "victimology"
+  | "infrastructure"
+  | "detection"
+  | "impact"
+  | "other";
+
+export const PRODUCTION_SYNTHESIS_POLICY_VERSION =
+  "production-synthesis-v1" as const;
+
+/**
+ * Canonical identity of one piece of evidence. The ``evidence_key`` is an
+ * internal content hash; it is never a temporary prompt handle.
+ */
+export interface ProductionSynthesisEvidenceRefV1 {
+  source_document_id: string;
+  kind: ProductionSynthesisEvidenceKindV1;
+  evidence_key: string;
+}
+
+export interface ProductionSynthesisParagraphV1 {
+  text: string;
+  evidence_refs: ProductionSynthesisEvidenceRefV1[];
+}
+
+export interface ProductionSynthesisSectionV1 {
+  kind: ProductionSynthesisSectionKindV1;
+  heading: string;
+  paragraphs: ProductionSynthesisParagraphV1[];
+}
+
+export interface ProductionSynthesisTimelineEntryV1 {
+  event_date: string | null;
+  date_text: string | null;
+  text: string;
+  evidence_refs: ProductionSynthesisEvidenceRefV1[];
+}
+
+export interface ProductionSynthesisUncertaintyV1 {
+  text: string;
+  source_document_ids: string[];
+}
+
+/** Mirror of the backend ``ProductionSynthesisV1`` canonical payload. */
+export interface ProductionSynthesisV1 {
+  schema_version: 1;
+  subject_id: string;
+  production_input_hash: string;
+  extraction_hash: string;
+  publication_language: string;
+  synthesis_policy_version: typeof PRODUCTION_SYNTHESIS_POLICY_VERSION;
+  title: string;
+  lead: ProductionSynthesisParagraphV1[];
+  sections: ProductionSynthesisSectionV1[];
+  timeline: ProductionSynthesisTimelineEntryV1[];
+  uncertainties: ProductionSynthesisUncertaintyV1[];
+  warnings: string[];
+}
+
+const SYNTHESIS_EVIDENCE_KINDS = new Set<string>([
+  "fact",
+  "event",
+  "indicator",
+  "rule",
+]);
+
+const SYNTHESIS_SECTION_KINDS = new Set<string>([
+  "overview",
+  "campaign",
+  "infection_chain",
+  "technical",
+  "victimology",
+  "infrastructure",
+  "detection",
+  "impact",
+  "other",
+]);
+
+function isIsoDate(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^\d{4}-\d{2}-\d{2}$/.test(value) &&
+    !Number.isNaN(Date.parse(`${value}T00:00:00Z`))
+  );
+}
+
+function isNonEmptyStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => isNonEmptyString(item));
+}
+
+function isSynthesisEvidenceRef(
+  value: unknown,
+): value is ProductionSynthesisEvidenceRefV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["source_document_id", "kind", "evidence_key"]) &&
+    isUuid(value.source_document_id) &&
+    typeof value.kind === "string" &&
+    SYNTHESIS_EVIDENCE_KINDS.has(value.kind) &&
+    isSha256(value.evidence_key)
+  );
+}
+
+function isSynthesisEvidenceRefs(
+  value: unknown,
+): value is ProductionSynthesisEvidenceRefV1[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(isSynthesisEvidenceRef)
+  );
+}
+
+function isSynthesisParagraph(
+  value: unknown,
+): value is ProductionSynthesisParagraphV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["text", "evidence_refs"]) &&
+    isNonEmptyString(value.text) &&
+    isSynthesisEvidenceRefs(value.evidence_refs)
+  );
+}
+
+function isSynthesisSection(
+  value: unknown,
+): value is ProductionSynthesisSectionV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["kind", "heading", "paragraphs"]) &&
+    typeof value.kind === "string" &&
+    SYNTHESIS_SECTION_KINDS.has(value.kind) &&
+    isNonEmptyString(value.heading) &&
+    Array.isArray(value.paragraphs) &&
+    value.paragraphs.length > 0 &&
+    value.paragraphs.every(isSynthesisParagraph)
+  );
+}
+
+function isSynthesisTimelineEntry(
+  value: unknown,
+): value is ProductionSynthesisTimelineEntryV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["event_date", "date_text", "text", "evidence_refs"]) &&
+    (value.event_date === null || isIsoDate(value.event_date)) &&
+    (value.date_text === null || isNonEmptyString(value.date_text)) &&
+    isNonEmptyString(value.text) &&
+    isSynthesisEvidenceRefs(value.evidence_refs)
+  );
+}
+
+function isSynthesisUncertainty(
+  value: unknown,
+): value is ProductionSynthesisUncertaintyV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, ["text", "source_document_ids"]) &&
+    isNonEmptyString(value.text) &&
+    Array.isArray(value.source_document_ids) &&
+    value.source_document_ids.length > 0 &&
+    value.source_document_ids.every(isUuid)
+  );
+}
+
+/** Decode only exact canonical V1 payloads; unknown fields are refused. */
+export function isProductionSynthesisV1(
+  value: unknown,
+): value is ProductionSynthesisV1 {
+  return (
+    isRecord(value) &&
+    hasExactKeys(value, [
+      "schema_version",
+      "subject_id",
+      "production_input_hash",
+      "extraction_hash",
+      "publication_language",
+      "synthesis_policy_version",
+      "title",
+      "lead",
+      "sections",
+      "timeline",
+      "uncertainties",
+      "warnings",
+    ]) &&
+    value.schema_version === 1 &&
+    isUuid(value.subject_id) &&
+    isSha256(value.production_input_hash) &&
+    isSha256(value.extraction_hash) &&
+    isNonEmptyString(value.publication_language) &&
+    value.synthesis_policy_version === PRODUCTION_SYNTHESIS_POLICY_VERSION &&
+    isNonEmptyString(value.title) &&
+    Array.isArray(value.lead) &&
+    value.lead.every(isSynthesisParagraph) &&
+    Array.isArray(value.sections) &&
+    value.sections.every(isSynthesisSection) &&
+    Array.isArray(value.timeline) &&
+    value.timeline.every(isSynthesisTimelineEntry) &&
+    Array.isArray(value.uncertainties) &&
+    value.uncertainties.every(isSynthesisUncertainty) &&
+    isNonEmptyStringArray(value.warnings)
+  );
 }
 
 export interface ExtractionItemV2 {
