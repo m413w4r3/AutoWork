@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 from uuid import UUID
 
 from cti_app.application.french_typography import apply_french_spacing
-from cti_app.application.production_extraction import _canonical_hash, references_corpus_hash
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import (
     ReferenceReport,
@@ -236,6 +238,10 @@ def _validate_publication_v3_lineage(
 ASSEMBLY_POLICY_VERSION: Final[str] = "1"
 
 
+def _canonical_digest(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(ProductionArtifactStore.canonical_json_bytes(payload)).hexdigest()
+
+
 def compute_assembly_input_hash(
     *,
     snapshot: ProductionInputSnapshot,
@@ -248,11 +254,11 @@ def compute_assembly_input_hash(
         "snapshot_input_hash": snapshot.input_hash,
         "references_hash": references_corpus_hash(references),
         "extraction_hash": canonical_extraction_hash(extraction),
-        "synthesis_hash": _canonical_hash(production_synthesis_to_json(synthesis)),
+        "synthesis_hash": _canonical_digest(production_synthesis_to_json(synthesis)),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
     }
-    return _canonical_hash(payload)
+    return _canonical_digest(payload)
 
 
 def _validate_synthesis_evidence_refs(

@@ -1,3 +1,4 @@
+import hashlib
 import json
 from dataclasses import replace
 from datetime import date
@@ -7,7 +8,8 @@ from uuid import UUID
 import pytest
 
 import cti_app.application.publication_builder as publication_builder
-from cti_app.application.production_extraction import _canonical_hash, references_corpus_hash
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
     _project_publication_iocs,
@@ -195,12 +197,16 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         "snapshot_input_hash": snapshot.input_hash,
         "references_hash": references_corpus_hash(references),
         "extraction_hash": canonical_extraction_hash(extraction),
-        "synthesis_hash": _canonical_hash(production_synthesis_to_json(synthesis)),
+        "synthesis_hash": hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(production_synthesis_to_json(synthesis))
+        ).hexdigest(),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
     }
 
-    expected_hash = _canonical_hash(payload)
+    expected_hash = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(payload)
+    ).hexdigest()
     assert (
         compute_assembly_input_hash(
             snapshot=snapshot,
