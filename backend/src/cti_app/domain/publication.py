@@ -506,19 +506,27 @@ def _publication_v3_string(value: Any, label: str) -> str:
 
 
 def _publication_v3_uuid(value: Any, label: str) -> UUID:
+    text = _publication_v3_string(value, label)
     try:
-        return UUID(_publication_v3_string(value, label))
+        parsed = UUID(text)
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be a UUID string") from exc
+    if str(parsed) != text:
+        raise ValueError(f"{label} must use canonical lowercase UUID form")
+    return parsed
 
 
 def _publication_v3_date(value: Any, label: str) -> date | None:
     if value is None:
         return None
+    text = _publication_v3_string(value, label)
     try:
-        return date.fromisoformat(_publication_v3_string(value, label))
+        parsed = date.fromisoformat(text)
     except (AttributeError, TypeError, ValueError) as exc:
         raise ValueError(f"{label} must be an ISO date string or null") from exc
+    if parsed.isoformat() != text:
+        raise ValueError(f"{label} must use canonical ISO date form")
+    return parsed
 
 
 def _publication_v3_evidence_refs(value: Any) -> tuple[PublicationEvidenceRefV1, ...]:
@@ -589,6 +597,8 @@ class PublicationDocumentV3:
         source_ids = tuple(source.source_document_id for source in self.sources)
         if len(set(source_ids)) != len(source_ids):
             raise ValueError("Publication sources must not repeat source_document_id values")
+        if len(set(self.uncertainties)) != len(self.uncertainties):
+            raise ValueError("Publication uncertainties must not repeat")
 
         used_source_ids = {
             ref.source_document_id for paragraph in self.lead for ref in paragraph.evidence_refs

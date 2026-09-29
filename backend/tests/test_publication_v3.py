@@ -475,6 +475,22 @@ def test_publication_document_v3_from_json_validates_nested_values_and_top_level
     with pytest.raises(ValueError, match="fields are invalid"):
         PublicationDocumentV3.from_json(missing_field)
 
+    upper_uuid = _publication_v3_document().to_json()
+    upper_uuid["subject_id"] = upper_uuid["subject_id"].upper()
+    with pytest.raises(ValueError, match="canonical lowercase UUID"):
+        PublicationDocumentV3.from_json(upper_uuid)
+
+    compact_date = _publication_v3_document().to_json()
+    compact_date["timeline"][1]["event_date"] = "20250203"
+    with pytest.raises(ValueError, match="canonical ISO date"):
+        PublicationDocumentV3.from_json(compact_date)
+
+
+def test_publication_document_v3_rejects_duplicate_uncertainties() -> None:
+    document = _publication_v3_document()
+    with pytest.raises(ValueError, match="uncertainties must not repeat"):
+        replace(document, uncertainties=(*document.uncertainties, document.uncertainties[0]))
+
 
 def test_v3_addition_preserves_v2_schema_construction_serialization_and_reader() -> None:
     document = PublicationDocumentV2(
