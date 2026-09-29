@@ -84,8 +84,9 @@ aux sources du corpus éligibles à l’extraction, ce qui préserve le comporte
 (une source non archivée n’atteint jamais Q2). Aucun autre service n’appelle
 `parse_reference_report`.
 
-Transition prévue : AW-012 retirera la dépendance aux `EVENT` legacy dans Synthesis; AW-013
-terminera la suppression de la projection `ReferenceReport`.
+`ReferenceReport` et ses `EVENT` restent des formats de compatibilité legacy pour les stages qui
+n'ont pas encore migré. Depuis AW-012, Synthesis ne les utilise plus ; AW-013 terminera la
+suppression de la projection `ReferenceReport`.
 
 ### EXTRACTION et contrat canonique
 
@@ -159,12 +160,52 @@ la source concernée, qui est relue seule, et aucun IOC n’est redistribué ent
 La progression publiée par le stage liste chaque source du corpus avec son tier, son profil et son
 verdict (`succeeded`, `cached`, `failed`, `omitted`).
 
-Synthesis, QA, Assembly, l’export d’état et le Repair Desk continuent de lire
-`TechnicalExtraction` à travers l’unique frontière de compatibilité
-`application/production_extraction.py` : `ProductionExtractionV1` est projeté vers le contrat
-legacy, jamais l’inverse. Cette projection étiquette chaque source avec le label de la projection
-legacy de REFERENCES (`S1`…), que ces consommateurs corrèlent encore ; AW-012 la supprimera pour
-Synthesis.
+Les consommateurs non migrés (notamment QA, Assembly, l’export d’état et le Repair Desk) peuvent
+encore lire `TechnicalExtraction` via la frontière legacy `application/production_extraction.py`.
+Cette frontière projette `ProductionExtractionV1` vers le contrat legacy, jamais l’inverse, et
+peut encore utiliser les labels `S1`… de REFERENCES. Synthesis ne passe plus par cette projection.
+
+### SYNTHESIS : rédaction fondée sur l’extraction canonique
+
+Le flux AW-012 est :
+
+```text
+REFERENCES sélectionne et archive les sources
+        ↓
+EXTRACTION établit les faits structurés et prouvés
+        ↓
+ProductionExtractionV1
+        ↓
+SYNTHESIS organise et rédige exclusivement à partir de cette vérité factuelle
+        ↓
+ProductionSynthesisV1
+        ↓
+adapter temporaire vers l’Assembly legacy d’AW-013
+```
+
+`ProductionExtractionV1` est l’unique vérité factuelle de Synthesis. Le stage construit un pack
+d’évidence déterministe à partir de l’extraction et du contexte éditorial figé dans le snapshot ;
+chaque affirmation factuelle canonique doit citer une `ExtractionEvidenceRefV1`. Synthesis
+n’effectue aucune recherche Web, ne rouvre aucun corps source pour découvrir des faits, ne prend
+pas `ReferenceReport` ni `TechnicalExtraction` comme entrées canoniques et ne consomme pas l’état
+`EVENT` Q1 de REFERENCES. Une information absente de l’extraction est omise.
+
+Le brouillon passe par `ModelGateway.draft` sous forme stateless, avec Web désactivé et sortie
+structurée. L’identité durable du `ModelRun` porte la soumission et sa réconciliation : une
+soumission probablement acceptée n’est pas rejouée automatiquement et requiert une revue. Une
+sortie structurée invalide passe également en revue ; elle n’ouvre pas de conversation de
+réparation de format. La validation de proposition et le contrôle de son ancrage dans l’évidence
+ont lieu aux frontières gateway et application.
+
+Le canonical artifact est `ProductionSynthesisV1`, enregistré dans `canonical_blob_id`. La vue
+frontend lit cette valeur canonique et résout chaque `ExtractionEvidenceRefV1.source_document_id`
+dans les métadonnées de source de `ProductionExtractionV1` pour présenter les documents associés.
+Elle ne résout pas les handles temporaires du prompt et ne prend pas le Markdown rendu pour
+source. `rendered_blob_id` peut contenir un aperçu Markdown déterministe optionnel.
+
+Jusqu’à AW-013, Assembly reçoit une projection legacy à sens unique de `ProductionSynthesisV1`.
+Le Markdown legacy n’est jamais reparsé en état canonique ; la refonte d’Assembly reste dans
+AW-013.
 
 ## ProductionBoard
 

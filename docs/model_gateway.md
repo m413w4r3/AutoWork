@@ -123,6 +123,21 @@ Les versions `model_policy_version` et `routing_policy_version` font partie de l
 fonctionnelle des checkpoints `source_extractions` : une politique différente crée un nouveau
 checkpoint au lieu de réutiliser silencieusement l'ancien.
 
+### SYNTHESIS AW-012 : brouillon stateless
+
+Synthesis envoie son pack d’évidence complet à `ModelGateway.draft` avec `web_search=false` et
+sans contexte de conversation. Le gateway valide la sortie structurée `SynthesisProposalV1` ;
+l’application vérifie ensuite son schéma métier, ses handles d’évidence et son ancrage dans
+`ProductionExtractionV1` avant de construire `ProductionSynthesisV1`. Synthesis organise et rédige
+les faits prouvés par Extraction ; elle ne cherche pas de faits nouveaux.
+
+Un `ModelRun` durable et déterministe identifie la génération et porte la reprise ainsi que la
+réconciliation de soumission. Seul un échec prouvé avant soumission peut être retenté avec cette
+identité. Si la requête a probablement été soumise, elle passe en `NEEDS_REVIEW` sans replay
+automatique. Une réponse structurée invalide passe aussi en revue : aucun échange de réparation
+de format n’est ouvert. AW-012 retire l’identité de conversation fonctionnelle propre à Synthesis ;
+cela ne supprime pas les capacités de conversation des autres usages de `ModelGateway`.
+
 ## Responses API et bridge ChatGPT
 
 Les adaptateurs construisent une requête Responses standard. `ChatGPTBridgeClient`, qui hérite
