@@ -1,3 +1,5 @@
+import json
+from dataclasses import replace
 from datetime import date, datetime
 from uuid import UUID
 
@@ -7,8 +9,12 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import EvidenceKind, SynthesisSectionKind
 from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
+    PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
+    PublicationDocumentV2,
+    PublicationDocumentV3,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -19,6 +25,7 @@ from cti_app.domain.publication import (
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
+    publication_document_from_json,
 )
 
 
@@ -238,3 +245,261 @@ def test_publication_uncertainty_requires_unique_sorted_uuid_provenance() -> Non
     ):
         with pytest.raises(ValueError):
             PublicationUncertaintyV1(text, source_document_ids)  # type: ignore[arg-type]
+
+
+def _publication_v3_document() -> PublicationDocumentV3:
+    first_id, second_id, third_id = UUID(int=1), UUID(int=2), UUID(int=3)
+    return PublicationDocumentV3(
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        subject_id=UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+        publication_language="en",
+        title="Intrusion activity report",
+        lead=(
+            PublicationParagraphV1(
+                "Initial assessment",
+                (_ref(str(first_id), evidence_key="1" * 64),),
+            ),
+            PublicationParagraphV1(
+                "Related activity",
+                (_ref(str(second_id), evidence_key="2" * 64),),
+            ),
+        ),
+        sections=(
+            PublicationSectionV1(
+                PublicationSectionKind.TECHNICAL,
+                "Technical details",
+                (
+                    PublicationParagraphV1(
+                        "The operator used a staged payload.",
+                        (_ref(str(second_id), evidence_key="3" * 64),),
+                    ),
+                    PublicationParagraphV1(
+                        "The payload contacted the infrastructure.",
+                        (_ref(str(first_id), evidence_key="4" * 64),),
+                    ),
+                ),
+            ),
+            PublicationSectionV1(
+                PublicationSectionKind.OVERVIEW,
+                "Overview",
+                (
+                    PublicationParagraphV1(
+                        "Activity affected several organizations.",
+                        (_ref(str(third_id), evidence_key="5" * 64),),
+                    ),
+                ),
+            ),
+        ),
+        timeline=(
+            PublicationTimelineEntryV1(
+                None,
+                "early 2025",
+                "Initial access was reported.",
+                (_ref(str(second_id), evidence_key="6" * 64),),
+            ),
+            PublicationTimelineEntryV1(
+                date(2025, 2, 3),
+                None,
+                "A payload was deployed.",
+                (_ref(str(third_id), evidence_key="7" * 64),),
+            ),
+        ),
+        indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.IP,
+                (
+                    PublicationIndicatorV1(
+                        "192.0.2.10", "192.0.2.10", ArtifactType.IP, (second_id, first_id)
+                    ),
+                ),
+            ),
+            PublicationIndicatorGroupV1(
+                ArtifactType.DOMAIN,
+                (
+                    PublicationIndicatorV1(
+                        "example.net", "example.net", ArtifactType.DOMAIN, (third_id,)
+                    ),
+                ),
+            ),
+        ),
+        sources=(
+            _publication_source(
+                source_document_id=third_id,
+                canonical_url="https://example.com/article-three",
+            ),
+            _publication_source(
+                source_document_id=first_id,
+                canonical_url="https://example.com/article-one",
+            ),
+            _publication_source(
+                source_document_id=second_id,
+                canonical_url="https://example.com/article-two",
+            ),
+        ),
+        uncertainties=(
+            PublicationUncertaintyV1("Possible shared infrastructure", (third_id,)),
+            PublicationUncertaintyV1("Attribution remains uncertain", (second_id, first_id)),
+        ),
+    )
+
+
+def test_publication_document_v3_round_trips_exactly_and_has_canonical_contract() -> None:
+    document = _publication_v3_document()
+    payload = document.to_json()
+
+    assert PublicationDocumentV3.from_json(payload) == document
+    assert set(payload) == {
+        "schema_version",
+        "subject_id",
+        "publication_language",
+        "title",
+        "lead",
+        "sections",
+        "timeline",
+        "indicators",
+        "sources",
+        "uncertainties",
+    }
+    assert (
+        not {
+            "warnings",
+            "renderer",
+            "renderer_fields",
+            "markdown",
+            "synthesis",
+            "local_id",
+            "source_id",
+        }
+        & payload.keys()
+    )
+    assert payload["subject_id"] == "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+    assert payload["timeline"][0]["event_date"] is None
+    assert payload["timeline"][1]["event_date"] == "2025-02-03"
+
+
+def test_publication_document_v3_sorts_non_editorial_collections_only() -> None:
+    document = _publication_v3_document()
+    reordered = replace(
+        document,
+        indicators=tuple(reversed(document.indicators)),
+        sources=tuple(reversed(document.sources)),
+        uncertainties=tuple(reversed(document.uncertainties)),
+    )
+
+    assert reordered.to_json() == document.to_json()
+    assert json.dumps(reordered.to_json(), sort_keys=True) == json.dumps(
+        document.to_json(), sort_keys=True
+    )
+    assert tuple(paragraph.text for paragraph in document.lead) == (
+        "Initial assessment",
+        "Related activity",
+    )
+    assert tuple(section.heading for section in document.sections) == (
+        "Technical details",
+        "Overview",
+    )
+    assert tuple(paragraph.text for paragraph in document.sections[0].paragraphs) == (
+        "The operator used a staged payload.",
+        "The payload contacted the infrastructure.",
+    )
+    assert tuple(entry.text for entry in document.timeline) == (
+        "Initial access was reported.",
+        "A payload was deployed.",
+    )
+    assert tuple(group.artifact_type for group in document.indicators) == (
+        ArtifactType.DOMAIN,
+        ArtifactType.IP,
+    )
+    assert tuple(source.source_document_id for source in document.sources) == (
+        UUID(int=1),
+        UUID(int=2),
+        UUID(int=3),
+    )
+    assert tuple(item.text for item in document.uncertainties) == (
+        "Attribution remains uncertain",
+        "Possible shared infrastructure",
+    )
+
+
+def test_publication_document_v3_requires_exactly_the_used_source_identities() -> None:
+    document = _publication_v3_document()
+    unknown_id = UUID(int=99)
+    unknown_paragraph = PublicationParagraphV1(
+        "Unresolved evidence",
+        (_ref(str(unknown_id), evidence_key="8" * 64),),
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        replace(document, lead=(unknown_paragraph, *document.lead[1:]))
+
+    with pytest.raises(ValueError, match="exactly match"):
+        replace(
+            document,
+            sources=tuple(
+                source for source in document.sources if source.source_document_id != UUID(int=3)
+            ),
+        )
+
+    unused_source = _publication_source(
+        source_document_id=unknown_id,
+        canonical_url="https://example.com/article-unused",
+    )
+    with pytest.raises(ValueError, match="exactly match"):
+        replace(document, sources=(*document.sources, unused_source))
+
+    with pytest.raises(ValueError, match="repeat source_document_id"):
+        replace(document, sources=(*document.sources, document.sources[0]))
+
+
+def test_publication_document_v3_rejects_duplicate_indicator_groups_and_bad_schema() -> None:
+    document = _publication_v3_document()
+    with pytest.raises(ValueError, match="repeat artifact types"):
+        replace(document, indicators=(*document.indicators, document.indicators[0]))
+
+    with pytest.raises(ValueError, match="requires schema_version"):
+        replace(document, schema_version="2")
+
+    with pytest.raises(ValueError, match="invalid value type"):
+        replace(document, lead=(None,))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="must be a tuple"):
+        replace(document, sections=[])  # type: ignore[arg-type]
+
+
+def test_publication_document_v3_from_json_validates_nested_values_and_top_level_shape() -> None:
+    payload = _publication_v3_document().to_json()
+    payload["lead"][0]["text"] = " "
+    with pytest.raises(ValueError, match="paragraph text"):
+        PublicationDocumentV3.from_json(payload)
+
+    missing_field = _publication_v3_document().to_json()
+    del missing_field["title"]
+    with pytest.raises(ValueError, match="fields are invalid"):
+        PublicationDocumentV3.from_json(missing_field)
+
+
+def test_v3_addition_preserves_v2_schema_construction_serialization_and_reader() -> None:
+    document = PublicationDocumentV2(
+        schema_version=PUBLICATION_SCHEMA_VERSION,
+        title="Historical V2 document",
+        timeline=(),
+        synthesis=(),
+        indicators=(),
+        sources=(),
+        uncertainties=(),
+    )
+    payload = document.to_json()
+
+    assert PUBLICATION_SCHEMA_VERSION == "2"
+    assert payload == {
+        "schema_version": "2",
+        "title": "Historical V2 document",
+        "timeline": (),
+        "synthesis": (),
+        "indicators": (),
+        "sources": (),
+        "uncertainties": (),
+        "analyst_note": None,
+        "original_indicators": (),
+    }
+    assert isinstance(publication_document_from_json(payload), PublicationDocumentV2)
+    with pytest.raises(ValueError, match="unsupported publication document"):
+        publication_document_from_json(_publication_v3_document().to_json())

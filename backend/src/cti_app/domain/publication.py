@@ -20,6 +20,7 @@ from cti_app.domain.production_references import ProductionReferenceKind, Produc
 
 LEGACY_PUBLICATION_SCHEMA_VERSION = "1"
 PUBLICATION_SCHEMA_VERSION = "2"
+PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION = "3"
 
 
 class ArtifactType(StrEnum):
@@ -476,4 +477,442 @@ class PublicationUncertaintyV1:
             _normalize_publication_source_document_ids(
                 self.source_document_ids, "Publication uncertainty"
             ),
+        )
+
+
+def _publication_v3_object(value: Any, label: str, fields: frozenset[str]) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{label} must be a JSON object")
+    if any(not isinstance(key, str) for key in value):
+        raise ValueError(f"{label} field names must be text")
+    actual_fields = frozenset(value)
+    if actual_fields != fields:
+        missing = sorted(fields - actual_fields)
+        unexpected = sorted(actual_fields - fields)
+        raise ValueError(f"{label} fields are invalid (missing={missing}, unexpected={unexpected})")
+    return value
+
+
+def _publication_v3_array(value: Any, label: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a JSON array")
+    return value
+
+
+def _publication_v3_string(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be text")
+    return value
+
+
+def _publication_v3_uuid(value: Any, label: str) -> UUID:
+    try:
+        return UUID(_publication_v3_string(value, label))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a UUID string") from exc
+
+
+def _publication_v3_date(value: Any, label: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(_publication_v3_string(value, label))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be an ISO date string or null") from exc
+
+
+def _publication_v3_evidence_refs(value: Any) -> tuple[PublicationEvidenceRefV1, ...]:
+    fields = frozenset({"source_document_id", "kind", "evidence_key"})
+    return tuple(
+        PublicationEvidenceRefV1(
+            source_document_id=_publication_v3_uuid(
+                item["source_document_id"], "Evidence source_document_id"
+            ),
+            kind=PublicationEvidenceKind(_publication_v3_string(item["kind"], "Evidence kind")),
+            evidence_key=_publication_v3_string(item["evidence_key"], "Evidence key"),
+        )
+        for item in (
+            _publication_v3_object(raw, "Evidence reference", fields)
+            for raw in _publication_v3_array(value, "Evidence references")
+        )
+    )
+
+
+def _publication_v3_source_ids(value: Any, label: str) -> tuple[UUID, ...]:
+    return tuple(_publication_v3_uuid(item, label) for item in _publication_v3_array(value, label))
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV3:
+    schema_version: str
+    subject_id: UUID
+    publication_language: str
+    title: str
+    lead: tuple[PublicationParagraphV1, ...]
+    sections: tuple[PublicationSectionV1, ...]
+    timeline: tuple[PublicationTimelineEntryV1, ...]
+    indicators: tuple[PublicationIndicatorGroupV1, ...]
+    sources: tuple[PublicationSourceV1, ...]
+    uncertainties: tuple[PublicationUncertaintyV1, ...]
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION:
+            raise ValueError(
+                "PublicationDocumentV3 requires "
+                f"schema_version={PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION!r}"
+            )
+        if not isinstance(self.subject_id, UUID):
+            raise ValueError("Publication subject identity must be a UUID")
+        if not isinstance(self.publication_language, str) or not self.publication_language.strip():
+            raise ValueError("Publication language must be non-empty text")
+        if not isinstance(self.title, str) or not self.title.strip():
+            raise ValueError("Publication title must be non-empty text")
+
+        tuple_fields: tuple[tuple[str, Any, type[Any]], ...] = (
+            ("lead", self.lead, PublicationParagraphV1),
+            ("sections", self.sections, PublicationSectionV1),
+            ("timeline", self.timeline, PublicationTimelineEntryV1),
+            ("indicators", self.indicators, PublicationIndicatorGroupV1),
+            ("sources", self.sources, PublicationSourceV1),
+            ("uncertainties", self.uncertainties, PublicationUncertaintyV1),
+        )
+        for label, items, item_type in tuple_fields:
+            if not isinstance(items, tuple):
+                raise ValueError(f"Publication {label} must be a tuple")
+            if any(not isinstance(item, item_type) for item in items):
+                raise ValueError(f"Publication {label} contains an invalid value type")
+
+        indicator_types = tuple(group.artifact_type for group in self.indicators)
+        if len(set(indicator_types)) != len(indicator_types):
+            raise ValueError("Publication indicator groups must not repeat artifact types")
+
+        source_ids = tuple(source.source_document_id for source in self.sources)
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("Publication sources must not repeat source_document_id values")
+
+        used_source_ids = {
+            ref.source_document_id for paragraph in self.lead for ref in paragraph.evidence_refs
+        }
+        used_source_ids.update(
+            ref.source_document_id
+            for section in self.sections
+            for paragraph in section.paragraphs
+            for ref in paragraph.evidence_refs
+        )
+        used_source_ids.update(
+            ref.source_document_id for entry in self.timeline for ref in entry.evidence_refs
+        )
+        used_source_ids.update(
+            source_id
+            for group in self.indicators
+            for indicator in group.indicators
+            for source_id in indicator.source_document_ids
+        )
+        used_source_ids.update(
+            source_id
+            for uncertainty in self.uncertainties
+            for source_id in uncertainty.source_document_ids
+        )
+        if used_source_ids != set(source_ids):
+            unknown = sorted(map(str, used_source_ids - set(source_ids)))
+            unused = sorted(map(str, set(source_ids) - used_source_ids))
+            raise ValueError(
+                "Publication sources must exactly match source identities used by the "
+                f"document (unknown={unknown}, unused={unused})"
+            )
+
+        object.__setattr__(
+            self,
+            "indicators",
+            tuple(sorted(self.indicators, key=lambda group: group.artifact_type.value)),
+        )
+        object.__setattr__(
+            self,
+            "sources",
+            tuple(sorted(self.sources, key=lambda source: str(source.source_document_id))),
+        )
+        object.__setattr__(
+            self,
+            "uncertainties",
+            tuple(
+                sorted(
+                    self.uncertainties,
+                    key=lambda item: (
+                        item.text,
+                        tuple(map(str, item.source_document_ids)),
+                    ),
+                )
+            ),
+        )
+
+    def to_json(self) -> dict[str, Any]:
+        def evidence_refs_json(
+            refs: tuple[PublicationEvidenceRefV1, ...],
+        ) -> list[dict[str, str]]:
+            return [
+                {
+                    "source_document_id": str(ref.source_document_id),
+                    "kind": ref.kind.value,
+                    "evidence_key": ref.evidence_key,
+                }
+                for ref in refs
+            ]
+
+        def paragraph_json(paragraph: PublicationParagraphV1) -> dict[str, Any]:
+            return {
+                "text": paragraph.text,
+                "evidence_refs": evidence_refs_json(paragraph.evidence_refs),
+            }
+
+        return {
+            "schema_version": self.schema_version,
+            "subject_id": str(self.subject_id),
+            "publication_language": self.publication_language,
+            "title": self.title,
+            "lead": [paragraph_json(paragraph) for paragraph in self.lead],
+            "sections": [
+                {
+                    "kind": section.kind.value,
+                    "heading": section.heading,
+                    "paragraphs": [paragraph_json(paragraph) for paragraph in section.paragraphs],
+                }
+                for section in self.sections
+            ],
+            "timeline": [
+                {
+                    "event_date": entry.event_date.isoformat()
+                    if entry.event_date is not None
+                    else None,
+                    "date_text": entry.date_text,
+                    "text": entry.text,
+                    "evidence_refs": evidence_refs_json(entry.evidence_refs),
+                }
+                for entry in self.timeline
+            ],
+            "indicators": [
+                {
+                    "artifact_type": group.artifact_type.value,
+                    "indicators": [
+                        {
+                            "value": indicator.value,
+                            "normalized_value": indicator.normalized_value,
+                            "artifact_type": indicator.artifact_type.value,
+                            "source_document_ids": [
+                                str(source_id) for source_id in indicator.source_document_ids
+                            ],
+                        }
+                        for indicator in group.indicators
+                    ],
+                }
+                for group in self.indicators
+            ],
+            "sources": [
+                {
+                    "source_document_id": str(source.source_document_id),
+                    "canonical_url": source.canonical_url,
+                    "title": source.title,
+                    "publisher": source.publisher,
+                    "published_at": source.published_at.isoformat()
+                    if source.published_at is not None
+                    else None,
+                    "tier": source.tier.value,
+                    "kind": source.kind.value,
+                    "role": source.role.value,
+                }
+                for source in self.sources
+            ],
+            "uncertainties": [
+                {
+                    "text": uncertainty.text,
+                    "source_document_ids": [
+                        str(source_id) for source_id in uncertainty.source_document_ids
+                    ],
+                }
+                for uncertainty in self.uncertainties
+            ],
+        }
+
+    @classmethod
+    def from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV3:
+        document_fields = frozenset(
+            {
+                "schema_version",
+                "subject_id",
+                "publication_language",
+                "title",
+                "lead",
+                "sections",
+                "timeline",
+                "indicators",
+                "sources",
+                "uncertainties",
+            }
+        )
+
+        def paragraph(raw: Any) -> PublicationParagraphV1:
+            item = _publication_v3_object(
+                raw, "Publication paragraph", frozenset({"text", "evidence_refs"})
+            )
+            return PublicationParagraphV1(
+                text=_publication_v3_string(item["text"], "Paragraph text"),
+                evidence_refs=_publication_v3_evidence_refs(item["evidence_refs"]),
+            )
+
+        document = _publication_v3_object(payload, "PublicationDocumentV3", document_fields)
+        sections = tuple(
+            PublicationSectionV1(
+                kind=PublicationSectionKind(_publication_v3_string(item["kind"], "Section kind")),
+                heading=_publication_v3_string(item["heading"], "Section heading"),
+                paragraphs=tuple(
+                    paragraph(nested)
+                    for nested in _publication_v3_array(item["paragraphs"], "Section paragraphs")
+                ),
+            )
+            for item in (
+                _publication_v3_object(
+                    raw, "Publication section", frozenset({"kind", "heading", "paragraphs"})
+                )
+                for raw in _publication_v3_array(document["sections"], "Sections")
+            )
+        )
+        timeline = tuple(
+            PublicationTimelineEntryV1(
+                event_date=_publication_v3_date(item["event_date"], "Timeline event_date"),
+                date_text=(
+                    None
+                    if item["date_text"] is None
+                    else _publication_v3_string(item["date_text"], "Timeline date_text")
+                ),
+                text=_publication_v3_string(item["text"], "Timeline text"),
+                evidence_refs=_publication_v3_evidence_refs(item["evidence_refs"]),
+            )
+            for item in (
+                _publication_v3_object(
+                    raw,
+                    "Publication timeline entry",
+                    frozenset({"event_date", "date_text", "text", "evidence_refs"}),
+                )
+                for raw in _publication_v3_array(document["timeline"], "Timeline")
+            )
+        )
+        indicators = tuple(
+            PublicationIndicatorGroupV1(
+                artifact_type=ArtifactType(
+                    _publication_v3_string(item["artifact_type"], "Indicator group type")
+                ),
+                indicators=tuple(
+                    PublicationIndicatorV1(
+                        value=_publication_v3_string(nested["value"], "Indicator value"),
+                        normalized_value=_publication_v3_string(
+                            nested["normalized_value"], "Indicator normalized_value"
+                        ),
+                        artifact_type=ArtifactType(
+                            _publication_v3_string(
+                                nested["artifact_type"], "Indicator artifact_type"
+                            )
+                        ),
+                        source_document_ids=_publication_v3_source_ids(
+                            nested["source_document_ids"], "Indicator source_document_ids"
+                        ),
+                    )
+                    for nested in (
+                        _publication_v3_object(
+                            raw_indicator,
+                            "Publication indicator",
+                            frozenset(
+                                {
+                                    "value",
+                                    "normalized_value",
+                                    "artifact_type",
+                                    "source_document_ids",
+                                }
+                            ),
+                        )
+                        for raw_indicator in _publication_v3_array(
+                            item["indicators"], "Indicators in group"
+                        )
+                    )
+                ),
+            )
+            for item in (
+                _publication_v3_object(
+                    raw,
+                    "Publication indicator group",
+                    frozenset({"artifact_type", "indicators"}),
+                )
+                for raw in _publication_v3_array(document["indicators"], "Indicator groups")
+            )
+        )
+        sources = tuple(
+            PublicationSourceV1(
+                source_document_id=_publication_v3_uuid(
+                    item["source_document_id"], "Source source_document_id"
+                ),
+                canonical_url=_publication_v3_string(item["canonical_url"], "Source canonical_url"),
+                title=(
+                    None
+                    if item["title"] is None
+                    else _publication_v3_string(item["title"], "Source title")
+                ),
+                publisher=(
+                    None
+                    if item["publisher"] is None
+                    else _publication_v3_string(item["publisher"], "Source publisher")
+                ),
+                published_at=_publication_v3_date(item["published_at"], "Source published_at"),
+                tier=ProductionReferenceTier(_publication_v3_string(item["tier"], "Source tier")),
+                kind=ProductionReferenceKind(_publication_v3_string(item["kind"], "Source kind")),
+                role=SourceRole(_publication_v3_string(item["role"], "Source role")),
+            )
+            for item in (
+                _publication_v3_object(
+                    raw,
+                    "Publication source",
+                    frozenset(
+                        {
+                            "source_document_id",
+                            "canonical_url",
+                            "title",
+                            "publisher",
+                            "published_at",
+                            "tier",
+                            "kind",
+                            "role",
+                        }
+                    ),
+                )
+                for raw in _publication_v3_array(document["sources"], "Sources")
+            )
+        )
+        uncertainties = tuple(
+            PublicationUncertaintyV1(
+                text=_publication_v3_string(item["text"], "Uncertainty text"),
+                source_document_ids=_publication_v3_source_ids(
+                    item["source_document_ids"], "Uncertainty source_document_ids"
+                ),
+            )
+            for item in (
+                _publication_v3_object(
+                    raw,
+                    "Publication uncertainty",
+                    frozenset({"text", "source_document_ids"}),
+                )
+                for raw in _publication_v3_array(document["uncertainties"], "Uncertainties")
+            )
+        )
+        return cls(
+            schema_version=_publication_v3_string(
+                document["schema_version"], "Publication schema_version"
+            ),
+            subject_id=_publication_v3_uuid(document["subject_id"], "Publication subject_id"),
+            publication_language=_publication_v3_string(
+                document["publication_language"], "Publication language"
+            ),
+            title=_publication_v3_string(document["title"], "Publication title"),
+            lead=tuple(paragraph(raw) for raw in _publication_v3_array(document["lead"], "Lead")),
+            sections=sections,
+            timeline=timeline,
+            indicators=indicators,
+            sources=sources,
+            uncertainties=uncertainties,
         )
