@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 
 from cti_app.application.french_typography import apply_french_spacing
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import (
     ReferenceReport,
@@ -13,7 +14,16 @@ from cti_app.application.production_parsers import (
     TechnicalExtraction,
 )
 from cti_app.application.production_rendering import collect_indicators
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.semantic_annotation import SemanticAnnotator
+from cti_app.domain.production import ProductionInputSnapshot
+from cti_app.domain.production_extraction import ProductionExtractionV1
+from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
+    extraction_evidence_refs_v1,
+    synthesis_evidence_refs,
+)
 from cti_app.domain.publication import (
     PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
@@ -29,6 +39,50 @@ from cti_app.domain.publication import (
 
 _VALID_TITLE = re.compile(r"^\[[^\]]+\]\s+.+")
 _CITATION_SEPARATOR = re.compile(r"^[\s,;:.·]+$")
+
+
+def _validate_publication_v3_lineage(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> None:
+    """Require all canonical artifacts to belong to the same frozen inputs."""
+    if (
+        len(
+            {
+                snapshot.subject_id,
+                references.subject_id,
+                extraction.subject_id,
+                synthesis.subject_id,
+            }
+        )
+        != 1
+    ):
+        raise ValueError("Publication artifacts must share the same subject identity")
+    if extraction.production_input_hash != snapshot.input_hash:
+        raise ValueError("Extraction does not match the production input snapshot")
+    if references_corpus_hash(references) != extraction.references_corpus_hash:
+        raise ValueError("Extraction does not match the canonical references corpus")
+    if synthesis.production_input_hash != snapshot.input_hash:
+        raise ValueError("Synthesis does not match the production input snapshot")
+    if synthesis.extraction_hash != canonical_extraction_hash(extraction):
+        raise ValueError("Synthesis does not match the canonical extraction")
+
+
+def _validate_synthesis_evidence_refs(
+    *, extraction: ProductionExtractionV1, synthesis: ProductionSynthesisV1
+) -> None:
+    """Require each synthesis citation to identify current extraction evidence."""
+    current_identities = {
+        (ref.source_document_id, ref.kind.value, ref.evidence_key)
+        for ref in extraction_evidence_refs_v1(extraction)
+    }
+    for ref in synthesis_evidence_refs(synthesis):
+        identity = (ref.source_document_id, ref.kind.value, ref.evidence_key)
+        if identity not in current_identities:
+            raise ValueError("Synthesis evidence reference is absent from the current extraction")
 
 
 def _normalize_title(title: str, extraction: TechnicalExtraction) -> str:
