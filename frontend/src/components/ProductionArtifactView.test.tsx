@@ -103,6 +103,16 @@ function synthesisArtifact(
             },
           ],
         },
+        {
+          kind: "campaign",
+          heading: "Contexte de la campagne",
+          paragraphs: [
+            {
+              text: "La campagne vise des organisations exposées.",
+              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+            },
+          ],
+        },
       ],
       timeline: [
         {
@@ -636,6 +646,9 @@ it("rend la synthèse canonique V1 et la provenance exacte de ses évidences", a
   expect(
     screen.getByRole("heading", { name: /Progression de l’attaque/ }),
   ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /Contexte de la campagne/ }),
+  ).toBeInTheDocument();
   expect(screen.getByText("Chaîne d’infection")).toBeInTheDocument();
   expect(screen.getByText(/20 août 2026/)).toBeInTheDocument();
   expect(
@@ -655,6 +668,29 @@ it("rend la synthèse canonique V1 et la provenance exacte de ses évidences", a
   // L'identité interne d'évidence n'est pas un handle prompt exposé.
   expect(container.textContent).not.toContain(EVIDENCE_KEY);
   expect(container.querySelector('a[href*="#conversations"]')).toBeNull();
+});
+
+it("affiche une date explicite quand l’événement n’en fournit aucune", async () => {
+  stubProductionFetch({
+    synthesis: synthesisArtifact({
+      sections: [],
+      timeline: [
+        {
+          event_date: null,
+          date_text: null,
+          text: "Événement sans date précise.",
+          evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
+        },
+      ],
+      uncertainties: [],
+      warnings: [],
+    }),
+  });
+
+  renderArtifact("synthesis");
+
+  expect(await screen.findByText(/Date non précisée/)).toBeInTheDocument();
+  expect(screen.getByText("Événement sans date précise.")).toBeInTheDocument();
 });
 
 it("conserve une source d’évidence inconnue sans la substituer", async () => {
@@ -684,7 +720,9 @@ it("conserve une source d’évidence inconnue sans la substituer", async () => 
 
   expect(await screen.findByText("3 preuves")).toBeInTheDocument();
   expect(screen.getAllByRole("link", { name: VENDOR_URL })).toHaveLength(1);
-  const unknown = screen.getByText("Source inconnue");
+  const unknown = screen.getByText(
+    `Document source indisponible : ${UNKNOWN_DOCUMENT_ID}`,
+  );
   expect(unknown).toHaveAttribute(
     "data-source-document-id",
     UNKNOWN_DOCUMENT_ID,
@@ -718,7 +756,10 @@ it("rend la synthèse canonique même quand l’extraction n’est pas résolue"
   expect(
     screen.getByText(/Extraction canonique indisponible/),
   ).toBeInTheDocument();
-  expect(screen.getAllByText("Source inconnue").length).toBeGreaterThan(0);
+  expect(
+    screen.getAllByText(`Document source indisponible : ${VENDOR_DOCUMENT_ID}`)
+      .length,
+  ).toBeGreaterThan(0);
   expect(screen.getByText("3 preuves")).toBeInTheDocument();
 });
 

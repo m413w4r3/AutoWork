@@ -797,15 +797,13 @@ function synthesisModeLabel(metadata: Record<string, unknown>): string {
   return SYNTHESIS_MODE_LABELS[mode] ?? mode;
 }
 
-function synthesisDateLabel(
-  entry: ProductionSynthesisTimelineEntryV1,
-): string | null {
+function synthesisDateLabel(entry: ProductionSynthesisTimelineEntryV1): string {
   if (entry.event_date) {
     return new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(
       new Date(`${entry.event_date}T00:00:00`),
     );
   }
-  return entry.date_text;
+  return entry.date_text ?? "Date non précisée";
 }
 
 /**
@@ -829,7 +827,7 @@ function SynthesisSource({
       data-source-document-id={documentId}
       title={documentId}
     >
-      Source inconnue
+      Document source indisponible : {documentId}
     </span>
   );
 }
@@ -989,9 +987,7 @@ function ProductionSynthesisView({
               const dateLabel = synthesisDateLabel(entry);
               return (
                 <li key={`timeline-${index}`}>
-                  {dateLabel ? (
-                    <strong className="semantic-date">{dateLabel} : </strong>
-                  ) : null}
+                  <strong className="semantic-date">{dateLabel} : </strong>
                   {entry.text}
                   <SynthesisEvidence
                     evidenceRefs={entry.evidence_refs}

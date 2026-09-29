@@ -539,6 +539,25 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.getAllByText("Relancer depuis Assemblage")).toHaveLength(1);
   });
 
+  it("décrit une erreur provider par la réconciliation de la soumission", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("failed"),
+          error_code: "bridge_timeout",
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "la soumission du modèle doit être réconciliée avant de poursuivre",
+    );
+    expect(alert).not.toHaveTextContent("conversation ChatGPT");
+  });
+
   it("propose la récupération explicite sans afficher le retry générique", async () => {
     const fetchMock = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === "POST") {

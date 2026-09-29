@@ -145,7 +145,7 @@ function issueCopy(
     return "Validation de synthèse échouée — consultez les détails de l’étape.";
   }
   if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
-    return "Intervention requise — la conversation ChatGPT n’a pas pu être finalisée.";
+    return "Intervention requise — la soumission du modèle doit être réconciliée avant de poursuivre.";
   }
   return status === "needs_review"
     ? "Intervention requise — vérifiez cette étape avant de poursuivre."
