@@ -7,6 +7,7 @@ import pytest
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
+    _project_synthesis_publication,
     _validate_publication_v3_lineage,
     _validate_synthesis_evidence_refs,
 )
@@ -36,9 +37,23 @@ from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
+    ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    SynthesisTimelineEntryV1,
+    SynthesisUncertaintyV1,
     extraction_evidence_refs_v1,
+)
+from cti_app.domain.publication import (
+    PublicationEvidenceKind,
+    PublicationEvidenceRefV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
+    PublicationTimelineEntryV1,
+    PublicationUncertaintyV1,
 )
 
 
@@ -117,7 +132,15 @@ def _canonical_inputs() -> tuple[
         profile=ExtractionProfile.FULL,
         checkpoint_id=None,
         reuse_state=ExtractionReuseState.FRESH,
-        facts=(fact,),
+        facts=(
+            fact,
+            replace(
+                fact,
+                category="infrastructure",
+                value="example.net",
+                evidence_quote="The source identifies example.net.",
+            ),
+        ),
         events=(),
         indicators=(),
         rules=(),
@@ -261,3 +284,123 @@ def test_synthesis_evidence_validation_rejects_noncurrent_identity(
 
     with pytest.raises(ValueError, match="absent from the current extraction"):
         _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
+
+
+def test_synthesis_publication_projection_preserves_narrative_and_order() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)
+    assert len(evidence) == 2
+    source_document_id = evidence[0].source_document_id
+    synthesis = replace(
+        synthesis,
+        lead=(
+            SynthesisParagraphV1("Lead first.", (evidence[1],)),
+            SynthesisParagraphV1("Lead second.", (evidence[0],)),
+        ),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="Overview heading",
+                paragraphs=(SynthesisParagraphV1("Overview text.", (evidence[0],)),),
+            ),
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.TECHNICAL,
+                heading="Technical heading",
+                paragraphs=(
+                    SynthesisParagraphV1("Technical first.", (evidence[1],)),
+                    SynthesisParagraphV1("Technical second.", (evidence[0],)),
+                ),
+            ),
+        ),
+        timeline=(
+            SynthesisTimelineEntryV1(
+                event_date=date(2025, 1, 8),
+                date_text="8 January",
+                text="Dated event text.",
+                evidence_refs=(evidence[1],),
+            ),
+            SynthesisTimelineEntryV1(
+                event_date=None,
+                date_text=None,
+                text="Undated event text.",
+                evidence_refs=(evidence[0],),
+            ),
+        ),
+        uncertainties=(
+            SynthesisUncertaintyV1("Uncertainty one.", (source_document_id,)),
+            SynthesisUncertaintyV1("Uncertainty two.", (source_document_id,)),
+        ),
+    )
+
+    projection = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+
+    def publication_ref(ref: ExtractionEvidenceRefV1) -> PublicationEvidenceRefV1:
+        return PublicationEvidenceRefV1(
+            source_document_id=ref.source_document_id,
+            kind=PublicationEvidenceKind(ref.kind.value),
+            evidence_key=ref.evidence_key,
+        )
+
+    assert projection.lead == (
+        PublicationParagraphV1("Lead first.", (publication_ref(evidence[1]),)),
+        PublicationParagraphV1("Lead second.", (publication_ref(evidence[0]),)),
+    )
+    assert projection.sections == (
+        PublicationSectionV1(
+            PublicationSectionKind.OVERVIEW,
+            "Overview heading",
+            (PublicationParagraphV1("Overview text.", (publication_ref(evidence[0]),)),),
+        ),
+        PublicationSectionV1(
+            PublicationSectionKind.TECHNICAL,
+            "Technical heading",
+            (
+                PublicationParagraphV1("Technical first.", (publication_ref(evidence[1]),)),
+                PublicationParagraphV1("Technical second.", (publication_ref(evidence[0]),)),
+            ),
+        ),
+    )
+    assert projection.timeline == (
+        PublicationTimelineEntryV1(
+            date(2025, 1, 8),
+            "8 January",
+            "Dated event text.",
+            (publication_ref(evidence[1]),),
+        ),
+        PublicationTimelineEntryV1(
+            None,
+            None,
+            "Undated event text.",
+            (publication_ref(evidence[0]),),
+        ),
+    )
+    assert projection.uncertainties == tuple(
+        PublicationUncertaintyV1(item.text, item.source_document_ids)
+        for item in synthesis.uncertainties
+    )
+    assert projection.used_source_document_ids == frozenset({source_document_id})
+
+    reversed_synthesis = replace(
+        synthesis,
+        lead=tuple(reversed(synthesis.lead)),
+        sections=tuple(reversed(synthesis.sections)),
+    )
+    reversed_projection = _project_synthesis_publication(
+        extraction=extraction,
+        synthesis=reversed_synthesis,
+    )
+    assert reversed_projection.lead == tuple(reversed(projection.lead))
+    assert reversed_projection.sections == tuple(reversed(projection.sections))
+
+
+def test_synthesis_publication_projection_validates_evidence_before_conversion() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    current_ref = extraction_evidence_refs_v1(extraction)[0]
+    invalid_ref = replace(current_ref, evidence_key="0" * 64)
+    synthesis = replace(
+        synthesis,
+        lead=(SynthesisParagraphV1("Invalid citation.", (invalid_ref,)),),
+    )
+
+    with pytest.raises(ValueError, match="absent from the current extraction"):
+        _project_synthesis_publication(extraction=extraction, synthesis=synthesis)

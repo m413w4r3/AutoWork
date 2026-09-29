@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from dataclasses import dataclass
+from uuid import UUID
 
 from cti_app.application.french_typography import apply_french_spacing
 from cti_app.application.production_extraction import references_corpus_hash
@@ -20,7 +22,9 @@ from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import (
+    ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
+    SynthesisParagraphV1,
     extraction_evidence_refs_v1,
     synthesis_evidence_refs,
 )
@@ -30,7 +34,14 @@ from cti_app.domain.publication import (
     Indicator,
     IndicatorGroup,
     PublicationDocumentV2,
+    PublicationEvidenceKind,
+    PublicationEvidenceRefV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
     PublicationSource,
+    PublicationTimelineEntryV1,
+    PublicationUncertaintyV1,
     RichSpan,
     RichSpanKind,
     RichText,
@@ -39,6 +50,81 @@ from cti_app.domain.publication import (
 
 _VALID_TITLE = re.compile(r"^\[[^\]]+\]\s+.+")
 _CITATION_SEPARATOR = re.compile(r"^[\s,;:.·]+$")
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationNarrativeProjection:
+    lead: tuple[PublicationParagraphV1, ...]
+    sections: tuple[PublicationSectionV1, ...]
+    timeline: tuple[PublicationTimelineEntryV1, ...]
+    uncertainties: tuple[PublicationUncertaintyV1, ...]
+    used_source_document_ids: frozenset[UUID]
+
+
+def _project_synthesis_publication(
+    *, extraction: ProductionExtractionV1, synthesis: ProductionSynthesisV1
+) -> _PublicationNarrativeProjection:
+    """Project validated canonical synthesis narrative without changing editorial order."""
+    _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
+    used_source_document_ids: set[UUID] = set()
+
+    def evidence_refs(
+        refs: tuple[ExtractionEvidenceRefV1, ...],
+    ) -> tuple[PublicationEvidenceRefV1, ...]:
+        projected = tuple(
+            PublicationEvidenceRefV1(
+                source_document_id=ref.source_document_id,
+                kind=PublicationEvidenceKind(ref.kind.value),
+                evidence_key=ref.evidence_key,
+            )
+            for ref in refs
+        )
+        used_source_document_ids.update(ref.source_document_id for ref in projected)
+        return projected
+
+    def paragraph(value: SynthesisParagraphV1) -> PublicationParagraphV1:
+        return PublicationParagraphV1(
+            text=value.text,
+            evidence_refs=evidence_refs(value.evidence_refs),
+        )
+
+    lead = tuple(paragraph(value) for value in synthesis.lead)
+    sections = tuple(
+        PublicationSectionV1(
+            kind=PublicationSectionKind(section.kind.value),
+            heading=section.heading,
+            paragraphs=tuple(paragraph(value) for value in section.paragraphs),
+        )
+        for section in synthesis.sections
+    )
+    timeline = tuple(
+        PublicationTimelineEntryV1(
+            event_date=entry.event_date,
+            date_text=entry.date_text,
+            text=entry.text,
+            evidence_refs=evidence_refs(entry.evidence_refs),
+        )
+        for entry in synthesis.timeline
+    )
+    uncertainties = tuple(
+        PublicationUncertaintyV1(
+            text=uncertainty.text,
+            source_document_ids=uncertainty.source_document_ids,
+        )
+        for uncertainty in synthesis.uncertainties
+    )
+    used_source_document_ids.update(
+        source_document_id
+        for uncertainty in uncertainties
+        for source_document_id in uncertainty.source_document_ids
+    )
+    return _PublicationNarrativeProjection(
+        lead=lead,
+        sections=sections,
+        timeline=timeline,
+        uncertainties=uncertainties,
+        used_source_document_ids=frozenset(used_source_document_ids),
+    )
 
 
 def _validate_publication_v3_lineage(
