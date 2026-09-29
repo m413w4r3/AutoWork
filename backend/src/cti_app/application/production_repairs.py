@@ -15,7 +15,6 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.extraction import _html_encoding, parse_document
-from cti_app.application.pandoc_rendering import PandocRenderer
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     MAX_REPAIR_EVIDENCE_BYTES,
@@ -4257,7 +4256,7 @@ class ProductionRepairMaterializationService:
             if repair_materialization is not None:
                 metadata["repair_materialization"] = dict(repair_materialization)
             new_publication = await CanonicalAssemblyService(
-                store, uow.production_artifacts, PandocRenderer()
+                store, uow.production_artifacts
             ).assemble_publication(
                 run=run,
                 snapshot=snapshot,

@@ -59,7 +59,6 @@ from cti_app.application.production_repairs import (
     ProductionRepairValueNotVerifiableError,
 )
 from cti_app.application.production_resume import (
-    STAGE_ARTIFACT,
     plan_production_resume,
 )
 from cti_app.application.production_review_recovery import ReviewRecoveryConflictError
@@ -101,6 +100,7 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.logging import get_correlation_id
@@ -1119,9 +1119,7 @@ async def _resume_plan_view(
 ) -> ProductionResumePlanView:
     """Preview the resume of a cancelled run, without changing anything."""
     current: dict[str, Any] = {}
-    for artifact_stage in STAGE_ARTIFACT.values():
-        if artifact_stage is None:
-            continue
+    for artifact_stage in production_artifact_stages():
         current[artifact_stage.value] = await uow.production_artifacts.get_current(
             run.id, artifact_stage.value
         )

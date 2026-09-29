@@ -60,6 +60,7 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRunStatus,
 )
+from cti_app.domain.production_pipeline import downstream_artifacts_from_artifact_stage
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
@@ -152,12 +153,15 @@ class _Artifacts:
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
         self.stale_calls.append((run_id, stage))
-        order = ["references", "extraction", "synthesis", "publication"]
-        if stage not in order:
+        try:
+            downstream = downstream_artifacts_from_artifact_stage(
+                ProductionArtifactStage(stage), inclusive=False
+            )
+        except ValueError:
             return
-        downstream = set(order[order.index(stage) + 1 :])
+        affected = {item.value for item in downstream}
         for index, item in enumerate(self.items):
-            if item.production_run_id == run_id and item.stage.value in downstream:
+            if item.production_run_id == run_id and item.stage.value in affected:
                 self.items[index] = _with_status(item, ProductionArtifactStatus.STALE)
 
 

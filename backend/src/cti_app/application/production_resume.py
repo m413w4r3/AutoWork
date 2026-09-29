@@ -21,11 +21,13 @@ from typing import Any
 
 from cti_app.domain.production import (
     ProductionArtifact,
-    ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+)
+from cti_app.domain.production_pipeline import (
+    artifact_stage_for,
     production_stages,
 )
 
@@ -33,16 +35,6 @@ from cti_app.domain.production import (
 # status (pending, running, failed, skipped) may still cost a model call.
 # ``production_workflow`` writes them and imports this set back.
 EXTRACTION_PROGRESS_COMPLETED_STATUSES = frozenset({"cached", "succeeded"})
-
-# The artifact that evidences each stage, when there is one.  SOURCES is
-# evidenced by the archived source collections instead.
-STAGE_ARTIFACT: dict[ProductionStage, ProductionArtifactStage | None] = {
-    ProductionStage.SOURCES: None,
-    ProductionStage.REFERENCES: ProductionArtifactStage.REFERENCES,
-    ProductionStage.EXTRACTION: ProductionArtifactStage.EXTRACTION,
-    ProductionStage.SYNTHESIS: ProductionArtifactStage.SYNTHESIS,
-    ProductionStage.ASSEMBLY: ProductionArtifactStage.PUBLICATION,
-}
 
 # Model calls a stage still owes when it has to run.  Extraction is variable:
 # it owes one call per source that has no usable answer yet.
@@ -134,7 +126,7 @@ def resolve_retry_stage(
     """
     live = set(live_artifact_stages)
     for stage in production_stages():
-        artifact_stage = STAGE_ARTIFACT[stage]
+        artifact_stage = artifact_stage_for(stage)
         if artifact_stage is None:
             continue
         if artifact_stage.value not in live:
@@ -160,7 +152,7 @@ def plan_production_resume(
     resume_from: ProductionStage | None = None
 
     for stage in stages:
-        artifact_stage = STAGE_ARTIFACT[stage]
+        artifact_stage = artifact_stage_for(stage)
         if artifact_stage is None:
             complete = archived_source_count > 0
         else:
@@ -181,7 +173,7 @@ def plan_production_resume(
         reused = [
             artifact_stage.value
             for stage in completed
-            if (artifact_stage := STAGE_ARTIFACT[stage]) is not None
+            if (artifact_stage := artifact_stage_for(stage)) is not None
         ]
 
     resume_index = stages.index(resume_from)
@@ -204,7 +196,6 @@ def plan_production_resume(
 
 __all__ = [
     "EXTRACTION_PROGRESS_COMPLETED_STATUSES",
-    "STAGE_ARTIFACT",
     "ProductionResumePlan",
     "pending_extraction_sources",
     "plan_production_resume",

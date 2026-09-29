@@ -1,5 +1,21 @@
 # Production canonique
 
+## Pipeline et artifacts
+
+L'étape du pipeline, son artifact et un rendu sont des notions distinctes. Le graphe canonique
+est défini dans `domain/production_pipeline.py` :
+
+| Étape | Artifact canonique |
+| --- | --- |
+| `SOURCES` | Aucun |
+| `REFERENCES` | `REFERENCES` |
+| `EXTRACTION` | `EXTRACTION` |
+| `SYNTHESIS` | `SYNTHESIS` |
+| `ASSEMBLY` | `PUBLICATION` |
+
+`ASSEMBLY` écrit `PublicationDocumentV3` dans l'artifact `PUBLICATION`. La QA canonique passée,
+le run devient `READY`. Un futur pipeline de rendu indépendant pourra consommer cet artifact.
+
 ## Modèle
 
 `Subject` est l’identité éditoriale stable matérialisée par Selection. Il conserve sa relation
@@ -175,7 +191,7 @@ ProductionSynthesisV1
         +
 ProductionReferenceCorpusV1
         ↓
-PublicationDocumentV3 → QA canonique → rendu Pandoc dérivé → READY
+PublicationDocumentV3 → QA canonique → READY
 ```
 
 `ProductionExtractionV1` est l’unique vérité factuelle de Synthesis. Le stage construit un pack
@@ -203,8 +219,8 @@ de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la chron
 incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction. Les sources sont
 résolues par `source_document_id`. Le hash d’Assembly dépend des quatre entrées canoniques, de
 la version de document et de la policy, sans version de renderer. QA recalcule la projection
-canonique et compare le document exact. Pandoc produit ensuite un dérivé Markdown ; le document
-canonique ne dépend pas de Pandoc.
+canonique et compare le document exact. L'artifact `PUBLICATION` conserve le document canonique,
+sans rendu. Un futur pipeline de rendu indépendant pourra le consommer.
 
 ## ProductionBoard
 

@@ -13,9 +13,11 @@ Ne lance pas ctx.py, rg, find, tree ni une exploration de répertoire.
 Si un chemin listé n'existe pas ou si une abstraction directement requise est
 introuvable, arrête et rapporte le nom précis du blocage au lieu d'explorer.
 
-Jusqu'à AW-013, ou jusqu'à une stabilisation explicitement déclarée, la
-baseline `0001_baseline` est mutable. Les évolutions du schéma cible modifient
-cette baseline ; aucune compatibilité avec les anciennes bases n'est requise.
+La baseline `0001_baseline` reste mutable jusqu'au gate de stabilisation
+pré-première édition prévu après AW-024. Tant que cette stabilisation n'est pas
+explicitement déclarée, les évolutions du schéma cible modifient cette baseline ;
+aucune migration de compatibilité avec les anciennes bases AutoWork ni migration
+`0002` pour un changement de la nouvelle baseline n'est requise.
 Les règles historiques d'immutabilité des migrations 0001 à 0004 ne sont plus
 actives.
 

@@ -25,6 +25,7 @@ from cti_app.domain.production import (
     ProductionRepairImpactKind,
     ProductionRunStatus,
 )
+from cti_app.domain.production_pipeline import production_artifact_stages
 
 
 class _Unset:
@@ -107,8 +108,10 @@ class _Artifacts:
         self._journal.append(("append", artifact))
 
     async def mark_stages_stale(self, run_id: UUID, stages: set[str]) -> list[str]:
-        order = ("references", "extraction", "synthesis", "publication")
-        selected = tuple(stage for stage in order if stage in stages)
+        requested = set(stages)
+        selected = tuple(
+            stage.value for stage in production_artifact_stages() if stage.value in requested
+        )
         self.stale_calls.append((run_id, selected))
         restored: list[tuple[ProductionArtifact, ProductionArtifactStatus]] = []
         for item in self.items:

@@ -21,7 +21,6 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
 )
-from cti_app.application.pandoc_rendering import PandocRenderer
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
@@ -1416,7 +1415,7 @@ class ProductionWorkflowOrchestrator:
                     await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
                 )
                 publication = await PublicationAssemblyService(
-                    self._artifact_store, uow.production_artifacts, PandocRenderer()
+                    self._artifact_store, uow.production_artifacts
                 ).assemble_publication(
                     run=run,
                     snapshot=snapshot,

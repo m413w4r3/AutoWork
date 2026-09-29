@@ -664,29 +664,6 @@ class ProductionInputSnapshot:
         return hashlib.sha256(encoded).hexdigest()
 
 
-def production_stages() -> tuple[ProductionStage, ...]:
-    """Return the one executable publication pipeline."""
-    return (
-        ProductionStage.SOURCES,
-        ProductionStage.REFERENCES,
-        ProductionStage.EXTRACTION,
-        ProductionStage.SYNTHESIS,
-        ProductionStage.ASSEMBLY,
-    )
-
-
-def next_stage(stage: ProductionStage) -> ProductionStage | None:
-    """Return the successor in the unified pipeline."""
-    if not isinstance(stage, ProductionStage):
-        raise TypeError("next_stage requires a ProductionStage")
-    stages = production_stages()
-    try:
-        index = stages.index(stage)
-    except ValueError as exc:
-        raise ValueError(f"Stage {stage.value} is not valid for the publication pipeline") from exc
-    return stages[index + 1] if index + 1 < len(stages) else None
-
-
 class ProductionArtifactStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
@@ -893,6 +870,10 @@ class ProductionRun:
     def advance_stage(self, *, now: datetime | None = None) -> None:
         if self.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
+        # Keep stage transitions owned by the canonical pipeline graph.
+        # This local import avoids a cycle: the graph imports enums from here.
+        from cti_app.domain.production_pipeline import next_stage
+
         successor = next_stage(self.current_stage)
         if successor is not None:
             self.current_stage = successor

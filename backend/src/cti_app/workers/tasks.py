@@ -52,7 +52,7 @@ from cti_app.application.virustotal_persistence import VirusTotalObservationServ
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
-from cti_app.domain.production import production_stages
+from cti_app.domain.production_pipeline import production_stages
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork

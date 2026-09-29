@@ -29,6 +29,7 @@ import {
   productionErrorMessage,
   retryTransientProductionFailure,
 } from "../features/production/productionLabels";
+import { RETRYABLE_PRODUCTION_STAGES } from "../features/production/productionStages";
 
 interface SubjectProductionProps {
   subjectId: string;
@@ -45,14 +46,7 @@ const STAGE_ARTIFACT_LABELS: Record<string, string> = {
   publication: "l’assemblage",
 };
 
-const RETRY_STAGES = [
-  "sources",
-  "references",
-  "extraction",
-  "synthesis",
-  "assembly",
-] as const;
-type RetryStage = (typeof RETRY_STAGES)[number];
+type RetryStage = (typeof RETRYABLE_PRODUCTION_STAGES)[number];
 
 const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
   sources: "Les sources et toutes les étapes suivantes seront recalculées.",
@@ -335,7 +329,7 @@ export function SubjectProduction({
     );
   }
 
-  const stageList = [...RETRY_STAGES];
+  const stageList = [...RETRYABLE_PRODUCTION_STAGES];
   // Warnings are recoveries the parser made: worth showing, never blocking.
   const warnings = status.warnings ?? [];
 
@@ -375,7 +369,9 @@ export function SubjectProduction({
   const completedStages = stageList.filter(
     (stage) => stages[stage]?.status === "succeeded",
   ).length;
-  const issueStageIndex = RETRY_STAGES.indexOf(status.current_stage);
+  const issueStageIndex = RETRYABLE_PRODUCTION_STAGES.indexOf(
+    status.current_stage,
+  );
   const reconciliationRequired =
     status.status === "needs_review" &&
     status.error_code === "model_submission_reconciliation_required" &&
@@ -387,9 +383,9 @@ export function SubjectProduction({
   const retryStages: readonly RetryStage[] = reconciliationRequired
     ? []
     : status.status === "ready"
-      ? RETRY_STAGES
+      ? RETRYABLE_PRODUCTION_STAGES
       : showIssue && issueStageIndex >= 0
-        ? RETRY_STAGES.slice(0, issueStageIndex + 1)
+        ? RETRYABLE_PRODUCTION_STAGES.slice(0, issueStageIndex + 1)
         : [];
   const issueRetryStage = showIssue ? status.current_stage : null;
   const currentStageRetryRecommended = status.recovery_disposition === "auto";

@@ -77,6 +77,10 @@ Chaque run suit une pipeline statique et ordonnée :
 SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → ASSEMBLY → READY
 ```
 
+`ASSEMBLY` produit l'artifact canonique `PUBLICATION`. `READY` signifie que les artifacts
+canoniques sont valides et que la QA canonique a réussi ; il n'indique pas qu'un rendu PDF ou
+DOCX a été compilé. Le rendu constitue un pipeline distinct.
+
 Les artifacts et diagnostics de chaque étape sont adressés par le run et sa génération de
 pipeline. La progression se lit depuis le batch et les runs en base. Une annulation d’un batch
 actif annule les runs non terminés, conserve les artifacts historiques et laisse l’édition

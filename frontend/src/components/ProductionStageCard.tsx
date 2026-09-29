@@ -1,5 +1,8 @@
+import { PRODUCTION_STAGE_LABELS } from "../features/production/productionStages";
+import type { ProductionStage } from "../api/production";
+
 interface ProductionStageCardProps {
-  stage: string;
+  stage: ProductionStage;
   status: string;
   stageNumber: number;
   isActive?: boolean;
@@ -7,14 +10,6 @@ interface ProductionStageCardProps {
   /** Short count line, e.g. "5 archivée(s)". */
   detail?: string;
 }
-
-const STAGE_NAMES: Record<string, string> = {
-  sources: "Sources",
-  references: "Références",
-  extraction: "Extraction CTI",
-  synthesis: "Synthèse",
-  assembly: "Assemblage",
-};
 
 const STATUS_LABELS: Record<string, string> = {
   pending: "en attente",
@@ -52,7 +47,7 @@ export function ProductionStageCard({
         {STATUS_ICONS[status] ?? "○"}
       </span>
       <span className="production-stage__name">
-        {stageNumber}. {STAGE_NAMES[stage] ?? stage}
+        {stageNumber}. {PRODUCTION_STAGE_LABELS[stage]}
       </span>
       <span className="production-stage__status">
         {reused ? "réutilisée" : (STATUS_LABELS[status] ?? status)}

@@ -56,6 +56,10 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.production_pipeline import (
+    downstream_artifacts_from_artifact_stage,
+    downstream_artifacts_from_pipeline_stage,
+)
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
@@ -433,38 +437,34 @@ class _Artifacts:
         return max(matches, key=lambda artifact: artifact.version) if matches else None
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        stages = ["references", "extraction", "synthesis", "publication"]
-        if stage not in stages:
+        try:
+            downstream = downstream_artifacts_from_artifact_stage(
+                ProductionArtifactStage(stage), inclusive=False
+            )
+        except ValueError:
             return
-        downstream = set(stages[stages.index(stage) + 1 :])
+        affected = {item.value for item in downstream}
         for artifact in self.items:
-            if artifact.production_run_id == run_id and artifact.stage.value in downstream:
+            if artifact.production_run_id == run_id and artifact.stage.value in affected:
                 artifact.status = ProductionArtifactStatus.STALE
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
         """Mirror the SQL repository's selected-stage-plus-downstream semantics."""
-        pipeline = ["sources", "references", "extraction", "synthesis", "assembly"]
-        artifact_stages = {
-            "references": "references",
-            "extraction": "extraction",
-            "synthesis": "synthesis",
-            "assembly": "publication",
-        }
-        if stage not in pipeline:
+        try:
+            affected = downstream_artifacts_from_pipeline_stage(
+                ProductionStage(stage), inclusive=True
+            )
+        except ValueError:
             return []
-        affected = [
-            artifact_stages[item]
-            for item in pipeline[pipeline.index(stage) :]
-            if item in artifact_stages
-        ]
+        affected_values = [item.value for item in affected]
         for artifact in self.items:
             if (
                 artifact.production_run_id == run_id
-                and artifact.stage.value in affected
+                and artifact.stage.value in affected_values
                 and artifact.status is not ProductionArtifactStatus.STALE
             ):
                 artifact.status = ProductionArtifactStatus.STALE
-        return affected
+        return affected_values
 
 
 class _SourceCollections:

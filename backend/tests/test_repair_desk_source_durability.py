@@ -76,6 +76,10 @@ from cti_app.domain.production import (
     ProductionStage,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_pipeline import (
+    downstream_artifacts_from_artifact_stage,
+    downstream_artifacts_from_pipeline_stage,
+)
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
@@ -257,21 +261,29 @@ class _Artifacts:
         self.items.append(artifact)
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        await self._stale(run_id, stage, inclusive=False)
+        await self._stale(run_id, stage, from_pipeline_stage=False)
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
-        return await self._stale(run_id, stage, inclusive=True)
+        return await self._stale(run_id, stage, from_pipeline_stage=True)
 
-    async def _stale(self, run_id: UUID, stage: str, *, inclusive: bool) -> list[str]:
-        order = ["references", "extraction", "synthesis", "publication"]
-        if stage not in order:
+    async def _stale(self, run_id: UUID, stage: str, *, from_pipeline_stage: bool) -> list[str]:
+        try:
+            if from_pipeline_stage:
+                affected = downstream_artifacts_from_pipeline_stage(
+                    ProductionStage(stage), inclusive=True
+                )
+            else:
+                affected = downstream_artifacts_from_artifact_stage(
+                    ProductionArtifactStage(stage), inclusive=False
+                )
+        except ValueError:
             return []
-        affected = set(order[order.index(stage) + (0 if inclusive else 1) :])
+        affected_values = {item.value for item in affected}
         staled: list[str] = []
         for index, item in enumerate(self.items):
             if (
                 item.production_run_id == run_id
-                and item.stage.value in affected
+                and item.stage.value in affected_values
                 and item.status is not ProductionArtifactStatus.STALE
             ):
                 self.items[index] = dataclass_replace(item, status=ProductionArtifactStatus.STALE)

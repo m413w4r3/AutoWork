@@ -1038,7 +1038,7 @@ export async function importProductionState(
 /** Recompute one stage in place, invalidating its downstream artifacts. */
 export async function retryProductionStage(
   subjectId: string,
-  stage: "sources" | "references" | "extraction" | "synthesis" | "assembly",
+  stage: ProductionStage,
 ): Promise<{
   run_id: string;
   status: string;

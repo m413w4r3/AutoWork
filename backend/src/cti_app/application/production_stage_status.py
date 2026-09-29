@@ -5,14 +5,13 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from cti_app.application.production_resume import STAGE_ARTIFACT as _STAGE_ARTIFACT
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
-    production_stages,
 )
+from cti_app.domain.production_pipeline import artifact_stage_for, production_stages
 
 
 def build_stage_statuses(
@@ -33,7 +32,7 @@ def build_stage_statuses(
     statuses: dict[str, dict[str, Any]] = {}
 
     for index, stage in enumerate(stages_for_pipeline):
-        artifact_stage = _STAGE_ARTIFACT[stage]
+        artifact_stage = artifact_stage_for(stage)
         artifact = artifacts.get(artifact_stage.value) if artifact_stage else None
 
         if run.status is ProductionRunStatus.READY:

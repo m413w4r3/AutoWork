@@ -17,7 +17,6 @@ from cti_app.application.persistence import (
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_resume import (
-    STAGE_ARTIFACT,
     ProductionResumePlan,
     plan_production_resume,
     resolve_retry_stage,
@@ -38,9 +37,9 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
     production_batch_request_fingerprint,
-    production_stages,
     source_role_rank,
 )
+from cti_app.domain.production_pipeline import production_artifact_stages, production_stages
 
 
 class ProductionRunNotFoundError(LookupError):
@@ -550,9 +549,7 @@ class SubjectProductionService:
         if artifacts is None:
             return {}
         current: dict[str, Any] = {}
-        for artifact_stage in STAGE_ARTIFACT.values():
-            if artifact_stage is None:
-                continue
+        for artifact_stage in production_artifact_stages():
             current[artifact_stage.value] = await artifacts.get_current(
                 run_id, artifact_stage.value
             )

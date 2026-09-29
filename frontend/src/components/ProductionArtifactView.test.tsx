@@ -186,7 +186,7 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
         version: 1,
         status: "verified",
         metadata: {},
-        rendered_content: '::: {custom-style="publication"}\ncontenu\n:::',
+        rendered_content: null,
         canonical_content: {
           schema_version: "1",
           title: "[Cavern Manticore] Un framework modulaire",
@@ -234,9 +234,8 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
   expect(screen.getByText("WinDirStat")).toHaveClass("semantic-tool");
   expect(screen.getByText("example.com")).toBeInTheDocument();
   expect(
-    screen.getByRole("link", { name: "Télécharger le Markdown Pandoc" }),
-  ).toHaveAttribute("download", "publication-pandoc.md");
-  expect(screen.queryByText(/custom-style/)).not.toBeInTheDocument();
+    screen.queryByRole("link", { name: "Télécharger le Markdown Pandoc" }),
+  ).not.toBeInTheDocument();
 });
 
 it("affiche la publication V3 et la provenance des sections, IOC et incertitudes", async () => {

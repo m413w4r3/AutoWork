@@ -65,6 +65,9 @@ puis `READY`. Les états asynchrones vivent en PostgreSQL ; Redis ne transporte 
 de jobs. L’annulation conserve l’historique, arrête les travaux non terminés et ne ferme pas
 l’édition.
 
+`ASSEMBLY` produit l'artifact canonique `PUBLICATION` sans rendu. `READY` valide la production
+canonique et sa QA, indépendamment de tout export PDF ou DOCX.
+
 ### Extraction : artifact borné et checkpoints source-level
 
 `production_artifacts` porte, pour l’étape `EXTRACTION`, un unique `canonical_blob_id` vers
@@ -123,3 +126,8 @@ supprimés.
 `backend/migrations/versions/0001_baseline.py` est l’unique head Alembic et définit la cible
 complète depuis une base vide. La validation vérifie les tables, colonnes, contraintes
 d’idempotence et triggers d’immutabilité de cette baseline.
+
+Cette baseline reste mutable jusqu'au gate de stabilisation pré-première édition prévu après
+AW-024. Tant que la stabilisation n'est pas explicitement déclarée, tout changement du schéma
+cible modifie `0001_baseline` ; aucune migration de compatibilité avec une ancienne base AutoWork
+ni migration `0002` pour la nouvelle baseline n'est requise.

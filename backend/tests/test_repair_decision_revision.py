@@ -59,6 +59,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     RepairDecisionApplicationState,
 )
+from cti_app.domain.production_pipeline import downstream_artifacts_from_artifact_stage
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
@@ -153,8 +154,15 @@ class _Artifacts:
         self.items.append(artifact)
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        order = ["references", "extraction", "synthesis", "publication"]
-        downstream = set(order[order.index(stage) + 1 :]) if stage in order else set()
+        try:
+            downstream = {
+                item.value
+                for item in downstream_artifacts_from_artifact_stage(
+                    ProductionArtifactStage(stage), inclusive=False
+                )
+            }
+        except ValueError:
+            return
         for index, item in enumerate(self.items):
             if item.production_run_id == run_id and item.stage.value in downstream:
                 self.items[index] = replace(item, status=ProductionArtifactStatus.STALE)

@@ -17,7 +17,7 @@ it("signale une étape réutilisée avec son statut de provenance", () => {
   );
 
   expect(container.querySelector(".production-stage.is-reused")).toBeTruthy();
-  expect(screen.getByText(/Extraction CTI/)).toBeInTheDocument();
+  expect(screen.getByText(/Extraction/)).toBeInTheDocument();
   expect(
     screen.getByText(/réutilisée · depuis un calcul précédent · 1 artifact/),
   ).toBeInTheDocument();

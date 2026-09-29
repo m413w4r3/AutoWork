@@ -9,8 +9,8 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionStage,
-    production_stages,
 )
+from cti_app.domain.production_pipeline import production_stages
 
 RUN_ID = UUID("11111111-1111-4111-8111-111111111111")
 SUBJECT_ID = UUID("22222222-2222-4222-8222-222222222222")

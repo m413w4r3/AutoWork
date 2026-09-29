@@ -1,5 +1,5 @@
 import { ApiError, type EditionStatus } from "./editions";
-import type { ProductionReconciliation } from "./production";
+import type { ProductionReconciliation, ProductionStage } from "./production";
 
 export type { ProductionReconciliation };
 
@@ -8,8 +8,7 @@ export type PublicationDecision = "include" | "exclude";
 export type ReviewRunStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
-export type ReviewRetryStage =
-  "sources" | "references" | "extraction" | "synthesis" | "assembly";
+export type ReviewRetryStage = ProductionStage;
 
 export type ProductionRepairIssueKind =
   "rejected_indicator" | "rejected_rule" | "supplemental_source_unarchived";

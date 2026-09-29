@@ -1,5 +1,6 @@
 from dataclasses import replace
 from datetime import date
+from inspect import signature
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -251,6 +252,11 @@ def _run(snapshot: ProductionInputSnapshot) -> ProductionRun:
         edition_id=snapshot.edition_id,
         id=snapshot.production_run_id,
     )
+
+
+def test_assembly_constructor_has_no_renderer_dependency() -> None:
+    parameters = tuple(signature(PublicationAssemblyService).parameters)
+    assert parameters == ("artifact_store", "production_artifacts")
 
 
 @pytest.mark.asyncio

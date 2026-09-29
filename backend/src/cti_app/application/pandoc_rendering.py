@@ -170,19 +170,15 @@ def _render_publication_v3(document: PublicationDocumentV3) -> str:
     return "\n\n".join(blocks).rstrip() + "\n"
 
 
-class PandocRenderer:
-    """Pure Markdown derivative of PublicationDocumentV3."""
-
-    def render(self, document: PublicationDocumentV3) -> str:
-        return _render_publication_v3(document)
-
-
 def render_publication_pandoc(
     document: BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3,
 ) -> str:
     """Render publication Markdown without invoking Pandoc or reading the network."""
     if isinstance(document, PublicationDocumentV3):
-        return PandocRenderer().render(document)
+        rendered = _render_publication_v3(document)
+        if "`" in rendered:
+            raise ValueError("Pandoc publication Markdown must not contain backticks")
+        return rendered
     sources = {source.source_id: source.canonical_url for source in document.sources}
     blocks = [_styled_block("title", _safe_text(document.title))]
 

@@ -39,6 +39,11 @@ from cti_app.domain.production import (
     SourceExtraction,
     SourceExtractionStatus,
 )
+from cti_app.domain.production_pipeline import (
+    downstream_artifacts_from_artifact_stage,
+    downstream_artifacts_from_pipeline_stage,
+    production_artifact_stages,
+)
 from cti_app.infrastructure.database.models.core import SubjectRow
 from cti_app.infrastructure.database.models.production import (
     AnalystDecisionRow,
@@ -530,12 +535,7 @@ class SqlAlchemyProductionArtifactRepository:
         not_before: datetime | None = None,
     ) -> ProductionArtifact | None:
         # Every reusable stage is identified by its canonical payload only.
-        if stage not in {
-            ProductionArtifactStage.REFERENCES.value,
-            ProductionArtifactStage.EXTRACTION.value,
-            ProductionArtifactStage.SYNTHESIS.value,
-            ProductionArtifactStage.PUBLICATION.value,
-        }:
+        if stage not in {item.value for item in production_artifact_stages()}:
             return None
 
         query = (
@@ -580,19 +580,14 @@ class SqlAlchemyProductionArtifactRepository:
         return [_production_artifact_from_row(row) for row in result.scalars()]
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
-        stages = [
-            ProductionArtifactStage.REFERENCES.value,
-            ProductionArtifactStage.EXTRACTION.value,
-            ProductionArtifactStage.SYNTHESIS.value,
-            ProductionArtifactStage.PUBLICATION.value,
-        ]
-        if stage not in stages:
+        try:
+            affected = downstream_artifacts_from_artifact_stage(
+                ProductionArtifactStage(stage), inclusive=False
+            )
+        except ValueError:
             return
-
-        stage_idx = stages.index(stage)
-        downstream_stages = stages[stage_idx + 1 :]
-
-        if downstream_stages:
+        downstream_stages = [item.value for item in affected]
+        if affected:
             stmt = (
                 update(ProductionArtifactRow)
                 .where(
@@ -605,14 +600,13 @@ class SqlAlchemyProductionArtifactRepository:
 
     async def mark_stages_stale(self, run_id: UUID, stages: Collection[str]) -> list[str]:
         """Mark exactly the requested artifact stages stale."""
-        pipeline = [
-            ProductionArtifactStage.REFERENCES.value,
-            ProductionArtifactStage.EXTRACTION.value,
-            ProductionArtifactStage.SYNTHESIS.value,
-            ProductionArtifactStage.PUBLICATION.value,
-        ]
-        requested = set(stages)
-        affected = [stage for stage in pipeline if stage in requested]
+        requested: set[ProductionArtifactStage] = set()
+        for value in stages:
+            try:
+                requested.add(ProductionArtifactStage(value))
+            except ValueError:
+                continue
+        affected = [stage.value for stage in production_artifact_stages() if stage in requested]
         if not affected:
             return []
 
@@ -631,32 +625,25 @@ class SqlAlchemyProductionArtifactRepository:
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
         """Mark selected production output and every downstream output stale."""
-        pipeline = ["sources", "references", "extraction", "synthesis", "assembly"]
-        if stage not in pipeline:
+        try:
+            affected = downstream_artifacts_from_pipeline_stage(
+                ProductionStage(stage), inclusive=True
+            )
+        except ValueError:
             return []
-        artifact_stages = {
-            "references": "references",
-            "extraction": "extraction",
-            "synthesis": "synthesis",
-            "assembly": "publication",
-        }
-        affected = [
-            artifact_stages[item]
-            for item in pipeline[pipeline.index(stage) :]
-            if item in artifact_stages
-        ]
         if not affected:
             return []
+        affected_stages = [item.value for item in affected]
         await self._session.execute(
             update(ProductionArtifactRow)
             .where(
                 (ProductionArtifactRow.production_run_id == run_id)
-                & (ProductionArtifactRow.stage.in_(affected))
+                & (ProductionArtifactRow.stage.in_(affected_stages))
                 & (ProductionArtifactRow.status != ProductionArtifactStatus.STALE.value)
             )
             .values(status=ProductionArtifactStatus.STALE.value)
         )
-        return affected
+        return affected_stages
 
 
 class SqlAlchemySourceExtractionRepository:

@@ -1366,18 +1366,6 @@ export function ProductionArtifactView({
         />
       ) : null}
 
-      {stage === "publication" && artifact.rendered_content && (
-        <p>
-          <a
-            className="button button--secondary"
-            download={"publication-pandoc.md"}
-            href={`data:text/markdown;charset=utf-8,${encodeURIComponent(artifact.rendered_content)}`}
-          >
-            Télécharger le Markdown Pandoc
-          </a>
-        </p>
-      )}
-
       {synthesisDocument && artifact.rendered_content ? (
         <details className="artifact-rendered-preview">
           <summary>Aperçu Markdown (projection temporaire)</summary>

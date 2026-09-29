@@ -12,7 +12,6 @@ from cti_app.application.publication_builder import (
     build_publication_document_v3,
     compute_assembly_input_hash,
 )
-from cti_app.application.publication_renderer import PublicationRenderer
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -34,11 +33,9 @@ class PublicationAssemblyService:
         self,
         artifact_store: ProductionArtifactStore,
         production_artifacts: ProductionArtifactRepository,
-        renderer: PublicationRenderer | None = None,
     ) -> None:
         self._artifact_store = artifact_store
         self._production_artifacts = production_artifacts
-        self._renderer = renderer
 
     async def assemble_publication(
         self,
@@ -80,7 +77,6 @@ class PublicationAssemblyService:
             and current.input_hash == input_hash
             and current.status is ProductionArtifactStatus.VERIFIED
             and current.canonical_blob_id is not None
-            and (self._renderer is None or current.rendered_blob_id is not None)
             and (
                 metadata_extra is None
                 or current.metadata.get("input_artifacts") == metadata_extra.get("input_artifacts")
@@ -100,7 +96,6 @@ class PublicationAssemblyService:
         ]
         version = max(prior_versions, default=0) + 1
 
-        rendered = self._renderer.render(document) if self._renderer is not None else None
         candidate = await self._reusable_candidate(run, input_hash, canonical_bytes)
         if candidate is not None:
             metadata = dict(metadata_extra or {})
@@ -111,9 +106,6 @@ class PublicationAssemblyService:
                     "reused_from_created_at": candidate.created_at.isoformat(),
                 }
             )
-            _, _, rendered_blob_id = await self._artifact_store.store_stage_payloads(
-                rendered=rendered
-            )
             artifact = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=run.subject_id,
@@ -121,7 +113,6 @@ class PublicationAssemblyService:
                 version=version,
                 input_hash=input_hash,
                 canonical_blob_id=candidate.canonical_blob_id,
-                rendered_blob_id=rendered_blob_id,
                 reused_from_artifact_id=candidate.id,
                 metadata=metadata,
             )
@@ -129,8 +120,8 @@ class PublicationAssemblyService:
             await self._production_artifacts.append(artifact)
             return artifact
 
-        _, canonical_blob_id, rendered_blob_id = await self._artifact_store.store_stage_payloads(
-            canonical=document.to_json(), rendered=rendered
+        _, canonical_blob_id, _ = await self._artifact_store.store_stage_payloads(
+            canonical=document.to_json()
         )
         if canonical_blob_id is None:
             raise RuntimeError("Canonical publication body was not persisted")
@@ -142,7 +133,6 @@ class PublicationAssemblyService:
             version=version,
             input_hash=input_hash,
             canonical_blob_id=canonical_blob_id,
-            rendered_blob_id=rendered_blob_id,
             metadata=dict(metadata_extra or {}),
         )
         self._set_repair_result_id(artifact)

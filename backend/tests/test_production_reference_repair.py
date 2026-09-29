@@ -26,6 +26,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRun,
 )
+from cti_app.domain.production_pipeline import downstream_artifacts_from_artifact_stage
 
 RAW_Q1 = """# REFERENCES
 ## SOURCE S1
@@ -111,11 +112,12 @@ class _Artifacts:
 
     async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
         self.stale_calls.append((run_id, stage))
-        downstream = {
-            ProductionArtifactStage.EXTRACTION,
-            ProductionArtifactStage.SYNTHESIS,
-            ProductionArtifactStage.PUBLICATION,
-        }
+        try:
+            downstream = downstream_artifacts_from_artifact_stage(
+                ProductionArtifactStage(stage), inclusive=False
+            )
+        except ValueError:
+            return
         for item in self.items:
             if item.production_run_id == run_id and item.stage in downstream:
                 item.status = ProductionArtifactStatus.STALE

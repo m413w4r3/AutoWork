@@ -4,7 +4,7 @@ from cti_app.application.discovery.jobs import (
 )
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.config import get_settings
-from cti_app.domain.production import production_stages
+from cti_app.domain.production_pipeline import production_stages
 from cti_app.workers.tasks import DURABLE_RESUME_JOB_KINDS, execute_job
 
 

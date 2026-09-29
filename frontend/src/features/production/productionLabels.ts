@@ -1,7 +1,6 @@
 import { ApiError } from "../../api/editions";
 import type {
   ProductionBatchPhase,
-  ProductionStage,
   ProductionRunStatus,
 } from "../../api/production";
 
@@ -14,13 +13,7 @@ export const STATUS_LABELS: Record<ProductionRunStatus, string> = {
   cancelled: "Annulé",
 };
 
-export const STAGE_LABELS: Record<ProductionStage, string> = {
-  sources: "Sources",
-  references: "Références",
-  extraction: "Extraction",
-  synthesis: "Synthèse",
-  assembly: "Assemblage",
-};
+export { PRODUCTION_STAGE_LABELS as STAGE_LABELS } from "./productionStages";
 
 export const PHASE_LABELS: Record<ProductionBatchPhase, string> = {
   initial: "Production initiale",

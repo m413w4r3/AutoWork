@@ -7,6 +7,7 @@ import {
 import { listSubjects, type Edition, type Subject } from "../../api/editions";
 import type { ProductionStatus, StageStatus } from "../../api/production";
 import { STAGE_LABELS } from "../production/productionLabels";
+import { PRODUCTION_STAGE_ORDER } from "../production/productionStages";
 import { subjectProductionQuery } from "../production/subjectProductionQuery";
 import { TlpBadge } from "../editions/editionPresentation";
 import { Link } from "../../routing";
@@ -16,12 +17,9 @@ import { Link } from "../../routing";
  * property of the Subject. `sources` is left out on purpose — it would add a
  * column without telling the reader anything actionable.
  */
-const STAGE_COLUMNS = [
-  "references",
-  "extraction",
-  "synthesis",
-  "assembly",
-] as const;
+const STAGE_COLUMNS = PRODUCTION_STAGE_ORDER.filter(
+  (stage) => stage !== "sources",
+);
 
 type StageColumn = (typeof STAGE_COLUMNS)[number];
 type ProductionQuery = UseQueryResult<ProductionStatus | null>;

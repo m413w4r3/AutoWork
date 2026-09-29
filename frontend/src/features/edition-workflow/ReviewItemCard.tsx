@@ -13,6 +13,7 @@ import { resumeProductionRun } from "../../api/production";
 import { Link } from "../../routing";
 import { ReconciliationPanel } from "./ReconciliationPanel";
 import type { RepairQueueFilter } from "./RepairQueue";
+import { PRODUCTION_STAGE_LABELS } from "../production/productionStages";
 
 const STALE_MESSAGE =
   "Cet article a changé depuis son ouverture. La revue a été rechargée.";
@@ -27,13 +28,8 @@ const REBUILD_MESSAGE =
   "La publication a été invalidée par une réparation en amont. " +
   "L’article doit être reconstruit avant d’être publié.";
 
-const STAGE_LABELS: Record<string, string> = {
-  sources: "Collecte des sources",
-  references: "Références",
-  extraction: "Extraction",
-  synthesis: "Synthèse",
-  assembly: "Assemblage",
-};
+const reviewStageLabel = (stage: keyof typeof PRODUCTION_STAGE_LABELS) =>
+  stage === "sources" ? "Collecte des sources" : PRODUCTION_STAGE_LABELS[stage];
 function isStaleReviewError(error: unknown): boolean {
   return error instanceof ApiError && error.code === "review_item_stale";
 }
@@ -251,7 +247,7 @@ export function ReviewItemCard({
   // The backend resolves the stage a retry must start from; naming it here
   // tells the analyst what the click will actually run and what it will cost.
   const retryStageLabel =
-    item.retry_stage !== null ? STAGE_LABELS[item.retry_stage] : null;
+    item.retry_stage !== null ? reviewStageLabel(item.retry_stage) : null;
   const retryLabel = needsRebuild
     ? retryStageLabel
       ? `Reconstruire (${retryStageLabel})`

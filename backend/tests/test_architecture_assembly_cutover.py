@@ -1,4 +1,4 @@
-"""Permanent boundary gate for the AW-013 canonical production path."""
+"""Permanent boundary gate for the AW-014 canonical production path."""
 
 from __future__ import annotations
 
@@ -9,14 +9,13 @@ from cti_app.application.production_workflow import ProductionWorkflowOrchestrat
 
 _APPLICATION = Path(__file__).resolve().parents[1] / "src" / "cti_app" / "application"
 _CANONICAL_FILES = (
-    "pandoc_rendering.py",
     "production_stages.py",
+    "production_synthesis.py",
     "publication_builder.py",
     "publication_assembly.py",
     "publication_qa.py",
-    "publication_renderer.py",
 )
-_FORBIDDEN = (
+_LEGACY_FORBIDDEN = (
     "ReferenceReport",
     "TechnicalExtraction",
     "load_reference_projection",
@@ -26,11 +25,42 @@ _FORBIDDEN = (
     "apply_numbering",
     "[S1]",
 )
+_RENDERER_FORBIDDEN = (
+    "PandocRenderer",
+    "publication_renderer",
+    "production_legacy_assembly",
+    "render_publication_pandoc",
+    "export_markdown_docx",
+    "pandoc",
+    "Pandoc",
+    "DOCX",
+    "OOXML",
+    "reference-doc",
+)
 
 
 def test_canonical_assembly_qa_and_orchestrator_have_no_legacy_dependency() -> None:
-    sources = [(_APPLICATION / name).read_text() for name in _CANONICAL_FILES]
-    sources.append(inspect.getsource(ProductionWorkflowOrchestrator._execute_assembly_stage))
-    for source in sources:
-        for forbidden in _FORBIDDEN:
+    sources = {name: (_APPLICATION / name).read_text() for name in _CANONICAL_FILES}
+    sources["_execute_assembly_stage"] = inspect.getsource(
+        ProductionWorkflowOrchestrator._execute_assembly_stage
+    )
+    for name, source in sources.items():
+        for forbidden in _RENDERER_FORBIDDEN:
             assert forbidden not in source
+        # production_synthesis.py retains an explicitly out-of-scope legacy
+        # projection; this gate still checks its canonical path for renderers.
+        if name != "production_synthesis.py":
+            for forbidden in _LEGACY_FORBIDDEN:
+                assert forbidden not in source
+
+    assert not (_APPLICATION / "publication_renderer.py").exists()
+
+
+def test_pandoc_renderer_class_is_absent_from_active_backend_python() -> None:
+    active_python = Path(__file__).resolve().parents[1] / "src" / "cti_app"
+    occurrences = [
+        path.relative_to(active_python)
+        for path in active_python.rglob("*.py")
+        if "PandocRenderer" in path.read_text()
+    ]
+    assert occurrences == []

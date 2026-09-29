@@ -46,8 +46,8 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
     model_run_awaits_reconciliation,
-    production_stages,
 )
+from cti_app.domain.production_pipeline import production_stages
 
 # Every automatic production stage job — SOURCES from the API, and every
 # chained stage submitted by ProductionStageChain — shares this retry policy.

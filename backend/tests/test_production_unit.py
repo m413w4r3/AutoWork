@@ -25,6 +25,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_pipeline import downstream_artifacts_from_pipeline_stage
 
 
 class TestProductionRunStates:
@@ -336,7 +337,12 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
         async def mark_from_stage_stale(self, run_id: object, stage: str) -> list[str]:
             assert run_id == run.id
             assert stage == ProductionStage.EXTRACTION.value
-            affected = ["extraction", "synthesis", "publication"]
+            affected = [
+                artifact_stage.value
+                for artifact_stage in downstream_artifacts_from_pipeline_stage(
+                    ProductionStage(stage), inclusive=True
+                )
+            ]
             for artifact in artifacts:
                 if artifact.stage.value in affected:
                     artifact.status = ProductionArtifactStatus.STALE
