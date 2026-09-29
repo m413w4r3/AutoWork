@@ -392,9 +392,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         if not cited_refs <= set(extraction_evidence_refs_v1(extraction)):
             raise ValueError("Synthesis cites evidence absent from extraction")
         source_ids = {source.source_document_id for source in extraction.sources}
-        if any(
-            not set(item.source_document_ids) <= source_ids for item in synthesis.uncertainties
-        ):
+        if any(not set(item.source_document_ids) <= source_ids for item in synthesis.uncertainties):
             raise ValueError("Synthesis uncertainty cites an absent source")
         canonical_payload = production_synthesis_to_json(synthesis)
         paragraphs = (*synthesis.lead, *(p for s in synthesis.sections for p in s.paragraphs))
@@ -456,6 +454,7 @@ class SynthesisService(_ArtifactPayloadMixin):
 
             await uow.commit()
             return artifact
+
 
 class PublicationAssemblyService(_ArtifactPayloadMixin):
     """Manages publication assembly stage (deterministic)."""

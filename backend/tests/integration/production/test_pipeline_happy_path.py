@@ -174,7 +174,9 @@ def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModel
             requested_model=str(adapter.requested_model),
             actual_model_version=str(adapter.requested_model),
             usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-            response_id=f"canonical-synthesis-{len(requests)}",
+            # model_runs.response_id is globally unique: derive it from the
+            # gateway's per-attempt request id, never from a per-test counter.
+            response_id=f"canonical-synthesis-{request.request_id}",
             output_text=proposal.model_dump_json(),
             structured_output=proposal,
         )

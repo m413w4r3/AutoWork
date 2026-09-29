@@ -283,7 +283,7 @@ class _CountingRetryModelAdapter:
                 requested_model=self.requested_model,
                 actual_model_version=self.requested_model,
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                response_id=f"retry-synthesis-{len(self.calls)}",
+                response_id=f"retry-synthesis-{request.request_id}",
                 output_text=proposal.model_dump_json(),
                 structured_output=proposal,
             )
