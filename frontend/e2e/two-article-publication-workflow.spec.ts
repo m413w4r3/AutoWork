@@ -254,7 +254,6 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       current_stage: "assembly",
       progress_current: 5,
       progress_total: 5,
-      synthesis_conversation_id: null,
       run_id: currentRun,
       pipeline_generation: 2,
       created_at: "2026-08-29T00:02:00Z",
