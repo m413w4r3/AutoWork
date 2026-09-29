@@ -19,7 +19,10 @@ from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.semantic_annotation import SemanticAnnotator
 from cti_app.domain.production import ProductionInputSnapshot
-from cti_app.domain.production_extraction import ProductionExtractionV1
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ProductionExtractionV1,
+)
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
@@ -29,6 +32,7 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
+    PUBLICATION_IOC_ARTIFACT_TYPES,
     PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
     Indicator,
@@ -36,6 +40,8 @@ from cti_app.domain.publication import (
     PublicationDocumentV2,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
@@ -58,6 +64,16 @@ class _PublicationNarrativeProjection:
     sections: tuple[PublicationSectionV1, ...]
     timeline: tuple[PublicationTimelineEntryV1, ...]
     uncertainties: tuple[PublicationUncertaintyV1, ...]
+    used_source_document_ids: frozenset[UUID]
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationContentProjection:
+    lead: tuple[PublicationParagraphV1, ...]
+    sections: tuple[PublicationSectionV1, ...]
+    timeline: tuple[PublicationTimelineEntryV1, ...]
+    uncertainties: tuple[PublicationUncertaintyV1, ...]
+    indicators: tuple[PublicationIndicatorGroupV1, ...]
     used_source_document_ids: frozenset[UUID]
 
 
@@ -123,6 +139,58 @@ def _project_synthesis_publication(
         sections=sections,
         timeline=timeline,
         uncertainties=uncertainties,
+        used_source_document_ids=frozenset(used_source_document_ids),
+    )
+
+
+def _project_publication_iocs(
+    *, extraction: ProductionExtractionV1, narrative: _PublicationNarrativeProjection
+) -> _PublicationContentProjection:
+    """Add confirmed canonical IOCs to the narrative projection."""
+    occurrences: dict[tuple[ArtifactType, str], tuple[set[str], set[UUID]]] = {}
+    for source in extraction.sources:
+        for item in source.indicators:
+            if (
+                item.indicator_status is not ExtractionIndicatorStatus.CONFIRMED_IOC
+                or item.artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES
+            ):
+                continue
+            try:
+                normalized_value = normalize_indicator_value(item.value, item.artifact_type)
+            except ValueError:
+                continue
+            identity = (item.artifact_type, normalized_value)
+            values, source_document_ids = occurrences.setdefault(identity, (set(), set()))
+            values.add(item.value)
+            source_document_ids.update(item.source_document_ids)
+
+    grouped: dict[ArtifactType, list[PublicationIndicatorV1]] = defaultdict(list)
+    used_source_document_ids = set(narrative.used_source_document_ids)
+    for (artifact_type, normalized_value), (values, source_document_ids) in sorted(
+        occurrences.items(),
+        key=lambda item: (item[0][0].value, item[0][1]),
+    ):
+        ordered_source_ids = tuple(sorted(source_document_ids, key=str))
+        used_source_document_ids.update(ordered_source_ids)
+        grouped[artifact_type].append(
+            PublicationIndicatorV1(
+                value=min(values),
+                normalized_value=normalized_value,
+                artifact_type=artifact_type,
+                source_document_ids=ordered_source_ids,
+            )
+        )
+
+    indicators = tuple(
+        PublicationIndicatorGroupV1(artifact_type, tuple(grouped[artifact_type]))
+        for artifact_type in sorted(grouped, key=lambda value: value.value)
+    )
+    return _PublicationContentProjection(
+        lead=narrative.lead,
+        sections=narrative.sections,
+        timeline=narrative.timeline,
+        uncertainties=narrative.uncertainties,
+        indicators=indicators,
         used_source_document_ids=frozenset(used_source_document_ids),
     )
 

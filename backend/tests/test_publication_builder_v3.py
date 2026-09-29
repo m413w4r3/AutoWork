@@ -7,6 +7,7 @@ import pytest
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
+    _project_publication_iocs,
     _project_synthesis_publication,
     _validate_publication_v3_lineage,
     _validate_synthesis_evidence_refs,
@@ -22,6 +23,8 @@ from cti_app.domain.production import (
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionFactV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
@@ -47,8 +50,11 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication import (
+    ArtifactType,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
@@ -404,3 +410,182 @@ def test_synthesis_publication_projection_validates_evidence_before_conversion()
 
     with pytest.raises(ValueError, match="absent from the current extraction"):
         _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+
+
+def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenance() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    source_a = extraction.sources[0]
+    source_b_id = UUID(int=5)
+
+    def indicator(
+        value: str,
+        artifact_type: ArtifactType,
+        status: ExtractionIndicatorStatus,
+        source_document_id: UUID,
+    ) -> ExtractionIndicatorV1:
+        return ExtractionIndicatorV1(
+            value=value,
+            artifact_type=artifact_type,
+            indicator_status=status,
+            context="",
+            evidence_quote=f"The source identifies {value}.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source_document_id,),
+        )
+
+    source_a = replace(
+        source_a,
+        indicators=(
+            indicator(
+                "Example[.]COM.",
+                ArtifactType.DOMAIN,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_a.source_document_id,
+            ),
+            indicator(
+                "Analyst[at]Example[.]COM",
+                ArtifactType.EMAIL,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_a.source_document_id,
+            ),
+            indicator(
+                "A" * 64,
+                ArtifactType.HASH,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_a.source_document_id,
+            ),
+            indicator(
+                "2001:DB8::1",
+                ArtifactType.IP,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_a.source_document_id,
+            ),
+            indicator(
+                "HXXPS://Example[.]COM/Path",
+                ArtifactType.URL,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_a.source_document_id,
+            ),
+            indicator(
+                "contextual.example",
+                ArtifactType.DOMAIN,
+                ExtractionIndicatorStatus.CONTEXTUAL,
+                source_a.source_document_id,
+            ),
+            *(
+                indicator(
+                    "rule artifact",
+                    artifact_type,
+                    ExtractionIndicatorStatus.CONFIRMED_IOC,
+                    source_a.source_document_id,
+                )
+                for artifact_type in (
+                    ArtifactType.YARA_RULE,
+                    ArtifactType.SIGMA_RULE,
+                    ArtifactType.SURICATA_RULE,
+                )
+            ),
+        ),
+    )
+    source_b = replace(
+        source_a,
+        source_document_id=source_b_id,
+        canonical_url="https://example.com/second",
+        facts=(),
+        events=(),
+        indicators=(
+            indicator(
+                "example.com",
+                ArtifactType.DOMAIN,
+                ExtractionIndicatorStatus.CONFIRMED_IOC,
+                source_b_id,
+            ),
+        ),
+        uncertainties=(),
+    )
+    extraction = replace(extraction, sources=(source_a, source_b))
+    synthesis = replace(
+        synthesis,
+        uncertainties=(
+            SynthesisUncertaintyV1("Uncertain finding.", (source_a.source_document_id,)),
+        ),
+    )
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+
+    projection = _project_publication_iocs(extraction=extraction, narrative=narrative)
+
+    assert projection.indicators == (
+        PublicationIndicatorGroupV1(
+            ArtifactType.DOMAIN,
+            (
+                PublicationIndicatorV1(
+                    "Example[.]COM.",
+                    "example.com",
+                    ArtifactType.DOMAIN,
+                    (source_a.source_document_id, source_b_id),
+                ),
+            ),
+        ),
+        PublicationIndicatorGroupV1(
+            ArtifactType.EMAIL,
+            (
+                PublicationIndicatorV1(
+                    "Analyst[at]Example[.]COM",
+                    "Analyst@example.com",
+                    ArtifactType.EMAIL,
+                    (source_a.source_document_id,),
+                ),
+            ),
+        ),
+        PublicationIndicatorGroupV1(
+            ArtifactType.HASH,
+            (
+                PublicationIndicatorV1(
+                    "A" * 64,
+                    "a" * 64,
+                    ArtifactType.HASH,
+                    (source_a.source_document_id,),
+                ),
+            ),
+        ),
+        PublicationIndicatorGroupV1(
+            ArtifactType.IP,
+            (
+                PublicationIndicatorV1(
+                    "2001:DB8::1",
+                    "2001:db8::1",
+                    ArtifactType.IP,
+                    (source_a.source_document_id,),
+                ),
+            ),
+        ),
+        PublicationIndicatorGroupV1(
+            ArtifactType.URL,
+            (
+                PublicationIndicatorV1(
+                    "HXXPS://Example[.]COM/Path",
+                    "https://example.com/Path",
+                    ArtifactType.URL,
+                    (source_a.source_document_id,),
+                ),
+            ),
+        ),
+    )
+    assert projection.used_source_document_ids == frozenset(
+        {source_a.source_document_id, source_b_id}
+    )
+
+    reordered_extraction = replace(
+        extraction,
+        sources=(
+            replace(source_a, indicators=tuple(reversed(source_a.indicators))),
+            replace(source_b, indicators=tuple(reversed(source_b.indicators))),
+        ),
+    )
+    assert (
+        _project_publication_iocs(
+            extraction=reordered_extraction,
+            narrative=narrative,
+        )
+        == projection
+    )
