@@ -1,10 +1,170 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
+import { isProductionSynthesisV1 } from "../api/production";
 import { ProductionArtifactView } from "./ProductionArtifactView";
 
 afterEach(() => vi.unstubAllGlobals());
+
+const SYNTHESIS_SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const VENDOR_DOCUMENT_ID = "11111111-1111-4111-8111-111111111111";
+const IOC_DOCUMENT_ID = "22222222-2222-4222-8222-222222222222";
+const UNKNOWN_DOCUMENT_ID = "99999999-9999-4999-8999-999999999999";
+const VENDOR_URL = "https://vendor.example/report";
+const IOC_URL = "https://research.example/iocs";
+const EVIDENCE_KEY = "f".repeat(64);
+
+function evidenceRef(documentId: string, kind: string) {
+  return {
+    source_document_id: documentId,
+    kind,
+    evidence_key: EVIDENCE_KEY,
+  };
+}
+
+function extractionSource(documentId: string, canonicalUrl: string) {
+  return {
+    source_document_id: documentId,
+    canonical_url: canonicalUrl,
+    content_sha256: "c".repeat(64),
+    tier: "core",
+    kind: "publication",
+    role: "primary",
+    profile: "full",
+    checkpoint_id: "33333333-3333-4333-8333-333333333333",
+    reuse_state: "fresh",
+    facts: [],
+    events: [],
+    indicators: [],
+    rules: [],
+    uncertainties: [],
+  };
+}
+
+function extractionArtifact(sources: unknown[]) {
+  return {
+    artifact_id: "extraction-1",
+    stage: "extraction",
+    version: 1,
+    status: "verified",
+    metadata: {},
+    rendered_content: null,
+    canonical_content: {
+      schema_version: 1,
+      subject_id: SYNTHESIS_SUBJECT_ID,
+      production_input_hash: "a".repeat(64),
+      references_corpus_hash: "b".repeat(64),
+      profile_policy_version: "production-reference-tier-v1",
+      sources,
+      omitted_sources: [],
+      warnings: [],
+    },
+  };
+}
+
+function synthesisArtifact(
+  contentOverrides: Record<string, unknown> = {},
+  artifactOverrides: Record<string, unknown> = {},
+) {
+  return {
+    artifact_id: "synthesis-1",
+    stage: "synthesis",
+    version: 1,
+    status: "verified",
+    metadata: { mode: "fresh", language: "fr" },
+    rendered_content: null,
+    canonical_content: {
+      schema_version: 1,
+      subject_id: SYNTHESIS_SUBJECT_ID,
+      production_input_hash: "a".repeat(64),
+      extraction_hash: "b".repeat(64),
+      publication_language: "fr",
+      synthesis_policy_version: "production-synthesis-v1",
+      title: "Campagne Cavern Manticore",
+      lead: [
+        {
+          text: "Le groupe exploite une faille d’accès initial.",
+          evidence_refs: [
+            evidenceRef(VENDOR_DOCUMENT_ID, "fact"),
+            evidenceRef(VENDOR_DOCUMENT_ID, "event"),
+            evidenceRef(IOC_DOCUMENT_ID, "indicator"),
+          ],
+        },
+      ],
+      sections: [
+        {
+          kind: "infection_chain",
+          heading: "Progression de l’attaque",
+          paragraphs: [
+            {
+              text: "Le leurre déclenche une chaîne PowerShell.",
+              evidence_refs: [evidenceRef(IOC_DOCUMENT_ID, "rule")],
+            },
+          ],
+        },
+      ],
+      timeline: [
+        {
+          event_date: "2026-08-20",
+          date_text: null,
+          text: "Début de la campagne observée.",
+          evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
+        },
+      ],
+      uncertainties: [
+        {
+          text: "Le domaine C2 peut être partagé.",
+          source_document_ids: [IOC_DOCUMENT_ID],
+        },
+      ],
+      warnings: ["Un fait mineur n’a pas pu être rattaché."],
+      ...contentOverrides,
+    },
+    ...artifactOverrides,
+  };
+}
+
+function urlOf(input: RequestInfo | URL): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  return input.url;
+}
+
+/** Route each artifact request to its own payload, like the real API. */
+function stubProductionFetch(payloads: {
+  synthesis: unknown;
+  extraction?: unknown;
+}) {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/production/artifacts/synthesis")) {
+        return Promise.resolve(Response.json(payloads.synthesis));
+      }
+      if (url.includes("/production/artifacts/extraction")) {
+        return Promise.resolve(
+          Response.json(payloads.extraction ?? extractionArtifact([])),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }),
+  );
+}
+
+function renderArtifact(
+  stage: "references" | "extraction" | "synthesis" | "publication",
+) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <ProductionArtifactView subjectId="subject-1" stage={stage} />
+    </QueryClientProvider>,
+  );
+}
 
 it("construit la preview de publication depuis le JSON canonique", async () => {
   vi.stubGlobal(
@@ -70,39 +230,32 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
 });
 
 it("préserve la provenance visible d'un artifact réutilisé", async () => {
-  vi.stubGlobal(
-    "fetch",
-    vi.fn().mockResolvedValue(
-      Response.json({
+  stubProductionFetch({
+    synthesis: synthesisArtifact(
+      { title: "Synthèse canonique réutilisée" },
+      {
         artifact_id: "synthesis-b",
-        stage: "synthesis",
-        version: 1,
-        status: "verified",
         reused: true,
         reused_from_artifact_id: "synthesis-a",
         reused_from_created_at: "2026-08-10T10:00:00Z",
-        metadata: {},
-        rendered_content: "Synthèse canonique réutilisée",
-        canonical_content: { body: "Synthèse canonique réutilisée" },
-      }),
+        metadata: { mode: "reuse_exact", language: "fr" },
+      },
     ),
-  );
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
   });
 
-  render(
-    <QueryClientProvider client={client}>
-      <ProductionArtifactView subjectId="subject-1" stage="synthesis" />
-    </QueryClientProvider>,
-  );
+  renderArtifact("synthesis");
 
   expect(
     await screen.findByText(/Réutilisé depuis un calcul précédent/),
   ).toBeInTheDocument();
   expect(screen.getByText(/artifact source : synthesis-a/)).toBeInTheDocument();
   expect(screen.getByText(/calcul original/)).toBeInTheDocument();
-  expect(screen.getByText("Synthèse canonique réutilisée")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Synthèse canonique réutilisée" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Réutilisation d’une synthèse identique"),
+  ).toBeInTheDocument();
 });
 
 it("affiche toutes les sources du corpus REFERENCES V1 avec leur URL canonique", async () => {
@@ -437,4 +590,173 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
     screen.getByText("extraction_source_text_unreadable"),
   ).toBeInTheDocument();
   expect(screen.queryByText(/schema_version/)).not.toBeInTheDocument();
+});
+
+it("rend la synthèse canonique V1 et la provenance exacte de ses évidences", async () => {
+  stubProductionFetch({
+    synthesis: synthesisArtifact(
+      {},
+      {
+        rendered_content:
+          "# Titre Markdown non canonique\n\nNe pas interpréter.",
+      },
+    ),
+    extraction: extractionArtifact([
+      extractionSource(VENDOR_DOCUMENT_ID, VENDOR_URL),
+      extractionSource(IOC_DOCUMENT_ID, IOC_URL),
+    ]),
+  });
+
+  const { container } = renderArtifact("synthesis");
+
+  expect(
+    await screen.findByRole("heading", { name: "Campagne Cavern Manticore" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Langue de publication")).toBeInTheDocument();
+  expect(screen.getByText("fr")).toBeInTheDocument();
+  expect(screen.getByText("Mode de génération")).toBeInTheDocument();
+  expect(screen.getByText("Rédaction initiale")).toBeInTheDocument();
+  expect(
+    screen.getByText("Le groupe exploite une faille d’accès initial."),
+  ).toBeInTheDocument();
+  expect(screen.getByText("3 preuves")).toBeInTheDocument();
+  // Two refs on the same document: one link, not two.
+  const leadParagraph = screen
+    .getByText("Le groupe exploite une faille d’accès initial.")
+    .closest(".synthesis-paragraph");
+  expect(leadParagraph).not.toBeNull();
+  expect(
+    within(leadParagraph as HTMLElement).getAllByRole("link", {
+      name: VENDOR_URL,
+    }),
+  ).toHaveLength(1);
+  expect(
+    within(leadParagraph as HTMLElement).getByRole("link", { name: IOC_URL }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: /Progression de l’attaque/ }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Chaîne d’infection")).toBeInTheDocument();
+  expect(screen.getByText(/20 août 2026/)).toBeInTheDocument();
+  expect(
+    screen.getByText("Début de la campagne observée."),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Le domaine C2 peut être partagé."),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Un fait mineur n’a pas pu être rattaché."),
+  ).toBeInTheDocument();
+  // Le Markdown rendu reste une projection secondaire, jamais la source.
+  expect(
+    screen.queryByRole("heading", { name: /Markdown non canonique/ }),
+  ).toBeNull();
+  expect(screen.getByText(/Ne pas interpréter\./)).toBeInTheDocument();
+  // L'identité interne d'évidence n'est pas un handle prompt exposé.
+  expect(container.textContent).not.toContain(EVIDENCE_KEY);
+  expect(container.querySelector('a[href*="#conversations"]')).toBeNull();
+});
+
+it("conserve une source d’évidence inconnue sans la substituer", async () => {
+  stubProductionFetch({
+    synthesis: synthesisArtifact({
+      lead: [
+        {
+          text: "Un paragraphe cite trois évidences.",
+          evidence_refs: [
+            evidenceRef(VENDOR_DOCUMENT_ID, "fact"),
+            evidenceRef(VENDOR_DOCUMENT_ID, "event"),
+            evidenceRef(UNKNOWN_DOCUMENT_ID, "rule"),
+          ],
+        },
+      ],
+      sections: [],
+      timeline: [],
+      uncertainties: [],
+      warnings: [],
+    }),
+    extraction: extractionArtifact([
+      extractionSource(VENDOR_DOCUMENT_ID, VENDOR_URL),
+    ]),
+  });
+
+  renderArtifact("synthesis");
+
+  expect(await screen.findByText("3 preuves")).toBeInTheDocument();
+  expect(screen.getAllByRole("link", { name: VENDOR_URL })).toHaveLength(1);
+  const unknown = screen.getByText("Source inconnue");
+  expect(unknown).toHaveAttribute(
+    "data-source-document-id",
+    UNKNOWN_DOCUMENT_ID,
+  );
+  expect(unknown).toHaveAttribute("title", UNKNOWN_DOCUMENT_ID);
+  expect(screen.queryByRole("link", { name: IOC_URL })).toBeNull();
+  expect(
+    screen.getByText("Aucun événement de chronologie."),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Aucune incertitude signalée.")).toBeInTheDocument();
+  expect(screen.getByText("Aucun warning.")).toBeInTheDocument();
+});
+
+it("rend la synthèse canonique même quand l’extraction n’est pas résolue", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/production/artifacts/synthesis")) {
+        return Promise.resolve(Response.json(synthesisArtifact()));
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    }),
+  );
+
+  renderArtifact("synthesis");
+
+  expect(
+    await screen.findByRole("heading", { name: "Campagne Cavern Manticore" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Extraction canonique indisponible/),
+  ).toBeInTheDocument();
+  expect(screen.getAllByText("Source inconnue").length).toBeGreaterThan(0);
+  expect(screen.getByText("3 preuves")).toBeInTheDocument();
+});
+
+it("décode strictement la charge canonique de synthèse V1", () => {
+  const canonical = synthesisArtifact().canonical_content;
+  expect(isProductionSynthesisV1(canonical)).toBe(true);
+  expect(
+    isProductionSynthesisV1({
+      ...canonical,
+      prompt_handles: ["handle-1"],
+    }),
+  ).toBe(false);
+  const missingTitle: Record<string, unknown> = { ...canonical };
+  delete missingTitle.title;
+  expect(isProductionSynthesisV1(missingTitle)).toBe(false);
+  expect(
+    isProductionSynthesisV1({
+      ...canonical,
+      lead: [{ text: "Sans évidence.", evidence_refs: [] }],
+    }),
+  ).toBe(false);
+  expect(
+    isProductionSynthesisV1({
+      ...canonical,
+      sections: [{ kind: "h1", heading: "Titre", paragraphs: [] }],
+    }),
+  ).toBe(false);
+  expect(
+    isProductionSynthesisV1({
+      ...canonical,
+      timeline: [
+        {
+          event_date: "2026-13-45",
+          date_text: null,
+          text: "Date invalide.",
+          evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
+        },
+      ],
+    }),
+  ).toBe(false);
 });

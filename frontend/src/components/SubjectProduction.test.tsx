@@ -66,7 +66,6 @@ function status(
     current_stage: currentStage,
     progress_current: 2,
     progress_total: 5,
-    synthesis_conversation_id: null,
     run_id: "r-1",
     pipeline_generation: 3,
     created_at: "2026-08-10T10:00:00Z",
@@ -715,15 +714,10 @@ describe("SubjectProduction retry from stage", () => {
     expect(screen.getAllByRole("option")).toHaveLength(6);
   });
 
-  it("REFERENCES n’expose plus de lien vers une conversation de recherche", async () => {
+  it("la synthèse n’est plus liée à une conversation", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        Response.json({
-          ...status("ready", "assembly"),
-          synthesis_conversation_id: "c-2",
-        }),
-      ),
+      vi.fn().mockResolvedValue(Response.json(status("ready", "assembly"))),
     );
     renderProduction();
     const references = await screen.findByRole("link", {
@@ -736,11 +730,19 @@ describe("SubjectProduction retry from stage", () => {
     expect(
       screen.queryByRole("link", { name: "Voir la recherche" }),
     ).toBeNull();
-    const conversationLinks = screen
-      .getAllByRole("link")
-      .filter((link) => link.getAttribute("href")?.endsWith("#conversations"));
-    expect(conversationLinks).toHaveLength(1);
-    expect(conversationLinks[0]).toHaveTextContent("Voir la synthèse");
+    expect(
+      screen.getByRole("link", { name: "Voir la synthèse" }),
+    ).toHaveAttribute(
+      "href",
+      `/subjects/${SUBJECT_ID}/production/artifacts/synthesis`,
+    );
+    expect(
+      screen
+        .getAllByRole("link")
+        .filter((link) =>
+          link.getAttribute("href")?.includes("#conversations"),
+        ),
+    ).toHaveLength(0);
   });
 
   it("RUNNING n’affiche aucune action retry", async () => {
