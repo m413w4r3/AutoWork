@@ -153,7 +153,8 @@ describe("SubjectProduction retry from stage", () => {
     await user.click(
       await screen.findByRole("button", { name: "Produire cet article" }),
     );
-    await waitFor(() => expect(attempts).toBe(2));
+    // The mutation's first retry waits TanStack's default 1000 ms delay.
+    await waitFor(() => expect(attempts).toBe(2), { timeout: 3000 });
 
     expect(postCalls).toHaveLength(2);
     expect(postCalls[0]?.headers).toEqual(postCalls[1]?.headers);

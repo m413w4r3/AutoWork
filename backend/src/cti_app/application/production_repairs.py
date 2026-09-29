@@ -15,6 +15,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.extraction import _html_encoding, parse_document
+from cti_app.application.pandoc_rendering import PandocRenderer
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import (
     MAX_REPAIR_EVIDENCE_BYTES,
@@ -28,6 +29,11 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_extraction import (
     extraction_compatibility_view,
     is_current_source_checkpoint,
+)
+from cti_app.application.production_legacy_assembly import (
+    LegacyProductionQAService,
+    LegacyPublicationAssemblyService,
+    assembly_synthesis_text,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
@@ -71,14 +77,16 @@ from cti_app.application.production_source_evidence import (
     source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
 )
-from cti_app.application.production_stages import (
-    ExtractionService,
-    ProductionQAService,
-    PublicationAssemblyService,
-    assembly_synthesis_text,
-    compute_input_hash,
+from cti_app.application.production_stages import ExtractionService, compute_input_hash
+from cti_app.application.production_synthesis import (
+    build_synthesis_evidence_pack,
+    canonical_extraction_hash,
 )
-from cti_app.application.production_synthesis import build_synthesis_evidence_pack
+from cti_app.application.publication_assembly import (
+    PublicationAssemblyService as CanonicalAssemblyService,
+)
+from cti_app.application.publication_builder import PublicationAssemblyValidationError
+from cti_app.application.publication_qa import ProductionQAService
 from cti_app.domain.collection import CollectionState, DetectedMimeType
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
@@ -115,6 +123,7 @@ from cti_app.domain.production_extraction import (
     ExtractionRuleV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -124,8 +133,14 @@ from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     extraction_evidence_refs_v1,
     production_synthesis_from_json,
+    production_synthesis_to_json,
+    synthesis_evidence_refs,
 )
-from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationDocumentV3,
+    is_publication_ioc_artifact_type,
+)
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 REPAIR_PLANNER_VERSION = "33.1"
@@ -3665,8 +3680,8 @@ class ProductionRepairMaterializationService:
         self,
         uow_factory: ProductionUnitOfWorkFactory,
         projection_service: ProductionRepairProjectionService | None = None,
-        publication_assembly_service: PublicationAssemblyService | None = None,
-        qa_service: ProductionQAService | None = None,
+        publication_assembly_service: LegacyPublicationAssemblyService | None = None,
+        qa_service: LegacyProductionQAService | None = None,
         checkpoint_service: Any | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
@@ -3677,10 +3692,10 @@ class ProductionRepairMaterializationService:
         )
         resolved_store = artifact_store or getattr(self._projection, "_artifact_store", None)
         self._artifact_store = resolved_store
-        self._assembly = publication_assembly_service or PublicationAssemblyService(
-            uow_factory, resolved_store
-        )
-        self._qa = qa_service or ProductionQAService(uow_factory)
+        # Explicit injected services are kept for historical repair fixtures.
+        # Normal materialization uses the canonical V3 path below.
+        self._assembly = publication_assembly_service
+        self._qa = qa_service
         self._checkpoint = checkpoint_service
         self._diagnostics = diagnostics or DiagnosticsLog(None)
 
@@ -3843,11 +3858,20 @@ class ProductionRepairMaterializationService:
                     reused_synthesis=True,
                 )
             elif impact.kind is ProductionRepairImpactKind.RULE_BUNDLE_ONLY:
-                # Synthesis and Publication stay semantically valid, so the
-                # QA runs against the outputs that remain current.
-                qa_result = await self._qa_current_outputs_in_uow(
-                    uow, run=run, extraction=projection.artifact
-                )
+                if self._assembly is None:
+                    # A changed canonical Extraction needs new lineage even
+                    # when only detection rules changed editorially.
+                    publication, qa_result = await self._materialize_publication_in_uow(
+                        uow,
+                        run=run,
+                        extraction=projection.artifact,
+                        repair_materialization=repair_audit,
+                    )
+                    repair_audit["result_publication_artifact_id"] = str(publication.id)
+                else:
+                    qa_result = await self._qa_current_outputs_in_uow(
+                        uow, run=run, extraction=projection.artifact
+                    )
             else:
                 await self._mark_stages_stale(
                     uow,
@@ -4055,6 +4079,13 @@ class ProductionRepairMaterializationService:
         one change: an Assembly or QA failure raises, the caller never
         commits, and the article stays exactly as it was before the repair.
         """
+        if self._assembly is None:
+            return await self._materialize_canonical_publication_in_uow(
+                uow,
+                run=run,
+                extraction=extraction,
+                repair_materialization=repair_materialization,
+            )
         run_id = run.id
         references = await uow.production_artifacts.get_current(
             run_id, ProductionArtifactStage.REFERENCES.value
@@ -4109,6 +4140,152 @@ class ProductionRepairMaterializationService:
         )
         await self._ensure_qa_passed(qa_result)
         return new_publication, qa_result
+
+    async def _materialize_canonical_publication_in_uow(
+        self,
+        uow: Any,
+        *,
+        run: Any,
+        extraction: ProductionArtifact,
+        repair_materialization: Mapping[str, Any] | None,
+    ) -> tuple[ProductionArtifact, dict[str, Any]]:
+        """Rebind unchanged narrative to IOC repairs, then assemble V3 atomically."""
+        store = self._artifact_store
+        if store is None or extraction.canonical_blob_id is None:
+            raise ProductionRepairProjectionError("assembly_inputs_missing")
+        snapshot = await uow.production_input_snapshots.get_by_run(run.id)
+        references_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.REFERENCES.value
+        )
+        synthesis_artifact = await uow.production_artifacts.get_current(
+            run.id, ProductionArtifactStage.SYNTHESIS.value
+        )
+        if (
+            not isinstance(snapshot, ProductionInputSnapshot)
+            or references_artifact is None
+            or references_artifact.canonical_blob_id is None
+            or synthesis_artifact is None
+            or synthesis_artifact.canonical_blob_id is None
+        ):
+            raise ProductionRepairProjectionError("assembly_inputs_missing")
+        try:
+            references = production_reference_corpus_from_json(
+                await store.read_json(references_artifact.canonical_blob_id)
+            )
+            canonical_extraction = production_extraction_from_json(
+                await store.read_json(extraction.canonical_blob_id)
+            )
+            synthesis = production_synthesis_from_json(
+                await store.read_json(synthesis_artifact.canonical_blob_id)
+            )
+            extraction_hash = canonical_extraction_hash(canonical_extraction)
+            if synthesis.extraction_hash != extraction_hash:
+                current_refs = set(extraction_evidence_refs_v1(canonical_extraction))
+                if not synthesis_evidence_refs(synthesis) <= current_refs:
+                    raise ProductionRepairProjectionError("assembly_evidence_missing")
+                prior_extractions = [
+                    artifact
+                    for artifact in await uow.production_artifacts.list_for_run(run.id)
+                    if artifact.stage is ProductionArtifactStage.EXTRACTION
+                    and artifact.version < extraction.version
+                    and artifact.canonical_blob_id is not None
+                ]
+                lineage_found = False
+                for prior in prior_extractions:
+                    previous = production_extraction_from_json(
+                        await store.read_json(cast(UUID, prior.canonical_blob_id))
+                    )
+                    if canonical_extraction_hash(previous) == synthesis.extraction_hash:
+                        lineage_found = True
+                        break
+                if not lineage_found:
+                    raise ProductionRepairProjectionError("assembly_inputs_mismatch")
+                synthesis = replace(synthesis, extraction_hash=extraction_hash)
+                _, synthesis_blob_id, _ = await store.store_stage_payloads(
+                    canonical=production_synthesis_to_json(synthesis)
+                )
+                if synthesis_blob_id is None:
+                    raise ProductionRepairProjectionError("assembly_inputs_missing")
+                await self._mark_stages_stale(
+                    uow, run.id, {ProductionArtifactStage.SYNTHESIS.value}
+                )
+                versions = [
+                    artifact.version
+                    for artifact in await uow.production_artifacts.list_for_run(run.id)
+                    if artifact.stage is ProductionArtifactStage.SYNTHESIS
+                ]
+                rebased = ProductionArtifact(
+                    production_run_id=run.id,
+                    subject_id=run.subject_id,
+                    stage=ProductionArtifactStage.SYNTHESIS,
+                    version=max(versions, default=0) + 1,
+                    input_hash=compute_input_hash(
+                        {
+                            "policy": "synthesis-lineage-rebase-v1",
+                            "source_input_hash": synthesis_artifact.input_hash,
+                            "extraction_hash": extraction_hash,
+                        }
+                    ),
+                    canonical_blob_id=synthesis_blob_id,
+                    rendered_blob_id=synthesis_artifact.rendered_blob_id,
+                    reused_from_artifact_id=synthesis_artifact.id,
+                    metadata={
+                        **synthesis_artifact.metadata,
+                        "reused": True,
+                        "reused_from_artifact_id": str(synthesis_artifact.id),
+                        "reused_from_created_at": synthesis_artifact.created_at.isoformat(),
+                        "lineage_rebased": True,
+                    },
+                )
+                await uow.production_artifacts.append(rebased)
+                synthesis_artifact = rebased
+
+            publication = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.PUBLICATION.value
+            )
+            if publication is not None:
+                await self._mark_stages_stale(
+                    uow, run.id, {ProductionArtifactStage.PUBLICATION.value}
+                )
+            metadata: dict[str, Any] = {
+                "input_artifacts": {
+                    "references_artifact_id": str(references_artifact.id),
+                    "extraction_artifact_id": str(extraction.id),
+                    "synthesis_artifact_id": str(synthesis_artifact.id),
+                }
+            }
+            if repair_materialization is not None:
+                metadata["repair_materialization"] = dict(repair_materialization)
+            new_publication = await CanonicalAssemblyService(
+                store, uow.production_artifacts, PandocRenderer()
+            ).assemble_publication(
+                run=run,
+                snapshot=snapshot,
+                references=references,
+                extraction=canonical_extraction,
+                synthesis=synthesis,
+                metadata_extra=metadata,
+            )
+            if new_publication.canonical_blob_id is None:
+                raise ProductionRepairProjectionError("assembly_inputs_missing")
+            document = PublicationDocumentV3.from_json(
+                await store.read_json(new_publication.canonical_blob_id)
+            )
+            qa_result = await ProductionQAService().run_qa(
+                snapshot=snapshot,
+                references=references,
+                extraction=canonical_extraction,
+                synthesis=synthesis,
+                publication=document,
+            )
+            await self._ensure_qa_passed(qa_result)
+            return new_publication, qa_result
+        except ProductionRepairProjectionError:
+            raise
+        except PublicationAssemblyValidationError as exc:
+            raise ProductionRepairProjectionError(exc.code.value) from exc
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ProductionRepairProjectionError("assembly_validation_failed") from exc
 
     async def _qa_current_outputs_in_uow(
         self,
@@ -4172,6 +4349,8 @@ class ProductionRepairMaterializationService:
     ) -> dict[str, Any]:
         if self._artifact_store is None:
             return {"passed": True, "checks": {}, "errors": [], "warnings": []}
+        if self._assembly is None or self._qa is None:
+            raise ProductionRepairProjectionError("publication_qa_inputs_missing")
         report, extraction_value, synthesis_text = await self._assembly._load_inputs(
             references, extraction, synthesis
         )

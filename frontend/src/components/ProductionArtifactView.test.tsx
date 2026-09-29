@@ -239,6 +239,116 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
   expect(screen.queryByText(/custom-style/)).not.toBeInTheDocument();
 });
 
+it("affiche la publication V3 et la provenance des sections, IOC et incertitudes", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() =>
+      Promise.resolve(
+        Response.json({
+          artifact_id: "publication-v3",
+          stage: "publication",
+          version: 1,
+          status: "verified",
+          metadata: {},
+          rendered_content: null,
+          canonical_content: {
+            schema_version: "3",
+            subject_id: SYNTHESIS_SUBJECT_ID,
+            publication_language: "fr",
+            title: "Article canonique",
+            lead: [
+              {
+                text: "Lead sourcé.",
+                evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+              },
+            ],
+            sections: [
+              {
+                kind: "overview",
+                heading: "Contexte",
+                paragraphs: [
+                  {
+                    text: "Paragraphe sourcé.",
+                    evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                  },
+                ],
+              },
+            ],
+            timeline: [
+              {
+                event_date: "2026-09-01",
+                date_text: null,
+                text: "Événement.",
+                evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
+              },
+            ],
+            indicators: [
+              {
+                artifact_type: "domain",
+                indicators: [
+                  {
+                    value: "evil.example",
+                    normalized_value: "evil.example",
+                    artifact_type: "domain",
+                    source_document_ids: [IOC_DOCUMENT_ID],
+                  },
+                ],
+              },
+            ],
+            sources: [
+              {
+                source_document_id: VENDOR_DOCUMENT_ID,
+                canonical_url: VENDOR_URL,
+                title: "Rapport",
+                publisher: "Vendor",
+                published_at: null,
+                tier: "core",
+                kind: "publication",
+                role: "primary",
+              },
+              {
+                source_document_id: IOC_DOCUMENT_ID,
+                canonical_url: IOC_URL,
+                title: "IOC source",
+                publisher: null,
+                published_at: null,
+                tier: "technical",
+                kind: "publication",
+                role: "primary",
+              },
+            ],
+            uncertainties: [
+              {
+                text: "Attribution incertaine.",
+                source_document_ids: [VENDOR_DOCUMENT_ID],
+              },
+            ],
+          },
+        }),
+      ),
+    ),
+  );
+
+  renderArtifact("publication");
+
+  expect(
+    await screen.findByRole("heading", { name: "Article canonique" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("Lead sourcé.")).toBeInTheDocument();
+  expect(screen.getByRole("heading", { name: "Contexte" })).toBeInTheDocument();
+  expect(screen.getByText("Paragraphe sourcé.")).toBeInTheDocument();
+  expect(screen.getByText("Événement.")).toBeInTheDocument();
+  expect(screen.getByText("evil.example")).toBeInTheDocument();
+  expect(screen.getByText("Attribution incertaine.")).toBeInTheDocument();
+  expect(screen.getAllByRole("link", { name: "Rapport" })[0]).toHaveAttribute(
+    "href",
+    VENDOR_URL,
+  );
+  expect(
+    screen.getAllByRole("link", { name: "IOC source" })[0],
+  ).toHaveAttribute("href", IOC_URL);
+});
+
 it("préserve la provenance visible d'un artifact réutilisé", async () => {
   stubProductionFetch({
     synthesis: synthesisArtifact(

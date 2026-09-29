@@ -21,6 +21,7 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
 )
+from cti_app.application.pandoc_rendering import PandocRenderer
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import (
     ProductionArtifactReuseService,
@@ -68,8 +69,6 @@ from cti_app.application.production_repairs import (
 from cti_app.application.production_resume import EXTRACTION_PROGRESS_COMPLETED_STATUSES
 from cti_app.application.production_stages import (
     ExtractionService,
-    ProductionQAService,
-    PublicationAssemblyService,
     ReferenceResearchService,
     SynthesisService,
     compute_input_hash,
@@ -79,6 +78,9 @@ from cti_app.application.production_synthesis import (
     ProductionSynthesisService,
     SynthesisExecutionStatus,
 )
+from cti_app.application.publication_assembly import PublicationAssemblyService
+from cti_app.application.publication_builder import PublicationAssemblyValidationError
+from cti_app.application.publication_qa import ProductionQAService
 from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.production import (
@@ -98,9 +100,11 @@ from cti_app.domain.production_extraction import (
     ExtractionReuseState,
     ProductionExtractionOmissionReason,
     ProductionExtractionV1,
+    production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
-from cti_app.domain.publication import is_publication_ioc_artifact_type
+from cti_app.domain.production_synthesis import production_synthesis_from_json
+from cti_app.domain.publication import PublicationDocumentV3, is_publication_ioc_artifact_type
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -463,7 +467,6 @@ class ProductionWorkflowOrchestrator:
             else None
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
-        self._assembly = PublicationAssemblyService(production_uow_factory, artifact_store)
         self._artifact_reuse = ProductionArtifactReuseService(
             production_uow_factory, artifact_store, self._diagnostics
         )
@@ -481,7 +484,6 @@ class ProductionWorkflowOrchestrator:
             if self._model_gateway is not None and artifact_store is not None
             else None
         )
-        self._qa = ProductionQAService(production_uow_factory)
         self._seed_enrichment = seed_enrichment
         self._pacing = pacing or ProductionPacingPolicy.zero()
         self._settings = get_settings()
@@ -738,35 +740,6 @@ class ProductionWorkflowOrchestrator:
             warnings=tuple(warnings),
             failures=tuple(supplemental_failures),
         )
-
-    async def _load_qa_inputs(
-        self,
-        references: Any,
-        extraction: Any,
-        synthesis: Any,
-        publication: Any,
-    ) -> dict[str, Any]:
-        """Read back what QA needs to judge the publication."""
-        if self._artifact_store is None:
-            return {}
-        store = self._artifact_store
-        loaded: dict[str, Any] = {}
-        try:
-            report, legacy_extraction, synthesis_text = await self._assembly._load_inputs(
-                references, extraction, synthesis
-            )
-            loaded.update(
-                {
-                    "report": report,
-                    "extraction": legacy_extraction,
-                    "synthesis_text": synthesis_text,
-                }
-            )
-            if publication.rendered_blob_id is not None:
-                loaded["publication_markdown"] = await store.read_text(publication.rendered_blob_id)
-        except Exception:
-            return loaded
-        return loaded
 
     def _log_parse(self, run: ProductionRun, stage: str, result: ParseResult[Any]) -> None:
         self._diagnostics.record_parse(
@@ -1411,7 +1384,7 @@ class ProductionWorkflowOrchestrator:
                 return {
                     "stage": "assembly",
                     "status": "error",
-                    "error": "Missing upstream artifacts",
+                    "error": "assembly_inputs_missing",
                 }
 
             repair_marker = None
@@ -1425,23 +1398,70 @@ class ProductionWorkflowOrchestrator:
                     repair_marker = dict(candidate_marker)
                     break
 
-            subject_title, _ = await self._subject_context(uow, run.subject_id, snapshot)
-            archived_urls = {
-                item.canonical_url
-                for item in await uow.source_collections.list_for_subject(run.subject_id)
-                if item.state.value in _ARCHIVED_STATES
-            }
-            publication = await self._assembly.assemble_publication(
-                run_id=run.id,
-                subject_id=run.subject_id,
-                subject_title=subject_title,
-                references_artifact=references,
-                extraction_artifact=extraction,
-                synthesis_artifact=synthesis,
-                metadata_extra=(
-                    {"repair_materialization": repair_marker} if repair_marker is not None else None
-                ),
-            )
+            if snapshot is None or self._artifact_store is None:
+                return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
+            if any(
+                artifact.canonical_blob_id is None
+                for artifact in (references, extraction, synthesis)
+            ):
+                return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
+            try:
+                canonical_references = production_reference_corpus_from_json(
+                    await self._artifact_store.read_json(cast(UUID, references.canonical_blob_id))
+                )
+                canonical_extraction = production_extraction_from_json(
+                    await self._artifact_store.read_json(cast(UUID, extraction.canonical_blob_id))
+                )
+                canonical_synthesis = production_synthesis_from_json(
+                    await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
+                )
+                publication = await PublicationAssemblyService(
+                    self._artifact_store, uow.production_artifacts, PandocRenderer()
+                ).assemble_publication(
+                    run=run,
+                    snapshot=snapshot,
+                    references=canonical_references,
+                    extraction=canonical_extraction,
+                    synthesis=canonical_synthesis,
+                    metadata_extra={
+                        "input_artifacts": {
+                            "references_artifact_id": str(references.id),
+                            "extraction_artifact_id": str(extraction.id),
+                            "synthesis_artifact_id": str(synthesis.id),
+                        },
+                        **(
+                            {"repair_materialization": repair_marker}
+                            if repair_marker is not None
+                            else {}
+                        ),
+                    },
+                )
+                if publication.canonical_blob_id is None:
+                    raise ValueError("Publication canonical body is missing")
+                document = PublicationDocumentV3.from_json(
+                    await self._artifact_store.read_json(publication.canonical_blob_id)
+                )
+                qa_result = await ProductionQAService().run_qa(
+                    snapshot=snapshot,
+                    references=canonical_references,
+                    extraction=canonical_extraction,
+                    synthesis=canonical_synthesis,
+                    publication=document,
+                )
+            except PublicationAssemblyValidationError as exc:
+                return {
+                    "stage": "assembly",
+                    "status": "error",
+                    "error": exc.code.value,
+                    "details": str(exc),
+                }
+            except (KeyError, TypeError, ValueError) as exc:
+                return {
+                    "stage": "assembly",
+                    "status": "error",
+                    "error": "assembly_validation_failed",
+                    "details": str(exc),
+                }
 
             if repair_marker is not None:
                 decision_ids = repair_marker.get("decision_ids", ())
@@ -1462,19 +1482,6 @@ class ProductionWorkflowOrchestrator:
                     reused_synthesis=bool(repair_marker.get("reused_synthesis_artifact_id")),
                     duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
                 )
-
-            # QA reads the real payloads, not the counters.
-            qa_inputs = await self._load_qa_inputs(references, extraction, synthesis, publication)
-            qa_result = await self._qa.run_qa(
-                run_id=run.id,
-                references_artifact=references,
-                extraction_artifact=extraction,
-                synthesis_artifact=synthesis,
-                publication_artifact=publication,
-                archived_urls=archived_urls,
-                research_date=run.research_date,
-                **qa_inputs,
-            )
 
             await self._check_cancellation(run.id, context)
             ending = await uow.production_runs.get_for_update(run.id)
@@ -1497,7 +1504,7 @@ class ProductionWorkflowOrchestrator:
                 }
             else:
                 ending.mark_needs_review(
-                    code="qa_failed",
+                    code="publication_qa_failed",
                     message="; ".join(qa_result["errors"]),
                     details=qa_result,
                     now=datetime.now(UTC),

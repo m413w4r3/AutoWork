@@ -579,13 +579,16 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     preview = await scenario.artifact_store.read_text(synthesis_artifact.rendered_blob_id)
     assert "The references stage records an editorial boundary event." not in preview
 
-    # Assembly consumes the canonical blob through the one-way compatibility adapter.
+    # Assembly projects the canonical synthesis without a Markdown adapter.
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "2"
+    assert publication_payload["schema_version"] == "3"
     publication_text = json.dumps(publication_payload)
-    # The semantic annotator splits recognised entities into their own spans.
+    assert publication_payload["title"] == synthesis.title
+    assert [item["text"] for item in publication_payload["lead"]] == [
+        item.text for item in synthesis.lead
+    ]
     assert "is documented by the selected publications." in publication_text
     assert "alpha-c2.security-lab.io" in publication_text
     assert "beta-c2.security-lab.io" in publication_text

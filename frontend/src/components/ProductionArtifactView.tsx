@@ -19,6 +19,8 @@ import {
   type ProductionSynthesisTimelineEntryV1,
   type ProductionSynthesisV1,
   type PublicationDocument,
+  type PublicationDocumentV3,
+  type PublicationEvidenceRefV1,
   type ExtractionDocumentV2,
   type ExtractionItemV2,
   type RichSpan,
@@ -61,10 +63,34 @@ function getArtifactFetcher(
 }
 
 function isPublicationDocument(value: unknown): value is PublicationDocument {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("schema_version" in value)
+  ) {
+    return false;
+  }
+  if (value.schema_version === "3") {
+    return (
+      "title" in value &&
+      typeof value.title === "string" &&
+      "subject_id" in value &&
+      typeof value.subject_id === "string" &&
+      "lead" in value &&
+      Array.isArray(value.lead) &&
+      "sections" in value &&
+      Array.isArray(value.sections) &&
+      "timeline" in value &&
+      Array.isArray(value.timeline) &&
+      "indicators" in value &&
+      Array.isArray(value.indicators) &&
+      "sources" in value &&
+      Array.isArray(value.sources) &&
+      "uncertainties" in value &&
+      Array.isArray(value.uncertainties)
+    );
+  }
   return (
-    typeof value === "object" &&
-    value !== null &&
-    "schema_version" in value &&
     (value.schema_version === "1" || value.schema_version === "2") &&
     "timeline" in value &&
     Array.isArray(value.timeline)
@@ -1042,6 +1068,9 @@ export function PublicationDocumentView({
 }: {
   document: PublicationDocument;
 }) {
+  if (document.schema_version === "3") {
+    return <PublicationDocumentV3View document={document} />;
+  }
   const visibleGroups = document.indicators.filter(
     (group) => IOC_LABELS[group.artifact_type] && group.values.length > 0,
   );
@@ -1083,6 +1112,114 @@ export function PublicationDocumentView({
                 ))}
               </ul>
             </div>
+          ))}
+        </section>
+      )}
+    </article>
+  );
+}
+
+function PublicationDocumentV3View({
+  document,
+}: {
+  document: PublicationDocumentV3;
+}) {
+  const sources = new Map(
+    document.sources.map((source) => [source.source_document_id, source]),
+  );
+  const provenance = (sourceIds: string[]) => (
+    <span className="publication-preview__provenance">
+      {Array.from(new Set(sourceIds)).map((sourceId, index) => {
+        const source = sources.get(sourceId);
+        return source ? (
+          <span key={sourceId}>
+            {index > 0 ? " · " : " "}
+            <a href={source.canonical_url} rel="noreferrer" target="_blank">
+              {source.title || source.publisher || source.canonical_url}
+            </a>
+          </span>
+        ) : null;
+      })}
+    </span>
+  );
+  const paragraph = (
+    item: { text: string; evidence_refs: PublicationEvidenceRefV1[] },
+    key: string,
+  ) => (
+    <p key={key}>
+      {item.text}
+      {provenance(item.evidence_refs.map((ref) => ref.source_document_id))}
+    </p>
+  );
+  return (
+    <article className="publication-preview">
+      <h3>{document.title}</h3>
+      {document.lead.map((item, index) => paragraph(item, `lead-${index}`))}
+      {document.sections.map((section, index) => (
+        <section key={`${section.kind}-${index}`}>
+          <h4>{section.heading}</h4>
+          {section.paragraphs.map((item, paragraphIndex) =>
+            paragraph(item, `${index}-${paragraphIndex}`),
+          )}
+        </section>
+      ))}
+      {document.timeline.length > 0 && (
+        <section>
+          <h4>Chronologie</h4>
+          {document.timeline.map((item, index) => (
+            <p key={index}>
+              {item.event_date || item.date_text ? (
+                <strong>{item.date_text || item.event_date} : </strong>
+              ) : null}
+              {item.text}
+              {provenance(
+                item.evidence_refs.map((ref) => ref.source_document_id),
+              )}
+            </p>
+          ))}
+        </section>
+      )}
+      {document.indicators.length > 0 && (
+        <section>
+          <h4>IOC</h4>
+          {document.indicators.map((group) => (
+            <div key={group.artifact_type}>
+              <h5>{IOC_LABELS[group.artifact_type] || group.artifact_type}</h5>
+              <ul>
+                {group.indicators.map((item) => (
+                  <li key={`${item.artifact_type}-${item.normalized_value}`}>
+                    <code>{item.normalized_value}</code>
+                    {provenance(item.source_document_ids)}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+        </section>
+      )}
+      {document.sources.length > 0 && (
+        <section>
+          <h4>Sources</h4>
+          <ul>
+            {document.sources.map((source) => (
+              <li key={source.source_document_id}>
+                <a href={source.canonical_url} rel="noreferrer" target="_blank">
+                  {source.title || source.canonical_url}
+                </a>
+                {source.publisher ? ` — ${source.publisher}` : ""}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+      {document.uncertainties.length > 0 && (
+        <section>
+          <h4>Incertitudes</h4>
+          {document.uncertainties.map((item, index) => (
+            <p key={index}>
+              {item.text}
+              {provenance(item.source_document_ids)}
+            </p>
           ))}
         </section>
       )}

@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 from cti_app.domain.publication import (
     BriefDocumentV1,
     PublicationDocumentV2,
+    PublicationDocumentV3,
     publication_document_from_json,
 )
 
@@ -310,7 +311,7 @@ def _legacy_publication_from_json(payload: Mapping[str, Any]) -> BriefDocumentV1
 class EditionPublicationV2:
     position: int
     subject_id: UUID
-    document: PublicationDocumentV2
+    document: PublicationDocumentV2 | PublicationDocumentV3
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -358,9 +359,9 @@ class EditionDocumentV2:
         publications: list[EditionPublicationV2] = []
         for item in payload.get("publications", []):
             document = publication_document_from_json(item["document"])
-            if not isinstance(document, PublicationDocumentV2):
+            if not isinstance(document, (PublicationDocumentV2, PublicationDocumentV3)):
                 raise ValueError(
-                    "EditionDocumentV2 publications must contain PublicationDocumentV2 documents"
+                    "EditionDocumentV2 publications must contain a supported publication document"
                 )
             publications.append(
                 EditionPublicationV2(

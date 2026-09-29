@@ -91,9 +91,10 @@ Le stage n’a pas de conversation canonique; le RAW conserve temporairement le 
 les champs legacy nécessaires aux anciens consommateurs.
 
 Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` et ne partage
-avec lui ni module ni service. La transition prévue est : AW-011 fait consommer le corpus
-directement à Extraction, AW-012 retire `EVENT` de la compatibilité Synthesis, puis AW-013
-termine la suppression de la projection legacy `ReferenceReport`.
+avec lui ni module ni service. Extraction consomme le corpus directement. Synthesis lit
+`ProductionExtractionV1`, puis Assembly construit `PublicationDocumentV3` depuis le snapshot,
+le corpus, l’extraction et la synthèse. La projection historique `ReferenceReport` reste limitée
+aux imports V4 et à certaines fonctions du Repair Desk.
 
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection
 de regroupement éditorial et n’ajoute aucun statut de production à l’édition.

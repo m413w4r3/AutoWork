@@ -46,7 +46,7 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_rendering import collect_indicators
-from cti_app.application.publication_builder import (
+from cti_app.application.publication_builder_legacy import (
     build_publication_document,
 )
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator

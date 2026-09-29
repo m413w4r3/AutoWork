@@ -6,6 +6,7 @@ from datetime import date
 from typing import Any
 from uuid import uuid4
 
+from cti_app.application.production_legacy_assembly import LegacyProductionQAService
 from cti_app.application.production_parsers import (
     DisplayPolicy,
     ExtractionItem,
@@ -20,7 +21,6 @@ from cti_app.application.production_rendering import (
     collect_indicators,
     render_publication_markdown,
 )
-from cti_app.application.production_stages import ProductionQAService
 from cti_app.application.production_verification import (
     accepted_for_publication,
     project_review_status,
@@ -201,7 +201,7 @@ async def _qa(**overrides: Any) -> dict[str, Any]:
         "research_date": RESEARCH_DATE,
     }
     payload.update(overrides)
-    return await ProductionQAService(lambda: None).run_qa(**payload)  # type: ignore[arg-type]
+    return await LegacyProductionQAService(lambda: None).run_qa(**payload)  # type: ignore[arg-type]
 
 
 async def test_a_complete_publication_passes_qa() -> None:

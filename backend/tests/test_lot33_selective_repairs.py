@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.production_legacy_assembly import LegacyProductionQAService
 from cti_app.application.production_parsers import (
     ParsedEvent,
     ParsedSource,
@@ -21,7 +22,6 @@ from cti_app.application.production_repairs import (
     _synthesis_evidence_refs,
     classify_repair_impact,
 )
-from cti_app.application.production_stages import ProductionQAService
 from cti_app.application.production_synthesis import (
     ProductionSynthesisService,
     canonical_extraction_hash,
@@ -260,7 +260,7 @@ async def test_lot33_qa_accepts_current_artifacts_with_independent_versions() ->
             status=ProductionArtifactStatus.VERIFIED,
         )
 
-    result = await ProductionQAService(lambda: None).run_qa(  # type: ignore[arg-type]
+    result = await LegacyProductionQAService(lambda: None).run_qa(  # type: ignore[arg-type]
         run_id=RUN_ID,
         references_artifact=current(ProductionArtifactStage.REFERENCES, 3),
         extraction_artifact=current(ProductionArtifactStage.EXTRACTION, 7),
