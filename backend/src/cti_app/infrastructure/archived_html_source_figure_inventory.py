@@ -13,14 +13,14 @@ from cti_app.application.source_figure_inventory import (
     is_external_reference,
     normalize_archive_path,
 )
-
-# HTML URL parsing strips leading and trailing ASCII whitespace from attribute values.
-_HTML_WHITESPACE = "\t\n\f\r "
 from cti_app.domain.production_source_figures import (
     SourceFigureCandidateV1,
     SourceFigureOriginKind,
     SourceFigureProvenanceV1,
 )
+
+# HTML URL parsing strips leading and trailing ASCII whitespace from attribute values.
+_HTML_WHITESPACE = "\t\n\f\r "
 
 
 class _ImageOccurrenceParser(HTMLParser):
