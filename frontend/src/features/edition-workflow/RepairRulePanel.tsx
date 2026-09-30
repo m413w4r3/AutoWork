@@ -2,7 +2,10 @@ import type {
   EditionRepairDetail,
   ProductionRepairAction,
 } from "../../api/publication";
-import { alternativeRepairActions, repairActionLabel } from "./RepairQueue";
+import {
+  alternativeRepairActions,
+  repairActionLabel,
+} from "./repairQueuePresentation";
 
 const RULE_ACTION_LABELS: Record<string, string> = {
   include: "Inclure la règle dans le livrable",

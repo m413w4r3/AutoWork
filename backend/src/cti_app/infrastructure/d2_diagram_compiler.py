@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import os
 import re
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -40,6 +42,10 @@ D2_MAX_STDERR_BYTES = 64 * 1024
 D2_PROCESS_LOCALE = "C.UTF-8"
 D2_EXIT_POLL_SECONDS = 0.01
 D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
+_VERSION_CACHE_LOCK = threading.Lock()
+_VERSION_CACHE_BINARY: str | None = None
+_VERSION_CACHE_RUNNER: D2ProcessRunner | None = None
+_VERSION_CACHE_FUTURE: concurrent.futures.Future[None] | None = None
 _CSS_URL = re.compile(
     r"""url\s*\(\s*(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^)\s"'(]*))\s*\)""",
     re.IGNORECASE | re.DOTALL,
@@ -461,12 +467,13 @@ class D2DiagramCompiler:
     """Compile canonical diagrams through a pinned, bounded D2 0.9.0 process."""
 
     def __init__(self, runner: D2ProcessRunner | None = None, binary: str = D2_COMPILER) -> None:
+        self._uses_default_runner = runner is None
         self._runner: D2ProcessRunner = runner if runner is not None else AsyncioD2ProcessRunner()
         self._binary = binary
 
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
         source_bytes = encode_d2_source(diagram)
-        semantic_hash = diagram_semantic_sha256(diagram)
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
         await self._verify_version()
         result = await self._runner.run(
             (
@@ -474,7 +481,7 @@ class D2DiagramCompiler:
                 f"--layout={D2_LAYOUT}",
                 f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
                 "--omit-version",
-                f"--salt={semantic_hash}",
+                f"--salt={source_sha256}",
                 "--stdout-format=svg",
                 "-",
                 "-",
@@ -491,7 +498,7 @@ class D2DiagramCompiler:
             diagram_key=diagram.key,
             source_format=D2_SOURCE_FORMAT,
             source_bytes=source_bytes,
-            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            source_sha256=source_sha256,
             media_type=D2_MEDIA_TYPE,
             media_bytes=result.stdout,
             media_sha256=hashlib.sha256(result.stdout).hexdigest(),
@@ -501,6 +508,37 @@ class D2DiagramCompiler:
         )
 
     async def _verify_version(self) -> None:
+        global _VERSION_CACHE_BINARY, _VERSION_CACHE_RUNNER, _VERSION_CACHE_FUTURE
+
+        cache_runner = None if self._uses_default_runner else self._runner
+        with _VERSION_CACHE_LOCK:
+            if self._binary != _VERSION_CACHE_BINARY or cache_runner is not _VERSION_CACHE_RUNNER:
+                _VERSION_CACHE_BINARY = self._binary
+                _VERSION_CACHE_RUNNER = cache_runner
+                _VERSION_CACHE_FUTURE = None
+            future = _VERSION_CACHE_FUTURE
+            if future is None:
+                future = concurrent.futures.Future()
+                _VERSION_CACHE_FUTURE = future
+                owns_check = True
+            else:
+                owns_check = False
+
+        if not owns_check:
+            await asyncio.wrap_future(future)
+            return
+
+        try:
+            await self._run_version_check()
+        except BaseException as exc:
+            future.set_exception(exc)
+            with _VERSION_CACHE_LOCK:
+                if _VERSION_CACHE_FUTURE is future:
+                    _VERSION_CACHE_FUTURE = None
+            raise
+        future.set_result(None)
+
+    async def _run_version_check(self) -> None:
         result = await self._runner.run(
             (self._binary, "--version"),
             stdin=b"",

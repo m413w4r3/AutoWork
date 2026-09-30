@@ -7,7 +7,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -23,6 +23,13 @@ from pydantic import (
     model_validator,
 )
 
+from cti_app.application.diagram_compilation import DiagramCompiler
+from cti_app.application.media_assets import (
+    MAX_SOURCE_FIGURE_BYTES,
+    MediaAssetStore,
+    SourceFigureIngestor,
+    compile_and_store_diagrams,
+)
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelGateway,
@@ -49,6 +56,10 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     synthesis_access_policy_hash,
 )
+from cti_app.application.source_figure_inventory import (
+    SourceFigureInventoryResult,
+    load_archived_source_figure_inventory,
+)
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -73,6 +84,9 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
@@ -356,6 +370,36 @@ class EditorialEnrichmentValidationError(ValueError):
         self.code = code
 
 
+def _source_figure_candidates(
+    inventory: SourceFigureInventoryResult,
+) -> tuple[SourceFigureCandidateV1, ...]:
+    return tuple(
+        SourceFigureCandidateV1(
+            key=f"source_figure_{figure.figure_id.hex}",
+            source_document_id=figure.source_document_id,
+            source_url=figure.source,
+            caption=figure.locator.figure_label or "Archived source figure",
+            provenance=figure.provenance,
+            locator=figure.locator,
+            inclusion_status=SourceFigureInclusionStatus.PROPOSED,
+            placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+            resolved_figure=figure,
+        )
+        for figure in inventory.accepted
+    )
+
+
+def _source_figure_inventory_warnings(
+    inventory: SourceFigureInventoryResult,
+) -> tuple[str, ...]:
+    warnings = set(inventory.warnings)
+    if any(figure.decision is not SourceFigureDecision.ACCEPTED for figure in inventory.figures):
+        warnings.add("source_figure_inventory_contains_unresolved_items")
+    if inventory.truncated:
+        warnings.add("source_figure_inventory_truncated")
+    return tuple(sorted(warnings))
+
+
 def canonical_synthesis_hash(synthesis: ProductionSynthesisV1) -> str:
     if not isinstance(synthesis, ProductionSynthesisV1):
         raise ValueError("Expected a ProductionSynthesisV1")
@@ -596,6 +640,7 @@ def build_editorial_enrichment_model_request(
     synthesis: ProductionSynthesisV1,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     access_policy: SynthesisAccessPolicyV1,
+    source_figure_inventory_hash: str | None = None,
 ) -> ModelRequest:
     if (
         run.id != snapshot.production_run_id
@@ -621,6 +666,7 @@ def build_editorial_enrichment_model_request(
         synthesis=synthesis,
         evidence_pack_hash=pack_hash,
         access_policy_hash=access_hash,
+        source_figure_inventory_hash=source_figure_inventory_hash,
     )
     prompt_payload = {
         "instructions": (
@@ -666,6 +712,19 @@ def build_editorial_enrichment_model_request(
     prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if any(str(record.source_document_id) in prompt for record in access_policy.sources):
         raise ValueError("Source document identities cannot appear in Editorial Enrichment prompt")
+    metadata = {
+        "editorial_enrichment_input_hash": input_hash,
+        "access_policy_hash": access_hash,
+        "effective_tlp": access_policy.effective_tlp.value,
+        "external_llm_allowed": access_policy.external_llm_allowed,
+        "do_not_submit": access_policy.do_not_submit,
+        "evidence_pack_hash": pack_hash,
+        "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+        "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
+        "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+    }
+    if source_figure_inventory_hash is not None:
+        metadata["source_figure_inventory_hash"] = source_figure_inventory_hash
     return ModelRequest(
         text=prompt,
         prompt_template_id="production-editorial-enrichment",
@@ -679,17 +738,7 @@ def build_editorial_enrichment_model_request(
         conversation=None,
         run_id=editorial_enrichment_model_run_id(run, input_hash),
         allow_failed_resubmit=True,
-        metadata={
-            "editorial_enrichment_input_hash": input_hash,
-            "access_policy_hash": access_hash,
-            "effective_tlp": access_policy.effective_tlp.value,
-            "external_llm_allowed": access_policy.external_llm_allowed,
-            "do_not_submit": access_policy.do_not_submit,
-            "evidence_pack_hash": pack_hash,
-            "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
-            "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
-            "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
-        },
+        metadata=metadata,
         parameters={
             "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
             "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
@@ -751,6 +800,9 @@ def validate_editorial_enrichment_proposal(
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    *,
+    source_figures: tuple[SourceFigureCandidateV1, ...] = (),
+    warnings: tuple[str, ...] = (),
 ) -> EditorialEnrichmentV1:
     """Resolve exact handles, ground technical literals, and build canonical V1."""
     try:
@@ -930,8 +982,8 @@ def validate_editorial_enrichment_proposal(
             enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
             tables=tuple(tables),
             diagrams=tuple(diagrams),
-            source_figures=(),
-            warnings=(),
+            source_figures=source_figures,
+            warnings=warnings,
         )
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     except EditorialEnrichmentValidationError as exc:
@@ -972,12 +1024,19 @@ class ProductionEditorialEnrichmentService:
         model_gateway: ModelGateway,
         editorial_enrichment_service: EditorialEnrichmentService,
         artifact_reuse: ProductionArtifactReuseService | None = None,
+        media_asset_store: MediaAssetStore | None = None,
+        diagram_compiler: DiagramCompiler | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._model_gateway = model_gateway
         self._editorial_enrichment_service = editorial_enrichment_service
         self._artifact_reuse = artifact_reuse
+        self._media_asset_store = media_asset_store
+        self._source_figure_ingestor = (
+            SourceFigureIngestor(media_asset_store) if media_asset_store is not None else None
+        )
+        self._diagram_compiler = diagram_compiler
 
     async def execute(
         self,
@@ -1002,6 +1061,14 @@ class ProductionEditorialEnrichmentService:
                         "The exact source access policy for Editorial Enrichment is unavailable",
                         details={"reason": str(exc)},
                     ) from exc
+                source_figure_inventory = await load_archived_source_figure_inventory(
+                    subject_id=snapshot.subject_id,
+                    extraction_sources=extraction.sources,
+                    source_document_repository=uow.source_documents,
+                    blob_repository=uow.blobs,
+                    artifact_store=self._artifact_store,
+                )
+            await self._ingest_source_figures(source_figure_inventory)
             evidence_pack = build_editorial_enrichment_evidence_pack(
                 snapshot, extraction, synthesis
             )
@@ -1012,6 +1079,7 @@ class ProductionEditorialEnrichmentService:
                 synthesis=synthesis,
                 evidence_pack_hash=evidence_pack_hash,
                 access_policy_hash=access_policy_hash,
+                source_figure_inventory_hash=source_figure_inventory.functional_hash(),
             )
         except _EditorialEnrichmentInputControl as control:
             return ProductionEditorialEnrichmentExecution(
@@ -1054,6 +1122,7 @@ class ProductionEditorialEnrichmentService:
             synthesis,
             evidence_pack,
             access_policy,
+            source_figure_inventory_hash=source_figure_inventory.functional_hash(),
         )
         model_run_id = editorial_enrichment_model_run_id(run, input_hash)
         if (
@@ -1126,6 +1195,8 @@ class ProductionEditorialEnrichmentService:
                 evidence_pack,
                 extraction,
                 synthesis,
+                source_figures=_source_figure_candidates(source_figure_inventory),
+                warnings=_source_figure_inventory_warnings(source_figure_inventory),
             )
         except EditorialEnrichmentProposalControlError as exc:
             return self._needs_review(
@@ -1134,6 +1205,17 @@ class ProductionEditorialEnrichmentService:
                 error_code=exc.code,
                 error_message=str(exc),
             )
+        if enrichment.diagrams:
+            if self._diagram_compiler is None or self._media_asset_store is None:
+                raise RuntimeError("Diagram compilation requires a compiler and media asset store")
+            compiled_diagrams = await compile_and_store_diagrams(
+                enrichment.diagrams,
+                compiler=self._diagram_compiler,
+                media_asset_store=self._media_asset_store,
+                production_run_id=run.id,
+            )
+            enrichment = replace(enrichment, diagrams=compiled_diagrams)
+            validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
         artifact = await self._editorial_enrichment_service.store_editorial_enrichment_result(
             run_id=run.id,
             subject_id=snapshot.subject_id,
@@ -1147,6 +1229,7 @@ class ProductionEditorialEnrichmentService:
             access_policy_hash=access_policy_hash,
             model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
             routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
+            source_figure_inventory_hash=source_figure_inventory.functional_hash(),
         )
         return ProductionEditorialEnrichmentExecution(
             status=EditorialEnrichmentExecutionStatus.SUCCEEDED,
@@ -1156,9 +1239,22 @@ class ProductionEditorialEnrichmentService:
             model_calls=1,
             table_count=len(enrichment.tables),
             diagram_count=len(enrichment.diagrams),
-            source_figure_count=0,
+            source_figure_count=len(enrichment.source_figures),
             warnings=enrichment.warnings,
         )
+
+    async def _ingest_source_figures(self, inventory: SourceFigureInventoryResult) -> None:
+        if not inventory.accepted:
+            return
+        if self._source_figure_ingestor is None:
+            raise RuntimeError("Source figure ingestion requires a media asset store")
+        for figure in inventory.accepted:
+            if figure.blob_id is None:
+                raise ValueError("Accepted source figure does not reference an archived blob")
+            content = await self._artifact_store.read_bytes(
+                figure.blob_id, max_bytes=MAX_SOURCE_FIGURE_BYTES
+            )
+            await self._source_figure_ingestor.ingest(figure, content)
 
     async def _load_extraction(
         self,
@@ -1316,7 +1412,7 @@ class ProductionEditorialEnrichmentService:
             model_calls=0,
             table_count=len(enrichment.tables),
             diagram_count=len(enrichment.diagrams),
-            source_figure_count=0,
+            source_figure_count=len(enrichment.source_figures),
             warnings=enrichment.warnings,
             details={"reused": reuse.reused},
         )
@@ -1380,33 +1476,38 @@ def compute_editorial_enrichment_input_hash(
     synthesis: ProductionSynthesisV1,
     evidence_pack_hash: str,
     access_policy_hash: str,
+    source_figure_inventory_hash: str | None = None,
 ) -> str:
     """Hash every functional input and policy version for this stage."""
     if _SHA256_RE.fullmatch(evidence_pack_hash) is None:
         raise ValueError("Editorial enrichment evidence pack hash must be lowercase SHA-256")
     if _SHA256_RE.fullmatch(access_policy_hash) is None:
         raise ValueError("Editorial enrichment access policy hash must be lowercase SHA-256")
-    return hashlib.sha256(
-        _canonical_json_bytes(
-            {
-                "stage": "editorial_enrichment",
-                "production_input_hash": synthesis.production_input_hash,
-                "extraction_hash": canonical_extraction_hash(extraction),
-                "synthesis_hash": canonical_synthesis_hash(synthesis),
-                "schema_version": EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
-                "policy_version": EDITORIAL_ENRICHMENT_POLICY_VERSION,
-                "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
-                "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
-                "evidence_pack_policy_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION,
-                "evidence_pack_hash": evidence_pack_hash,
-                "access_policy_hash": access_policy_hash,
-                "prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
-                "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
-                "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
-                "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
-            }
-        )
-    ).hexdigest()
+    if (
+        source_figure_inventory_hash is not None
+        and _SHA256_RE.fullmatch(source_figure_inventory_hash) is None
+    ):
+        raise ValueError("Source figure inventory hash must be lowercase SHA-256")
+    payload = {
+        "stage": "editorial_enrichment",
+        "production_input_hash": synthesis.production_input_hash,
+        "extraction_hash": canonical_extraction_hash(extraction),
+        "synthesis_hash": canonical_synthesis_hash(synthesis),
+        "schema_version": EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
+        "policy_version": EDITORIAL_ENRICHMENT_POLICY_VERSION,
+        "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+        "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
+        "evidence_pack_policy_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION,
+        "evidence_pack_hash": evidence_pack_hash,
+        "access_policy_hash": access_policy_hash,
+        "prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+        "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
+        "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+        "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
+    }
+    if source_figure_inventory_hash is not None:
+        payload["source_figure_inventory_hash"] = source_figure_inventory_hash
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
 def validate_editorial_enrichment(

@@ -21,12 +21,12 @@ import {
 import { ApiError } from "../../api/editions";
 import { RepairApplicationDiagnosticView } from "./RepairApplicationDiagnostic";
 import { ReviewItemCard } from "./ReviewItemCard";
+import { RepairQueue } from "./RepairQueue";
 import {
-  RepairQueue,
   repairIssueMatchesFilter,
   repairReasonLabel,
   type RepairQueueFilter,
-} from "./RepairQueue";
+} from "./repairQueuePresentation";
 import { RepairIssueInspector } from "./RepairIssueInspector";
 import { RepairRebuildBar } from "./RepairRebuildBar";
 

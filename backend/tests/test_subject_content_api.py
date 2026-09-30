@@ -19,6 +19,11 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionRun,
 )
+from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    PublicationDocumentV3,
+)
+from cti_app.domain.publication_document import serialize_publication_document
 
 SUBJECT_ID = uuid4()
 
@@ -171,15 +176,20 @@ def _artifact(
 
 
 def _document(title: str) -> dict[str, Any]:
-    return {
-        "schema_version": "1",
-        "title": title,
-        "timeline": [],
-        "synthesis": [],
-        "indicators": [],
-        "sources": [],
-        "uncertainties": [],
-    }
+    return serialize_publication_document(
+        PublicationDocumentV3(
+            schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+            subject_id=SUBJECT_ID,
+            publication_language="fr",
+            title=title,
+            lead=(),
+            sections=(),
+            timeline=(),
+            indicators=(),
+            sources=(),
+            uncertainties=(),
+        )
+    )
 
 
 def _extraction(*items: dict[str, Any]) -> dict[str, Any]:

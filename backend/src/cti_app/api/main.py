@@ -79,6 +79,7 @@ from cti_app.application.subjects import SubjectService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
@@ -260,6 +261,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         production_checkpoint=production_checkpoint,
         publication_assembly=publication_assembly,
         bridge_transport=bridge_provider,
+        production_diagram_compiler=D2DiagramCompiler(),
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory

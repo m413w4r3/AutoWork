@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel
 
+from cti_app.application.diagram_compilation import CompiledDiagram
 from cti_app.application.model_gateway import (
     ModelExecution,
     ModelGatewayError,
@@ -93,6 +94,11 @@ class _MemorySourceDocuments:
 
     async def get(self, document_id: UUID) -> SourceDocument | None:
         return self.documents.get(document_id)
+
+    async def list_for_subject(self, subject_id: UUID) -> tuple[SourceDocument, ...]:
+        return tuple(
+            document for document in self.documents.values() if document.subject_id == subject_id
+        )
 
 
 def _snapshot(
@@ -566,15 +572,50 @@ class _MemoryArtifactStore:
         return self.payloads[blob_id]
 
 
+class _MemoryMediaAssetStore:
+    async def store_diagram(self, compiled: CompiledDiagram, *, source: str) -> SimpleNamespace:
+        del source
+        return SimpleNamespace(asset_id=uuid4())
+
+    async def put(self, *_: object, **__: object) -> SimpleNamespace:
+        return SimpleNamespace(asset_id=uuid4())
+
+
+class _MemoryDiagramCompiler:
+    async def compile(self, diagram: object) -> CompiledDiagram:
+        key = diagram.key  # type: ignore[attr-defined]
+        source = f"{key}: source".encode()
+        svg = f"<svg>{key}</svg>".encode()
+        return CompiledDiagram(
+            diagram_key=key,
+            source_format="d2",
+            source_bytes=source,
+            source_sha256=hashlib.sha256(source).hexdigest(),
+            media_type="image/svg+xml",
+            media_bytes=svg,
+            media_sha256=hashlib.sha256(svg).hexdigest(),
+            compiler="d2",
+            compiler_version="0.9.0",
+            compiler_policy_version="diagram-d2-svg-v2",
+        )
+
+
 class _Uow:
     def __init__(self, documents: _MemorySourceDocuments) -> None:
         self.source_documents = documents
+        self.blobs = _MemoryBlobs()
 
     async def __aenter__(self) -> _Uow:
         return self
 
     async def __aexit__(self, *args: object) -> None:
         del args
+
+
+class _MemoryBlobs:
+    async def get(self, blob_id: UUID) -> None:
+        del blob_id
+        return None
 
 
 class _RecordingGateway:
@@ -688,6 +729,8 @@ def _world(
         model_gateway=gateway,  # type: ignore[arg-type]
         editorial_enrichment_service=writer,  # type: ignore[arg-type]
         artifact_reuse=reuse,  # type: ignore[arg-type]
+        media_asset_store=_MemoryMediaAssetStore(),  # type: ignore[arg-type]
+        diagram_compiler=_MemoryDiagramCompiler(),  # type: ignore[arg-type]
     )
 
     def artifact(stage: ProductionArtifactStage, payload: dict[str, object]) -> ProductionArtifact:
@@ -748,6 +791,7 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
     assert stored["input_hash"] == result.input_hash
     enrichment = stored["enrichment"]
     assert enrichment.source_figures == ()  # type: ignore[attr-defined]
+    assert enrichment.diagrams[0].compiled_asset_id is not None  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

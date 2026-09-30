@@ -52,7 +52,8 @@ from cti_app.domain.production import (
     ProductionStage,
     RepairDecisionApplicationState,
 )
-from cti_app.domain.publication import PublicationDocumentV2
+from cti_app.domain.publication import PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION, PublicationDocumentV3
+from cti_app.domain.publication_document import serialize_publication_document
 from cti_app.domain.publication_review import PublicationDecision
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
@@ -111,12 +112,15 @@ def _artifact(
     )
 
 
-def _document(title: str) -> PublicationDocumentV2:
-    return PublicationDocumentV2(
-        schema_version="2",
+def _document(title: str) -> PublicationDocumentV3:
+    return PublicationDocumentV3(
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        subject_id=SUBJECT_A,
+        publication_language="fr",
         title=title,
+        lead=(),
+        sections=(),
         timeline=(),
-        synthesis=(),
         indicators=(),
         sources=(),
         uncertainties=(),
@@ -366,9 +370,15 @@ class _Uow:
         blob_a = uuid4()
         blob_b = uuid4()
         blob_c = uuid4()
-        blobs.blobs[blob_a] = json.dumps(_document("Alpha").to_json()).encode()
-        blobs.blobs[blob_b] = json.dumps(_document("Bravo").to_json()).encode()
-        blobs.blobs[blob_c] = json.dumps(_document("Charlie").to_json()).encode()
+        blobs.blobs[blob_a] = json.dumps(
+            serialize_publication_document(_document("Alpha"))
+        ).encode()
+        blobs.blobs[blob_b] = json.dumps(
+            serialize_publication_document(_document("Bravo"))
+        ).encode()
+        blobs.blobs[blob_c] = json.dumps(
+            serialize_publication_document(_document("Charlie"))
+        ).encode()
         self.editions = _Editions(edition)
         self.edition_production_batches = type(
             "Batches", (), {"get_latest_for_edition": self._get_batch}
@@ -872,7 +882,9 @@ async def test_preview_becomes_stale_when_the_current_publication_artifact_chang
 
     replacement_id = uuid4()
     replacement_blob = uuid4()
-    blobs.blobs[replacement_blob] = json.dumps(_document("Replacement").to_json()).encode()
+    blobs.blobs[replacement_blob] = json.dumps(
+        serialize_publication_document(_document("Replacement"))
+    ).encode()
     replacement = _artifact(replacement_id, RUN_A, SUBJECT_A, replacement_blob)
     replacement.input_hash = "b" * 64
     uow.production_artifacts.artifacts = {replacement_id: replacement}
@@ -1146,7 +1158,7 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
 
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert edition_document["schema_version"] == "2"
-    assert edition_document["publications"][0]["document"]["schema_version"] == "2"
+    assert edition_document["publications"][0]["document"]["schema_version"] == "3"
     assert content[:2] == b"PK"
     with zipfile.ZipFile(BytesIO(content)) as archive:
         document_xml = archive.read("word/document.xml")
@@ -1196,7 +1208,7 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
     for artifact_id, title in ((ARTIFACT_A, "Article A"), (ARTIFACT_B, "Article B")):
         blob_id = uow.production_artifacts.artifacts[artifact_id].canonical_blob_id
         assert blob_id is not None
-        blobs.blobs[blob_id] = json.dumps(_document(title).to_json()).encode()
+        blobs.blobs[blob_id] = json.dumps(serialize_publication_document(_document(title))).encode()
     accepted = await EditionPublicationService(lambda: uow, blobs).accept(
         EDITION_ID, actor_id="analyst"
     )  # type: ignore[arg-type]

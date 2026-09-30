@@ -42,7 +42,6 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
-from cti_app.application.publication_builder_legacy import build_publication_document
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.publication import ArtifactType
 
@@ -212,7 +211,7 @@ def test_explicit_iocs_survive_the_extraction_artifact_round_trip() -> None:
     assert _canonical_keys(collect_indicators(restored)) == _expected_keys()
 
 
-def test_explicit_iocs_reach_the_rendered_publication_and_document() -> None:
+def test_explicit_iocs_reach_the_rendered_publication() -> None:
     extraction = _corpus_extraction()
     report = ReferenceReport(
         sources=(
@@ -248,19 +247,6 @@ def test_explicit_iocs_reach_the_rendered_publication_and_document() -> None:
         numbering=numbering,
     )
     assert all(f"`{value}`" in markdown for _, value in EXPECTED_EXPLICIT_IOCS)
-
-    document = build_publication_document(
-        subject_title="[Nebula Serpent] Campagne",
-        report=report,
-        extraction=extraction,
-        synthesis_text=synthesis,
-    )
-    published = {
-        (group.artifact_type.value, indicator.value)
-        for group in document.indicators
-        for indicator in group.values
-    }
-    assert published == set(EXPECTED_EXPLICIT_IOCS)
 
 
 def test_similar_subdomains_stay_distinct_indicators() -> None:

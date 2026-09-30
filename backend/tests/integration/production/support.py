@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from cti_app.application.blobs import BlobCatalogService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.diagram_compilation import CompiledDiagram
 from cti_app.application.http_collection import (
     CollectionPolicy,
     HttpTransport,
@@ -91,6 +92,7 @@ from cti_app.domain.entities import Subject
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRun, ModelTransport
 from cti_app.domain.production import ProductionRun, ProductionStage
+from cti_app.domain.production_editorial_enrichment import DiagramSpecV1
 from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.discovery_support import make_discovery_run_for_edition
@@ -151,6 +153,26 @@ class _CatalogModelOutputStore:
         except ValueError as exc:
             raise ValueError(f"Invalid model output reference: {reference}") from exc
         return await self._catalog.read(blob_id, max_bytes=max_bytes)
+
+
+class _DeterministicDiagramCompiler:
+    async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+        source_bytes = f"test-diagram:{diagram.key}".encode()
+        media_bytes = (
+            f'<svg xmlns="http://www.w3.org/2000/svg"><text>{diagram.key}</text></svg>'
+        ).encode()
+        return CompiledDiagram(
+            diagram_key=diagram.key,
+            source_format="d2",
+            source_bytes=source_bytes,
+            source_sha256=sha256(source_bytes).hexdigest(),
+            media_type="image/svg+xml",
+            media_bytes=media_bytes,
+            media_sha256=sha256(media_bytes).hexdigest(),
+            compiler="d2-test",
+            compiler_version="0.9.0-test",
+            compiler_policy_version="diagram-test-v1",
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -598,6 +620,7 @@ class ProductionScenario:
             artifact_store=self.artifact_store,
             diagnostics=self.diagnostics,
             pacing=ProductionPacingPolicy.zero(),
+            diagram_compiler=_DeterministicDiagramCompiler(),
         )
 
     def restrict_core_sources(self, canonical_urls: Sequence[str]) -> None:

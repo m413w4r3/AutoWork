@@ -6,7 +6,7 @@ import {
   startProductionBatch,
 } from "../../api/production";
 import type { Edition } from "../../api/editions";
-import { navigate } from "../../routing";
+import { navigate } from "../../navigation";
 import { DiscoveryPanel } from "../discovery/DiscoveryPanel";
 import { EditionDashboard } from "../edition-dashboard/EditionDashboard";
 import { ProductionBatchSelector } from "../edition-workflow/ProductionBatchSelector";

@@ -57,6 +57,7 @@ from cti_app.domain.invariants import (
     ResolvedFeature,
 )
 from cti_app.domain.jobs import Job, JobEvent, JobOperationalMetrics
+from cti_app.domain.media_assets import MediaAssetManifest
 from cti_app.domain.model_conversations import (
     ConversationPurpose,
     ConversationStatus,
@@ -106,6 +107,14 @@ class BlobRepository(Protocol):
     async def count_references(self, blob_id: UUID) -> int: ...
 
     async def delete(self, blob_id: UUID) -> None: ...
+
+
+class MediaAssetRepository(Protocol):
+    async def add_if_absent(self, asset: MediaAssetManifest) -> MediaAssetManifest: ...
+
+    async def get(self, asset_id: UUID) -> MediaAssetManifest | None: ...
+
+    async def get_by_identity(self, sha256: str, mime_type: str) -> MediaAssetManifest | None: ...
 
 
 class GoodwareBaselineRepository(Protocol):
@@ -662,6 +671,7 @@ class RejectedModelProposalRepository(Protocol):
 
 class UnitOfWork(Protocol):
     blobs: BlobRepository
+    media_assets: MediaAssetRepository
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository

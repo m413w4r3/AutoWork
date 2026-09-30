@@ -646,6 +646,7 @@ def create_job_registry(
     production_checkpoint: object | None = None,
     publication_assembly: object | None = None,
     bridge_transport: object | None = None,
+    production_diagram_compiler: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -719,6 +720,7 @@ def create_job_registry(
             seed_enrichment=cast(Any, seed_enrichment),
             checkpoint=production_checkpoint,
             bridge_transport=cast(Any, bridge_transport),
+            diagram_compiler=cast(Any, production_diagram_compiler),
         )
     if publication_assembly is not None:
         from cti_app.application.edition_publication import (

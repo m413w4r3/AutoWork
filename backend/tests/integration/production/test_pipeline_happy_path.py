@@ -43,7 +43,8 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_synthesis import SynthesisSectionKind
-from cti_app.domain.publication import ArtifactType, PublicationDocumentV3
+from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_document import parse_publication_document
 
 from .support import ProductionScenario, grounded_editorial_proposal
 
@@ -467,7 +468,7 @@ async def test_ioc_only_repair_reuses_synthesis_and_rebuilds_publication(
     assert extraction_a is not None and extraction_a.canonical_blob_id is not None
     assert synthesis_a is not None
     assert publication_a is not None and publication_a.canonical_blob_id is not None
-    document_a = PublicationDocumentV3.from_json(
+    document_a = parse_publication_document(
         await scenario.artifact_store.read_json(publication_a.canonical_blob_id)
     )
     extraction = production_extraction_from_json(
@@ -519,7 +520,7 @@ async def test_ioc_only_repair_reuses_synthesis_and_rebuilds_publication(
     assert publication_b.id != publication_a.id
     assert publication_b.input_hash != publication_a.input_hash
     assert publication_b.canonical_blob_id is not None
-    document_b = PublicationDocumentV3.from_json(
+    document_b = parse_publication_document(
         await scenario.artifact_store.read_json(publication_b.canonical_blob_id)
     )
     assert (document_b.title, document_b.lead, document_b.sections, document_b.timeline) == (

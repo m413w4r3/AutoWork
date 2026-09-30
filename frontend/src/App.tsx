@@ -4,7 +4,8 @@ import type { EditionTool } from "./features/edition-tools/EditionWorkspace";
 import { EditionCreatePage } from "./pages/EditionCreatePage";
 import { EditionDetailPage } from "./pages/EditionDetailPage";
 import { EditionListPage } from "./pages/EditionListPage";
-import { Link, usePathname } from "./routing";
+import { Link } from "./routing";
+import { usePathname } from "./navigation";
 
 export function App() {
   const pathname = usePathname();

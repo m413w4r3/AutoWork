@@ -26,6 +26,7 @@ from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import PublicationAssemblyErrorCode
+from cti_app.domain.publication_document import serialize_publication_document
 
 
 class PublicationAssemblyService:
@@ -87,7 +88,8 @@ class PublicationAssemblyService:
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
         )
-        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(document.to_json())
+        canonical_document = serialize_publication_document(document)
+        canonical_bytes = ProductionArtifactStore.canonical_json_bytes(canonical_document)
         stage = ProductionArtifactStage.PUBLICATION
         current = await self._production_artifacts.get_current(run.id, stage.value)
         if (
@@ -139,7 +141,7 @@ class PublicationAssemblyService:
             return artifact
 
         _, canonical_blob_id, _ = await self._artifact_store.store_stage_payloads(
-            canonical=document.to_json()
+            canonical=canonical_document
         )
         if canonical_blob_id is None:
             raise RuntimeError("Canonical publication body was not persisted")

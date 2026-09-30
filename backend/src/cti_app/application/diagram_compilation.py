@@ -9,7 +9,7 @@ from typing import Protocol
 
 from cti_app.domain.production_editorial_enrichment import DiagramSpecV1
 
-DIAGRAM_COMPILATION_POLICY_VERSION = "diagram-d2-svg-v1"
+DIAGRAM_COMPILATION_POLICY_VERSION = "diagram-d2-svg-v2"
 
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 

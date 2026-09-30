@@ -1,15 +1,10 @@
-"""Canonical, renderer-independent publication models.
-
-``BriefDocumentV1`` and ``PublicationDocumentV2`` remain historical read models.
-New Production writes use ``PublicationDocumentV3`` and readers dispatch by
-``schema_version``.
-"""
+"""Publication domain values and the current renderer-independent document."""
 
 from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 from typing import Any
@@ -18,8 +13,6 @@ from uuid import UUID
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 
-LEGACY_PUBLICATION_SCHEMA_VERSION = "1"
-PUBLICATION_SCHEMA_VERSION = "2"
 PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION = "3"
 
 
@@ -81,166 +74,6 @@ class RichSpan:
 
 
 type RichText = tuple[RichSpan, ...]
-
-
-@dataclass(frozen=True)
-class TimelineEntry:
-    date: date | None
-    content: RichText
-    source_ids: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class Indicator:
-    value: str
-    normalized_value: str
-    artifact_type: ArtifactType
-    source_ids: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class IndicatorGroup:
-    artifact_type: ArtifactType
-    values: tuple[Indicator, ...]
-
-
-@dataclass(frozen=True)
-class PublicationSource:
-    source_id: str
-    canonical_url: str
-
-
-@dataclass(frozen=True)
-class BriefDocumentV1:
-    """Historical publication document kept for read compatibility."""
-
-    schema_version: str
-    title: str
-    timeline: tuple[TimelineEntry, ...]
-    synthesis: tuple[RichText, ...]
-    indicators: tuple[IndicatorGroup, ...]
-    sources: tuple[PublicationSource, ...]
-    uncertainties: tuple[str, ...]
-    analyst_note: RichText | None = None
-    original_indicators: tuple[IndicatorGroup, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.schema_version != LEGACY_PUBLICATION_SCHEMA_VERSION:
-            raise ValueError(
-                f"BriefDocumentV1 requires schema_version={LEGACY_PUBLICATION_SCHEMA_VERSION!r}"
-            )
-
-    def to_json(self) -> dict[str, Any]:
-        """Return the historical JSON representation stored as a BRIEF artifact."""
-        payload = asdict(self)
-        for entry in payload["timeline"]:
-            if entry["date"] is not None:
-                entry["date"] = entry["date"].isoformat()
-        return payload
-
-    @classmethod
-    def from_json(cls, payload: Mapping[str, Any]) -> BriefDocumentV1:
-        return cls(**_publication_document_fields(payload, LEGACY_PUBLICATION_SCHEMA_VERSION))
-
-
-@dataclass(frozen=True)
-class PublicationDocumentV2:
-    """Generic document written by the unified publication pipeline."""
-
-    schema_version: str
-    title: str
-    timeline: tuple[TimelineEntry, ...]
-    synthesis: tuple[RichText, ...]
-    indicators: tuple[IndicatorGroup, ...]
-    sources: tuple[PublicationSource, ...]
-    uncertainties: tuple[str, ...]
-    analyst_note: RichText | None = None
-    original_indicators: tuple[IndicatorGroup, ...] = ()
-
-    def __post_init__(self) -> None:
-        if self.schema_version != PUBLICATION_SCHEMA_VERSION:
-            raise ValueError(
-                f"PublicationDocumentV2 requires schema_version={PUBLICATION_SCHEMA_VERSION!r}"
-            )
-
-    def to_json(self) -> dict[str, Any]:
-        payload = asdict(self)
-        for entry in payload["timeline"]:
-            if entry["date"] is not None:
-                entry["date"] = entry["date"].isoformat()
-        return payload
-
-    @classmethod
-    def from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV2:
-        return cls(**_publication_document_fields(payload, PUBLICATION_SCHEMA_VERSION))
-
-
-def _publication_document_fields(
-    payload: Mapping[str, Any], default_schema_version: str
-) -> dict[str, Any]:
-    def rich(items: list[Mapping[str, Any]]) -> RichText:
-        return tuple(
-            RichSpan(
-                kind=RichSpanKind(item["kind"]),
-                text=str(item.get("text", "")),
-                source_ids=tuple(item.get("source_ids", [])),
-            )
-            for item in items
-        )
-
-    def group(item: Mapping[str, Any]) -> IndicatorGroup:
-        return IndicatorGroup(
-            artifact_type=ArtifactType(item["artifact_type"]),
-            values=tuple(
-                Indicator(
-                    value=value["value"],
-                    normalized_value=value["normalized_value"],
-                    artifact_type=ArtifactType(value["artifact_type"]),
-                    source_ids=tuple(value.get("source_ids", [])),
-                )
-                for value in item.get("values", [])
-            ),
-        )
-
-    analyst = payload.get("analyst_note")
-    return {
-        "schema_version": str(payload.get("schema_version", default_schema_version)),
-        "title": str(payload["title"]),
-        "timeline": tuple(
-            TimelineEntry(
-                date=date.fromisoformat(item["date"]) if item.get("date") else None,
-                content=rich(item.get("content", [])),
-                source_ids=tuple(item.get("source_ids", [])),
-            )
-            for item in payload.get("timeline", [])
-        ),
-        "synthesis": tuple(rich(item) for item in payload.get("synthesis", [])),
-        "indicators": tuple(group(item) for item in payload.get("indicators", [])),
-        "sources": tuple(
-            PublicationSource(source_id=item["source_id"], canonical_url=item["canonical_url"])
-            for item in payload.get("sources", [])
-        ),
-        "uncertainties": tuple(payload.get("uncertainties", [])),
-        "analyst_note": rich(analyst) if analyst is not None else None,
-        "original_indicators": tuple(
-            group(item) for item in payload.get("original_indicators", [])
-        ),
-    }
-
-
-def publication_document_from_json(
-    payload: Mapping[str, Any],
-) -> BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3:
-    """Read canonical V3 and isolated historical publication payloads."""
-
-    schema_version = str(payload.get("schema_version", LEGACY_PUBLICATION_SCHEMA_VERSION))
-    if schema_version == LEGACY_PUBLICATION_SCHEMA_VERSION:
-        return BriefDocumentV1.from_json(payload)
-    if schema_version == PUBLICATION_SCHEMA_VERSION:
-        return PublicationDocumentV2.from_json(payload)
-    if schema_version == PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION:
-        return PublicationDocumentV3.from_json(payload)
-    raise ValueError(f"unsupported publication document schema_version={schema_version!r}")
 
 
 class PublicationEvidenceKind(StrEnum):
@@ -665,7 +498,7 @@ class PublicationDocumentV3:
             ),
         )
 
-    def to_json(self) -> dict[str, Any]:
+    def _to_json(self) -> dict[str, Any]:
         def evidence_refs_json(
             refs: tuple[PublicationEvidenceRefV1, ...],
         ) -> list[dict[str, str]]:
@@ -753,7 +586,7 @@ class PublicationDocumentV3:
         }
 
     @classmethod
-    def from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV3:
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV3:
         document_fields = frozenset(
             {
                 "schema_version",

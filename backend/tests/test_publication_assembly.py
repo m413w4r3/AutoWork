@@ -77,7 +77,10 @@ from cti_app.domain.publication import (
     PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     ArtifactType,
     PublicationAssemblyErrorCode,
-    PublicationDocumentV3,
+)
+from cti_app.domain.publication_document import (
+    parse_publication_document,
+    serialize_publication_document,
 )
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
@@ -297,7 +300,9 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         ),
     )
 
-    expected_bytes = ProductionArtifactStore.canonical_json_bytes(document.to_json())
+    expected_bytes = ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(document)
+    )
     assert catalog.writes == [
         (expected_bytes, "production-artifacts-canonical", "application/json")
     ]
@@ -320,8 +325,9 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
     assert artifact.raw_blob_id is None
     assert artifact.rendered_blob_id is None
     assert artifact.metadata == {}
-    assert document.to_json()["schema_version"] == PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION
-    assert set(document.to_json()) == {
+    document_json = serialize_publication_document(document)
+    assert document_json["schema_version"] == PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION
+    assert set(document_json) == {
         "schema_version",
         "subject_id",
         "publication_language",
@@ -479,7 +485,9 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     assert second.reused_from_artifact_id is None
     assert second.canonical_blob_id != first.canonical_blob_id
     assert len(catalog.writes) == 2
-    assert catalog.writes[1][0] == ProductionArtifactStore.canonical_json_bytes(expected.to_json())
+    assert catalog.writes[1][0] == ProductionArtifactStore.canonical_json_bytes(
+        serialize_publication_document(expected)
+    )
     assert artifacts.appended == [first, second]
 
 
@@ -643,9 +651,7 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
     assert publication_b.input_hash != publication_a.input_hash
     assert publication_b.version == 2
     assert publication_b.canonical_blob_id is not None
-    document = PublicationDocumentV3.from_json(
-        await store.read_json(publication_b.canonical_blob_id)
-    )
+    document = parse_publication_document(await store.read_json(publication_b.canonical_blob_id))
     assert document.lead[0].text == synthesis_a.lead[0].text
     assert [
         (group.artifact_type, item.normalized_value)

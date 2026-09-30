@@ -14,7 +14,9 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.diagram_compilation import DiagramCompiler
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_gateway import (
     ModelGateway,
     ModelGatewayError,
@@ -111,7 +113,8 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import production_synthesis_from_json
-from cti_app.domain.publication import PublicationDocumentV3, is_publication_ioc_artifact_type
+from cti_app.domain.publication import is_publication_ioc_artifact_type
+from cti_app.domain.publication_document import parse_publication_document
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -450,6 +453,8 @@ class ProductionWorkflowOrchestrator:
         diagnostics: DiagnosticsLog | None = None,
         seed_enrichment: VirusTotalSeedEnrichmentService | None = None,
         pacing: ProductionPacingPolicy | None = None,
+        media_asset_store: MediaAssetStore | None = None,
+        diagram_compiler: DiagramCompiler | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_gateway = model_gateway
@@ -504,6 +509,8 @@ class ProductionWorkflowOrchestrator:
                 model_gateway=self._model_gateway,
                 editorial_enrichment_service=self._editorial_enrichment,
                 artifact_reuse=self._artifact_reuse,
+                media_asset_store=media_asset_store,
+                diagram_compiler=diagram_compiler,
             )
             if self._model_gateway is not None and artifact_store is not None
             else None
@@ -1566,7 +1573,7 @@ class ProductionWorkflowOrchestrator:
                 )
                 if publication.canonical_blob_id is None:
                     raise ValueError("Publication canonical body is missing")
-                document = PublicationDocumentV3.from_json(
+                document = parse_publication_document(
                     await self._artifact_store.read_json(publication.canonical_blob_id)
                 )
                 qa_result = await ProductionQAService().run_qa(

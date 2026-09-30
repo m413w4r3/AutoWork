@@ -11,6 +11,7 @@ from sqlalchemy import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
 from cti_app.domain.classification import TLP
@@ -45,7 +46,7 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
     await scenario.start()
     run = await scenario.run_until_terminal()
-    assert run.status is ProductionRunStatus.READY
+    assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_message)
 
     async with scenario.uow_factory() as uow:
         artifacts = {
@@ -78,6 +79,20 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     assert enrichment.tables[0].rows[0].evidence_refs
     assert all(node.evidence_refs for node in enrichment.diagrams[0].nodes)
     assert all(edge.evidence_refs for edge in enrichment.diagrams[0].edges)
+    compiled_asset_id = enrichment.diagrams[0].compiled_asset_id
+    assert compiled_asset_id is not None
+    media_asset_store = MediaAssetStore(scenario.artifact_store, scenario.uow_factory)
+    media_manifest = await media_asset_store.get(compiled_asset_id)
+    assert media_manifest is not None
+    assert media_manifest.kind.value == "diagram_svg"
+    assert media_manifest.compiler_name == "d2-test"
+    assert (
+        await media_asset_store.read(compiled_asset_id)
+        == (
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            f"<text>{enrichment.diagrams[0].key}</text></svg>"
+        ).encode()
+    )
     assert len([call for call in scenario.model.calls if call.stage == "editorial_enrichment"]) == 1
 
 

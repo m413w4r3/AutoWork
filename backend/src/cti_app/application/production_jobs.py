@@ -11,6 +11,7 @@ from pydantic import ConfigDict, Field
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
+from cti_app.application.diagram_compilation import DiagramCompiler
 from cti_app.application.edition_workspace import EditionProductionCheckpointService
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -22,6 +23,7 @@ from cti_app.application.jobs import (
     JobRegistry,
     JobService,
 )
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_gateway import ModelGateway
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -354,10 +356,15 @@ def register_production_jobs(
     checkpoint: EditionProductionCheckpointService | None = None,
     bridge_transport: ReconciliationTransport | None = None,
     reconciliation_resolver: ProductionReconciliationResolver | None = None,
+    diagram_compiler: DiagramCompiler | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
     production_pacing = pacing or stage_chain.pacing
+    media_asset_store = (
+        MediaAssetStore(artifact_store, uow_factory) if artifact_store is not None else None
+    )
+    configured_diagram_compiler = diagram_compiler if artifact_store is not None else None
     resolver = reconciliation_resolver or ProductionReconciliationResolver(
         uow_factory,
         transport=bridge_transport,
@@ -626,6 +633,8 @@ def register_production_jobs(
             diagnostics=diagnostics,
             seed_enrichment=seed_enrichment,
             pacing=production_pacing,
+            media_asset_store=media_asset_store,
+            diagram_compiler=configured_diagram_compiler,
         )
 
         correlation_id = await context.correlation_id()

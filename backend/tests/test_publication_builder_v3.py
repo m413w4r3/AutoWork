@@ -75,6 +75,7 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
+from cti_app.domain.publication_document import serialize_publication_document
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 
@@ -968,7 +969,10 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
     assert document == expected
 
     canonical_json = json.dumps(
-        document.to_json(), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        serialize_publication_document(document),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
     repeated = build_publication_document_v3(
         snapshot=snapshot,
@@ -977,7 +981,12 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
         synthesis=synthesis,
     )
     assert (
-        json.dumps(repeated.to_json(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        json.dumps(
+            serialize_publication_document(repeated),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
         == canonical_json
     )
 

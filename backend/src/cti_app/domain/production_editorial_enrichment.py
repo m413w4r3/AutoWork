@@ -6,8 +6,10 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
-from uuid import UUID
+from typing import Any, Literal
+from uuid import NAMESPACE_URL, UUID, uuid5
+
+from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, field_validator, model_validator
 
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
@@ -240,6 +242,7 @@ class DiagramSpecV1:
     edges: tuple[DiagramEdgeV1, ...]
     groups: tuple[DiagramGroupV1, ...]
     placement: EnrichmentPlacementV1
+    compiled_asset_id: UUID | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Diagram key")
@@ -284,6 +287,8 @@ class DiagramSpecV1:
             raise ValueError("Diagram groups must not share nodes")
         if not isinstance(self.placement, EnrichmentPlacementV1):
             raise ValueError("Diagram placement is invalid")
+        if self.compiled_asset_id is not None and not isinstance(self.compiled_asset_id, UUID):
+            raise ValueError("Compiled diagram asset identity must be a UUID")
 
 
 class SourceFigureInclusionStatus(StrEnum):
@@ -313,6 +318,98 @@ class SourceFigureLocatorV1:
             raise ValueError("A source figure locator requires at least one location")
 
 
+class SourceFigureDecision(StrEnum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    PENDING = "pending"
+
+
+SourceFigureMimeType = Literal[
+    "image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"
+]
+
+
+def source_figure_id(
+    *, source_document_id: UUID, sha256: str | None, source: str, locator: SourceFigureLocatorV1
+) -> UUID:
+    """Return the stable identity for one media hash or unresolved source location."""
+    if sha256 is not None:
+        identity = f"source-figure-v1:sha256:{sha256}"
+    else:
+        identity = "source-figure-v1:location:" + ":".join(
+            (
+                str(source_document_id),
+                source,
+                str(locator.page or ""),
+                locator.section or "",
+                locator.figure_label or "",
+                locator.original_asset_url or "",
+            )
+        )
+    return uuid5(NAMESPACE_URL, identity)
+
+
+class ResolvedSourceFigureV1(BaseModel):
+    """Strict inventory record for one archived or unresolved source figure."""
+
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, arbitrary_types_allowed=True
+    )
+
+    figure_id: UUID
+    blob_id: UUID | None
+    sha256: StrictStr | None
+    mime_type: SourceFigureMimeType | None
+    byte_size: StrictInt | None
+    source_document_id: UUID
+    source: StrictStr
+    provenance: StrictStr
+    locator: SourceFigureLocatorV1
+    decision: SourceFigureDecision
+    decision_reason: StrictStr
+
+    @field_validator("sha256")
+    @classmethod
+    def _valid_sha256(cls, value: str | None) -> str | None:
+        if value is not None and _SHA256.fullmatch(value) is None:
+            raise ValueError("Source figure SHA-256 must be lowercase hexadecimal")
+        return value
+
+    @field_validator("source", "provenance", "decision_reason")
+    @classmethod
+    def _nonempty_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Source figure text fields must not be empty")
+        return value
+
+    @field_validator("byte_size")
+    @classmethod
+    def _valid_byte_size(cls, value: int | None) -> int | None:
+        if value is not None and value < 0:
+            raise ValueError("Source figure byte size must not be negative")
+        return value
+
+    @model_validator(mode="after")
+    def _valid_resolution(self) -> ResolvedSourceFigureV1:
+        if not isinstance(self.locator, SourceFigureLocatorV1):
+            raise ValueError("Source figure locator is invalid")
+        if self.figure_id != source_figure_id(
+            source_document_id=self.source_document_id,
+            sha256=self.sha256,
+            source=self.source,
+            locator=self.locator,
+        ):
+            raise ValueError("Source figure identity is not deterministic")
+        metadata = (self.blob_id, self.sha256, self.mime_type, self.byte_size)
+        if self.decision is SourceFigureDecision.ACCEPTED and any(
+            value is None for value in metadata
+        ):
+            raise ValueError("An accepted source figure requires complete archived blob metadata")
+        if self.blob_id is not None and any(value is None for value in metadata[1:]):
+            raise ValueError("An archived source figure blob requires complete metadata")
+        return self
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFigureCandidateV1:
     key: str
@@ -323,6 +420,7 @@ class SourceFigureCandidateV1:
     locator: SourceFigureLocatorV1
     inclusion_status: SourceFigureInclusionStatus
     placement: EnrichmentPlacementV1
+    resolved_figure: ResolvedSourceFigureV1 | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Source figure key")
@@ -337,6 +435,14 @@ class SourceFigureCandidateV1:
             raise ValueError("Source figure inclusion status is invalid")
         if not isinstance(self.placement, EnrichmentPlacementV1):
             raise ValueError("Source figure placement is invalid")
+        if self.resolved_figure is not None and (
+            not isinstance(self.resolved_figure, ResolvedSourceFigureV1)
+            or self.resolved_figure.decision is not SourceFigureDecision.ACCEPTED
+            or self.resolved_figure.source_document_id != self.source_document_id
+            or self.resolved_figure.source != self.source_url
+            or self.resolved_figure.locator != self.locator
+        ):
+            raise ValueError("A source figure candidate must reference an accepted local figure")
 
 
 @dataclass(frozen=True, slots=True)
@@ -442,7 +548,7 @@ def _table_to_json(table: TableSpecV1) -> dict[str, Any]:
 
 
 def _diagram_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
-    return {
+    payload = {
         "key": diagram.key,
         "kind": diagram.kind.value,
         "title": diagram.title,
@@ -471,10 +577,13 @@ def _diagram_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
         ],
         "placement": _placement_to_json(diagram.placement),
     }
+    if diagram.compiled_asset_id is not None:
+        payload["compiled_asset_id"] = str(diagram.compiled_asset_id)
+    return payload
 
 
 def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
-    return {
+    payload = {
         "key": figure.key,
         "source_document_id": str(figure.source_document_id),
         "source_url": figure.source_url,
@@ -489,6 +598,27 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
         "inclusion_status": figure.inclusion_status.value,
         "placement": _placement_to_json(figure.placement),
     }
+    if figure.resolved_figure is not None:
+        resolved = figure.resolved_figure
+        payload["resolved_figure"] = {
+            "figure_id": str(resolved.figure_id),
+            "blob_id": str(resolved.blob_id),
+            "sha256": resolved.sha256,
+            "mime_type": resolved.mime_type,
+            "byte_size": resolved.byte_size,
+            "source_document_id": str(resolved.source_document_id),
+            "source": resolved.source,
+            "provenance": resolved.provenance,
+            "locator": {
+                "page": resolved.locator.page,
+                "section": resolved.locator.section,
+                "figure_label": resolved.locator.figure_label,
+                "original_asset_url": resolved.locator.original_asset_url,
+            },
+            "decision": resolved.decision.value,
+            "decision_reason": resolved.decision_reason,
+        }
+    return payload
 
 
 def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str, Any]:
@@ -533,9 +663,10 @@ _TABLE_KEYS = frozenset({"key", "kind", "title", "caption", "columns", "rows", "
 _NODE_KEYS = frozenset({"node_id", "label", "evidence_refs"})
 _EDGE_KEYS = frozenset({"source_node_id", "target_node_id", "label", "evidence_refs"})
 _GROUP_KEYS = frozenset({"group_id", "label", "node_ids"})
-_DIAGRAM_KEYS = frozenset(
+_DIAGRAM_BASE_KEYS = frozenset(
     {"key", "kind", "title", "caption", "direction", "nodes", "edges", "groups", "placement"}
 )
+_DIAGRAM_KEYS = _DIAGRAM_BASE_KEYS | {"compiled_asset_id"}
 _LOCATOR_KEYS = frozenset({"page", "section", "figure_label", "original_asset_url"})
 _FIGURE_KEYS = frozenset(
     {
@@ -547,8 +678,10 @@ _FIGURE_KEYS = frozenset(
         "locator",
         "inclusion_status",
         "placement",
+        "resolved_figure",
     }
 )
+_FIGURE_BASE_KEYS = _FIGURE_KEYS - {"resolved_figure"}
 
 
 def _object(raw: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
@@ -693,7 +826,12 @@ def _group_from_json(raw: Any) -> DiagramGroupV1:
 
 
 def _diagram_from_json(raw: Any) -> DiagramSpecV1:
-    payload = _object(raw, _DIAGRAM_KEYS, "Editorial diagram")
+    if not isinstance(raw, Mapping) or frozenset(raw) not in {
+        _DIAGRAM_BASE_KEYS,
+        _DIAGRAM_KEYS,
+    }:
+        raise ValueError("Editorial diagram has missing or extra fields")
+    payload = raw
     caption = payload["caption"]
     if caption is not None:
         caption = _text(caption, "Diagram caption")
@@ -709,6 +847,11 @@ def _diagram_from_json(raw: Any) -> DiagramSpecV1:
             _group_from_json(value) for value in _array(payload["groups"], "Diagram groups")
         ),
         placement=_placement_from_json(payload["placement"]),
+        compiled_asset_id=(
+            _uuid(payload["compiled_asset_id"], "Compiled diagram asset ID")
+            if "compiled_asset_id" in payload
+            else None
+        ),
     )
 
 
@@ -730,7 +873,54 @@ def _locator_from_json(raw: Any) -> SourceFigureLocatorV1:
 
 
 def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
-    payload = _object(raw, _FIGURE_KEYS, "Source figure candidate")
+    if not isinstance(raw, Mapping) or frozenset(raw) not in {_FIGURE_BASE_KEYS, _FIGURE_KEYS}:
+        raise ValueError("Source figure candidate has missing or extra fields")
+    payload = raw
+    resolved_figure = None
+    if "resolved_figure" in payload:
+        resolved_raw = _object(
+            payload["resolved_figure"],
+            frozenset(
+                {
+                    "figure_id",
+                    "blob_id",
+                    "sha256",
+                    "mime_type",
+                    "byte_size",
+                    "source_document_id",
+                    "source",
+                    "provenance",
+                    "locator",
+                    "decision",
+                    "decision_reason",
+                }
+            ),
+            "Resolved source figure",
+        )
+        sha256 = resolved_raw["sha256"]
+        mime_type = resolved_raw["mime_type"]
+        byte_size = resolved_raw["byte_size"]
+        resolved_figure = ResolvedSourceFigureV1.model_validate(
+            {
+                "figure_id": _uuid(resolved_raw["figure_id"], "Figure identity"),
+                "blob_id": _uuid(resolved_raw["blob_id"], "Figure blob identity"),
+                "sha256": None if sha256 is None else _sha256(sha256, "Figure SHA-256"),
+                "mime_type": None if mime_type is None else _text(mime_type, "Figure MIME type"),
+                "byte_size": byte_size,
+                "source_document_id": _uuid(
+                    resolved_raw["source_document_id"], "Figure source document ID"
+                ),
+                "source": _text(resolved_raw["source"], "Figure source", semantic=True),
+                "provenance": _text(resolved_raw["provenance"], "Figure provenance", semantic=True),
+                "locator": _locator_from_json(resolved_raw["locator"]),
+                "decision": _enum(
+                    SourceFigureDecision, resolved_raw["decision"], "Figure decision"
+                ),
+                "decision_reason": _text(
+                    resolved_raw["decision_reason"], "Figure decision reason", semantic=True
+                ),
+            }
+        )
     return SourceFigureCandidateV1(
         key=_text(payload["key"], "Source figure key"),
         source_document_id=_uuid(payload["source_document_id"], "Source figure document ID"),
@@ -744,6 +934,7 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
             "Source figure inclusion status",
         ),
         placement=_placement_from_json(payload["placement"]),
+        resolved_figure=resolved_figure,
     )
 
 

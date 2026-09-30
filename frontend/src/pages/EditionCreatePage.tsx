@@ -3,7 +3,7 @@ import { type FormEvent, useState } from "react";
 
 import { createEdition, type EditionFields, type Tlp } from "../api/editions";
 import { ErrorMessage } from "../components/ErrorMessage";
-import { navigate } from "../routing";
+import { navigate } from "../navigation";
 
 export function EditionCreatePage() {
   const [error, setError] = useState<Error | null>(null);

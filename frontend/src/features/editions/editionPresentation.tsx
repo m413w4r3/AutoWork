@@ -1,9 +1,5 @@
 import type { EditionStatus, Tlp } from "../../api/editions";
-
-export const statusLabels: Record<EditionStatus, string> = {
-  open: "Ouverte",
-  archived: "Archivée",
-};
+import { statusLabels } from "./editionPresentationUtils";
 
 export function StatusBadge({ state }: { state: EditionStatus }) {
   return (
@@ -19,12 +15,4 @@ export function TlpBadge({ tlp }: { tlp: Tlp }) {
       TLP:{tlp}
     </span>
   );
-}
-
-export function formatPeriod(periodStart: string) {
-  return new Intl.DateTimeFormat("fr-FR", {
-    month: "long",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(new Date(`${periodStart}T00:00:00Z`));
 }

@@ -4,12 +4,15 @@ import { useEffect, useState } from "react";
 import { type EditionStatus, listEditions } from "../api/editions";
 import { ErrorMessage } from "../components/ErrorMessage";
 import {
-  StatusBadge,
-  TlpBadge,
   formatPeriod,
   statusLabels,
+} from "../features/editions/editionPresentationUtils";
+import {
+  StatusBadge,
+  TlpBadge,
 } from "../features/editions/editionPresentation";
-import { Link, navigate } from "../routing";
+import { Link } from "../routing";
+import { navigate } from "../navigation";
 
 type EditionFilters = {
   countryCode: string;

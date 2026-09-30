@@ -9,6 +9,7 @@ DOCKER ?= docker
 COMPOSE ?= $(DOCKER) compose
 UV ?= uv
 PNPM ?= pnpm
+D2_BINARY ?= d2
 
 PYTHON_VERSION ?= 3.12
 
@@ -174,6 +175,7 @@ doctor: ## Vérifie les prérequis locaux
 		echo "ERREUR: pnpm >= 10 requis, trouvé $$pnpm_version." >&2; \
 		exit 1; \
 	fi; \
+	./scripts/check-d2.sh "$(D2_BINARY)"; \
 	echo "OK: Docker, Compose, uv, Node.js et pnpm sont disponibles."
 
 setup: doctor backend-sync frontend-sync ## Prépare entièrement l'environnement de développement

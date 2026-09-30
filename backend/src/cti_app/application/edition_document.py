@@ -13,11 +13,7 @@ from cti_app.domain.edition_publication import (
 )
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication import (
-    PublicationDocumentV2,
-    PublicationDocumentV3,
-    publication_document_from_json,
-)
+from cti_app.domain.publication_document import parse_publication_document
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,11 +99,9 @@ async def build_edition_document(
 
         try:
             payload = await artifact_store.read_json(artifact.canonical_blob_id)
-            publication = publication_document_from_json(payload)
+            publication = parse_publication_document(payload)
         except (KeyError, TypeError, ValueError) as exc:
             raise EditionDocumentBuildError("publication_document_invalid") from exc
-        if not isinstance(publication, (PublicationDocumentV2, PublicationDocumentV3)):
-            raise EditionDocumentBuildError("publication_document_schema_mismatch")
         publications.append(
             EditionPublicationV2(
                 position=ref.position,

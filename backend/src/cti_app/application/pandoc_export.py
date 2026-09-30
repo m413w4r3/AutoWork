@@ -14,7 +14,7 @@ from cti_app.application.docx_postprocessing import (
     validate_docx,
 )
 from cti_app.application.pandoc_rendering import render_publication_pandoc
-from cti_app.domain.publication import BriefDocumentV1, PublicationDocumentV2, PublicationDocumentV3
+from cti_app.domain.publication_document import CanonicalPublicationDocument
 
 LOGGER = logging.getLogger(__name__)
 PANDOC_EXTENSIONS = "markdown+fenced_divs+bracketed_spans+superscript+raw_attribute"
@@ -26,7 +26,7 @@ class PandocExportError(RuntimeError):
 
 
 def export_publication_docx(
-    document: BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3,
+    document: CanonicalPublicationDocument,
     output_path: Path,
     *,
     reference_doc: Path = DEFAULT_REFERENCE_DOC,

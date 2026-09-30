@@ -23,9 +23,8 @@ from cti_app.application.pandoc_export import (
 from cti_app.application.pandoc_rendering import (
     PAGE_BREAK_MARKDOWN,
     WORD_STYLE_MAP,
-    _render_rich,
+    _render_v3_citations,
     render_edition_pandoc,
-    render_publication_pandoc,
 )
 from cti_app.application.production_normalization import (
     canonical_indicator_key,
@@ -46,21 +45,21 @@ from cti_app.application.production_parsers import (
     validate_synthesis,
 )
 from cti_app.application.production_rendering import collect_indicators
-from cti_app.application.publication_builder_legacy import (
-    build_publication_document,
-)
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
+from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     ArtifactType,
-    PublicationDocumentV2,
-    PublicationSource,
-    RichSpan,
+    PublicationDocumentV3,
+    PublicationEvidenceKind,
+    PublicationEvidenceRefV1,
+    PublicationParagraphV1,
+    PublicationSectionKind,
+    PublicationSectionV1,
+    PublicationSourceV1,
     RichSpanKind,
-    RichText,
-    TimelineEntry,
-    publication_document_from_json,
 )
 
 ROOT = Path(__file__).parents[2]
@@ -169,25 +168,37 @@ def _report() -> ReferenceReport:
     )
 
 
-def _multi_source_document() -> PublicationDocumentV2:
-    return PublicationDocumentV2(
-        schema_version="2",
+def _publication_source(source_id: UUID, url: str, title: str = "Example") -> PublicationSourceV1:
+    return PublicationSourceV1(
+        source_document_id=source_id,
+        canonical_url=url,
+        title=title,
+        publisher="Example",
+        published_at=None,
+        tier=ProductionReferenceTier.CORE,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.PRIMARY,
+    )
+
+
+def _multi_source_document() -> PublicationDocumentV3:
+    first_id, second_id = UUID(int=1), UUID(int=2)
+    refs = (
+        PublicationEvidenceRefV1(first_id, PublicationEvidenceKind.FACT, "a" * 64),
+        PublicationEvidenceRefV1(second_id, PublicationEvidenceKind.FACT, "b" * 64),
+    )
+    return PublicationDocumentV3(
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        subject_id=UUID(int=10),
+        publication_language="fr",
         title="Citation test",
-        timeline=(
-            TimelineEntry(
-                date=None,
-                content=(
-                    RichSpan(RichSpanKind.TEXT, "Information vérifiée"),
-                    RichSpan(RichSpanKind.CITATION, "", ("S1", "S2")),
-                ),
-                source_ids=("S1", "S2"),
-            ),
-        ),
-        synthesis=(),
+        lead=(PublicationParagraphV1("Information vérifiée", refs),),
+        sections=(),
+        timeline=(),
         indicators=(),
         sources=(
-            PublicationSource("S1", "https://example.test/1"),
-            PublicationSource("S2", "https://example.test/2"),
+            _publication_source(first_id, "https://example.test/1"),
+            _publication_source(second_id, "https://example.test/2"),
         ),
         uncertainties=(),
     )
@@ -241,70 +252,27 @@ def test_semantic_annotation_prioritizes_entities_and_citations() -> None:
 @pytest.mark.parametrize(
     ("source_ids", "expected"),
     [
-        (("S1",), "^[https://example.test/1]"),
-        (("S1", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
-        (("S1", "S1", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
-        (("S1", "UNKNOWN", "S2"), "^[https://example.test/1 ; https://example.test/2]"),
-        (("UNKNOWN",), ""),
+        ((1,), " ^[https://example.test/1]"),
+        ((1, 2), " ^[https://example.test/1 ; https://example.test/2]"),
+        ((1, 1, 2), " ^[https://example.test/1 ; https://example.test/2]"),
     ],
 )
 def test_pandoc_renderer_renders_one_footnote_per_citation(
-    source_ids: tuple[str, ...], expected: str
+    source_ids: tuple[int, ...], expected: str
 ) -> None:
-    rendered = _render_rich(
-        (RichSpan(RichSpanKind.CITATION, "", source_ids),),
+    rendered = _render_v3_citations(
+        tuple(
+            PublicationEvidenceRefV1(UUID(int=source_id), PublicationEvidenceKind.FACT, "a" * 64)
+            for source_id in source_ids
+        ),
         {
-            "S1": "https://example.test/1",
-            "S2": "https://example.test/2",
+            str(UUID(int=1)): "https://example.test/1",
+            str(UUID(int=2)): "https://example.test/2",
         },
     )
 
     assert rendered == expected
     assert "^[https://example.test/1]^[https://example.test/2]" not in rendered
-
-
-def test_builder_never_emits_two_adjacent_footnotes_for_one_event() -> None:
-    report = _report()
-    second = ParsedSource(
-        local_id="S2",
-        title="Cavern follow-up",
-        url="https://research.example/followup",
-        canonical_url="https://research.example/followup",
-        publisher="Research",
-        published_at=date(2026, 7, 7),
-        role=SourceRole.INDEPENDENT,
-    )
-    report = ReferenceReport(
-        sources=(*report.sources, second),
-        events=(
-            ParsedEvent(
-                local_id="R1",
-                event_date=date(2026, 7, 6),
-                source_ids=("S1", "S2"),
-                text="Publication de l'analyse Cavern [S1].",
-            ),
-        ),
-        editorial_title=report.editorial_title,
-    )
-    document = build_publication_document(
-        subject_title="Cavern",
-        report=report,
-        extraction=_extraction(),
-        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
-    )
-
-    citations = [
-        span for span in document.timeline[0].content if span.kind is RichSpanKind.CITATION
-    ]
-    assert len(citations) == 1
-    assert citations[0].source_ids == ("S1", "S2")
-
-    paragraph = render_publication_pandoc(document).split("Synthèse")[0]
-    assert paragraph.count("^[") == 1
-    assert (
-        "^[https://research.example/cavern\\_report ; https://research.example/followup]"
-        in paragraph
-    )
 
 
 def test_synthesis_validator_allows_ioc_section_values_in_body() -> None:
@@ -333,54 +301,6 @@ def test_synthesis_validator_allows_ioc_section_values_in_body() -> None:
     assert ioc.text == "cloudlanecdn[.]com"
 
 
-def test_current_builder_writes_only_v2_and_uses_the_central_reader() -> None:
-    document = build_publication_document(
-        subject_title="Cavern",
-        report=_report(),
-        extraction=_extraction(),
-        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
-    )
-
-    assert isinstance(document, PublicationDocumentV2)
-    assert document.to_json()["schema_version"] == "2"
-    assert publication_document_from_json(document.to_json()) == document
-    assert render_publication_pandoc(document)
-
-
-def test_cavern_document_round_trip_and_pandoc_golden() -> None:
-    document = build_publication_document(
-        subject_title="Cavern",
-        report=_report(),
-        extraction=_extraction(),
-        synthesis_text=(
-            "Cavern Manticore déploie HOLLOWGRAPH par DLL side-loading au moyen de "
-            "WinDirStat, un binaire légitime [S1]."
-        ),
-    )
-    markdown = render_publication_pandoc(document)
-    assert "# " not in markdown and "[S1]" not in markdown and "`" not in markdown
-    assert "**Cavern Manticore**" in markdown
-    assert "**HOLLOWGRAPH**" in markdown
-    assert '[WinDirStat]{custom-style="Veille - Outil Char"}' in markdown
-    assert '[DLL side-loading]{custom-style="Veille - Elément technique Char"}' in markdown
-    assert "^[https://research.example/cavern\\_report]" in markdown
-    assert "cloudlanecdn.com" in markdown
-    assert "2001:4998:44:3507::8000" not in markdown
-    assert "uxtheme.dll" not in markdown
-    assert "CVE-2026-1234" not in markdown
-
-
-def test_publication_document_title_uses_editorial_title_exactly() -> None:
-    """Q1's editorial_title must reach the published title verbatim."""
-    document = build_publication_document(
-        subject_title="Cavern",
-        report=_report(),
-        extraction=_extraction(),
-        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
-    )
-    assert document.title == _report().editorial_title
-
-
 def _edition_document(count: int) -> EditionDocumentV2:
     return EditionDocumentV2(
         edition={"period_start": "2026-07-01", "country": "Iran"},
@@ -395,22 +315,26 @@ def _edition_document(count: int) -> EditionDocumentV2:
     )
 
 
-def _publication(title: str, *, analyst_note: RichText | None = None) -> PublicationDocumentV2:
-    return PublicationDocumentV2(
-        schema_version="2",
+def _publication(title: str) -> PublicationDocumentV3:
+    source_id = UUID(int=1)
+    evidence = PublicationEvidenceRefV1(source_id, PublicationEvidenceKind.FACT, "a" * 64)
+    return PublicationDocumentV3(
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        subject_id=UUID(int=1),
+        publication_language="fr",
         title=title,
-        timeline=(
-            TimelineEntry(
-                date=None,
-                content=(RichSpan(RichSpanKind.TEXT, "Contenu"),),
-                source_ids=(),
+        lead=(PublicationParagraphV1("Contenu", (evidence,)),),
+        sections=(
+            PublicationSectionV1(
+                PublicationSectionKind.OVERVIEW,
+                "Synthèse",
+                (PublicationParagraphV1("Synthèse du sujet", (evidence,)),),
             ),
         ),
-        synthesis=((RichSpan(RichSpanKind.TEXT, "Synthèse du sujet"),),),
+        timeline=(),
         indicators=(),
-        sources=(),
+        sources=(_publication_source(source_id, "https://example.test/article"),),
         uncertainties=(),
-        analyst_note=analyst_note,
     )
 
 
@@ -423,30 +347,6 @@ def test_edition_markdown_separates_publications_with_one_page_break(
     assert markdown.count(PAGE_BREAK_MARKDOWN) == breaks
     assert not markdown.startswith(PAGE_BREAK_MARKDOWN)
     assert not markdown.rstrip().endswith(PAGE_BREAK_MARKDOWN)
-
-
-def test_publication_without_analyst_note_renders_no_note_block() -> None:
-    markdown = render_publication_pandoc(_publication("Alpha"))
-
-    assert "Note de l'analyste" not in markdown
-    assert str(WORD_STYLE_MAP["analyst_note"]) not in markdown
-
-
-def test_publication_renders_an_explicit_analyst_note_with_editorial_styles() -> None:
-    note: RichText = (
-        RichSpan(RichSpanKind.TEXT, "Le lien avec "),
-        RichSpan(RichSpanKind.ACTOR, "Cavern Manticore"),
-        RichSpan(RichSpanKind.TEXT, " reste probable."),
-    )
-
-    markdown = render_publication_pandoc(_publication("Alpha", analyst_note=note))
-
-    title_style = WORD_STYLE_MAP["analyst_note"]
-    assert f'::: {{custom-style="{title_style}"}}\nNote de l\'analyste' in markdown
-    assert (
-        f'::: {{custom-style="{WORD_STYLE_MAP["analyst_note_body"]}"}}\n'
-        "Le lien avec **Cavern Manticore** reste probable."
-    ) in markdown
 
 
 def test_reference_doc_contains_every_mapped_style() -> None:
@@ -463,12 +363,7 @@ def test_reference_doc_contains_every_mapped_style() -> None:
 
 @pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
 def test_real_pandoc_export_produces_an_openable_docx(tmp_path: Path) -> None:
-    document = build_publication_document(
-        subject_title="Cavern",
-        report=_report(),
-        extraction=_extraction(),
-        synthesis_text="Cavern Manticore utilise WinDirStat [S1].",
-    )
+    document = _publication("Cavern")
     output = export_publication_docx(document, tmp_path / "publication.docx")
     with zipfile.ZipFile(output) as archive:
         assert archive.testzip() is None

@@ -23,7 +23,7 @@ import {
   repairKindLabel,
   repairReasonLabel,
   repairStatusLabel,
-} from "./RepairQueue";
+} from "./repairQueuePresentation";
 
 const STALE_REPAIR_MESSAGE =
   "Cet élément a changé depuis son ouverture. La file de réparation a été rechargée.";

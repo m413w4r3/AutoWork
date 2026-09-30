@@ -35,7 +35,8 @@ from cti_app.domain.production import (
     ProductionStage,
     production_batch_request_fingerprint,
 )
-from cti_app.domain.publication import PublicationDocumentV2
+from cti_app.domain.publication import PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION, PublicationDocumentV3
+from cti_app.domain.publication_document import serialize_publication_document
 from tests.integration.production.support import ProductionScenario
 
 pytestmark = pytest.mark.integration
@@ -51,17 +52,20 @@ async def _seed_review_snapshot(
     input_hash: str,
     run_number: int,
 ) -> tuple[EditionProductionBatch, ProductionRun, ProductionArtifact]:
-    document = PublicationDocumentV2(
-        schema_version="2",
+    document = PublicationDocumentV3(
+        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        subject_id=scenario.subject.id,
+        publication_language="fr",
         title=title,
+        lead=(),
+        sections=(),
         timeline=(),
-        synthesis=(),
         indicators=(),
         sources=(),
         uncertainties=(),
     )
     document_blob_id, _ = await store.put_canonical_json(
-        document.to_json(), bucket="test-publication"
+        serialize_publication_document(document), bucket="test-publication"
     )
     run = ProductionRun(
         subject_id=scenario.subject.id,

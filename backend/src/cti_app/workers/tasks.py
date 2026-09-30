@@ -54,6 +54,7 @@ from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production_pipeline import production_stages
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
@@ -286,6 +287,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             production_checkpoint=production_checkpoint,
             publication_assembly=publication_assembly,
             bridge_transport=bridge_provider,
+            production_diagram_compiler=D2DiagramCompiler(),
         )
         job_service = JobService(uow_factory, registry)
         production_chain.bind(job_service, job_dispatcher)

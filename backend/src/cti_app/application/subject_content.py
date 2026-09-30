@@ -17,7 +17,8 @@ from cti_app.application.production_parsers import DisplayPolicy, IndicatorStatu
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
-from cti_app.domain.publication import ArtifactType, publication_document_from_json
+from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication_document import parse_publication_document
 
 
 class ArtifactPayloadReader(Protocol):
@@ -89,7 +90,7 @@ class SubjectContentService:
                 return None
 
             canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            document = publication_document_from_json(canonical)
+            document = parse_publication_document(canonical)
             rendered = (
                 await self._artifact_store.read_text(artifact.rendered_blob_id)
                 if artifact.rendered_blob_id is not None

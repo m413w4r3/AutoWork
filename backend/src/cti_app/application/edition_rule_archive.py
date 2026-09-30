@@ -1,6 +1,6 @@
 """Edition-wide detection rule archive built from canonical extraction artifacts.
 
-The published bulletin does not carry detection rules: ``PublicationDocumentV2``
+The published bulletin does not carry detection rules: ``PublicationDocumentV3``
 holds the narrative, the indicators and the sources, while YARA/Sigma/Suricata
 rules live in the Extraction artifact of each article.  The workspace sidecars
 under ``items/*/article/rules`` are a disposable projection marked

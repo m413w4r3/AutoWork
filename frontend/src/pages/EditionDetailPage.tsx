@@ -2,10 +2,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { archiveEdition, type Edition, getEdition } from "../api/editions";
 import { ErrorMessage } from "../components/ErrorMessage";
+import { formatPeriod } from "../features/editions/editionPresentationUtils";
 import {
   StatusBadge,
   TlpBadge,
-  formatPeriod,
 } from "../features/editions/editionPresentation";
 import {
   EditionWorkspace,

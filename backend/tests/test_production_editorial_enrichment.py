@@ -28,7 +28,9 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
+    ResolvedSourceFigureV1,
     SourceFigureCandidateV1,
+    SourceFigureDecision,
     SourceFigureInclusionStatus,
     SourceFigureLocatorV1,
     TableColumnV1,
@@ -37,6 +39,7 @@ from cti_app.domain.production_editorial_enrichment import (
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
+    source_figure_id,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -208,6 +211,71 @@ def test_populated_contract_round_trips_canonically() -> None:
     payload = editorial_enrichment_to_json(enrichment)
     assert editorial_enrichment_from_json(payload) == enrichment
     assert editorial_enrichment_to_json(editorial_enrichment_from_json(payload)) == payload
+
+
+def test_compiled_diagram_asset_identity_round_trips_in_canonical_enrichment() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    enrichment = _populated_enrichment(extraction, synthesis)
+    asset_id = uuid4()
+    compiled_diagram = replace(enrichment.diagrams[0], compiled_asset_id=asset_id)
+    compiled = replace(enrichment, diagrams=(compiled_diagram,))
+
+    payload = editorial_enrichment_to_json(compiled)
+
+    assert payload["diagrams"][0]["compiled_asset_id"] == str(asset_id)
+    assert editorial_enrichment_from_json(payload) == compiled
+
+
+def test_resolved_source_figure_round_trips_without_changing_legacy_candidate_usage() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    source = extraction.sources[0]
+    locator = SourceFigureLocatorV1(
+        page=1,
+        figure_label="Network diagram",
+        original_asset_url="https://example.test/images/network.png",
+    )
+    figure_hash = "d" * 64
+    resolved = ResolvedSourceFigureV1(
+        figure_id=source_figure_id(
+            source_document_id=source.source_document_id,
+            sha256=figure_hash,
+            source=source.canonical_url,
+            locator=locator,
+        ),
+        blob_id=UUID("30000000-0000-0000-0000-000000000003"),
+        sha256=figure_hash,
+        mime_type="image/png",
+        byte_size=128,
+        source_document_id=source.source_document_id,
+        source=source.canonical_url,
+        provenance="Matched to an image blob already in the archive",
+        locator=locator,
+        decision=SourceFigureDecision.ACCEPTED,
+        decision_reason="matched_archived_blob",
+    )
+    candidate = SourceFigureCandidateV1(
+        key=f"source_figure_{resolved.figure_id.hex}",
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+        caption="Network diagram",
+        provenance=resolved.provenance,
+        locator=locator,
+        inclusion_status=SourceFigureInclusionStatus.PROPOSED,
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+        resolved_figure=resolved,
+    )
+    enrichment = replace(
+        _populated_enrichment(extraction, synthesis),
+        source_figures=(candidate,),
+    )
+
+    payload = editorial_enrichment_to_json(enrichment)
+
+    assert editorial_enrichment_from_json(payload) == enrichment
+    assert editorial_enrichment_to_json(editorial_enrichment_from_json(payload)) == payload
+    validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     assert enrichment.tables[0].caption is None
     assert canonical_editorial_enrichment_hash(enrichment) == canonical_editorial_enrichment_hash(
         editorial_enrichment_from_json(payload)

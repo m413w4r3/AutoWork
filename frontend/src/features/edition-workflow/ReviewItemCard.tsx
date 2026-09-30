@@ -12,7 +12,7 @@ import {
 import { resumeProductionRun } from "../../api/production";
 import { Link } from "../../routing";
 import { ReconciliationPanel } from "./ReconciliationPanel";
-import type { RepairQueueFilter } from "./RepairQueue";
+import type { RepairQueueFilter } from "./repairQueuePresentation";
 import { PRODUCTION_STAGE_LABELS } from "../production/productionStages";
 
 const STALE_MESSAGE =

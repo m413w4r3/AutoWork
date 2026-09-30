@@ -25,11 +25,11 @@ SYNTHESIS → ProductionSynthesisV1
   ↓
 EDITORIAL_ENRICHMENT → EditorialEnrichmentV1
   ↓
-ASSEMBLY → PublicationDocumentV3  [transition AW-015]
+ASSEMBLY → PublicationDocumentV3
 ```
 
 `ASSEMBLY` écrit `PublicationDocumentV3` dans l'artifact `PUBLICATION`. La QA canonique passée,
-le run devient `READY`. Un futur pipeline de rendu indépendant pourra consommer cet artifact.
+le run devient `READY`.
 
 ## Modèle
 
@@ -251,8 +251,8 @@ les données ne gagnent rien à être représentées autrement. Une panne modèl
 interdit la soumission ne produit jamais un enrichissement vide artificiel.
 
 Aucun langage de renderer ni locator d’image source n’est généré par le modèle. AW-016 ne réalise
-pas de recherche web et garde `source_figures` vide ; leur inventaire et validation sont différés à
-AW-017b. L’appel est stateless, sans recherche web ni conversation. L’artifact versionné conserve
+pas de recherche web ; le stage s’appuie sur AW-017b pour inventorier les figures des documents et
+blobs déjà archivés. L’appel est stateless, sans recherche web ni conversation. L’artifact versionné conserve
 la provenance `ModelRun`, le RAW fournisseur disponible et les hashes fonctionnels du pack de
 preuves et de la politique d’accès. Une nouvelle version invalide `PUBLICATION`. Le stage peut
 consommer au plus un appel modèle ; un reuse exact ou un artifact vérifié déjà présent n’en coûte
@@ -293,11 +293,11 @@ analysable, racine `svg`, ni `script` ni `foreignObject`, références limitées
 et aux polices `data:` embarquées par D2. La policy `diagram-d2-svg-v1` est distincte de la version
 du binaire et évolue avec tout changement volontaire des bytes produits.
 
-À ce stade, le SVG n’est pas persisté, n’est pas relié à `EditorialEnrichmentService`, n’est pas
-injecté dans `PublicationDocumentV3` et n’est pas consommé par Assembly. L’inventaire des figures
-sources reste AW-017b ; la résolution des médias et leur persistance content-addressed restent
-AW-017c ; la projection dans `PublicationDocumentV4` reste AW-018. AW-017a conserve le rôle actuel
-de Pandoc.
+Le stage `EDITORIAL_ENRICHMENT` compile les diagrammes et persiste les SVG avec les médias gérés par
+`MediaAssetStore`. `SourceFigureInventory` inventorie les figures locales ; `SourceFigureIngestor`
+valide et archive celles retenues. L’assemblage ne les projette pas encore dans
+`PublicationDocumentV3` : cette évolution relève d’AW-018. La compilation D2 ne remplace pas le
+renderer documentaire actuel.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
 l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
@@ -306,13 +306,11 @@ Les sources sont résolues par `source_document_id`. Le hash d’Assembly dépen
 la version de document et de la policy, sans version de renderer. AW-015 inclut le hash de
 l’enrichissement dans l’identité d’Assembly sans changer le corps de `PublicationDocumentV3`.
 QA recalcule la projection canonique et compare le document exact. L'artifact `PUBLICATION`
-conserve le document canonique, sans rendu. Un futur pipeline de rendu indépendant pourra le
-consommer.
+conserve le document canonique, sans rendu.
 
-AW-016 a remplacé la génération vide par des propositions structurées. AW-017a fournit la
-compilation dérivée des diagrammes ; AW-017b inventorie les figures sources et AW-017c résout et
-persiste les médias. AW-018 projettera l’enrichissement et les médias résolus dans
-`PublicationDocumentV4`.
+AW-016 produit des propositions structurées. AW-017a, AW-017b et AW-017c fournissent la compilation
+des diagrammes, l’inventaire des figures et la persistance des médias. AW-018 reste nécessaire pour
+projeter l’enrichissement et les médias dans `PublicationDocumentV4`.
 
 ## ProductionBoard
 

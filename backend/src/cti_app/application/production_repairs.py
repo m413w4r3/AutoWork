@@ -149,9 +149,9 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import (
     ArtifactType,
-    PublicationDocumentV3,
     is_publication_ioc_artifact_type,
 )
+from cti_app.domain.publication_document import parse_publication_document
 
 REPAIR_EVIDENCE_SCHEMA_VERSION = "1"
 REPAIR_PLANNER_VERSION = "33.1"
@@ -4360,7 +4360,7 @@ class ProductionRepairMaterializationService:
             )
             if new_publication.canonical_blob_id is None:
                 raise ProductionRepairProjectionError("assembly_inputs_missing")
-            document = PublicationDocumentV3.from_json(
+            document = parse_publication_document(
                 await store.read_json(new_publication.canonical_blob_id)
             )
             qa_result = await ProductionQAService().run_qa(

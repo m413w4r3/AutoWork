@@ -11,6 +11,7 @@ from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import PublicationDocumentV3
+from cti_app.domain.publication_document import serialize_publication_document
 
 _LEGACY_CITATION = re.compile(r"\[S\d+\]", re.IGNORECASE)
 
@@ -46,7 +47,9 @@ def qa_publication_v3(
         errors.append(str(exc))
     else:
         checks["canonical_inputs_valid"] = True
-        checks["exact_projection"] = publication.to_json() == expected.to_json()
+        checks["exact_projection"] = serialize_publication_document(
+            publication
+        ) == serialize_publication_document(expected)
         if not checks["exact_projection"]:
             errors.append("Publication differs from canonical Assembly projection")
 

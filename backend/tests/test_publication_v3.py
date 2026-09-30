@@ -11,9 +11,7 @@ from cti_app.domain.production_synthesis import EvidenceKind, SynthesisSectionKi
 from cti_app.domain.publication import (
     PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
-    PUBLICATION_SCHEMA_VERSION,
     ArtifactType,
-    PublicationDocumentV2,
     PublicationDocumentV3,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
@@ -25,7 +23,11 @@ from cti_app.domain.publication import (
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
-    publication_document_from_json,
+)
+from cti_app.domain.publication_document import (
+    parse_publication_document,
+    serialize_publication_document,
+    validate_publication_document,
 )
 
 
@@ -345,9 +347,9 @@ def _publication_v3_document() -> PublicationDocumentV3:
 
 def test_publication_document_v3_round_trips_exactly_and_has_canonical_contract() -> None:
     document = _publication_v3_document()
-    payload = document.to_json()
+    payload = serialize_publication_document(document)
 
-    assert PublicationDocumentV3.from_json(payload) == document
+    assert parse_publication_document(payload) == document
     assert set(payload) == {
         "schema_version",
         "subject_id",
@@ -386,9 +388,9 @@ def test_publication_document_v3_sorts_non_editorial_collections_only() -> None:
         uncertainties=tuple(reversed(document.uncertainties)),
     )
 
-    assert reordered.to_json() == document.to_json()
-    assert json.dumps(reordered.to_json(), sort_keys=True) == json.dumps(
-        document.to_json(), sort_keys=True
+    assert serialize_publication_document(reordered) == serialize_publication_document(document)
+    assert json.dumps(serialize_publication_document(reordered), sort_keys=True) == json.dumps(
+        serialize_publication_document(document), sort_keys=True
     )
     assert tuple(paragraph.text for paragraph in document.lead) == (
         "Initial assessment",
@@ -464,26 +466,26 @@ def test_publication_document_v3_rejects_duplicate_indicator_groups_and_bad_sche
         replace(document, sections=[])  # type: ignore[arg-type]
 
 
-def test_publication_document_v3_from_json_validates_nested_values_and_top_level_shape() -> None:
-    payload = _publication_v3_document().to_json()
+def test_publication_document_v3_parse_validates_nested_values_and_top_level_shape() -> None:
+    payload = serialize_publication_document(_publication_v3_document())
     payload["lead"][0]["text"] = " "
     with pytest.raises(ValueError, match="paragraph text"):
-        PublicationDocumentV3.from_json(payload)
+        parse_publication_document(payload)
 
-    missing_field = _publication_v3_document().to_json()
+    missing_field = serialize_publication_document(_publication_v3_document())
     del missing_field["title"]
     with pytest.raises(ValueError, match="fields are invalid"):
-        PublicationDocumentV3.from_json(missing_field)
+        parse_publication_document(missing_field)
 
-    upper_uuid = _publication_v3_document().to_json()
+    upper_uuid = serialize_publication_document(_publication_v3_document())
     upper_uuid["subject_id"] = upper_uuid["subject_id"].upper()
     with pytest.raises(ValueError, match="canonical lowercase UUID"):
-        PublicationDocumentV3.from_json(upper_uuid)
+        parse_publication_document(upper_uuid)
 
-    compact_date = _publication_v3_document().to_json()
+    compact_date = serialize_publication_document(_publication_v3_document())
     compact_date["timeline"][1]["event_date"] = "20250203"
     with pytest.raises(ValueError, match="canonical ISO date"):
-        PublicationDocumentV3.from_json(compact_date)
+        parse_publication_document(compact_date)
 
 
 def test_publication_document_v3_rejects_duplicate_uncertainties() -> None:
@@ -492,32 +494,12 @@ def test_publication_document_v3_rejects_duplicate_uncertainties() -> None:
         replace(document, uncertainties=(*document.uncertainties, document.uncertainties[0]))
 
 
-def test_v3_addition_preserves_v2_schema_construction_serialization_and_reader() -> None:
-    document = PublicationDocumentV2(
-        schema_version=PUBLICATION_SCHEMA_VERSION,
-        title="Historical V2 document",
-        timeline=(),
-        synthesis=(),
-        indicators=(),
-        sources=(),
-        uncertainties=(),
-    )
-    payload = document.to_json()
+def test_canonical_document_entrypoint_round_trips_and_rejects_removed_versions() -> None:
+    document = _publication_v3_document()
+    payload = serialize_publication_document(document)
 
-    assert PUBLICATION_SCHEMA_VERSION == "2"
-    assert payload == {
-        "schema_version": "2",
-        "title": "Historical V2 document",
-        "timeline": (),
-        "synthesis": (),
-        "indicators": (),
-        "sources": (),
-        "uncertainties": (),
-        "analyst_note": None,
-        "original_indicators": (),
-    }
-    assert isinstance(publication_document_from_json(payload), PublicationDocumentV2)
-    assert isinstance(
-        publication_document_from_json(_publication_v3_document().to_json()),
-        PublicationDocumentV3,
-    )
+    assert parse_publication_document(payload) == document
+    assert validate_publication_document(document) is document
+    for schema_version in ("1", "2", "4"):
+        with pytest.raises(ValueError, match="unsupported publication document"):
+            parse_publication_document({**payload, "schema_version": schema_version})

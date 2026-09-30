@@ -374,6 +374,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         access_policy_hash: str,
         model_policy_version: str,
         routing_policy_version: str,
+        source_figure_inventory_hash: str | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
@@ -385,6 +386,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             synthesis=synthesis,
             evidence_pack_hash=evidence_pack_hash,
             access_policy_hash=access_policy_hash,
+            source_figure_inventory_hash=source_figure_inventory_hash,
         ):
             raise ValueError("editorial_enrichment_lineage_mismatch")
         payload = editorial_enrichment_to_json(enrichment)
@@ -405,6 +407,24 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             raw_id, canonical_id, _ = await self._store_payloads(raw=raw_result, canonical=payload)
             if canonical_id is None:
                 raise ValueError("editorial_enrichment_validation_failed")
+            artifact_metadata = {
+                "schema_version": enrichment.schema_version,
+                "policy_version": enrichment.enrichment_policy_version,
+                "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+                "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
+                "model_policy_version": model_policy_version,
+                "routing_policy_version": routing_policy_version,
+                "evidence_pack_hash": evidence_pack_hash,
+                "access_policy_hash": access_policy_hash,
+                "table_count": len(enrichment.tables),
+                "diagram_count": len(enrichment.diagrams),
+                "source_figure_count": len(enrichment.source_figures),
+                "warnings_count": len(enrichment.warnings),
+                "extraction_hash": enrichment.extraction_hash,
+                "synthesis_hash": enrichment.synthesis_hash,
+            }
+            if source_figure_inventory_hash is not None:
+                artifact_metadata["source_figure_inventory_hash"] = source_figure_inventory_hash
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -417,22 +437,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 rendered_blob_id=None,
                 model_run_id=model_run_id,
                 conversation_turn_id=None,
-                metadata={
-                    "schema_version": enrichment.schema_version,
-                    "policy_version": enrichment.enrichment_policy_version,
-                    "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
-                    "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
-                    "model_policy_version": model_policy_version,
-                    "routing_policy_version": routing_policy_version,
-                    "evidence_pack_hash": evidence_pack_hash,
-                    "access_policy_hash": access_policy_hash,
-                    "table_count": len(enrichment.tables),
-                    "diagram_count": len(enrichment.diagrams),
-                    "source_figure_count": len(enrichment.source_figures),
-                    "warnings_count": len(enrichment.warnings),
-                    "extraction_hash": enrichment.extraction_hash,
-                    "synthesis_hash": enrichment.synthesis_hash,
-                },
+                metadata=artifact_metadata,
             )
             await uow.production_artifacts.append(artifact)
             await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)

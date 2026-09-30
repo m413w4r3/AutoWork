@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import re
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from uuid import UUID
 
 import pytest
@@ -31,6 +33,7 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.infrastructure.d2_diagram_compiler import (
+    D2_COMPILER_VERSION,
     AsyncioD2ProcessRunner,
     D2DiagramCompiler,
     D2ProcessResult,
@@ -167,6 +170,18 @@ def test_encoding_and_semantic_hash_are_stable_and_key_sensitive() -> None:
     )
 
 
+def test_d2_tool_lock_matches_compiler_version() -> None:
+    lock_file = Path(__file__).parents[2] / "infra" / "d2.lock"
+    match = re.search(r"^D2_VERSION=([0-9.]+)$", lock_file.read_text(), re.MULTILINE)
+
+    assert match is not None
+    assert match.group(1) == D2_COMPILER_VERSION
+
+
+def test_diagram_compilation_policy_version_was_incremented() -> None:
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v2"
+
+
 @dataclass(frozen=True, slots=True)
 class _RecordedRun:
     argv: tuple[str, ...]
@@ -289,7 +304,7 @@ async def test_compile_pins_version_render_argv_environment_and_limits() -> None
         "--layout=dagre",
         "--timeout=10",
         "--omit-version",
-        f"--salt={diagram_semantic_sha256(diagram)}",
+        f"--salt={hashlib.sha256(encode_d2_source(diagram)).hexdigest()}",
         "--stdout-format=svg",
         "-",
         "-",
@@ -317,7 +332,6 @@ async def test_compile_is_deterministic_for_identical_diagrams() -> None:
     runner = _ControlledRunner(
         _version_result(),
         _svg_result(),
-        _version_result(),
         _svg_result(),
     )
     compiler = D2DiagramCompiler(runner=runner)
@@ -328,9 +342,10 @@ async def test_compile_is_deterministic_for_identical_diagrams() -> None:
 
     assert first.source_bytes == second.source_bytes
     assert first.source_sha256 == second.source_sha256
-    assert runner.calls[0].argv == runner.calls[2].argv
-    assert runner.calls[1].argv == runner.calls[3].argv
-    assert runner.calls[1].argv[4] == f"--salt={diagram_semantic_sha256(diagram)}"
+    assert len(runner.calls) == 3
+    assert runner.calls[0].argv == ("d2", "--version")
+    assert runner.calls[1].argv == runner.calls[2].argv
+    assert runner.calls[1].argv[4] == f"--salt={first.source_sha256}"
     assert first.media_bytes == second.media_bytes
     assert first.media_sha256 == second.media_sha256
 
@@ -342,6 +357,26 @@ async def test_compile_uses_configured_binary_for_version_and_render() -> None:
 
     assert runner.calls[0].argv == ("/opt/d2", "--version")
     assert runner.calls[1].argv[0] == "/opt/d2"
+
+
+async def test_version_cache_is_process_wide_and_binary_specific() -> None:
+    runner = _ControlledRunner(
+        _version_result(),
+        _svg_result(),
+        _svg_result(),
+        _version_result(),
+        _svg_result(),
+    )
+
+    await D2DiagramCompiler(runner=runner).compile(_diagram())
+    await D2DiagramCompiler(runner=runner).compile(_diagram())
+    await D2DiagramCompiler(runner=runner, binary="/opt/other-d2").compile(_diagram())
+
+    assert [call.argv for call in runner.calls if call.argv[-1] == "--version"] == [
+        ("d2", "--version"),
+        ("/opt/other-d2", "--version"),
+    ]
+    assert len(runner.calls) == 5
 
 
 async def test_compile_rejects_invalid_svg_after_successful_process() -> None:
@@ -436,19 +471,19 @@ async def test_stdout_overflow_maps_to_output_too_large() -> None:
         await D2DiagramCompiler(runner=runner).compile(_diagram())
 
 
-async def test_salt_is_deterministic_and_key_sensitive() -> None:
-    runner = _ControlledRunner(_version_result(), _svg_result(), _version_result(), _svg_result())
+async def test_salt_uses_canonical_d2_source_not_semantic_metadata() -> None:
+    runner = _ControlledRunner(_version_result(), _svg_result(), _svg_result())
     compiler = D2DiagramCompiler(runner=runner)
     first = _diagram()
-    second = replace(first, key="diagram-other")
+    second = replace(first, key="diagram-other", title="Changed legend")
 
     await compiler.compile(first)
     await compiler.compile(second)
 
-    first_salt, second_salt = runner.calls[1].argv[4], runner.calls[3].argv[4]
-    assert first_salt == f"--salt={diagram_semantic_sha256(first)}"
-    assert second_salt == f"--salt={diagram_semantic_sha256(second)}"
-    assert first_salt != second_salt
+    first_salt, second_salt = runner.calls[1].argv[4], runner.calls[2].argv[4]
+    expected_salt = f"--salt={hashlib.sha256(encode_d2_source(first)).hexdigest()}"
+    assert encode_d2_source(first) == encode_d2_source(second)
+    assert first_salt == second_salt == expected_salt
 
 
 class _FakeStdin:

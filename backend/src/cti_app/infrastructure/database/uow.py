@@ -33,6 +33,7 @@ from cti_app.application.persistence import (
     InvestigationGoodwareBaselineRepository,
     JobEventRepository,
     JobRepository,
+    MediaAssetRepository,
     ModelConversationRepository,
     ModelConversationTurnRepository,
     ModelOutputRejectionRepository,
@@ -121,6 +122,9 @@ from cti_app.infrastructure.database.repositories.jobs import (
     SqlAlchemyJobEventRepository,
     SqlAlchemyJobRepository,
 )
+from cti_app.infrastructure.database.repositories.media_assets import (
+    SqlAlchemyMediaAssetRepository,
+)
 from cti_app.infrastructure.database.repositories.model_conversations import (
     SqlAlchemyModelConversationRepository,
     SqlAlchemyModelConversationTurnRepository,
@@ -158,6 +162,7 @@ from cti_app.infrastructure.database.repositories.selection import (
 
 class SqlAlchemyUnitOfWork:
     blobs: BlobRepository
+    media_assets: MediaAssetRepository
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
@@ -228,6 +233,7 @@ class SqlAlchemyUnitOfWork:
     async def __aenter__(self) -> "SqlAlchemyUnitOfWork":
         self._session = self._session_factory()
         self.blobs = SqlAlchemyBlobRepository(self._session)
+        self.media_assets = SqlAlchemyMediaAssetRepository(self._session)
         self.goodware_baselines = SqlAlchemyGoodwareBaselineRepository(self._session)
         self.investigation_goodware_baselines = SqlAlchemyInvestigationGoodwareBaselineRepository(
             self._session

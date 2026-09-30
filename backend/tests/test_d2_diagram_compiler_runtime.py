@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import os
 import re
 import shutil
 import subprocess
 from dataclasses import replace
+from typing import NoReturn
 from uuid import UUID
 
 import pytest
@@ -50,14 +52,24 @@ def _canonical_diagram() -> DiagramSpecV1:
 
 @pytest.fixture
 def d2_binary() -> str:
-    binary = shutil.which("d2")
+    binary = os.environ.get("D2_BINARY") or shutil.which("d2")
     if binary is None:
-        pytest.skip("d2 executable is not installed")
-    probe = subprocess.run((binary, "--version"), capture_output=True, check=False, timeout=10)
+        _skip_unless_ci("d2 executable is not installed")
+    assert binary is not None
+    try:
+        probe = subprocess.run((binary, "--version"), capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _skip_unless_ci(f"d2 version check failed: {exc}")
     reported = probe.stdout.decode("utf-8", errors="replace")
-    if reported.strip().removeprefix("v") != D2_COMPILER_VERSION:
-        pytest.skip(f"d2 {D2_COMPILER_VERSION} is not installed")
+    if probe.returncode != 0 or reported.strip().removeprefix("v") != D2_COMPILER_VERSION:
+        _skip_unless_ci(f"d2 {D2_COMPILER_VERSION} is required, found {reported.strip()!r}")
     return binary
+
+
+def _skip_unless_ci(reason: str) -> NoReturn:
+    if os.environ.get("CI", "").lower() == "true":
+        pytest.fail(reason)
+    pytest.skip(reason)
 
 
 def _svg_text(svg: bytes) -> list[str]:
@@ -75,9 +87,12 @@ def test_real_d2_compilation_is_byte_deterministic(d2_binary: str) -> None:
             await compiler.compile(diagram),
             await compiler.compile(diagram),
             await compiler.compile(replace(diagram, key="runtime-other")),
+            await compiler.compile(
+                replace(diagram, title="Updated legend", caption="Changed caption")
+            ),
         )
 
-    first, second, other_key = asyncio.run(compile_twice())
+    first, second, other_key, other_legend = asyncio.run(compile_twice())
 
     expected_source = b'direction: right\nn001: "Start"\nn002: "Finish"\nn001 -> n002: "connects"\n'
     expected_source_sha256 = "0f03e24b222fce2975a515a298f284fde901af64715ec2eaeeaa1c242cceb26d"
@@ -86,8 +101,9 @@ def test_real_d2_compilation_is_byte_deterministic(d2_binary: str) -> None:
     assert first.media_bytes == second.media_bytes
     assert first.media_sha256 == second.media_sha256
     assert hashlib.sha256(first.media_bytes).hexdigest() == first.media_sha256
-    assert other_key.source_bytes == first.source_bytes
-    assert other_key.media_sha256 != first.media_sha256
+    assert other_key.source_bytes == other_legend.source_bytes == first.source_bytes
+    assert other_key.media_bytes == other_legend.media_bytes == first.media_bytes
+    assert other_key.media_sha256 == other_legend.media_sha256 == first.media_sha256
 
 
 def test_real_d2_renders_hostile_labels_as_visible_text(d2_binary: str) -> None:
