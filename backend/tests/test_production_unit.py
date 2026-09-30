@@ -69,6 +69,9 @@ class TestProductionRunStates:
         assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage(now=datetime.now(UTC))
+        assert run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
+
+        run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is ProductionStage.ASSEMBLY
 
     def test_mark_ready_terminates_run(self) -> None:
@@ -369,7 +372,12 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
         run.id, ProductionStage.EXTRACTION
     )
 
-    assert result.staled_artifacts == ["extraction", "synthesis", "publication"]
+    assert result.staled_artifacts == [
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+        "publication",
+    ]
     assert run.current_stage is ProductionStage.EXTRACTION
     assert run.pipeline_generation == 1
     assert references.status is ProductionArtifactStatus.VERIFIED

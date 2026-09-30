@@ -7,6 +7,7 @@ from uuid import UUID
 import pytest
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import build_empty_editorial_enrichment
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
@@ -277,6 +278,9 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
 
     expected_bytes = ProductionArtifactStore.canonical_json_bytes(document.to_json())
@@ -294,6 +298,9 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
     assert artifact.canonical_blob_id == UUID(int=50)
     assert artifact.raw_blob_id is None
@@ -324,6 +331,9 @@ async def test_identical_inputs_in_the_same_run_return_the_current_publication()
         "references": references,
         "extraction": extraction,
         "synthesis": synthesis,
+        "editorial_enrichment": build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     }
 
     first = await service.assemble_publication(**inputs)
@@ -345,6 +355,9 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
     artifacts.terminal_runs[source_run.id] = source_run.edition_id
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
@@ -356,6 +369,9 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
 
     assert len(catalog.writes) == 1
@@ -385,6 +401,9 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
     artifacts.terminal_runs[source_run.id] = source_run.edition_id
     catalog.blobs.clear()
@@ -396,6 +415,9 @@ async def test_unreadable_reuse_candidate_falls_back_to_fresh_persistence() -> N
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
 
     assert len(catalog.writes) == 2
@@ -415,6 +437,9 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=synthesis
+        ),
     )
     changed_synthesis = replace(synthesis, title="Revised synthesis")
 
@@ -424,6 +449,9 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
         references=references,
         extraction=extraction,
         synthesis=changed_synthesis,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction, synthesis=changed_synthesis
+        ),
     )
 
     expected = build_publication_document_v3(
@@ -541,6 +569,9 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
         references=references,
         extraction=extraction_a,
         synthesis=synthesis_a,
+        editorial_enrichment=build_empty_editorial_enrichment(
+            extraction=extraction_a, synthesis=synthesis_a
+        ),
     )
     extraction_b_artifact = await artifact(
         ProductionArtifactStage.EXTRACTION, 2, production_extraction_to_json(extraction_b)
@@ -645,6 +676,9 @@ async def test_invalid_lineage_fails_before_body_or_artifact_persistence(
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=build_empty_editorial_enrichment(
+                extraction=extraction, synthesis=synthesis
+            ),
         )
 
     assert failure.value.code is (

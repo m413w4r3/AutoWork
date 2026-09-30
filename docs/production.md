@@ -11,7 +11,22 @@ est défini dans `domain/production_pipeline.py` :
 | `REFERENCES` | `REFERENCES` |
 | `EXTRACTION` | `EXTRACTION` |
 | `SYNTHESIS` | `SYNTHESIS` |
+| `EDITORIAL_ENRICHMENT` | `EDITORIAL_ENRICHMENT` |
 | `ASSEMBLY` | `PUBLICATION` |
+
+```text
+ProductionInputSnapshot
+  ↓
+REFERENCES → ProductionReferenceCorpusV1
+  ↓
+EXTRACTION → ProductionExtractionV1
+  ↓
+SYNTHESIS → ProductionSynthesisV1
+  ↓
+EDITORIAL_ENRICHMENT → EditorialEnrichmentV1
+  ↓
+ASSEMBLY → PublicationDocumentV3  [transition AW-015]
+```
 
 `ASSEMBLY` écrit `PublicationDocumentV3` dans l'artifact `PUBLICATION`. La QA canonique passée,
 le run devient `READY`. Un futur pipeline de rendu indépendant pourra consommer cet artifact.
@@ -94,7 +109,8 @@ réutilisé ne porte donc pas d’identité de `ProductionRun`.
 Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
 production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
 La projection historique `ReferenceReport` reste confinée aux imports V4 et à certaines fonctions
-du Repair Desk. Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → ASSEMBLY lit directement
+du Repair Desk. Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT
+→ ASSEMBLY lit directement
 les contrats canoniques et n'utilise plus les `EVENT` Q1 comme identité de publication.
 
 ### EXTRACTION et contrat canonique
@@ -188,8 +204,10 @@ ProductionExtractionV1
 SYNTHESIS organise et rédige exclusivement à partir de cette vérité factuelle
         ↓
 ProductionSynthesisV1
-        +
-ProductionReferenceCorpusV1
+        ↓
+EDITORIAL_ENRICHMENT produit EditorialEnrichmentV1
+        ↓
+ASSEMBLY lit aussi ProductionReferenceCorpusV1
         ↓
 PublicationDocumentV3 → QA canonique → READY
 ```
@@ -214,13 +232,32 @@ dans les métadonnées de source de `ProductionExtractionV1` pour présenter les
 Elle ne résout pas les handles temporaires du prompt et ne prend pas le Markdown rendu pour
 source. `rendered_blob_id` peut contenir un aperçu Markdown déterministe optionnel.
 
-Assembly vérifie le lineage du snapshot, des références, de l’extraction et de la synthèse avant
-de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la chronologie et les
-incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction. Les sources sont
-résolues par `source_document_id`. Le hash d’Assembly dépend des quatre entrées canoniques, de
-la version de document et de la policy, sans version de renderer. QA recalcule la projection
-canonique et compare le document exact. L'artifact `PUBLICATION` conserve le document canonique,
-sans rendu. Un futur pipeline de rendu indépendant pourra le consommer.
+### EDITORIAL_ENRICHMENT : contrat canonique AW-015
+
+`EditorialEnrichmentV1` décrit les intentions de tables, diagrammes et figures sources sans
+syntaxe de renderer ni média dérivé. Les cellules de table, nodes et edges portent des références
+d’évidence appartenant à l’extraction courante. Les figures désignent un `source_document_id`
+canonique et son URL exacte. Les placements par section sont liés au hash exact de la synthèse.
+
+AW-015 produit automatiquement un enrichissement vide, valide et déterministe : `tables`,
+`diagrams` et `source_figures` sont vides. Ce stage n’appelle pas `ModelGateway`. Son hash d’entrée
+inclut les hashes canoniques de l’extraction et de la synthèse, la policy et la version du
+générateur `bootstrap-empty-v1`. L’artifact canonique est versionné ; une nouvelle version
+invalide `PUBLICATION`. La reprise depuis ce stage coûte zéro appel modèle.
+
+Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
+l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
+chronologie et les incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction.
+Les sources sont résolues par `source_document_id`. Le hash d’Assembly dépend des cinq entrées canoniques, de
+la version de document et de la policy, sans version de renderer. AW-015 inclut le hash de
+l’enrichissement dans l’identité d’Assembly sans changer le corps de `PublicationDocumentV3`.
+QA recalcule la projection canonique et compare le document exact. L'artifact `PUBLICATION`
+conserve le document canonique, sans rendu. Un futur pipeline de rendu indépendant pourra le
+consommer.
+
+AW-016 remplacera la génération vide par des propositions structurées. AW-017 résoudra les
+médias et compilera les diagrammes. AW-018 projettera l’enrichissement dans
+`PublicationDocumentV4`.
 
 ## ProductionBoard
 
@@ -291,7 +328,7 @@ sujet depuis un titre, une position ou une ressemblance visuelle.
 Chaque run traverse la pipeline statique suivante :
 
 ```text
-SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → ASSEMBLY → READY
+SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
 ```
 
 Chaque étape produit un artifact versionné et adressé par les entrées fonctionnelles, le run et la

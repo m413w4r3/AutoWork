@@ -1613,6 +1613,7 @@ def _repair_execution_plan_view(plan: DomainRepairExecutionPlan) -> RepairExecut
                 ProductionDerivedOutput.REFERENCES,
                 ProductionDerivedOutput.EXTRACTION,
                 ProductionDerivedOutput.SYNTHESIS,
+                ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
                 ProductionDerivedOutput.PUBLICATION,
                 ProductionDerivedOutput.RULE_BUNDLE,
                 ProductionDerivedOutput.CHECKPOINT,

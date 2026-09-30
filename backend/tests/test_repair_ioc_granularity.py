@@ -211,7 +211,11 @@ def test_ioc_include_only_rebuilds_publication() -> None:
     )
 
     assert impact.affected_outputs == frozenset(
-        {ProductionDerivedOutput.EXTRACTION, ProductionDerivedOutput.CHECKPOINT}
+        {
+            ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
+            ProductionDerivedOutput.CHECKPOINT,
+        }
     ) | {ProductionDerivedOutput.PUBLICATION}
     assert publication_projection_hash(
         report, previous, SYNTHESIS_TEXT

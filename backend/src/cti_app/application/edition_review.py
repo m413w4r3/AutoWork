@@ -31,6 +31,7 @@ from cti_app.domain.production import (
     RepairExecutionPlan,
     requires_submission_reconciliation,
 )
+from cti_app.domain.production_pipeline import downstream_artifacts_from_pipeline_stage
 from cti_app.domain.publication_review import (
     PublicationDecision,
     PublicationReviewDecision,
@@ -673,14 +674,24 @@ def _rebuild_only_execution_plan(stage: ProductionStage) -> RepairExecutionPlan:
         ProductionStage.REFERENCES,
         ProductionStage.SYNTHESIS,
     }
+    affected_outputs = frozenset(
+        ProductionDerivedOutput(artifact.value)
+        for artifact in downstream_artifacts_from_pipeline_stage(stage, inclusive=True)
+    )
     return RepairExecutionPlan(
         impact_kind=ProductionRepairImpactKind.NARRATIVE,
-        affected_outputs=frozenset(
-            {ProductionDerivedOutput.SYNTHESIS, ProductionDerivedOutput.PUBLICATION}
-        ),
+        affected_outputs=affected_outputs,
         model_call_required=model_call_required,
         provider_steps=(f"Rejouer l'étape « {stage.value} »",) if model_call_required else (),
-        deterministic_steps=("Reconstruction de la publication", "Contrôle QA"),
+        deterministic_steps=(
+            *(
+                ("Enrichissement éditorial",)
+                if ProductionDerivedOutput.EDITORIAL_ENRICHMENT in affected_outputs
+                else ()
+            ),
+            "Reconstruction de la publication",
+            "Contrôle QA",
+        ),
         ready_to_apply=True,
     )
 

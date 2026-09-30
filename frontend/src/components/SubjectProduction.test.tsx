@@ -714,7 +714,7 @@ describe("SubjectProduction retry from stage", () => {
     ).toBeInTheDocument();
   });
 
-  it("READY affiche un menu avec les cinq étapes", async () => {
+  it("READY affiche un menu avec les six étapes", async () => {
     const readyBase = status("ready", "assembly");
     const ready = {
       ...readyBase,
@@ -731,7 +731,7 @@ describe("SubjectProduction retry from stage", () => {
       name: "Relancer depuis une étape",
     });
     expect(select).toHaveValue("");
-    expect(screen.getAllByRole("option")).toHaveLength(6);
+    expect(screen.getAllByRole("option")).toHaveLength(7);
   });
 
   it("la synthèse n’est plus liée à une conversation", async () => {

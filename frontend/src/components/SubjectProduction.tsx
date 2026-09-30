@@ -43,6 +43,7 @@ const STAGE_ARTIFACT_LABELS: Record<string, string> = {
   references: "les références",
   extraction: "l’extraction",
   synthesis: "la synthèse",
+  editorial_enrichment: "l’enrichissement éditorial",
   publication: "l’assemblage",
 };
 
@@ -56,6 +57,8 @@ const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
     "L’extraction et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
   synthesis:
     "La synthèse et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
+  editorial_enrichment:
+    "L’enrichissement éditorial et l’assemblage seront recalculés. Les références, l’extraction et la synthèse existantes seront conservées.",
   assembly:
     "L’assemblage sera recalculé. Les références existantes seront conservées.",
 };

@@ -18,6 +18,10 @@ PRODUCTION_PIPELINE: tuple[ProductionStageSpec, ...] = (
     ProductionStageSpec(ProductionStage.REFERENCES, ProductionArtifactStage.REFERENCES),
     ProductionStageSpec(ProductionStage.EXTRACTION, ProductionArtifactStage.EXTRACTION),
     ProductionStageSpec(ProductionStage.SYNTHESIS, ProductionArtifactStage.SYNTHESIS),
+    ProductionStageSpec(
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+    ),
     ProductionStageSpec(ProductionStage.ASSEMBLY, ProductionArtifactStage.PUBLICATION),
 )
 
@@ -70,6 +74,15 @@ def stage_spec(stage: ProductionStage) -> ProductionStageSpec:
 
 def artifact_stage_for(stage: ProductionStage) -> ProductionArtifactStage | None:
     return stage_spec(stage).artifact_stage
+
+
+def prerequisite_artifact_for(stage: ProductionStage) -> ProductionArtifactStage | None:
+    spec = stage_spec(stage)
+    index = PRODUCTION_PIPELINE.index(spec)
+    for previous in reversed(PRODUCTION_PIPELINE[:index]):
+        if previous.artifact_stage is not None:
+            return previous.artifact_stage
+    return None
 
 
 def pipeline_stage_for_artifact(
@@ -136,6 +149,7 @@ __all__ = [
     "downstream_artifacts_from_pipeline_stage",
     "next_stage",
     "pipeline_stage_for_artifact",
+    "prerequisite_artifact_for",
     "production_artifact_stages",
     "production_stages",
     "stage_spec",

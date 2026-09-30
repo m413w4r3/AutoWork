@@ -25,6 +25,12 @@ from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
     verify_q2_proposals,
 )
+from cti_app.application.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+    build_empty_editorial_enrichment,
+    compute_editorial_enrichment_input_hash,
+    validate_editorial_enrichment,
+)
 from cti_app.application.production_extraction import (
     extraction_compatibility_view,
     is_current_source_checkpoint,
@@ -89,6 +95,7 @@ from cti_app.application.publication_qa import ProductionQAService
 from cti_app.domain.collection import CollectionState, DetectedMimeType
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.editions import EditionAuditEvent, EditionStatus
+from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.production import (
     PUBLICATION_REBUILD_REQUIRED_ERROR_CODE,
     DetectionRule,
@@ -116,6 +123,10 @@ from cti_app.domain.production import (
     RepairRemediation,
     SupplementalSourceRepairState,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    editorial_enrichment_to_json,
+)
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
@@ -130,6 +141,7 @@ from cti_app.domain.production_references import (
 )
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
     extraction_evidence_refs_v1,
     production_synthesis_from_json,
     production_synthesis_to_json,
@@ -1044,6 +1056,7 @@ _NO_DELIVERABLE_OUTPUTS = frozenset[ProductionDerivedOutput]()
 _RULE_BUNDLE_OUTPUTS = frozenset(
     {
         ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
         ProductionDerivedOutput.RULE_BUNDLE,
         ProductionDerivedOutput.CHECKPOINT,
     }
@@ -1051,6 +1064,7 @@ _RULE_BUNDLE_OUTPUTS = frozenset(
 _PUBLICATION_OUTPUTS = frozenset(
     {
         ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
         ProductionDerivedOutput.PUBLICATION,
         ProductionDerivedOutput.CHECKPOINT,
     }
@@ -1059,6 +1073,7 @@ _NARRATIVE_OUTPUTS = frozenset(
     {
         ProductionDerivedOutput.EXTRACTION,
         ProductionDerivedOutput.SYNTHESIS,
+        ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
         ProductionDerivedOutput.PUBLICATION,
         ProductionDerivedOutput.CHECKPOINT,
     }
@@ -1068,6 +1083,7 @@ _SOURCE_CORPUS_OUTPUTS = frozenset(
         ProductionDerivedOutput.REFERENCES,
         ProductionDerivedOutput.EXTRACTION,
         ProductionDerivedOutput.SYNTHESIS,
+        ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
         ProductionDerivedOutput.PUBLICATION,
         ProductionDerivedOutput.CHECKPOINT,
     }
@@ -1086,12 +1102,14 @@ _REPAIR_PLAN_STEPS: dict[ProductionRepairImpactKind, tuple[str, ...]] = {
     ProductionRepairImpactKind.RULE_BUNDLE_ONLY: (
         "Décision analyste",
         "Projection Extraction",
+        "Enrichissement éditorial",
         "Mise à jour des fichiers YARA/Sigma",
         "Contrôle QA",
     ),
     ProductionRepairImpactKind.PUBLICATION_ONLY: (
         "Décision analyste",
         "Projection Extraction",
+        "Enrichissement éditorial",
         "Rendu Publication",
         "Contrôle QA",
     ),
@@ -1099,6 +1117,7 @@ _REPAIR_PLAN_STEPS: dict[ProductionRepairImpactKind, tuple[str, ...]] = {
         "Décision analyste",
         "Projection Extraction",
         "Nouvelle synthèse",
+        "Enrichissement éditorial",
         "Rendu Publication",
         "Contrôle QA",
     ),
@@ -1107,6 +1126,7 @@ _REPAIR_PLAN_STEPS: dict[ProductionRepairImpactKind, tuple[str, ...]] = {
         "Références",
         "Extraction",
         "Synthèse si nécessaire",
+        "Enrichissement éditorial",
         "Publication",
         "Contrôle QA",
     ),
@@ -1186,6 +1206,7 @@ def merge_repair_impacts(
             "Extraction",
             "Nouvelle synthèse",
             "Synthèse si nécessaire",
+            "Enrichissement éditorial",
             "Mise à jour des fichiers YARA/Sigma",
             "Rendu Publication",
             "Publication",
@@ -2549,6 +2570,7 @@ def _impact_from_projection_hashes(
 
     affected = {
         ProductionDerivedOutput.EXTRACTION,
+        ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
         ProductionDerivedOutput.CHECKPOINT,
     }
     if rules_changed:
@@ -3817,6 +3839,7 @@ class ProductionRepairMaterializationService:
                         ProductionArtifactStage.REFERENCES.value,
                         ProductionArtifactStage.EXTRACTION.value,
                         ProductionArtifactStage.SYNTHESIS.value,
+                        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
                         ProductionArtifactStage.PUBLICATION.value,
                     },
                 )
@@ -3868,6 +3891,11 @@ class ProductionRepairMaterializationService:
                     )
                     repair_audit["result_publication_artifact_id"] = str(publication.id)
                 else:
+                    await self._mark_stages_stale(
+                        uow,
+                        run.id,
+                        {ProductionArtifactStage.EDITORIAL_ENRICHMENT.value},
+                    )
                     qa_result = await self._qa_current_outputs_in_uow(
                         uow, run=run, extraction=projection.artifact
                     )
@@ -3877,6 +3905,7 @@ class ProductionRepairMaterializationService:
                     run.id,
                     {
                         ProductionArtifactStage.SYNTHESIS.value,
+                        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
                         ProductionArtifactStage.PUBLICATION.value,
                     },
                 )
@@ -4096,11 +4125,14 @@ class ProductionRepairMaterializationService:
         )
         if references is None or synthesis is None:
             raise ProductionRepairProjectionError("publication_inputs_missing")
-        publication = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.PUBLICATION.value
+        await self._mark_stages_stale(
+            uow,
+            run_id,
+            {
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+                ProductionArtifactStage.PUBLICATION.value,
+            },
         )
-        if publication is not None:
-            await self._mark_stages_stale(uow, run_id, {ProductionArtifactStage.PUBLICATION.value})
         title = await self._subject_title(uow, run_id, run.subject_id)
         assembly_kwargs: dict[str, Any] = (
             {"metadata_extra": {"repair_materialization": dict(repair_materialization)}}
@@ -4239,6 +4271,17 @@ class ProductionRepairMaterializationService:
                 await uow.production_artifacts.append(rebased)
                 synthesis_artifact = rebased
 
+            (
+                editorial_enrichment,
+                editorial_enrichment_artifact,
+            ) = await self._materialize_editorial_enrichment_in_uow(
+                uow,
+                run=run,
+                extraction_artifact=extraction,
+                extraction=canonical_extraction,
+                synthesis_artifact=synthesis_artifact,
+                synthesis=synthesis,
+            )
             publication = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.PUBLICATION.value
             )
@@ -4251,6 +4294,7 @@ class ProductionRepairMaterializationService:
                     "references_artifact_id": str(references_artifact.id),
                     "extraction_artifact_id": str(extraction.id),
                     "synthesis_artifact_id": str(synthesis_artifact.id),
+                    "editorial_enrichment_artifact_id": str(editorial_enrichment_artifact.id),
                 }
             }
             if repair_materialization is not None:
@@ -4263,6 +4307,7 @@ class ProductionRepairMaterializationService:
                 references=references,
                 extraction=canonical_extraction,
                 synthesis=synthesis,
+                editorial_enrichment=editorial_enrichment,
                 metadata_extra=metadata,
             )
             if new_publication.canonical_blob_id is None:
@@ -4285,6 +4330,108 @@ class ProductionRepairMaterializationService:
             raise ProductionRepairProjectionError(exc.code.value) from exc
         except (KeyError, TypeError, ValueError) as exc:
             raise ProductionRepairProjectionError("assembly_validation_failed") from exc
+
+    async def _materialize_editorial_enrichment_in_uow(
+        self,
+        uow: Any,
+        *,
+        run: Any,
+        extraction_artifact: ProductionArtifact,
+        extraction: ProductionExtractionV1,
+        synthesis_artifact: ProductionArtifact,
+        synthesis: ProductionSynthesisV1,
+    ) -> tuple[EditorialEnrichmentV1, ProductionArtifact]:
+        """Rebuild the deterministic AW-015 enrichment within the repair transaction."""
+        store = self._artifact_store
+        if (
+            store is None
+            or extraction_artifact.canonical_blob_id is None
+            or synthesis_artifact.canonical_blob_id is None
+        ):
+            raise ProductionRepairProjectionError("editorial_enrichment_inputs_missing")
+
+        try:
+            enrichment = build_empty_editorial_enrichment(
+                extraction=extraction,
+                synthesis=synthesis,
+            )
+            validate_editorial_enrichment(
+                enrichment,
+                extraction=extraction,
+                synthesis=synthesis,
+            )
+            canonical_payload = editorial_enrichment_to_json(enrichment)
+            input_hash = compute_editorial_enrichment_input_hash(
+                extraction=extraction,
+                synthesis=synthesis,
+            )
+        except ValueError as exc:
+            code = getattr(exc, "code", "editorial_enrichment_validation_failed")
+            raise ProductionRepairProjectionError(str(code)) from exc
+
+        stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        current = await uow.production_artifacts.get_current(run.id, stage.value)
+        if (
+            current is not None
+            and current.status is ProductionArtifactStatus.VERIFIED
+            and current.input_hash == input_hash
+            and current.canonical_blob_id is not None
+        ):
+            try:
+                stored = await store.read_bytes(current.canonical_blob_id)
+            except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError):
+                pass
+            else:
+                if stored == ProductionArtifactStore.canonical_json_bytes(canonical_payload):
+                    return enrichment, current
+
+        await self._mark_stages_stale(
+            uow,
+            run.id,
+            {stage.value, ProductionArtifactStage.PUBLICATION.value},
+        )
+        prior_artifacts = await uow.production_artifacts.list_for_run(run.id)
+        version = (
+            max(
+                (artifact.version for artifact in prior_artifacts if artifact.stage is stage),
+                default=0,
+            )
+            + 1
+        )
+        _, canonical_blob_id, _ = await store.store_stage_payloads(canonical=canonical_payload)
+        if canonical_blob_id is None:
+            raise ProductionRepairProjectionError("editorial_enrichment_validation_failed")
+
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=version,
+            input_hash=input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            raw_blob_id=None,
+            canonical_blob_id=canonical_blob_id,
+            rendered_blob_id=None,
+            model_run_id=None,
+            conversation_turn_id=None,
+            metadata={
+                "schema_version": enrichment.schema_version,
+                "policy_version": enrichment.enrichment_policy_version,
+                "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+                "table_count": len(enrichment.tables),
+                "diagram_count": len(enrichment.diagrams),
+                "source_figure_count": len(enrichment.source_figures),
+                "warnings_count": len(enrichment.warnings),
+                "extraction_hash": enrichment.extraction_hash,
+                "synthesis_hash": enrichment.synthesis_hash,
+                "input_artifacts": {
+                    "extraction_artifact_id": str(extraction_artifact.id),
+                    "synthesis_artifact_id": str(synthesis_artifact.id),
+                },
+            },
+        )
+        await uow.production_artifacts.append(artifact)
+        return enrichment, artifact
 
     async def _qa_current_outputs_in_uow(
         self,

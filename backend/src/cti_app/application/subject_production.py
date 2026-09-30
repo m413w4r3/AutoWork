@@ -39,7 +39,11 @@ from cti_app.domain.production import (
     production_batch_request_fingerprint,
     source_role_rank,
 )
-from cti_app.domain.production_pipeline import production_artifact_stages, production_stages
+from cti_app.domain.production_pipeline import (
+    prerequisite_artifact_for,
+    production_artifact_stages,
+    production_stages,
+)
 
 
 class ProductionRunNotFoundError(LookupError):
@@ -698,15 +702,13 @@ class SubjectProductionService:
                     missing_artifact=None,
                     runnable_stage=ProductionStage.SOURCES,
                 )
-        prerequisite = {
-            ProductionStage.EXTRACTION: "references",
-            ProductionStage.SYNTHESIS: "extraction",
-            ProductionStage.ASSEMBLY: "synthesis",
-        }.get(stage)
-        if prerequisite:
+        prerequisite = prerequisite_artifact_for(stage)
+        if prerequisite is not None:
             artifacts = getattr(uow, "production_artifacts", None)
             artifact = (
-                await artifacts.get_current(run_id, prerequisite) if artifacts is not None else None
+                await artifacts.get_current(run_id, prerequisite.value)
+                if artifacts is not None
+                else None
             )
             if artifact is None:
                 # Name the stage that can actually run.  The analyst asked for
@@ -723,7 +725,7 @@ class SubjectProductionService:
                 )
                 raise RetryPrerequisiteMissingError(
                     requested_stage=stage,
-                    missing_artifact=prerequisite,
+                    missing_artifact=prerequisite.value,
                     runnable_stage=resolve_retry_stage(live, current_stage=stage),
                 )
 

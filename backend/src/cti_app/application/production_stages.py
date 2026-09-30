@@ -10,6 +10,11 @@ from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+    compute_editorial_enrichment_input_hash,
+    validate_editorial_enrichment,
+)
 from cti_app.application.production_extraction import (
     production_extraction_metadata,
 )
@@ -27,6 +32,10 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     SynthesisMode,
+)
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    editorial_enrichment_to_json,
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
@@ -338,6 +347,82 @@ class ExtractionService(_ArtifactPayloadMixin):
         # synthesis and publication.
         await uow.production_artifacts.append(artifact)
         return artifact
+
+
+class EditorialEnrichmentService(_ArtifactPayloadMixin):
+    def __init__(
+        self,
+        uow_factory: ProductionUnitOfWorkFactory,
+        artifact_store: ProductionArtifactStore | None = None,
+    ) -> None:
+        self._uow_factory = uow_factory
+        self._artifact_store = artifact_store
+
+    async def store_editorial_enrichment_result(
+        self,
+        *,
+        run_id: UUID,
+        subject_id: UUID,
+        input_hash: str,
+        enrichment: EditorialEnrichmentV1,
+        extraction: ProductionExtractionV1,
+        synthesis: ProductionSynthesisV1,
+    ) -> ProductionArtifact:
+        if self._artifact_store is None:
+            raise ValueError("editorial_enrichment_inputs_missing")
+        if enrichment.subject_id != subject_id:
+            raise ValueError("editorial_enrichment_lineage_mismatch")
+        validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+        if input_hash != compute_editorial_enrichment_input_hash(
+            extraction=extraction, synthesis=synthesis
+        ):
+            raise ValueError("editorial_enrichment_lineage_mismatch")
+        payload = editorial_enrichment_to_json(enrichment)
+        encoded = ProductionArtifactStore.canonical_json_bytes(payload)
+        stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        async with self._uow_factory() as uow:
+            current = await uow.production_artifacts.get_current(run_id, stage.value)
+            if (
+                current is not None
+                and current.status is ProductionArtifactStatus.VERIFIED
+                and current.input_hash == input_hash
+                and current.canonical_blob_id is not None
+                and await self._artifact_store.read_bytes(current.canonical_blob_id) == encoded
+            ):
+                return current
+            previous = await uow.production_artifacts.list_for_run(run_id)
+            version = max((item.version for item in previous if item.stage is stage), default=0) + 1
+            _, canonical_id, _ = await self._store_payloads(canonical=payload)
+            if canonical_id is None:
+                raise ValueError("editorial_enrichment_validation_failed")
+            artifact = ProductionArtifact(
+                production_run_id=run_id,
+                subject_id=subject_id,
+                stage=stage,
+                version=version,
+                input_hash=input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                raw_blob_id=None,
+                canonical_blob_id=canonical_id,
+                rendered_blob_id=None,
+                model_run_id=None,
+                conversation_turn_id=None,
+                metadata={
+                    "schema_version": enrichment.schema_version,
+                    "policy_version": enrichment.enrichment_policy_version,
+                    "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+                    "table_count": len(enrichment.tables),
+                    "diagram_count": len(enrichment.diagrams),
+                    "source_figure_count": len(enrichment.source_figures),
+                    "warnings_count": len(enrichment.warnings),
+                    "extraction_hash": enrichment.extraction_hash,
+                    "synthesis_hash": enrichment.synthesis_hash,
+                },
+            )
+            await uow.production_artifacts.append(artifact)
+            await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)
+            await uow.commit()
+            return artifact
 
 
 class SynthesisService(_ArtifactPayloadMixin):

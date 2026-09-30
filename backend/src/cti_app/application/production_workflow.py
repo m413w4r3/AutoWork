@@ -31,6 +31,12 @@ from cti_app.application.production_artifact_store import (
     ProductionReuseStorageUnavailableError,
 )
 from cti_app.application.production_context import build_subject_production_context
+from cti_app.application.production_editorial_enrichment import (
+    EditorialEnrichmentValidationError,
+    build_empty_editorial_enrichment,
+    compute_editorial_enrichment_input_hash,
+    validate_editorial_enrichment,
+)
 from cti_app.application.production_extraction import (
     PRODUCTION_EXTRACTION_SERVICE_VERSION,
     ExtractionPlan,
@@ -67,6 +73,7 @@ from cti_app.application.production_repairs import (
 )
 from cti_app.application.production_resume import EXTRACTION_PROGRESS_COMPLETED_STATUSES
 from cti_app.application.production_stages import (
+    EditorialEnrichmentService,
     ExtractionService,
     ReferenceResearchService,
     SynthesisService,
@@ -94,6 +101,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionReuseState,
@@ -568,6 +576,8 @@ class ProductionWorkflowOrchestrator:
                 result = await self._execute_extraction_stage(run, context, snapshot)
             elif expected_stage == ProductionStage.SYNTHESIS:
                 result = await self._execute_synthesis_stage(run, context, snapshot)
+            elif expected_stage == ProductionStage.EDITORIAL_ENRICHMENT:
+                result = await self._execute_editorial_enrichment_stage(run, context, snapshot)
             elif expected_stage == ProductionStage.ASSEMBLY:
                 result = await self._execute_assembly_stage(run, context, snapshot)
             else:
@@ -1365,6 +1375,94 @@ class ProductionWorkflowOrchestrator:
         )
         return result
 
+    async def _execute_editorial_enrichment_stage(
+        self,
+        run: ProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
+    ) -> dict[str, Any]:
+        await self._check_cancellation(run.id, context)
+        if snapshot is None or self._artifact_store is None:
+            return {
+                "stage": "editorial_enrichment",
+                "status": "terminal_error",
+                "error_code": "editorial_enrichment_inputs_missing",
+            }
+        async with self._uow_factory() as uow:
+            extraction_artifact = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.EXTRACTION.value
+            )
+            synthesis_artifact = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.SYNTHESIS.value
+            )
+        if (
+            extraction_artifact is None
+            or synthesis_artifact is None
+            or extraction_artifact.canonical_blob_id is None
+            or synthesis_artifact.canonical_blob_id is None
+        ):
+            return {
+                "stage": "editorial_enrichment",
+                "status": "terminal_error",
+                "error_code": "editorial_enrichment_inputs_missing",
+            }
+        try:
+            extraction = production_extraction_from_json(
+                await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+            )
+            synthesis = production_synthesis_from_json(
+                await self._artifact_store.read_json(synthesis_artifact.canonical_blob_id)
+            )
+            if (
+                extraction.subject_id != snapshot.subject_id
+                or synthesis.subject_id != snapshot.subject_id
+                or extraction.production_input_hash != snapshot.input_hash
+                or synthesis.production_input_hash != snapshot.input_hash
+            ):
+                raise ValueError("editorial_enrichment_lineage_mismatch")
+            enrichment = build_empty_editorial_enrichment(
+                extraction=extraction, synthesis=synthesis
+            )
+            validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+            input_hash = compute_editorial_enrichment_input_hash(
+                extraction=extraction, synthesis=synthesis
+            )
+            artifact = await EditorialEnrichmentService(
+                self._uow_factory, self._artifact_store
+            ).store_editorial_enrichment_result(
+                run_id=run.id,
+                subject_id=run.subject_id,
+                input_hash=input_hash,
+                enrichment=enrichment,
+                extraction=extraction,
+                synthesis=synthesis,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            code = (
+                exc.code
+                if isinstance(exc, EditorialEnrichmentValidationError)
+                else (
+                    "editorial_enrichment_lineage_mismatch"
+                    if str(exc) == "editorial_enrichment_lineage_mismatch"
+                    else "editorial_enrichment_validation_failed"
+                )
+            )
+            return {
+                "stage": "editorial_enrichment",
+                "status": "terminal_error",
+                "error_code": code,
+                "details": str(exc),
+            }
+        await self._check_cancellation(run.id, context)
+        return {
+            "stage": "editorial_enrichment",
+            "status": "success",
+            "artifact_id": str(artifact.id),
+            "tables": 0,
+            "diagrams": 0,
+            "source_figures": 0,
+        }
+
     async def _execute_assembly_stage(
         self,
         run: ProductionRun,
@@ -1378,8 +1476,11 @@ class ProductionWorkflowOrchestrator:
             references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
+            enrichment = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+            )
 
-            if references is None or extraction is None or synthesis is None:
+            if references is None or extraction is None or synthesis is None or enrichment is None:
                 return {
                     "stage": "assembly",
                     "status": "error",
@@ -1401,7 +1502,7 @@ class ProductionWorkflowOrchestrator:
                 return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
             if any(
                 artifact.canonical_blob_id is None
-                for artifact in (references, extraction, synthesis)
+                for artifact in (references, extraction, synthesis, enrichment)
             ):
                 return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
             try:
@@ -1414,6 +1515,14 @@ class ProductionWorkflowOrchestrator:
                 canonical_synthesis = production_synthesis_from_json(
                     await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
                 )
+                canonical_enrichment = editorial_enrichment_from_json(
+                    await self._artifact_store.read_json(cast(UUID, enrichment.canonical_blob_id))
+                )
+                validate_editorial_enrichment(
+                    canonical_enrichment,
+                    extraction=canonical_extraction,
+                    synthesis=canonical_synthesis,
+                )
                 publication = await PublicationAssemblyService(
                     self._artifact_store, uow.production_artifacts
                 ).assemble_publication(
@@ -1422,11 +1531,13 @@ class ProductionWorkflowOrchestrator:
                     references=canonical_references,
                     extraction=canonical_extraction,
                     synthesis=canonical_synthesis,
+                    editorial_enrichment=canonical_enrichment,
                     metadata_extra={
                         "input_artifacts": {
                             "references_artifact_id": str(references.id),
                             "extraction_artifact_id": str(extraction.id),
                             "synthesis_artifact_id": str(synthesis.id),
+                            "editorial_enrichment_artifact_id": str(enrichment.id),
                         },
                         **(
                             {"repair_materialization": repair_marker}

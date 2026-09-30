@@ -21,12 +21,18 @@ const CORRECTED_VALUE = "c".repeat(64);
 /** The plan an IOC arbitration must advertise: publication only, no model. */
 const IOC_PLAN: RepairExecutionPlan = {
   impact_kind: "publication_only",
-  affected_outputs: ["extraction", "publication", "checkpoint"],
+  affected_outputs: [
+    "extraction",
+    "editorial_enrichment",
+    "publication",
+    "checkpoint",
+  ],
   model_call_required: false,
   provider_steps: [],
   deterministic_steps: [
     "Décision analyste",
     "Projection Extraction",
+    "Enrichissement éditorial",
     "Rendu Publication",
     "Contrôle QA",
   ],

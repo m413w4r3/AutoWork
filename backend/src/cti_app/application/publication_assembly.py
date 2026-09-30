@@ -7,6 +7,7 @@ from typing import Any
 
 from cti_app.application.persistence import ProductionArtifactRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     build_publication_document_v3,
@@ -20,6 +21,7 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionRun,
 )
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
@@ -45,6 +47,7 @@ class PublicationAssemblyService:
         references: ProductionReferenceCorpusV1,
         extraction: ProductionExtractionV1,
         synthesis: ProductionSynthesisV1,
+        editorial_enrichment: EditorialEnrichmentV1,
         metadata_extra: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         if (
@@ -55,6 +58,20 @@ class PublicationAssemblyService:
             raise PublicationAssemblyValidationError(
                 PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                 "Production input snapshot must belong to the production run",
+            )
+        try:
+            validate_editorial_enrichment(
+                editorial_enrichment, extraction=extraction, synthesis=synthesis
+            )
+        except ValueError as exc:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                str(exc),
+            ) from exc
+        if editorial_enrichment.production_input_hash != snapshot.input_hash:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                "Editorial enrichment does not match the production input snapshot",
             )
         document = build_publication_document_v3(
             snapshot=snapshot,
@@ -68,6 +85,7 @@ class PublicationAssemblyService:
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=editorial_enrichment,
         )
         canonical_bytes = ProductionArtifactStore.canonical_json_bytes(document.to_json())
         stage = ProductionArtifactStage.PUBLICATION

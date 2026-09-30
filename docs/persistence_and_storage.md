@@ -60,7 +60,8 @@ d’idempotence associe la clé à l’empreinte canonique du payload : le même
 le même batch ; une autre empreinte ou une nouvelle clé incompatible avec un batch actif est
 refusée. Le board de production peut être vide et retourne alors `200` avec zéro sujet.
 
-La pipeline d’un run est fixe : `SOURCES`, `REFERENCES`, `EXTRACTION`, `SYNTHESIS`, `ASSEMBLY`,
+La pipeline d’un run est fixe : `SOURCES`, `REFERENCES`, `EXTRACTION`, `SYNTHESIS`,
+`EDITORIAL_ENRICHMENT`, `ASSEMBLY`,
 puis `READY`. Les états asynchrones vivent en PostgreSQL ; Redis ne transporte que les identifiants
 de jobs. L’annulation conserve l’historique, arrête les travaux non terminés et ne ferme pas
 l’édition.

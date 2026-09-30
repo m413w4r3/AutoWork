@@ -565,6 +565,7 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
         ProductionStage.SYNTHESIS,
+        ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
     ]
     assert orchestrator.model_calls == ["q2:S2", "q2:S3", "q4"]
@@ -594,13 +595,16 @@ async def test_cancel_after_extraction_never_replays_extraction(
     assert resumed.plan.model_calls_expected == 1
     assert orchestrator.calls == [
         ProductionStage.SYNTHESIS,
+        ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
     ]
     assert orchestrator.model_calls == ["q4"]
     assert world.run.status is ProductionRunStatus.READY
 
 
-async def test_cancel_after_synthesis_only_assembles(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_cancel_after_synthesis_runs_enrichment_then_assembles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     world = _World(
         stage=ProductionStage.ASSEMBLY,
         produced=(
@@ -615,10 +619,13 @@ async def test_cancel_after_synthesis_only_assembles(monkeypatch: pytest.MonkeyP
 
     resumed = await _resume_and_drain(world, registry, jobs)
 
-    assert resumed.plan.resume_from_stage is ProductionStage.ASSEMBLY
+    assert resumed.plan.resume_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
     assert resumed.plan.reused_artifacts == ("references", "extraction", "synthesis")
     assert resumed.plan.model_calls_expected == 0
-    assert orchestrator.calls == [ProductionStage.ASSEMBLY]
+    assert orchestrator.calls == [
+        ProductionStage.EDITORIAL_ENRICHMENT,
+        ProductionStage.ASSEMBLY,
+    ]
     assert orchestrator.model_calls == []
     assert world.run.status is ProductionRunStatus.READY
 
@@ -805,7 +812,12 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
 
     assert plan.resume_from_stage is ProductionStage.ASSEMBLY
     assert plan.model_calls_expected == 0
-    assert plan.reused_artifacts == ("references", "extraction", "synthesis")
+    assert plan.reused_artifacts == (
+        "references",
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+    )
 
 
 async def test_the_log_payload_names_exactly_the_documented_fields() -> None:

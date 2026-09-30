@@ -9,10 +9,15 @@ from typing import Any, Final
 from uuid import UUID
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    canonical_editorial_enrichment_hash,
+    canonical_synthesis_hash,
+)
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.domain.production import ProductionInputSnapshot
+from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
@@ -26,7 +31,6 @@ from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     extraction_evidence_refs_v1,
-    production_synthesis_to_json,
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
@@ -253,13 +257,15 @@ def compute_assembly_input_hash(
     references: ProductionReferenceCorpusV1,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1,
 ) -> str:
     """Return the deterministic functional identity of canonical Assembly inputs."""
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
         "references_hash": references_corpus_hash(references),
         "extraction_hash": canonical_extraction_hash(extraction),
-        "synthesis_hash": _canonical_digest(production_synthesis_to_json(synthesis)),
+        "synthesis_hash": canonical_synthesis_hash(synthesis),
+        "editorial_enrichment_hash": canonical_editorial_enrichment_hash(editorial_enrichment),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
     }

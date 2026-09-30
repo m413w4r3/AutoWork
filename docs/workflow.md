@@ -74,11 +74,13 @@ modifie jamais ce snapshot ni le run historique.
 Chaque run suit une pipeline statique et ordonnée :
 
 ```text
-SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → ASSEMBLY → READY
+SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
 ```
 
-`ASSEMBLY` produit l'artifact canonique `PUBLICATION`. `READY` signifie que les artifacts
-canoniques sont valides et que la QA canonique a réussi ; il n'indique pas qu'un rendu PDF ou
+`EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et déterministe en
+AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
+fonctionnelle de `PUBLICATION`, dont le corps reste `PublicationDocumentV3`. `READY` signifie
+que les artifacts canoniques sont valides et que la QA canonique a réussi ; il n'indique pas qu'un rendu PDF ou
 DOCX a été compilé. Le rendu constitue un pipeline distinct.
 
 Les artifacts et diagnostics de chaque étape sont adressés par le run et sa génération de
@@ -96,8 +98,9 @@ les champs legacy nécessaires aux anciens consommateurs.
 
 Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` et ne partage
 avec lui ni module ni service. Extraction consomme le corpus directement. Synthesis lit
-`ProductionExtractionV1`, puis Assembly construit `PublicationDocumentV3` depuis le snapshot,
-le corpus, l’extraction et la synthèse. La projection historique `ReferenceReport` reste limitée
+`ProductionExtractionV1`, puis Editorial Enrichment lie un contrat vide à l’extraction et à la
+synthèse. Assembly construit `PublicationDocumentV3` depuis le snapshot, le corpus, l’extraction,
+la synthèse et cet enrichment. La projection historique `ReferenceReport` reste limitée
 aux imports V4 et à certaines fonctions du Repair Desk.
 
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection

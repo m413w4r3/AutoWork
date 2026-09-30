@@ -57,11 +57,12 @@ async def test_publication_resolver_does_not_fall_back_to_other_stages() -> None
     assert repository.calls == ["publication"]
 
 
-def test_current_pipeline_contains_only_the_five_article_stages() -> None:
+def test_current_pipeline_contains_the_six_article_stages() -> None:
     assert production_stages() == (
         ProductionStage.SOURCES,
         ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
         ProductionStage.SYNTHESIS,
+        ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
     )

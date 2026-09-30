@@ -31,6 +31,7 @@ class ProductionStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
+    EDITORIAL_ENRICHMENT = "editorial_enrichment"
     ASSEMBLY = "assembly"
 
 
@@ -97,6 +98,7 @@ class ProductionDerivedOutput(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
+    EDITORIAL_ENRICHMENT = "editorial_enrichment"
     PUBLICATION = "publication"
     RULE_BUNDLE = "rule_bundle"
     CHECKPOINT = "checkpoint"
@@ -668,6 +670,7 @@ class ProductionArtifactStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
     SYNTHESIS = "synthesis"
+    EDITORIAL_ENRICHMENT = "editorial_enrichment"
     PUBLICATION = "publication"
 
 
@@ -991,6 +994,7 @@ class ProductionRun:
                 ProductionStage.REFERENCES: ProductionStage.REFERENCES,
                 ProductionStage.EXTRACTION: ProductionStage.EXTRACTION,
                 ProductionStage.SYNTHESIS: ProductionStage.SYNTHESIS,
+                ProductionStage.EDITORIAL_ENRICHMENT: None,
                 ProductionStage.ASSEMBLY: None,
             }[stage]
         else:

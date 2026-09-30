@@ -9,6 +9,10 @@ import pytest
 
 import cti_app.application.publication_builder as publication_builder
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_empty_editorial_enrichment,
+    canonical_editorial_enrichment_hash,
+)
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
@@ -193,6 +197,7 @@ def _canonical_inputs() -> tuple[
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
         "references_hash": references_corpus_hash(references),
@@ -200,6 +205,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         "synthesis_hash": hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(production_synthesis_to_json(synthesis))
         ).hexdigest(),
+        "editorial_enrichment_hash": canonical_editorial_enrichment_hash(enrichment),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
     }
@@ -213,6 +219,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         == expected_hash
     )
@@ -222,6 +229,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         == expected_hash
     )
@@ -236,6 +244,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
             references=reconstructed_references,
             extraction=reconstructed_extraction,
             synthesis=reconstructed_synthesis,
+            editorial_enrichment=enrichment,
         )
         == expected_hash
     )
@@ -245,11 +254,13 @@ def test_assembly_input_hash_changes_with_each_functional_component(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     original = compute_assembly_input_hash(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=enrichment,
     )
 
     changed_snapshot = replace(
@@ -265,6 +276,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         != original
     )
@@ -277,6 +289,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=changed_references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         != original
     )
@@ -288,6 +301,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=references,
             extraction=changed_extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         != original
     )
@@ -299,6 +313,19 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=references,
             extraction=extraction,
             synthesis=changed_synthesis,
+            editorial_enrichment=enrichment,
+        )
+        != original
+    )
+
+    changed_enrichment = replace(enrichment, warnings=("Editorial note",))
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+            editorial_enrichment=changed_enrichment,
         )
         != original
     )
@@ -314,6 +341,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         != original
     )
@@ -325,6 +353,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=enrichment,
         )
         != original
     )
@@ -332,7 +361,13 @@ def test_assembly_input_hash_changes_with_each_functional_component(
 
 def test_assembly_input_hash_api_excludes_runtime_and_renderer_inputs() -> None:
     parameters = signature(compute_assembly_input_hash).parameters
-    assert tuple(parameters) == ("snapshot", "references", "extraction", "synthesis")
+    assert tuple(parameters) == (
+        "snapshot",
+        "references",
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+    )
     assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 
 

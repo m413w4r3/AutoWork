@@ -242,6 +242,13 @@ async def test_edition_repair_http_list_exposes_summary_items_and_cursor() -> No
     assert body["items"][0]["payload_available"] is True
     assert body["items"][0]["execution_plan"]["impact_kind"] == "publication_only"
     assert body["items"][0]["execution_plan"]["model_call_required"] is False
+    assert body["items"][0]["execution_plan"]["affected_outputs"] == [
+        "extraction",
+        "editorial_enrichment",
+        "publication",
+        "checkpoint",
+    ]
+    assert "Enrichissement éditorial" in body["items"][0]["execution_plan"]["deterministic_steps"]
     assert "Rendu Publication" in body["items"][0]["execution_plan"]["deterministic_steps"]
     assert body["next_cursor"] is None
 

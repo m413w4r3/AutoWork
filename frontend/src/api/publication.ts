@@ -27,6 +27,7 @@ export type RepairAffectedOutput =
   | "references"
   | "extraction"
   | "synthesis"
+  | "editorial_enrichment"
   | "publication"
   | "rule_bundle"
   | "checkpoint";

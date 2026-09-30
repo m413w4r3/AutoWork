@@ -275,7 +275,7 @@ describe("EditionDashboard", () => {
 
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(screen.getAllByText("Chargement…", { selector: "td" })).toHaveLength(
-      4,
+      5,
     );
     expect(
       screen.queryAllByText("Non démarrée", { selector: "td" }),
@@ -291,7 +291,7 @@ describe("EditionDashboard", () => {
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(
       screen.getAllByText("Indisponible", { selector: "td" }),
-    ).toHaveLength(4);
+    ).toHaveLength(5);
     expect(
       screen.queryAllByText("Non démarrée", { selector: "td" }),
     ).toHaveLength(0);
@@ -306,7 +306,7 @@ describe("EditionDashboard", () => {
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(
       screen.getAllByText("Non démarrée", { selector: "td" }),
-    ).toHaveLength(5);
+    ).toHaveLength(6);
   });
 
   it("signale un payload Subjects non conforme sans afficher l'état vide", async () => {
@@ -384,7 +384,7 @@ describe("EditionDashboard", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("représente les quatre stages en colonnes projetées du ProductionRun", async () => {
+  it("représente les stages en colonnes projetées du ProductionRun", async () => {
     const subject = subjects[0]!;
     listSubjectsMock.mockResolvedValue([subject]);
     getSubjectProductionMock.mockResolvedValue(
@@ -410,6 +410,12 @@ describe("EditionDashboard", () => {
             error_code: null,
             error_message: null,
           },
+          editorial_enrichment: {
+            status: "pending",
+            version: null,
+            error_code: null,
+            error_message: null,
+          },
           assembly: {
             status: "pending",
             version: null,
@@ -427,6 +433,7 @@ describe("EditionDashboard", () => {
       "Références",
       "Extraction",
       "Synthèse",
+      "Enrichissement",
       "Assemblage",
     ]) {
       expect(
@@ -436,8 +443,14 @@ describe("EditionDashboard", () => {
     const cells = screen
       .getAllByRole("cell")
       .map((cell) => cell.textContent)
-      .slice(-4);
-    expect(cells).toEqual(["Terminée", "Attention", "En cours", NON_DEMARREE]);
+      .slice(-5);
+    expect(cells).toEqual([
+      "Terminée",
+      "Attention",
+      "En cours",
+      NON_DEMARREE,
+      NON_DEMARREE,
+    ]);
     // Le stage courant reste une lecture du ProductionRun, pas du Subject.
     expect(
       screen.getByText("Synthèse", { selector: "td" }),

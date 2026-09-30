@@ -93,6 +93,9 @@ class TestProductionRun:
         assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage()
+        assert run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
+
+        run.advance_stage()
         assert run.current_stage is ProductionStage.ASSEMBLY
 
         run.mark_ready()
@@ -303,6 +306,7 @@ class TestProductionWorkflow:
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
             ProductionStage.SYNTHESIS,
+            ProductionStage.EDITORIAL_ENRICHMENT,
             ProductionStage.ASSEMBLY,
         ]
 

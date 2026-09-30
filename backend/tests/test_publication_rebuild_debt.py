@@ -43,6 +43,7 @@ SUBJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
 _REFERENCES = ProductionArtifactStage.REFERENCES.value
 _EXTRACTION = ProductionArtifactStage.EXTRACTION.value
 _SYNTHESIS = ProductionArtifactStage.SYNTHESIS.value
+_ENRICHMENT = ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
 _PUBLICATION = ProductionArtifactStage.PUBLICATION.value
 
 
@@ -171,11 +172,12 @@ async def test_a_cancelled_run_is_never_moved() -> None:
         ),
         # A references reconciliation stales everything downstream of it.
         ({_REFERENCES}, ProductionStage.EXTRACTION),
+        ({_REFERENCES, _EXTRACTION, _SYNTHESIS}, ProductionStage.EDITORIAL_ENRICHMENT),
         # Nothing survived at all.
         (set(), ProductionStage.REFERENCES),
         # Publication alone was staled, ready for a deterministic reassembly.
         (
-            {_REFERENCES, _EXTRACTION, _SYNTHESIS},
+            {_REFERENCES, _EXTRACTION, _SYNTHESIS, _ENRICHMENT},
             ProductionStage.ASSEMBLY,
         ),
     ],
@@ -188,7 +190,7 @@ def test_retry_stage_is_the_first_missing_artifact(
 
 def test_a_complete_run_replays_its_last_stage() -> None:
     """Every artifact is current: there is no gap to aim at."""
-    live = {_REFERENCES, _EXTRACTION, _SYNTHESIS, _PUBLICATION}
+    live = {_REFERENCES, _EXTRACTION, _SYNTHESIS, _ENRICHMENT, _PUBLICATION}
 
     assert (
         resolve_retry_stage(live, current_stage=ProductionStage.ASSEMBLY)

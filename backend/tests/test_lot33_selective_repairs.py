@@ -164,6 +164,7 @@ def test_lot33_minimum_matrix_plans_only_the_required_outputs(
         assert impact.affected_outputs == frozenset(
             {
                 ProductionDerivedOutput.EXTRACTION,
+                ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
                 ProductionDerivedOutput.RULE_BUNDLE,
                 ProductionDerivedOutput.CHECKPOINT,
             }

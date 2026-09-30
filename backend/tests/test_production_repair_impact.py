@@ -97,6 +97,7 @@ def test_include_publication_ioc_is_publication_only(artifact_type: str) -> None
     assert impact.affected_outputs == frozenset(
         {
             ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.CHECKPOINT,
         }
@@ -116,6 +117,7 @@ def test_include_yara_is_rule_bundle_only_without_model_call() -> None:
     assert impact.affected_outputs == frozenset(
         {
             ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.RULE_BUNDLE,
             ProductionDerivedOutput.CHECKPOINT,
         }
@@ -259,6 +261,7 @@ def test_archived_source_pending_references_invalidates_full_chain() -> None:
             ProductionDerivedOutput.REFERENCES,
             ProductionDerivedOutput.EXTRACTION,
             ProductionDerivedOutput.SYNTHESIS,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.CHECKPOINT,
         }
@@ -283,6 +286,7 @@ def test_merge_rule_and_ioc_uses_publication_dominance_and_unions_outputs() -> N
     assert merged.affected_outputs == frozenset(
         {
             ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.RULE_BUNDLE,
             ProductionDerivedOutput.CHECKPOINT,
@@ -291,6 +295,7 @@ def test_merge_rule_and_ioc_uses_publication_dominance_and_unions_outputs() -> N
     assert not merged.model_call_required
     assert merged.ready_to_apply
     assert "Mise à jour des fichiers YARA/Sigma" in merged.deterministic_steps
+    assert "Enrichissement éditorial" in merged.deterministic_steps
     assert "Rendu Publication" in merged.deterministic_steps
 
 

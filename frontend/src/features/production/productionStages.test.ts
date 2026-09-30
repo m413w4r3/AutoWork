@@ -12,10 +12,18 @@ it("exposes the ordered production stages and their labels", () => {
     "references",
     "extraction",
     "synthesis",
+    "editorial_enrichment",
     "assembly",
   ]);
   expect(
     PRODUCTION_STAGE_ORDER.map((stage) => PRODUCTION_STAGE_LABELS[stage]),
-  ).toEqual(["Sources", "Références", "Extraction", "Synthèse", "Assemblage"]);
+  ).toEqual([
+    "Sources",
+    "Références",
+    "Extraction",
+    "Synthèse",
+    "Enrichissement",
+    "Assemblage",
+  ]);
   expect(RETRYABLE_PRODUCTION_STAGES).toBe(PRODUCTION_STAGE_ORDER);
 });

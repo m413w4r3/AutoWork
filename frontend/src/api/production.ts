@@ -4,7 +4,12 @@ export type ProductionRunStatus =
   "queued" | "running" | "ready" | "needs_review" | "failed" | "cancelled";
 
 export type ProductionStage =
-  "sources" | "references" | "extraction" | "synthesis" | "assembly";
+  | "sources"
+  | "references"
+  | "extraction"
+  | "synthesis"
+  | "editorial_enrichment"
+  | "assembly";
 
 export type ProductionBatchPhase = "initial" | "recovery" | "review";
 export type ProductionRecoveryDisposition = "auto" | "manual_only";

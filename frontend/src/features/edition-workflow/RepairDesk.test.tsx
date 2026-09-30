@@ -30,12 +30,18 @@ function executionPlanFor(
   if (kind === "rejected_rule") {
     return {
       impact_kind: "rule_bundle_only",
-      affected_outputs: ["extraction", "rule_bundle", "checkpoint"],
+      affected_outputs: [
+        "extraction",
+        "editorial_enrichment",
+        "rule_bundle",
+        "checkpoint",
+      ],
       model_call_required: false,
       provider_steps: [],
       deterministic_steps: [
         "Décision analyste",
         "Projection Extraction",
+        "Enrichissement éditorial",
         "Mise à jour des fichiers YARA/Sigma",
         "Contrôle QA",
       ],
@@ -49,6 +55,7 @@ function executionPlanFor(
         "references",
         "extraction",
         "synthesis",
+        "editorial_enrichment",
         "publication",
         "checkpoint",
       ],
@@ -62,6 +69,7 @@ function executionPlanFor(
         "Références",
         "Extraction",
         "Synthèse si nécessaire",
+        "Enrichissement éditorial",
         "Publication",
         "Contrôle QA",
       ],
@@ -70,12 +78,18 @@ function executionPlanFor(
   }
   return {
     impact_kind: "publication_only",
-    affected_outputs: ["extraction", "publication", "checkpoint"],
+    affected_outputs: [
+      "extraction",
+      "editorial_enrichment",
+      "publication",
+      "checkpoint",
+    ],
     model_call_required: false,
     provider_steps: [],
     deterministic_steps: [
       "Décision analyste",
       "Projection Extraction",
+      "Enrichissement éditorial",
       "Rendu Publication",
       "Contrôle QA",
     ],
@@ -407,6 +421,7 @@ describe("Repair Desk", () => {
         affected_outputs: [
           "extraction",
           "synthesis",
+          "editorial_enrichment",
           "publication",
           "checkpoint",
         ],
@@ -416,6 +431,7 @@ describe("Repair Desk", () => {
           "Décision analyste",
           "Projection Extraction",
           "Nouvelle synthèse",
+          "Enrichissement éditorial",
           "Rendu Publication",
           "Contrôle QA",
         ],
@@ -841,6 +857,7 @@ describe("Repair Desk", () => {
           affected_outputs: [
             "extraction",
             "synthesis",
+            "editorial_enrichment",
             "publication",
             "checkpoint",
           ],
@@ -850,6 +867,7 @@ describe("Repair Desk", () => {
             "Décision analyste",
             "Projection Extraction",
             "Nouvelle synthèse",
+            "Enrichissement éditorial",
             "Rendu Publication",
             "Contrôle QA",
           ],

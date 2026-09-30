@@ -8,6 +8,7 @@ from pathlib import Path
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 
 _APPLICATION = Path(__file__).resolve().parents[1] / "src" / "cti_app" / "application"
+_DOMAIN = _APPLICATION.parent / "domain"
 _CANONICAL_FILES = (
     "production_stages.py",
     "production_synthesis.py",
@@ -64,3 +65,13 @@ def test_pandoc_renderer_class_is_absent_from_active_backend_python() -> None:
         if "PandocRenderer" in path.read_text()
     ]
     assert occurrences == []
+
+
+def test_editorial_enrichment_contract_has_no_renderer_or_compiler_dependency() -> None:
+    for path in (
+        _APPLICATION / "production_editorial_enrichment.py",
+        _DOMAIN / "production_editorial_enrichment.py",
+    ):
+        source = path.read_text()
+        for forbidden in ("Pandoc", "Typst", "D2", "Mermaid", "Graphviz", "TikZ"):
+            assert forbidden not in source

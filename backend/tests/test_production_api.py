@@ -1859,33 +1859,38 @@ async def test_production_state_import_maps_validation_errors(
         (
             ProductionRunStatus.READY,
             ProductionStage.SOURCES,
-            ["references", "extraction", "synthesis", "publication"],
+            ["references", "extraction", "synthesis", "editorial_enrichment", "publication"],
         ),
         (
             ProductionRunStatus.READY,
             ProductionStage.REFERENCES,
-            ["references", "extraction", "synthesis", "publication"],
+            ["references", "extraction", "synthesis", "editorial_enrichment", "publication"],
         ),
         (
             ProductionRunStatus.READY,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "publication"],
+            ["extraction", "synthesis", "editorial_enrichment", "publication"],
         ),
         (
             ProductionRunStatus.READY,
             ProductionStage.SYNTHESIS,
-            ["synthesis", "publication"],
+            ["synthesis", "editorial_enrichment", "publication"],
+        ),
+        (
+            ProductionRunStatus.READY,
+            ProductionStage.EDITORIAL_ENRICHMENT,
+            ["editorial_enrichment", "publication"],
         ),
         (ProductionRunStatus.READY, ProductionStage.ASSEMBLY, ["publication"]),
         (
             ProductionRunStatus.FAILED,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "publication"],
+            ["extraction", "synthesis", "editorial_enrichment", "publication"],
         ),
         (
             ProductionRunStatus.NEEDS_REVIEW,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "publication"],
+            ["extraction", "synthesis", "editorial_enrichment", "publication"],
         ),
     ),
 )
@@ -2042,13 +2047,37 @@ async def test_a_refused_retry_names_the_stage_that_would_run(
     assert response.status_code == 409, response.text
     detail = response.json()["detail"]
     assert detail["code"] == "retry_prerequisite_missing"
-    assert detail["missing_artifact"] == "synthesis"
+    assert detail["missing_artifact"] == "editorial_enrichment"
     assert detail["requested_stage"] == "assembly"
     # The stage the analyst should actually run, and a message that says so.
     assert detail["retry_stage"] == "synthesis"
     assert "Synthèse" in detail["message"]
     # Nothing was started: a refused retry must not open a generation.
     assert uow.production_runs.items[run.id].pipeline_generation == 0
+
+
+async def test_retry_assembly_without_enrichment_points_to_enrichment(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
+    await uow.production_runs.add(run)
+    (await uow.editions.get(run.edition_id)).state = EditionStatus.OPEN
+    for stage in (
+        ProductionArtifactStage.REFERENCES,
+        ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.SYNTHESIS,
+    ):
+        await uow.production_artifacts.append(_artifact(run, stage))
+
+    response = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": "assembly"})
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["code"] == "retry_prerequisite_missing"
+    assert detail["missing_artifact"] == "editorial_enrichment"
+    assert detail["retry_stage"] == "editorial_enrichment"
 
 
 async def test_the_named_retry_stage_is_the_one_that_succeeds(

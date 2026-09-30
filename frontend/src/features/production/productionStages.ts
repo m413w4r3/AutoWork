@@ -5,6 +5,7 @@ export const PRODUCTION_STAGE_ORDER = [
   "references",
   "extraction",
   "synthesis",
+  "editorial_enrichment",
   "assembly",
 ] as const satisfies readonly ProductionStage[];
 
@@ -13,6 +14,7 @@ export const PRODUCTION_STAGE_LABELS: Record<ProductionStage, string> = {
   references: "Références",
   extraction: "Extraction",
   synthesis: "Synthèse",
+  editorial_enrichment: "Enrichissement",
   assembly: "Assemblage",
 };
 

@@ -43,6 +43,7 @@
             "references",
             "extraction",
             "synthesis",
+            "editorial_enrichment",
             "publication",
             "checkpoint"
           ],
@@ -56,6 +57,7 @@
             "Références",
             "Extraction",
             "Synthèse si nécessaire",
+            "Enrichissement éditorial",
             "Publication",
             "Contrôle QA"
           ],
@@ -81,6 +83,7 @@
             "references",
             "extraction",
             "synthesis",
+            "editorial_enrichment",
             "publication",
             "checkpoint"
           ],
@@ -94,6 +97,7 @@
             "Références",
             "Extraction",
             "Synthèse si nécessaire",
+            "Enrichissement éditorial",
             "Publication",
             "Contrôle QA"
           ],

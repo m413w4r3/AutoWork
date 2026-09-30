@@ -53,17 +53,20 @@ def _impact(kind: ProductionRepairImpactKind) -> ProductionRepairImpact:
     outputs = {
         ProductionRepairImpactKind.RULE_BUNDLE_ONLY: {
             ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.RULE_BUNDLE,
             ProductionDerivedOutput.CHECKPOINT,
         },
         ProductionRepairImpactKind.PUBLICATION_ONLY: {
             ProductionDerivedOutput.EXTRACTION,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.CHECKPOINT,
         },
         ProductionRepairImpactKind.NARRATIVE: {
             ProductionDerivedOutput.EXTRACTION,
             ProductionDerivedOutput.SYNTHESIS,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
             ProductionDerivedOutput.PUBLICATION,
             ProductionDerivedOutput.CHECKPOINT,
         },
@@ -85,6 +88,7 @@ class _Artifacts:
             _artifact(ProductionArtifactStage.REFERENCES),
             _artifact(ProductionArtifactStage.EXTRACTION),
             _artifact(ProductionArtifactStage.SYNTHESIS),
+            _artifact(ProductionArtifactStage.EDITORIAL_ENRICHMENT),
             _artifact(ProductionArtifactStage.PUBLICATION),
         ]
         self.stale_calls: list[tuple[UUID, tuple[str, ...]]] = []
@@ -335,7 +339,7 @@ def _service(
 
 
 @pytest.mark.asyncio
-async def test_rules_materialization_does_not_stale_downstream() -> None:
+async def test_rules_materialization_stales_enrichment_only() -> None:
     service, uow, _projection, assembly, qa, checkpoint = _service(
         ProductionRepairImpactKind.RULE_BUNDLE_ONLY
     )
@@ -343,14 +347,14 @@ async def test_rules_materialization_does_not_stale_downstream() -> None:
     result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
 
     assert result.action == "rules_materialized"
-    assert uow.artifacts.stale_calls == []
+    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment",))]
     assert assembly.calls == 0
     assert qa.calls == 1
     assert checkpoint.calls == [RUN_ID]
 
 
 @pytest.mark.asyncio
-async def test_publication_materialization_stales_only_publication() -> None:
+async def test_publication_materialization_stales_enrichment_and_publication() -> None:
     service, uow, _projection, assembly, _qa, checkpoint = _service(
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
@@ -358,14 +362,14 @@ async def test_publication_materialization_stales_only_publication() -> None:
     result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
 
     assert result.action == "publication_reassembled"
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("publication",))]
+    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment", "publication"))]
     assert assembly.calls == 1
     assert checkpoint.calls == [RUN_ID]
     assert result.publication_artifact is not None
 
 
 @pytest.mark.asyncio
-async def test_narrative_materialization_stales_two_outputs_without_dispatch() -> None:
+async def test_narrative_materialization_stales_three_outputs_without_dispatch() -> None:
     service, uow, _projection, assembly, qa, checkpoint = _service(
         ProductionRepairImpactKind.NARRATIVE
     )
@@ -374,7 +378,9 @@ async def test_narrative_materialization_stales_two_outputs_without_dispatch() -
 
     assert result.action == "retry_required"
     assert result.retry_stage == "synthesis"
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("synthesis", "publication"))]
+    assert uow.artifacts.stale_calls == [
+        (RUN_ID, ("synthesis", "editorial_enrichment", "publication"))
+    ]
     assert assembly.calls == 0
     assert qa.calls == 0
     assert checkpoint.calls == []
@@ -493,7 +499,7 @@ async def test_publication_assembly_failure_leaves_the_article_untouched() -> No
     assert extraction is not None and extraction.version == 1
     assert publication is not None and publication.version == 1
     assert publication.status is ProductionArtifactStatus.VERIFIED
-    assert len(uow.artifacts.items) == 4
+    assert len(uow.artifacts.items) == 5
 
 
 @pytest.mark.asyncio
@@ -577,7 +583,7 @@ async def test_rule_bundle_checkpoint_failure_is_reported_as_pending() -> None:
     assert uow.commits == 1
     extraction = await uow.artifacts.get_current(RUN_ID, "extraction")
     assert extraction is not None and extraction.version == 2
-    assert uow.artifacts.stale_calls == []
+    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment",))]
 
 
 @pytest.mark.asyncio
@@ -629,4 +635,4 @@ async def test_a_stale_generation_refuses_before_any_projection() -> None:
     assert projection.calls == assembly.calls == qa.calls == 0
     assert checkpoint.calls == []
     assert uow.commits == 0
-    assert len(uow.artifacts.items) == 4
+    assert len(uow.artifacts.items) == 5
