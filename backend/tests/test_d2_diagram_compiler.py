@@ -5,7 +5,7 @@ import hashlib
 import os
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from uuid import UUID
 
 import pytest
@@ -18,7 +18,6 @@ from cti_app.application.diagram_compilation import (
     DiagramCompilerTimeoutError,
     DiagramCompilerUnavailableError,
     DiagramCompilerVersionError,
-    UnsupportedDiagramStructureError,
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
@@ -110,14 +109,14 @@ def test_preserves_tuple_order_and_qualifies_grouped_nodes() -> None:
 
     assert encode_d2_source(diagram).decode().splitlines() == [
         "direction: right",
-        "g001: 'Group Z' {}",
-        "g002: 'Group A' {}",
-        "g002.n001: 'third'",
-        "n002: 'first'",
-        "g001.n003: 'second'",
-        "g002.n001 -> n002: 'first edge'",
+        'g001: "Group Z" {}',
+        'g002: "Group A" {}',
+        'g002.n001: "third"',
+        'n002: "first"',
+        'g001.n003: "second"',
+        'g002.n001 -> n002: "first edge"',
         "n002 -> g001.n003",
-        "g001.n003 -> g002.n001: 'third edge'",
+        'g001.n003 -> g002.n001: "third edge"',
     ]
 
 
@@ -127,32 +126,29 @@ def test_encodes_two_directed_edges_in_tuple_order() -> None:
     )
 
     assert encode_d2_source(diagram).decode().splitlines()[-2:] == [
-        "n001 -> n002: 'forward'",
-        "n002 -> n001: 'return'",
+        'n001 -> n002: "forward"',
+        'n002 -> n001: "return"',
     ]
 
 
-def test_escapes_hostile_labels_as_single_quoted_content() -> None:
-    node_label = "Unicode café 雪; quotes \" and ' backslash \\\nnext\t{ } : # -> <- | $ ${D2_VAR}"
+def test_escapes_hostile_labels_as_double_quoted_content() -> None:
+    node_label = "Unicode café 雪; quotes \" and ' backslash \\\nnext\t{ } : # -> <- | ${D2_VAR}"
     group_label = '@import("https://example.test") ![icon](image.png)'
-    edge_label = "<- ${CONFIG}; | -> ; link: https://example.test 'end'"
+    edge_label = '<- $CONFIG; | -> ; link: https://example.test "end"'
     diagram = _diagram(
         nodes=(_node("model -> n001", node_label), _node("target")),
         edges=(_edge("model -> n001", "target", edge_label),),
         groups=(DiagramGroupV1("model-group", group_label, ("model -> n001",)),),
     )
 
-    source = encode_d2_source(diagram).decode()
-    assert f"g001: '{group_label}' {{}}" in source
-    node_source_line = next(line for line in source.splitlines() if "café" in line)
-    assert node_source_line.startswith("g001.n001: 'Unicode café 雪; quotes \" and \\'")
-    assert node_source_line.endswith("{ } : # -> <- | $ ${D2_VAR}'")
-    assert ("backslash " + "\\\\" * node_label.count("\\") + "\\nnext\\t") in node_source_line
-    assert (
-        "g001.n001 -> n002: '<- ${CONFIG}; | -> ; link: https://example.test \\'end\\''" in source
-    )
-    assert "\nimport " not in source
-    assert "\nhttps://" not in source
+    assert encode_d2_source(diagram).decode().splitlines() == [
+        "direction: right",
+        'g001: "@import(\\"https://example.test\\") ![icon](image.png)" {}',
+        'g001.n001: "Unicode café 雪; quotes \\" and \' backslash \\\\\\nnext\\t'
+        '{ } : # -> <- | \\${D2_VAR}"',
+        'n002: "target"',
+        'g001.n001 -> n002: "<- \\$CONFIG; | -> ; link: https://example.test \\"end\\""',
+    ]
 
 
 def test_omits_only_none_edge_labels() -> None:
@@ -169,36 +165,6 @@ def test_encoding_and_semantic_hash_are_stable_and_key_sensitive() -> None:
     assert diagram_semantic_sha256(diagram) != diagram_semantic_sha256(
         replace(diagram, key="diagram-other")
     )
-
-
-@pytest.mark.parametrize(
-    "invalid_groups",
-    (
-        (
-            DiagramGroupV1("group-a", "A", ("source",)),
-            DiagramGroupV1("group-b", "B", ("source",)),
-        ),
-        (),
-    ),
-)
-def test_rejects_ambiguous_or_empty_group_membership(
-    invalid_groups: tuple[DiagramGroupV1, ...],
-) -> None:
-    if not invalid_groups:
-        empty_group = object.__new__(DiagramGroupV1)
-        object.__setattr__(empty_group, "group_id", "empty")
-        object.__setattr__(empty_group, "label", "Empty")
-        object.__setattr__(empty_group, "node_ids", ())
-        invalid_groups = (empty_group,)
-
-    diagram = object.__new__(DiagramSpecV1)
-    valid_diagram = _diagram()
-    for field in fields(valid_diagram):
-        object.__setattr__(diagram, field.name, getattr(valid_diagram, field.name))
-    object.__setattr__(diagram, "groups", invalid_groups)
-
-    with pytest.raises(UnsupportedDiagramStructureError):
-        encode_d2_source(diagram)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +241,12 @@ def _test_environment() -> dict[str, str]:
         b'<svg><rect style="fill: url(https://example.invalid/p.svg#x)" /></svg>',
         b'<svg><rect fill="url(#x)" filter="url(../filter.svg#x)" /></svg>',
         b"<svg><style>.shape { fill: url(file:///tmp/paint.svg#x) }</style></svg>",
+        b"<svg><style>.s { fill: url(data:image/svg+xml;base64,AAAA) }</style></svg>",
+        b'<svg><style>@import "https://example.invalid/x.css";</style></svg>',
+        b"<svg><style>.s { fill: url/**/(https://example.invalid/x) }</style></svg>",
+        b"<svg><style>.s { fill: url(https://example.invalid/x }</style></svg>",
+        b"<svg><style>.s { fill: \\75rl(https://example.invalid/x) }</style></svg>",
+        b'<svg><image href="data:font/woff;base64,AAAA" /></svg>',
         b'<!DOCTYPE svg [<!ENTITY label "unsafe">]><svg>&label;</svg>',
     ),
 )
@@ -288,6 +260,8 @@ def test_validate_d2_svg_accepts_fragment_references_and_url_like_text() -> None
         b'<svg xmlns="urn:svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
         b'<use xlink:href="#local-id" />'
         b"<rect style=\"fill: url('#local-id')\" />"
+        b"<style>@font-face { font-family: f; "
+        b'src: url("data:application/font-woff;base64,d09GRgABAAA=") }</style>'
         b"<text>https://example.invalid file: /tmp/image.svg #local-id</text>"
         b"</svg>"
     )

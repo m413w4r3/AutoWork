@@ -7,7 +7,6 @@ import hashlib
 import json
 import os
 import re
-import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
@@ -23,7 +22,6 @@ from cti_app.application.diagram_compilation import (
     DiagramCompilerTimeoutError,
     DiagramCompilerUnavailableError,
     DiagramCompilerVersionError,
-    UnsupportedDiagramStructureError,
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramSpecV1,
@@ -45,6 +43,14 @@ D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
 _CSS_URL = re.compile(
     r"""url\s*\(\s*(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^)\s"'(]*))\s*\)""",
     re.IGNORECASE | re.DOTALL,
+)
+_CSS_URL_OPENING = re.compile(r"url\s*\(", re.IGNORECASE)
+_CSS_COMMENT = re.compile(r"/\*.*?(?:\*/|\Z)", re.DOTALL)
+# D2 embeds its fonts as base64 data URIs in the SVG stylesheet; nothing else may be inlined.
+_EMBEDDED_FONT_PREFIXES = (
+    "data:application/font-woff;base64,",
+    "data:font/woff;base64,",
+    "data:font/woff2;base64,",
 )
 _CSS_PRESENTATION_ATTRIBUTES = frozenset(
     {
@@ -68,14 +74,15 @@ _D2_DIRECTION_BY_V1 = {
     EnrichmentDiagramDirection.LEFT_TO_RIGHT: "right",
     EnrichmentDiagramDirection.TOP_TO_BOTTOM: "down",
 }
+# D2 double-quoted strings decode these escapes; ``$`` must be escaped so that
+# ``${...}`` in canonical content is never resolved as a D2 variable.
 _LABEL_ESCAPES = {
     "\\": "\\\\",
-    "'": "\\'",
+    '"': '\\"',
+    "$": "\\$",
     "\n": "\\n",
     "\r": "\\r",
     "\t": "\\t",
-    "\b": "\\b",
-    "\f": "\\f",
 }
 
 
@@ -131,39 +138,17 @@ def diagram_semantic_sha256(diagram: DiagramSpecV1) -> str:
 
 
 def _escape_d2_label(value: str) -> str:
-    escaped: list[str] = []
-    for char in value:
-        replacement = _LABEL_ESCAPES.get(char)
-        if replacement is not None:
-            escaped.append(replacement)
-        elif unicodedata.category(char) in {"Cc", "Cs", "Zl", "Zp"}:
-            escaped.append(f"\\u{ord(char):04x}")
-        else:
-            escaped.append(char)
-    return "'" + "".join(escaped) + "'"
+    """Quote canonical text so D2 renders it verbatim and never parses it as syntax."""
+    return '"' + "".join(_LABEL_ESCAPES.get(char, char) for char in value) + '"'
 
 
 def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
-    node_ids = {node.node_id for node in diagram.nodes}
-    group_ids: dict[str, str] = {}
-    memberships: dict[str, str] = {}
-    for group_index, group in enumerate(diagram.groups, 1):
-        if not group.node_ids:
-            raise UnsupportedDiagramStructureError("diagram groups must contain nodes")
-        if group.group_id in group_ids:
-            raise UnsupportedDiagramStructureError("diagram group identifiers must be unique")
-        group_ids[group.group_id] = f"g{group_index:03d}"
-        for node_id in group.node_ids:
-            if node_id not in node_ids:
-                raise UnsupportedDiagramStructureError(
-                    "diagram groups must reference existing nodes"
-                )
-            if node_id in memberships:
-                raise UnsupportedDiagramStructureError(
-                    "diagram nodes cannot belong to multiple groups"
-                )
-            memberships[node_id] = group_ids[group.group_id]
-
+    """Map canonical node IDs to synthetic D2 paths; group invariants hold in the domain."""
+    memberships = {
+        node_id: f"g{group_index:03d}"
+        for group_index, group in enumerate(diagram.groups, 1)
+        for node_id in group.node_ids
+    }
     references: dict[str, str] = {}
     for node_index, node in enumerate(diagram.nodes, 1):
         node_reference = f"n{node_index:03d}"
@@ -403,54 +388,20 @@ def _raise_process_failure(result: D2ProcessResult) -> None:
 
 
 def _css_url_targets(css: str) -> Sequence[str]:
+    """Return every CSS url() target, rejecting constructs that could hide one."""
+    if "\\" in css:
+        raise DiagramCompilerOutputInvalidError("D2 SVG contains an unsupported CSS escape")
+    css = _CSS_COMMENT.sub(" ", css)
+    if "@import" in css.lower():
+        raise DiagramCompilerOutputInvalidError("D2 SVG contains a CSS @import")
     targets: list[str] = []
-    index = 0
-    while index < len(css):
-        if css.startswith("/*", index):
-            comment_end = css.find("*/", index + 2)
-            if comment_end == -1:
-                break
-            index = comment_end + 2
-            continue
-        if css[index] in {"'", '"'}:
-            quote = css[index]
-            index += 1
-            while index < len(css):
-                if css[index] == "\\":
-                    index += 2
-                elif css[index] == quote:
-                    index += 1
-                    break
-                else:
-                    index += 1
-            continue
-        if css[index] == "\\":
-            raise DiagramCompilerOutputInvalidError("D2 SVG contains an unsupported CSS escape")
-        if css[index : index + 3].lower() == "url" and (
-            index == 0 or not (css[index - 1].isalnum() or css[index - 1] in "_-\\")
-        ):
-            match = _CSS_URL.match(css, index)
-            if match is not None:
-                targets.append((match.group("quoted") or match.group("bare") or "").strip())
-                index = match.end()
-                continue
-            after_name = index + 3
-            while after_name < len(css):
-                if css[after_name].isspace():
-                    after_name += 1
-                elif css.startswith("/*", after_name):
-                    comment_end = css.find("*/", after_name + 2)
-                    if comment_end == -1:
-                        after_name = len(css)
-                    else:
-                        after_name = comment_end + 2
-                else:
-                    break
-            if after_name < len(css) and css[after_name] == "(":
-                raise DiagramCompilerOutputInvalidError(
-                    "D2 SVG contains an invalid CSS url() reference"
-                )
-        index += 1
+    for opening in _CSS_URL_OPENING.finditer(css):
+        match = _CSS_URL.match(css, opening.start())
+        if match is None:
+            raise DiagramCompilerOutputInvalidError(
+                "D2 SVG contains an invalid CSS url() reference"
+            )
+        targets.append((match.group("quoted") or match.group("bare") or "").strip())
     return targets
 
 
@@ -463,9 +414,13 @@ def _xml_local_name(name: str) -> str:
     return name.rsplit("}", 1)[-1]
 
 
-def _validate_resource_target(target: str) -> None:
-    if not target.strip().startswith("#"):
-        raise DiagramCompilerOutputInvalidError("D2 SVG contains a non-fragment resource reference")
+def _validate_resource_target(target: str, *, allow_embedded_font: bool = False) -> None:
+    target = target.strip()
+    if target.startswith("#"):
+        return
+    if allow_embedded_font and target.lower().startswith(_EMBEDDED_FONT_PREFIXES):
+        return
+    raise DiagramCompilerOutputInvalidError("D2 SVG contains a non-fragment resource reference")
 
 
 def validate_d2_svg(svg_bytes: bytes) -> None:
@@ -496,10 +451,10 @@ def validate_d2_svg(svg_bytes: bytes) -> None:
                 _validate_resource_target(value)
             if attribute_name == "style" or attribute_name.lower() in _CSS_PRESENTATION_ATTRIBUTES:
                 for target in _css_url_targets(value):
-                    _validate_resource_target(target)
+                    _validate_resource_target(target, allow_embedded_font=True)
         if name == "style":
             for target in _css_url_targets(element.text or ""):
-                _validate_resource_target(target)
+                _validate_resource_target(target, allow_embedded_font=True)
 
 
 class D2DiagramCompiler:

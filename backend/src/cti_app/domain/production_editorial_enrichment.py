@@ -20,6 +20,9 @@ EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v1"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+# Diagram labels are displayed text: line breaks and tabs are allowed, other control
+# characters and lone surrogates have no visible form and are rejected.
+_LABEL_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
 
 
 def _text(value: Any, label: str, *, semantic: bool = False) -> str:
@@ -28,6 +31,13 @@ def _text(value: Any, label: str, *, semantic: bool = False) -> str:
     if semantic and not value.strip():
         raise ValueError(f"{label} must be non-empty text")
     return value
+
+
+def _diagram_label(value: Any, label: str, *, semantic: bool = True) -> str:
+    text = _text(value, label, semantic=semantic)
+    if _LABEL_CONTROL.search(text):
+        raise ValueError(f"{label} must not contain control characters")
+    return text
 
 
 def _key(value: Any, label: str) -> str:
@@ -173,7 +183,7 @@ class DiagramNodeV1:
 
     def __post_init__(self) -> None:
         _text(self.node_id, "Diagram node ID", semantic=True)
-        _text(self.label, "Diagram node label", semantic=True)
+        _diagram_label(self.label, "Diagram node label")
         object.__setattr__(
             self,
             "evidence_refs",
@@ -192,7 +202,7 @@ class DiagramEdgeV1:
         _text(self.source_node_id, "Diagram edge source node ID", semantic=True)
         _text(self.target_node_id, "Diagram edge target node ID", semantic=True)
         if self.label is not None:
-            _text(self.label, "Diagram edge label")
+            _diagram_label(self.label, "Diagram edge label", semantic=False)
         object.__setattr__(
             self,
             "evidence_refs",
@@ -208,7 +218,7 @@ class DiagramGroupV1:
 
     def __post_init__(self) -> None:
         _text(self.group_id, "Diagram group ID", semantic=True)
-        _text(self.label, "Diagram group label", semantic=True)
+        _diagram_label(self.label, "Diagram group label")
         if not isinstance(self.node_ids, tuple) or any(
             not isinstance(node_id, str) or not node_id.strip() for node_id in self.node_ids
         ):

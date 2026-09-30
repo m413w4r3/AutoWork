@@ -15,10 +15,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \
-    case "$TARGETARCH" in \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
         amd64) d2_arch=amd64; d2_sha256=5669ddc46b99e942cc96078f4a4e36d5e62103348f4c05179ede27802fdd87a9 ;; \
         arm64) d2_arch=arm64; d2_sha256=ac2c028697199479acb321db1e3d68caee9f2ba492ed73caa3cd13f3829bf913 ;; \
-        *) echo "unsupported D2 architecture: ${TARGETARCH:-unset}" >&2; exit 1 ;; \
+        *) echo "unsupported D2 architecture: ${arch}" >&2; exit 1 ;; \
     esac; \
     build_dir="$(mktemp -d)"; \
     archive="${build_dir}/d2.tar.gz"; \

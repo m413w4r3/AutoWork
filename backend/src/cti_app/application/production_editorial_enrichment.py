@@ -857,45 +857,48 @@ def validate_editorial_enrichment_proposal(
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             )
-        nodes: list[DiagramNodeV1] = []
-        edges: list[DiagramEdgeV1] = []
-        groups: list[DiagramGroupV1] = []
-        diagram_refs: set[ExtractionEvidenceRefV1] = set()
-        for node in diagram.nodes:
-            refs = _all_refs_for_handles(node.evidence_handles, evidence_pack)
-            diagram_refs.update(refs)
-            _validate_grounded_editorial_text(node.label, refs, entries, technical_support)
-            nodes.append(DiagramNodeV1(node_id=node.node_id, label=node.label, evidence_refs=refs))
-        for edge in diagram.edges:
-            refs = _all_refs_for_handles(edge.evidence_handles, evidence_pack)
-            diagram_refs.update(refs)
-            if edge.label is not None:
-                _validate_grounded_editorial_text(edge.label, refs, entries, technical_support)
-            edges.append(
-                DiagramEdgeV1(
-                    source_node_id=edge.source_node_id,
-                    target_node_id=edge.target_node_id,
-                    label=edge.label,
-                    evidence_refs=refs,
-                )
-            )
-        for group in diagram.groups:
-            _validate_ungrounded_editorial_text(group.label)
-            groups.append(
-                DiagramGroupV1(
-                    group_id=group.group_id,
-                    label=group.label,
-                    node_ids=group.node_ids,
-                )
-            )
-        for value in (diagram.title, diagram.caption or ""):
-            _validate_grounded_editorial_text(
-                value,
-                tuple(sorted(diagram_refs, key=evidence_ref_sort_key)),
-                entries,
-                technical_support,
-            )
+        # Domain invariants of nodes, edges and groups are model output defects too.
         try:
+            nodes: list[DiagramNodeV1] = []
+            edges: list[DiagramEdgeV1] = []
+            groups: list[DiagramGroupV1] = []
+            diagram_refs: set[ExtractionEvidenceRefV1] = set()
+            for node in diagram.nodes:
+                refs = _all_refs_for_handles(node.evidence_handles, evidence_pack)
+                diagram_refs.update(refs)
+                _validate_grounded_editorial_text(node.label, refs, entries, technical_support)
+                nodes.append(
+                    DiagramNodeV1(node_id=node.node_id, label=node.label, evidence_refs=refs)
+                )
+            for edge in diagram.edges:
+                refs = _all_refs_for_handles(edge.evidence_handles, evidence_pack)
+                diagram_refs.update(refs)
+                if edge.label is not None:
+                    _validate_grounded_editorial_text(edge.label, refs, entries, technical_support)
+                edges.append(
+                    DiagramEdgeV1(
+                        source_node_id=edge.source_node_id,
+                        target_node_id=edge.target_node_id,
+                        label=edge.label,
+                        evidence_refs=refs,
+                    )
+                )
+            for group in diagram.groups:
+                _validate_ungrounded_editorial_text(group.label)
+                groups.append(
+                    DiagramGroupV1(
+                        group_id=group.group_id,
+                        label=group.label,
+                        node_ids=group.node_ids,
+                    )
+                )
+            for value in (diagram.title, diagram.caption or ""):
+                _validate_grounded_editorial_text(
+                    value,
+                    tuple(sorted(diagram_refs, key=evidence_ref_sort_key)),
+                    entries,
+                    technical_support,
+                )
             diagrams.append(
                 DiagramSpecV1(
                     key=diagram.key,

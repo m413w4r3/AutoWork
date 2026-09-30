@@ -284,6 +284,16 @@ def test_diagram_node_edge_and_group_invariants_are_enforced() -> None:
         DiagramEdgeV1("a", "b", None, ())
     with pytest.raises(ValueError, match="at least one node"):
         DiagramGroupV1("empty", "Empty", ())
+    for control in ("\x00", "\x1b", "\x7f", "\x85", "\ud800"):
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramNodeV1("a", f"Node{control}A", (ref,))
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramEdgeV1("a", "b", f"edge{control}", (ref,))
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramGroupV1("group", f"Group{control}", ("a",))
+    assert DiagramNodeV1("a", "line\nbreak\tand\r\u2028", (ref,)).label == (
+        "line\nbreak\tand\r\u2028"
+    )
 
     base = dict(
         key="diagram",

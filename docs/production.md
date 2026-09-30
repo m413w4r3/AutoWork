@@ -268,29 +268,36 @@ toutes ses preuves citées subsistent. Sinon, la réparation devient `retry_requ
 
 ### AW-017a : compilation déterministe des diagrammes
 
+```text
+AW-016
+EditorialEnrichmentV1
+  └── DiagramSpecV1
+
+AW-017a
+DiagramSpecV1
+  → D2 0.9.0
+  → SVG
+```
+
 `DiagramSpecV1`, contenu sémantique canonique d’`EditorialEnrichmentV1`, peut être compilé de façon
 déterministe en source D2 puis en SVG par le compiler D2 0.9.0. D2 et le SVG sont des médias dérivés,
 pas des artifacts canoniques. Cette capacité de compilation n’est ni un `ProductionStage` ni un
 `ProductionArtifactStage` et ne modifie donc pas le graphe ni la table canoniques ci-dessus.
 
+Le programme D2 est construit par AutoWork uniquement : identifiants synthétiques `n001`/`g001`
+dans l’ordre canonique, labels en chaînes D2 entre guillemets doubles avec échappement de `\`,
+`"`, `$` et des sauts de ligne. Le binaire est lancé sans shell (`--layout=dagre`,
+`--omit-version`, `--stdout-format=svg`, salt dérivé du hash sémantique du diagramme), source sur
+stdin, SVG sur stdout, 10 s et 2 MiB au plus. Le SVG n’est accepté qu’après validation : XML
+analysable, racine `svg`, ni `script` ni `foreignObject`, références limitées aux fragments `#id`
+et aux polices `data:` embarquées par D2. La policy `diagram-d2-svg-v1` est distincte de la version
+du binaire et évolue avec tout changement volontaire des bytes produits.
+
 À ce stade, le SVG n’est pas persisté, n’est pas relié à `EditorialEnrichmentService`, n’est pas
 injecté dans `PublicationDocumentV3` et n’est pas consommé par Assembly. L’inventaire des figures
-sources relève d’AW-017b ; la résolution des médias et leur persistance content-addressed relèvent
-d’AW-017c ; la projection dans `PublicationDocumentV4` relève d’AW-018. AW-017a conserve le rôle
-actuel de Pandoc.
-
-### AW-017b : inventaire des figures HTML archivées
-
-`SourceFigureCandidateV1` est la sortie immuable de l’inventaire des figures d’une source archivée.
-Chaque candidat porte les bytes exacts de l’image, leurs hashes et leur provenance.
-Le flux HTML implémenté part d’un snapshot HTML déjà archivé et des assets archivés localement,
-puis produit des candidats de façon déterministe. L’inventaire ne fait aucun accès réseau ni
-aucune persistance ; les ressources externes non résolues ne sont pas téléchargées.
-
-L’extraction des figures depuis les PDF reste un travail AW-017b à réaliser. AW-017c reste
-responsable des manifestes média et de la persistance content-addressed. AW-018 reste responsable
-de la consommation par `PublicationDocumentV4` et Assembly. Cet inventaire ne crée ni stage de
-production ni artifact de production.
+sources reste AW-017b ; la résolution des médias et leur persistance content-addressed restent
+AW-017c ; la projection dans `PublicationDocumentV4` reste AW-018. AW-017a conserve le rôle actuel
+de Pandoc.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
 l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
@@ -303,9 +310,9 @@ conserve le document canonique, sans rendu. Un futur pipeline de rendu indépend
 consommer.
 
 AW-016 a remplacé la génération vide par des propositions structurées. AW-017a fournit la
-compilation dérivée des diagrammes ; AW-017b inventorie les figures HTML archivées et reste à
-compléter pour les PDF ; AW-017c résout les médias et fournit leurs manifestes et leur persistance.
-AW-018 projettera l’enrichissement et les médias résolus dans `PublicationDocumentV4`.
+compilation dérivée des diagrammes ; AW-017b inventorie les figures sources et AW-017c résout et
+persiste les médias. AW-018 projettera l’enrichissement et les médias résolus dans
+`PublicationDocumentV4`.
 
 ## ProductionBoard
 
