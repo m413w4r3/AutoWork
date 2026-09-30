@@ -34,8 +34,12 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
-    build_empty_editorial_enrichment,
+    EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+    EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
+    EditorialEnrichmentProposalV1,
+    build_editorial_enrichment_evidence_pack,
     compute_editorial_enrichment_input_hash,
+    editorial_enrichment_evidence_pack_hash,
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import (
@@ -151,6 +155,7 @@ from cti_app.domain.selection import (
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore
 from tests.discovery_support import make_discovery_run_for_edition
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 pytestmark = pytest.mark.integration
 
@@ -295,6 +300,18 @@ class _CountingRetryModelAdapter:
                 actual_model_version=self.requested_model,
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
                 response_id=f"retry-synthesis-{request.request_id}",
+                output_text=proposal.model_dump_json(),
+                structured_output=proposal,
+            )
+        if request.prompt_template_id == "production-editorial-enrichment":
+            proposal = EditorialEnrichmentProposalV1()
+            return AdapterResult(
+                status=AdapterResultStatus.COMPLETED,
+                provider=self.provider,
+                requested_model=self.requested_model,
+                actual_model_version=self.requested_model,
+                usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
+                response_id=f"retry-enrichment-{request.request_id}",
                 output_text=proposal.model_dump_json(),
                 structured_output=proposal,
             )
@@ -880,6 +897,7 @@ async def _store_empty_enrichment(
     *,
     run_id: UUID,
     subject_id: UUID,
+    snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
 ) -> ProductionArtifact:
@@ -888,16 +906,32 @@ async def _store_empty_enrichment(
         synthesis=synthesis,
     )
     validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+    async with uow_factory() as uow:
+        access_policy = await build_synthesis_access_policy(
+            snapshot, extraction, uow.source_documents
+        )
+    evidence_pack_hash = editorial_enrichment_evidence_pack_hash(
+        build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    )
+    access_policy_hash = synthesis_access_policy_hash(access_policy)
     return await EditorialEnrichmentService(uow_factory, store).store_editorial_enrichment_result(
         run_id=run_id,
         subject_id=subject_id,
         input_hash=compute_editorial_enrichment_input_hash(
             extraction=extraction,
             synthesis=synthesis,
+            evidence_pack_hash=evidence_pack_hash,
+            access_policy_hash=access_policy_hash,
         ),
         enrichment=enrichment,
         extraction=extraction,
         synthesis=synthesis,
+        raw_result=None,
+        model_run_id=None,
+        evidence_pack_hash=evidence_pack_hash,
+        access_policy_hash=access_policy_hash,
+        model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+        routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
     )
 
 
@@ -914,8 +948,8 @@ async def _assert_enrichment_lineage(
     assert enrichment_artifact.production_run_id == run_id
     assert enrichment_artifact.subject_id == subject_id
     assert enrichment_artifact.status is ProductionArtifactStatus.VERIFIED
-    assert enrichment_artifact.reused_from_artifact_id is None
-    assert enrichment_artifact.raw_blob_id is None
+    if enrichment_artifact.raw_blob_id is not None:
+        await store.read_bytes(enrichment_artifact.raw_blob_id)
     assert enrichment_artifact.rendered_blob_id is None
     assert enrichment_artifact.canonical_blob_id is not None
     assert extraction_artifact.canonical_blob_id is not None
@@ -936,6 +970,8 @@ async def _assert_enrichment_lineage(
     assert enrichment_artifact.input_hash == compute_editorial_enrichment_input_hash(
         extraction=extraction,
         synthesis=synthesis,
+        evidence_pack_hash=enrichment_artifact.metadata["evidence_pack_hash"],
+        access_policy_hash=enrichment_artifact.metadata["access_policy_hash"],
     )
     assert enrichment_artifact.metadata["extraction_hash"] == enrichment.extraction_hash
     assert enrichment_artifact.metadata["synthesis_hash"] == enrichment.synthesis_hash
@@ -1031,6 +1067,7 @@ async def _seed_reusable_article(
         store,
         run_id=source_run.id,
         subject_id=subject.id,
+        snapshot=snapshot,
         extraction=first_pass.extraction,
         synthesis=synthesis,
     )
@@ -1376,6 +1413,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         store,
         run_id=run_a.id,
         subject_id=subject.id,
+        snapshot=snapshot_a,
         extraction=first_pass.extraction,
         synthesis=synthesis,
     )
@@ -1594,6 +1632,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     )
     assert artifacts_b[ProductionArtifactStage.EXTRACTION].reused_from_artifact_id is None
     assert artifacts_b[ProductionArtifactStage.SYNTHESIS].reused_from_artifact_id is None
+    assert artifacts_b[ProductionArtifactStage.EDITORIAL_ENRICHMENT].reused_from_artifact_id is None
     await _assert_enrichment_lineage(
         store,
         artifacts_b,

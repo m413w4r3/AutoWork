@@ -153,6 +153,20 @@ class TestProductionRunStates:
         with pytest.raises(ValueError, match="production_run_cancelled"):
             run.mark_ready()
 
+    def test_retrying_editorial_enrichment_forces_recompute_from_that_stage(self) -> None:
+        run = ProductionRun(
+            subject_id=uuid4(),
+            edition_id=uuid4(),
+        )
+        run.start_running(now=datetime.now(UTC))
+        run.mark_failed(code="stage_failed", message="retry requested")
+
+        run.retry_from_stage(ProductionStage.EDITORIAL_ENRICHMENT)
+
+        assert run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
+        assert run.force_recompute_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
+        assert run.pipeline_generation == 1
+
     def test_cannot_transition_from_terminal_state(self) -> None:
         run = ProductionRun(
             subject_id=uuid4(),

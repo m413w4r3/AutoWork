@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from hashlib import sha256
@@ -179,6 +179,7 @@ class ScriptedModelScript:
 
     def __init__(self) -> None:
         self._references: str | None = None
+        self._editorial_enrichment: str | Callable[[str], str] = '{"tables": [], "diagrams": []}'
         self._q2: dict[str, str | Q2SourceOutput | Exception] = {}
         self._url_by_sha256: dict[str, str] = {}
 
@@ -190,6 +191,9 @@ class ScriptedModelScript:
 
     def references(self, response: str) -> None:
         self._references = response
+
+    def editorial_enrichment(self, response: str | Callable[[str], str]) -> None:
+        self._editorial_enrichment = response
 
     def q2(self, *, source_url: str, response: str | Q2SourceOutput | Exception) -> None:
         """Script the extraction of one source; Markdown is the readable Q2 dialect."""
@@ -226,6 +230,13 @@ class ScriptedModelScript:
 
         if request.prompt_template_id == "production-synthesis":
             return _grounded_synthesis_proposal(request.text)
+
+        if request.prompt_template_id == "production-editorial-enrichment":
+            return (
+                self._editorial_enrichment(request.text)
+                if callable(self._editorial_enrichment)
+                else self._editorial_enrichment
+            )
 
         raise AssertionError(
             "No scripted model response for "
@@ -386,6 +397,8 @@ class ScriptedModelGateway(ModelGateway):
             stage = "references"
         elif request.prompt_template_id == "production-synthesis":
             stage = "synthesis"
+        elif request.prompt_template_id == "production-editorial-enrichment":
+            stage = "editorial_enrichment"
         else:
             stage = request.routing_hint.value
         self.calls.append(
@@ -848,6 +861,61 @@ def _grounded_synthesis_proposal(prompt_text: str) -> str:
     )
 
 
+def grounded_editorial_proposal(prompt_text: str) -> str:
+    """Return a structured table and diagram using exact pack handles."""
+    pack = json.loads(prompt_text)["current_evidence_pack"]
+    evidence = pack["technical_evidence"] or pack["narrative_evidence"]
+    if not evidence:
+        raise AssertionError("Editorial enrichment requires extraction evidence")
+    first = evidence[0]
+    handle = first["handle"]
+    value = first.get("value") or first.get("text")
+    if not isinstance(value, str) or not value:
+        raise AssertionError("Editorial evidence has no readable value")
+    placement = {"kind": "after_lead", "section_index": None}
+    return json.dumps(
+        {
+            "tables": [
+                {
+                    "key": "observations",
+                    "kind": "custom",
+                    "title": "Observations rapportées",
+                    "caption": None,
+                    "columns": [
+                        {"key": "type", "label": "Type"},
+                        {"key": "value", "label": "Valeur"},
+                    ],
+                    "rows": [{"cells": ["Élément", value], "evidence_handles": [handle]}],
+                    "placement": placement,
+                }
+            ],
+            "diagrams": [
+                {
+                    "key": "reported_activity",
+                    "kind": "custom",
+                    "title": "Éléments documentés",
+                    "caption": None,
+                    "direction": "left_to_right",
+                    "nodes": [
+                        {"node_id": "report", "label": "Rapport", "evidence_handles": [handle]},
+                        {"node_id": "observation", "label": value, "evidence_handles": [handle]},
+                    ],
+                    "edges": [
+                        {
+                            "source_node_id": "report",
+                            "target_node_id": "observation",
+                            "label": "documente",
+                            "evidence_handles": [handle],
+                        }
+                    ],
+                    "groups": [],
+                    "placement": placement,
+                }
+            ],
+        }
+    )
+
+
 def _canonical_url(url: str) -> str:
     from cti_app.domain.discovery import canonicalize_http_url
 
@@ -860,5 +928,6 @@ __all__ = [
     "ProductionScenario",
     "ScriptedModelCall",
     "ScriptedModelGateway",
+    "grounded_editorial_proposal",
     "reserve_edition_code",
 ]

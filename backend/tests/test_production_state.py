@@ -10,7 +10,6 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
-from cti_app.application.production_editorial_enrichment import build_empty_editorial_enrichment
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_state import (
@@ -71,6 +70,7 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tools.production_state_checksum import canonical_checksum
 
 

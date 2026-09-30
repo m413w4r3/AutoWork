@@ -544,7 +544,7 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     jobs = await _jobs_for_run(scenario)
     assert len([job for job in jobs if job.kind == extraction_job.kind]) == 1
     assert extraction_job.status is JobStatus.SUCCEEDED
-    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 3
+    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 4
     await _assert_artifact_invariants(scenario, artifacts)
 
 

@@ -10,7 +10,6 @@ import pytest
 import cti_app.application.publication_builder as publication_builder
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
-    build_empty_editorial_enrichment,
     canonical_editorial_enrichment_hash,
 )
 from cti_app.application.production_extraction import references_corpus_hash
@@ -76,6 +75,7 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 
 def _canonical_inputs() -> tuple[

@@ -22,12 +22,14 @@ from cti_app.domain.production import (
     ProductionRun,
     SynthesisMode,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 
 _COSTLY_STAGES = (
     ProductionArtifactStage.REFERENCES,
     ProductionArtifactStage.EXTRACTION,
     ProductionArtifactStage.SYNTHESIS,
+    ProductionArtifactStage.EDITORIAL_ENRICHMENT,
 )
 
 
@@ -194,6 +196,11 @@ class ProductionArtifactReuseService:
             synthesis = production_synthesis_from_json(payload)
             if synthesis.subject_id != artifact.subject_id:
                 raise ValueError("Synthesis subject does not match artifact subject")
+        elif artifact.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT:
+            payload = await self._artifact_store.read_json(blob_id)
+            enrichment = editorial_enrichment_from_json(payload)
+            if enrichment.subject_id != artifact.subject_id:
+                raise ValueError("Editorial enrichment subject does not match artifact subject")
         else:
             await self._artifact_store.read_bytes(blob_id)
 

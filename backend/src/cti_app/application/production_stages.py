@@ -12,6 +12,7 @@ from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+    EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
     compute_editorial_enrichment_input_hash,
     validate_editorial_enrichment,
 )
@@ -367,6 +368,12 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         enrichment: EditorialEnrichmentV1,
         extraction: ProductionExtractionV1,
         synthesis: ProductionSynthesisV1,
+        raw_result: str | None,
+        model_run_id: UUID | None,
+        evidence_pack_hash: str,
+        access_policy_hash: str,
+        model_policy_version: str,
+        routing_policy_version: str,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
@@ -374,7 +381,10 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             raise ValueError("editorial_enrichment_lineage_mismatch")
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
         if input_hash != compute_editorial_enrichment_input_hash(
-            extraction=extraction, synthesis=synthesis
+            extraction=extraction,
+            synthesis=synthesis,
+            evidence_pack_hash=evidence_pack_hash,
+            access_policy_hash=access_policy_hash,
         ):
             raise ValueError("editorial_enrichment_lineage_mismatch")
         payload = editorial_enrichment_to_json(enrichment)
@@ -392,7 +402,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 return current
             previous = await uow.production_artifacts.list_for_run(run_id)
             version = max((item.version for item in previous if item.stage is stage), default=0) + 1
-            _, canonical_id, _ = await self._store_payloads(canonical=payload)
+            raw_id, canonical_id, _ = await self._store_payloads(raw=raw_result, canonical=payload)
             if canonical_id is None:
                 raise ValueError("editorial_enrichment_validation_failed")
             artifact = ProductionArtifact(
@@ -402,15 +412,20 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 version=version,
                 input_hash=input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
-                raw_blob_id=None,
+                raw_blob_id=raw_id,
                 canonical_blob_id=canonical_id,
                 rendered_blob_id=None,
-                model_run_id=None,
+                model_run_id=model_run_id,
                 conversation_turn_id=None,
                 metadata={
                     "schema_version": enrichment.schema_version,
                     "policy_version": enrichment.enrichment_policy_version,
                     "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+                    "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
+                    "model_policy_version": model_policy_version,
+                    "routing_policy_version": routing_policy_version,
+                    "evidence_pack_hash": evidence_pack_hash,
+                    "access_policy_hash": access_policy_hash,
                     "table_count": len(enrichment.tables),
                     "diagram_count": len(enrichment.diagrams),
                     "source_figure_count": len(enrichment.source_figures),

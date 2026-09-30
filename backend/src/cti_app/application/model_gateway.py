@@ -108,6 +108,7 @@ class ModelRoutingHint(StrEnum):
     AMBIGUOUS_CLUSTERING = "ambiguous_clustering"
     STANDARD_DRAFT = "standard_draft"
     PREMIUM_SYNTHESIS = "premium_synthesis"
+    EDITORIAL_ENRICHMENT = "editorial_enrichment"
     CRITIQUE = "critique"
     DISCOVERY_MERGE = "discovery_merge"
 
@@ -370,6 +371,7 @@ class ModelRouter:
             ModelRoutingHint.AMBIGUOUS_CLUSTERING: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.STANDARD_DRAFT: ModelBackend.QWEN,
             ModelRoutingHint.PREMIUM_SYNTHESIS: ModelBackend.CHATGPT_BRIDGE,
+            ModelRoutingHint.EDITORIAL_ENRICHMENT: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.CRITIQUE: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.DISCOVERY_MERGE: ModelBackend.CHATGPT_BRIDGE,
         }

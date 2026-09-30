@@ -83,6 +83,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
             ModelRoutingHint.AMBIGUOUS_CLUSTERING: settings.model_route_ambiguous_clustering,
             ModelRoutingHint.STANDARD_DRAFT: settings.model_route_standard_draft,
             ModelRoutingHint.PREMIUM_SYNTHESIS: settings.model_route_premium_synthesis,
+            ModelRoutingHint.EDITORIAL_ENRICHMENT: settings.model_route_editorial_enrichment,
             ModelRoutingHint.CRITIQUE: settings.model_route_critique,
             ModelRoutingHint.DISCOVERY_MERGE: settings.model_route_discovery_merge,
         }.items()

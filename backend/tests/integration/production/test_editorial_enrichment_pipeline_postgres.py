@@ -1,7 +1,8 @@
-"""PostgreSQL contract checks for the AW-015 editorial enrichment stage."""
+"""PostgreSQL contract checks for the editorial enrichment stage."""
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
@@ -19,13 +21,64 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRun,
+    ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
+from cti_app.domain.production_extraction import production_extraction_from_json
+from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.infrastructure.database.models.production import ProductionArtifactRow
+from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
 from ..edition_codes import reserve_edition_code
+from .test_pipeline_happy_path import _configured_scenario, _install_canonical_synthesis
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.asyncio
+async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
+    production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
+) -> None:
+    scenario = await _configured_scenario(production_scenario_factory)
+    _install_canonical_synthesis(scenario)
+    scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
+    await scenario.start()
+    run = await scenario.run_until_terminal()
+    assert run.status is ProductionRunStatus.READY
+
+    async with scenario.uow_factory() as uow:
+        artifacts = {
+            item.stage: item for item in await uow.production_artifacts.list_for_run(run.id)
+        }
+    enrichment_artifact = artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+    assert enrichment_artifact.model_run_id is not None
+    assert enrichment_artifact.raw_blob_id is not None
+    assert enrichment_artifact.canonical_blob_id is not None
+    assert (
+        artifacts[ProductionArtifactStage.PUBLICATION].status is ProductionArtifactStatus.VERIFIED
+    )
+
+    extraction = production_extraction_from_json(
+        await scenario.artifact_store.read_json(
+            artifacts[ProductionArtifactStage.EXTRACTION].canonical_blob_id  # type: ignore[arg-type]
+        )
+    )
+    synthesis = production_synthesis_from_json(
+        await scenario.artifact_store.read_json(
+            artifacts[ProductionArtifactStage.SYNTHESIS].canonical_blob_id  # type: ignore[arg-type]
+        )
+    )
+    enrichment = editorial_enrichment_from_json(
+        await scenario.artifact_store.read_json(enrichment_artifact.canonical_blob_id)
+    )
+    assert len(enrichment.tables) == len(enrichment.diagrams) == 1
+    assert enrichment.source_figures == ()
+    validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+    assert enrichment.tables[0].rows[0].evidence_refs
+    assert all(node.evidence_refs for node in enrichment.diagrams[0].nodes)
+    assert all(edge.evidence_refs for edge in enrichment.diagrams[0].edges)
+    assert len([call for call in scenario.model.calls if call.stage == "editorial_enrichment"]) == 1
 
 
 @pytest.mark.asyncio

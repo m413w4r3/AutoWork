@@ -2817,8 +2817,8 @@ async def test_cancelled_production_status_carries_its_resume_plan(
         "previous_status": "cancelled",
         "resume_from_stage": "references",
         "reused_artifacts": [],
-        # Q1, one Q2 call for the single archived source, then Q4.
-        "model_calls_expected": 3,
+        # Q1, one Q2 call for the archived source, Q4, then enrichment.
+        "model_calls_expected": 4,
     }
     assert run.status is ProductionRunStatus.CANCELLED
 
@@ -2861,7 +2861,7 @@ async def test_resume_dispatches_the_first_incomplete_stage_and_logs_its_plan(
     assert event["previous_status"] == "cancelled"
     assert event["resume_from_stage"] == "extraction"
     assert event["reused_artifacts"] == ["references"]
-    assert event["model_calls_expected"] == 2
+    assert event["model_calls_expected"] == 3
     assert event["actor_id"] == "analyst-1"
 
 

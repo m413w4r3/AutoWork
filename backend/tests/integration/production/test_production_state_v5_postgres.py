@@ -23,7 +23,7 @@ from cti_app.domain.production import (
 )
 from cti_app.infrastructure.database.models.model_execution import ModelRunRow
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
-from tests.integration.production.support import ProductionScenario
+from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
 from .test_pipeline_happy_path import _configured_scenario, _install_canonical_synthesis
 
@@ -43,6 +43,7 @@ async def test_imported_v5_state_is_directly_assemblable(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
+    scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
     _install_canonical_synthesis(scenario)
     initial = await scenario.start()
     assert initial.status is ProductionRunStatus.RUNNING
@@ -56,6 +57,9 @@ async def test_imported_v5_state_is_directly_assemblable(
     service = ProductionStateService(scenario.uow_factory, scenario.artifact_store)
     exported = await service.export_state(subject_id=completed.subject_id)
     assert exported.schema_version == 5
+    editorial_content = exported.artifacts.editorial_enrichment.canonical_content
+    assert len(editorial_content["tables"]) == 1
+    assert len(editorial_content["diagrams"]) == 1
     assert set(exported.artifacts.model_fields_set) == {
         "references",
         "extraction",
@@ -98,6 +102,11 @@ async def test_imported_v5_state_is_directly_assemblable(
             and artifact.canonical_blob_id is not None
             for artifact in imported_artifacts
         )
+        imported_editorial = imported_by_stage[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+        imported_content = await scenario.artifact_store.read_json(
+            imported_editorial.canonical_blob_id  # type: ignore[arg-type]
+        )
+        assert imported_content == editorial_content
         assert await uow.analyst_investigations.get_for_run(imported.run_id) is None
 
     upstream_artifact_ids = {stage: imported_by_stage[stage].id for stage in imported_by_stage}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import inspect
 from pathlib import Path
 
@@ -72,6 +73,15 @@ def test_editorial_enrichment_contract_has_no_renderer_or_compiler_dependency() 
         _APPLICATION / "production_editorial_enrichment.py",
         _DOMAIN / "production_editorial_enrichment.py",
     ):
-        source = path.read_text()
-        for forbidden in ("Pandoc", "Typst", "D2", "Mermaid", "Graphviz", "TikZ"):
-            assert forbidden not in source
+        tree = ast.parse(path.read_text())
+        imported = [
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        ]
+        imported.extend(
+            node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
+        )
+        for forbidden in ("pandoc", "typst", "d2", "mermaid", "graphviz", "tikz"):
+            assert all(forbidden not in name.lower() for name in imported)

@@ -42,7 +42,7 @@ _STAGE_MODEL_CALLS: dict[ProductionStage, int] = {
     ProductionStage.SOURCES: 0,
     ProductionStage.REFERENCES: 1,
     ProductionStage.SYNTHESIS: 1,
-    ProductionStage.EDITORIAL_ENRICHMENT: 0,
+    ProductionStage.EDITORIAL_ENRICHMENT: 1,
     ProductionStage.ASSEMBLY: 0,
 }
 

@@ -29,10 +29,12 @@ implémentation expose toutes les capacités OpenAI.
 | Structuration de la découverte | Qwen |
 | Regroupement ambigu | OpenAI via `chatgpt-bridge` |
 | Synthèse premium et critique | OpenAI via `chatgpt-bridge` |
+| Editorial enrichment structuré | OpenAI via `chatgpt-bridge` |
 | Extraction volumique | Qwen |
 | Brouillon standard ou contenu sensible | Qwen |
 
 Les variables `MODEL_ROUTE_<HINT>` configurent le mapping `ModelRoutingHint -> ModelBackend`.
+`MODEL_ROUTE_EDITORIAL_ENRICHMENT` configure séparément le backend de l’enrichissement éditorial.
 `MODEL_FORCE_ADAPTER=chatgpt_bridge|gemini_webai|qwen|fake` permet un forçage uniquement lorsque
 `APP_ENV=development`; `openai` et `gemini` restent des alias de compatibilité. `auto` conserve
 la politique ci-dessus.
@@ -137,6 +139,22 @@ identité. Si la requête a probablement été soumise, elle passe en `NEEDS_REV
 automatique. Une réponse structurée invalide passe aussi en revue : aucun échange de réparation
 de format n’est ouvert. AW-012 retire l’identité de conversation fonctionnelle propre à Synthesis ;
 cela ne supprime pas les capacités de conversation des autres usages de `ModelGateway`.
+
+### EDITORIAL_ENRICHMENT AW-016 : propositions structurées
+
+`EDITORIAL_ENRICHMENT` appelle `DraftingModel.draft` avec une proposition stricte
+`EditorialEnrichmentProposalV1`. L’appel est stateless (`web_search=false`,
+`conversation=None`, `background=false`) et utilise le routage dédié
+`ModelRoutingHint.EDITORIAL_ENRICHMENT`, configuré par
+`MODEL_ROUTE_EDITORIAL_ENRICHMENT`. L’application résout les handles de preuve exactement vers
+`ExtractionEvidenceRefV1` et valide la proposition avant de persister le canonical.
+
+Une requête possiblement soumise ou une sortie structurée invalide passe en `NEEDS_REVIEW` sans
+replay automatique. Une proposition vide est un résultat éditorial valide ; une indisponibilité du
+modèle ou une policy d’accès bloquante ne produit pas un enrichissement vide.
+
+Le modèle ne génère ni langage de renderer ni figure source. `source_figures` reste vide dans
+AW-016 ; l’inventaire des images sources relève d’AW-017.
 
 ## Responses API et bridge ChatGPT
 
@@ -274,6 +292,7 @@ table ni dans les logs. Les sorties complètes vivent dans `model-outputs/` sur 
 | `WEBAI_MODEL` | identifiant Gemini demandé à WebAI, par défaut `gemini-3-flash` |
 | `WEBAI_IS_EXTERNAL` | frontière de confiance WebAI, `true` par défaut |
 | `MODEL_ROUTE_<HINT>` | backend choisi pour chaque type de tâche |
+| `MODEL_ROUTE_EDITORIAL_ENRICHMENT` | backend dédié aux propositions d’enrichissement éditorial |
 | `MODEL_FORCE_ADAPTER` | `auto`, ou forçage de développement |
 | `MODEL_REQUEST_TIMEOUT_SECONDS` | timeout HTTP borné |
 | `DISCOVERY_CHATGPT_STRUCTURING_FALLBACK` | fallback explicite, désactivé par défaut |

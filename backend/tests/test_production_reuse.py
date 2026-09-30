@@ -60,6 +60,7 @@ from cti_app.domain.production import (
     ProductionStage,
     SynthesisMode,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionEventV1,
@@ -74,6 +75,8 @@ from cti_app.domain.production_references import (
     ProductionReferenceTier,
 )
 from cti_app.domain.production_synthesis import production_synthesis_from_json
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.test_production_synthesis_storage import canonical_pair
 
 
 class _Artifacts:
@@ -169,6 +172,17 @@ class _Store:
 class _UnavailableStore:
     async def read_bytes(self, blob_id: UUID) -> bytes:
         raise ProductionReuseStorageUnavailableError(f"storage unavailable for {blob_id}")
+
+
+class _JSONStore(_Store):
+    def __init__(self, readable: set[UUID], payload: dict[str, Any]) -> None:
+        super().__init__(readable)
+        self.payload = payload
+
+    async def read_json(self, blob_id: UUID) -> dict[str, Any]:
+        if blob_id not in self.readable:
+            raise FileNotFoundError(blob_id)
+        return self.payload
 
 
 class _WorkflowUow:
@@ -437,6 +451,50 @@ async def test_invalidation_cutoff_excludes_old_candidate() -> None:
     assert artifacts.not_before == invalidation.occurred_at
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_subject_matches", [True, False])
+async def test_editorial_enrichment_reuse_validates_canonical_subject(
+    canonical_subject_matches: bool,
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    source_run = _run(
+        edition_id=edition_id,
+        subject_id=subject_id,
+        status=ProductionRunStatus.READY,
+    )
+    target_run = _run(
+        edition_id=edition_id,
+        subject_id=subject_id,
+        status=ProductionRunStatus.RUNNING,
+    )
+    source = _artifact(
+        source_run,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+    )
+    payload_subject = subject_id if canonical_subject_matches else uuid4()
+    synthesis, extraction = canonical_pair(payload_subject)
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    store = _JSONStore(
+        {cast(UUID, source.canonical_blob_id)},
+        editorial_enrichment_to_json(enrichment),
+    )
+    artifacts = _Artifacts([source])
+    uow = _Uow(artifacts, _Invalidations())
+    service = ProductionArtifactReuseService(cast(Any, lambda: uow), cast(Any, store))
+
+    result = await service.find_or_reuse(
+        run=target_run,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        input_hash=source.input_hash,
+    )
+
+    assert (result is not None) is canonical_subject_matches
+    if result is not None:
+        assert result.reused is True
+        assert result.artifact.reused_from_artifact_id == source.id
+        assert result.artifact.model_run_id == source.model_run_id
+
+
 def test_same_run_cache_has_priority_and_force_only_disables_cross_run() -> None:
     edition_id, subject_id = uuid4(), uuid4()
     run = _run(edition_id=edition_id, subject_id=subject_id, status=ProductionRunStatus.RUNNING)
@@ -445,6 +503,10 @@ def test_same_run_cache_has_priority_and_force_only_disables_cross_run() -> None
     assert cross_run_reuse_allowed(run, ProductionArtifactStage.REFERENCES)
     assert not cross_run_reuse_allowed(run, ProductionArtifactStage.EXTRACTION)
     assert not cross_run_reuse_allowed(run, ProductionArtifactStage.SYNTHESIS)
+
+    run.force_recompute_from_stage = ProductionStage.EDITORIAL_ENRICHMENT
+    assert cross_run_reuse_allowed(run, ProductionArtifactStage.SYNTHESIS)
+    assert not cross_run_reuse_allowed(run, ProductionArtifactStage.EDITORIAL_ENRICHMENT)
 
 
 def test_snapshot_reuse_basis_excludes_research_date() -> None:

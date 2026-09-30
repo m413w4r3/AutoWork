@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     model_route_premium_synthesis: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
+    model_route_editorial_enrichment: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
     model_route_critique: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )

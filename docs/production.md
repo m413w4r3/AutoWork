@@ -243,11 +243,28 @@ syntaxe de renderer ni média dérivé. Les cellules de table, nodes et edges po
 d’évidence appartenant à l’extraction courante. Les figures désignent un `source_document_id`
 canonique et son URL exacte. Les placements par section sont liés au hash exact de la synthèse.
 
-AW-015 produit automatiquement un enrichissement vide, valide et déterministe : `tables`,
-`diagrams` et `source_figures` sont vides. Ce stage n’appelle pas `ModelGateway`. Son hash d’entrée
-inclut les hashes canoniques de l’extraction et de la synthèse, la policy et la version du
-générateur `bootstrap-empty-v1`. L’artifact canonique est versionné ; une nouvelle version
-invalide `PUBLICATION`. La reprise depuis ce stage coûte zéro appel modèle.
+AW-016 consomme uniquement les artifacts canoniques `EXTRACTION` et `SYNTHESIS` ainsi que les
+métadonnées d’accès exactes des sources. Le modèle propose des tableaux indépendants du renderer et
+des diagrammes sémantiques via une sortie structurée stricte. Chaque ligne, nœud et arête résout
+ses handles vers des `ExtractionEvidenceRefV1` exactes. Une proposition vide reste valide lorsque
+les données ne gagnent rien à être représentées autrement. Une panne modèle ou une politique qui
+interdit la soumission ne produit jamais un enrichissement vide artificiel.
+
+Aucun langage de renderer ni locator d’image source n’est généré par le modèle. AW-016 ne réalise
+pas de recherche web et garde `source_figures` vide ; leur inventaire et validation sont différés à
+AW-017. L’appel est stateless, sans recherche web ni conversation. L’artifact versionné conserve
+la provenance `ModelRun`, le RAW fournisseur disponible et les hashes fonctionnels du pack de
+preuves et de la politique d’accès. Une nouvelle version invalide `PUBLICATION`. Le stage peut
+consommer au plus un appel modèle ; un reuse exact ou un artifact vérifié déjà présent n’en coûte
+aucun. Un retry explicite depuis ce stage force son recalcul cross-run.
+Une soumission possiblement acceptée par le fournisseur passe le run en `needs_review` avec le code
+partagé `model_submission_reconciliation_required` et l’identité exacte du `ModelRun`, comme
+`SYNTHESIS` : seule l’adoption de la réponse existante le débloque, jamais une resoumission.
+
+Une réparation IOC ou règles n’appelle jamais le modèle et ne fabrique pas d’enrichissement vide :
+l’enrichissement courant est rebasé tel quel sur la nouvelle lignée extraction/synthèse lorsque
+toutes ses preuves citées subsistent. Sinon, la réparation devient `retry_required` depuis
+`editorial_enrichment`.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
 l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la

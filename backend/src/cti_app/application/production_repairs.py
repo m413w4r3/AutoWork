@@ -26,9 +26,7 @@ from cti_app.application.production_artifact_verification import (
     verify_q2_proposals,
 )
 from cti_app.application.production_editorial_enrichment import (
-    EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
-    build_empty_editorial_enrichment,
-    compute_editorial_enrichment_input_hash,
+    canonical_synthesis_hash,
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import (
@@ -125,6 +123,8 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentV1,
+    editorial_enrichment_evidence_refs,
+    editorial_enrichment_from_json,
     editorial_enrichment_to_json,
 )
 from cti_app.domain.production_extraction import (
@@ -466,6 +466,14 @@ class ProductionRepairCorrectionVerification:
 
 class ProductionRepairProjectionError(ValueError):
     """The effective extraction cannot be safely projected."""
+
+
+class _EditorialEnrichmentRebuildRequired(RuntimeError):
+    """The current enrichment cannot follow the repair without a new model proposal."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class ProductionReferenceRepairError(ValueError):
@@ -3864,14 +3872,19 @@ class ProductionRepairMaterializationService:
 
             publication: ProductionArtifact | None = None
             qa_result: dict[str, Any] | None = None
+            enrichment_rebuild: _EditorialEnrichmentRebuildRequired | None = None
             if impact.kind is ProductionRepairImpactKind.PUBLICATION_ONLY:
-                publication, qa_result = await self._materialize_publication_in_uow(
-                    uow,
-                    run=run,
-                    extraction=projection.artifact,
-                    repair_materialization=repair_audit,
-                )
-                repair_audit["result_publication_artifact_id"] = str(publication.id)
+                try:
+                    publication, qa_result = await self._materialize_publication_in_uow(
+                        uow,
+                        run=run,
+                        extraction=projection.artifact,
+                        repair_materialization=repair_audit,
+                    )
+                except _EditorialEnrichmentRebuildRequired as exc:
+                    enrichment_rebuild = exc
+                else:
+                    repair_audit["result_publication_artifact_id"] = str(publication.id)
                 self._record_repair_diagnostic(
                     event="production.repair.publication_reassembled",
                     run=run,
@@ -3883,13 +3896,17 @@ class ProductionRepairMaterializationService:
                 if self._assembly is None:
                     # A changed canonical Extraction needs new lineage even
                     # when only detection rules changed editorially.
-                    publication, qa_result = await self._materialize_publication_in_uow(
-                        uow,
-                        run=run,
-                        extraction=projection.artifact,
-                        repair_materialization=repair_audit,
-                    )
-                    repair_audit["result_publication_artifact_id"] = str(publication.id)
+                    try:
+                        publication, qa_result = await self._materialize_publication_in_uow(
+                            uow,
+                            run=run,
+                            extraction=projection.artifact,
+                            repair_materialization=repair_audit,
+                        )
+                    except _EditorialEnrichmentRebuildRequired as exc:
+                        enrichment_rebuild = exc
+                    else:
+                        repair_audit["result_publication_artifact_id"] = str(publication.id)
                 else:
                     await self._mark_stages_stale(
                         uow,
@@ -3929,6 +3946,37 @@ class ProductionRepairMaterializationService:
                     projection=projection,
                     action="retry_required",
                     retry_stage=ProductionStage.SYNTHESIS.value,
+                    repair_materialization=repair_audit,
+                )
+
+            if enrichment_rebuild is not None:
+                # The model-generated enrichment cites evidence the repair
+                # removed. It is never replaced by an empty one: the stage
+                # owes a new proposal, committed with the repaired Extraction.
+                await self._mark_stages_stale(
+                    uow,
+                    run.id,
+                    {
+                        ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
+                        ProductionArtifactStage.PUBLICATION.value,
+                    },
+                )
+                repair_audit["editorial_enrichment_rebuild_reason"] = enrichment_rebuild.code
+                self._record_repair_diagnostic(
+                    event="production.repair.model_retry_requested",
+                    run=run,
+                    projection=projection,
+                    started=started,
+                    reused_synthesis=True,
+                )
+                await _require_publication_rebuild(
+                    uow, run, retry_stage=ProductionStage.EDITORIAL_ENRICHMENT.value
+                )
+                await uow.commit()
+                return ProductionRepairMaterializationResult(
+                    projection=projection,
+                    action="retry_required",
+                    retry_stage=ProductionStage.EDITORIAL_ENRICHMENT.value,
                     repair_materialization=repair_audit,
                 )
 
@@ -4341,7 +4389,14 @@ class ProductionRepairMaterializationService:
         synthesis_artifact: ProductionArtifact,
         synthesis: ProductionSynthesisV1,
     ) -> tuple[EditorialEnrichmentV1, ProductionArtifact]:
-        """Rebuild the deterministic AW-015 enrichment within the repair transaction."""
+        """Rebase the current model-generated enrichment onto the repaired lineage.
+
+        A repair never calls the model and never fabricates an empty
+        enrichment. The current tables and diagrams are kept verbatim when
+        every evidence ref they cite survives the repair; otherwise the stage
+        owes a new model proposal and the caller turns the repair into a
+        retry from EDITORIAL_ENRICHMENT.
+        """
         store = self._artifact_store
         if (
             store is None
@@ -4350,40 +4405,54 @@ class ProductionRepairMaterializationService:
         ):
             raise ProductionRepairProjectionError("editorial_enrichment_inputs_missing")
 
-        try:
-            enrichment = build_empty_editorial_enrichment(
-                extraction=extraction,
-                synthesis=synthesis,
-            )
-            validate_editorial_enrichment(
-                enrichment,
-                extraction=extraction,
-                synthesis=synthesis,
-            )
-            canonical_payload = editorial_enrichment_to_json(enrichment)
-            input_hash = compute_editorial_enrichment_input_hash(
-                extraction=extraction,
-                synthesis=synthesis,
-            )
-        except ValueError as exc:
-            code = getattr(exc, "code", "editorial_enrichment_validation_failed")
-            raise ProductionRepairProjectionError(str(code)) from exc
-
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         current = await uow.production_artifacts.get_current(run.id, stage.value)
         if (
-            current is not None
-            and current.status is ProductionArtifactStatus.VERIFIED
-            and current.input_hash == input_hash
-            and current.canonical_blob_id is not None
+            current is None
+            or current.status is not ProductionArtifactStatus.VERIFIED
+            or current.canonical_blob_id is None
+        ):
+            raise _EditorialEnrichmentRebuildRequired("editorial_enrichment_inputs_missing")
+        try:
+            previous = editorial_enrichment_from_json(
+                await store.read_json(current.canonical_blob_id)
+            )
+        except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError, ValueError) as exc:
+            raise _EditorialEnrichmentRebuildRequired(
+                "editorial_enrichment_inputs_missing"
+            ) from exc
+
+        extraction_hash = canonical_extraction_hash(extraction)
+        synthesis_hash = canonical_synthesis_hash(synthesis)
+        if (
+            previous.extraction_hash == extraction_hash
+            and previous.synthesis_hash == synthesis_hash
         ):
             try:
-                stored = await store.read_bytes(current.canonical_blob_id)
-            except (BlobIntegrityError, EntityNotFoundError, FileNotFoundError):
-                pass
-            else:
-                if stored == ProductionArtifactStore.canonical_json_bytes(canonical_payload):
-                    return enrichment, current
+                validate_editorial_enrichment(previous, extraction=extraction, synthesis=synthesis)
+            except ValueError as exc:
+                raise _EditorialEnrichmentRebuildRequired(
+                    str(getattr(exc, "code", "editorial_enrichment_validation_failed"))
+                ) from exc
+            return previous, current
+
+        if not editorial_enrichment_evidence_refs(previous) <= set(
+            extraction_evidence_refs_v1(extraction)
+        ):
+            raise _EditorialEnrichmentRebuildRequired("editorial_enrichment_evidence_missing")
+        enrichment = replace(
+            previous,
+            production_input_hash=synthesis.production_input_hash,
+            extraction_hash=extraction_hash,
+            synthesis_hash=synthesis_hash,
+        )
+        try:
+            validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+        except ValueError as exc:
+            raise _EditorialEnrichmentRebuildRequired(
+                str(getattr(exc, "code", "editorial_enrichment_validation_failed"))
+            ) from exc
+        canonical_payload = editorial_enrichment_to_json(enrichment)
 
         await self._mark_stages_stale(
             uow,
@@ -4407,23 +4476,25 @@ class ProductionRepairMaterializationService:
             subject_id=run.subject_id,
             stage=stage,
             version=version,
-            input_hash=input_hash,
+            input_hash=compute_input_hash(
+                {
+                    "policy": "editorial-enrichment-lineage-rebase-v1",
+                    "source_input_hash": current.input_hash,
+                    "extraction_hash": extraction_hash,
+                    "synthesis_hash": synthesis_hash,
+                }
+            ),
             status=ProductionArtifactStatus.VERIFIED,
-            raw_blob_id=None,
             canonical_blob_id=canonical_blob_id,
-            rendered_blob_id=None,
-            model_run_id=None,
-            conversation_turn_id=None,
+            reused_from_artifact_id=current.id,
             metadata={
-                "schema_version": enrichment.schema_version,
-                "policy_version": enrichment.enrichment_policy_version,
-                "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
-                "table_count": len(enrichment.tables),
-                "diagram_count": len(enrichment.diagrams),
-                "source_figure_count": len(enrichment.source_figures),
-                "warnings_count": len(enrichment.warnings),
-                "extraction_hash": enrichment.extraction_hash,
-                "synthesis_hash": enrichment.synthesis_hash,
+                **current.metadata,
+                "extraction_hash": extraction_hash,
+                "synthesis_hash": synthesis_hash,
+                "reused": True,
+                "reused_from_artifact_id": str(current.id),
+                "reused_from_created_at": current.created_at.isoformat(),
+                "lineage_rebased": True,
                 "input_artifacts": {
                     "extraction_artifact_id": str(extraction_artifact.id),
                     "synthesis_artifact_id": str(synthesis_artifact.id),

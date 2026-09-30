@@ -827,6 +827,35 @@ async def test_production_factory_builds_gemini_fail_closed_for_structured_outpu
         )
 
 
+async def test_production_factory_routes_editorial_enrichment_independently() -> None:
+    from typing import cast
+
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.config import Settings
+    from cti_app.integrations.model_factory import create_model_gateway
+
+    def no_persistence() -> Any:
+        raise AssertionError("Routing selection must not open a unit of work")
+
+    settings = Settings(
+        _env_file=None,
+        model_route_premium_synthesis="qwen",
+        model_route_editorial_enrichment="fake",
+    )
+    gateway = create_model_gateway(settings, cast(UnitOfWorkFactory, no_persistence))
+    editorial = request(
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
+    )
+    synthesis = request(
+        external_llm_allowed=True,
+        routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS,
+    )
+
+    assert gateway._router.select(editorial, ModelRole.DRAFTING).backend is ModelBackend.FAKE
+    assert gateway._router.select(synthesis, ModelRole.DRAFTING).backend is ModelBackend.QWEN
+
+
 async def test_bridge_detail_pre_submission_fails_without_reconciliation() -> None:
     calls = 0
 

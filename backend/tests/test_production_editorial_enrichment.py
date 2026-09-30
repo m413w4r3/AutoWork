@@ -7,7 +7,6 @@ import pytest
 
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentValidationError,
-    build_empty_editorial_enrichment,
     canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
@@ -59,6 +58,7 @@ from cti_app.domain.production_synthesis import (
     evidence_ref_sort_key,
     extraction_evidence_refs_v1,
 )
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
 _DOCUMENT_ID = UUID("b8f83b7b-7088-409a-9667-4f93758c18e1")
@@ -390,12 +390,15 @@ def test_builder_and_stage_hash_are_deterministic_and_bind_both_inputs() -> None
 
     assert built.extraction_hash == canonical_extraction_hash(extraction)
     assert built.synthesis_hash == canonical_synthesis_hash(synthesis)
-    first = compute_editorial_enrichment_input_hash(extraction=extraction, synthesis=synthesis)
+    hashes = {"evidence_pack_hash": "1" * 64, "access_policy_hash": "2" * 64}
+    first = compute_editorial_enrichment_input_hash(
+        extraction=extraction, synthesis=synthesis, **hashes
+    )
     assert first == compute_editorial_enrichment_input_hash(
-        extraction=extraction, synthesis=synthesis
+        extraction=extraction, synthesis=synthesis, **hashes
     )
 
     changed_synthesis = replace(synthesis, title="Changed title")
     assert first != compute_editorial_enrichment_input_hash(
-        extraction=extraction, synthesis=changed_synthesis
+        extraction=extraction, synthesis=changed_synthesis, **hashes
     )

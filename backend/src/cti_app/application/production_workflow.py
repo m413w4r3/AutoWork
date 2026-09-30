@@ -32,9 +32,9 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_context import build_subject_production_context
 from cti_app.application.production_editorial_enrichment import (
-    EditorialEnrichmentValidationError,
-    build_empty_editorial_enrichment,
-    compute_editorial_enrichment_input_hash,
+    EditorialEnrichmentExecutionStatus,
+    ProductionEditorialEnrichmentExecution,
+    ProductionEditorialEnrichmentService,
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import (
@@ -474,6 +474,9 @@ class ProductionWorkflowOrchestrator:
             else None
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
+        self._editorial_enrichment = EditorialEnrichmentService(
+            production_uow_factory, artifact_store
+        )
         self._artifact_reuse = ProductionArtifactReuseService(
             production_uow_factory, artifact_store, self._diagnostics
         )
@@ -486,6 +489,20 @@ class ProductionWorkflowOrchestrator:
                 artifact_store=artifact_store,
                 model_gateway=self._model_gateway,
                 synthesis_service=self._synthesis,
+                artifact_reuse=self._artifact_reuse,
+            )
+            if self._model_gateway is not None and artifact_store is not None
+            else None
+        )
+        # EDITORIAL_ENRICHMENT owns its evidence pack, access-policy checks,
+        # structured model call, canonical validation and reuse. The workflow
+        # only resolves the two upstream artifact identities and maps status.
+        self._canonical_editorial_enrichment: ProductionEditorialEnrichmentService | None = (
+            ProductionEditorialEnrichmentService(
+                uow_factory=production_uow_factory,
+                artifact_store=artifact_store,
+                model_gateway=self._model_gateway,
+                editorial_enrichment_service=self._editorial_enrichment,
                 artifact_reuse=self._artifact_reuse,
             )
             if self._model_gateway is not None and artifact_store is not None
@@ -1382,11 +1399,18 @@ class ProductionWorkflowOrchestrator:
         snapshot: ProductionInputSnapshot | None = None,
     ) -> dict[str, Any]:
         await self._check_cancellation(run.id, context)
-        if snapshot is None or self._artifact_store is None:
+        service = self._canonical_editorial_enrichment
+        if snapshot is None:
             return {
                 "stage": "editorial_enrichment",
                 "status": "terminal_error",
                 "error_code": "editorial_enrichment_inputs_missing",
+            }
+        if service is None:
+            return {
+                "stage": "editorial_enrichment",
+                "status": "terminal_error",
+                "error_code": "editorial_enrichment_service_unavailable",
             }
         async with self._uow_factory() as uow:
             extraction_artifact = await uow.production_artifacts.get_current(
@@ -1395,73 +1419,67 @@ class ProductionWorkflowOrchestrator:
             synthesis_artifact = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.SYNTHESIS.value
             )
-        if (
-            extraction_artifact is None
-            or synthesis_artifact is None
-            or extraction_artifact.canonical_blob_id is None
-            or synthesis_artifact.canonical_blob_id is None
-        ):
+        if extraction_artifact is None or synthesis_artifact is None:
             return {
                 "stage": "editorial_enrichment",
                 "status": "terminal_error",
                 "error_code": "editorial_enrichment_inputs_missing",
             }
         try:
-            extraction = production_extraction_from_json(
-                await self._artifact_store.read_json(extraction_artifact.canonical_blob_id)
+            execution = await service.execute(
+                run, snapshot, extraction_artifact, synthesis_artifact
             )
-            synthesis = production_synthesis_from_json(
-                await self._artifact_store.read_json(synthesis_artifact.canonical_blob_id)
-            )
-            if (
-                extraction.subject_id != snapshot.subject_id
-                or synthesis.subject_id != snapshot.subject_id
-                or extraction.production_input_hash != snapshot.input_hash
-                or synthesis.production_input_hash != snapshot.input_hash
-            ):
-                raise ValueError("editorial_enrichment_lineage_mismatch")
-            enrichment = build_empty_editorial_enrichment(
-                extraction=extraction, synthesis=synthesis
-            )
-            validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
-            input_hash = compute_editorial_enrichment_input_hash(
-                extraction=extraction, synthesis=synthesis
-            )
-            artifact = await EditorialEnrichmentService(
-                self._uow_factory, self._artifact_store
-            ).store_editorial_enrichment_result(
-                run_id=run.id,
-                subject_id=run.subject_id,
-                input_hash=input_hash,
-                enrichment=enrichment,
-                extraction=extraction,
-                synthesis=synthesis,
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            code = (
-                exc.code
-                if isinstance(exc, EditorialEnrichmentValidationError)
-                else (
-                    "editorial_enrichment_lineage_mismatch"
-                    if str(exc) == "editorial_enrichment_lineage_mismatch"
-                    else "editorial_enrichment_validation_failed"
-                )
-            )
-            return {
-                "stage": "editorial_enrichment",
-                "status": "terminal_error",
-                "error_code": code,
-                "details": str(exc),
-            }
+        except JobCancelledError:
+            raise
+        except Exception as exc:
+            await self._check_cancellation(run.id, context)
+            return self._handle_stage_exception(run, "editorial_enrichment", exc)
         await self._check_cancellation(run.id, context)
-        return {
+        return self._editorial_enrichment_execution_result(execution)
+
+    @staticmethod
+    def _editorial_enrichment_execution_result(
+        execution: ProductionEditorialEnrichmentExecution,
+    ) -> dict[str, Any]:
+        """Map the bounded canonical execution onto durable stage status."""
+        result: dict[str, Any] = {
             "stage": "editorial_enrichment",
-            "status": "success",
-            "artifact_id": str(artifact.id),
-            "tables": 0,
-            "diagrams": 0,
-            "source_figures": 0,
+            "input_hash": execution.input_hash,
+            "tables": execution.table_count,
+            "diagrams": execution.diagram_count,
+            "source_figures": execution.source_figure_count,
+            "model_calls": execution.model_calls,
         }
+        if execution.model_run_id is not None:
+            result["model_run_id"] = str(execution.model_run_id)
+        artifact = execution.artifact
+        if execution.status is EditorialEnrichmentExecutionStatus.SUCCEEDED and artifact:
+            result.update({"status": "success", "artifact_id": str(artifact.id), "reused": False})
+        elif execution.status is EditorialEnrichmentExecutionStatus.REUSED and artifact:
+            reused_from = artifact.reused_from_artifact_id
+            result.update(
+                {
+                    "status": "success",
+                    "artifact_id": str(artifact.id),
+                    # A same-run current artifact is served as-is (not cloned).
+                    "reused": bool((execution.details or {}).get("reused")),
+                    "reused_from_artifact_id": str(reused_from) if reused_from else None,
+                }
+            )
+        else:
+            result.update(
+                {
+                    "status": (
+                        "needs_review"
+                        if execution.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+                        else "terminal_error"
+                    ),
+                    "error_code": execution.error_code,
+                    "error": execution.error_message,
+                    "details": dict(execution.details or {}),
+                }
+            )
+        return result
 
     async def _execute_assembly_stage(
         self,

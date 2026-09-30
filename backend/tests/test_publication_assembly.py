@@ -7,12 +7,12 @@ from uuid import UUID
 import pytest
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_editorial_enrichment import build_empty_editorial_enrichment
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
+    _EditorialEnrichmentRebuildRequired,
 )
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_assembly import PublicationAssemblyService
@@ -35,6 +35,17 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
     ProductionRun,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
+    editorial_enrichment_from_json,
+    editorial_enrichment_to_json,
+)
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionFactV1,
@@ -55,6 +66,8 @@ from cti_app.domain.production_references import (
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
+    ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     extraction_evidence_refs_v1,
@@ -66,6 +79,7 @@ from cti_app.domain.publication import (
     PublicationAssemblyErrorCode,
     PublicationDocumentV3,
 )
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 
 def _canonical_inputs() -> tuple[
@@ -519,6 +533,27 @@ def test_confirmed_ioc_with_invalid_normalization_blocks_assembly() -> None:
         )
 
 
+def _enrichment_citing(
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    ref: ExtractionEvidenceRefV1,
+) -> EditorialEnrichmentV1:
+    return replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(
+            TableSpecV1(
+                key="observations",
+                kind=EnrichmentTableKind.CUSTOM,
+                title="Observations",
+                caption=None,
+                columns=(TableColumnV1("item", "Item"), TableColumnV1("note", "Note")),
+                rows=(TableRowV1(("Observed", "Reported by the source"), (ref,)),),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+            ),
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
     snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
@@ -563,15 +598,22 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
         ProductionArtifactStage.EXTRACTION, 1, production_extraction_to_json(extraction_a)
     )
     await artifact(ProductionArtifactStage.SYNTHESIS, 1, production_synthesis_to_json(synthesis_a))
+    fact_ref = next(
+        ref for ref in extraction_evidence_refs_v1(extraction_a) if ref.kind is EvidenceKind.FACT
+    )
+    enrichment_a = _enrichment_citing(extraction_a, synthesis_a, fact_ref)
+    enrichment_a_artifact = await artifact(
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        1,
+        editorial_enrichment_to_json(enrichment_a),
+    )
     publication_a = await service.assemble_publication(
         run=run,
         snapshot=snapshot,
         references=references,
         extraction=extraction_a,
         synthesis=synthesis_a,
-        editorial_enrichment=build_empty_editorial_enrichment(
-            extraction=extraction_a, synthesis=synthesis_a
-        ),
+        editorial_enrichment=enrichment_a,
     )
     extraction_b_artifact = await artifact(
         ProductionArtifactStage.EXTRACTION, 2, production_extraction_to_json(extraction_b)
@@ -616,6 +658,22 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
     assert len(syntheses) == 2
     assert syntheses[-1].reused_from_artifact_id == syntheses[0].id
     assert syntheses[-1].model_run_id is None
+    # The model-generated enrichment follows the repair verbatim: no model
+    # call, no artificial empty enrichment.
+    enrichments = [
+        row
+        for row in artifacts.appended
+        if row.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    ]
+    assert len(enrichments) == 2
+    assert enrichments[-1].reused_from_artifact_id == enrichment_a_artifact.id
+    assert enrichments[-1].metadata["lineage_rebased"] is True
+    assert enrichments[-1].canonical_blob_id is not None
+    rebased = editorial_enrichment_from_json(
+        await store.read_json(enrichments[-1].canonical_blob_id)
+    )
+    assert rebased.tables == enrichment_a.tables
+    assert rebased.extraction_hash == canonical_extraction_hash(extraction_b)
 
     extraction_c = replace(
         extraction_b,
@@ -635,6 +693,94 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
         len([row for row in artifacts.appended if row.stage is ProductionArtifactStage.PUBLICATION])
         == 2
     )
+
+
+@pytest.mark.asyncio
+async def test_ioc_repair_requires_enrichment_rebuild_when_cited_evidence_disappears() -> None:
+    snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
+    source = extraction_a.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="ioc.example",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="",
+        evidence_quote="The source identifies the domain.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction_b = replace(extraction_a, sources=(replace(source, indicators=(indicator,)),))
+    synthesis_b = replace(synthesis_a, extraction_hash=canonical_extraction_hash(extraction_b))
+    indicator_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction_b)
+        if ref.kind is EvidenceKind.INDICATOR
+    )
+    _service_unused, catalog, artifacts = _service()
+    store = ProductionArtifactStore(catalog)
+    run = _run(snapshot)
+
+    async def artifact(
+        stage: ProductionArtifactStage, version: int, payload: dict[str, object]
+    ) -> ProductionArtifact:
+        _, blob_id, _ = await store.store_stage_payloads(canonical=payload)
+        assert blob_id is not None
+        row = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=version,
+            input_hash=f"{version}" * 64,
+            canonical_blob_id=blob_id,
+        )
+        await artifacts.append(row)
+        return row
+
+    await artifact(
+        ProductionArtifactStage.REFERENCES, 1, production_reference_corpus_to_json(references)
+    )
+    await artifact(
+        ProductionArtifactStage.EXTRACTION, 1, production_extraction_to_json(extraction_b)
+    )
+    await artifact(ProductionArtifactStage.SYNTHESIS, 1, production_synthesis_to_json(synthesis_b))
+    await artifact(
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        1,
+        editorial_enrichment_to_json(_enrichment_citing(extraction_b, synthesis_b, indicator_ref)),
+    )
+    # The repair excludes the only indicator the enrichment table cites.
+    extraction_c_artifact = await artifact(
+        ProductionArtifactStage.EXTRACTION, 2, production_extraction_to_json(extraction_a)
+    )
+
+    class Snapshots:
+        async def get_by_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
+            return snapshot if run_id == run.id else None
+
+    uow = SimpleNamespace(
+        production_artifacts=artifacts,
+        production_input_snapshots=Snapshots(),
+    )
+    repair = ProductionRepairMaterializationService(
+        lambda: None,  # type: ignore[arg-type]
+        projection_service=object(),  # type: ignore[arg-type]
+        artifact_store=store,
+    )
+    with pytest.raises(_EditorialEnrichmentRebuildRequired) as raised:
+        await repair._materialize_canonical_publication_in_uow(
+            uow,
+            run=run,
+            extraction=extraction_c_artifact,
+            repair_materialization=None,
+        )
+    assert raised.value.code == "editorial_enrichment_evidence_missing"
+    assert [
+        row.version
+        for row in artifacts.appended
+        if row.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    ] == [1]
+    assert not [
+        row for row in artifacts.appended if row.stage is ProductionArtifactStage.PUBLICATION
+    ]
 
 
 @pytest.mark.parametrize(

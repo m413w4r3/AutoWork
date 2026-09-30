@@ -45,7 +45,7 @@ from cti_app.domain.production_extraction import (
 from cti_app.domain.production_synthesis import SynthesisSectionKind
 from cti_app.domain.publication import ArtifactType, PublicationDocumentV3
 
-from .support import ProductionScenario
+from .support import ProductionScenario, grounded_editorial_proposal
 
 pytestmark = pytest.mark.integration
 
@@ -200,6 +200,7 @@ async def test_complete_production_pipeline_reaches_ready(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
+    scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
     drafts = _install_canonical_synthesis(scenario)
     initial = await scenario.start()
     assert initial.status is ProductionRunStatus.RUNNING
@@ -308,17 +309,26 @@ async def test_complete_production_pipeline_reaches_ready(
         for call in scenario.model.provider_calls
         if call.prompt_template_id == "production-synthesis"
     ]
+    editorial_requests = [
+        call
+        for call in scenario.model.provider_calls
+        if call.prompt_template_id == "production-editorial-enrichment"
+    ]
     assert model_calls[0].stage == "references"
-    assert model_calls[-1].stage == "synthesis"
-    assert all(call.stage == "extraction" for call in model_calls[1:-1])
+    assert model_calls[-1].stage == "editorial_enrichment"
+    assert all(call.stage == "extraction" for call in model_calls[1:-2])
+    assert model_calls[-2].stage == "synthesis"
     # Canonical Synthesis is one stateless structured draft through the gateway.
     assert len(synthesis_requests) == 1
     assert synthesis_requests[0].web_search is False
     assert synthesis_requests[0].conversation is None
+    assert len(editorial_requests) == 1
+    assert editorial_requests[0].web_search is False
+    assert editorial_requests[0].conversation is None
     covered_q2_urls = tuple(url for call in q2_calls for url in call.source_urls)
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
-    assert len(model_calls) == 2 + len(q2_calls)
+    assert len(model_calls) == 3 + len(q2_calls)
     # Only the References stage searches the web; extraction and synthesis are
     # stateless and offline.
     assert all(call.web_search is (call.stage == "references") for call in model_calls)
@@ -347,6 +357,11 @@ async def test_complete_production_pipeline_reaches_ready(
         synthesis_payload = await scenario.artifact_store.read_json(
             synthesis_artifact.canonical_blob_id  # type: ignore[arg-type]
         )
+        editorial_artifact = by_stage[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+        assert editorial_artifact.model_run_id is not None
+        editorial_payload = await scenario.artifact_store.read_json(
+            editorial_artifact.canonical_blob_id  # type: ignore[arg-type]
+        )
         publication_payload = await scenario.artifact_store.read_json(
             by_stage[ProductionArtifactStage.PUBLICATION].canonical_blob_id  # type: ignore[arg-type]
         )
@@ -354,6 +369,9 @@ async def test_complete_production_pipeline_reaches_ready(
     assert all(model_run is not None for model_run in model_runs.values())
     assert all(model_run.status is ModelRunStatus.SUCCEEDED for model_run in model_runs.values())
     assert all(model_run.raw_output_sha256 for model_run in model_runs.values())
+    assert editorial_payload["source_figures"] == []
+    assert len(editorial_payload["tables"]) == 1
+    assert len(editorial_payload["diagrams"]) == 1
     assert model_calls[0].model_run_id == by_stage[ProductionArtifactStage.REFERENCES].model_run_id
     assert len(references_payload["sources"]) == 2
     assert {source["canonical_url"] for source in references_payload["sources"]} == set(SOURCE_URLS)
@@ -378,7 +396,12 @@ async def test_complete_production_pipeline_reaches_ready(
             rows = await uow.source_extractions.list_for_url(source["canonical_url"])
             row = next(row for row in rows if str(row.id) == source["checkpoint_id"])
             checkpoint_runs.add(row.model_run_id)
-    assert checkpoint_runs == {call.model_run_id for call in q2_calls}
+        checkpoint_model_runs = [await uow.model_runs.get(run_id) for run_id in checkpoint_runs]
+    assert len(checkpoint_runs) == len(extraction_payload["sources"])
+    assert all(
+        model_run is not None and model_run.status is ModelRunStatus.SUCCEEDED
+        for model_run in checkpoint_model_runs
+    )
     assert "core-c2.security-lab.io" in synthesis_text
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)

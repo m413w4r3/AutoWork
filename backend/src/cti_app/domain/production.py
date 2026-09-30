@@ -994,7 +994,7 @@ class ProductionRun:
                 ProductionStage.REFERENCES: ProductionStage.REFERENCES,
                 ProductionStage.EXTRACTION: ProductionStage.EXTRACTION,
                 ProductionStage.SYNTHESIS: ProductionStage.SYNTHESIS,
-                ProductionStage.EDITORIAL_ENRICHMENT: None,
+                ProductionStage.EDITORIAL_ENRICHMENT: ProductionStage.EDITORIAL_ENRICHMENT,
                 ProductionStage.ASSEMBLY: None,
             }[stage]
         else:

@@ -560,8 +560,8 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     assert plan.previous_status is ProductionRunStatus.CANCELLED
     assert plan.resume_from_stage is ProductionStage.EXTRACTION
     assert plan.reused_artifacts == ("references",)
-    # Two sources still owe a Q2 answer, and Q4 owes one call.
-    assert plan.model_calls_expected == 3
+    # Two sources still owe Q2, Q4 owes synthesis, and enrichment may draft once.
+    assert plan.model_calls_expected == 4
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
         ProductionStage.SYNTHESIS,
@@ -592,7 +592,7 @@ async def test_cancel_after_extraction_never_replays_extraction(
 
     assert resumed.plan.resume_from_stage is ProductionStage.SYNTHESIS
     assert resumed.plan.reused_artifacts == ("references", "extraction")
-    assert resumed.plan.model_calls_expected == 1
+    assert resumed.plan.model_calls_expected == 2
     assert orchestrator.calls == [
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
@@ -621,7 +621,7 @@ async def test_cancel_after_synthesis_runs_enrichment_then_assembles(
 
     assert resumed.plan.resume_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
     assert resumed.plan.reused_artifacts == ("references", "extraction", "synthesis")
-    assert resumed.plan.model_calls_expected == 0
+    assert resumed.plan.model_calls_expected == 1
     assert orchestrator.calls == [
         ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
@@ -641,8 +641,8 @@ async def test_cancel_before_references_resumes_the_first_model_stage(
 
     assert resumed.plan.resume_from_stage is ProductionStage.REFERENCES
     assert resumed.plan.reused_artifacts == ()
-    # Q1, then one Q2 call per archived source, then Q4.
-    assert resumed.plan.model_calls_expected == 1 + len(SOURCE_IDS) + 1
+    # Q1, Q2 per archived source, Q4 synthesis, then one enrichment draft.
+    assert resumed.plan.model_calls_expected == 1 + len(SOURCE_IDS) + 2
     assert orchestrator.calls[0] is ProductionStage.REFERENCES
     assert world.run.status is ProductionRunStatus.READY
 
@@ -834,7 +834,7 @@ async def test_the_log_payload_names_exactly_the_documented_fields() -> None:
         "previous_status": "cancelled",
         "resume_from_stage": "synthesis",
         "reused_artifacts": ["references", "extraction"],
-        "model_calls_expected": 1,
+        "model_calls_expected": 2,
     }
 
 
