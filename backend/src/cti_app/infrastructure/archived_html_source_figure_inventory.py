@@ -6,13 +6,16 @@ import hashlib
 from html.parser import HTMLParser
 
 from cti_app.application.source_figure_inventory import (
-    _PATH_SCHEME,
     ArchivedSourceDocumentSnapshot,
     SourceFigureInventory,
     SourceFigureInventoryError,
     UnsupportedSourceFigureFormatError,
-    _normalize_archive_path,
+    is_external_reference,
+    normalize_archive_path,
 )
+
+# HTML URL parsing strips leading and trailing ASCII whitespace from attribute values.
+_HTML_WHITESPACE = "\t\n\f\r "
 from cti_app.domain.production_source_figures import (
     SourceFigureCandidateV1,
     SourceFigureOriginKind,
@@ -29,10 +32,14 @@ class _ImageOccurrenceParser(HTMLParser):
         if tag != "img":
             return
 
-        attributes = {name: value for name, value in attrs}
+        # HTML keeps the first occurrence of a duplicated attribute.
+        attributes: dict[str, str | None] = {}
+        for name, value in attrs:
+            attributes.setdefault(name, value)
+        src = attributes.get("src")
         self.occurrences.append(
             (
-                attributes.get("src"),
+                src.strip(_HTML_WHITESPACE) if src is not None else None,
                 attributes.get("alt"),
                 attributes.get("title"),
                 len(self.occurrences),
@@ -65,11 +72,11 @@ class ArchivedHtmlSourceFigureInventory(SourceFigureInventory):
         assets_by_path = {asset.path: asset for asset in source.local_assets}
         candidates: list[SourceFigureCandidateV1] = []
         for locator, alt_text, title_text, occurrence_index in parser.occurrences:
-            if not locator or _PATH_SCHEME.match(locator):
+            if not locator or is_external_reference(locator):
                 continue
 
             try:
-                archive_path = _normalize_archive_path(locator)
+                archive_path = normalize_archive_path(locator)
             except ValueError as exc:
                 raise SourceFigureInventoryError(
                     "Archived HTML image src is not a safe archive-relative path"

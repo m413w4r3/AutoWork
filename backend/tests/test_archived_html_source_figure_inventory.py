@@ -105,6 +105,8 @@ async def test_remote_and_scheme_references_are_ignored() -> None:
         '<img src="data:image/png;base64,AA==">'
         '<img src="file:///tmp/c.png">'
         '<img src="custom:value">'
+        '<img src="//cdn.example.test/d.png">'
+        '<img src=" https://example.test/e.png ">'
         '<img src=""><img src="local.png">',
         _asset("local.png"),
     )
@@ -114,7 +116,19 @@ async def test_remote_and_scheme_references_are_ignored() -> None:
     assert len(candidates) == 1
     assert candidates[0].key == "figure-001"
     assert candidates[0].provenance.source_locator == "local.png"
-    assert candidates[0].provenance.occurrence_index == 6
+    assert candidates[0].provenance.occurrence_index == 8
+
+
+@pytest.mark.asyncio
+async def test_src_whitespace_is_stripped_and_first_duplicate_attribute_wins() -> None:
+    source = _source(
+        '<img src="\n images/a.png\t" src="images/other.png">',
+        _asset("images/a.png"),
+    )
+
+    (candidate,) = await ArchivedHtmlSourceFigureInventory().inventory(source)
+
+    assert candidate.provenance.source_locator == "images/a.png"
 
 
 @pytest.mark.asyncio

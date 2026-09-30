@@ -14,7 +14,13 @@ _PATH_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _IMAGE_MEDIA_TYPE = re.compile(r"^image/[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
 
 
-def _normalize_archive_path(path: str) -> str:
+def is_external_reference(locator: str) -> bool:
+    """Return whether a locator names a resource outside the archived snapshot."""
+    portable_locator = locator.replace("\\", "/")
+    return portable_locator.startswith("//") or _PATH_SCHEME.match(portable_locator) is not None
+
+
+def normalize_archive_path(path: str) -> str:
     if not isinstance(path, str) or not path:
         raise ValueError("Archived source asset path must be a non-empty string")
 
@@ -39,7 +45,7 @@ class ArchivedSourceAsset:
     content: bytes
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "path", _normalize_archive_path(self.path))
+        object.__setattr__(self, "path", normalize_archive_path(self.path))
         if not isinstance(self.media_type, str) or not _IMAGE_MEDIA_TYPE.fullmatch(self.media_type):
             raise ValueError("Archived source asset media type must be an image MIME type")
         if not isinstance(self.content, bytes) or not self.content:
