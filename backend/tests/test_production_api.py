@@ -25,13 +25,13 @@ from cti_app.api import production as production_api
 from cti_app.api.production import router
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.production_parsers import technical_extraction_from_json
 from cti_app.application.production_read_model import BatchStatusItem
 from cti_app.application.production_reconciliation_resolver import ReconciliationOutcome
 from cti_app.application.production_state import (
-    ProductionStateSnapshotV4,
+    ProductionStateSnapshotV5,
     compute_production_state_checksum,
 )
+from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -63,6 +63,7 @@ from cti_app.domain.production_pipeline import (
 from cti_app.domain.selection import SubjectDiscoveryOrigin
 from cti_app.integrations.models import BridgeTransportError
 from cti_app.logging import CorrelationIdMiddleware
+from tests.test_production_state import canonical_production_state_artifacts
 
 
 def _origin(edition_id: UUID, subject_id: UUID) -> SubjectDiscoveryOrigin:
@@ -1523,66 +1524,47 @@ def _artifact(run: ProductionRun, stage: ProductionArtifactStage) -> ProductionA
     )
 
 
-def _state_payload() -> dict[str, Any]:
+def _state_payload(
+    subject_id: UUID | None = None,
+    *,
+    production_input_hash: str = "a" * 64,
+    subject_title: str = "TAG-182",
+    research_date: date = date(2026, 8, 26),
+    discovery_snapshot_id: UUID | None = None,
+    discovery_snapshot_version: int = 1,
+) -> dict[str, Any]:
+    subject_id = subject_id or uuid4()
+    canonical = canonical_production_state_artifacts(subject_id, production_input_hash)
     payload: dict[str, Any] = {
         "format": "autowork.production-state",
-        "schema_version": 4,
+        "schema_version": 5,
         "exported_at": "2026-08-26T15:00:00Z",
         "origin": {
-            "subject_title": "TAG-182",
-            "subject_id": str(uuid4()),
+            "subject_title": subject_title,
+            "subject_id": str(subject_id),
             "production_run_id": str(uuid4()),
-            "research_date": "2026-08-26",
-            "discovery_snapshot_id": str(uuid4()),
-            "discovery_snapshot_version": 1,
+            "research_date": research_date.isoformat(),
+            "discovery_snapshot_id": str(discovery_snapshot_id or uuid4()),
+            "discovery_snapshot_version": discovery_snapshot_version,
         },
         "artifacts": {
             "references": {
-                "input_hash": "a" * 64,
-                "canonical_content": {
-                    "sources": [
-                        {
-                            "id": "S1",
-                            "title": "Source",
-                            "url": "https://example.test/source",
-                            "canonical_url": "https://example.test/source",
-                        }
-                    ],
-                    "events": [],
-                },
+                "input_hash": "c" * 64,
+                "canonical_content": canonical["references"],
             },
             "extraction": {
-                "input_hash": "b" * 64,
-                "canonical_content": {
-                    "schema_version": "2",
-                    "parser_version": "production-markdown-v2",
-                    "items": [
-                        {
-                            "id": "I1",
-                            "category": "infrastructure",
-                            "value": "evil.example",
-                            "context": "observed",
-                            "artifact_type": "domain",
-                            "semantic_type": "indicator",
-                            "indicator_status": "confirmed_ioc",
-                            "provenance": "source",
-                            "display_policy": "ioc_section",
-                            "normalized_value": "evil.example",
-                            "evidence_quote": "evil.example",
-                            "attack_id": None,
-                            "reference_ids": [],
-                            "source_ids": ["S1"],
-                            "supported": True,
-                        }
-                    ],
-                    "uncertainties": [],
-                },
+                "input_hash": "d" * 64,
+                "canonical_content": canonical["extraction"],
             },
-            "synthesis": {"input_hash": "c" * 64, "rendered_content": "Fait [S1]"},
+            "synthesis": {"input_hash": "e" * 64, "canonical_content": canonical["synthesis"]},
+            "editorial_enrichment": {
+                "input_hash": "f" * 64,
+                "canonical_content": canonical["editorial_enrichment"],
+            },
         },
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV4.model_validate(payload)
+    snapshot = ProductionStateSnapshotV5.model_validate(payload)
     payload["content_sha256"] = compute_production_state_checksum(snapshot)
     return payload
 
@@ -1593,49 +1575,58 @@ async def _seed_exportable_run(
     run = _terminal_run(edition_id, subject_id, status=ProductionRunStatus.NEEDS_REVIEW)
     run.current_stage = ProductionStage.ASSEMBLY
     await uow.production_runs.add(run)
-    await uow.production_input_snapshots.add(
-        SimpleNamespace(
-            production_run_id=run.id,
-            subject_id=subject_id,
-            subject_title=uow.subjects.items[subject_id].title,
-            research_date=date(2026, 8, 26),
-            discovery_snapshot_id=uuid4(),
-            discovery_snapshot_version=7,
-        )
+    input_snapshot = await capture_production_input_snapshot(
+        uow,
+        production_run_id=run.id,
+        subject_id=subject_id,
+        edition_id=edition_id,
+        research_date=date(2026, 8, 26),
+        captured_at=run.created_at,
     )
-    payload = _state_payload()
+    await uow.production_input_snapshots.add(input_snapshot)
+    payload = _state_payload(
+        subject_id,
+        production_input_hash=input_snapshot.input_hash,
+        subject_title=input_snapshot.subject_title,
+        research_date=input_snapshot.research_date,
+        discovery_snapshot_id=input_snapshot.discovery_snapshot_id,
+        discovery_snapshot_version=input_snapshot.discovery_snapshot_version,
+    )
     artifacts = payload["artifacts"]
     assert isinstance(artifacts, dict)
-    refs = artifacts["references"]
-    extraction = artifacts["extraction"]
-    synthesis = artifacts["synthesis"]
-    assert isinstance(refs, dict) and isinstance(extraction, dict) and isinstance(synthesis, dict)
-    _, refs_blob, _ = await store.store_stage_payloads(canonical=refs["canonical_content"])
-    extraction_raw, extraction_blob, _ = await store.store_stage_payloads(
-        raw="SECRET_RAW_MODEL_OUTPUT_SENTINEL", canonical=extraction["canonical_content"]
-    )
-    _, _, synthesis_blob = await store.store_stage_payloads(rendered=synthesis["rendered_content"])
-    for stage, input_hash, canonical_blob_id, rendered_blob_id in (
-        (ProductionArtifactStage.REFERENCES, refs["input_hash"], refs_blob, None),
-        (ProductionArtifactStage.EXTRACTION, extraction["input_hash"], extraction_blob, None),
-        (ProductionArtifactStage.SYNTHESIS, synthesis["input_hash"], None, synthesis_blob),
+    for stage_name, stage in (
+        ("references", ProductionArtifactStage.REFERENCES),
+        ("extraction", ProductionArtifactStage.EXTRACTION),
+        ("synthesis", ProductionArtifactStage.SYNTHESIS),
+        ("editorial_enrichment", ProductionArtifactStage.EDITORIAL_ENRICHMENT),
     ):
+        stage_payload = artifacts[stage_name]
+        assert isinstance(stage_payload, dict)
+        raw = (
+            "SECRET_RAW_MODEL_OUTPUT_SENTINEL"
+            if stage is ProductionArtifactStage.EXTRACTION
+            else None
+        )
+        raw_blob, canonical_blob_id, _ = await store.store_stage_payloads(
+            raw=raw,
+            canonical=stage_payload["canonical_content"],
+        )
         await uow.production_artifacts.append(
             ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=subject_id,
                 stage=stage,
                 version=1,
-                input_hash=input_hash,
+                input_hash=stage_payload["input_hash"],
+                status=ProductionArtifactStatus.VERIFIED,
                 canonical_blob_id=canonical_blob_id,
-                rendered_blob_id=rendered_blob_id,
-                raw_blob_id=extraction_raw if stage is ProductionArtifactStage.EXTRACTION else None,
+                raw_blob_id=raw_blob,
             )
         )
     return run
 
 
-async def test_production_state_export_import_is_transparent(
+async def test_imported_v5_state_is_directly_assemblable(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
@@ -1648,60 +1639,53 @@ async def test_production_state_export_import_is_transparent(
     assert exported.status_code == 200, exported.text
     snapshot = exported.json()
     assert snapshot["format"] == "autowork.production-state"
-    assert snapshot["schema_version"] == 4
+    assert snapshot["schema_version"] == 5
     assert snapshot["origin"]["subject_title"] == "Canonical export title"
     input_snapshot = uow.production_input_snapshots.items[run.id]
     assert snapshot["origin"]["subject_id"] == str(subject_id)
     assert snapshot["origin"]["production_run_id"] == str(run.id)
     assert snapshot["origin"]["discovery_snapshot_id"] == str(input_snapshot.discovery_snapshot_id)
-    assert snapshot["origin"]["discovery_snapshot_version"] == 7
+    assert (
+        snapshot["origin"]["discovery_snapshot_version"]
+        == input_snapshot.discovery_snapshot_version
+    )
     # A run with no repair projection exports an explicitly empty audit block.
     assert snapshot["repair"] is None
     assert snapshot["content_sha256"]
-    assert snapshot["artifacts"]["references"]["canonical_content"]["sources"][0]["id"] == "S1"
+    assert snapshot["artifacts"]["references"]["canonical_content"]["schema_version"] == 1
     assert (
-        snapshot["artifacts"]["extraction"]["canonical_content"]["items"][0]["value"]
-        == "evil.example"
+        snapshot["artifacts"]["extraction"]["canonical_content"]["sources"][0]["facts"][0]["value"]
+        == "ExampleRAT"
     )
-    assert snapshot["artifacts"]["synthesis"]["rendered_content"] == "Fait [S1]"
-
-    imported_subject = uuid4()
-    _select(uow, edition_id, "TAG-182", imported_subject)
-    imported_edition_id = uuid4()
-    uow.subjects.items[imported_subject] = dataclasses.replace(
-        uow.subjects.items[imported_subject], edition_id=imported_edition_id
-    )
-    imported_origin = await uow.subject_discovery_origins.get_by_subject(imported_subject)
-    assert imported_origin is not None
-    imported_origin_index = uow.subject_discovery_origins.items.index(imported_origin)
-    uow.subject_discovery_origins.items[imported_origin_index] = dataclasses.replace(
-        imported_origin, edition_id=imported_edition_id
-    )
-    # The imported subject freezes its own inputs, so its edition needs the
-    # same discovery lineage the selected subject had.
-    uow.discovery_lineage.register(imported_edition_id, imported_origin.discovery_subject_id)
+    assert snapshot["artifacts"]["synthesis"]["canonical_content"]["title"] == "Example report"
+    assert "canonical_content" in snapshot["artifacts"]["editorial_enrichment"]
     submitted = len(production_app.state.job_service.submitted)
-    imported = await api.post(
-        f"/api/subjects/{imported_subject}/production/state/import", json=snapshot
-    )
+    imported = await api.post(f"/api/subjects/{subject_id}/production/state/import", json=snapshot)
     assert imported.status_code == 200, imported.text
     assert imported.json()["status"] == "needs_review"
     assert imported.json()["current_stage"] == "assembly"
-    assert imported.json()["imported_stages"] == ["references", "extraction", "synthesis"]
+    assert imported.json()["imported_stages"] == [
+        "references",
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+    ]
     assert len(production_app.state.job_service.submitted) == submitted
     assert not uow.analyst_investigations.items
     assert not uow.analyst_input_packs.items
 
-    production = await api.get(f"/api/subjects/{imported_subject}/production")
+    production = await api.get(f"/api/subjects/{subject_id}/production")
     assert production.json()["status"] == "needs_review"
     assert production.json()["current_stage"] == "assembly"
     assert production.json()["stages"]["references"]["status"] == "succeeded"
     assert production.json()["stages"]["extraction"]["status"] == "succeeded"
     assert production.json()["stages"]["synthesis"]["status"] == "succeeded"
+    assert production.json()["stages"]["editorial_enrichment"]["status"] == "succeeded"
     assert production.json()["stages"]["assembly"]["status"] == "needs_review"
     imported_artifacts: dict[str, dict[str, Any]] = {}
-    for stage in ("references", "extraction", "synthesis"):
-        artifact = await api.get(f"/api/subjects/{imported_subject}/production/artifacts/{stage}")
+    for stage in ("references", "extraction", "synthesis", "editorial_enrichment"):
+        artifact = await api.get(f"/api/subjects/{subject_id}/production/artifacts/{stage}")
+        assert artifact.status_code == 200, f"{stage}: {artifact.text}"
         assert artifact.json()["stage"] == stage
         assert artifact.json()["status"] == "verified"
         imported_artifacts[stage] = artifact.json()
@@ -1714,36 +1698,54 @@ async def test_production_state_export_import_is_transparent(
         == snapshot["artifacts"]["extraction"]["canonical_content"]
     )
     assert (
-        imported_artifacts["synthesis"]["rendered_content"]
-        == snapshot["artifacts"]["synthesis"]["rendered_content"]
+        imported_artifacts["synthesis"]["canonical_content"]
+        == snapshot["artifacts"]["synthesis"]["canonical_content"]
+    )
+    assert (
+        imported_artifacts["editorial_enrichment"]["canonical_content"]
+        == snapshot["artifacts"]["editorial_enrichment"]["canonical_content"]
     )
     assert run.id != UUID(imported.json()["run_id"])
 
-    imported_run = await uow.production_runs.get_current_for_subject(imported_subject)
+    imported_run = await uow.production_runs.get_current_for_subject(subject_id)
     assert imported_run is not None
-    assert imported_run.edition_id == imported_edition_id
+    assert imported_run.edition_id == edition_id
+    imported_enrichment = await uow.production_artifacts.get_current(
+        imported_run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+    )
+    assert imported_enrichment is not None
+    assert imported_enrichment.status is ProductionArtifactStatus.VERIFIED
+    assert imported_enrichment.canonical_blob_id is not None
+    assert (
+        await store.read_json(imported_enrichment.canonical_blob_id)
+        == snapshot["artifacts"]["editorial_enrichment"]["canonical_content"]
+    )
     extraction_artifact = await uow.production_artifacts.get_current(imported_run.id, "extraction")
     assert extraction_artifact is not None and extraction_artifact.canonical_blob_id is not None
     restored = await store.read_json(extraction_artifact.canonical_blob_id)
-    extraction_document = technical_extraction_from_json(restored)
-    assert [item.value for item in extraction_document.items] == ["evil.example"]
-    assert extraction_document.items[0].supported is True
+    assert restored == snapshot["artifacts"]["extraction"]["canonical_content"]
+
+    assembly_retry = await api.post(
+        f"/api/subjects/{subject_id}/production/retry", json={"stage": "assembly"}
+    )
+    assert assembly_retry.status_code == 200, assembly_retry.text
+    assert assembly_retry.json()["requested_stage"] == "assembly"
+    assert production_app.state.job_service.submitted[-1]["kind"] == "production.subject.assemble"
 
 
 async def test_production_state_import_has_no_generation_side_effects(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
-    edition_id, source_id, target_id = uuid4(), uuid4(), uuid4()
-    _select(uow, edition_id, "Source", source_id)
-    _select(uow, edition_id, "Target", target_id)
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Subject", subject_id)
     await _seed_exportable_run(
-        uow, production_app.state.production_artifact_store, edition_id, source_id
+        uow, production_app.state.production_artifact_store, edition_id, subject_id
     )
-    snapshot = (await api.get(f"/api/subjects/{source_id}/production/state/export")).json()
+    snapshot = (await api.get(f"/api/subjects/{subject_id}/production/state/export")).json()
     jobs = production_app.state.job_service
     before_jobs = len(jobs.submitted)
     before_runs = len(uow.production_runs.items)
-    response = await api.post(f"/api/subjects/{target_id}/production/state/import", json=snapshot)
+    response = await api.post(f"/api/subjects/{subject_id}/production/state/import", json=snapshot)
     assert response.status_code == 200
     assert len(jobs.submitted) == before_jobs
     assert len(uow.production_runs.items) == before_runs + 1
@@ -1752,21 +1754,21 @@ async def test_production_state_import_has_no_generation_side_effects(
 async def test_production_state_export_import_export_preserves_business_content(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
-    edition_id, source_id, target_id = uuid4(), uuid4(), uuid4()
-    _select(uow, edition_id, "Source", source_id)
-    _select(uow, edition_id, "Target", target_id)
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Subject", subject_id)
     await _seed_exportable_run(
-        uow, production_app.state.production_artifact_store, edition_id, source_id
+        uow, production_app.state.production_artifact_store, edition_id, subject_id
     )
-    first = (await api.get(f"/api/subjects/{source_id}/production/state/export")).json()
+    first = (await api.get(f"/api/subjects/{subject_id}/production/state/export")).json()
     assert (
-        await api.post(f"/api/subjects/{target_id}/production/state/import", json=first)
+        await api.post(f"/api/subjects/{subject_id}/production/state/import", json=first)
     ).status_code == 200
-    second = (await api.get(f"/api/subjects/{target_id}/production/state/export")).json()
+    second = (await api.get(f"/api/subjects/{subject_id}/production/state/export")).json()
     for stage, field in (
         ("references", "canonical_content"),
         ("extraction", "canonical_content"),
-        ("synthesis", "rendered_content"),
+        ("synthesis", "canonical_content"),
+        ("editorial_enrichment", "canonical_content"),
     ):
         assert second["artifacts"][stage][field] == first["artifacts"][stage][field]
 
@@ -1794,7 +1796,7 @@ async def test_production_state_import_keeps_history_and_previous_artifacts(
     )
     for run_id in imported_ids:
         artifacts = await uow.production_artifacts.list_for_run(run_id)
-        assert len(artifacts) == 3
+        assert len(artifacts) == 4
         assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
     original_artifacts = await uow.production_artifacts.list_for_run(original.id)
     assert all(
@@ -1815,11 +1817,7 @@ async def test_production_state_export_excludes_foreign_ids_and_raw_output(
         for a in uow.production_artifacts.items
         if a.production_run_id == run.id and a.stage is ProductionArtifactStage.EXTRACTION
     )
-    extraction_content = production_app.state.production_artifact_store.payloads[
-        extraction.canonical_blob_id
-    ]
-    assert isinstance(extraction_content, dict)
-    extraction_content["items"][0]["model_run_ids"] = [str(uuid4())]
+    extraction.metadata["model_run_ids"] = [str(uuid4())]
     snapshot = (await api.get(f"/api/subjects/{subject_id}/production/state/export")).json()
     serialized = json.dumps(snapshot)
     # The run id is part of the V4 provenance block; artifact and blob ids

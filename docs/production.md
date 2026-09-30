@@ -108,8 +108,12 @@ réutilisé ne porte donc pas d’identité de `ProductionRun`.
 
 Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
 production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
-La projection historique `ReferenceReport` reste confinée aux imports V4 et à certaines fonctions
-du Repair Desk. Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT
+La projection historique `ReferenceReport` reste confinée à certaines fonctions du Repair Desk.
+Le Production State V5 transporte les quatre artefacts canoniques vérifiés avant Assembly :
+`ProductionReferenceCorpusV1`, `ProductionExtractionV1`, `ProductionSynthesisV1` et
+`EditorialEnrichmentV1`. L’import restaure ces artefacts puis place le run en revue à `ASSEMBLY` ;
+son retry reconstruit `PUBLICATION` et exécute la QA sans rejouer les étapes antérieures.
+Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT
 → ASSEMBLY lit directement
 les contrats canoniques et n'utilise plus les `EVENT` Q1 comme identité de publication.
 

@@ -847,9 +847,9 @@ export interface ProductionStateRepair {
   materialization: Record<string, unknown> | null;
 }
 
-export interface ProductionStateSnapshotV4 {
+export interface ProductionStateSnapshotV5 {
   format: "autowork.production-state";
-  schema_version: 4;
+  schema_version: 5;
   exported_at: string;
   origin: {
     subject_title: string;
@@ -866,25 +866,34 @@ export interface ProductionStateSnapshotV4 {
     };
     extraction: {
       input_hash: string;
-      canonical_content: ExtractionDocumentV2;
+      canonical_content: Record<string, unknown>;
     };
     synthesis: {
       input_hash: string;
-      rendered_content: string;
+      canonical_content: Record<string, unknown>;
+    };
+    editorial_enrichment: {
+      input_hash: string;
+      canonical_content: Record<string, unknown>;
     };
   };
   repair?: ProductionStateRepair | null;
   content_sha256: string;
 }
 
-export type ProductionStateSnapshot = ProductionStateSnapshotV4;
+export type ProductionStateSnapshot = ProductionStateSnapshotV5;
 
 export interface ProductionStateImportResult {
   run_id: string;
   status: "needs_review";
   current_stage: "assembly";
-  imported_stages: ["references", "extraction", "synthesis"];
-  schema_version: 4;
+  imported_stages: [
+    "references",
+    "extraction",
+    "synthesis",
+    "editorial_enrichment",
+  ];
+  schema_version: 5;
   content_sha256: string;
 }
 
@@ -1025,7 +1034,7 @@ export async function getSubjectProductionRuns(
 
 export async function exportProductionState(
   subjectId: string,
-): Promise<ProductionStateSnapshotV4> {
+): Promise<ProductionStateSnapshotV5> {
   return request(`/api/subjects/${subjectId}/production/state/export`);
 }
 

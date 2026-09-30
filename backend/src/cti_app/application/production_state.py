@@ -1,7 +1,7 @@
 """Portable export and import of verified publication production state.
 
 Blob ingestion necessarily precedes the SQL transaction that references the
-three new immutable payloads. If that transaction fails, the content-addressed
+four new immutable payloads. If that transaction fails, the content-addressed
 catalog may retain unreferenced, safely deduplicated blobs; operators can
 reclaim them with the existing ``delete_unreferenced`` operation.
 """
@@ -13,7 +13,7 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, date, datetime
 from typing import Any, Literal, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -23,26 +23,15 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
 )
 from cti_app.application.production_batch_repointing import _repoint_batch_item
-from cti_app.application.production_extraction import (
-    extraction_compatibility_view,
-    legacy_technical_extraction_from_payload,
+from cti_app.application.production_editorial_enrichment import (
+    validate_editorial_enrichment,
 )
-from cti_app.application.production_legacy_assembly import assembly_synthesis_text
-from cti_app.application.production_parsers import (
-    ParseResult,
-    ReferenceReport,
-    TechnicalExtraction,
-    reference_report_from_json,
-    reference_report_to_json,
-    technical_extraction_to_json,
-    validate_synthesis,
-)
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import (
-    load_legacy_reference_report,
     production_reference_corpus_from_json,
-    report_source_labels,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,
@@ -56,10 +45,23 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentV1,
+    editorial_enrichment_from_json,
+)
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_from_json,
+)
+from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
+    production_synthesis_from_json,
+)
 
 PRODUCTION_STATE_FORMAT = "autowork.production-state"
-PRODUCTION_STATE_SCHEMA_VERSION = 4
-PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset({4})
+PRODUCTION_STATE_SCHEMA_VERSION = 5
+PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS = frozenset({5})
 MAX_PRODUCTION_STATE_BYTES = 16 * 1024 * 1024
 IMPORTED_RUN_ERROR_CODE = "imported_production_state"
 
@@ -87,7 +89,7 @@ class ProductionStateError(ValueError):
         super().__init__(message)
 
 
-class ProductionStateOriginV4(BaseModel):
+class ProductionStateOriginV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     subject_title: str
@@ -98,33 +100,41 @@ class ProductionStateOriginV4(BaseModel):
     discovery_snapshot_version: int = Field(ge=1)
 
 
-class ProductionStateReferences(BaseModel):
+class ProductionStateReferencesV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_hash: str = Field(pattern=_HASH)
     canonical_content: dict[str, Any]
 
 
-class ProductionStateExtraction(BaseModel):
+class ProductionStateExtractionV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_hash: str = Field(pattern=_HASH)
     canonical_content: dict[str, Any]
 
 
-class ProductionStateSynthesis(BaseModel):
+class ProductionStateSynthesisV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     input_hash: str = Field(pattern=_HASH)
-    rendered_content: str = Field(min_length=1)
+    canonical_content: dict[str, Any]
 
 
-class ProductionStateArtifacts(BaseModel):
+class ProductionStateEditorialEnrichmentV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    references: ProductionStateReferences
-    extraction: ProductionStateExtraction
-    synthesis: ProductionStateSynthesis
+    input_hash: str = Field(pattern=_HASH)
+    canonical_content: dict[str, Any]
+
+
+class ProductionStateArtifactsV5(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    references: ProductionStateReferencesV5
+    extraction: ProductionStateExtractionV5
+    synthesis: ProductionStateSynthesisV5
+    editorial_enrichment: ProductionStateEditorialEnrichmentV5
 
 
 class ProductionStateRepairDecision(BaseModel):
@@ -163,14 +173,14 @@ class ProductionStateRepair(BaseModel):
     materialization: dict[str, Any] | None = None
 
 
-class ProductionStateSnapshotV4(BaseModel):
+class ProductionStateSnapshotV5(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     format: Literal["autowork.production-state"]
-    schema_version: Literal[4]
+    schema_version: Literal[5]
     exported_at: datetime
-    origin: ProductionStateOriginV4
-    artifacts: ProductionStateArtifacts
+    origin: ProductionStateOriginV5
+    artifacts: ProductionStateArtifactsV5
     # Absent when the run carries no repair projection at all.
     repair: ProductionStateRepair | None = None
     content_sha256: str = Field(pattern=_HASH)
@@ -189,8 +199,13 @@ class ProductionStateImportResult(BaseModel):
     run_id: UUID
     status: Literal["needs_review", "running"]
     current_stage: Literal["assembly"]
-    imported_stages: tuple[Literal["references"], Literal["extraction"], Literal["synthesis"]]
-    schema_version: Literal[4]
+    imported_stages: tuple[
+        Literal["references"],
+        Literal["extraction"],
+        Literal["synthesis"],
+        Literal["editorial_enrichment"],
+    ]
+    schema_version: Literal[5]
     content_sha256: str = Field(pattern=_HASH)
 
 
@@ -204,16 +219,16 @@ def _canonical_json(payload: Mapping[str, Any]) -> bytes:
 
 
 def compute_production_state_checksum(
-    snapshot_without_checksum: (ProductionStateSnapshotV4 | Mapping[str, Any]),
+    snapshot_without_checksum: (ProductionStateSnapshotV5 | Mapping[str, Any]),
 ) -> str:
     if isinstance(snapshot_without_checksum, BaseModel):
-        model: ProductionStateSnapshotV4 | None = snapshot_without_checksum
+        model: ProductionStateSnapshotV5 | None = snapshot_without_checksum
     else:
         # Import always hashes the validated model, so a raw payload has to be
         # normalised the same way: a hand-edited file that dropped an optional
         # field would otherwise get a checksum import then rejects.
         try:
-            model = ProductionStateSnapshotV4.model_validate(
+            model = ProductionStateSnapshotV5.model_validate(
                 {**snapshot_without_checksum, "content_sha256": "0" * 64}
             )
         except ValidationError:
@@ -230,30 +245,6 @@ def _invalid(message: str) -> ProductionStateError:
     return ProductionStateError(code="production_state_invalid", message=message)
 
 
-async def _portable_references_content(
-    store: ProductionArtifactStore,
-    artifact: ProductionArtifact,
-    payload: dict[str, Any],
-) -> dict[str, Any]:
-    """Project REFERENCES into the legacy contract V4 still expects.
-
-    V4 carries a ``ReferenceReport``.  An AW-010 corpus is converted through
-    its RAW answer and the single compatibility adapter, so V4 stays portable
-    without changing its schema -- and without writing the corpus into a field
-    a V4 reader would misread.  An imported legacy artifact is already a
-    report and travels unchanged.
-    """
-    try:
-        corpus = production_reference_corpus_from_json(payload)
-    except ValueError:
-        return payload
-    if artifact.raw_blob_id is None:
-        raise ValueError("REFERENCES RAW payload is missing")
-    raw = await store.read_text(artifact.raw_blob_id)
-    report = load_legacy_reference_report(raw, corpus.research_date, corpus=corpus)
-    return reference_report_to_json(report)
-
-
 def _json_size(payload: dict[str, Any]) -> int:
     try:
         return len(_canonical_json(payload))
@@ -261,48 +252,96 @@ def _json_size(payload: dict[str, Any]) -> int:
         raise _invalid("Production state contains non-JSON content") from exc
 
 
-def _validate_parsers(
-    snapshot: ProductionStateSnapshotV4,
-) -> tuple[ReferenceReport, TechnicalExtraction]:
+def _validate_canonical_artifacts_v5(
+    snapshot: ProductionStateSnapshotV5,
+) -> tuple[
+    ProductionReferenceCorpusV1,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+    EditorialEnrichmentV1,
+]:
     try:
-        report = reference_report_from_json(snapshot.artifacts.references.canonical_content)
-        extraction = legacy_technical_extraction_from_payload(
-            snapshot.artifacts.extraction.canonical_content,
-            source_labels=report_source_labels(report),
+        references = production_reference_corpus_from_json(
+            snapshot.artifacts.references.canonical_content
         )
-        synthesis_result: ParseResult[str] = validate_synthesis(
-            snapshot.artifacts.synthesis.rendered_content, report, extraction
+        extraction = production_extraction_from_json(
+            snapshot.artifacts.extraction.canonical_content
         )
+        synthesis = production_synthesis_from_json(snapshot.artifacts.synthesis.canonical_content)
+        enrichment = editorial_enrichment_from_json(
+            snapshot.artifacts.editorial_enrichment.canonical_content
+        )
+
+        origin_subject_id = snapshot.origin.subject_id
+        if any(
+            subject_id != origin_subject_id
+            for subject_id in (
+                references.subject_id,
+                extraction.subject_id,
+                synthesis.subject_id,
+                enrichment.subject_id,
+            )
+        ):
+            raise ValueError("Canonical artifacts do not match the snapshot origin subject")
+        if references.subject_id != extraction.subject_id:
+            raise ValueError("REFERENCES and EXTRACTION subjects differ")
+        if extraction.subject_id != synthesis.subject_id:
+            raise ValueError("EXTRACTION and SYNTHESIS subjects differ")
+
+        if references_corpus_hash(references) != extraction.references_corpus_hash:
+            raise ValueError("EXTRACTION references corpus hash does not match REFERENCES")
+
+        if canonical_extraction_hash(extraction) != synthesis.extraction_hash:
+            raise ValueError("SYNTHESIS extraction hash does not match EXTRACTION")
+        if extraction.production_input_hash != synthesis.production_input_hash:
+            raise ValueError("EXTRACTION and SYNTHESIS production input hashes differ")
+        if (
+            len(
+                {
+                    references.production_input_hash,
+                    extraction.production_input_hash,
+                    synthesis.production_input_hash,
+                    enrichment.production_input_hash,
+                }
+            )
+            != 1
+        ):
+            raise ValueError("Canonical artifacts have different production input hashes")
+
+        validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
-        raise _invalid("Production state artifact content is invalid") from exc
-    if not synthesis_result.usable:
-        raise _invalid("Production state synthesis is invalid")
-    return report, extraction
+        raise _invalid("Production state canonical artifacts or lineage are invalid") from exc
+    return references, extraction, synthesis, enrichment
 
 
-def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV4:
+def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV5:
     if payload.get("format") != PRODUCTION_STATE_FORMAT:
         raise ProductionStateError(
             code="production_state_invalid_format", message="Unsupported production state format"
         )
     schema_version = payload.get("schema_version")
-    if schema_version not in PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS:
+    if (
+        type(schema_version) is not int
+        or schema_version not in PRODUCTION_STATE_SUPPORTED_SCHEMA_VERSIONS
+    ):
         raise ProductionStateError(
             code="production_state_version_unsupported",
             message="Unsupported production state schema version",
         )
     try:
-        snapshot = ProductionStateSnapshotV4.model_validate(payload)
+        snapshot = ProductionStateSnapshotV5.model_validate(payload)
     except ValidationError as exc:
         raise _invalid("Invalid production state") from exc
 
     references = snapshot.artifacts.references.canonical_content
     extraction = snapshot.artifacts.extraction.canonical_content
-    synthesis = snapshot.artifacts.synthesis.rendered_content
+    synthesis = snapshot.artifacts.synthesis.canonical_content
+    enrichment = snapshot.artifacts.editorial_enrichment.canonical_content
     if (
         _json_size(references) > MAX_ARTIFACT_BYTES
         or _json_size(extraction) > MAX_ARTIFACT_BYTES
-        or len(synthesis.encode("utf-8")) > MAX_ARTIFACT_BYTES
+        or _json_size(synthesis) > MAX_ARTIFACT_BYTES
+        or _json_size(enrichment) > MAX_ARTIFACT_BYTES
         or _json_size(payload) > MAX_PRODUCTION_STATE_BYTES
     ):
         raise ProductionStateError(
@@ -312,11 +351,43 @@ def _validate_snapshot(payload: dict[str, Any]) -> ProductionStateSnapshotV4:
         raise ProductionStateError(
             code="production_state_checksum_mismatch", message="Production state checksum mismatch"
         )
-    _validate_parsers(snapshot)
+    _validate_canonical_artifacts_v5(snapshot)
     return snapshot
 
 
-def _snapshot_metadata(snapshot: ProductionStateSnapshotV4, now: datetime) -> dict[str, Any]:
+def _validate_import_lineage(
+    snapshot: ProductionStateSnapshotV5,
+    subject_id: UUID,
+    edition_id: UUID,
+    input_snapshot: Any,
+) -> tuple[
+    ProductionReferenceCorpusV1,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+    EditorialEnrichmentV1,
+]:
+    if snapshot.origin.subject_id != subject_id:
+        raise _invalid("Production state origin subject does not match the target subject")
+    if input_snapshot.subject_id != subject_id or input_snapshot.edition_id != edition_id:
+        raise _invalid("Local production snapshot does not match the import target")
+    if (
+        snapshot.origin.subject_title != input_snapshot.subject_title
+        or snapshot.origin.research_date != input_snapshot.research_date
+        or snapshot.origin.discovery_snapshot_id != input_snapshot.discovery_snapshot_id
+        or snapshot.origin.discovery_snapshot_version != input_snapshot.discovery_snapshot_version
+    ):
+        raise _invalid("Production state origin does not match the local production snapshot")
+
+    canonical = _validate_canonical_artifacts_v5(snapshot)
+    expected_input_hash = input_snapshot.input_hash
+    if canonical[0].production_input_hash != expected_input_hash:
+        raise _invalid(
+            "Production artifact input hash does not match the local production snapshot"
+        )
+    return canonical
+
+
+def _snapshot_metadata(snapshot: ProductionStateSnapshotV5, now: datetime) -> dict[str, Any]:
     return {
         "snapshot_import": {
             "format": PRODUCTION_STATE_FORMAT,
@@ -329,7 +400,7 @@ def _snapshot_metadata(snapshot: ProductionStateSnapshotV4, now: datetime) -> di
     }
 
 
-def _snapshot_repair(snapshot: ProductionStateSnapshotV4) -> ProductionStateRepair | None:
+def _snapshot_repair(snapshot: ProductionStateSnapshotV5) -> ProductionStateRepair | None:
     return getattr(snapshot, "repair", None)
 
 
@@ -399,34 +470,6 @@ def _exported_repair_block(
     )
 
 
-def _portable_extraction_content(
-    content: dict[str, Any], report: ReferenceReport
-) -> dict[str, Any]:
-    """Project any extraction payload onto the legacy contract V4 still carries.
-
-    An AW-011 ``ProductionExtractionV1`` payload is projected one way through
-    the single compatibility boundary, so V4 keeps its historical
-    ``TechnicalExtraction`` shape and never exposes the canonical contract to a
-    V4 reader.  A genuinely legacy payload travels unchanged: the state
-    transfer never promotes it into the canonical contract.  Model-run
-    provenance is not part of the portable V4 contract either way.
-    """
-    view = extraction_compatibility_view(content, source_labels=report_source_labels(report))
-    portable = (
-        technical_extraction_to_json(view.legacy) if view.canonical is not None else dict(content)
-    )
-    for collection_name in ("items", "rules"):
-        collection = portable.get(collection_name)
-        if isinstance(collection, list):
-            portable[collection_name] = [
-                {key: value for key, value in item.items() if key != "model_run_ids"}
-                if isinstance(item, dict)
-                else item
-                for item in collection
-            ]
-    return portable
-
-
 async def _repair_decisions_for_projection(
     uow: Any, run: Any, metadata: Mapping[str, Any] | None
 ) -> dict[str, Any]:
@@ -458,7 +501,7 @@ class ProductionStateService:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
 
-    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV4:
+    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV5:
         """Export the latest terminal run for a subject from its input snapshot."""
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_current_for_subject(subject_id)
@@ -469,7 +512,7 @@ class ProductionStateService:
 
         return await self.export_run_state(run.id)
 
-    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV5:
         """Export exactly ``run_id`` without resolving another current run."""
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get(run_id)
@@ -490,6 +533,7 @@ class ProductionStateService:
             refs = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
+            enrichment = await uow.production_artifacts.get_current(run.id, "editorial_enrichment")
             publication = await uow.production_artifacts.get_current(run.id, "publication")
             # The current extraction already IS the effective projection; the
             # decisions travel with it so an import stays auditable, not only
@@ -498,52 +542,41 @@ class ProductionStateService:
                 uow, run, getattr(extraction, "metadata", None)
             )
 
-        if refs is None or extraction is None or synthesis is None:
+        if refs is None or extraction is None or synthesis is None or enrichment is None:
             raise ProductionStateError(
                 code="production_state_incomplete", message="Production artifacts are incomplete"
             )
-        if any(
-            artifact.status is not ProductionArtifactStatus.VERIFIED
-            for artifact in (refs, extraction, synthesis)
-        ):
+        artifacts = (refs, extraction, synthesis, enrichment)
+        if any(artifact.status is not ProductionArtifactStatus.VERIFIED for artifact in artifacts):
             raise ProductionStateError(
                 code="production_state_unverified", message="Production artifacts are not verified"
             )
-        if (
-            refs.canonical_blob_id is None
-            or extraction.canonical_blob_id is None
-            or (synthesis.canonical_blob_id is None and synthesis.rendered_blob_id is None)
-        ):
+        if any(artifact.canonical_blob_id is None for artifact in artifacts):
             raise ProductionStateError(
                 code="production_state_incomplete", message="Production artifact content is missing"
             )
         repair_materialization: dict[str, Any] = {}
-        for artifact in (extraction, synthesis, publication):
+        for artifact in (*artifacts, publication):
             if artifact is None:
                 continue
             candidate = artifact.metadata.get("repair_materialization")
             if isinstance(candidate, Mapping):
                 repair_materialization.update(dict(candidate))
         try:
-            refs_content = await self._artifact_store.read_json(refs.canonical_blob_id)
-            refs_content = await _portable_references_content(
-                self._artifact_store, refs, refs_content
+            refs_content = await self._artifact_store.read_json(cast(UUID, refs.canonical_blob_id))
+            extraction_content = await self._artifact_store.read_json(
+                cast(UUID, extraction.canonical_blob_id)
             )
-            report = reference_report_from_json(refs_content)
-            extraction_payload = await self._artifact_store.read_json(extraction.canonical_blob_id)
-            extraction_content = _portable_extraction_content(extraction_payload, report)
-            # V4 carries the legacy Assembly text: the one-way projection of a
-            # canonical synthesis, never its human preview.
-            synthesis_content = await assembly_synthesis_text(
-                self._artifact_store,
-                report,
-                extraction_compatibility_view(extraction_payload).canonical,
-                synthesis,
+            synthesis_content = await self._artifact_store.read_json(
+                cast(UUID, synthesis.canonical_blob_id)
+            )
+            enrichment_content = await self._artifact_store.read_json(
+                cast(UUID, enrichment.canonical_blob_id)
             )
         except (EntityNotFoundError, KeyError, TypeError, ValueError, UnicodeError) as exc:
             raise _invalid("Production artifact content is invalid") from exc
 
-        origin = ProductionStateOriginV4(
+        origin = ProductionStateOriginV5(
             subject_title=input_snapshot.subject_title,
             subject_id=input_snapshot.subject_id,
             production_run_id=run.id,
@@ -551,7 +584,7 @@ class ProductionStateService:
             discovery_snapshot_id=input_snapshot.discovery_snapshot_id,
             discovery_snapshot_version=input_snapshot.discovery_snapshot_version,
         )
-        snapshot = ProductionStateSnapshotV4(
+        snapshot = ProductionStateSnapshotV5(
             format=PRODUCTION_STATE_FORMAT,
             schema_version=PRODUCTION_STATE_SCHEMA_VERSION,
             exported_at=datetime.now(UTC),
@@ -561,22 +594,28 @@ class ProductionStateService:
                 repair_decisions,
                 repair_materialization or None,
             ),
-            artifacts=ProductionStateArtifacts(
-                references=ProductionStateReferences(
+            artifacts=ProductionStateArtifactsV5(
+                references=ProductionStateReferencesV5(
                     input_hash=refs.input_hash, canonical_content=refs_content
                 ),
-                extraction=ProductionStateExtraction(
+                extraction=ProductionStateExtractionV5(
                     input_hash=extraction.input_hash, canonical_content=extraction_content
                 ),
-                synthesis=ProductionStateSynthesis(
-                    input_hash=synthesis.input_hash, rendered_content=synthesis_content
+                synthesis=ProductionStateSynthesisV5(
+                    input_hash=synthesis.input_hash, canonical_content=synthesis_content
+                ),
+                editorial_enrichment=ProductionStateEditorialEnrichmentV5(
+                    input_hash=enrichment.input_hash, canonical_content=enrichment_content
                 ),
             ),
             content_sha256="0" * 64,
         )
-        _validate_parsers(snapshot)
+        parsed = _validate_canonical_artifacts_v5(snapshot)
+        if parsed[0].production_input_hash != input_snapshot.input_hash:
+            raise _invalid("Production artifact input hash does not match its local snapshot")
         checksum = compute_production_state_checksum(snapshot)
-        return snapshot.model_copy(update={"content_sha256": checksum})
+        exported = snapshot.model_copy(update={"content_sha256": checksum})
+        return _validate_snapshot(exported.model_dump(mode="json"))
 
     async def import_state(
         self,
@@ -586,7 +625,10 @@ class ProductionStateService:
         payload: dict[str, Any],
     ) -> ProductionStateImportResult:
         snapshot = _validate_snapshot(payload)
+        if snapshot.origin.subject_id != subject_id:
+            raise _invalid("Production state origin subject does not match the target subject")
         now = datetime.now(UTC)
+        run_id = uuid4()
 
         async with self._uow_factory() as uow:
             await _lock_open_edition(uow, edition_id)
@@ -598,42 +640,48 @@ class ProductionStateService:
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
                 )
+            local_input_snapshot = await capture_production_input_snapshot(
+                uow,
+                production_run_id=run_id,
+                subject_id=subject_id,
+                edition_id=edition_id,
+                research_date=snapshot.origin.research_date,
+                captured_at=now,
+            )
+        parsed_references, parsed_extraction, parsed_synthesis, parsed_enrichment = (
+            _validate_import_lineage(snapshot, subject_id, edition_id, local_input_snapshot)
+        )
 
         refs_content = snapshot.artifacts.references.canonical_content
-        extraction_content = _portable_extraction_content(
-            snapshot.artifacts.extraction.canonical_content,
-            reference_report_from_json(refs_content),
-        )
-        synthesis_content = snapshot.artifacts.synthesis.rendered_content
+        extraction_content = snapshot.artifacts.extraction.canonical_content
+        synthesis_content = snapshot.artifacts.synthesis.canonical_content
+        enrichment_content = snapshot.artifacts.editorial_enrichment.canonical_content
         _, refs_canonical, _ = await self._artifact_store.store_stage_payloads(
             canonical=refs_content
         )
         _, extraction_canonical, _ = await self._artifact_store.store_stage_payloads(
             canonical=extraction_content
         )
-        _, _, synthesis_rendered = await self._artifact_store.store_stage_payloads(
-            rendered=synthesis_content
+        _, synthesis_canonical, _ = await self._artifact_store.store_stage_payloads(
+            canonical=synthesis_content
+        )
+        _, enrichment_canonical, _ = await self._artifact_store.store_stage_payloads(
+            canonical=enrichment_content
         )
         metadata_base = _snapshot_metadata(snapshot, now)
         refs_meta = {
             **metadata_base,
-            # A V4 import stays a legacy ``ReferenceReport``: it is never
-            # presented as a ``ProductionReferenceCorpusV1``, and its missing
-            # collection identity is never fabricated.
-            "legacy_reference_report": True,
-            "event_count": len(refs_content.get("events", [])),
-            "source_count": len(refs_content.get("sources", [])),
-            "parser_version": refs_content.get("parser_version"),
-            "warnings": [],
+            "source_count": len(parsed_references.sources),
+            "warnings": list(parsed_references.warnings),
         }
         repair_block = _snapshot_repair(snapshot)
         extraction_meta = {
             **metadata_base,
             "element_counts": {
-                k: len(v) for k, v in extraction_content.items() if isinstance(v, list)
+                "sources": len(parsed_extraction.sources),
+                "omitted_sources": len(parsed_extraction.omitted_sources),
             },
-            "parser_version": extraction_content.get("parser_version"),
-            "warnings": [],
+            "warnings": list(parsed_extraction.warnings),
             # Deliberately NOT "repair_projection": the exported base artifact
             # and decision rows do not exist here, so a projection marker would
             # dangle. This keeps the audit trail without forging local identity.
@@ -648,12 +696,44 @@ class ProductionStateService:
                 else {}
             ),
         }
+        synthesis_words = [parsed_synthesis.title]
+        synthesis_words.extend(paragraph.text for paragraph in parsed_synthesis.lead)
+        synthesis_words.extend(
+            paragraph.text
+            for section in parsed_synthesis.sections
+            for paragraph in section.paragraphs
+        )
         synthesis_meta = {
             **metadata_base,
-            "word_count": len(synthesis_content.split()),
-            "reference_count": synthesis_content.count("[S"),
+            "section_count": len(parsed_synthesis.sections),
+            "word_count": sum(len(part.split()) for part in synthesis_words),
+            "warnings_count": len(parsed_synthesis.warnings),
             "diagnostics": {},
         }
+        enrichment_meta = {
+            **metadata_base,
+            "schema_version": parsed_enrichment.schema_version,
+            "policy_version": parsed_enrichment.enrichment_policy_version,
+            "table_count": len(parsed_enrichment.tables),
+            "diagram_count": len(parsed_enrichment.diagrams),
+            "source_figure_count": len(parsed_enrichment.source_figures),
+            "warnings_count": len(parsed_enrichment.warnings),
+            "extraction_hash": parsed_enrichment.extraction_hash,
+            "synthesis_hash": parsed_enrichment.synthesis_hash,
+        }
+        if repair_block := _snapshot_repair(snapshot):
+            audit_metadata = {"imported_repair_audit": repair_block.model_dump(mode="json")}
+            refs_meta.update(audit_metadata)
+            extraction_meta.update(audit_metadata)
+            synthesis_meta.update(audit_metadata)
+            enrichment_meta.update(audit_metadata)
+            if repair_block.materialization is not None:
+                materialization_metadata = {
+                    "repair_materialization": dict(repair_block.materialization)
+                }
+                extraction_meta.update(materialization_metadata)
+                synthesis_meta.update(materialization_metadata)
+                enrichment_meta.update(materialization_metadata)
 
         async with self._uow_factory() as uow:
             await _lock_open_edition(uow, edition_id)
@@ -666,6 +746,17 @@ class ProductionStateService:
                 raise ProductionStateError(
                     code="production_state_active_run", message="Production run is active"
                 )
+            confirmed_input_snapshot = await capture_production_input_snapshot(
+                uow,
+                production_run_id=run_id,
+                subject_id=subject_id,
+                edition_id=edition_id,
+                research_date=snapshot.origin.research_date,
+                captured_at=now,
+            )
+            _validate_import_lineage(snapshot, subject_id, edition_id, confirmed_input_snapshot)
+            if confirmed_input_snapshot.input_hash != local_input_snapshot.input_hash:
+                raise _invalid("Local production input changed while importing production state")
             # L'item de lot d'édition pointe vers le run remplacé. Sans
             # repointage, la revue de publication continue d'afficher l'ancien
             # run en échec et l'état importé reste invisible.
@@ -674,14 +765,15 @@ class ProductionStateService:
             run = ProductionRun(
                 subject_id=subject_id,
                 edition_id=edition_id,
+                id=run_id,
                 status=ProductionRunStatus.NEEDS_REVIEW,
                 current_stage=ProductionStage.ASSEMBLY,
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(
-                    "État importé : références, extraction et synthèse restaurées ; "
-                    "assemblage non rejoué."
+                    "État importé : références, extraction, synthèse et enrichissement éditorial "
+                    "restaurés ; l'assemblage doit être reconstruit."
                 ),
                 started_at=now,
                 finished_at=now,
@@ -693,15 +785,7 @@ class ProductionStateService:
             # La décision de publication reste attachée au run remplacé : un
             # état corrigé à la main doit être revu, pas hérité.
             await _repoint_batch_item(uow, replaced_run_id, run.id)
-            input_snapshot = await capture_production_input_snapshot(
-                uow,
-                production_run_id=run.id,
-                subject_id=subject_id,
-                edition_id=edition_id,
-                research_date=snapshot.origin.research_date,
-                captured_at=now,
-            )
-            await uow.production_input_snapshots.add(input_snapshot)
+            await uow.production_input_snapshots.add(confirmed_input_snapshot)
             refs = ProductionArtifact(
                 production_run_id=run.id,
                 subject_id=subject_id,
@@ -731,16 +815,27 @@ class ProductionStateService:
                 version=1,
                 input_hash=snapshot.artifacts.synthesis.input_hash,
                 status=ProductionArtifactStatus.VERIFIED,
-                rendered_blob_id=synthesis_rendered,
+                canonical_blob_id=synthesis_canonical,
                 metadata=synthesis_meta,
             )
             await uow.production_artifacts.append(synthesis)
+            enrichment = ProductionArtifact(
+                production_run_id=run.id,
+                subject_id=subject_id,
+                stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                version=1,
+                input_hash=snapshot.artifacts.editorial_enrichment.input_hash,
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=enrichment_canonical,
+                metadata=enrichment_meta,
+            )
+            await uow.production_artifacts.append(enrichment)
             await uow.commit()
         return ProductionStateImportResult(
             run_id=run.id,
             status="needs_review",
             current_stage="assembly",
-            imported_stages=("references", "extraction", "synthesis"),
+            imported_stages=("references", "extraction", "synthesis", "editorial_enrichment"),
             schema_version=snapshot.schema_version,
             content_sha256=snapshot.content_sha256,
         )

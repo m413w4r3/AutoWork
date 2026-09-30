@@ -101,7 +101,8 @@ avec lui ni module ni service. Extraction consomme le corpus directement. Synthe
 `ProductionExtractionV1`, puis Editorial Enrichment lie un contrat vide à l’extraction et à la
 synthèse. Assembly construit `PublicationDocumentV3` depuis le snapshot, le corpus, l’extraction,
 la synthèse et cet enrichment. La projection historique `ReferenceReport` reste limitée
-aux imports V4 et à certaines fonctions du Repair Desk.
+à certaines fonctions du Repair Desk. Le format portable Production State V5 conserve les quatre
+artefacts canoniques avant Assembly, enrichissement éditorial compris.
 
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection
 de regroupement éditorial et n’ajoute aucun statut de production à l’édition.

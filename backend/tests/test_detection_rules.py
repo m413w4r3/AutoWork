@@ -33,7 +33,7 @@ from cti_app.application.production_rendering import (
     collect_indicators,
     render_publication_markdown,
 )
-from cti_app.application.production_state import ProductionStateSnapshotV4
+from cti_app.application.production_state import ProductionStateSnapshotV5
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
 from cti_app.domain.publication import ArtifactType
@@ -250,11 +250,11 @@ def test_rules_are_not_iocs_or_publication_body() -> None:
     assert rule.body not in publication
 
 
-def _state() -> ProductionStateSnapshotV4:
-    return ProductionStateSnapshotV4.model_validate(
+def _state() -> ProductionStateSnapshotV5:
+    return ProductionStateSnapshotV5.model_validate(
         {
             "format": "autowork.production-state",
-            "schema_version": 4,
+            "schema_version": 5,
             "exported_at": "2026-08-29T10:00:00Z",
             "origin": {
                 "subject_title": "Sujet",
@@ -267,7 +267,8 @@ def _state() -> ProductionStateSnapshotV4:
             "artifacts": {
                 "references": {"input_hash": "a" * 64, "canonical_content": {"items": []}},
                 "extraction": {"input_hash": "b" * 64, "canonical_content": {"items": []}},
-                "synthesis": {"input_hash": "c" * 64, "rendered_content": "Article"},
+                "synthesis": {"input_hash": "c" * 64, "canonical_content": {}},
+                "editorial_enrichment": {"input_hash": "e" * 64, "canonical_content": {}},
             },
             "content_sha256": "d" * 64,
         }

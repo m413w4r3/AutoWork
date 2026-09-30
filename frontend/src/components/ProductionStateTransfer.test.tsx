@@ -5,15 +5,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   ProductionStatus,
-  ProductionStateSnapshotV4,
+  ProductionStateSnapshotV5,
 } from "../api/production";
 import { ProductionStateTransfer } from "./ProductionStateTransfer";
 
 const SUBJECT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
-const snapshot: ProductionStateSnapshotV4 = {
+const snapshot: ProductionStateSnapshotV5 = {
   format: "autowork.production-state",
-  schema_version: 4,
+  schema_version: 5,
   exported_at: "2026-08-20T12:34:56Z",
   origin: {
     subject_title: "Campagne d’Iran",
@@ -34,7 +34,8 @@ const snapshot: ProductionStateSnapshotV4 = {
         uncertainties: [],
       },
     },
-    synthesis: { input_hash: "c", rendered_content: "Synthèse" },
+    synthesis: { input_hash: "c", canonical_content: {} },
+    editorial_enrichment: { input_hash: "d", canonical_content: {} },
   },
   content_sha256: "d",
 };
@@ -92,8 +93,13 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit): Response {
       run_id: "run-imported",
       status: "needs_review",
       current_stage: "assembly",
-      imported_stages: ["references", "extraction", "synthesis"],
-      schema_version: 4,
+      imported_stages: [
+        "references",
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+      ],
+      schema_version: 5,
       content_sha256: "d",
     });
   }
@@ -149,11 +155,11 @@ describe("ProductionStateTransfer", () => {
       screen.getByText("Sujet d’origine : Campagne d’Iran"),
     ).toBeInTheDocument();
     expect(screen.getByText(/Exporté le :/)).toBeInTheDocument();
-    expect(screen.getAllByText(/✓/)).toHaveLength(3);
+    expect(screen.getAllByText(/✓/)).toHaveLength(4);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("recharge immédiatement le V4 produit par l’export et l’importe", async () => {
+  it("recharge immédiatement le V5 produit par l’export et l’importe", async () => {
     const fetchMock = vi.fn(responseFor);
     vi.stubGlobal("fetch", fetchMock);
     let exportedBlob: Blob | undefined;
@@ -197,8 +203,9 @@ describe("ProductionStateTransfer", () => {
     await userEvent.upload(screen.getByLabelText("Importer un état"), file);
 
     expect(
-      await screen.findByText("Format : AutoWork production-state v4"),
+      await screen.findByText("Format : AutoWork production-state v5"),
     ).toBeInTheDocument();
+    expect(screen.getByText("✓ Enrichissement éditorial")).toBeInTheDocument();
     await userEvent.click(
       await screen.findByRole("button", { name: "Importer" }),
     );
@@ -207,7 +214,7 @@ describe("ProductionStateTransfer", () => {
     if (typeof body !== "string")
       throw new Error("Import request has no JSON body");
     expect(JSON.parse(body)).toMatchObject({
-      schema_version: 4,
+      schema_version: 5,
       origin: {
         subject_title: "Campagne d’Iran",
         subject_id: SUBJECT_ID,
@@ -222,14 +229,26 @@ describe("ProductionStateTransfer", () => {
   it("signale un autre sujet et permet d’annuler sans importer", async () => {
     const fetchMock = vi.fn(responseFor);
     vi.stubGlobal("fetch", fetchMock);
-    renderTransfer(productionStatus("ready", "Sujet ouvert"));
-    const file = new File([JSON.stringify(snapshot)], "state.json", {
-      type: "application/json",
-    });
+    renderTransfer(productionStatus("ready"));
+    const otherSubjectSnapshot = {
+      ...snapshot,
+      origin: {
+        ...snapshot.origin,
+        subject_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      },
+    };
+    const file = new File(
+      [JSON.stringify(otherSubjectSnapshot)],
+      "state.json",
+      {
+        type: "application/json",
+      },
+    );
     await userEvent.upload(screen.getByLabelText("Importer un état"), file);
     expect(
       await screen.findByText(/Le fichier provient d’un autre sujet/),
     ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Importer" })).toBeDisabled();
     await userEvent.click(screen.getByRole("button", { name: "Annuler" }));
     expect(screen.queryByText("État prêt à importer")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -298,7 +317,7 @@ describe("ProductionStateTransfer", () => {
     );
     await waitFor(() => expect(click).toHaveBeenCalled());
     expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-    expect(downloadedName).toContain("production-state-v4");
+    expect(downloadedName).toContain("production-state-v5");
     expect(revokeObjectURL).toHaveBeenCalledWith("blob:test");
   });
 
@@ -307,6 +326,29 @@ describe("ProductionStateTransfer", () => {
     vi.stubGlobal("fetch", fetchMock);
     renderTransfer(productionStatus("ready"));
     const file = new File(["not-json"], "state.json", {
+      type: "application/json",
+    });
+    await userEvent.upload(screen.getByLabelText("Importer un état"), file);
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Ce fichier n’est pas un état de production AutoWork valide.",
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejette un ancien état V4 sans enrichissement éditorial", async () => {
+    const fetchMock = vi.fn(responseFor);
+    vi.stubGlobal("fetch", fetchMock);
+    renderTransfer(productionStatus("ready"));
+    const legacy = {
+      ...snapshot,
+      schema_version: 4,
+      artifacts: {
+        references: snapshot.artifacts.references,
+        extraction: snapshot.artifacts.extraction,
+        synthesis: { input_hash: "c", rendered_content: "Synthèse" },
+      },
+    };
+    const file = new File([JSON.stringify(legacy)], "old-state.json", {
       type: "application/json",
     });
     await userEvent.upload(screen.getByLabelText("Importer un état"), file);

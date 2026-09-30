@@ -70,7 +70,7 @@ from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
     ProductionStateService,
-    ProductionStateSnapshotV4,
+    ProductionStateSnapshotV5,
 )
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
@@ -1377,7 +1377,7 @@ async def restart_subject_with_new_sources(
 async def export_subject_production_state(
     subject_id: UUID,
     request: Request,
-) -> ProductionStateSnapshotV4:
+) -> ProductionStateSnapshotV5:
     await _selected_subject(request, subject_id)
     async with request.app.state.uow_factory() as uow:
         subject = await uow.subjects.get(subject_id)
@@ -2334,6 +2334,13 @@ async def get_extraction_artifact(subject_id: UUID, request: Request) -> dict[st
 @router.get("/subjects/{subject_id}/production/artifacts/synthesis")
 async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     return await _artifact_view(request, subject_id, "synthesis")
+
+
+@router.get("/subjects/{subject_id}/production/artifacts/editorial_enrichment")
+async def get_editorial_enrichment_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
+    return await _artifact_view(
+        request, subject_id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+    )
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/publication")

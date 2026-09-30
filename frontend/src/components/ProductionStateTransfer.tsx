@@ -41,8 +41,14 @@ function isArtifacts(value: unknown): boolean {
   const references = value.references;
   const extraction = value.extraction;
   const synthesis = value.synthesis;
+  const enrichment = value.editorial_enrichment;
   return (
-    hasExactKeys(value, ["references", "extraction", "synthesis"]) &&
+    hasExactKeys(value, [
+      "references",
+      "extraction",
+      "synthesis",
+      "editorial_enrichment",
+    ]) &&
     isRecord(references) &&
     hasExactKeys(references, ["input_hash", "canonical_content"]) &&
     typeof references.input_hash === "string" &&
@@ -52,9 +58,13 @@ function isArtifacts(value: unknown): boolean {
     typeof extraction.input_hash === "string" &&
     isRecord(extraction.canonical_content) &&
     isRecord(synthesis) &&
-    hasExactKeys(synthesis, ["input_hash", "rendered_content"]) &&
+    hasExactKeys(synthesis, ["input_hash", "canonical_content"]) &&
     typeof synthesis.input_hash === "string" &&
-    typeof synthesis.rendered_content === "string"
+    isRecord(synthesis.canonical_content) &&
+    isRecord(enrichment) &&
+    hasExactKeys(enrichment, ["input_hash", "canonical_content"]) &&
+    typeof enrichment.input_hash === "string" &&
+    isRecord(enrichment.canonical_content)
   );
 }
 
@@ -131,7 +141,7 @@ function isProductionStateSnapshot(
       ])
     ) ||
     value.format !== "autowork.production-state" ||
-    value.schema_version !== 4 ||
+    value.schema_version !== 5 ||
     typeof value.exported_at !== "string" ||
     typeof value.content_sha256 !== "string" ||
     !isArtifacts(value.artifacts) ||
@@ -248,7 +258,7 @@ export function ProductionStateTransfer({
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
-      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v4-${filesystemTimestamp(snapshot.exported_at)}.json`;
+      link.download = `autowork-${slugify(snapshot.origin.subject_title)}-production-state-v5-${filesystemTimestamp(snapshot.exported_at)}.json`;
       document.body.appendChild(link);
       link.click();
       link.remove();
@@ -261,7 +271,7 @@ export function ProductionStateTransfer({
       importProductionState(subjectId, snapshot),
     onSuccess: () => {
       setSuccess(
-        "État importé. Références, extraction et synthèse ont été restaurées.",
+        "État importé. Références, extraction, synthèse et enrichissement éditorial ont été restaurés.",
       );
       setSelectedSnapshot(null);
       if (inputRef.current) inputRef.current.value = "";
@@ -280,7 +290,10 @@ export function ProductionStateTransfer({
     productionStatus.status === "running" ||
     exportMutation.isPending;
   const importDisabled =
-    !isImportAllowed(productionStatus) || importMutation.isPending;
+    !isImportAllowed(productionStatus) ||
+    importMutation.isPending ||
+    (selectedSnapshot !== null &&
+      selectedSnapshot.origin.subject_id !== subjectId);
 
   function clearSelection() {
     setSelectedSnapshot(null);
@@ -379,17 +392,17 @@ export function ProductionStateTransfer({
             <li>✓ Références</li>
             <li>✓ Extraction</li>
             <li>✓ Synthèse</li>
+            <li>✓ Enrichissement éditorial</li>
           </ul>
           <p>
-            Ce fichier restaure les résultats coûteux de recherche, extraction
-            et synthèse. Aucun appel ChatGPT, collecte de source ou analyse
-            VirusTotal ne sera lancé.
+            Ce fichier restaure les résultats de recherche, extraction, synthèse
+            et enrichissement éditorial. Aucun appel ChatGPT, collecte de source
+            ou analyse VirusTotal ne sera lancé.
           </p>
-          {productionStatus?.title &&
-          productionStatus.title !== selectedSnapshot.origin.subject_title ? (
+          {selectedSnapshot.origin.subject_id !== subjectId ? (
             <p>
-              Le fichier provient d’un autre sujet. Son contenu sera importé
-              dans le sujet actuellement ouvert.
+              Le fichier provient d’un autre sujet. Sélectionnez le sujet
+              correspondant pour l’importer.
             </p>
           ) : null}
           <div className="production-state-transfer__actions">

@@ -314,6 +314,7 @@ async def test_restart_after_sources_reconstructs_the_pipeline(
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
         ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     }
 
@@ -424,7 +425,7 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
 
 
 @pytest.mark.asyncio
-async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
+async def test_restart_after_synthesis_runs_editorial_enrichment_and_assembly(
     production_scenario_factory: ScenarioFactory,
     migrated_postgres_url: str,
 ) -> None:
@@ -432,7 +433,7 @@ async def test_restart_after_synthesis_assembly_consumes_the_persisted_artifact(
     await scenario.start()
     await _run_prefix(scenario, 4)
     before = await _reload(scenario)
-    assert before.run.current_stage is ProductionStage.ASSEMBLY
+    assert before.run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
     synthesis = next(
         artifact
         for artifact in before.artifacts
