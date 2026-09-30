@@ -11,6 +11,7 @@ from uuid import UUID
 import pytest
 
 from cti_app.application.diagram_compilation import (
+    DIAGRAM_COMPILATION_POLICY_VERSION,
     DiagramCompilerOutputInvalidError,
     DiagramCompilerOutputTooLargeError,
     DiagramCompilerProcessError,
@@ -335,7 +336,38 @@ async def test_compile_pins_version_render_argv_environment_and_limits() -> None
     assert compiled.media_sha256 == hashlib.sha256(b"<svg></svg>\n").hexdigest()
     assert compiled.compiler == "d2"
     assert compiled.compiler_version == "0.9.0"
-    assert compiled.compiler_policy_version == "diagram-d2-svg-v1"
+    assert compiled.compiler_policy_version == DIAGRAM_COMPILATION_POLICY_VERSION
+
+
+async def test_compile_is_deterministic_for_identical_diagrams() -> None:
+    runner = _ControlledRunner(
+        _version_result(),
+        _svg_result(),
+        _version_result(),
+        _svg_result(),
+    )
+    compiler = D2DiagramCompiler(runner=runner)
+    diagram = _diagram()
+
+    first = await compiler.compile(diagram)
+    second = await compiler.compile(diagram)
+
+    assert first.source_bytes == second.source_bytes
+    assert first.source_sha256 == second.source_sha256
+    assert runner.calls[0].argv == runner.calls[2].argv
+    assert runner.calls[1].argv == runner.calls[3].argv
+    assert runner.calls[1].argv[4] == f"--salt={diagram_semantic_sha256(diagram)}"
+    assert first.media_bytes == second.media_bytes
+    assert first.media_sha256 == second.media_sha256
+
+
+async def test_compile_uses_configured_binary_for_version_and_render() -> None:
+    runner = _ControlledRunner(_version_result(), _svg_result())
+
+    await D2DiagramCompiler(runner=runner, binary="/opt/d2").compile(_diagram())
+
+    assert runner.calls[0].argv == ("/opt/d2", "--version")
+    assert runner.calls[1].argv[0] == "/opt/d2"
 
 
 async def test_compile_rejects_invalid_svg_after_successful_process() -> None:

@@ -15,6 +15,7 @@ from typing import Any, Protocol
 from xml.etree import ElementTree
 
 from cti_app.application.diagram_compilation import (
+    DIAGRAM_COMPILATION_POLICY_VERSION,
     CompiledDiagram,
     DiagramCompilerOutputInvalidError,
     DiagramCompilerOutputTooLargeError,
@@ -35,7 +36,6 @@ D2_SOURCE_ENCODING = "utf-8"
 D2_MEDIA_TYPE = "image/svg+xml"
 D2_LAYOUT = "dagre"
 D2_COMPILER_VERSION = "0.9.0"
-D2_COMPILER_POLICY_VERSION = "diagram-d2-svg-v1"
 D2_COMPILATION_TIMEOUT_SECONDS = 10
 D2_MAX_STDOUT_BYTES = 2 * 1024 * 1024
 D2_MAX_STDERR_BYTES = 64 * 1024
@@ -505,19 +505,21 @@ def validate_d2_svg(svg_bytes: bytes) -> None:
 class D2DiagramCompiler:
     """Compile canonical diagrams through a pinned, bounded D2 0.9.0 process."""
 
-    def __init__(self, runner: D2ProcessRunner | None = None) -> None:
+    def __init__(self, runner: D2ProcessRunner | None = None, binary: str = D2_COMPILER) -> None:
         self._runner: D2ProcessRunner = runner if runner is not None else AsyncioD2ProcessRunner()
+        self._binary = binary
 
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
-        await self._verify_version()
         source_bytes = encode_d2_source(diagram)
+        semantic_hash = diagram_semantic_sha256(diagram)
+        await self._verify_version()
         result = await self._runner.run(
             (
-                D2_COMPILER,
+                self._binary,
                 f"--layout={D2_LAYOUT}",
                 f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
                 "--omit-version",
-                f"--salt={diagram_semantic_sha256(diagram)}",
+                f"--salt={semantic_hash}",
                 "--stdout-format=svg",
                 "-",
                 "-",
@@ -540,12 +542,12 @@ class D2DiagramCompiler:
             media_sha256=hashlib.sha256(result.stdout).hexdigest(),
             compiler=D2_COMPILER,
             compiler_version=D2_COMPILER_VERSION,
-            compiler_policy_version=D2_COMPILER_POLICY_VERSION,
+            compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
         )
 
     async def _verify_version(self) -> None:
         result = await self._runner.run(
-            (D2_COMPILER, "--version"),
+            (self._binary, "--version"),
             stdin=b"",
             environment=d2_process_environment(),
             timeout_seconds=float(D2_COMPILATION_TIMEOUT_SECONDS),
