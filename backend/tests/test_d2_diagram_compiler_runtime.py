@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import shutil
+import subprocess
 from uuid import UUID
 
 import pytest
@@ -17,7 +18,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementV1,
 )
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
-from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
+from cti_app.infrastructure.d2_diagram_compiler import D2_COMPILER_VERSION, D2DiagramCompiler
 
 
 def _canonical_diagram() -> DiagramSpecV1:
@@ -50,6 +51,10 @@ def test_real_d2_compilation_is_byte_deterministic() -> None:
     binary = shutil.which("d2")
     if binary is None:
         pytest.skip("d2 executable is not installed")
+    probe = subprocess.run((binary, "--version"), capture_output=True, check=False, timeout=10)
+    reported = probe.stdout.decode("utf-8", errors="replace")
+    if reported.strip().removeprefix("v") != D2_COMPILER_VERSION:
+        pytest.skip(f"d2 {D2_COMPILER_VERSION} is not installed")
 
     compiler = D2DiagramCompiler(binary=binary)
     first, second = asyncio.run(_compile_twice(compiler, _canonical_diagram()))
