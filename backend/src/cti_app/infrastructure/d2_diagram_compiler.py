@@ -1,22 +1,44 @@
-"""Deterministic D2 source encoding for canonical diagrams."""
+"""Deterministic D2 source encoding and bounded D2 0.9.0 subprocess execution."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 import unicodedata
-from typing import Any
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Protocol
 
-from cti_app.application.diagram_compilation import UnsupportedDiagramStructureError
+from cti_app.application.diagram_compilation import (
+    CompiledDiagram,
+    DiagramCompilerOutputTooLargeError,
+    DiagramCompilerProcessError,
+    DiagramCompilerTimeoutError,
+    DiagramCompilerUnavailableError,
+    DiagramCompilerVersionError,
+    UnsupportedDiagramStructureError,
+)
 from cti_app.domain.production_editorial_enrichment import (
     DiagramSpecV1,
     EnrichmentDiagramDirection,
 )
 
+D2_COMPILER = "d2"
 D2_SOURCE_FORMAT = "d2"
 D2_SOURCE_ENCODING = "utf-8"
+D2_MEDIA_TYPE = "image/svg+xml"
+D2_LAYOUT = "dagre"
 D2_COMPILER_VERSION = "0.9.0"
 D2_COMPILER_POLICY_VERSION = "diagram-d2-svg-v1"
+D2_COMPILATION_TIMEOUT_SECONDS = 10
+D2_MAX_STDOUT_BYTES = 2 * 1024 * 1024
+D2_MAX_STDERR_BYTES = 64 * 1024
+D2_PROCESS_LOCALE = "C.UTF-8"
+D2_EXIT_POLL_SECONDS = 0.01
+D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
 
 _D2_DIRECTION_BY_V1 = {
     EnrichmentDiagramDirection.LEFT_TO_RIGHT: "right",
@@ -146,3 +168,268 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         lines.append(line)
 
     return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
+
+
+class D2ProcessStatus(StrEnum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED_TO_START = "FAILED_TO_START"
+    TIMED_OUT = "TIMED_OUT"
+    NON_ZERO_EXIT = "NON_ZERO_EXIT"
+    STDOUT_LIMIT = "STDOUT_LIMIT"
+
+
+@dataclass(frozen=True, slots=True)
+class D2ProcessResult:
+    status: D2ProcessStatus
+    exit_code: int | None
+    stdout: bytes
+    stderr: bytes
+
+
+class D2ProcessRunner(Protocol):
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: bytes,
+        environment: Mapping[str, str],
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> D2ProcessResult: ...
+
+
+def d2_process_environment() -> dict[str, str]:
+    """Return the minimal environment: PATH plus fixed locale values only."""
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "LANG": D2_PROCESS_LOCALE,
+        "LC_ALL": D2_PROCESS_LOCALE,
+    }
+
+
+class AsyncioD2ProcessRunner:
+    """Shell-free direct execution with bounded, concurrent stream capture."""
+
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: bytes,
+        environment: Mapping[str, str],
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> D2ProcessResult:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=dict(environment),
+            )
+        except OSError:
+            return D2ProcessResult(D2ProcessStatus.FAILED_TO_START, None, b"", b"")
+
+        stdin_stream = process.stdin
+        stdout_stream = process.stdout
+        stderr_stream = process.stderr
+        assert stdin_stream is not None
+        assert stdout_stream is not None
+        assert stderr_stream is not None
+
+        exit_code: int | None = None
+        stdout_bytes = b""
+        stderr_bytes = b""
+
+        def close_transport() -> None:
+            transport = getattr(process, "_transport", None)
+            if transport is not None:
+                transport.close()
+
+        def settle(result: D2ProcessResult) -> D2ProcessResult:
+            close_transport()
+            return result
+
+        def task_bytes(task: asyncio.Task[tuple[bytes, bool]]) -> bytes:
+            if not task.done() or task.cancelled() or task.exception() is not None:
+                return b""
+            return task.result()[0]
+
+        async def write_stdin() -> None:
+            try:
+                stdin_stream.write(stdin)
+                await stdin_stream.drain()
+            except OSError:
+                pass
+            finally:
+                stdin_stream.close()
+
+        async def read_stream(
+            stream: asyncio.StreamReader, *, limit: int, stop_on_overflow: bool
+        ) -> tuple[bytes, bool]:
+            buffer = bytearray()
+            while True:
+                chunk = await stream.read(64 * 1024)
+                if not chunk:
+                    return bytes(buffer), False
+                remaining = limit - len(buffer)
+                if len(chunk) > remaining:
+                    buffer.extend(chunk[:remaining])
+                    if stop_on_overflow:
+                        return bytes(buffer), True
+                else:
+                    buffer.extend(chunk)
+
+        async def drain_stream(stream: asyncio.StreamReader) -> None:
+            while await stream.read(64 * 1024):
+                pass
+
+        async def wait_for_exit(reap_timeout_seconds: float | None = None) -> int | None:
+            """Poll for the child exit so delivery never depends on watcher wakeups."""
+            loop = asyncio.get_running_loop()
+            deadline = None if reap_timeout_seconds is None else loop.time() + reap_timeout_seconds
+            while process.returncode is None:
+                if deadline is not None and loop.time() >= deadline:
+                    break
+                await asyncio.sleep(D2_EXIT_POLL_SECONDS)
+            return process.returncode
+
+        async def kill_and_wait(*tasks: asyncio.Future[Any]) -> None:
+            if process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(
+                drain_stream(stdout_stream),
+                drain_stream(stderr_stream),
+                return_exceptions=True,
+            )
+            await wait_for_exit(D2_EXIT_REAP_TIMEOUT_SECONDS)
+
+        async def collect() -> D2ProcessStatus:
+            nonlocal exit_code, stdout_bytes, stderr_bytes
+            stdin_task = asyncio.create_task(write_stdin())
+            stdout_task = asyncio.create_task(
+                read_stream(stdout_stream, limit=stdout_limit, stop_on_overflow=True)
+            )
+            stderr_task = asyncio.create_task(
+                read_stream(stderr_stream, limit=stderr_limit, stop_on_overflow=False)
+            )
+            stream_tasks = {stdout_task, stderr_task}
+            try:
+                while stream_tasks:
+                    done, stream_tasks = await asyncio.wait(
+                        stream_tasks, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if any(task.result()[1] for task in done):
+                        await kill_and_wait(stdin_task, stdout_task, stderr_task)
+                        exit_code = process.returncode
+                        stdout_bytes = stdout_task.result()[0]
+                        stderr_bytes = stderr_task.result()[0]
+                        return D2ProcessStatus.STDOUT_LIMIT
+                exit_code = await wait_for_exit()
+                stdout_bytes = stdout_task.result()[0]
+                stderr_bytes = stderr_task.result()[0]
+                if exit_code == 0:
+                    return D2ProcessStatus.SUCCEEDED
+                return D2ProcessStatus.NON_ZERO_EXIT
+            except asyncio.CancelledError:
+                await kill_and_wait(stdin_task, stdout_task, stderr_task)
+                exit_code = process.returncode
+                stdout_bytes = task_bytes(stdout_task)
+                stderr_bytes = task_bytes(stderr_task)
+                raise
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                status = await collect()
+        except TimeoutError:
+            return settle(
+                D2ProcessResult(D2ProcessStatus.TIMED_OUT, exit_code, stdout_bytes, stderr_bytes)
+            )
+        return settle(D2ProcessResult(status, exit_code, stdout_bytes, stderr_bytes))
+
+
+def _stderr_note(stderr: bytes) -> str:
+    text = stderr.decode("utf-8", errors="replace").strip()
+    if not text:
+        return ""
+    return f": {text[:512]}"
+
+
+def _raise_process_failure(result: D2ProcessResult) -> None:
+    if result.status is D2ProcessStatus.SUCCEEDED:
+        return
+    note = _stderr_note(result.stderr)
+    if result.status is D2ProcessStatus.FAILED_TO_START:
+        raise DiagramCompilerUnavailableError(f"d2 executable could not be started{note}")
+    if result.status is D2ProcessStatus.TIMED_OUT:
+        raise DiagramCompilerTimeoutError(
+            f"d2 exceeded the {D2_COMPILATION_TIMEOUT_SECONDS} second budget{note}"
+        )
+    if result.status is D2ProcessStatus.STDOUT_LIMIT:
+        raise DiagramCompilerOutputTooLargeError(
+            f"d2 stdout exceeded {D2_MAX_STDOUT_BYTES} bytes and was terminated{note}"
+        )
+    raise DiagramCompilerProcessError(f"d2 exited with code {result.exit_code}{note}")
+
+
+class D2DiagramCompiler:
+    """Compile canonical diagrams through a pinned, bounded D2 0.9.0 process."""
+
+    def __init__(self, runner: D2ProcessRunner | None = None) -> None:
+        self._runner: D2ProcessRunner = runner if runner is not None else AsyncioD2ProcessRunner()
+
+    async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+        await self._verify_version()
+        source_bytes = encode_d2_source(diagram)
+        result = await self._runner.run(
+            (
+                D2_COMPILER,
+                f"--layout={D2_LAYOUT}",
+                f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
+                "--omit-version",
+                f"--salt={diagram_semantic_sha256(diagram)}",
+                "--stdout-format=svg",
+                "-",
+                "-",
+            ),
+            stdin=source_bytes,
+            environment=d2_process_environment(),
+            timeout_seconds=float(D2_COMPILATION_TIMEOUT_SECONDS),
+            stdout_limit=D2_MAX_STDOUT_BYTES,
+            stderr_limit=D2_MAX_STDERR_BYTES,
+        )
+        _raise_process_failure(result)
+        return CompiledDiagram(
+            diagram_key=diagram.key,
+            source_format=D2_SOURCE_FORMAT,
+            source_bytes=source_bytes,
+            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            media_type=D2_MEDIA_TYPE,
+            media_bytes=result.stdout,
+            media_sha256=hashlib.sha256(result.stdout).hexdigest(),
+            compiler=D2_COMPILER,
+            compiler_version=D2_COMPILER_VERSION,
+            compiler_policy_version=D2_COMPILER_POLICY_VERSION,
+        )
+
+    async def _verify_version(self) -> None:
+        result = await self._runner.run(
+            (D2_COMPILER, "--version"),
+            stdin=b"",
+            environment=d2_process_environment(),
+            timeout_seconds=float(D2_COMPILATION_TIMEOUT_SECONDS),
+            stdout_limit=D2_MAX_STDOUT_BYTES,
+            stderr_limit=D2_MAX_STDERR_BYTES,
+        )
+        _raise_process_failure(result)
+        reported = result.stdout.decode("utf-8", errors="replace").strip().removeprefix("v")
+        if reported != D2_COMPILER_VERSION:
+            raise DiagramCompilerVersionError(
+                f"required d2 version {D2_COMPILER_VERSION}, reported {reported[:64]!r}"
+            )

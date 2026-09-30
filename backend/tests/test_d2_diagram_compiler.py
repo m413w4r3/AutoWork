@@ -1,11 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import fields, replace
+import asyncio
+import hashlib
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields, replace
 from uuid import UUID
 
 import pytest
 
-from cti_app.application.diagram_compilation import UnsupportedDiagramStructureError
+from cti_app.application.diagram_compilation import (
+    DiagramCompilerOutputTooLargeError,
+    DiagramCompilerProcessError,
+    DiagramCompilerTimeoutError,
+    DiagramCompilerUnavailableError,
+    DiagramCompilerVersionError,
+    UnsupportedDiagramStructureError,
+)
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
@@ -18,6 +30,10 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.infrastructure.d2_diagram_compiler import (
+    AsyncioD2ProcessRunner,
+    D2DiagramCompiler,
+    D2ProcessResult,
+    D2ProcessStatus,
     diagram_semantic_sha256,
     encode_d2_source,
 )
@@ -180,3 +196,342 @@ def test_rejects_ambiguous_or_empty_group_membership(
 
     with pytest.raises(UnsupportedDiagramStructureError):
         encode_d2_source(diagram)
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordedRun:
+    argv: tuple[str, ...]
+    stdin: bytes
+    environment: dict[str, str]
+    timeout_seconds: float
+    stdout_limit: int
+    stderr_limit: int
+
+
+class _ControlledRunner:
+    def __init__(self, *results: D2ProcessResult) -> None:
+        self._results = list(results)
+        self.calls: list[_RecordedRun] = []
+
+    async def run(
+        self,
+        argv: Sequence[str],
+        *,
+        stdin: bytes,
+        environment: Mapping[str, str],
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> D2ProcessResult:
+        self.calls.append(
+            _RecordedRun(
+                tuple(argv), stdin, dict(environment), timeout_seconds, stdout_limit, stderr_limit
+            )
+        )
+        assert self._results, "unexpected D2 process invocation"
+        return self._results.pop(0)
+
+
+def _version_result(reported: bytes = b"0.9.0\n") -> D2ProcessResult:
+    return D2ProcessResult(D2ProcessStatus.SUCCEEDED, 0, reported, b"")
+
+
+def _svg_result(stdout: bytes = b"<svg></svg>\n") -> D2ProcessResult:
+    return D2ProcessResult(D2ProcessStatus.SUCCEEDED, 0, stdout, b"")
+
+
+def _assert_minimal_environment(environment: Mapping[str, str]) -> None:
+    assert sorted(environment) == ["LANG", "LC_ALL", "PATH"]
+    assert environment["LANG"] == environment["LC_ALL"] == "C.UTF-8"
+    assert environment["PATH"] == os.environ.get("PATH", os.defpath)
+
+
+def _test_environment() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+    }
+
+
+async def test_compile_pins_version_render_argv_environment_and_limits() -> None:
+    runner = _ControlledRunner(_version_result(), _svg_result())
+    diagram = _diagram()
+
+    compiled = await D2DiagramCompiler(runner=runner).compile(diagram)
+
+    assert len(runner.calls) == 2
+    version_call, render_call = runner.calls
+    assert version_call.argv == ("d2", "--version")
+    assert version_call.stdin == b""
+    assert render_call.argv == (
+        "d2",
+        "--layout=dagre",
+        "--timeout=10",
+        "--omit-version",
+        f"--salt={diagram_semantic_sha256(diagram)}",
+        "--stdout-format=svg",
+        "-",
+        "-",
+    )
+    assert render_call.stdin == encode_d2_source(diagram)
+    for call in (version_call, render_call):
+        assert call.timeout_seconds <= 10
+        assert call.stdout_limit == 2 * 1024 * 1024
+        assert call.stderr_limit == 64 * 1024
+        _assert_minimal_environment(call.environment)
+
+    assert compiled.diagram_key == "diagram-main"
+    assert compiled.source_format == "d2"
+    assert compiled.source_bytes == encode_d2_source(diagram)
+    assert compiled.source_sha256 == hashlib.sha256(encode_d2_source(diagram)).hexdigest()
+    assert compiled.media_type == "image/svg+xml"
+    assert compiled.media_bytes == b"<svg></svg>\n"
+    assert compiled.media_sha256 == hashlib.sha256(b"<svg></svg>\n").hexdigest()
+    assert compiled.compiler == "d2"
+    assert compiled.compiler_version == "0.9.0"
+    assert compiled.compiler_policy_version == "diagram-d2-svg-v1"
+
+
+async def test_compile_ignores_d2_and_home_environment_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("D2_LAYOUT", "elk")
+    monkeypatch.setenv("D2_SALT", "attacker")
+    monkeypatch.setenv("D2_THEME", "0")
+    monkeypatch.setenv("HOME", "/home/attacker")
+    runner = _ControlledRunner(_version_result(), _svg_result())
+
+    await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert len(runner.calls) == 2
+    for call in runner.calls:
+        _assert_minimal_environment(call.environment)
+        assert not any(key.startswith("D2_") for key in call.environment)
+        assert "HOME" not in call.environment
+
+
+@pytest.mark.parametrize("reported", (b"0.9.0", b"0.9.0\n", b"v0.9.0\n"))
+async def test_version_probe_accepts_optional_v_prefix(reported: bytes) -> None:
+    runner = _ControlledRunner(_version_result(reported), _svg_result())
+
+    compiled = await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert compiled.compiler_version == "0.9.0"
+    assert len(runner.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "reported", (b"", b"0.8.0", b"v0.9.1", b"0.9.0\n0.9.0\n", b"d2 version 0.9.0")
+)
+async def test_version_probe_rejects_any_other_version(reported: bytes) -> None:
+    runner = _ControlledRunner(_version_result(reported))
+
+    with pytest.raises(DiagramCompilerVersionError):
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert len(runner.calls) == 1
+
+
+async def test_missing_binary_maps_to_compiler_unavailable() -> None:
+    runner = _ControlledRunner(D2ProcessResult(D2ProcessStatus.FAILED_TO_START, None, b"", b""))
+
+    with pytest.raises(DiagramCompilerUnavailableError):
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert len(runner.calls) == 1
+
+
+async def test_compilation_timeout_maps_to_typed_timeout() -> None:
+    runner = _ControlledRunner(
+        _version_result(),
+        D2ProcessResult(D2ProcessStatus.TIMED_OUT, -9, b"<svg>partial", b"still running"),
+    )
+
+    with pytest.raises(DiagramCompilerTimeoutError) as error:
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert "still running" in str(error.value)
+
+
+async def test_non_zero_exit_never_yields_partial_stdout() -> None:
+    runner = _ControlledRunner(
+        _version_result(),
+        D2ProcessResult(D2ProcessStatus.NON_ZERO_EXIT, 2, b"<svg>partial</svg>", b"render failed"),
+    )
+
+    with pytest.raises(DiagramCompilerProcessError) as error:
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+    assert "render failed" in str(error.value)
+
+
+async def test_stdout_overflow_maps_to_output_too_large() -> None:
+    runner = _ControlledRunner(
+        _version_result(),
+        D2ProcessResult(D2ProcessStatus.STDOUT_LIMIT, -9, b"x" * 16, b""),
+    )
+
+    with pytest.raises(DiagramCompilerOutputTooLargeError):
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
+
+
+async def test_salt_is_deterministic_and_key_sensitive() -> None:
+    runner = _ControlledRunner(_version_result(), _svg_result(), _version_result(), _svg_result())
+    compiler = D2DiagramCompiler(runner=runner)
+    first = _diagram()
+    second = replace(first, key="diagram-other")
+
+    await compiler.compile(first)
+    await compiler.compile(second)
+
+    first_salt, second_salt = runner.calls[1].argv[4], runner.calls[3].argv[4]
+    assert first_salt == f"--salt={diagram_semantic_sha256(first)}"
+    assert second_salt == f"--salt={diagram_semantic_sha256(second)}"
+    assert first_salt != second_salt
+
+
+class _FakeStdin:
+    def __init__(self) -> None:
+        self.received = bytearray()
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.received.extend(data)
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closed = True
+
+
+async def test_runner_creation_uses_direct_exec_with_pipes_and_no_shell(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _CapturedProcess:
+        returncode = 0
+
+        def __init__(self) -> None:
+            self.stdin = _FakeStdin()
+            self.stdout = asyncio.StreamReader()
+            self.stderr = asyncio.StreamReader()
+
+        def kill(self) -> None:
+            raise AssertionError("a healthy process must not be killed")
+
+        async def wait(self) -> int:
+            return 0
+
+    process = _CapturedProcess()
+    process.stdout.feed_eof()
+    process.stderr.feed_eof()
+
+    async def _create_subprocess_exec(*argv: str, **kwargs: object) -> _CapturedProcess:
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _create_subprocess_exec)
+
+    result = await AsyncioD2ProcessRunner().run(
+        ("d2", "--version"),
+        stdin=b"",
+        environment=_test_environment(),
+        timeout_seconds=1,
+        stdout_limit=128,
+        stderr_limit=64,
+    )
+
+    assert result.status is D2ProcessStatus.SUCCEEDED
+    assert result.exit_code == 0
+    assert captured["argv"] == ("d2", "--version")
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert set(kwargs) == {"stdin", "stdout", "stderr", "env"}
+    assert kwargs["stdin"] is asyncio.subprocess.PIPE
+    assert kwargs["stdout"] is asyncio.subprocess.PIPE
+    assert kwargs["stderr"] is asyncio.subprocess.PIPE
+    assert kwargs["env"] == _test_environment()
+    assert process.stdin.received == b""
+    assert process.stdin.closed is True
+
+
+async def test_runner_streams_stdin_and_truncates_stderr() -> None:
+    script = (
+        "import sys; data = sys.stdin.buffer.read(); sys.stdout.buffer.write(data[::-1]); "
+        "sys.stderr.write('e' * 4096)"
+    )
+
+    result = await AsyncioD2ProcessRunner().run(
+        (sys.executable, "-c", script),
+        stdin=b"payload",
+        environment=_test_environment(),
+        timeout_seconds=10,
+        stdout_limit=1024,
+        stderr_limit=64,
+    )
+
+    assert result.status is D2ProcessStatus.SUCCEEDED
+    assert result.exit_code == 0
+    assert result.stdout == b"daolyap"
+    assert len(result.stderr) == 64
+
+
+async def test_runner_terminates_process_on_stdout_overflow() -> None:
+    script = "import sys; sys.stdout.write('x' * (2 * 1024 * 1024))"
+
+    result = await AsyncioD2ProcessRunner().run(
+        (sys.executable, "-c", script),
+        stdin=b"",
+        environment=_test_environment(),
+        timeout_seconds=10,
+        stdout_limit=4096,
+        stderr_limit=64,
+    )
+
+    assert result.status is D2ProcessStatus.STDOUT_LIMIT
+    assert len(result.stdout) == 4096
+    assert result.exit_code is not None
+
+
+async def test_runner_terminates_process_on_timeout() -> None:
+    script = "import sys, time; sys.stdin.buffer.read(); time.sleep(30)"
+
+    result = await AsyncioD2ProcessRunner().run(
+        (sys.executable, "-c", script),
+        stdin=b"input",
+        environment=_test_environment(),
+        timeout_seconds=0.25,
+        stdout_limit=1024,
+        stderr_limit=64,
+    )
+
+    assert result.status is D2ProcessStatus.TIMED_OUT
+    assert result.exit_code is not None
+
+
+async def test_runner_reports_non_zero_exit_and_missing_executable() -> None:
+    failed = await AsyncioD2ProcessRunner().run(
+        (sys.executable, "-c", "raise SystemExit(3)"),
+        stdin=b"",
+        environment=_test_environment(),
+        timeout_seconds=10,
+        stdout_limit=64,
+        stderr_limit=64,
+    )
+    assert failed.status is D2ProcessStatus.NON_ZERO_EXIT
+    assert failed.exit_code == 3
+
+    missing = await AsyncioD2ProcessRunner().run(
+        ("d2-binary-that-does-not-exist", "--version"),
+        stdin=b"",
+        environment=_test_environment(),
+        timeout_seconds=1,
+        stdout_limit=64,
+        stderr_limit=64,
+    )
+    assert missing.status is D2ProcessStatus.FAILED_TO_START
+    assert missing.exit_code is None
