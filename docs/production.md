@@ -238,8 +238,8 @@ source. `rendered_blob_id` peut contenir un aperçu Markdown déterministe optio
 
 ### EDITORIAL_ENRICHMENT : contrat canonique AW-015
 
-`EditorialEnrichmentV1` décrit les intentions de tables, diagrammes et figures sources sans
-syntaxe de renderer ni média dérivé. Les cellules de table, nodes et edges portent des références
+`EditorialEnrichmentV1` est le contrat sémantique canonique : il décrit les intentions de tables,
+diagrammes et figures sources sans syntaxe de renderer ni média dérivé. Les cellules de table, nodes et edges portent des références
 d’évidence appartenant à l’extraction courante. Les figures désignent un `source_document_id`
 canonique et son URL exacte. Les placements par section sont liés au hash exact de la synthèse.
 
@@ -252,7 +252,7 @@ interdit la soumission ne produit jamais un enrichissement vide artificiel.
 
 Aucun langage de renderer ni locator d’image source n’est généré par le modèle. AW-016 ne réalise
 pas de recherche web et garde `source_figures` vide ; leur inventaire et validation sont différés à
-AW-017. L’appel est stateless, sans recherche web ni conversation. L’artifact versionné conserve
+AW-017b. L’appel est stateless, sans recherche web ni conversation. L’artifact versionné conserve
 la provenance `ModelRun`, le RAW fournisseur disponible et les hashes fonctionnels du pack de
 preuves et de la politique d’accès. Une nouvelle version invalide `PUBLICATION`. Le stage peut
 consommer au plus un appel modèle ; un reuse exact ou un artifact vérifié déjà présent n’en coûte
@@ -266,6 +266,19 @@ l’enrichissement courant est rebasé tel quel sur la nouvelle lignée extracti
 toutes ses preuves citées subsistent. Sinon, la réparation devient `retry_required` depuis
 `editorial_enrichment`.
 
+### AW-017a : compilation déterministe des diagrammes
+
+`DiagramSpecV1`, contenu sémantique canonique d’`EditorialEnrichmentV1`, peut être compilé de façon
+déterministe en source D2 puis en SVG par le compiler D2 0.9.0. D2 et le SVG sont des médias dérivés,
+pas des artifacts canoniques. Cette capacité de compilation n’est ni un `ProductionStage` ni un
+`ProductionArtifactStage` et ne modifie donc pas le graphe ni la table canoniques ci-dessus.
+
+À ce stade, le SVG n’est pas persisté, n’est pas relié à `EditorialEnrichmentService`, n’est pas
+injecté dans `PublicationDocumentV3` et n’est pas consommé par Assembly. L’inventaire des figures
+sources reste AW-017b ; la résolution des médias et leur persistance content-addressed restent
+AW-017c ; la projection dans `PublicationDocumentV4` reste AW-018. AW-017a conserve le rôle actuel
+de Pandoc.
+
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
 l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
 chronologie et les incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction.
@@ -276,8 +289,9 @@ QA recalcule la projection canonique et compare le document exact. L'artifact `P
 conserve le document canonique, sans rendu. Un futur pipeline de rendu indépendant pourra le
 consommer.
 
-AW-016 remplacera la génération vide par des propositions structurées. AW-017 résoudra les
-médias et compilera les diagrammes. AW-018 projettera l’enrichissement dans
+AW-016 a remplacé la génération vide par des propositions structurées. AW-017a fournit la
+compilation dérivée des diagrammes ; AW-017b inventorie les figures sources et AW-017c résout et
+persiste les médias. AW-018 projettera l’enrichissement et les médias résolus dans
 `PublicationDocumentV4`.
 
 ## ProductionBoard
