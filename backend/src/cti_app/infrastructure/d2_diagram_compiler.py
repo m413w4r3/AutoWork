@@ -6,14 +6,17 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
+from xml.etree import ElementTree
 
 from cti_app.application.diagram_compilation import (
     CompiledDiagram,
+    DiagramCompilerOutputInvalidError,
     DiagramCompilerOutputTooLargeError,
     DiagramCompilerProcessError,
     DiagramCompilerTimeoutError,
@@ -39,6 +42,27 @@ D2_MAX_STDERR_BYTES = 64 * 1024
 D2_PROCESS_LOCALE = "C.UTF-8"
 D2_EXIT_POLL_SECONDS = 0.01
 D2_EXIT_REAP_TIMEOUT_SECONDS = 5.0
+_CSS_URL = re.compile(
+    r"""url\s*\(\s*(?:(?P<quote>["'])(?P<quoted>(?:\\.|(?!(?P=quote)).)*)(?P=quote)|(?P<bare>[^)\s"'(]*))\s*\)""",
+    re.IGNORECASE | re.DOTALL,
+)
+_CSS_PRESENTATION_ATTRIBUTES = frozenset(
+    {
+        "clip-path",
+        "color-profile",
+        "cursor",
+        "fill",
+        "filter",
+        "marker",
+        "marker-end",
+        "marker-mid",
+        "marker-start",
+        "mask",
+        "shape-inside",
+        "shape-subtract",
+        "stroke",
+    }
+)
 
 _D2_DIRECTION_BY_V1 = {
     EnrichmentDiagramDirection.LEFT_TO_RIGHT: "right",
@@ -378,6 +402,106 @@ def _raise_process_failure(result: D2ProcessResult) -> None:
     raise DiagramCompilerProcessError(f"d2 exited with code {result.exit_code}{note}")
 
 
+def _css_url_targets(css: str) -> Sequence[str]:
+    targets: list[str] = []
+    index = 0
+    while index < len(css):
+        if css.startswith("/*", index):
+            comment_end = css.find("*/", index + 2)
+            if comment_end == -1:
+                break
+            index = comment_end + 2
+            continue
+        if css[index] in {"'", '"'}:
+            quote = css[index]
+            index += 1
+            while index < len(css):
+                if css[index] == "\\":
+                    index += 2
+                elif css[index] == quote:
+                    index += 1
+                    break
+                else:
+                    index += 1
+            continue
+        if css[index] == "\\":
+            raise DiagramCompilerOutputInvalidError("D2 SVG contains an unsupported CSS escape")
+        if css[index : index + 3].lower() == "url" and (
+            index == 0 or not (css[index - 1].isalnum() or css[index - 1] in "_-\\")
+        ):
+            match = _CSS_URL.match(css, index)
+            if match is not None:
+                targets.append((match.group("quoted") or match.group("bare") or "").strip())
+                index = match.end()
+                continue
+            after_name = index + 3
+            while after_name < len(css):
+                if css[after_name].isspace():
+                    after_name += 1
+                elif css.startswith("/*", after_name):
+                    comment_end = css.find("*/", after_name + 2)
+                    if comment_end == -1:
+                        after_name = len(css)
+                    else:
+                        after_name = comment_end + 2
+                else:
+                    break
+            if after_name < len(css) and css[after_name] == "(":
+                raise DiagramCompilerOutputInvalidError(
+                    "D2 SVG contains an invalid CSS url() reference"
+                )
+        index += 1
+    return targets
+
+
+class _SvgTreeBuilder(ElementTree.TreeBuilder):
+    def doctype(self, name: str, pubid: str | None, system: str | None) -> None:
+        raise DiagramCompilerOutputInvalidError("D2 SVG must not contain a document type")
+
+
+def _xml_local_name(name: str) -> str:
+    return name.rsplit("}", 1)[-1]
+
+
+def _validate_resource_target(target: str) -> None:
+    if not target.strip().startswith("#"):
+        raise DiagramCompilerOutputInvalidError("D2 SVG contains a non-fragment resource reference")
+
+
+def validate_d2_svg(svg_bytes: bytes) -> None:
+    """Reject invalid, unsafe, or unbounded D2 SVG output."""
+    if not svg_bytes:
+        raise DiagramCompilerOutputInvalidError("D2 SVG output is empty")
+    if len(svg_bytes) > D2_MAX_STDOUT_BYTES:
+        raise DiagramCompilerOutputTooLargeError(
+            f"D2 SVG output exceeded {D2_MAX_STDOUT_BYTES} bytes"
+        )
+    try:
+        root = ElementTree.fromstring(
+            svg_bytes, parser=ElementTree.XMLParser(target=_SvgTreeBuilder())
+        )
+    except ElementTree.ParseError as exc:
+        raise DiagramCompilerOutputInvalidError("D2 SVG output is not valid XML") from exc
+    if _xml_local_name(root.tag) != "svg":
+        raise DiagramCompilerOutputInvalidError("D2 SVG root element is not svg")
+
+    for element in root.iter():
+        name = _xml_local_name(element.tag)
+        if name in {"script", "foreignObject"}:
+            raise DiagramCompilerOutputInvalidError(f"D2 SVG contains a forbidden {name} element")
+        for attribute, value in element.attrib.items():
+            attribute_name = _xml_local_name(attribute)
+            is_xml_base = attribute == "{http://www.w3.org/XML/1998/namespace}base"
+            if attribute_name in {"href", "src"} or is_xml_base:
+                _validate_resource_target(value)
+            if attribute_name == "style" or attribute_name.lower() in _CSS_PRESENTATION_ATTRIBUTES:
+                for target in _css_url_targets(value):
+                    _validate_resource_target(target)
+        if name == "style":
+            for target in _css_url_targets(element.text or ""):
+                _validate_resource_target(target)
+
+
 class D2DiagramCompiler:
     """Compile canonical diagrams through a pinned, bounded D2 0.9.0 process."""
 
@@ -405,6 +529,7 @@ class D2DiagramCompiler:
             stderr_limit=D2_MAX_STDERR_BYTES,
         )
         _raise_process_failure(result)
+        validate_d2_svg(result.stdout)
         return CompiledDiagram(
             diagram_key=diagram.key,
             source_format=D2_SOURCE_FORMAT,

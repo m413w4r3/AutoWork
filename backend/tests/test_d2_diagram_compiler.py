@@ -11,6 +11,7 @@ from uuid import UUID
 import pytest
 
 from cti_app.application.diagram_compilation import (
+    DiagramCompilerOutputInvalidError,
     DiagramCompilerOutputTooLargeError,
     DiagramCompilerProcessError,
     DiagramCompilerTimeoutError,
@@ -36,6 +37,7 @@ from cti_app.infrastructure.d2_diagram_compiler import (
     D2ProcessStatus,
     diagram_semantic_sha256,
     encode_d2_source,
+    validate_d2_svg,
 )
 
 _EVIDENCE = ExtractionEvidenceRefV1(
@@ -254,6 +256,49 @@ def _test_environment() -> dict[str, str]:
     }
 
 
+@pytest.mark.parametrize(
+    "svg_bytes",
+    (
+        b"",
+        b"<svg>",
+        b"<html />",
+        b"<svg><script /></svg>",
+        b'<svg xmlns="urn:root"><x:script xmlns:x="urn:child" /></svg>',
+        b'<svg xmlns="urn:root"><x:foreignObject xmlns:x="urn:child" /></svg>',
+        b'<svg><image href="http://example.invalid/image.png" /></svg>',
+        b'<svg><image href="https://example.invalid/image.png" /></svg>',
+        b'<svg><image href="file:///tmp/image.png" /></svg>',
+        b'<svg><image href="images/image.png" /></svg>',
+        b'<svg><image href="/tmp/image.png" /></svg>',
+        b'<svg><image src="data:image/png;base64,AAAA" /></svg>',
+        b'<svg><rect style="fill: url(https://example.invalid/p.svg#x)" /></svg>',
+        b'<svg><rect fill="url(#x)" filter="url(../filter.svg#x)" /></svg>',
+        b"<svg><style>.shape { fill: url(file:///tmp/paint.svg#x) }</style></svg>",
+        b'<!DOCTYPE svg [<!ENTITY label "unsafe">]><svg>&label;</svg>',
+    ),
+)
+def test_validate_d2_svg_rejects_invalid_or_external_output(svg_bytes: bytes) -> None:
+    with pytest.raises(DiagramCompilerOutputInvalidError):
+        validate_d2_svg(svg_bytes)
+
+
+def test_validate_d2_svg_accepts_fragment_references_and_url_like_text() -> None:
+    svg_bytes = (
+        b'<svg xmlns="urn:svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
+        b'<use xlink:href="#local-id" />'
+        b"<rect style=\"fill: url('#local-id')\" />"
+        b"<text>https://example.invalid file: /tmp/image.svg #local-id</text>"
+        b"</svg>"
+    )
+
+    validate_d2_svg(svg_bytes)
+
+
+def test_validate_d2_svg_rejects_output_over_two_mib() -> None:
+    with pytest.raises(DiagramCompilerOutputTooLargeError):
+        validate_d2_svg(b" " * (2 * 1024 * 1024 + 1))
+
+
 async def test_compile_pins_version_render_argv_environment_and_limits() -> None:
     runner = _ControlledRunner(_version_result(), _svg_result())
     diagram = _diagram()
@@ -291,6 +336,15 @@ async def test_compile_pins_version_render_argv_environment_and_limits() -> None
     assert compiled.compiler == "d2"
     assert compiled.compiler_version == "0.9.0"
     assert compiled.compiler_policy_version == "diagram-d2-svg-v1"
+
+
+async def test_compile_rejects_invalid_svg_after_successful_process() -> None:
+    runner = _ControlledRunner(
+        _version_result(), _svg_result(b'<svg><image href="/tmp/x" /></svg>')
+    )
+
+    with pytest.raises(DiagramCompilerOutputInvalidError):
+        await D2DiagramCompiler(runner=runner).compile(_diagram())
 
 
 async def test_compile_ignores_d2_and_home_environment_configuration(
