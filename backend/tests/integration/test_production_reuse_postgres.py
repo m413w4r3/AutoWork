@@ -33,6 +33,11 @@ from cti_app.application.model_gateway import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_empty_editorial_enrichment,
+    compute_editorial_enrichment_input_hash,
+    validate_editorial_enrichment,
+)
 from cti_app.application.production_extraction import (
     extraction_input_hash,
     references_corpus_hash,
@@ -40,6 +45,7 @@ from cti_app.application.production_extraction import (
 from cti_app.application.production_legacy_assembly import LegacyPublicationAssemblyService
 from cti_app.application.production_parsers import Q2FactProposal, Q2SourceOutput
 from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     SynthesisClaimProposalV1,
     SynthesisProposalV1,
@@ -104,12 +110,16 @@ from cti_app.domain.production import (
     SourceExtraction,
     SourceExtractionStatus,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    editorial_enrichment_from_json,
+)
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionEventV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -130,6 +140,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionV1,
     SynthesisTimelineEntryV1,
     extraction_evidence_refs_v1,
+    production_synthesis_from_json,
     production_synthesis_to_json,
 )
 from cti_app.domain.selection import (
@@ -863,6 +874,73 @@ async def _store_canonical_first_pass(
     )
 
 
+async def _store_empty_enrichment(
+    uow_factory: UnitOfWorkFactory,
+    store: ProductionArtifactStore,
+    *,
+    run_id: UUID,
+    subject_id: UUID,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> ProductionArtifact:
+    enrichment = build_empty_editorial_enrichment(
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+    return await EditorialEnrichmentService(uow_factory, store).store_editorial_enrichment_result(
+        run_id=run_id,
+        subject_id=subject_id,
+        input_hash=compute_editorial_enrichment_input_hash(
+            extraction=extraction,
+            synthesis=synthesis,
+        ),
+        enrichment=enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+
+
+async def _assert_enrichment_lineage(
+    store: ProductionArtifactStore,
+    artifacts: dict[ProductionArtifactStage, ProductionArtifact],
+    *,
+    run_id: UUID,
+    subject_id: UUID,
+) -> None:
+    enrichment_artifact = artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+    extraction_artifact = artifacts[ProductionArtifactStage.EXTRACTION]
+    synthesis_artifact = artifacts[ProductionArtifactStage.SYNTHESIS]
+    assert enrichment_artifact.production_run_id == run_id
+    assert enrichment_artifact.subject_id == subject_id
+    assert enrichment_artifact.status is ProductionArtifactStatus.VERIFIED
+    assert enrichment_artifact.reused_from_artifact_id is None
+    assert enrichment_artifact.raw_blob_id is None
+    assert enrichment_artifact.rendered_blob_id is None
+    assert enrichment_artifact.canonical_blob_id is not None
+    assert extraction_artifact.canonical_blob_id is not None
+    assert synthesis_artifact.canonical_blob_id is not None
+
+    extraction = production_extraction_from_json(
+        await store.read_json(extraction_artifact.canonical_blob_id)
+    )
+    synthesis = production_synthesis_from_json(
+        await store.read_json(synthesis_artifact.canonical_blob_id)
+    )
+    enrichment = editorial_enrichment_from_json(
+        await store.read_json(enrichment_artifact.canonical_blob_id)
+    )
+    validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+    assert enrichment.subject_id == subject_id
+    assert enrichment.production_input_hash == synthesis.production_input_hash
+    assert enrichment_artifact.input_hash == compute_editorial_enrichment_input_hash(
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    assert enrichment_artifact.metadata["extraction_hash"] == enrichment.extraction_hash
+    assert enrichment_artifact.metadata["synthesis_hash"] == enrichment.synthesis_hash
+
+
 async def _seed_reusable_article(
     uow_factory: UnitOfWorkFactory,
     store: ProductionArtifactStore,
@@ -947,6 +1025,15 @@ async def _seed_reusable_article(
         for artifact in source_artifacts.values():
             await uow.production_artifacts.append(artifact)
         await uow.commit()
+
+    source_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT] = await _store_empty_enrichment(
+        uow_factory,
+        store,
+        run_id=source_run.id,
+        subject_id=subject.id,
+        extraction=first_pass.extraction,
+        synthesis=synthesis,
+    )
 
     publication = await LegacyPublicationAssemblyService(uow_factory, store).assemble_publication(
         run_id=source_run.id,
@@ -1284,6 +1371,15 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             await uow.production_artifacts.append(artifact)
         await uow.commit()
 
+    source_enrichment_artifact = await _store_empty_enrichment(
+        uow_factory,
+        store,
+        run_id=run_a.id,
+        subject_id=subject.id,
+        extraction=first_pass.extraction,
+        synthesis=synthesis,
+    )
+
     assembly = LegacyPublicationAssemblyService(uow_factory, store)
     assembly_inputs = (
         source_artifacts[ProductionArtifactStage.REFERENCES],
@@ -1359,6 +1455,11 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             await production.advance_stage(run_b.id)
 
     await production.advance_stage(run_b.id)
+    enrichment_result = await orchestrator.execute_stage(
+        run_b.id, ProductionStage.EDITORIAL_ENRICHMENT
+    )
+    assert enrichment_result["status"] == "success"
+    await production.advance_stage(run_b.id)
     assembly_result = await orchestrator.execute_stage(run_b.id, ProductionStage.ASSEMBLY)
     assert assembly_result["status"] == "success"
 
@@ -1370,6 +1471,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         persisted_b = await uow.production_runs.get(run_b.id)
     assert persisted_b is not None
     assert persisted_b.status is ProductionRunStatus.READY
+    assert source_enrichment_artifact.status is ProductionArtifactStatus.VERIFIED
     for stage, source_artifact in source_artifacts.items():
         reused = artifacts_b[stage]
         assert reused.id != source_artifact.id
@@ -1377,6 +1479,12 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         assert reused.reused_from_artifact_id == source_artifact.id
         assert reused.canonical_blob_id == source_artifact.canonical_blob_id
         assert reused.rendered_blob_id == source_artifact.rendered_blob_id
+    await _assert_enrichment_lineage(
+        store,
+        artifacts_b,
+        run_id=run_b.id,
+        subject_id=subject.id,
+    )
     publication_b = artifacts_b[ProductionArtifactStage.PUBLICATION]
     assert publication_b.production_run_id == run_b.id
     assert publication_b.status is ProductionArtifactStatus.VERIFIED
@@ -1389,7 +1497,12 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert retry.run.current_stage is ProductionStage.EXTRACTION
     assert retry.run.pipeline_generation == persisted_b.pipeline_generation + 1
     assert retry.run.force_recompute_from_stage is ProductionStage.EXTRACTION
-    assert retry.staled_artifacts == ["extraction", "synthesis", "publication"]
+    assert retry.staled_artifacts == [
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+        "publication",
+    ]
 
     async with uow_factory() as uow:
         stale_artifacts = {
@@ -1405,6 +1518,10 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     )
     assert (
         stale_artifacts[ProductionArtifactStage.SYNTHESIS].status is ProductionArtifactStatus.STALE
+    )
+    assert (
+        stale_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT].status
+        is ProductionArtifactStatus.STALE
     )
     assert (
         stale_artifacts[ProductionArtifactStage.PUBLICATION].status
@@ -1447,6 +1564,11 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert synthesis_technical_replay["status"] == "cached"
     assert len(retry_adapter.calls) == 2
     await production.advance_stage(run_b.id)
+    enrichment_retry = await retry_orchestrator.execute_stage(
+        run_b.id, ProductionStage.EDITORIAL_ENRICHMENT
+    )
+    assert enrichment_retry["status"] == "success"
+    await production.advance_stage(run_b.id)
     retry_assembly = await retry_orchestrator.execute_stage(run_b.id, ProductionStage.ASSEMBLY)
     assert retry_assembly["status"] == "success"
 
@@ -1467,8 +1589,17 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert artifacts_b[ProductionArtifactStage.SYNTHESIS].id != (
         stale_artifacts[ProductionArtifactStage.SYNTHESIS].id
     )
+    assert artifacts_b[ProductionArtifactStage.EDITORIAL_ENRICHMENT].id != (
+        stale_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT].id
+    )
     assert artifacts_b[ProductionArtifactStage.EXTRACTION].reused_from_artifact_id is None
     assert artifacts_b[ProductionArtifactStage.SYNTHESIS].reused_from_artifact_id is None
+    await _assert_enrichment_lineage(
+        store,
+        artifacts_b,
+        run_id=run_b.id,
+        subject_id=subject.id,
+    )
     publication_b = artifacts_b[ProductionArtifactStage.PUBLICATION]
     assert publication_b.production_run_id == run_b.id
     assert publication_b.status is ProductionArtifactStatus.VERIFIED
@@ -1535,6 +1666,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         await uow.commit()
 
     source_publications: list[ProductionArtifact] = []
+    source_enrichments: list[ProductionArtifact] = []
     prepared_articles: list[tuple[DiscoveryBatch, SourceCandidate]] = []
     for subject, title in zip(subjects, ("Article A", "Article B"), strict=True):
         prepared_articles.append(
@@ -1558,7 +1690,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     for subject, title, (article_batch, source) in zip(
         subjects, ("Article A", "Article B"), prepared_articles, strict=True
     ):
-        _source_run, _, source_publication = await _seed_reusable_article(
+        _source_run, source_artifacts, source_publication = await _seed_reusable_article(
             uow_factory,
             store,
             edition=edition,
@@ -1568,6 +1700,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
             source=source,
         )
         source_publications.append(source_publication)
+        source_enrichments.append(source_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT])
 
     batch_service = ProductionBatchService(uow_factory)
     created = await batch_service.create(
@@ -1607,6 +1740,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         artifact_store=store,
     )
     cached_results: list[dict[str, object]] = []
+    enrichment_results: list[dict[str, object]] = []
 
     async def execute_cached(run_id: UUID) -> None:
         await SubjectProductionService(uow_factory).advance_stage(run_id)
@@ -1621,6 +1755,12 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
             if stage is not ProductionStage.SYNTHESIS:
                 await SubjectProductionService(uow_factory).advance_stage(run_id)
         await SubjectProductionService(uow_factory).advance_stage(run_id)
+        enrichment_result = await orchestrator.execute_stage(
+            run_id, ProductionStage.EDITORIAL_ENRICHMENT
+        )
+        enrichment_results.append(enrichment_result)
+        assert enrichment_result["status"] == "success"
+        await SubjectProductionService(uow_factory).advance_stage(run_id)
         assembly_result = await orchestrator.execute_stage(run_id, ProductionStage.ASSEMBLY)
         assert assembly_result["status"] == "success"
 
@@ -1632,14 +1772,17 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     await execute_cached(second.id)
     assert await batch_service.on_subject_terminal(batch.id, second.id) is None
     assert len(cached_results) == 6
+    assert len(enrichment_results) == 2
     assert sentinel.calls == 0
 
     async with uow_factory() as uow:
         persisted_edition = await uow.editions.get(edition.id)
         review_rows = await uow.edition_review_read_model.list_for_edition(edition.id)
         target_publications = []
+        target_artifact_sets = []
         for row in review_rows:
             artifacts = await uow.production_artifacts.list_for_run(row.run_id)
+            target_artifact_sets.append({artifact.stage: artifact for artifact in artifacts})
             target_publications.append(
                 next(
                     artifact
@@ -1655,6 +1798,20 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     assert [artifact.id for artifact in target_publications] != [
         publication.id for publication in source_publications
     ]
+    target_enrichments = [
+        artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+        for artifacts in target_artifact_sets
+    ]
+    assert [artifact.id for artifact in target_enrichments] != [
+        artifact.id for artifact in source_enrichments
+    ]
+    for run, artifacts in zip((first, second), target_artifact_sets, strict=True):
+        await _assert_enrichment_lineage(
+            store,
+            artifacts,
+            run_id=run.id,
+            subject_id=run.subject_id,
+        )
 
     accepted = await EditionPublicationService(uow_factory, store).accept(
         edition.id, actor_id="reviewer", correlation_id="two-article-cached-smoke"

@@ -258,10 +258,11 @@ async def test_complete_production_pipeline_reaches_ready(
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
         ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     }
     assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
-    assert [by_stage[stage].version for stage in by_stage] == [1, 1, 1, 1]
+    assert [by_stage[stage].version for stage in by_stage] == [1, 1, 1, 1, 1]
     assert all(len(artifact.input_hash) == 64 for artifact in artifacts)
     assert by_stage[ProductionArtifactStage.REFERENCES].metadata["warnings"] == []
     assert by_stage[ProductionArtifactStage.EXTRACTION].metadata["warnings"] == []

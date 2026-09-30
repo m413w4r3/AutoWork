@@ -13,7 +13,7 @@ from cti_app.application.edition_workspace import (
     EditionWorkspaceMaterializer,
     safe_slug,
 )
-from cti_app.application.production_state import ProductionStateError, ProductionStateSnapshotV4
+from cti_app.application.production_state import ProductionStateError, ProductionStateSnapshotV5
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
@@ -27,11 +27,11 @@ def _state(
     reference_hash: str = "a" * 64,
     extraction_hash: str = "b" * 64,
     synthesis_hash: str = "c" * 64,
-) -> ProductionStateSnapshotV4:
-    return ProductionStateSnapshotV4.model_validate(
+) -> ProductionStateSnapshotV5:
+    return ProductionStateSnapshotV5.model_validate(
         {
             "format": "autowork.production-state",
-            "schema_version": 4,
+            "schema_version": 5,
             "exported_at": "2026-08-29T10:00:00Z",
             "origin": {
                 "subject_title": "Sujet / à vérifier",
@@ -47,7 +47,11 @@ def _state(
                     "input_hash": extraction_hash,
                     "canonical_content": {"items": []},
                 },
-                "synthesis": {"input_hash": synthesis_hash, "rendered_content": "Article"},
+                "synthesis": {"input_hash": synthesis_hash, "canonical_content": {}},
+                "editorial_enrichment": {
+                    "input_hash": "e" * 64,
+                    "canonical_content": {},
+                },
             },
             "content_sha256": "d" * 64,
         }
@@ -193,23 +197,23 @@ class _State:
     def __init__(
         self,
         *,
-        exact_state: ProductionStateSnapshotV4 | None = None,
-        current_state: ProductionStateSnapshotV4 | None = None,
+        exact_state: ProductionStateSnapshotV5 | None = None,
+        current_state: ProductionStateSnapshotV5 | None = None,
     ) -> None:
         self.exact_run_ids: list[UUID] = []
         self.exact_state = exact_state or _state()
         self.current_state = current_state or _state()
 
-    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV4:
+    async def export_state(self, *, subject_id: UUID) -> ProductionStateSnapshotV5:
         return self.current_state
 
-    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV5:
         self.exact_run_ids.append(run_id)
         return self.exact_state
 
 
 class _IncompleteState(_State):
-    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV4:
+    async def export_run_state(self, run_id: UUID) -> ProductionStateSnapshotV5:
         raise ProductionStateError(
             code="production_state_incomplete", message="Artifacts are not complete"
         )

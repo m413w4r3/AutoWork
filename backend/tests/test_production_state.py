@@ -1,4 +1,6 @@
 import hashlib
+from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -8,26 +10,24 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
-from cti_app.application.production_parsers import (
-    reference_report_from_json,
-    technical_extraction_from_json,
-    validate_synthesis,
-)
+from cti_app.application.production_editorial_enrichment import build_empty_editorial_enrichment
+from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_state import (
     MAX_PRODUCTION_STATE_BYTES,
     ProductionStateError,
     ProductionStateService,
-    ProductionStateSnapshotV4,
+    ProductionStateSnapshotV5,
     _exported_repair_block,
     _validate_snapshot,
     compute_production_state_checksum,
 )
+from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
-    DetectionRuleType,
     EditionProductionBatchItem,
     ExtractionProfile,
     ProductionArtifact,
@@ -37,16 +37,21 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
+    editorial_enrichment_to_json,
+)
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionFactV1,
-    ExtractionIndicatorStatus,
-    ExtractionIndicatorV1,
     ExtractionReuseState,
-    ExtractionRuleV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
-    production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -56,44 +61,180 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
-from cti_app.domain.publication import ArtifactType
+from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+    SYNTHESIS_POLICY_VERSION,
+    ProductionSynthesisV1,
+    SynthesisParagraphV1,
+    SynthesisSectionKind,
+    SynthesisSectionV1,
+    extraction_evidence_refs_v1,
+    production_synthesis_to_json,
+)
 from tools.production_state_checksum import canonical_checksum
 
 
-def _payload() -> dict[str, Any]:
+def canonical_production_state_artifacts(
+    subject_id: UUID, production_input_hash: str = "a" * 64
+) -> dict[str, dict[str, Any]]:
+    """Build a portable canonical chain with matching AW-015 lineage."""
+    document_id = uuid4()
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=subject_id,
+        research_date=date(2026, 8, 26),
+        production_input_hash=production_input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url="https://example.test/source",
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                title="Source",
+                publisher="Publisher",
+                published_at=date(2026, 8, 20),
+                source_collection_id=uuid4(),
+                source_document_id=document_id,
+                discovery_candidate_ids=(uuid4(),),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256="b" * 64,
+                relevance_reason="Documents the campaign",
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+            ),
+        ),
+        warnings=(),
+    )
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=subject_id,
+        production_input_hash=production_input_hash,
+        references_corpus_hash=references_corpus_hash(corpus),
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=document_id,
+                canonical_url="https://example.test/source",
+                content_sha256="b" * 64,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=None,
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(
+                    ExtractionFactV1(
+                        category="malware",
+                        value="ExampleRAT",
+                        attack_id=None,
+                        context="",
+                        evidence_quote="ExampleRAT",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(document_id,),
+                    ),
+                    ExtractionFactV1(
+                        category="campaigns",
+                        value="Example campaign",
+                        attack_id=None,
+                        context="",
+                        evidence_quote="Example campaign",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(document_id,),
+                    ),
+                ),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(),
+        warnings=(),
+    )
+    evidence_ref = extraction_evidence_refs_v1(extraction)[0]
+    paragraph = SynthesisParagraphV1("ExampleRAT activity is documented.", (evidence_ref,))
+    synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=subject_id,
+        production_input_hash=production_input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title="Example report",
+        lead=(paragraph,),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="Overview",
+                paragraphs=(paragraph,),
+            ),
+        ),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=(
+            TableSpecV1(
+                key="facts",
+                kind=EnrichmentTableKind.CUSTOM,
+                title="Evidence",
+                caption=None,
+                columns=(TableColumnV1("fact", "Fact"), TableColumnV1("context", "Context")),
+                rows=(
+                    TableRowV1(
+                        cells=("ExampleRAT", "Observed in the report"),
+                        evidence_refs=(extraction_evidence_refs_v1(extraction)[0],),
+                    ),
+                ),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+            ),
+        ),
+    )
+    return {
+        "references": production_reference_corpus_to_json(corpus),
+        "extraction": production_extraction_to_json(extraction),
+        "synthesis": production_synthesis_to_json(synthesis),
+        "editorial_enrichment": editorial_enrichment_to_json(enrichment),
+    }
+
+
+def _payload(
+    subject_id: UUID | None = None,
+    *,
+    production_input_hash: str = "a" * 64,
+    subject_title: str = "Imported subject",
+    discovery_snapshot_id: UUID | None = None,
+    discovery_snapshot_version: int = 1,
+) -> dict[str, Any]:
+    subject_id = subject_id or uuid4()
+    canonical = canonical_production_state_artifacts(subject_id, production_input_hash)
     payload: dict[str, Any] = {
         "format": "autowork.production-state",
-        "schema_version": 4,
+        "schema_version": 5,
         "exported_at": "2026-08-26T15:00:00Z",
         "origin": {
-            "subject_title": "Titre original",
-            "subject_id": str(uuid4()),
+            "subject_title": subject_title,
+            "subject_id": str(subject_id),
             "production_run_id": str(uuid4()),
             "research_date": "2026-08-26",
-            "discovery_snapshot_id": str(uuid4()),
-            "discovery_snapshot_version": 1,
+            "discovery_snapshot_id": str(discovery_snapshot_id or uuid4()),
+            "discovery_snapshot_version": discovery_snapshot_version,
         },
         "artifacts": {
-            "references": {
-                "input_hash": "a" * 64,
-                "canonical_content": {
-                    "sources": [
-                        {
-                            "id": "S1",
-                            "title": "Source",
-                            "url": "https://example.test/source",
-                            "canonical_url": "https://example.test/source",
-                        }
-                    ],
-                    "events": [],
-                },
+            "references": {"input_hash": "c" * 64, "canonical_content": canonical["references"]},
+            "extraction": {"input_hash": "d" * 64, "canonical_content": canonical["extraction"]},
+            "synthesis": {"input_hash": "e" * 64, "canonical_content": canonical["synthesis"]},
+            "editorial_enrichment": {
+                "input_hash": "f" * 64,
+                "canonical_content": canonical["editorial_enrichment"],
             },
-            "extraction": {"input_hash": "b" * 64, "canonical_content": {"items": []}},
-            "synthesis": {"input_hash": "c" * 64, "rendered_content": "Fait [S1]"},
         },
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV4.model_validate(payload)
+    snapshot = ProductionStateSnapshotV5.model_validate(payload)
     payload["content_sha256"] = compute_production_state_checksum(snapshot)
     return payload
 
@@ -104,7 +245,9 @@ class _FailingFactory:
 
 
 class _ImportUow:
-    def __init__(self, current: ProductionRun, item: Any | None) -> None:
+    def __init__(
+        self, current: ProductionRun, item: Any | None, *, subject_title: str = "Imported subject"
+    ) -> None:
         self.production_runs = SimpleNamespace(
             lock_creation_for_subject=AsyncMock(),
             get_current_for_subject=AsyncMock(return_value=current),
@@ -131,7 +274,7 @@ class _ImportUow:
                 return_value=SimpleNamespace(
                     id=current.subject_id,
                     edition_id=current.edition_id,
-                    title="Imported subject",
+                    title=subject_title,
                     version=1,
                     tlp=TLP.AMBER,
                 )
@@ -150,20 +293,19 @@ class _ImportUow:
         self.discovery_subject_identities = SimpleNamespace(
             resolve_canonical_subject=AsyncMock(return_value=discovery_subject_id)
         )
-        self.discovery_snapshots = SimpleNamespace(
-            get_active=AsyncMock(
-                return_value=SimpleNamespace(
-                    id=uuid4(),
-                    version=1,
-                    subjects=[
-                        SimpleNamespace(
-                            subject_id=discovery_subject_id,
-                            member_references=(),
-                            candidate=SimpleNamespace(summary="Imported subject"),
-                        )
-                    ],
+        self.discovery_snapshot = SimpleNamespace(
+            id=uuid4(),
+            version=1,
+            subjects=[
+                SimpleNamespace(
+                    subject_id=discovery_subject_id,
+                    member_references=(),
+                    candidate=SimpleNamespace(summary=subject_title),
                 )
-            )
+            ],
+        )
+        self.discovery_snapshots = SimpleNamespace(
+            get_active=AsyncMock(return_value=self.discovery_snapshot)
         )
         self.discovery_candidates = SimpleNamespace(list_for_edition=AsyncMock(return_value=[]))
         self.production_artifacts = SimpleNamespace(append=AsyncMock())
@@ -198,22 +340,49 @@ class _ImportArtifactStore:
         return None, None, uuid4()
 
 
-def _import_service(item: Any | None) -> tuple[ProductionStateService, _ImportUow, UUID, UUID]:
-    subject_id = uuid4()
+def _import_service(
+    item: Any | None,
+    *,
+    subject_id: UUID | None = None,
+    subject_title: str = "Imported subject",
+) -> tuple[ProductionStateService, _ImportUow, UUID, UUID]:
+    subject_id = subject_id or uuid4()
     edition_id = uuid4()
     current = ProductionRun(
         subject_id=subject_id,
         edition_id=edition_id,
         status=ProductionRunStatus.NEEDS_REVIEW,
     )
-    uow = _ImportUow(current, item)
+    uow = _ImportUow(current, item, subject_title=subject_title)
     service = ProductionStateService(_ImportFactory(uow), _ImportArtifactStore())
     return service, uow, subject_id, edition_id
 
 
+async def _payload_for_import(
+    uow: _ImportUow, *, subject_id: UUID, edition_id: UUID
+) -> dict[str, Any]:
+    local = await capture_production_input_snapshot(
+        uow,
+        production_run_id=uuid4(),
+        subject_id=subject_id,
+        edition_id=edition_id,
+        research_date=date(2026, 8, 26),
+        captured_at=datetime.now(UTC),
+    )
+    return _payload(
+        subject_id,
+        production_input_hash=local.input_hash,
+        subject_title=local.subject_title,
+        discovery_snapshot_id=local.discovery_snapshot_id,
+        discovery_snapshot_version=local.discovery_snapshot_version,
+    )
+
+
 @pytest.mark.asyncio
 async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() -> None:
-    service, uow, subject_id, edition_id = _import_service(None)
+    subject_id = uuid4()
+    service, uow, subject_id, edition_id = _import_service(None, subject_id=subject_id)
+    payload = await _payload_for_import(uow, subject_id=subject_id, edition_id=edition_id)
     current_run_id = uow.production_runs.get_current_for_subject.return_value.id
     item = EditionProductionBatchItem(
         batch_id=uuid4(),
@@ -225,7 +394,7 @@ async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() ->
     uow.edition_production_batch_items.get_by_run.return_value = item
 
     result = await service.import_state(
-        subject_id=subject_id, edition_id=edition_id, payload=_payload()
+        subject_id=subject_id, edition_id=edition_id, payload=payload
     )
 
     assert item.production_run_id == result.run_id
@@ -236,10 +405,12 @@ async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() ->
 
 @pytest.mark.asyncio
 async def test_import_without_batch_item_succeeds() -> None:
-    service, uow, subject_id, edition_id = _import_service(None)
+    subject_id = uuid4()
+    service, uow, subject_id, edition_id = _import_service(None, subject_id=subject_id)
+    payload = await _payload_for_import(uow, subject_id=subject_id, edition_id=edition_id)
 
     result = await service.import_state(
-        subject_id=subject_id, edition_id=edition_id, payload=_payload()
+        subject_id=subject_id, edition_id=edition_id, payload=payload
     )
 
     assert result.status == "needs_review"
@@ -249,8 +420,9 @@ async def test_import_without_batch_item_succeeds() -> None:
 
 @pytest.mark.asyncio
 async def test_import_round_trip_preserves_repair_audit_without_regeneration() -> None:
-    payload = _payload()
-    payload["origin"]["subject_title"] = "Titre original"
+    subject_id = uuid4()
+    service, uow, subject_id, edition_id = _import_service(None, subject_id=subject_id)
+    payload = await _payload_for_import(uow, subject_id=subject_id, edition_id=edition_id)
     decision_id = str(uuid4())
     base_id = str(uuid4())
     materialization = {
@@ -282,10 +454,8 @@ async def test_import_round_trip_preserves_repair_audit_without_regeneration() -
         "materialization": materialization,
     }
     payload["content_sha256"] = compute_production_state_checksum(
-        ProductionStateSnapshotV4.model_validate(payload)
+        ProductionStateSnapshotV5.model_validate(payload)
     )
-    service, uow, subject_id, edition_id = _import_service(None)
-
     await service.import_state(subject_id=subject_id, edition_id=edition_id, payload=payload)
 
     extraction = uow.production_artifacts.append.await_args_list[1].args[0]
@@ -301,7 +471,9 @@ async def test_import_round_trip_preserves_repair_audit_without_regeneration() -
 
 def test_checksum_tool_repairs_edited_snapshot() -> None:
     payload = _payload()
-    payload["artifacts"]["synthesis"]["rendered_content"] = "Fait [S1] corrigé par l'analyste"
+    payload["artifacts"]["editorial_enrichment"]["canonical_content"]["warnings"].append(
+        "Reviewed by analyst"
+    )
     payload["content_sha256"] = canonical_checksum(payload)
 
     snapshot = _validate_snapshot(payload)
@@ -358,158 +530,80 @@ class _ExportUow:
         return None
 
 
-def _corpus_state_artifacts(
-    store: _ExportStore,
-    *,
-    run_id: UUID,
-    subject_id: UUID,
-) -> tuple[ProductionArtifact, dict[str, Any]]:
-    """One AW-010 run: a canonical corpus, its RAW and a legacy projection."""
-    raw = """# REFERENCES
-editorial-title: [Publication] Titre
-## SOURCE S1
-title: Source
-url: https://example.test/source
-publisher: Publisher
-published-at: 2026-08-20
-role: independent
-kind: publication
-reason: Documents the campaign
-## EVENT R1
-date: 2026-08-21
-sources: S1
-text: Shared fact
-"""
-    corpus = ProductionReferenceCorpusV1(
-        schema_version=1,
-        subject_id=subject_id,
-        research_date=date(2026, 8, 26),
-        production_input_hash="a" * 64,
-        research_status=ProductionReferenceResearchStatus.COMPLETED,
-        sources=(
-            ProductionReferenceSourceV1(
-                canonical_url="https://example.test/source",
-                tier=ProductionReferenceTier.CORE,
-                kind=ProductionReferenceKind.PUBLICATION,
-                role=SourceRole.INDEPENDENT,
-                title="Source",
-                publisher="Publisher",
-                published_at=date(2026, 8, 20),
-                source_collection_id=uuid4(),
-                source_document_id=uuid4(),
-                discovery_candidate_ids=(uuid4(),),
-                collection_state=CollectionState.ARCHIVED,
-                content_sha256="b" * 64,
-                relevance_reason=None,
-                proposed_by_model=False,
-                eligible_for_extraction=True,
-            ),
-        ),
-        warnings=(),
-    )
-    raw_id = uuid4()
-    canonical_id = uuid4()
-    store.text[raw_id] = raw
-    store.json[canonical_id] = production_reference_corpus_to_json(corpus)
-    return (
-        ProductionArtifact(
-            production_run_id=run_id,
-            subject_id=subject_id,
-            stage=ProductionArtifactStage.REFERENCES,
-            version=1,
-            input_hash="a" * 64,
-            status=ProductionArtifactStatus.VERIFIED,
-            raw_blob_id=raw_id,
-            canonical_blob_id=canonical_id,
-        ),
-        {"raw": raw, "corpus": corpus},
-    )
-
-
 @pytest.mark.asyncio
-async def test_corpus_export_projects_v4_references_and_import_stays_legacy() -> None:
-    """AW-010: a corpus exports as the V4 references contract, never as itself."""
+async def test_v5_export_preserves_the_four_canonical_artifacts() -> None:
+    """V5 exports a directly portable canonical pre-Assembly chain."""
     run = ProductionRun(
         subject_id=uuid4(),
         edition_id=uuid4(),
         status=ProductionRunStatus.NEEDS_REVIEW,
     )
-    store = _ExportStore()
-    references, _ = _corpus_state_artifacts(store, run_id=run.id, subject_id=run.subject_id)
-    extraction = await store.store_stage_payloads(canonical={"items": []})
-    synthesis = await store.store_stage_payloads(rendered="Fait [S1]")
-    artifacts = {
-        "references": references,
-        ProductionArtifactStage.EXTRACTION.value: ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=run.subject_id,
-            stage=ProductionArtifactStage.EXTRACTION,
-            version=1,
-            input_hash="b" * 64,
-            status=ProductionArtifactStatus.VERIFIED,
-            canonical_blob_id=extraction[1],
-        ),
-        ProductionArtifactStage.SYNTHESIS.value: ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=run.subject_id,
-            stage=ProductionArtifactStage.SYNTHESIS,
-            version=1,
-            input_hash="c" * 64,
-            status=ProductionArtifactStatus.VERIFIED,
-            rendered_blob_id=synthesis[2],
-        ),
-    }
-    snapshot = SimpleNamespace(
-        subject_title="Titre original",
+    import_uow = _ImportUow(run, None)
+    local_snapshot = await capture_production_input_snapshot(
+        import_uow,
+        production_run_id=run.id,
         subject_id=run.subject_id,
+        edition_id=run.edition_id,
         research_date=date(2026, 8, 26),
-        discovery_snapshot_id=uuid4(),
-        discovery_snapshot_version=1,
+        captured_at=datetime.now(UTC),
     )
+    store = _ExportStore()
+    canonical = canonical_production_state_artifacts(run.subject_id, local_snapshot.input_hash)
+    artifacts: dict[str, ProductionArtifact] = {}
+    for stage_name, stage in (
+        ("references", ProductionArtifactStage.REFERENCES),
+        ("extraction", ProductionArtifactStage.EXTRACTION),
+        ("synthesis", ProductionArtifactStage.SYNTHESIS),
+        ("editorial_enrichment", ProductionArtifactStage.EDITORIAL_ENRICHMENT),
+    ):
+        _, canonical_blob_id, _ = await store.store_stage_payloads(canonical=canonical[stage_name])
+        assert canonical_blob_id is not None
+        artifacts[stage_name] = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=1,
+            input_hash=hashlib.sha256(stage_name.encode()).hexdigest(),
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=canonical_blob_id,
+        )
     service = ProductionStateService(
-        cast(Any, lambda: _ExportUow(run, snapshot, artifacts)), cast(Any, store)
+        cast(Any, lambda: _ExportUow(run, local_snapshot, artifacts)), cast(Any, store)
     )
 
     exported = await service.export_run_state(run.id)
 
-    refs_content = exported.artifacts.references.canonical_content
-    # V4 keeps its historical contract: a projected ReferenceReport, not the corpus.
-    assert "production_input_hash" not in refs_content
-    assert "tier" not in refs_content["sources"][0]
-    assert [source["id"] for source in refs_content["sources"]] == ["S1"]
-    assert refs_content["editorial_title"] == "[Publication] Titre"
+    assert exported.schema_version == 5
+    for stage_name in ("references", "extraction", "synthesis", "editorial_enrichment"):
+        assert getattr(exported.artifacts, stage_name).canonical_content == canonical[stage_name]
 
-    _, uow, subject_id, edition_id = _import_service(None)
-    imported_service = ProductionStateService(cast(Any, _ImportFactory(uow)), cast(Any, store))
-    result = await imported_service.import_state(
-        subject_id=subject_id,
-        edition_id=edition_id,
+    result = await ProductionStateService(
+        cast(Any, _ImportFactory(import_uow)), cast(Any, store)
+    ).import_state(
+        subject_id=run.subject_id,
+        edition_id=run.edition_id,
         payload=exported.model_dump(mode="json"),
     )
 
-    imported_references = uow.production_artifacts.append.await_args_list[0].args[0]
-    assert imported_references.metadata["legacy_reference_report"] is True
-    imported_content = store.json[imported_references.canonical_blob_id]
-    report = reference_report_from_json(imported_content)
-    assert [source.local_id for source in report.sources] == ["S1"]
-    # The import never fabricates the collection identity the report lacks.
-    assert "tier" not in imported_content["sources"][0]
-    assert "collection_state" not in imported_content["sources"][0]
-    assert "source_document_id" not in imported_content["sources"][0]
-    assert "content_sha256" not in imported_content["sources"][0]
-    # Assembly-compatible: the synthesis validates against the imported report.
-    assert validate_synthesis(
-        exported.artifacts.synthesis.rendered_content,
-        report,
-        technical_extraction_from_json(exported.artifacts.extraction.canonical_content),
-    ).usable
+    imported_artifacts = [
+        call.args[0] for call in import_uow.production_artifacts.append.await_args_list
+    ]
+    assert [artifact.stage.value for artifact in imported_artifacts] == [
+        "references",
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+    ]
+    assert all(
+        artifact.status is ProductionArtifactStatus.VERIFIED for artifact in imported_artifacts
+    )
     assert result.status == "needs_review"
 
 
 @pytest.mark.asyncio
-async def test_import_accepts_v4_checksum_and_rejects_unknown_fields() -> None:
+async def test_import_accepts_v5_checksum_and_rejects_unknown_fields() -> None:
     payload = _payload()
-    snapshot = ProductionStateSnapshotV4.model_validate(payload)
+    snapshot = ProductionStateSnapshotV5.model_validate(payload)
     assert snapshot.content_sha256 == compute_production_state_checksum(snapshot)
 
     payload["unexpected"] = True
@@ -525,6 +619,7 @@ async def test_import_accepts_v4_checksum_and_rejects_unknown_fields() -> None:
     ("field", "value", "code"),
     [
         ("format", "other", "production_state_invalid_format"),
+        ("schema_version", 4, "production_state_version_unsupported"),
         ("schema_version", 2, "production_state_version_unsupported"),
     ],
 )
@@ -553,9 +648,138 @@ async def test_import_rejects_bad_checksum_without_side_effects() -> None:
 
 def test_checksum_is_deterministic_and_excludes_checksum_field() -> None:
     payload = _payload()
-    snapshot = ProductionStateSnapshotV4.model_validate(payload)
+    snapshot = ProductionStateSnapshotV5.model_validate(payload)
     changed = snapshot.model_copy(update={"content_sha256": "e" * 64})
     assert compute_production_state_checksum(snapshot) == compute_production_state_checksum(changed)
+
+
+@pytest.mark.parametrize(
+    ("artifact", "field", "value"),
+    (
+        ("references", "subject_id", str(uuid4())),
+        ("extraction", "references_corpus_hash", "9" * 64),
+        ("extraction", "production_input_hash", "9" * 64),
+        ("synthesis", "extraction_hash", "9" * 64),
+        ("synthesis", "production_input_hash", "9" * 64),
+        ("editorial_enrichment", "extraction_hash", "9" * 64),
+        ("editorial_enrichment", "synthesis_hash", "9" * 64),
+    ),
+)
+def test_snapshot_rejects_canonical_artifacts_with_broken_lineage(
+    artifact: str, field: str, value: str
+) -> None:
+    payload = _payload()
+    payload["artifacts"][artifact]["canonical_content"][field] = value
+    payload["content_sha256"] = canonical_checksum(payload)
+
+    with pytest.raises(ProductionStateError) as exc_info:
+        _validate_snapshot(payload)
+
+    assert exc_info.value.code == "production_state_invalid"
+
+
+def test_snapshot_rejects_enrichment_with_unknown_evidence_reference() -> None:
+    payload = _payload()
+    reference = payload["artifacts"]["editorial_enrichment"]["canonical_content"]["tables"][0][
+        "rows"
+    ][0]["evidence_refs"][0]
+    reference["evidence_key"] = "9" * 64
+    payload["content_sha256"] = canonical_checksum(payload)
+
+    with pytest.raises(ProductionStateError) as exc_info:
+        _validate_snapshot(payload)
+
+    assert exc_info.value.code == "production_state_invalid"
+
+
+def test_checksum_covers_enrichment_cells_evidence_and_input_hash() -> None:
+    payload = _payload()
+    original = compute_production_state_checksum(payload)
+
+    edited_cell = deepcopy(payload)
+    edited_cell["artifacts"]["editorial_enrichment"]["canonical_content"]["tables"][0]["rows"][0][
+        "cells"
+    ][0] = "ExampleRAT revised"
+    changed_cell_checksum = compute_production_state_checksum(edited_cell)
+
+    edited_evidence = deepcopy(payload)
+    refs = edited_evidence["artifacts"]["editorial_enrichment"]["canonical_content"]["tables"][0][
+        "rows"
+    ][0]["evidence_refs"]
+    refs[0]["evidence_key"] = "8" * 64
+    changed_evidence_checksum = compute_production_state_checksum(edited_evidence)
+
+    edited_input_hash = deepcopy(payload)
+    edited_input_hash["artifacts"]["editorial_enrichment"]["input_hash"] = "9" * 64
+    changed_input_hash_checksum = compute_production_state_checksum(edited_input_hash)
+
+    assert len({original, changed_cell_checksum, changed_evidence_checksum}) == 3
+    assert changed_input_hash_checksum != original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fault", "expected_code"),
+    (
+        ("missing_enrichment", "production_state_incomplete"),
+        ("stale_enrichment", "production_state_unverified"),
+        ("missing_enrichment_blob", "production_state_incomplete"),
+        ("rendered_only_synthesis", "production_state_incomplete"),
+    ),
+)
+async def test_export_requires_verified_canonical_enrichment_and_synthesis(
+    fault: str, expected_code: str
+) -> None:
+    run = ProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        status=ProductionRunStatus.NEEDS_REVIEW,
+    )
+    store = _ExportStore()
+    canonical = canonical_production_state_artifacts(run.subject_id)
+    stages = (
+        ("references", ProductionArtifactStage.REFERENCES),
+        ("extraction", ProductionArtifactStage.EXTRACTION),
+        ("synthesis", ProductionArtifactStage.SYNTHESIS),
+        ("editorial_enrichment", ProductionArtifactStage.EDITORIAL_ENRICHMENT),
+    )
+    artifacts: dict[str, ProductionArtifact] = {}
+    for stage_name, stage in stages:
+        if fault == "missing_enrichment" and stage_name == "editorial_enrichment":
+            continue
+        _, canonical_blob_id, _ = await store.store_stage_payloads(canonical=canonical[stage_name])
+        artifact = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=1,
+            input_hash=hashlib.sha256(stage_name.encode()).hexdigest(),
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=canonical_blob_id,
+        )
+        if fault == "stale_enrichment" and stage_name == "editorial_enrichment":
+            artifact.status = ProductionArtifactStatus.STALE
+        if fault == "missing_enrichment_blob" and stage_name == "editorial_enrichment":
+            artifact.canonical_blob_id = None
+        if fault == "rendered_only_synthesis" and stage_name == "synthesis":
+            artifact.canonical_blob_id = None
+            artifact.rendered_blob_id = uuid4()
+        artifacts[stage_name] = artifact
+    local_snapshot = SimpleNamespace(
+        subject_title="Titre original",
+        subject_id=run.subject_id,
+        research_date=date(2026, 8, 26),
+        discovery_snapshot_id=uuid4(),
+        discovery_snapshot_version=1,
+    )
+    service = ProductionStateService(
+        cast(Any, lambda: _ExportUow(run, local_snapshot, artifacts)), cast(Any, store)
+    )
+
+    with pytest.raises(ProductionStateError) as exc_info:
+        await service.export_run_state(run.id)
+
+    assert exc_info.value.code == expected_code
 
 
 def test_snapshot_limits_are_defined() -> None:
@@ -564,15 +788,12 @@ def test_snapshot_limits_are_defined() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("artifact", ("references", "extraction", "synthesis"))
+@pytest.mark.parametrize(
+    "artifact", ("references", "extraction", "synthesis", "editorial_enrichment")
+)
 async def test_import_rejects_each_oversized_artifact_before_creating_a_run(artifact: str) -> None:
     payload = _payload()
-    if artifact == "synthesis":
-        payload["artifacts"][artifact]["rendered_content"] = "x" * (MAX_ARTIFACT_BYTES + 1)
-    else:
-        payload["artifacts"][artifact]["canonical_content"]["padding"] = "x" * (
-            MAX_ARTIFACT_BYTES + 1
-        )
+    payload["artifacts"][artifact]["canonical_content"]["padding"] = "x" * (MAX_ARTIFACT_BYTES + 1)
     with pytest.raises(ProductionStateError) as exc_info:
         await ProductionStateService(_FailingFactory(), cast(Any, object())).import_state(
             subject_id=uuid4(), edition_id=uuid4(), payload=payload
@@ -591,151 +812,17 @@ async def test_import_rejects_oversized_snapshot_before_creating_a_run() -> None
     assert exc_info.value.code == "production_state_too_large"
 
 
-def _v1_extraction_payload(subject_id: UUID) -> dict[str, Any]:
-    """One AW-011 canonical extraction, as EXTRACTION now persists it."""
-    document_id = uuid4()
-    checkpoint_id = uuid4()
-    rule_body = "rule Example { condition: true }"
-    return production_extraction_to_json(
-        ProductionExtractionV1(
-            schema_version=1,
-            subject_id=subject_id,
-            production_input_hash="a" * 64,
-            references_corpus_hash="b" * 64,
-            profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
-            sources=(
-                ProductionSourceExtractionV1(
-                    source_document_id=document_id,
-                    canonical_url="https://example.test/source",
-                    content_sha256="c" * 64,
-                    tier=ProductionReferenceTier.CORE,
-                    kind=ProductionReferenceKind.PUBLICATION,
-                    role=SourceRole.PRIMARY,
-                    profile=ExtractionProfile.FULL,
-                    checkpoint_id=checkpoint_id,
-                    reuse_state=ExtractionReuseState.FRESH,
-                    facts=(
-                        ExtractionFactV1(
-                            category="malware",
-                            value="FooRAT",
-                            attack_id=None,
-                            context="",
-                            evidence_quote="FooRAT",
-                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
-                            source_document_ids=(document_id,),
-                        ),
-                    ),
-                    events=(),
-                    indicators=(
-                        ExtractionIndicatorV1(
-                            value="evil.example",
-                            artifact_type=ArtifactType.DOMAIN,
-                            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
-                            context="",
-                            evidence_quote="evil.example",
-                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
-                            source_document_ids=(document_id,),
-                        ),
-                    ),
-                    rules=(
-                        ExtractionRuleV1(
-                            rule_type=DetectionRuleType.YARA,
-                            name="Example",
-                            body=rule_body,
-                            sha256=hashlib.sha256(rule_body.encode()).hexdigest(),
-                            context="",
-                            evidence_quote=rule_body,
-                            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
-                            source_document_ids=(document_id,),
-                        ),
-                    ),
-                    uncertainties=(),
-                ),
-            ),
-            omitted_sources=(),
-            warnings=(),
-        )
-    )
-
-
 @pytest.mark.asyncio
-async def test_v1_extraction_exports_as_legacy_v4_and_import_never_promotes_it() -> None:
-    """AW-011: V4 keeps its legacy contract; nothing promotes legacy to V1."""
-    run = ProductionRun(
-        subject_id=uuid4(),
-        edition_id=uuid4(),
-        status=ProductionRunStatus.NEEDS_REVIEW,
-    )
-    store = _ExportStore()
-    references, _ = _corpus_state_artifacts(store, run_id=run.id, subject_id=run.subject_id)
-    v1_payload = _v1_extraction_payload(run.subject_id)
-    extraction = await store.store_stage_payloads(canonical=v1_payload)
-    synthesis = await store.store_stage_payloads(rendered="Fait [S1]")
-    artifacts = {
-        "references": references,
-        ProductionArtifactStage.EXTRACTION.value: ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=run.subject_id,
-            stage=ProductionArtifactStage.EXTRACTION,
-            version=1,
-            input_hash="b" * 64,
-            status=ProductionArtifactStatus.VERIFIED,
-            canonical_blob_id=extraction[1],
-        ),
-        ProductionArtifactStage.SYNTHESIS.value: ProductionArtifact(
-            production_run_id=run.id,
-            subject_id=run.subject_id,
-            stage=ProductionArtifactStage.SYNTHESIS,
-            version=1,
-            input_hash="c" * 64,
-            status=ProductionArtifactStatus.VERIFIED,
-            rendered_blob_id=synthesis[2],
-        ),
-    }
-    snapshot = SimpleNamespace(
-        subject_title="Titre original",
-        subject_id=run.subject_id,
-        research_date=date(2026, 8, 26),
-        discovery_snapshot_id=uuid4(),
-        discovery_snapshot_version=1,
-    )
-    service = ProductionStateService(
-        cast(Any, lambda: _ExportUow(run, snapshot, artifacts)), cast(Any, store)
-    )
+async def test_v5_rejects_the_old_rendered_only_synthesis_and_missing_enrichment() -> None:
+    """The historical V4 shape cannot masquerade as a V5 assembly checkpoint."""
+    payload = _payload()
+    synthesis = payload["artifacts"]["synthesis"]
+    synthesis.pop("canonical_content")
+    synthesis["rendered_content"] = "Fait [S1]"
+    payload["artifacts"].pop("editorial_enrichment")
+    payload["content_sha256"] = canonical_checksum(payload)
 
-    exported = await service.export_run_state(run.id)
+    with pytest.raises(ProductionStateError) as exc_info:
+        _validate_snapshot(payload)
 
-    content = exported.artifacts.extraction.canonical_content
-    # The V4 extraction contract is the legacy one, never the canonical blob.
-    assert "sources" not in content
-    assert "profile_policy_version" not in content
-    with pytest.raises(ValueError):
-        production_extraction_from_json(content)
-    legacy = technical_extraction_from_json(content)
-    assert {item.value for item in legacy.items} == {"FooRAT", "evil.example"}
-    assert legacy.rules[0].body == "rule Example { condition: true }"
-
-    # An external V4 payload that carries the canonical contract is validated
-    # through the projection and imported back as legacy: no promotion.
-    payload = exported.model_dump(mode="json")
-    payload["artifacts"]["extraction"]["canonical_content"] = v1_payload
-    payload["content_sha256"] = compute_production_state_checksum(
-        ProductionStateSnapshotV4.model_validate(payload)
-    )
-    _, uow, subject_id, edition_id = _import_service(None)
-    imported_service = ProductionStateService(cast(Any, _ImportFactory(uow)), cast(Any, store))
-    result = await imported_service.import_state(
-        subject_id=subject_id,
-        edition_id=edition_id,
-        payload=payload,
-    )
-
-    assert result.status == "needs_review"
-    imported_extraction = uow.production_artifacts.append.await_args_list[1].args[0]
-    imported_content = store.json[imported_extraction.canonical_blob_id]
-    assert "sources" not in imported_content
-    with pytest.raises(ValueError):
-        production_extraction_from_json(imported_content)
-    assert technical_extraction_from_json(imported_content).rules[0].body == (
-        "rule Example { condition: true }"
-    )
+    assert exc_info.value.code == "production_state_invalid"

@@ -66,6 +66,11 @@ puis `READY`. Les états asynchrones vivent en PostgreSQL ; Redis ne transporte 
 de jobs. L’annulation conserve l’historique, arrête les travaux non terminés et ne ferme pas
 l’édition.
 
+Production State V5 exporte les quatre blobs canoniques vérifiés de `REFERENCES`, `EXTRACTION`,
+`SYNTHESIS` et `EDITORIAL_ENRICHMENT`, avec leurs hashes et leur lineage. Son import les restaure
+en nouveaux artifacts et reprend à `ASSEMBLY` après revue. `PUBLICATION` est reconstruite par
+Assembly et ne fait pas partie du snapshot portable.
+
 `ASSEMBLY` produit l'artifact canonique `PUBLICATION` sans rendu. `READY` valide la production
 canonique et sa QA, indépendamment de tout export PDF ou DOCX.
 

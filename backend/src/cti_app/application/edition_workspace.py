@@ -22,7 +22,7 @@ from cti_app.application.production_extraction import legacy_technical_extractio
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateService,
-    ProductionStateSnapshotV4,
+    ProductionStateSnapshotV5,
 )
 from cti_app.domain.production import DetectionRule, DetectionRuleType
 
@@ -93,7 +93,7 @@ class EditionWorkspaceMaterializer:
         position: int,
         subject_id: UUID,
         subject_title: str,
-        production_state: ProductionStateSnapshotV4,
+        production_state: ProductionStateSnapshotV5,
         publication: Mapping[str, Any] | None = None,
         rendered_content: str | None = None,
         sources: Sequence[Mapping[str, Any]] = (),

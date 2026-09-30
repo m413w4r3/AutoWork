@@ -414,7 +414,12 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
     assert retry.previous_status is ProductionRunStatus.FAILED
     assert retry.old_generation == 0
     assert retry.run.pipeline_generation == 1
-    assert retry.staled_artifacts == ["extraction", "synthesis", "publication"]
+    assert retry.staled_artifacts == [
+        "extraction",
+        "synthesis",
+        "editorial_enrichment",
+        "publication",
+    ]
 
     _, stale_artifacts, _, _ = await _state(scenario)
     assert {
@@ -424,6 +429,7 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
     } == {
         ProductionArtifactStage.EXTRACTION,
         ProductionArtifactStage.SYNTHESIS,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     }
     assert (
@@ -453,6 +459,9 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
             initial_versions[ProductionArtifactStage.EXTRACTION] + 1
         ),
         ProductionArtifactStage.SYNTHESIS: initial_versions[ProductionArtifactStage.SYNTHESIS] + 1,
+        ProductionArtifactStage.EDITORIAL_ENRICHMENT: (
+            initial_versions[ProductionArtifactStage.EDITORIAL_ENRICHMENT] + 1
+        ),
         ProductionArtifactStage.PUBLICATION: (
             initial_versions[ProductionArtifactStage.PUBLICATION] + 1
         ),
@@ -502,7 +511,7 @@ async def test_concurrent_start_requests_create_one_run_and_one_job(
     final, artifacts, _, _ = await _state(scenario)
     assert final.status is ProductionRunStatus.READY
     assert final.pipeline_generation == 0
-    assert len(await _jobs_for_run(scenario)) == 5
+    assert len(await _jobs_for_run(scenario)) == 6
     await _assert_artifact_invariants(scenario, artifacts)
 
 
@@ -841,5 +850,5 @@ async def test_successful_pipeline_drafts_synthesis_once_without_conversation(
     assert len(synthesis_calls) == 1
     assert synthesis_calls[0].conversation_id is None
     assert synthesis_calls[0].web_search is False
-    assert len(await _jobs_for_run(scenario)) == 5
+    assert len(await _jobs_for_run(scenario)) == 6
     await _assert_artifact_invariants(scenario, artifacts)

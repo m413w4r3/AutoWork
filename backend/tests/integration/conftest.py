@@ -24,6 +24,12 @@ BACKEND_ROOT = Path(__file__).resolve().parents[2]
 def _alembic_config(database_url: str) -> Config:
     config = Config(BACKEND_ROOT / "alembic.ini")
     config.set_main_option("sqlalchemy.url", database_url.replace("%", "%%"))
+    # migrations/env.py calls fileConfig(config.config_file_name), whose default
+    # disables every logger not named in alembic.ini. That process-global side
+    # effect breaks caplog in unit tests after PostgreSQL integration tests.
+    # The script location and all migration options are already loaded above;
+    # skip only Alembic's logging setup for this in-process test configuration.
+    config.config_file_name = None
     return config
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ from cti_app.application.edition_review import (
 )
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import canonical_synthesis_hash
 from cti_app.application.production_parsers import (
     TechnicalExtraction,
     technical_extraction_from_json,
@@ -45,7 +47,10 @@ from cti_app.application.production_repairs import (
 from cti_app.application.production_state import (
     PRODUCTION_STATE_SCHEMA_VERSION,
     ProductionStateService,
+    ProductionStateSnapshotV5,
+    compute_production_state_checksum,
 )
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -60,6 +65,16 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRunStatus,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    editorial_enrichment_from_json,
+    editorial_enrichment_to_json,
+)
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    production_extraction_from_json,
+    production_extraction_to_json,
+)
 from cti_app.domain.production_pipeline import downstream_artifacts_from_artifact_stage
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -68,7 +83,13 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_synthesis import (
+    production_synthesis_from_json,
+    production_synthesis_to_json,
+)
+from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_review import PublicationDecision
+from tests.test_production_state import canonical_production_state_artifacts
 
 EDITION_ID = UUID("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa")
 SUBJECT_A = UUID("bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb")
@@ -280,11 +301,13 @@ def _discovery_snapshot() -> SimpleNamespace:
 def _input_snapshot(run_id: UUID) -> SimpleNamespace:
     return SimpleNamespace(
         production_run_id=run_id,
+        edition_id=EDITION_ID,
         subject_id=SUBJECT_A,
         subject_title="Article 1",
         research_date=date(2026, 8, 28),
         discovery_snapshot_id=UUID("eeeeeeee-5555-4555-8555-eeeeeeeeeeee"),
         discovery_snapshot_version=7,
+        input_hash="a" * 64,
     )
 
 
@@ -1126,11 +1149,9 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
 
 
 def _snapshot(extraction: TechnicalExtraction) -> Any:
-    """Minimal V4 snapshot used where only the extraction matters."""
-    from cti_app.application.production_state import (
-        ProductionStateSnapshotV4,
-        compute_production_state_checksum,
-    )
+    """Minimal V5 state for tests of workspace rule sidecars."""
+    del extraction
+    canonical = canonical_production_state_artifacts(SUBJECT_A)
 
     payload = {
         "format": "autowork.production-state",
@@ -1145,20 +1166,55 @@ def _snapshot(extraction: TechnicalExtraction) -> Any:
             "discovery_snapshot_version": 7,
         },
         "artifacts": {
-            "references": {"input_hash": "a" * 64, "canonical_content": {"sources": []}},
-            "extraction": {
-                "input_hash": "b" * 64,
-                "canonical_content": technical_extraction_to_json(extraction),
+            "references": {"input_hash": "a" * 64, "canonical_content": canonical["references"]},
+            "extraction": {"input_hash": "b" * 64, "canonical_content": canonical["extraction"]},
+            "synthesis": {"input_hash": "c" * 64, "canonical_content": canonical["synthesis"]},
+            "editorial_enrichment": {
+                "input_hash": "d" * 64,
+                "canonical_content": canonical["editorial_enrichment"],
             },
-            "synthesis": {"input_hash": "c" * 64, "rendered_content": "Article"},
         },
         "repair": None,
         "content_sha256": "0" * 64,
     }
-    snapshot = ProductionStateSnapshotV4.model_validate(payload)
+    snapshot = ProductionStateSnapshotV5.model_validate(payload)
     return snapshot.model_copy(
         update={"content_sha256": compute_production_state_checksum(snapshot)}
     )
+
+
+def _canonical_repaired_artifacts(value: str) -> dict[str, dict[str, Any]]:
+    canonical = canonical_production_state_artifacts(SUBJECT_A)
+    extraction = production_extraction_from_json(canonical["extraction"])
+    source = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value=value,
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="Analyst repair decision",
+        evidence_quote="",
+        evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction = replace(
+        extraction,
+        sources=(replace(source, indicators=(indicator,)),),
+    )
+    synthesis = replace(
+        production_synthesis_from_json(canonical["synthesis"]),
+        extraction_hash=canonical_extraction_hash(extraction),
+    )
+    enrichment = replace(
+        editorial_enrichment_from_json(canonical["editorial_enrichment"]),
+        extraction_hash=canonical_extraction_hash(extraction),
+        synthesis_hash=canonical_synthesis_hash(synthesis),
+    )
+    return {
+        **canonical,
+        "extraction": production_extraction_to_json(extraction),
+        "synthesis": production_synthesis_to_json(synthesis),
+        "editorial_enrichment": editorial_enrichment_to_json(enrichment),
+    }
 
 
 class _StateUow(_Uow):
@@ -1219,43 +1275,37 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
     ).project_effective_extraction(RUN_A, actor_id="analyst")
     assert projection.changed
 
-    references = ProductionArtifact(
-        production_run_id=RUN_A,
-        subject_id=SUBJECT_A,
-        stage=ProductionArtifactStage.REFERENCES,
-        version=1,
-        input_hash="a" * 64,
-        status=ProductionArtifactStatus.VERIFIED,
-        canonical_blob_id=await store.put_json(
-            {"parser_version": "1", "sources": [], "events": []},
-            bucket="production-artifacts-canonical",
-        ),
+    projected_content = technical_extraction_from_json(
+        await store.read_json(projection.artifact.canonical_blob_id)  # type: ignore[arg-type]
     )
-    synthesis_blob, _, rendered = await store.store_stage_payloads(rendered="Article de test")
-    del synthesis_blob
-    synthesis = ProductionArtifact(
-        production_run_id=RUN_A,
-        subject_id=SUBJECT_A,
-        stage=ProductionArtifactStage.SYNTHESIS,
-        version=1,
-        input_hash="c" * 64,
-        status=ProductionArtifactStatus.VERIFIED,
-        rendered_blob_id=rendered,
-    )
-    await uow.production_artifacts.append(references)
-    await uow.production_artifacts.append(synthesis)
-
-    # Synthesis validation is out of scope here; the audit is about the
-    # repair block travelling with the artifacts.
-    monkeypatch.setattr(
-        "cti_app.application.production_state._validate_parsers",
-        lambda snapshot: (None, None),
-    )
+    assert projected_content.items[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    canonical = _canonical_repaired_artifacts(projected_content.items[0].value)
+    for stage, content in canonical.items():
+        metadata = projection.artifact.metadata if stage == "extraction" else {}
+        await uow.production_artifacts.append(
+            ProductionArtifact(
+                production_run_id=RUN_A,
+                subject_id=SUBJECT_A,
+                stage=ProductionArtifactStage(stage),
+                version=projection.artifact.version + 1 if stage == "extraction" else 1,
+                input_hash={
+                    "references": "a" * 64,
+                    "extraction": "b" * 64,
+                    "synthesis": "c" * 64,
+                    "editorial_enrichment": "d" * 64,
+                }[stage],
+                status=ProductionArtifactStatus.VERIFIED,
+                canonical_blob_id=await store.put_json(
+                    content, bucket="production-artifacts-canonical"
+                ),
+                metadata=metadata,
+            )
+        )
 
     service = ProductionStateService(_factory(uow), store)  # type: ignore[arg-type]
     snapshot = await service.export_run_state(RUN_A)
 
-    assert snapshot.schema_version == PRODUCTION_STATE_SCHEMA_VERSION == 4
+    assert snapshot.schema_version == PRODUCTION_STATE_SCHEMA_VERSION == 5
     assert snapshot.repair is not None
     assert snapshot.repair.included_repair_keys == (key,)
     assert snapshot.repair.base_extraction_artifact_id == str(base.id)
@@ -1264,18 +1314,24 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
     assert snapshot.repair.decisions[0].actor_id == "analyst"
 
     # The exported extraction already is the effective one.
-    exported = technical_extraction_from_json(snapshot.artifacts.extraction.canonical_content)
-    projected = technical_extraction_from_json(
-        await store.read_json(projection.artifact.canonical_blob_id)  # type: ignore[arg-type]
-    )
-    assert [item.value for item in exported.items] == [item.value for item in projected.items]
-    assert exported.items[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    exported = production_extraction_from_json(snapshot.artifacts.extraction.canonical_content)
+    assert exported.sources[0].indicators[0].value == projected_content.items[0].value
+    exported_indicator = exported.sources[0].indicators[0]
+    assert exported_indicator.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
 
     # Importing reproduces the same deliverable and keeps the audit readable.
     target = _StateUow(runs=[], artifacts=[])
     monkeypatch.setattr(
         "cti_app.application.production_state._repoint_batch_item",
         lambda *_args, **_kwargs: _value(None),
+    )
+
+    async def capture_input(*_args: Any, **kwargs: Any) -> SimpleNamespace:
+        return _input_snapshot(kwargs["production_run_id"])
+
+    monkeypatch.setattr(
+        "cti_app.application.production_state.capture_production_input_snapshot",
+        capture_input,
     )
     target_service = ProductionStateService(_factory(target), store)  # type: ignore[arg-type]
     result = await target_service.import_state(
@@ -1284,17 +1340,18 @@ async def test_audit9_repaired_state_round_trips_with_its_decision_audit(
         payload=snapshot.model_dump(mode="json"),
     )
 
-    assert result.schema_version == 4
+    assert result.schema_version == 5
     imported = next(
         item
         for item in target.production_artifacts.items
         if item.stage is ProductionArtifactStage.EXTRACTION
     )
-    reimported = technical_extraction_from_json(
+    reimported = production_extraction_from_json(
         await store.read_json(imported.canonical_blob_id)  # type: ignore[arg-type]
     )
-    assert [item.value for item in reimported.items] == [item.value for item in exported.items]
-    assert reimported.items[0].evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
+    assert reimported == exported
+    reimported_indicator = reimported.sources[0].indicators[0]
+    assert reimported_indicator.evidence_basis is ProductionEvidenceBasis.ANALYST_OVERRIDE
     audit = imported.metadata["imported_repair_audit"]
     assert audit["included_repair_keys"] == [key]
     assert audit["decisions"][0]["repair_key"] == key
