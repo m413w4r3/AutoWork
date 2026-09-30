@@ -213,6 +213,8 @@ class DiagramGroupV1:
             not isinstance(node_id, str) or not node_id.strip() for node_id in self.node_ids
         ):
             raise ValueError("Diagram group node IDs must be a tuple of non-empty text")
+        if not self.node_ids:
+            raise ValueError("Diagram groups must contain at least one node")
         if len(self.node_ids) != len(set(self.node_ids)):
             raise ValueError("A diagram group must not repeat a node")
 
@@ -267,6 +269,9 @@ class DiagramSpecV1:
             raise ValueError("Diagram edge endpoints must reference existing nodes")
         if any(not set(group.node_ids) <= known_node_ids for group in self.groups):
             raise ValueError("Diagram groups must reference existing nodes")
+        grouped_node_ids = [node_id for group in self.groups for node_id in group.node_ids]
+        if len(grouped_node_ids) != len(set(grouped_node_ids)):
+            raise ValueError("Diagram groups must not share nodes")
         if not isinstance(self.placement, EnrichmentPlacementV1):
             raise ValueError("Diagram placement is invalid")
 
