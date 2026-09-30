@@ -346,6 +346,7 @@ class ModelRouter:
         openai_research: ModelAdapter,
         openai_structured: ModelAdapter,
         openai_drafting: ModelAdapter | None = None,
+        openai_structured_drafting: ModelAdapter | None = None,
         openai_critic: ModelAdapter | None = None,
         qwen: ModelAdapter,
         fake: ModelAdapter,
@@ -362,6 +363,7 @@ class ModelRouter:
         self._openai_research = openai_research
         self._openai_structured = openai_structured
         self._openai_drafting = openai_drafting or openai_research
+        self._openai_structured_drafting = openai_structured_drafting or openai_structured
         self._openai_critic = openai_critic or openai_research
         self._adapters[ModelBackend.CHATGPT_BRIDGE] = openai_research
         self._forced_backend = forced_backend
@@ -376,21 +378,35 @@ class ModelRouter:
             ModelRoutingHint.DISCOVERY_MERGE: ModelBackend.CHATGPT_BRIDGE,
         }
 
-    def select(self, request: ModelRequest, role: ModelRole) -> ModelAdapter:
+    def select(
+        self,
+        request: ModelRequest,
+        role: ModelRole,
+        *,
+        structured_output: bool = False,
+    ) -> ModelAdapter:
         if request.backend is not None:
-            return self.by_backend(request.backend, role)
+            return self.by_backend(request.backend, role, structured_output=structured_output)
         if request.provider is not None:
-            return self.by_provider(request.provider, role)
+            return self.by_provider(request.provider, role, structured_output=structured_output)
         if self._forced_backend is not None:
-            return self.by_backend(self._forced_backend, role)
+            return self.by_backend(self._forced_backend, role, structured_output=structured_output)
         backend = self._routing[request.routing_hint]
-        return self.by_backend(backend, role)
+        return self.by_backend(backend, role, structured_output=structured_output)
 
-    def by_backend(self, backend: ModelBackend, role: ModelRole) -> ModelAdapter:
+    def by_backend(
+        self,
+        backend: ModelBackend,
+        role: ModelRole,
+        *,
+        structured_output: bool = False,
+    ) -> ModelAdapter:
         if backend is ModelBackend.CHATGPT_BRIDGE:
             if role is ModelRole.STRUCTURED_EXTRACTION:
                 return self._openai_structured
             if role is ModelRole.DRAFTING:
+                if structured_output:
+                    return self._openai_structured_drafting
                 return self._openai_drafting
             if role is ModelRole.CRITIC:
                 return self._openai_critic
@@ -400,16 +416,24 @@ class ModelRouter:
         except KeyError as exc:
             raise ModelGatewayError(f"Model backend is not configured: {backend.value}") from exc
 
-    def by_provider(self, provider: ModelProvider, role: ModelRole) -> ModelAdapter:
+    def by_provider(
+        self,
+        provider: ModelProvider,
+        role: ModelRole,
+        *,
+        structured_output: bool = False,
+    ) -> ModelAdapter:
         if provider is ModelProvider.OPENAI:
-            return self.by_backend(ModelBackend.CHATGPT_BRIDGE, role)
+            return self.by_backend(
+                ModelBackend.CHATGPT_BRIDGE, role, structured_output=structured_output
+            )
         defaults = {
             ModelProvider.GEMINI: ModelBackend.GEMINI_WEBAI,
             ModelProvider.QWEN: ModelBackend.QWEN,
             ModelProvider.FAKE: ModelBackend.FAKE,
         }
         try:
-            return self.by_backend(defaults[provider], role)
+            return self.by_backend(defaults[provider], role, structured_output=structured_output)
         except KeyError as exc:
             raise ModelGatewayError(f"Model provider is not configured: {provider.value}") from exc
 
@@ -662,11 +686,16 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     )
             await uow.commit()
 
-    def build_run(self, request: ModelRequest, role: ModelRole) -> ModelRun:
-        adapter = self._router.select(request, role)
-        _ensure_capabilities(
-            adapter, request, structured_output=role is ModelRole.STRUCTURED_EXTRACTION
-        )
+    def build_run(
+        self,
+        request: ModelRequest,
+        role: ModelRole,
+        *,
+        structured_output: bool = False,
+    ) -> ModelRun:
+        requires_structured_output = structured_output or role is ModelRole.STRUCTURED_EXTRACTION
+        adapter = self._router.select(request, role, structured_output=requires_structured_output)
+        _ensure_capabilities(adapter, request, structured_output=requires_structured_output)
         safe_request = sanitize_model_request(request)
         return ModelRun(
             provider=adapter.provider,
@@ -704,7 +733,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 or not run.response_id
             ):
                 raise ModelGatewayError("Model run is not waiting for a background response")
-            adapter = self._router.by_backend(run.backend, run.model_role)
+            adapter = self._router.by_backend(
+                run.backend,
+                run.model_role,
+                structured_output=(
+                    output_schema is not None or run.model_role is ModelRole.STRUCTURED_EXTRACTION
+                ),
+            )
             if (
                 adapter.provider is not run.provider
                 or adapter.backend is not run.backend
@@ -775,14 +810,15 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         *,
         output_schema: type[BaseModel] | None = None,
     ) -> ModelExecution:
-        adapter = self._router.select(request, role)
-        _ensure_capabilities(
-            adapter,
-            request,
-            structured_output=output_schema is not None or role is ModelRole.STRUCTURED_EXTRACTION,
+        # Le choix de l'adapter et sa validation portent sur la même exigence :
+        # un draft avec schéma doit atteindre un adapter structured.
+        requires_structured_output = (
+            output_schema is not None or role is ModelRole.STRUCTURED_EXTRACTION
         )
+        adapter = self._router.select(request, role, structured_output=requires_structured_output)
+        _ensure_capabilities(adapter, request, structured_output=requires_structured_output)
         safe_request = sanitize_model_request(request)
-        run = self.build_run(request, role)
+        run = self.build_run(request, role, structured_output=requires_structured_output)
         persisted_success: ModelRun | None = None
         resume_run_id: UUID | None = None
         async with self._uow_factory() as uow:

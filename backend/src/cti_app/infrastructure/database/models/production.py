@@ -27,7 +27,9 @@ PRODUCTION_STAGE_VALUES_SQL = (
 PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = (
     "'references', 'extraction', 'synthesis', 'editorial_enrichment', 'publication'"
 )
-PRODUCTION_REUSE_STAGE_VALUES_SQL = "'references', 'extraction', 'synthesis'"
+PRODUCTION_REUSE_STAGE_VALUES_SQL = (
+    "'references', 'extraction', 'synthesis', 'editorial_enrichment'"
+)
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'failed'"
 TLP_VALUES_SQL = "'CLEAR', 'GREEN', 'AMBER', 'AMBER+STRICT', 'RED'"

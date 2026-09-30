@@ -53,6 +53,11 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         bridge_transport, model=settings.openai_structured_model
     )
     openai_drafting = OpenAIResearchAdapter(bridge_transport, model=settings.openai_drafting_model)
+    # Drafting structuré : même modèle que le drafting textuel, mais un transport
+    # qui porte le contrat JSON (le bridge valide côté client, pas nativement).
+    openai_structured_drafting = OpenAIStructuredAdapter(
+        bridge_transport, model=settings.openai_drafting_model
+    )
     openai_critic = OpenAIResearchAdapter(bridge_transport, model=settings.openai_critic_model)
     qwen = QwenAdapter(
         qwen_transport,
@@ -92,6 +97,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         openai_research=openai_research,
         openai_structured=openai_structured,
         openai_drafting=openai_drafting,
+        openai_structured_drafting=openai_structured_drafting,
         openai_critic=openai_critic,
         qwen=qwen,
         gemini=gemini,

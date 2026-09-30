@@ -2152,6 +2152,7 @@ async def invalidate_production_reuse(
         ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
         ProductionStage.SYNTHESIS,
+        ProductionStage.EDITORIAL_ENRICHMENT,
     }:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

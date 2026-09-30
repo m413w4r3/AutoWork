@@ -38,6 +38,7 @@ from cti_app.application.production_editorial_enrichment import (
     compute_editorial_enrichment_input_hash,
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_model_run_id,
+    editorial_enrichment_output_contract_example,
     validate_editorial_enrichment_proposal,
 )
 from cti_app.application.production_synthesis import (
@@ -295,6 +296,44 @@ def test_strict_proposal_rejects_extra_keys_missing_evidence_and_unknown_handles
     with pytest.raises(EditorialEnrichmentProposalControlError) as unknown:
         validate_editorial_enrichment_proposal(_proposal("E999"), pack, extraction, synthesis)
     assert unknown.value.code is EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+
+
+def _colliding_proposal(collision: str) -> dict[str, object]:
+    proposal = _proposal("E001").model_dump(mode="json")
+    if collision == "duplicate_table_keys":
+        proposal["tables"] = [proposal["tables"][0], dict(proposal["tables"][0])]
+    else:
+        proposal["diagrams"][0]["key"] = proposal["tables"][0]["key"]
+    return proposal
+
+
+@pytest.mark.parametrize("collision", ["duplicate_table_keys", "table_key_equals_diagram_key"])
+def test_global_key_collision_is_output_invalid_not_a_raw_domain_error(collision: str) -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+
+    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
+        validate_editorial_enrichment_proposal(
+            _colliding_proposal(collision), pack, extraction, synthesis
+        )
+
+    assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+
+
+def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> None:
+    example = editorial_enrichment_output_contract_example()
+
+    parsed = EditorialEnrichmentProposalV1.model_validate(example)
+
+    for diagram in example["diagrams"]:
+        node_ids = {node["node_id"] for node in diagram["nodes"]}
+        for edge in diagram["edges"]:
+            assert edge["source_node_id"] in node_ids
+            assert edge["target_node_id"] in node_ids
+    keys = [item.key for item in (*parsed.tables, *parsed.diagrams)]
+    assert len(keys) == len(set(keys))
 
 
 def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
@@ -805,6 +844,22 @@ async def test_invalid_structured_output_needs_review_without_artifact(failure: 
         EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value,
         EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE.value,
     }
+    assert result.model_calls == 1
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("collision", ["duplicate_table_keys", "table_key_equals_diagram_key"])
+async def test_key_collision_in_structured_proposal_needs_review_without_artifact(
+    collision: str,
+) -> None:
+    proposal = EditorialEnrichmentProposalV1.model_validate(_colliding_proposal(collision))
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, proposal)))
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == "editorial_enrichment_output_invalid"
     assert result.model_calls == 1
     assert world.writer.calls == []
 

@@ -34,7 +34,15 @@ implémentation expose toutes les capacités OpenAI.
 | Brouillon standard ou contenu sensible | Qwen |
 
 Les variables `MODEL_ROUTE_<HINT>` configurent le mapping `ModelRoutingHint -> ModelBackend`.
-`MODEL_ROUTE_EDITORIAL_ENRICHMENT` configure séparément le backend de l’enrichissement éditorial.
+`MODEL_ROUTE_EDITORIAL_ENRICHMENT` configure séparément le backend de l’enrichissement éditorial ;
+il accepte `chatgpt_bridge`, `qwen` ou `fake` (Gemini WebAI n’a pas encore de contrat structured).
+
+Sur `chatgpt_bridge`, le routeur choisit l’adaptateur selon le rôle **et** l’exigence de sortie
+structurée : un `draft()` sans schéma utilise l’adaptateur drafting textuel, un `draft()` avec
+`output_schema` (Synthesis, Editorial Enrichment, fusion Discovery) utilise un adaptateur
+structured qui garde `OPENAI_DRAFTING_MODEL`. Le bridge annonce
+`structured_output=prompt_and_client_validation` : le contrat JSON est injecté dans le prompt et
+validé côté AutoWork. `STRUCTURED_EXTRACTION` conserve `OPENAI_STRUCTURED_MODEL`.
 `MODEL_FORCE_ADAPTER=chatgpt_bridge|gemini_webai|qwen|fake` permet un forçage uniquement lorsque
 `APP_ENV=development`; `openai` et `gemini` restent des alias de compatibilité. `auto` conserve
 la politique ci-dessus.

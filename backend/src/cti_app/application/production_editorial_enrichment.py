@@ -104,7 +104,7 @@ if TYPE_CHECKING:
 EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-structured-v1"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 1
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = "editorial-enrichment-evidence-pack-v1"
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-draft-v1"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-draft-v2"
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v1"
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = "editorial-enrichment-routing-policy-v1"
@@ -538,6 +538,57 @@ def editorial_enrichment_model_run_id(run: ProductionRun, input_hash: str) -> UU
     return uuid5(NAMESPACE_URL, identity)
 
 
+def editorial_enrichment_output_contract_example() -> dict[str, Any]:
+    """Shape example injected in the prompt; it must satisfy the enforced contract."""
+    return {
+        "tables": [
+            {
+                "key": "commands",
+                "kind": "commands",
+                "title": "Commands observed",
+                "caption": None,
+                "columns": [
+                    {"key": "command", "label": "Command"},
+                    {"key": "purpose", "label": "Purpose"},
+                ],
+                "rows": [{"cells": ["...", "..."], "evidence_handles": ["E001"]}],
+                "placement": {"kind": "after_lead", "section_index": None},
+            }
+        ],
+        "diagrams": [
+            {
+                "key": "infection_chain",
+                "kind": "infection_chain",
+                "title": "Infection chain",
+                "caption": None,
+                "direction": "left_to_right",
+                "nodes": [
+                    {
+                        "node_id": "step_1",
+                        "label": "Observed initial step",
+                        "evidence_handles": ["E001"],
+                    },
+                    {
+                        "node_id": "step_2",
+                        "label": "Observed following step",
+                        "evidence_handles": ["E002"],
+                    },
+                ],
+                "edges": [
+                    {
+                        "source_node_id": "step_1",
+                        "target_node_id": "step_2",
+                        "label": "leads to",
+                        "evidence_handles": ["E003"],
+                    }
+                ],
+                "groups": [],
+                "placement": {"kind": "after_section", "section_index": 0},
+            }
+        ],
+    }
+
+
 def build_editorial_enrichment_model_request(
     run: ProductionRun,
     snapshot: ProductionInputSnapshot,
@@ -610,48 +661,7 @@ def build_editorial_enrichment_model_request(
                 "diagram_groups": MAX_DIAGRAM_GROUPS,
             },
         },
-        "output_contract": {
-            "tables": [
-                {
-                    "key": "commands",
-                    "kind": "commands",
-                    "title": "Commands observed",
-                    "caption": None,
-                    "columns": [
-                        {"key": "command", "label": "Command"},
-                        {"key": "purpose", "label": "Purpose"},
-                    ],
-                    "rows": [{"cells": ["...", "..."], "evidence_handles": ["E001"]}],
-                    "placement": {"kind": "after_lead", "section_index": None},
-                }
-            ],
-            "diagrams": [
-                {
-                    "key": "infection_chain",
-                    "kind": "infection_chain",
-                    "title": "Infection chain",
-                    "caption": None,
-                    "direction": "left_to_right",
-                    "nodes": [
-                        {
-                            "node_id": "step_1",
-                            "label": "Observed step",
-                            "evidence_handles": ["E001"],
-                        }
-                    ],
-                    "edges": [
-                        {
-                            "source_node_id": "step_1",
-                            "target_node_id": "step_2",
-                            "label": "leads to",
-                            "evidence_handles": ["E001"],
-                        }
-                    ],
-                    "groups": [],
-                    "placement": {"kind": "after_section", "section_index": 0},
-                }
-            ],
-        },
+        "output_contract": editorial_enrichment_output_contract_example(),
     }
     prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     if any(str(record.source_document_id) in prompt for record in access_policy.sources):
@@ -904,20 +914,22 @@ def validate_editorial_enrichment_proposal(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             ) from exc
 
-    enrichment = EditorialEnrichmentV1(
-        schema_version=EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
-        subject_id=synthesis.subject_id,
-        production_input_hash=synthesis.production_input_hash,
-        extraction_hash=canonical_extraction_hash(extraction),
-        synthesis_hash=canonical_synthesis_hash(synthesis),
-        publication_language=synthesis.publication_language,
-        enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
-        tables=tuple(tables),
-        diagrams=tuple(diagrams),
-        source_figures=(),
-        warnings=(),
-    )
+    # Root invariants (e.g. globally unique table/diagram keys) are a model
+    # output defect, never an infrastructure error.
     try:
+        enrichment = EditorialEnrichmentV1(
+            schema_version=EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
+            subject_id=synthesis.subject_id,
+            production_input_hash=synthesis.production_input_hash,
+            extraction_hash=canonical_extraction_hash(extraction),
+            synthesis_hash=canonical_synthesis_hash(synthesis),
+            publication_language=synthesis.publication_language,
+            enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
+            tables=tuple(tables),
+            diagrams=tuple(diagrams),
+            source_figures=(),
+            warnings=(),
+        )
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     except EditorialEnrichmentValidationError as exc:
         code = (
@@ -926,6 +938,10 @@ def validate_editorial_enrichment_proposal(
             else EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
         )
         raise EditorialEnrichmentProposalControlError(code) from exc
+    except ValueError as exc:
+        raise EditorialEnrichmentProposalControlError(
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+        ) from exc
     return enrichment
 
 

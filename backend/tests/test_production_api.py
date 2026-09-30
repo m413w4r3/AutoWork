@@ -812,7 +812,9 @@ async def test_invalidate_reuse_rejects_non_costly_stage(
     assert uow.production_reuse_invalidations.items == []
 
 
-@pytest.mark.parametrize("from_stage", ["references", "extraction", "synthesis"])
+@pytest.mark.parametrize(
+    "from_stage", ["references", "extraction", "synthesis", "editorial_enrichment"]
+)
 async def test_invalidate_reuse_persists_identity_from_provider(
     api: AsyncClient,
     uow: _Uow,

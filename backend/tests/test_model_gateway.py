@@ -936,3 +936,147 @@ async def test_gemini_http_refusals_are_typed_and_only_proven_ones_skip_reconcil
     diagnostics = bad_request_run.error_details["bridge_diagnostics"]
     assert diagnostics["error_code"] == "provider_bad_request"
     assert diagnostics["http_status"] == 400
+
+
+class _RecordingResponsesTransport:
+    def __init__(self, output_text: str) -> None:
+        self._output_text = output_text
+        self.payloads: list[dict[str, Any]] = []
+
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del idempotency_key
+        self.payloads.append(payload)
+        return {
+            "id": f"resp_{len(self.payloads)}",
+            "status": "completed",
+            "model": payload["model"],
+            "output_text": self._output_text,
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+
+    async def retrieve(self, response_id: str) -> dict[str, Any]:
+        del response_id
+        raise AssertionError("not used")
+
+
+def _chatgpt_bridge_gateway(
+    transport: ResponsesTransport,
+) -> tuple[ModelGateway, InMemoryModelRunUnitOfWorkFactory]:
+    """Mirror the production composition: distinct drafting / structured models."""
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    router = ModelRouter(
+        openai_research=OpenAIResearchAdapter(transport, model="research-model"),
+        openai_structured=OpenAIStructuredAdapter(transport, model="structured-model"),
+        openai_drafting=OpenAIResearchAdapter(transport, model="drafting-model"),
+        openai_structured_drafting=OpenAIStructuredAdapter(transport, model="drafting-model"),
+        openai_critic=OpenAIResearchAdapter(transport, model="critic-model"),
+        qwen=QwenAdapter(NoCallChatTransport(), model="Qwen3-32B", is_external=False),
+        fake=FakeModelAdapter(),
+    )
+    return ModelGateway(router, model_uow, InMemoryModelOutputStore()), model_uow
+
+
+def test_production_factory_routes_chatgpt_drafting_by_structured_requirement() -> None:
+    from typing import cast
+
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.config import Settings
+    from cti_app.integrations.model_factory import create_model_gateway
+
+    def no_persistence() -> Any:
+        raise AssertionError("Routing selection must not open a unit of work")
+
+    settings = Settings(
+        _env_file=None,
+        openai_drafting_model="drafting-model",
+        openai_structured_model="structured-model",
+    )
+    assert settings.model_route_editorial_enrichment == "chatgpt_bridge"
+    router = create_model_gateway(settings, cast(UnitOfWorkFactory, no_persistence))._router
+    editorial = request(
+        external_llm_allowed=True, routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT
+    )
+
+    textual = router.select(editorial, ModelRole.DRAFTING)
+    structured = router.select(editorial, ModelRole.DRAFTING, structured_output=True)
+    extraction = router.by_backend(ModelBackend.CHATGPT_BRIDGE, ModelRole.STRUCTURED_EXTRACTION)
+
+    assert isinstance(textual, OpenAIResearchAdapter)
+    assert textual.requested_model == "drafting-model"
+    assert textual.capabilities.structured_output is False
+    assert isinstance(structured, OpenAIStructuredAdapter)
+    assert structured.requested_model == "drafting-model"
+    assert structured.capabilities.structured_output is True
+    assert isinstance(extraction, OpenAIStructuredAdapter)
+    assert extraction.requested_model == "structured-model"
+
+
+def test_chatgpt_router_selects_adapter_per_role_and_structured_requirement() -> None:
+    gateway, _ = _chatgpt_bridge_gateway(_RecordingResponsesTransport("{}"))
+    router = gateway._router
+    backend = ModelBackend.CHATGPT_BRIDGE
+
+    assert router.by_backend(backend, ModelRole.DRAFTING).requested_model == "drafting-model"
+    assert isinstance(router.by_backend(backend, ModelRole.DRAFTING), OpenAIResearchAdapter)
+    structured_drafting = router.by_backend(backend, ModelRole.DRAFTING, structured_output=True)
+    assert isinstance(structured_drafting, OpenAIStructuredAdapter)
+    assert structured_drafting.requested_model == "drafting-model"
+    extraction = router.by_backend(backend, ModelRole.STRUCTURED_EXTRACTION)
+    assert isinstance(extraction, OpenAIStructuredAdapter)
+    assert extraction.requested_model == "structured-model"
+
+
+def test_router_structured_drafting_defaults_to_structured_adapter() -> None:
+    transport = SequencedResponsesTransport([])
+    gateway, _, _ = gateway_with_transport(transport)
+
+    adapter = gateway._router.by_backend(
+        ModelBackend.CHATGPT_BRIDGE, ModelRole.DRAFTING, structured_output=True
+    )
+
+    assert adapter.capabilities.structured_output is True
+
+
+@pytest.mark.parametrize(
+    "routing_hint",
+    [
+        ModelRoutingHint.EDITORIAL_ENRICHMENT,
+        ModelRoutingHint.PREMIUM_SYNTHESIS,
+        ModelRoutingHint.DISCOVERY_MERGE,
+    ],
+)
+async def test_chatgpt_structured_draft_reaches_structured_drafting_adapter(
+    routing_hint: ModelRoutingHint,
+) -> None:
+    transport = _RecordingResponsesTransport('{"title": "Structured"}')
+    gateway, model_uow = _chatgpt_bridge_gateway(transport)
+    model_request = request(external_llm_allowed=True, routing_hint=routing_hint)
+
+    execution = await gateway.draft(model_request, output_schema=_Extraction)
+
+    assert execution.run.status is ModelRunStatus.SUCCEEDED
+    assert execution.run.backend is ModelBackend.CHATGPT_BRIDGE
+    assert execution.run.model_role is ModelRole.DRAFTING
+    assert execution.run.requested_model == "drafting-model"
+    assert execution.structured_output == _Extraction(title="Structured")
+    assert len(transport.payloads) == 1
+    assert transport.payloads[0]["model"] == "drafting-model"
+    # The structured adapter carries the JSON contract to the bridge.
+    assert '"required": ["title"]' in transport.payloads[0]["input"][0]["content"]
+    assert execution.run.id in model_uow.state
+
+
+async def test_chatgpt_textual_draft_keeps_textual_drafting_adapter() -> None:
+    transport = _RecordingResponsesTransport("Plain draft")
+    gateway, _ = _chatgpt_bridge_gateway(transport)
+
+    execution = await gateway.draft(
+        request(external_llm_allowed=True, routing_hint=ModelRoutingHint.PREMIUM_SYNTHESIS)
+    )
+
+    assert execution.output_text == "Plain draft"
+    assert execution.structured_output is None
+    assert execution.run.requested_model == "drafting-model"
+    assert "contrat" not in transport.payloads[0]["input"][0]["content"]

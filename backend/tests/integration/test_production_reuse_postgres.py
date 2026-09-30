@@ -1225,6 +1225,101 @@ async def test_postgres_invalidation_blocks_only_downstream_stages(
 
 
 @pytest.mark.asyncio
+async def test_postgres_persists_forced_editorial_enrichment_retry(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    """The domain retry marker must satisfy the real ``ck_run_force_recompute_stage``."""
+    edition = _edition()
+    await _persist_edition(uow_factory, edition)
+    subject = Subject(
+        edition_id=edition.id,
+        title="Editorial retry subject",
+        slug=f"editorial-retry-{uuid4().hex}",
+        tlp=TLP.AMBER,
+    )
+    store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    )
+    run, _ = await _seed_computed_run(
+        uow_factory,
+        store,
+        edition=edition,
+        subject=subject,
+        created_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+
+    retry = await SubjectProductionService(uow_factory).retry_from_stage(
+        run.id, ProductionStage.EDITORIAL_ENRICHMENT, force_recompute=True
+    )
+
+    assert retry.run.force_recompute_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
+    async with uow_factory() as uow:
+        persisted = await uow.production_runs.get(run.id)
+    assert persisted is not None
+    assert persisted.status is ProductionRunStatus.RUNNING
+    assert persisted.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
+    assert persisted.pipeline_generation == run.pipeline_generation + 1
+    assert persisted.force_recompute_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
+
+
+@pytest.mark.asyncio
+async def test_postgres_persists_editorial_enrichment_reuse_invalidation(
+    uow_factory: UnitOfWorkFactory, tmp_path: Path
+) -> None:
+    edition = _edition()
+    await _persist_edition(uow_factory, edition)
+    subject = Subject(
+        edition_id=edition.id,
+        title="Editorial invalidation subject",
+        slug=f"editorial-invalidate-{uuid4().hex}",
+        tlp=TLP.AMBER,
+    )
+    store = ProductionArtifactStore(
+        BlobCatalogService(FilesystemBlobStore(tmp_path / "blobs"), uow_factory)
+    )
+    _, source_artifacts = await _seed_computed_run(
+        uow_factory,
+        store,
+        edition=edition,
+        subject=subject,
+        created_at=datetime.now(UTC) - timedelta(minutes=2),
+    )
+    invalidation = ProductionReuseInvalidation(
+        edition_id=edition.id,
+        subject_id=subject.id,
+        from_stage=ProductionStage.EDITORIAL_ENRICHMENT,
+        actor_id="operator",
+        correlation_id=str(uuid4()),
+        occurred_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    async with uow_factory() as uow:
+        await uow.production_reuse_invalidations.add(invalidation)
+        target_run = ProductionRun(
+            subject_id=subject.id,
+            edition_id=edition.id,
+            run_number=2,
+            status=ProductionRunStatus.RUNNING,
+            current_stage=ProductionStage.REFERENCES,
+        )
+        await uow.production_runs.add(target_run)
+        await uow.commit()
+
+    async with uow_factory() as uow:
+        persisted = await uow.production_reuse_invalidations.list_for_subject(
+            edition.id, subject.id
+        )
+    assert [item.from_stage for item in persisted] == [ProductionStage.EDITORIAL_ENRICHMENT]
+    assert persisted[0].id == invalidation.id
+    # The cutoff starts at EDITORIAL_ENRICHMENT: upstream synthesis stays reusable.
+    synthesis = await ProductionArtifactReuseService(uow_factory, store).find_or_reuse(
+        run=target_run,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        input_hash=source_artifacts[ProductionArtifactStage.SYNTHESIS].input_hash,
+    )
+    assert synthesis is not None
+
+
+@pytest.mark.asyncio
 async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     uow_factory: UnitOfWorkFactory, tmp_path: Path
 ) -> None:

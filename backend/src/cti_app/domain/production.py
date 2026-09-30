@@ -1275,6 +1275,7 @@ class ProductionReuseInvalidation:
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
             ProductionStage.SYNTHESIS,
+            ProductionStage.EDITORIAL_ENRICHMENT,
         }:
             raise ValueError("Production reuse invalidation must start at a costly stage")
         if not self.actor_id.strip():
