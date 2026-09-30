@@ -275,9 +275,22 @@ pas des artifacts canoniques. Cette capacité de compilation n’est ni un `Prod
 
 À ce stade, le SVG n’est pas persisté, n’est pas relié à `EditorialEnrichmentService`, n’est pas
 injecté dans `PublicationDocumentV3` et n’est pas consommé par Assembly. L’inventaire des figures
-sources reste AW-017b ; la résolution des médias et leur persistance content-addressed restent
-AW-017c ; la projection dans `PublicationDocumentV4` reste AW-018. AW-017a conserve le rôle actuel
-de Pandoc.
+sources relève d’AW-017b ; la résolution des médias et leur persistance content-addressed relèvent
+d’AW-017c ; la projection dans `PublicationDocumentV4` relève d’AW-018. AW-017a conserve le rôle
+actuel de Pandoc.
+
+### AW-017b : inventaire des figures HTML archivées
+
+`SourceFigureCandidateV1` est la sortie immuable de l’inventaire des figures d’une source archivée.
+Chaque candidat porte les bytes exacts de l’image, leurs hashes et leur provenance.
+Le flux HTML implémenté part d’un snapshot HTML déjà archivé et des assets archivés localement,
+puis produit des candidats de façon déterministe. L’inventaire ne fait aucun accès réseau ni
+aucune persistance ; les ressources externes non résolues ne sont pas téléchargées.
+
+L’extraction des figures depuis les PDF reste un travail AW-017b à réaliser. AW-017c reste
+responsable des manifestes média et de la persistance content-addressed. AW-018 reste responsable
+de la consommation par `PublicationDocumentV4` et Assembly. Cet inventaire ne crée ni stage de
+production ni artifact de production.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
 l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
@@ -290,9 +303,9 @@ conserve le document canonique, sans rendu. Un futur pipeline de rendu indépend
 consommer.
 
 AW-016 a remplacé la génération vide par des propositions structurées. AW-017a fournit la
-compilation dérivée des diagrammes ; AW-017b inventorie les figures sources et AW-017c résout et
-persiste les médias. AW-018 projettera l’enrichissement et les médias résolus dans
-`PublicationDocumentV4`.
+compilation dérivée des diagrammes ; AW-017b inventorie les figures HTML archivées et reste à
+compléter pour les PDF ; AW-017c résout les médias et fournit leurs manifestes et leur persistance.
+AW-018 projettera l’enrichissement et les médias résolus dans `PublicationDocumentV4`.
 
 ## ProductionBoard
 
