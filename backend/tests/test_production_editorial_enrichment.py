@@ -282,6 +282,18 @@ def test_diagram_node_edge_and_group_invariants_are_enforced() -> None:
         DiagramNodeV1("a", "Node A", ())
     with pytest.raises(ValueError, match="at least one evidence"):
         DiagramEdgeV1("a", "b", None, ())
+    with pytest.raises(ValueError, match="at least one node"):
+        DiagramGroupV1("empty", "Empty", ())
+    for control in ("\x00", "\x1b", "\x7f", "\x85", "\ud800"):
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramNodeV1("a", f"Node{control}A", (ref,))
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramEdgeV1("a", "b", f"edge{control}", (ref,))
+        with pytest.raises(ValueError, match="control characters"):
+            DiagramGroupV1("group", f"Group{control}", ("a",))
+    assert DiagramNodeV1("a", "line\nbreak\tand\r\u2028", (ref,)).label == (
+        "line\nbreak\tand\r\u2028"
+    )
 
     base = dict(
         key="diagram",
@@ -300,6 +312,16 @@ def test_diagram_node_edge_and_group_invariants_are_enforced() -> None:
         DiagramSpecV1(**{**base, "edges": (DiagramEdgeV1("a", "missing", None, (ref,)),)})
     with pytest.raises(ValueError, match="groups must reference"):
         DiagramSpecV1(**{**base, "groups": (DiagramGroupV1("group", "Group", ("missing",)),)})
+    with pytest.raises(ValueError, match="must not share nodes"):
+        DiagramSpecV1(
+            **{
+                **base,
+                "groups": (
+                    DiagramGroupV1("first", "First", ("a",)),
+                    DiagramGroupV1("second", "Second", ("a", "b")),
+                ),
+            }
+        )
 
 
 def test_source_figure_requires_locator_and_positive_page() -> None:

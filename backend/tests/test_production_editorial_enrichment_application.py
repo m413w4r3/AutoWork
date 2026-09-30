@@ -322,6 +322,33 @@ def test_global_key_collision_is_output_invalid_not_a_raw_domain_error(collision
     assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
 
 
+@pytest.mark.parametrize(
+    "groups",
+    (
+        [{"group_id": "empty", "label": "Empty", "node_ids": []}],
+        [
+            {"group_id": "first", "label": "First", "node_ids": ["malware"]},
+            {"group_id": "second", "label": "Second", "node_ids": ["malware", "execution"]},
+        ],
+        [{"group_id": "stage", "label": "Stage", "node_ids": ["malware", "malware"]}],
+    ),
+)
+def test_invalid_diagram_groups_are_output_invalid_not_a_raw_domain_error(
+    groups: list[dict[str, object]],
+) -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    proposal = _proposal("E001").model_dump(mode="json")
+    proposal["diagrams"][0]["groups"] = groups
+
+    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
+        validate_editorial_enrichment_proposal(proposal, pack, extraction, synthesis)
+
+    assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+
+
 def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> None:
     example = editorial_enrichment_output_contract_example()
 
