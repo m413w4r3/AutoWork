@@ -115,21 +115,23 @@ async def test_lot33_postgres_selective_versions_keep_current_and_audit_distinct
         action=ProductionRepairAction.EXCLUDE,
         actor_id="reviewer",
     )
-    audit_v3 = {
+    audit_revision_3 = {
         **audit_v2,
         "decision_ids": [str(decision_two.id)],
         "result_extraction_artifact_id": None,
         "result_publication_artifact_id": None,
     }
-    extraction_v3 = artifact(ProductionArtifactStage.EXTRACTION, 3, repair_materialization=audit_v3)
-    publication_v3 = artifact(ProductionArtifactStage.PUBLICATION, 3)
-    audit_v3["result_extraction_artifact_id"] = str(extraction_v3.id)
-    audit_v3["result_publication_artifact_id"] = str(publication_v3.id)
+    extraction_revision_3 = artifact(
+        ProductionArtifactStage.EXTRACTION, 3, repair_materialization=audit_revision_3
+    )
+    publication_revision_3 = artifact(ProductionArtifactStage.PUBLICATION, 3)
+    audit_revision_3["result_extraction_artifact_id"] = str(extraction_revision_3.id)
+    audit_revision_3["result_publication_artifact_id"] = str(publication_revision_3.id)
     async with uow_factory() as uow:
         await uow.production_repair_decisions.append(decision_two)
         await uow.production_artifacts.mark_stages_stale(run.id, {"publication"})
-        await uow.production_artifacts.append(extraction_v3)
-        await uow.production_artifacts.append(publication_v3)
+        await uow.production_artifacts.append(extraction_revision_3)
+        await uow.production_artifacts.append(publication_revision_3)
         await uow.commit()
 
     async with uow_factory() as uow:

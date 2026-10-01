@@ -1620,7 +1620,8 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     publication_b = artifacts_b[ProductionArtifactStage.PUBLICATION]
     assert publication_b.production_run_id == run_b.id
     assert publication_b.status is ProductionArtifactStatus.VERIFIED
-    assert publication_b.reused_from_artifact_id is None
+    assert publication_b.reused_from_artifact_id == publication_a.id
+    assert publication_b.canonical_blob_id == publication_a.canonical_blob_id
     assert publication_b.id != publication_a.id
 
     retry = await production.retry_from_stage(run_b.id, ProductionStage.EXTRACTION)

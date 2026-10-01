@@ -37,6 +37,13 @@ from cti_app.application.production_repairs import (
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.domain.classification import TLP
+from cti_app.domain.discovery_cumulative import (
+    DiscoveryMergeRun,
+    DiscoveryPlannerKind,
+    DiscoverySnapshot,
+    DiscoverySubjectIdentity,
+    MergeValidationStatus,
+)
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
@@ -55,6 +62,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
 from cti_app.domain.production_extraction import production_extraction_to_json
 from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.selection import SelectionAction, SelectionDecision, SubjectDiscoveryOrigin
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import _canonical_inputs
@@ -158,6 +166,44 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         position=1,
     )
 
+    # Production resolves real, FK-checked selection lineage rows.
+    merge_run = DiscoveryMergeRun(
+        edition_id=edition.id,
+        parent_snapshot_id=None,
+        intake_id=None,
+        planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+        prompt_version="1",
+        policy_version="1",
+        blocking_version="1",
+        merge_input_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+        handle_map={},
+        included_subject_ids=(subject.id,),
+        excluded_subject_count=0,
+        validation_status=MergeValidationStatus.VALID,
+    )
+    discovery_snapshot = DiscoverySnapshot(
+        edition_id=edition.id,
+        version=1,
+        parent_snapshot_id=None,
+        intake_id=None,
+        merge_run_id=merge_run.id,
+        planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+        subjects=(),
+        snapshot_hash=hashlib.sha256(subject.id.bytes).hexdigest(),
+        is_active=True,
+    )
+    decision = SelectionDecision(
+        edition_id=edition.id,
+        discovery_subject_id=subject.id,
+        snapshot_id=discovery_snapshot.id,
+        snapshot_version=discovery_snapshot.version,
+        action=SelectionAction.SELECT,
+        subject_id=subject.id,
+        actor_id="lot34",
+        correlation_id="lot34",
+        idempotency_key=f"lot34-{subject.id}",
+    )
+
     base_snapshot, base_references, base_extraction, base_synthesis = _canonical_inputs()
     snapshot = replace(
         base_snapshot,
@@ -165,6 +211,13 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         edition_id=edition.id,
         subject_id=subject.id,
         subject_title=subject.title,
+        selection_decision_id=decision.id,
+        origin_discovery_subject_id=subject.id,
+        canonical_discovery_subject_id=subject.id,
+        discovery_snapshot_id=discovery_snapshot.id,
+        discovery_snapshot_version=discovery_snapshot.version,
+        input_hash="",
+        reuse_basis_hash="",
     )
     reference_source = replace(base_references.sources[0], canonical_url=SOURCE_URL)
     references_value = replace(
@@ -268,6 +321,29 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
     async with uow_factory() as uow:
         assert await uow.editions.add_if_absent(edition)
         await uow.subjects.add(subject)
+        assert await uow.discovery_merge_runs.add_if_absent(merge_run)
+        await uow.discovery_subject_identities.add_many_if_absent(
+            [
+                DiscoverySubjectIdentity(
+                    edition_id=edition.id,
+                    origin_key=f"subject:{subject.id}",
+                    created_by_merge_run_id=merge_run.id,
+                    id=subject.id,
+                )
+            ]
+        )
+        await uow.discovery_snapshots.append(discovery_snapshot)
+        await uow.selection_decisions.append(decision)
+        await uow.subject_discovery_origins.add(
+            SubjectDiscoveryOrigin(
+                subject_id=subject.id,
+                edition_id=edition.id,
+                discovery_subject_id=subject.id,
+                selection_decision_id=decision.id,
+                selected_snapshot_id=discovery_snapshot.id,
+                selected_snapshot_version=discovery_snapshot.version,
+            )
+        )
         await uow.edition_production_batches.add(batch)
         await uow.production_runs.add(run)
         await uow.production_input_snapshots.add(snapshot)
@@ -374,17 +450,28 @@ async def test_repair_materialization_is_one_commit_with_the_new_publication(
     assert publication is not None and publication.id == result.publication_artifact.id
     assert publication.version == 2
     assert synthesis is not None and synthesis.id != fixture.synthesis.id
+    enrichment = await _current(
+        uow_factory, fixture.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    )
+    assert enrichment is not None
     assert publication.metadata["input_artifacts"] == {
         "references_artifact_id": str(fixture.references.id),
         "extraction_artifact_id": str(extraction.id),
         "synthesis_artifact_id": str(synthesis.id),
+        "editorial_enrichment_artifact_id": str(enrichment.id),
     }
     async with uow_factory() as uow:
         rows = await uow.production_artifacts.list_for_run(fixture.run.id)
     stale = {
         (row.stage, row.version) for row in rows if row.status is ProductionArtifactStatus.STALE
     }
-    assert stale == {(ProductionArtifactStage.PUBLICATION, 1)}
+    # The repaired Extraction changes the lineage hashes, so every downstream
+    # artifact bound to the old Extraction is superseded together.
+    assert stale == {
+        (ProductionArtifactStage.SYNTHESIS, 1),
+        (ProductionArtifactStage.EDITORIAL_ENRICHMENT, 1),
+        (ProductionArtifactStage.PUBLICATION, 1),
+    }
 
 
 @pytest.mark.asyncio
