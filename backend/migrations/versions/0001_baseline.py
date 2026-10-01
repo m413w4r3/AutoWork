@@ -23,6 +23,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     media_assets,
     model_execution,
     production,
+    publication_render,
     publication_review,
     selection,
 )

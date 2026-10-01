@@ -18,6 +18,14 @@ COPY scripts/install-d2.sh /usr/local/bin/install-d2
 RUN D2_LOCK_FILE=/usr/local/share/autowork/d2.lock \
     TARGETARCH="$TARGETARCH" /usr/local/bin/install-d2 /usr/local/bin
 
+COPY infra/typst.lock /usr/local/share/autowork/typst.lock
+COPY scripts/install-typst.sh /usr/local/bin/install-typst
+RUN TYPST_LOCK_FILE=/usr/local/share/autowork/typst.lock \
+    TARGETARCH="$TARGETARCH" /usr/local/bin/install-typst /usr/local/bin
+
+COPY infra/typst-fonts.lock /usr/local/share/autowork/typst-fonts.lock
+COPY chpTypst /app/chpTypst
+
 COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.ini ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src

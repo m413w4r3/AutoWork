@@ -13,7 +13,7 @@ encore activée.
 ## Prérequis
 
 - Docker avec Docker Compose v2 ;
-- pour travailler hors conteneur : Python 3.12+, `uv`, Node.js 22+, `pnpm` 10+ et D2 0.9.0.
+- pour travailler hors conteneur : Python 3.12+, `uv`, Node.js 22+, `pnpm` 10+, D2 0.9.0 et Typst 0.15.1.
 
 ## Démarrage local
 
@@ -61,8 +61,8 @@ sortie modèle et donne la commande d'export explicite de l'artefact brut.
 make setup
 ```
 
-`make setup` vérifie les prérequis, dont D2 0.9.0 pour compiler les diagrammes,
-synchronise le backend avec `backend/uv.lock`
+`make setup` vérifie les prérequis, dont D2 0.9.0 pour compiler les diagrammes et
+Typst 0.15.1 pour le rendu PDF des publications, synchronise le backend avec `backend/uv.lock`
 en installant explicitement les groupes `dev` et `analysis`, puis installe les
 dépendances frontend. Les commandes utiles pour une action ciblée sont :
 
@@ -73,9 +73,10 @@ make frontend-sync
 make reset-backend-env
 ```
 
-`make doctor` échoue si D2 0.9.0 manque en CI et affiche un avertissement local.
-Pour pointer vers un binaire précis, définir `D2_BINARY=/chemin/vers/d2` ; cette
-variable est aussi utilisée par les tests de compilation D2 réels.
+`make doctor` échoue si D2 0.9.0 ou Typst 0.15.1 manquent en CI et affiche un
+avertissement local. Pour pointer vers un binaire précis, définir
+`D2_BINARY=/chemin/vers/d2` ou `TYPST_BINARY=/chemin/vers/typst` ; ces variables
+sont aussi utilisées par les tests de compilation D2 et Typst réels.
 
 Pour mettre volontairement à jour le lockfile après une modification de
 dépendances, utiliser `make backend-lock`. `backend-sync` utilise `--locked` et

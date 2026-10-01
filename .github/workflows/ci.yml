@@ -38,6 +38,11 @@ jobs:
           ../scripts/install-d2.sh "$RUNNER_TEMP/d2"
           echo "$RUNNER_TEMP/d2" >> "$GITHUB_PATH"
           echo "D2_BINARY=$RUNNER_TEMP/d2/d2" >> "$GITHUB_ENV"
+      - name: Install pinned Typst for publication render tests
+        run: |
+          ../scripts/install-typst.sh "$RUNNER_TEMP/typst"
+          echo "$RUNNER_TEMP/typst" >> "$GITHUB_PATH"
+          echo "TYPST_BINARY=$RUNNER_TEMP/typst/typst" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"

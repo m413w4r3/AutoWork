@@ -1,8 +1,5 @@
 #import "colors.typ": *
 
-#import "@preview/notionly:0.1.0": *
-
-#import "@preview/oasis-align:0.4.1": *
 #set grid(gutter: 1em)
 
 
@@ -52,6 +49,19 @@
 // Chronologie
 #let timeline(events) = [
   #for event in events {
+    let source-urls = if event.len() > 2 {
+      let sources = event.at(2)
+      if type(sources) == str {
+        if sources == "" { () } else { (sources,) }
+      } else if sources == none {
+        ()
+      } else {
+        sources
+      }
+    } else {
+      ()
+    }
+
     grid(
       columns: (0.25cm, auto, 1fr),
       gutter: 2pt,
@@ -71,9 +81,11 @@
           #event.at(0)
         ]
         : #event.at(1)
-        #if event.len() > 2 and event.at(2) != none and event.at(2) != "" {
-            footnote[#better-link(event.at(2))[#event.at(2)]]
+        #for url in source-urls {
+          if url != none and url != "" {
+            footnote[#better-link(url)[#url]]
           }
+        }
       ]
     )
 
@@ -105,7 +117,7 @@
 
 #let noteAnalyste(content) = {
   block(
-    fill: notion.gray_bg,
+    fill: notion-gray-bg,
     radius: 4pt,
     width: 100%,
     inset: 8pt,
@@ -290,7 +302,7 @@
 }
 
 #let ioc(content) = {
-  text(font: "Liberation Mono")[#content]
+  text(font: "Cascadia Mono")[#content]
 }
 
 #let vt(body) = highlight( fill: luma(0%), radius: 2pt )[ #text( font: "Cascadia Mono", fill: white, size:11pt)[#body]]
@@ -301,20 +313,26 @@
   domains: [],
   urls: [],
   files: [],
+  emails: [],
+  hashes: [],
 ) = {
   set par(leading: 0pt)
-  let parse-list(content) = {
-    if "children" in content.fields() {
-      content.children
+  let parse-list(value) = {
+    if type(value) == array {
+      value
+    } else if type(value) == content {
+      if "children" in value.fields() { value.children } else { (value,) }
+    } else if value == none {
+      ()
     } else {
-      (content,)
+      (value,)
     }
   }
 
   let ioc-listt(items) = {
     
     for item in items {
-      text(font: "Liberation Mono")[#item]
+      text(font: "Cascadia Mono")[#item]
       linebreak()
     }
   }
@@ -322,6 +340,8 @@
   let ips = parse-list(ips)
   let domains = parse-list(domains)
   let urls = parse-list(urls)
+  let emails = parse-list(emails)
+  let hashes = parse-list(hashes)
   let files = parse-list(files)
 
   [
@@ -342,9 +362,43 @@
       #ioc-listt(urls)
     ]
 
+    #if emails.len() > 0 [
+      Adresses e-mail : \
+      #ioc-listt(emails)
+    ]
+
+    #if hashes.len() > 0 [
+      Empreintes (hashes) : \
+      #ioc-listt(hashes)
+    ]
+
     #if files.len() > 0 [
       Fichiers : \
       #ioc-listt(files)
     ]
   ]
 }
+
+#let source-list(sources) = [
+  #for source in sources {
+    let title = source.at("title", default: none)
+    let publisher = source.at("publisher", default: none)
+    let date = source.at("date", default: none)
+
+    block(above: 4pt, below: 4pt)[
+      #if title != none and title != "" {
+        text(weight: "bold")[#title]
+      }
+      #if publisher != none and publisher != "" {
+        if title != none and title != "" [ · ]
+        text(size: 9pt, fill: grey)[#publisher]
+      }
+      #if date != none and date != "" {
+        if (title != none and title != "") or (publisher != none and publisher != "") [ · ]
+        text(size: 9pt, fill: grey)[#date]
+      }
+      #linebreak()
+      #better-link(source.url)[#source.url]
+    ]
+  }
+]

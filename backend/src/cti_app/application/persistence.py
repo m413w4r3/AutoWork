@@ -79,6 +79,7 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SourceExtraction,
 )
+from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.selection import (
@@ -115,6 +116,37 @@ class MediaAssetRepository(Protocol):
     async def get(self, asset_id: UUID) -> MediaAssetManifest | None: ...
 
     async def get_by_identity(self, sha256: str, mime_type: str) -> MediaAssetManifest | None: ...
+
+
+class PublicationRenderRepository(Protocol):
+    async def get(self, render_id: UUID) -> PublicationRender | None: ...
+
+    async def get_by_input_hash(self, input_hash: str) -> PublicationRender | None: ...
+
+    async def add(self, render: PublicationRender) -> PublicationRender: ...
+
+    async def mark_retrying(self, render_id: UUID) -> PublicationRender: ...
+
+    async def mark_succeeded(
+        self,
+        render_id: UUID,
+        *,
+        output_blob_id: UUID,
+        output_sha256: str,
+        output_byte_size: int,
+        source_blob_id: UUID | None = None,
+        render_data_blob_id: UUID | None = None,
+    ) -> PublicationRender: ...
+
+    async def mark_failed(
+        self,
+        render_id: UUID,
+        *,
+        error_code: str,
+        error_message: str | None = None,
+        source_blob_id: UUID | None = None,
+        render_data_blob_id: UUID | None = None,
+    ) -> PublicationRender: ...
 
 
 class GoodwareBaselineRepository(Protocol):
@@ -672,6 +704,7 @@ class RejectedModelProposalRepository(Protocol):
 class UnitOfWork(Protocol):
     blobs: BlobRepository
     media_assets: MediaAssetRepository
+    publication_renders: PublicationRenderRepository
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
@@ -773,6 +806,28 @@ class JobUnitOfWork(Protocol):
 
 class JobUnitOfWorkFactory(Protocol):
     def __call__(self) -> JobUnitOfWork: ...
+
+
+class PublicationRenderUnitOfWork(Protocol):
+    production_artifacts: ProductionArtifactRepository
+    publication_renders: PublicationRenderRepository
+
+    async def __aenter__(self) -> Self: ...
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None: ...
+
+    async def commit(self) -> None: ...
+
+    async def rollback(self) -> None: ...
+
+
+class PublicationRenderUnitOfWorkFactory(Protocol):
+    def __call__(self) -> PublicationRenderUnitOfWork: ...
 
 
 class EditionUnitOfWork(Protocol):

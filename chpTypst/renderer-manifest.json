@@ -1,0 +1,12 @@
+{
+  "template_version": "chp-article-v1",
+  "files": [
+    "RENDERER/publication.typ",
+    "RENDERER/publication_helpers.typ",
+    "UTILS/document_style.typ",
+    "UTILS/helpers.typ",
+    "UTILS/colors.typ",
+    "UTILS/header_footer.typ",
+    "UTILS/chap.png"
+  ]
+}

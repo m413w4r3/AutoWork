@@ -10,6 +10,7 @@ COMPOSE ?= $(DOCKER) compose
 UV ?= uv
 PNPM ?= pnpm
 D2_BINARY ?= d2
+TYPST_BINARY ?= typst
 
 PYTHON_VERSION ?= 3.12
 
@@ -176,6 +177,7 @@ doctor: ## Vérifie les prérequis locaux
 		exit 1; \
 	fi; \
 	./scripts/check-d2.sh "$(D2_BINARY)"; \
+	./scripts/check-typst.sh "$(TYPST_BINARY)"; \
 	echo "OK: Docker, Compose, uv, Node.js et pnpm sont disponibles."
 
 setup: doctor backend-sync frontend-sync ## Prépare entièrement l'environnement de développement

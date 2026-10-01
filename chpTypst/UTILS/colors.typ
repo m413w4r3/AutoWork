@@ -3,6 +3,7 @@
 #let dark = rgb("#17202A")
 #let grey = rgb("#667085")
 #let light-grey = rgb("#E4E7EC")
+#let notion-gray-bg = rgb("#F1F1EF")
 
 
 /*
