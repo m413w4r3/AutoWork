@@ -86,11 +86,8 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     ArtifactType,
     PublicationAssemblyErrorCode,
-    PublicationDiagramV1,
-    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -101,6 +98,11 @@ from cti_app.domain.publication import (
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
+)
+from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
     publication_document_v4_to_json,
 )
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment

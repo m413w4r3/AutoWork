@@ -45,12 +45,9 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
     ArtifactType,
     PublicationAssemblyErrorCode,
-    PublicationDiagramV1,
-    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -58,13 +55,18 @@ from cti_app.domain.publication import (
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
-    PublicationSourceFigureV1,
     PublicationSourceV1,
+    PublicationTimelineEntryV1,
+    PublicationUncertaintyV1,
+)
+from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
+    PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
-    PublicationTimelineEntryV1,
-    PublicationUncertaintyV1,
 )
 
 
@@ -347,7 +349,7 @@ def _project_publication_sources(
     return tuple(publication_sources)
 
 
-def _validate_publication_v4_enrichment(
+def _validate_publication_enrichment(
     *,
     editorial_enrichment: EditorialEnrichmentV1,
     extraction: ProductionExtractionV1,
@@ -495,7 +497,7 @@ def build_publication_document_v4(
         extraction=extraction,
         synthesis=synthesis,
     )
-    _validate_publication_v4_enrichment(
+    _validate_publication_enrichment(
         editorial_enrichment=editorial_enrichment,
         extraction=extraction,
         synthesis=synthesis,

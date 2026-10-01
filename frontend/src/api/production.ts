@@ -278,7 +278,7 @@ export interface ArtifactResponse {
   /** Publication Markdown is downloadable alongside the canonical document. */
   rendered_content: string | null;
   canonical_content:
-    | PublicationDocument
+    | PublicationDocumentV4
     | ProductionExtractionV1
     | ProductionSynthesisV1
     | ExtractionDocumentV2
@@ -897,109 +897,10 @@ export interface ProductionStateImportResult {
   content_sha256: string;
 }
 
-export type RichSpanKind =
-  | "text"
-  | "emphasis"
-  | "actor"
-  | "malware"
-  | "tool"
-  | "product"
-  | "technical"
-  | "ioc"
-  | "code"
-  | "citation";
-
-export interface RichSpan {
-  kind: RichSpanKind;
-  text: string;
-  source_ids: string[];
-}
-
-export interface BriefDocumentV1 {
-  schema_version: "1";
-  title: string;
-  timeline: Array<{
-    date: string | null;
-    content: RichSpan[];
-    source_ids: string[];
-  }>;
-  synthesis: RichSpan[][];
-  indicators: Array<{
-    artifact_type: string;
-    values: Array<{
-      value: string;
-      normalized_value: string;
-      artifact_type: string;
-      source_ids: string[];
-    }>;
-  }>;
-  sources: Array<{ source_id: string; canonical_url: string }>;
-  uncertainties: string[];
-  analyst_note?: RichSpan[] | null;
-  original_indicators?: Array<{
-    artifact_type: string;
-    values: Array<{
-      value: string;
-      normalized_value: string;
-      artifact_type: string;
-      source_ids: string[];
-    }>;
-  }>;
-}
-
-export interface PublicationDocumentV2 extends Omit<
-  BriefDocumentV1,
-  "schema_version"
-> {
-  schema_version: "2";
-}
-
 export interface PublicationEvidenceRefV1 {
   source_document_id: string;
   kind: "fact" | "event" | "indicator" | "rule";
   evidence_key: string;
-}
-
-export interface PublicationDocumentV3 {
-  schema_version: "3";
-  subject_id: string;
-  publication_language: string;
-  title: string;
-  lead: Array<{ text: string; evidence_refs: PublicationEvidenceRefV1[] }>;
-  sections: Array<{
-    kind: string;
-    heading: string;
-    paragraphs: Array<{
-      text: string;
-      evidence_refs: PublicationEvidenceRefV1[];
-    }>;
-  }>;
-  timeline: Array<{
-    event_date: string | null;
-    date_text: string | null;
-    text: string;
-    evidence_refs: PublicationEvidenceRefV1[];
-  }>;
-  indicators: Array<{
-    artifact_type: string;
-    indicators: Array<{
-      value: string;
-      normalized_value: string;
-      artifact_type: string;
-      source_document_ids: string[];
-    }>;
-  }>;
-  sources: Array<{
-    source_document_id: string;
-    canonical_url: string;
-    title: string | null;
-    publisher: string | null;
-    published_at: string | null;
-    tier: string;
-    kind: string;
-    role: string;
-  }>;
-  uncertainties: Array<{ text: string; source_document_ids: string[] }>;
 }
 
 export interface PublicationTableColumnV1 {
@@ -1080,21 +981,50 @@ export interface PublicationSourceFigureV1 {
   placement: PublicationPlacementV1;
 }
 
-export interface PublicationDocumentV4 extends Omit<
-  PublicationDocumentV3,
-  "schema_version"
-> {
+export interface PublicationDocumentV4 {
   schema_version: "4";
+  subject_id: string;
+  publication_language: string;
+  title: string;
+  lead: Array<{ text: string; evidence_refs: PublicationEvidenceRefV1[] }>;
+  sections: Array<{
+    kind: string;
+    heading: string;
+    paragraphs: Array<{
+      text: string;
+      evidence_refs: PublicationEvidenceRefV1[];
+    }>;
+  }>;
+  timeline: Array<{
+    event_date: string | null;
+    date_text: string | null;
+    text: string;
+    evidence_refs: PublicationEvidenceRefV1[];
+  }>;
+  indicators: Array<{
+    artifact_type: string;
+    indicators: Array<{
+      value: string;
+      normalized_value: string;
+      artifact_type: string;
+      source_document_ids: string[];
+    }>;
+  }>;
+  sources: Array<{
+    source_document_id: string;
+    canonical_url: string;
+    title: string | null;
+    publisher: string | null;
+    published_at: string | null;
+    tier: string;
+    kind: string;
+    role: string;
+  }>;
+  uncertainties: Array<{ text: string; source_document_ids: string[] }>;
   tables: PublicationTableV1[];
   diagrams: PublicationDiagramV1[];
   figures: PublicationSourceFigureV1[];
 }
-
-export type PublicationDocument =
-  | BriefDocumentV1
-  | PublicationDocumentV2
-  | PublicationDocumentV3
-  | PublicationDocumentV4;
 
 export async function restartProductionWithNewSources(
   subjectId: string,

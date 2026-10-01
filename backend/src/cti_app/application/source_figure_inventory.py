@@ -10,7 +10,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from io import BytesIO
-from typing import cast
 from urllib.parse import unquote_to_bytes, urljoin, urlsplit
 from uuid import UUID
 
@@ -19,6 +18,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.entities import SourceDocument
+from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
 from cti_app.domain.production_editorial_enrichment import (
     ResolvedSourceFigureV1,
     SourceFigureDecision,
@@ -33,9 +33,6 @@ MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_FIGURE_TOTAL_BYTES = 20 * 1024 * 1024
 
-_ALLOWED_MIME_TYPES = frozenset(
-    {"image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"}
-)
 _DATA_URI_PREFIX = re.compile(r"^data:([^,]*?),(.*)$", re.IGNORECASE | re.DOTALL)
 
 
@@ -485,7 +482,7 @@ def _data_uri(value: str, max_bytes: int) -> _ObservedImage:
         return _ObservedImage(
             digest, _allowed_mime(actual_mime), len(content), "figure_exceeds_byte_limit"
         )
-    if actual_mime is None or actual_mime not in _ALLOWED_MIME_TYPES:
+    if actual_mime is None or actual_mime not in SUPPORTED_MEDIA_MIME_TYPES:
         return _ObservedImage(digest, None, len(content), "unsupported_image_mime_type")
     if declared_mime != actual_mime:
         return _ObservedImage(digest, actual_mime, len(content), "data_uri_mime_mismatch")
@@ -498,7 +495,7 @@ def _resolve_observed_bytes(
 ) -> tuple[SourceFigureDecision, str]:
     if observed.error is not None:
         return SourceFigureDecision.REJECTED, observed.error
-    if observed.mime_type not in _ALLOWED_MIME_TYPES:
+    if observed.mime_type not in SUPPORTED_MEDIA_MIME_TYPES:
         return SourceFigureDecision.REJECTED, "unsupported_image_mime_type"
     if asset is None:
         return SourceFigureDecision.PENDING, "image_bytes_not_in_blob_store"
@@ -572,7 +569,7 @@ def _allowed_mime(value: str | None) -> SourceFigureMimeType | None:
     if value is None:
         return None
     normalized = _normalized_mime(value)
-    return cast(SourceFigureMimeType, normalized) if normalized in _ALLOWED_MIME_TYPES else None
+    return normalized if normalized in SUPPORTED_MEDIA_MIME_TYPES else None
 
 
 def _canonical_http_url(value: str | None) -> str | None:

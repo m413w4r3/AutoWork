@@ -9,8 +9,8 @@ import pytest
 from cti_app.application.publication_builder import build_publication_document_v4
 from cti_app.application.publication_qa import qa_publication_v4
 from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
-from cti_app.domain.publication import PublicationDocumentV4
 from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
     parse_publication_document,
     serialize_publication_document,
 )

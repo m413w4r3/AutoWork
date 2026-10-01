@@ -63,21 +63,23 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     ArtifactType,
-    PublicationDiagramV1,
-    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
-    PublicationSourceFigureV1,
     PublicationSourceV1,
+    RichSpanKind,
+)
+from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
+    PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
-    RichSpanKind,
 )
 
 ROOT = Path(__file__).parents[2]

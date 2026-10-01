@@ -26,11 +26,8 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionKind,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
     ArtifactType,
-    PublicationDiagramV1,
-    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -38,13 +35,18 @@ from cti_app.domain.publication import (
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
-    PublicationSourceFigureV1,
     PublicationSourceV1,
+    PublicationTimelineEntryV1,
+    PublicationUncertaintyV1,
+)
+from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
+    PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
-    PublicationTimelineEntryV1,
-    PublicationUncertaintyV1,
     publication_document_v4_from_json,
     publication_document_v4_to_json,
 )

@@ -18,13 +18,13 @@ import {
   type ProductionSynthesisSectionKindV1,
   type ProductionSynthesisTimelineEntryV1,
   type ProductionSynthesisV1,
-  type PublicationDocument,
   type PublicationDocumentV4,
-  type PublicationDocumentV3,
+  type PublicationDiagramV1,
   type PublicationEvidenceRefV1,
+  type PublicationSourceFigureV1,
+  type PublicationTableV1,
   type ExtractionDocumentV2,
   type ExtractionItemV2,
-  type RichSpan,
 } from "../api/production";
 
 interface ProductionArtifactViewProps {
@@ -63,49 +63,21 @@ function getArtifactFetcher(
   }
 }
 
-function isPublicationDocument(value: unknown): value is PublicationDocument {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("schema_version" in value)
-  ) {
-    return false;
-  }
-  const hasPublicationFields =
-    "title" in value &&
-    typeof value.title === "string" &&
-    "subject_id" in value &&
-    typeof value.subject_id === "string" &&
-    "lead" in value &&
-    Array.isArray(value.lead) &&
-    "sections" in value &&
-    Array.isArray(value.sections) &&
-    "timeline" in value &&
-    Array.isArray(value.timeline) &&
-    "indicators" in value &&
-    Array.isArray(value.indicators) &&
-    "sources" in value &&
-    Array.isArray(value.sources) &&
-    "uncertainties" in value &&
-    Array.isArray(value.uncertainties);
-  if (value.schema_version === "3") {
-    return hasPublicationFields;
-  }
-  if (value.schema_version === "4") {
-    return (
-      hasPublicationFields &&
-      "tables" in value &&
-      Array.isArray(value.tables) &&
-      "diagrams" in value &&
-      Array.isArray(value.diagrams) &&
-      "figures" in value &&
-      Array.isArray(value.figures)
-    );
-  }
+function isPublicationDocument(value: unknown): value is PublicationDocumentV4 {
   return (
-    (value.schema_version === "1" || value.schema_version === "2") &&
-    "timeline" in value &&
-    Array.isArray(value.timeline)
+    isRecord(value) &&
+    value.schema_version === "4" &&
+    typeof value.title === "string" &&
+    typeof value.subject_id === "string" &&
+    Array.isArray(value.lead) &&
+    Array.isArray(value.sections) &&
+    Array.isArray(value.timeline) &&
+    Array.isArray(value.indicators) &&
+    Array.isArray(value.sources) &&
+    Array.isArray(value.uncertainties) &&
+    Array.isArray(value.tables) &&
+    Array.isArray(value.diagrams) &&
+    Array.isArray(value.figures)
   );
 }
 
@@ -254,29 +226,6 @@ function ProductionReferenceCorpusView({
       )}
     </section>
   );
-}
-
-function RichText({ spans }: { spans: RichSpan[] }) {
-  return spans.map((span, index) => {
-    if (span.kind === "citation") {
-      return (
-        <sup key={index} className="semantic-citation">
-          {span.source_ids.join(", ")}
-        </sup>
-      );
-    }
-    if (span.kind === "actor" || span.kind === "malware") {
-      return <strong key={index}>{span.text}</strong>;
-    }
-    if (span.kind === "emphasis") {
-      return <em key={index}>{span.text}</em>;
-    }
-    return (
-      <span key={index} className={`semantic-${span.kind}`}>
-        {span.text}
-      </span>
-    );
-  });
 }
 
 const IOC_LABELS: Record<string, string> = {
@@ -1078,86 +1027,7 @@ function ProductionSynthesisView({
 export function PublicationDocumentView({
   document,
 }: {
-  document: PublicationDocument;
-}) {
-  if (document.schema_version === "3") {
-    return <PublicationDocumentV3View document={document} />;
-  }
-  if (document.schema_version === "4") {
-    return <PublicationDocumentV4View document={document} />;
-  }
-  const visibleGroups = document.indicators.filter(
-    (group) => IOC_LABELS[group.artifact_type] && group.values.length > 0,
-  );
-  return (
-    <article className="publication-preview">
-      <h3>{document.title}</h3>
-      <div className="publication-preview__timeline">
-        {document.timeline.map((entry, index) => (
-          <p key={index}>
-            {entry.date && (
-              <strong className="semantic-date">
-                {new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(
-                  new Date(`${entry.date}T00:00:00`),
-                )}
-                {" : "}
-              </strong>
-            )}
-            <RichText spans={entry.content} />
-          </p>
-        ))}
-      </div>
-      <h4>Synthèse</h4>
-      {document.synthesis.map((paragraph, index) => (
-        <p key={index}>
-          <RichText spans={paragraph} />
-        </p>
-      ))}
-      {visibleGroups.length > 0 && (
-        <section className="publication-preview__indicators">
-          <h4>IOC</h4>
-          {visibleGroups.map((group) => (
-            <div key={group.artifact_type}>
-              <h5>{IOC_LABELS[group.artifact_type]}</h5>
-              <ul>
-                {group.values.map((indicator) => (
-                  <li key={indicator.normalized_value}>
-                    <code>{indicator.normalized_value}</code>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </section>
-      )}
-    </article>
-  );
-}
-
-function PublicationDocumentV3View({
-  document,
-}: {
-  document: PublicationDocumentV3;
-}) {
-  return <PublicationDocumentNarrativeView document={document} />;
-}
-
-function PublicationDocumentV4View({
-  document,
-}: {
   document: PublicationDocumentV4;
-}) {
-  return (
-    <PublicationDocumentNarrativeView document={document} showEnrichment />
-  );
-}
-
-function PublicationDocumentNarrativeView({
-  document,
-  showEnrichment = false,
-}: {
-  document: PublicationDocumentV3 | PublicationDocumentV4;
-  showEnrichment?: boolean;
 }) {
   const sources = new Map(
     document.sources.map((source) => [source.source_document_id, source]),
@@ -1258,107 +1128,121 @@ function PublicationDocumentNarrativeView({
           ))}
         </section>
       )}
-      {showEnrichment && document.schema_version === "4" && (
-        <>
-          {document.tables.length > 0 && (
-            <section>
-              <h4>Tableaux</h4>
-              {document.tables.map((table) => (
-                <article key={table.key}>
-                  <h5>{table.title}</h5>
-                  <p>
-                    {table.key} · {table.kind}
-                  </p>
-                  {table.caption && <p>{table.caption}</p>}
-                  <p>Placement : {table.placement.kind}</p>
-                  <table>
-                    <thead>
-                      <tr>
-                        {table.columns.map((column) => (
-                          <th key={column.key}>{column.label}</th>
-                        ))}
-                        <th>Preuves</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {table.rows.map((row, rowIndex) => (
-                        <tr key={rowIndex}>
-                          {row.cells.map((cell, cellIndex) => (
-                            <td key={cellIndex}>{cell}</td>
-                          ))}
-                          <td>{row.evidence_refs.length} preuves</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </article>
-              ))}
-            </section>
-          )}
-          {document.diagrams.length > 0 && (
-            <section>
-              <h4>Diagrammes</h4>
-              {document.diagrams.map((diagram) => (
-                <article key={diagram.key}>
-                  <h5>{diagram.title}</h5>
-                  <p>
-                    {diagram.key} · {diagram.kind} · {diagram.direction}
-                  </p>
-                  <p>
-                    {diagram.nodes.length} nœuds · {diagram.edges.length}{" "}
-                    relations
-                  </p>
-                  <dl>
-                    <dt>Asset ID</dt>
-                    <dd>{diagram.asset_id}</dd>
-                    <dt>Placement</dt>
-                    <dd>{diagram.placement.kind}</dd>
-                  </dl>
-                  {diagram.caption && <p>{diagram.caption}</p>}
-                </article>
-              ))}
-            </section>
-          )}
-          {document.figures.length > 0 && (
-            <section>
-              <h4>Figures source</h4>
-              {document.figures.map((figure) => (
-                <article key={figure.key}>
-                  <h5>{figure.key}</h5>
-                  <p>{figure.caption}</p>
-                  <dl>
-                    <dt>Provenance</dt>
-                    <dd>{figure.provenance}</dd>
-                    <dt>Source URL</dt>
-                    <dd>
-                      <a
-                        href={figure.source_url}
-                        rel="noreferrer"
-                        target="_blank"
-                      >
-                        {figure.source_url}
-                      </a>
-                    </dd>
-                    <dt>Asset ID</dt>
-                    <dd>{figure.asset_id}</dd>
-                    <dt>SHA-256</dt>
-                    <dd>{figure.sha256}</dd>
-                    <dt>MIME</dt>
-                    <dd>{figure.mime_type}</dd>
-                    <dt>Taille</dt>
-                    <dd>{figure.byte_size} octets</dd>
-                    <dt>Locator</dt>
-                    <dd>{JSON.stringify(figure.locator)}</dd>
-                    <dt>Placement</dt>
-                    <dd>{figure.placement.kind}</dd>
-                  </dl>
-                </article>
-              ))}
-            </section>
-          )}
-        </>
-      )}
+      <PublicationTablesView tables={document.tables} />
+      <PublicationDiagramsView diagrams={document.diagrams} />
+      <PublicationFiguresView figures={document.figures} />
     </article>
+  );
+}
+
+function PublicationTablesView({ tables }: { tables: PublicationTableV1[] }) {
+  if (tables.length === 0) return null;
+  return (
+    <section>
+      <h4>Tableaux</h4>
+      {tables.map((table) => (
+        <article key={table.key}>
+          <h5>{table.title}</h5>
+          <p>
+            {table.key} · {table.kind}
+          </p>
+          {table.caption && <p>{table.caption}</p>}
+          <p>Placement : {table.placement.kind}</p>
+          <table>
+            <thead>
+              <tr>
+                {table.columns.map((column) => (
+                  <th key={column.key}>{column.label}</th>
+                ))}
+                <th>Preuves</th>
+              </tr>
+            </thead>
+            <tbody>
+              {table.rows.map((row, rowIndex) => (
+                <tr key={rowIndex}>
+                  {row.cells.map((cell, cellIndex) => (
+                    <td key={cellIndex}>{cell}</td>
+                  ))}
+                  <td>{row.evidence_refs.length} preuves</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function PublicationDiagramsView({
+  diagrams,
+}: {
+  diagrams: PublicationDiagramV1[];
+}) {
+  if (diagrams.length === 0) return null;
+  return (
+    <section>
+      <h4>Diagrammes</h4>
+      {diagrams.map((diagram) => (
+        <article key={diagram.key}>
+          <h5>{diagram.title}</h5>
+          <p>
+            {diagram.key} · {diagram.kind} · {diagram.direction}
+          </p>
+          <p>
+            {diagram.nodes.length} nœuds · {diagram.edges.length} relations
+          </p>
+          <dl>
+            <dt>Asset ID</dt>
+            <dd>{diagram.asset_id}</dd>
+            <dt>Placement</dt>
+            <dd>{diagram.placement.kind}</dd>
+          </dl>
+          {diagram.caption && <p>{diagram.caption}</p>}
+        </article>
+      ))}
+    </section>
+  );
+}
+
+function PublicationFiguresView({
+  figures,
+}: {
+  figures: PublicationSourceFigureV1[];
+}) {
+  if (figures.length === 0) return null;
+  return (
+    <section>
+      <h4>Figures source</h4>
+      {figures.map((figure) => (
+        <article key={figure.key}>
+          <h5>{figure.key}</h5>
+          <p>{figure.caption}</p>
+          <dl>
+            <dt>Provenance</dt>
+            <dd>{figure.provenance}</dd>
+            <dt>Source URL</dt>
+            <dd>
+              <a href={figure.source_url} rel="noreferrer" target="_blank">
+                {figure.source_url}
+              </a>
+            </dd>
+            <dt>Asset ID</dt>
+            <dd>{figure.asset_id}</dd>
+            <dt>SHA-256</dt>
+            <dd>{figure.sha256}</dd>
+            <dt>MIME</dt>
+            <dd>{figure.mime_type}</dd>
+            <dt>Taille</dt>
+            <dd>{figure.byte_size} octets</dd>
+            <dt>Locator</dt>
+            <dd>{JSON.stringify(figure.locator)}</dd>
+            <dt>Placement</dt>
+            <dd>{figure.placement.kind}</dd>
+          </dl>
+        </article>
+      ))}
+    </section>
   );
 }
 

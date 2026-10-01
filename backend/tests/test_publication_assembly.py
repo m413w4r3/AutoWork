@@ -73,12 +73,9 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
-from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
-    ArtifactType,
-    PublicationAssemblyErrorCode,
-)
+from cti_app.domain.publication import ArtifactType, PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     parse_publication_document,
     serialize_publication_document,
 )

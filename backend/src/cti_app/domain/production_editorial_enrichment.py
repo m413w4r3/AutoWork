@@ -6,11 +6,12 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, field_validator, model_validator
 
+from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -324,9 +325,7 @@ class SourceFigureDecision(StrEnum):
     PENDING = "pending"
 
 
-SourceFigureMimeType = Literal[
-    "image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"
-]
+SourceFigureMimeType = str
 
 
 def source_figure_id(
@@ -373,6 +372,13 @@ class ResolvedSourceFigureV1(BaseModel):
     def _valid_sha256(cls, value: str | None) -> str | None:
         if value is not None and _SHA256.fullmatch(value) is None:
             raise ValueError("Source figure SHA-256 must be lowercase hexadecimal")
+        return value
+
+    @field_validator("mime_type")
+    @classmethod
+    def _supported_mime_type(cls, value: str | None) -> str | None:
+        if value is not None and value not in SUPPORTED_MEDIA_MIME_TYPES:
+            raise ValueError("Source figure MIME type is not supported")
         return value
 
     @field_validator("source", "provenance", "decision_reason")
@@ -529,6 +535,11 @@ def _placement_to_json(placement: EnrichmentPlacementV1) -> dict[str, Any]:
     return {"kind": placement.kind.value, "section_index": placement.section_index}
 
 
+def placement_to_json(placement: EnrichmentPlacementV1) -> dict[str, Any]:
+    """Serialize a placement shared by enrichment and publication documents."""
+    return _placement_to_json(placement)
+
+
 def _table_to_json(table: TableSpecV1) -> dict[str, Any]:
     return {
         "key": table.key,
@@ -554,32 +565,44 @@ def _diagram_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
         "title": diagram.title,
         "caption": diagram.caption,
         "direction": diagram.direction.value,
-        "nodes": [
-            {
-                "node_id": node.node_id,
-                "label": node.label,
-                "evidence_refs": [_ref_to_json(ref) for ref in node.evidence_refs],
-            }
-            for node in diagram.nodes
-        ],
-        "edges": [
-            {
-                "source_node_id": edge.source_node_id,
-                "target_node_id": edge.target_node_id,
-                "label": edge.label,
-                "evidence_refs": [_ref_to_json(ref) for ref in edge.evidence_refs],
-            }
-            for edge in diagram.edges
-        ],
-        "groups": [
-            {"group_id": group.group_id, "label": group.label, "node_ids": list(group.node_ids)}
-            for group in diagram.groups
-        ],
+        "nodes": [diagram_node_to_json(node) for node in diagram.nodes],
+        "edges": [diagram_edge_to_json(edge) for edge in diagram.edges],
+        "groups": [diagram_group_to_json(group) for group in diagram.groups],
         "placement": _placement_to_json(diagram.placement),
     }
     if diagram.compiled_asset_id is not None:
         payload["compiled_asset_id"] = str(diagram.compiled_asset_id)
     return payload
+
+
+def diagram_node_to_json(node: DiagramNodeV1) -> dict[str, Any]:
+    return {
+        "node_id": node.node_id,
+        "label": node.label,
+        "evidence_refs": [evidence_ref_to_json(ref) for ref in node.evidence_refs],
+    }
+
+
+def diagram_edge_to_json(edge: DiagramEdgeV1) -> dict[str, Any]:
+    return {
+        "source_node_id": edge.source_node_id,
+        "target_node_id": edge.target_node_id,
+        "label": edge.label,
+        "evidence_refs": [evidence_ref_to_json(ref) for ref in edge.evidence_refs],
+    }
+
+
+def diagram_group_to_json(group: DiagramGroupV1) -> dict[str, Any]:
+    return {"group_id": group.group_id, "label": group.label, "node_ids": list(group.node_ids)}
+
+
+def source_figure_locator_to_json(locator: SourceFigureLocatorV1) -> dict[str, Any]:
+    return {
+        "page": locator.page,
+        "section": locator.section,
+        "figure_label": locator.figure_label,
+        "original_asset_url": locator.original_asset_url,
+    }
 
 
 def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
@@ -589,12 +612,7 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
         "source_url": figure.source_url,
         "caption": figure.caption,
         "provenance": figure.provenance,
-        "locator": {
-            "page": figure.locator.page,
-            "section": figure.locator.section,
-            "figure_label": figure.locator.figure_label,
-            "original_asset_url": figure.locator.original_asset_url,
-        },
+        "locator": source_figure_locator_to_json(figure.locator),
         "inclusion_status": figure.inclusion_status.value,
         "placement": _placement_to_json(figure.placement),
     }
@@ -609,12 +627,7 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
             "source_document_id": str(resolved.source_document_id),
             "source": resolved.source,
             "provenance": resolved.provenance,
-            "locator": {
-                "page": resolved.locator.page,
-                "section": resolved.locator.section,
-                "figure_label": resolved.locator.figure_label,
-                "original_asset_url": resolved.locator.original_asset_url,
-            },
+            "locator": source_figure_locator_to_json(resolved.locator),
             "decision": resolved.decision.value,
             "decision_reason": resolved.decision_reason,
         }
@@ -971,3 +984,42 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         ),
         warnings=warnings,
     )
+
+
+# Shared strict JSON and value-object helpers used by PublicationDocumentV4.
+# Keep the enrichment implementation as the single source for these rules.
+validate_text = _text
+validate_editorial_key = _key
+normalize_evidence_refs = _normalize_evidence_refs
+validate_sha256 = _sha256
+json_object = _object
+json_array = _array
+json_text = _text
+json_uuid = _uuid
+json_sha256 = _sha256
+json_enum = _enum
+
+
+def json_int(raw: Any, label: str) -> int:
+    if type(raw) is not int:
+        raise ValueError(f"{label} must be an integer")
+    return raw
+
+
+def publication_json_object(raw: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
+    """Apply the publication codec's historical strict-object error wording."""
+    try:
+        return _object(raw, keys, label)
+    except ValueError as exc:
+        raise ValueError(f"{label} fields are invalid") from exc
+
+
+evidence_ref_to_json = _ref_to_json
+evidence_ref_from_json = _ref_from_json
+evidence_refs_from_json = _refs_from_json
+placement_from_json = _placement_from_json
+diagram_node_from_json = _node_from_json
+diagram_edge_from_json = _edge_from_json
+diagram_group_from_json = _group_from_json
+diagram_from_json = _diagram_from_json
+source_figure_locator_from_json = _locator_from_json

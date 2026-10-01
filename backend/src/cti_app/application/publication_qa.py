@@ -11,8 +11,10 @@ from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
-from cti_app.domain.publication import PublicationDocumentV4
-from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
+    serialize_publication_document,
+)
 
 _LEGACY_CITATION = re.compile(r"\[S\d+\]", re.IGNORECASE)
 

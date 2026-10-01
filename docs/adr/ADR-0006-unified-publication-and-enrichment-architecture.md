@@ -88,10 +88,9 @@ Partager un hash ou les mêmes octets ne leur donne pas la même sémantique.
 
 ### 4. Le contrat éditorial versionné
 
-`BriefDocumentV1` reste un format sérialisé valide pour les productions existantes tant que leur
-lecture est nécessaire. La cible est un contrat renderer-independent nommé
-`PublicationDocumentV4` est le contrat écrit de la pipeline courante ; les formats antérieurs
-ne sont pas écrits par cette pipeline.
+`PublicationDocumentV4` est l'unique contrat éditorial renderer-independent, écrit et lu par la
+pipeline courante. Les formats antérieurs (`BriefDocumentV1`, `PublicationDocumentV2`, `V3`) ne sont
+ni écrits ni lus.
 
 Le passage à V2 est un changement de schéma explicite. Une nouvelle version ne doit pas être
 écrite sous le numéro de schéma V1 et les anciens artifacts ne doivent pas être réécrits en place.
@@ -238,7 +237,7 @@ Pendant cette période :
 - `ProductionProfile.BRIEF_AUTO` et `ProductionProfile.MAJOR_ASSISTED` ne sont lus que par les
   compatibilités historiques nécessaires ;
 - aucune nouvelle feature ne doit ajouter une condition fonctionnelle fondée sur ces profils ;
-- `BriefDocumentV1` reste lisible mais n'est plus produit par la pipeline courante ;
+- `BriefDocumentV1` n'est ni produit ni lu par la pipeline courante ;
 - l'ancien parcours `BriefEvidencePack` / `BriefDraft` reste isolé ; il ne doit pas devenir une
   dépendance de la nouvelle review ou de la nouvelle publication d'édition ;
 - les nouveaux endpoints et composants utilisent une terminologie générique même s'ils s'appuient

@@ -176,65 +176,40 @@ function renderArtifact(
   );
 }
 
-it("construit la preview de publication depuis le JSON canonique", async () => {
+it("ne rend pas une publication dont le schema n'est pas V4", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
       Response.json({
-        artifact_id: "publication-1",
+        artifact_id: "publication-v3",
         stage: "publication",
         version: 1,
         status: "verified",
         metadata: {},
         rendered_content: null,
         canonical_content: {
-          schema_version: "1",
-          title: "[Cavern Manticore] Un framework modulaire",
+          schema_version: "3",
+          title: "Publication legacy à ne pas afficher",
+          lead: [],
+          sections: [],
           timeline: [],
-          synthesis: [
-            [
-              { kind: "actor", text: "Cavern Manticore", source_ids: [] },
-              { kind: "text", text: " utilise ", source_ids: [] },
-              { kind: "tool", text: "WinDirStat", source_ids: [] },
-            ],
-          ],
-          indicators: [
-            {
-              artifact_type: "domain",
-              values: [
-                {
-                  value: "example[.]com",
-                  normalized_value: "example.com",
-                  artifact_type: "domain",
-                  source_ids: ["S1"],
-                },
-              ],
-            },
-          ],
+          indicators: [],
           sources: [],
           uncertainties: [],
         },
       }),
     ),
   );
-  const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
-  });
-  render(
-    <QueryClientProvider client={client}>
-      <ProductionArtifactView subjectId="subject-1" stage="publication" />
-    </QueryClientProvider>,
-  );
+
+  renderArtifact("publication");
 
   expect(
-    await screen.findByRole("heading", {
-      name: "[Cavern Manticore] Un framework modulaire",
-    }),
+    await screen.findByText("ID de l'artifact : publication-v3"),
   ).toBeInTheDocument();
-  expect(screen.getByText("WinDirStat")).toHaveClass("semantic-tool");
-  expect(screen.getByText("example.com")).toBeInTheDocument();
   expect(
-    screen.queryByRole("link", { name: "Télécharger le Markdown Pandoc" }),
+    screen.queryByRole("heading", {
+      name: "Publication legacy à ne pas afficher",
+    }),
   ).not.toBeInTheDocument();
 });
 

@@ -52,7 +52,7 @@ from cti_app.domain.production import (
     ProductionStage,
     RepairDecisionApplicationState,
 )
-from cti_app.domain.publication import (
+from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PublicationDocumentV4,
     publication_document_v4_to_json,

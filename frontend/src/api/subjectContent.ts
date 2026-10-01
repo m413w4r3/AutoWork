@@ -1,5 +1,5 @@
 import { ApiError } from "./editions";
-import type { PublicationDocument } from "./production";
+import type { PublicationDocumentV4 } from "./production";
 
 export interface SubjectContentResponse {
   subject_id: string;
@@ -10,7 +10,7 @@ export interface SubjectContentResponse {
   artifact_input_hash: string;
   status: string;
   schema_version: string;
-  canonical_content: PublicationDocument;
+  canonical_content: PublicationDocumentV4;
   rendered_content: string | null;
 }
 

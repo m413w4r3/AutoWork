@@ -35,11 +35,11 @@ from cti_app.domain.production import (
     ProductionStage,
     production_batch_request_fingerprint,
 )
-from cti_app.domain.publication import (
+from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PublicationDocumentV4,
+    serialize_publication_document,
 )
-from cti_app.domain.publication_document import serialize_publication_document
 from tests.integration.production.support import ProductionScenario
 
 pytestmark = pytest.mark.integration

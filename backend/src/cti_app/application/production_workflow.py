@@ -113,9 +113,7 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_synthesis import production_synthesis_from_json
-from cti_app.domain.publication import (
-    is_publication_ioc_artifact_type,
-)
+from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.publication_document import parse_publication_document
 
 if TYPE_CHECKING:
