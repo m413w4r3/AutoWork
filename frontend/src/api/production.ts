@@ -1002,8 +1002,99 @@ export interface PublicationDocumentV3 {
   uncertainties: Array<{ text: string; source_document_ids: string[] }>;
 }
 
+export interface PublicationTableColumnV1 {
+  key: string;
+  label: string;
+}
+
+export interface PublicationTableRowV1 {
+  cells: string[];
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationPlacementV1 {
+  kind: string;
+  section_index: number | null;
+}
+
+export interface PublicationTableV1 {
+  key: string;
+  kind: string;
+  title: string;
+  caption: string | null;
+  columns: PublicationTableColumnV1[];
+  rows: PublicationTableRowV1[];
+  placement: PublicationPlacementV1;
+}
+
+export interface PublicationDiagramNodeV1 {
+  node_id: string;
+  label: string;
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationDiagramEdgeV1 {
+  source_node_id: string;
+  target_node_id: string;
+  label: string | null;
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationDiagramGroupV1 {
+  group_id: string;
+  label: string;
+  node_ids: string[];
+}
+
+export interface PublicationDiagramV1 {
+  key: string;
+  kind: string;
+  title: string;
+  caption: string | null;
+  direction: string;
+  nodes: PublicationDiagramNodeV1[];
+  edges: PublicationDiagramEdgeV1[];
+  groups: PublicationDiagramGroupV1[];
+  placement: PublicationPlacementV1;
+  asset_id: string;
+}
+
+export interface PublicationSourceFigureLocatorV1 {
+  page: number | null;
+  section: string | null;
+  figure_label: string | null;
+  original_asset_url: string | null;
+}
+
+export interface PublicationSourceFigureV1 {
+  key: string;
+  asset_id: string;
+  sha256: string;
+  mime_type: string;
+  byte_size: number;
+  source_document_id: string;
+  source_url: string;
+  caption: string;
+  provenance: string;
+  locator: PublicationSourceFigureLocatorV1;
+  placement: PublicationPlacementV1;
+}
+
+export interface PublicationDocumentV4 extends Omit<
+  PublicationDocumentV3,
+  "schema_version"
+> {
+  schema_version: "4";
+  tables: PublicationTableV1[];
+  diagrams: PublicationDiagramV1[];
+  figures: PublicationSourceFigureV1[];
+}
+
 export type PublicationDocument =
-  BriefDocumentV1 | PublicationDocumentV2 | PublicationDocumentV3;
+  | BriefDocumentV1
+  | PublicationDocumentV2
+  | PublicationDocumentV3
+  | PublicationDocumentV4;
 
 export async function restartProductionWithNewSources(
   subjectId: string,

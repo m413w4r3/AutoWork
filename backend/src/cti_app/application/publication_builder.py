@@ -10,14 +10,25 @@ from uuid import UUID
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
+    EditorialEnrichmentValidationError,
     canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
+    validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import ProductionInputSnapshot
-from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
+from cti_app.domain.production_editorial_enrichment import (
+    DiagramSpecV1,
+    EditorialEnrichmentV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
+    TableSpecV1,
+    editorial_enrichment_evidence_refs,
+)
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
@@ -34,11 +45,12 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PUBLICATION_IOC_ARTIFACT_TYPES,
     ArtifactType,
     PublicationAssemblyErrorCode,
-    PublicationDocumentV3,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -46,7 +58,11 @@ from cti_app.domain.publication import (
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
+    PublicationSourceFigureV1,
     PublicationSourceV1,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
+    PublicationTableV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
@@ -199,7 +215,7 @@ def _project_publication_iocs(
     )
 
 
-def _validate_publication_v3_lineage(
+def _validate_publication_lineage(
     *,
     snapshot: ProductionInputSnapshot,
     references: ProductionReferenceCorpusV1,
@@ -244,7 +260,7 @@ def _validate_publication_v3_lineage(
         )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "1"
+ASSEMBLY_POLICY_VERSION: Final[str] = "2"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -266,7 +282,7 @@ def compute_assembly_input_hash(
         "extraction_hash": canonical_extraction_hash(extraction),
         "synthesis_hash": canonical_synthesis_hash(synthesis),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(editorial_enrichment),
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
     }
     return _canonical_digest(payload)
@@ -289,23 +305,12 @@ def _validate_synthesis_evidence_refs(
             )
 
 
-def build_publication_document_v3(
+def _project_publication_sources(
     *,
-    snapshot: ProductionInputSnapshot,
     references: ProductionReferenceCorpusV1,
-    extraction: ProductionExtractionV1,
-    synthesis: ProductionSynthesisV1,
-) -> PublicationDocumentV3:
-    """Build a renderer-independent publication from canonical production inputs."""
-    _validate_publication_v3_lineage(
-        snapshot=snapshot,
-        references=references,
-        extraction=extraction,
-        synthesis=synthesis,
-    )
-    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
-    projection = _project_publication_iocs(extraction=extraction, narrative=narrative)
-
+    used_source_document_ids: frozenset[UUID] | set[UUID],
+) -> tuple[PublicationSourceV1, ...]:
+    """Project exactly the canonical reference sources used by a publication."""
     sources_by_id: dict[UUID, ProductionReferenceSourceV1] = {}
     for source in references.sources:
         source_document_id = source.source_document_id
@@ -319,7 +324,7 @@ def build_publication_document_v3(
         sources_by_id[source_document_id] = source
 
     publication_sources: list[PublicationSourceV1] = []
-    for source_document_id in sorted(projection.used_source_document_ids, key=str):
+    for source_document_id in sorted(used_source_document_ids, key=str):
         resolved_source = sources_by_id.get(source_document_id)
         if resolved_source is None:
             raise PublicationAssemblyValidationError(
@@ -339,9 +344,177 @@ def build_publication_document_v3(
                 role=resolved_source.role,
             )
         )
+    return tuple(publication_sources)
 
-    return PublicationDocumentV3(
-        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+
+def _validate_publication_v4_enrichment(
+    *,
+    editorial_enrichment: EditorialEnrichmentV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> None:
+    """Apply the canonical Editorial Enrichment cross-artifact validator."""
+    try:
+        validate_editorial_enrichment(
+            editorial_enrichment,
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+    except EditorialEnrichmentValidationError as exc:
+        code = {
+            "editorial_enrichment_lineage_mismatch": PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+            "editorial_enrichment_evidence_missing": PublicationAssemblyErrorCode.EVIDENCE_MISSING,
+            "editorial_enrichment_source_figure_invalid": (
+                PublicationAssemblyErrorCode.SOURCE_FIGURE_INVALID
+            ),
+        }.get(exc.code, PublicationAssemblyErrorCode.VALIDATION_FAILED)
+        raise PublicationAssemblyValidationError(code, str(exc)) from exc
+    except ValueError as exc:
+        raise PublicationAssemblyValidationError(
+            PublicationAssemblyErrorCode.VALIDATION_FAILED,
+            str(exc),
+        ) from exc
+
+
+def _project_publication_tables(
+    tables: tuple[TableSpecV1, ...],
+) -> tuple[PublicationTableV1, ...]:
+    return tuple(
+        PublicationTableV1(
+            key=table.key,
+            kind=table.kind,
+            title=table.title,
+            caption=table.caption,
+            columns=tuple(
+                PublicationTableColumnV1(key=column.key, label=column.label)
+                for column in table.columns
+            ),
+            rows=tuple(
+                PublicationTableRowV1(cells=row.cells, evidence_refs=row.evidence_refs)
+                for row in table.rows
+            ),
+            placement=table.placement,
+        )
+        for table in tables
+    )
+
+
+def _project_publication_diagrams(
+    diagrams: tuple[DiagramSpecV1, ...],
+) -> tuple[PublicationDiagramV1, ...]:
+    projected: list[PublicationDiagramV1] = []
+    for diagram in diagrams:
+        if diagram.compiled_asset_id is None:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.DIAGRAM_ASSET_MISSING,
+                f"Publication diagram {diagram.key} has no compiled asset",
+            )
+        projected.append(
+            PublicationDiagramV1(
+                key=diagram.key,
+                kind=diagram.kind,
+                title=diagram.title,
+                caption=diagram.caption,
+                direction=diagram.direction,
+                nodes=diagram.nodes,
+                edges=diagram.edges,
+                groups=diagram.groups,
+                placement=diagram.placement,
+                asset_id=diagram.compiled_asset_id,
+            )
+        )
+    return tuple(projected)
+
+
+def _project_publication_figures(
+    source_figures: tuple[SourceFigureCandidateV1, ...],
+) -> tuple[PublicationSourceFigureV1, ...]:
+    projected: list[PublicationSourceFigureV1] = []
+    for candidate in source_figures:
+        if candidate.inclusion_status is not SourceFigureInclusionStatus.INCLUDED:
+            continue
+
+        resolved = candidate.resolved_figure
+        if resolved is None:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.SOURCE_FIGURE_UNRESOLVED,
+                f"Included source figure {candidate.key} has no resolved local figure",
+            )
+        if resolved.decision is not SourceFigureDecision.ACCEPTED:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.SOURCE_FIGURE_INVALID,
+                f"Included source figure {candidate.key} was not accepted",
+            )
+
+        blob_id = resolved.blob_id
+        sha256 = resolved.sha256
+        mime_type = resolved.mime_type
+        byte_size = resolved.byte_size
+        if blob_id is None or sha256 is None or mime_type is None or byte_size is None:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.SOURCE_FIGURE_METADATA_MISSING,
+                f"Included source figure {candidate.key} has incomplete local metadata",
+            )
+
+        try:
+            projected.append(
+                PublicationSourceFigureV1(
+                    key=candidate.key,
+                    asset_id=media_asset_id(sha256, mime_type),
+                    sha256=sha256,
+                    mime_type=mime_type,
+                    byte_size=byte_size,
+                    source_document_id=candidate.source_document_id,
+                    source_url=candidate.source_url,
+                    caption=candidate.caption,
+                    provenance=candidate.provenance,
+                    locator=candidate.locator,
+                    placement=candidate.placement,
+                )
+            )
+        except ValueError as exc:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.SOURCE_FIGURE_INVALID,
+                f"Included source figure {candidate.key} is invalid: {exc}",
+            ) from exc
+    return tuple(projected)
+
+
+def build_publication_document_v4(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1,
+) -> PublicationDocumentV4:
+    """Build the renderer-independent V4 publication from canonical inputs."""
+    _validate_publication_lineage(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+    _validate_publication_v4_enrichment(
+        editorial_enrichment=editorial_enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
+    )
+
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+    projection = _project_publication_iocs(extraction=extraction, narrative=narrative)
+    tables = _project_publication_tables(editorial_enrichment.tables)
+    diagrams = _project_publication_diagrams(editorial_enrichment.diagrams)
+    figures = _project_publication_figures(editorial_enrichment.source_figures)
+
+    used_source_document_ids = set(projection.used_source_document_ids)
+    used_source_document_ids.update(
+        ref.source_document_id for ref in editorial_enrichment_evidence_refs(editorial_enrichment)
+    )
+    used_source_document_ids.update(figure.source_document_id for figure in figures)
+
+    return PublicationDocumentV4(
+        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         subject_id=snapshot.subject_id,
         publication_language=synthesis.publication_language,
         title=synthesis.title,
@@ -349,6 +522,12 @@ def build_publication_document_v3(
         sections=projection.sections,
         timeline=projection.timeline,
         indicators=projection.indicators,
-        sources=tuple(publication_sources),
+        sources=_project_publication_sources(
+            references=references,
+            used_source_document_ids=used_source_document_ids,
+        ),
         uncertainties=projection.uncertainties,
+        tables=tables,
+        diagrams=diagrams,
+        figures=figures,
     )

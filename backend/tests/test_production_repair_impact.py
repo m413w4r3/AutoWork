@@ -1,34 +1,17 @@
 from __future__ import annotations
 
-import hashlib
-from datetime import date
 from uuid import UUID
 
 import pytest
 
-from cti_app.application.production_parsers import (
-    DisplayPolicy,
-    ExtractionItem,
-    IndicatorStatus,
-    ParsedSource,
-    ReferenceReport,
-    SemanticType,
-    TechnicalExtraction,
-)
 from cti_app.application.production_repairs import (
     ProductionRepairIssueView,
     SupplementalSourceRepairIssue,
     classify_repair_impact,
     merge_repair_impacts,
-    publication_projection_hash,
-    rule_bundle_projection_hash,
 )
-from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
-    DetectionRule,
-    DetectionRuleType,
     ProductionDerivedOutput,
-    ProductionEvidenceBasis,
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairImpactKind,
@@ -36,7 +19,7 @@ from cti_app.domain.production import (
     RepairDecisionApplicationState,
     SupplementalSourceRepairState,
 )
-from cti_app.domain.publication import ArtifactType, is_publication_ioc_artifact_type
+from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 EDITION_ID = UUID("00000000-0000-0000-0000-000000000001")
 SUBJECT_ID = UUID("00000000-0000-0000-0000-000000000002")
@@ -319,125 +302,3 @@ def test_merge_source_dominates_narrative_and_preserves_model_steps() -> None:
         "Nouvelle extraction possible",
         "Nouvelle synthèse possible",
     )
-
-
-def _report() -> ReferenceReport:
-    return ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title="Source",
-                url="https://source.example/report",
-                canonical_url="https://source.example/report",
-                publisher="Publisher",
-                published_at=date(2026, 1, 1),
-                role=SourceRole.PRIMARY,
-            ),
-        ),
-        events=(),
-    )
-
-
-def _item(
-    value: str,
-    artifact_type: ArtifactType,
-    *,
-    context: str = "",
-    evidence_basis: ProductionEvidenceBasis = ProductionEvidenceBasis.SOURCE_VERIFIED,
-) -> ExtractionItem:
-    return ExtractionItem(
-        local_id=value,
-        category="network_artifacts"
-        if is_publication_ioc_artifact_type(artifact_type)
-        else "files",
-        value=value,
-        context=context,
-        artifact_type=artifact_type,
-        attack_id=None,
-        reference_ids=(),
-        source_ids=("S1",),
-        supported=True,
-        semantic_type=SemanticType.INDICATOR,
-        indicator_status=IndicatorStatus.CONFIRMED_IOC,
-        display_policy=DisplayPolicy.IOC_SECTION,
-        evidence_basis=evidence_basis,
-    )
-
-
-def _rule(body: str, name: str = "Example") -> DetectionRule:
-    return DetectionRule(
-        rule_type=DetectionRuleType.YARA,
-        name=name,
-        body=body,
-        source_ids=("S1",),
-        context="rule context",
-        evidence_quote="rule evidence",
-        supported=True,
-        model_run_ids=("model-run-must-not-hash",),
-        sha256=hashlib.sha256(body.encode()).hexdigest(),
-    )
-
-
-def test_rule_body_changes_rule_bundle_hash_but_not_publication_hash() -> None:
-    report = _report()
-    extraction_a = TechnicalExtraction(
-        items=(_item("x.example", ArtifactType.DOMAIN),), rules=(_rule("rule A"),)
-    )
-    extraction_b = TechnicalExtraction(items=extraction_a.items, rules=(_rule("rule B"),))
-
-    assert rule_bundle_projection_hash(extraction_a) != rule_bundle_projection_hash(extraction_b)
-    assert publication_projection_hash(
-        report, extraction_a, "Texte [S1]."
-    ) == publication_projection_hash(report, extraction_b, "Texte [S1].")
-
-
-def test_publication_projection_changes_for_analyst_override_ioc() -> None:
-    report = _report()
-    base = TechnicalExtraction(items=(_item("source.example", ArtifactType.DOMAIN),))
-    override = TechnicalExtraction(
-        items=(
-            *base.items,
-            _item(
-                "manual.example",
-                ArtifactType.DOMAIN,
-                evidence_basis=ProductionEvidenceBasis.ANALYST_OVERRIDE,
-            ),
-        )
-    )
-
-    assert publication_projection_hash(report, base, "Texte [S1].") != publication_projection_hash(
-        report, override, "Texte [S1]."
-    )
-
-
-def test_rule_and_ioc_order_does_not_change_projection_hashes() -> None:
-    report = _report()
-    item_a = _item("a.example", ArtifactType.DOMAIN)
-    item_b = _item("b.example", ArtifactType.IP)
-    rule_a = _rule("rule A", "A")
-    rule_b = _rule("rule B", "B")
-    first = TechnicalExtraction(items=(item_a, item_b), rules=(rule_a, rule_b))
-    reversed_order = TechnicalExtraction(items=(item_b, item_a), rules=(rule_b, rule_a))
-
-    assert publication_projection_hash(report, first, "Texte [S1].") == publication_projection_hash(
-        report, reversed_order, "Texte [S1]."
-    )
-    assert rule_bundle_projection_hash(first) == rule_bundle_projection_hash(reversed_order)
-
-
-def test_projection_hashes_are_stable_across_repeated_serialization() -> None:
-    report = _report()
-    extraction = TechnicalExtraction(
-        items=(_item("stable.example", ArtifactType.DOMAIN),), rules=(_rule("stable"),)
-    )
-
-    first = (
-        publication_projection_hash(report, extraction, "Texte [S1]."),
-        rule_bundle_projection_hash(extraction),
-    )
-    second = (
-        publication_projection_hash(report, extraction, "Texte [S1]."),
-        rule_bundle_projection_hash(extraction),
-    )
-
-    assert first == second

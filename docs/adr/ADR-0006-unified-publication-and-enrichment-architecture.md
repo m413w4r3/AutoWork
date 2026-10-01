@@ -2,11 +2,11 @@
 
 Statut : accepté — 2026-08-28
 
-Mise à jour AW-013 : les mentions ci-dessous de `PublicationDocumentV2` comme cible future
-décrivent la décision initiale. Les nouvelles écritures Production produisent désormais
-`PublicationDocumentV3` depuis le snapshot, `ProductionReferenceCorpusV1`,
-`ProductionExtractionV1` et `ProductionSynthesisV1`. V1/V2 restent des lecteurs historiques.
-Le rendu Pandoc est un dérivé du document V3 et sa version n'entre pas dans le hash d'Assembly.
+Historique de version : le contrat de publication a évolué de V2 à V3, puis à V4.
+Depuis AW-018, `PublicationDocumentV4` est le seul contrat canonique écrit ; il ajoute tables,
+diagrammes (spécification sémantique + `asset_id` du média compilé) et figures-source incluses,
+sans source D2, SVG, Typst ni Markdown. Le rendu Pandoc est un dérivé du document canonique et sa
+version n'entre pas dans le hash d'Assembly.
 
 ## Contexte
 
@@ -90,8 +90,8 @@ Partager un hash ou les mêmes octets ne leur donne pas la même sémantique.
 
 `BriefDocumentV1` reste un format sérialisé valide pour les productions existantes tant que leur
 lecture est nécessaire. La cible est un contrat renderer-independent nommé
-`PublicationDocumentV2`, qui a servi de contrat intermédiaire. Depuis AW-013, les nouvelles
-écritures Production utilisent `PublicationDocumentV3` ; V1 et V2 restent des lecteurs historiques.
+`PublicationDocumentV4` est le contrat écrit de la pipeline courante ; les formats antérieurs
+ne sont pas écrits par cette pipeline.
 
 Le passage à V2 est un changement de schéma explicite. Une nouvelle version ne doit pas être
 écrite sous le numéro de schéma V1 et les anciens artifacts ne doivent pas être réécrits en place.
@@ -220,8 +220,8 @@ domaine malware/investigation est un concept séparé de `ProductionReferenceCor
 module ou service n'est partagé entre les deux.
 
 AW-011 a fait consommer le corpus directement à Extraction ; AW-012 a retiré les `EVENT` legacy
-de Synthesis ; AW-013 a retiré `ReferenceReport` du chemin canonique Assembly/QA. La lecture
-historique V4 et certaines fonctions du Repair Desk conservent leur compatibilité isolée.
+de Synthesis ; AW-013 a retiré `ReferenceReport` du chemin canonique Assembly/QA. Certaines
+fonctions du Repair Desk conservent une projection isolée pour les données historiques.
 
 À l'intérieur d'une édition, la production reste séquentielle pour garder un comportement
 prévisible vis-à-vis des modèles, des conversations, des quotas externes et du pacing. La
@@ -252,8 +252,7 @@ vocabulaire et changement de comportement.
 Le cutover futur suit quatre étapes conceptuelles.
 
 1. Les surfaces UI/API et les nouveaux use cases n'emploient plus la distinction.
-2. `PublicationDocumentV2` a remplacé V1 comme format écrit, puis
-   `PublicationDocumentV3` l'a remplacé pour les nouvelles productions ; V1/V2 restent lisibles.
+2. `PublicationDocumentV4` est le format écrit de la pipeline courante.
 3. La configuration éditoriale d'une édition passe d'objectifs distincts `major/brief` à un objectif
    unique d'items/articles, et la production passe à une seule pipeline déclarée.
 4. Les profils legacy et les composants exclusivement attachés à ce workflow restent limités à la

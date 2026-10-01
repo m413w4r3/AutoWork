@@ -44,19 +44,19 @@ def _styled_block(style_key: str, content: str) -> str:
     return f'::: {{custom-style="{style}"}}\n{content}\n:::'
 
 
-def _render_v3_citations(
-    refs: tuple[PublicationEvidenceRefV1, ...], sources: dict[str, str]
-) -> str:
+def _render_citations(refs: tuple[PublicationEvidenceRefV1, ...], sources: dict[str, str]) -> str:
     urls = list(dict.fromkeys(sources[str(ref.source_document_id)] for ref in refs))
     return f" ^[{' ; '.join(_footnote_url(url) for url in urls)}]" if urls else ""
 
 
-def _render_publication_v3(document: CanonicalPublicationDocument) -> str:
+def _render_publication_narrative(
+    document: CanonicalPublicationDocument,
+) -> str:
     sources = {str(source.source_document_id): source.canonical_url for source in document.sources}
     blocks = [_styled_block("title", _safe_text(document.title))]
     blocks.extend(
         _styled_block(
-            "paragraph", _safe_text(item.text) + _render_v3_citations(item.evidence_refs, sources)
+            "paragraph", _safe_text(item.text) + _render_citations(item.evidence_refs, sources)
         )
         for item in document.lead
     )
@@ -65,7 +65,7 @@ def _render_publication_v3(document: CanonicalPublicationDocument) -> str:
         blocks.extend(
             _styled_block(
                 "paragraph",
-                _safe_text(item.text) + _render_v3_citations(item.evidence_refs, sources),
+                _safe_text(item.text) + _render_citations(item.evidence_refs, sources),
             )
             for item in section.paragraphs
         )
@@ -78,7 +78,7 @@ def _render_publication_v3(document: CanonicalPublicationDocument) -> str:
                 else entry.date_text
             )
             content = f"{_safe_text(label)} : " if label else ""
-            content += _safe_text(entry.text) + _render_v3_citations(entry.evidence_refs, sources)
+            content += _safe_text(entry.text) + _render_citations(entry.evidence_refs, sources)
             blocks.append(_styled_block("paragraph", content))
     if document.indicators:
         blocks.append(_styled_block("section", "IOC"))
@@ -108,7 +108,7 @@ def _render_publication_v3(document: CanonicalPublicationDocument) -> str:
 
 def render_publication_pandoc(document: CanonicalPublicationDocument) -> str:
     """Render publication Markdown without invoking Pandoc or reading the network."""
-    rendered = _render_publication_v3(document)
+    rendered = _render_publication_narrative(document)
     if "`" in rendered:
         raise ValueError("Pandoc publication Markdown must not contain backticks")
     return rendered

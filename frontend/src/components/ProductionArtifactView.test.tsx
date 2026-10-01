@@ -238,20 +238,20 @@ it("construit la preview de publication depuis le JSON canonique", async () => {
   ).not.toBeInTheDocument();
 });
 
-it("affiche la publication V3 et la provenance des sections, IOC et incertitudes", async () => {
+it("affiche la publication V4 et ses enrichissements", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn(() =>
       Promise.resolve(
         Response.json({
-          artifact_id: "publication-v3",
+          artifact_id: "publication-v4",
           stage: "publication",
           version: 1,
           status: "verified",
           metadata: {},
           rendered_content: null,
           canonical_content: {
-            schema_version: "3",
+            schema_version: "4",
             subject_id: SYNTHESIS_SUBJECT_ID,
             publication_language: "fr",
             title: "Article canonique",
@@ -322,6 +322,77 @@ it("affiche la publication V3 et la provenance des sections, IOC et incertitudes
                 source_document_ids: [VENDOR_DOCUMENT_ID],
               },
             ],
+            tables: [
+              {
+                key: "commands",
+                kind: "commands",
+                title: "Commandes observées",
+                caption: "Commandes issues du rapport.",
+                columns: [
+                  { key: "command", label: "Commande" },
+                  { key: "purpose", label: "Usage" },
+                ],
+                rows: [
+                  {
+                    cells: ["powershell", "Exécution"],
+                    evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                  },
+                ],
+                placement: { kind: "after_lead", section_index: null },
+              },
+            ],
+            diagrams: [
+              {
+                key: "infection_chain",
+                kind: "infection_chain",
+                title: "Chaîne d’infection",
+                caption: null,
+                direction: "left_to_right",
+                nodes: [
+                  {
+                    node_id: "loader",
+                    label: "Loader",
+                    evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                  },
+                  {
+                    node_id: "payload",
+                    label: "Payload",
+                    evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                  },
+                ],
+                edges: [
+                  {
+                    source_node_id: "loader",
+                    target_node_id: "payload",
+                    label: "loads",
+                    evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                  },
+                ],
+                groups: [],
+                placement: { kind: "end", section_index: null },
+                asset_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+              },
+            ],
+            figures: [
+              {
+                key: "source_figure_01",
+                asset_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                sha256: "a".repeat(64),
+                mime_type: "image/png",
+                byte_size: 128,
+                source_document_id: VENDOR_DOCUMENT_ID,
+                source_url: "https://vendor.example/figure.png",
+                caption: "Architecture source.",
+                provenance: "Figure 1 from the vendor report.",
+                locator: {
+                  page: 4,
+                  section: "Network",
+                  figure_label: "Figure 1",
+                  original_asset_url: "https://vendor.example/figure.png",
+                },
+                placement: { kind: "after_lead", section_index: null },
+              },
+            ],
           },
         }),
       ),
@@ -339,6 +410,23 @@ it("affiche la publication V3 et la provenance des sections, IOC et incertitudes
   expect(screen.getByText("Événement.")).toBeInTheDocument();
   expect(screen.getByText("evil.example")).toBeInTheDocument();
   expect(screen.getByText("Attribution incertaine.")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Commandes observées" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("powershell")).toBeInTheDocument();
+  expect(screen.getByText("1 preuves")).toBeInTheDocument();
+  expect(
+    screen.getByRole("heading", { name: "Chaîne d’infection" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("Figure 1 from the vendor report."),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("https://vendor.example/figure.png"),
+  ).toBeInTheDocument();
   expect(screen.getAllByRole("link", { name: "Rapport" })[0]).toHaveAttribute(
     "href",
     VENDOR_URL,
@@ -346,6 +434,52 @@ it("affiche la publication V3 et la provenance des sections, IOC et incertitudes
   expect(
     screen.getAllByRole("link", { name: "IOC source" })[0],
   ).toHaveAttribute("href", IOC_URL);
+});
+
+it("affiche une publication V4 sans enrichissement comme une publication narrative", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "publication-v4-empty",
+        stage: "publication",
+        version: 1,
+        status: "verified",
+        metadata: {},
+        rendered_content: null,
+        canonical_content: {
+          schema_version: "4",
+          subject_id: SYNTHESIS_SUBJECT_ID,
+          publication_language: "fr",
+          title: "Publication V4 minimale",
+          lead: [],
+          sections: [],
+          timeline: [],
+          indicators: [],
+          sources: [],
+          uncertainties: [],
+          tables: [],
+          diagrams: [],
+          figures: [],
+        },
+      }),
+    ),
+  );
+
+  renderArtifact("publication");
+
+  expect(
+    await screen.findByRole("heading", { name: "Publication V4 minimale" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "Tableaux" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "Diagrammes" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "Figures source" }),
+  ).not.toBeInTheDocument();
 });
 
 it("préserve la provenance visible d'un artifact réutilisé", async () => {

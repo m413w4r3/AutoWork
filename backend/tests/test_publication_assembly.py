@@ -18,10 +18,10 @@ from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
-    build_publication_document_v3,
+    build_publication_document_v4,
     compute_assembly_input_hash,
 )
-from cti_app.application.publication_qa import qa_publication_v3
+from cti_app.application.publication_qa import qa_publication_v4
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -74,7 +74,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     ArtifactType,
     PublicationAssemblyErrorCode,
 )
@@ -278,15 +278,17 @@ def test_assembly_constructor_has_no_renderer_dependency() -> None:
 
 
 @pytest.mark.asyncio
-async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() -> None:
+async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     run = _run(snapshot)
     service, catalog, artifacts = _service()
-    document = build_publication_document_v3(
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    document = build_publication_document_v4(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=enrichment,
     )
 
     artifact = await service.assemble_publication(
@@ -295,9 +297,7 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         references=references,
         extraction=extraction,
         synthesis=synthesis,
-        editorial_enrichment=build_empty_editorial_enrichment(
-            extraction=extraction, synthesis=synthesis
-        ),
+        editorial_enrichment=enrichment,
     )
 
     expected_bytes = ProductionArtifactStore.canonical_json_bytes(
@@ -317,16 +317,14 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         references=references,
         extraction=extraction,
         synthesis=synthesis,
-        editorial_enrichment=build_empty_editorial_enrichment(
-            extraction=extraction, synthesis=synthesis
-        ),
+        editorial_enrichment=enrichment,
     )
     assert artifact.canonical_blob_id == UUID(int=50)
     assert artifact.raw_blob_id is None
     assert artifact.rendered_blob_id is None
     assert artifact.metadata == {}
     document_json = serialize_publication_document(document)
-    assert document_json["schema_version"] == PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION
+    assert document_json["schema_version"] == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
     assert set(document_json) == {
         "schema_version",
         "subject_id",
@@ -338,7 +336,34 @@ async def test_assembly_persists_exact_v3_body_and_one_publication_artifact() ->
         "indicators",
         "sources",
         "uncertainties",
+        "tables",
+        "diagrams",
+        "figures",
     }
+
+
+@pytest.mark.asyncio
+async def test_assembly_persists_editorial_enrichment_in_the_canonical_body() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    enrichment = _enrichment_citing(extraction, synthesis, evidence)
+    service, catalog, _artifacts = _service()
+    store = ProductionArtifactStore(catalog)
+
+    artifact = await service.assemble_publication(
+        run=_run(snapshot),
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert artifact.rendered_blob_id is None
+    assert artifact.canonical_blob_id is not None
+    document = parse_publication_document(await store.read_json(artifact.canonical_blob_id))
+    assert document.tables[0].key == "observations"
+    assert document.tables[0].rows[0].cells == ("Observed", "Reported by the source")
 
 
 @pytest.mark.asyncio
@@ -474,11 +499,15 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
         ),
     )
 
-    expected = build_publication_document_v3(
+    changed_enrichment = build_empty_editorial_enrichment(
+        extraction=extraction, synthesis=changed_synthesis
+    )
+    expected = build_publication_document_v4(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=changed_synthesis,
+        editorial_enrichment=changed_enrichment,
     )
     assert (first.version, second.version) == (1, 2)
     assert second.input_hash != first.input_hash
@@ -493,27 +522,30 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
 
 def test_canonical_qa_rejects_added_claim_and_legacy_marker() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    document = build_publication_document_v3(
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    document = build_publication_document_v4(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=enrichment,
     )
     inputs = {
         "snapshot": snapshot,
         "references": references,
         "extraction": extraction,
         "synthesis": synthesis,
+        "editorial_enrichment": enrichment,
     }
 
-    assert qa_publication_v3(publication=document, **inputs)["passed"] is True
+    assert qa_publication_v4(publication=document, **inputs)["passed"] is True
     injected = replace(document, title="Added editorial claim")
-    result = qa_publication_v3(publication=injected, **inputs)
+    result = qa_publication_v4(publication=injected, **inputs)
     assert result["checks"]["exact_projection"] is False
     assert result["passed"] is False
 
     legacy = replace(document, title=f"{document.title} [S1]")
-    result = qa_publication_v3(publication=legacy, **inputs)
+    result = qa_publication_v4(publication=legacy, **inputs)
     assert result["checks"]["no_legacy_citation"] is False
     assert result["passed"] is False
 
@@ -533,11 +565,14 @@ def test_confirmed_ioc_with_invalid_normalization_blocks_assembly() -> None:
     extraction = replace(extraction, sources=(replace(source, indicators=(invalid,)),))
     synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
     with pytest.raises(ValueError, match="cannot be normalized"):
-        build_publication_document_v3(
+        build_publication_document_v4(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=build_empty_editorial_enrichment(
+                extraction=extraction, synthesis=synthesis
+            ),
         )
 
 
@@ -563,7 +598,7 @@ def _enrichment_citing(
 
 
 @pytest.mark.asyncio
-async def test_ioc_only_repair_reuses_narrative_and_reassembles_v3() -> None:
+async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_publication() -> None:
     snapshot, references, extraction_a, synthesis_a = _canonical_inputs()
     source = extraction_a.sources[0]
     indicator = ExtractionIndicatorV1(

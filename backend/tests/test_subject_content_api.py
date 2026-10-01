@@ -20,10 +20,10 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
-    PublicationDocumentV3,
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDocumentV4,
+    publication_document_v4_to_json,
 )
-from cti_app.domain.publication_document import serialize_publication_document
 
 SUBJECT_ID = uuid4()
 
@@ -176,9 +176,9 @@ def _artifact(
 
 
 def _document(title: str) -> dict[str, Any]:
-    return serialize_publication_document(
-        PublicationDocumentV3(
-            schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    return publication_document_v4_to_json(
+        PublicationDocumentV4(
+            schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
             subject_id=SUBJECT_ID,
             publication_language="fr",
             title=title,
@@ -188,6 +188,9 @@ def _document(title: str) -> dict[str, Any]:
             indicators=(),
             sources=(),
             uncertainties=(),
+            tables=(),
+            diagrams=(),
+            figures=(),
         )
     )
 

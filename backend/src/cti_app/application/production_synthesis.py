@@ -1368,69 +1368,6 @@ def render_synthesis_markdown(
     return "\n".join(lines).rstrip() + "\n"
 
 
-def project_legacy_synthesis_markdown(
-    synthesis: ProductionSynthesisV1,
-    extraction: ProductionExtractionV1,
-    source_labels: Mapping[UUID, str],
-) -> str:
-    """Project canonical synthesis claims into the temporary Assembly format.
-
-    ``source_labels`` is an exact source-document-to-legacy-label mapping
-    created at the Assembly boundary. This adapter never resolves sources by
-    title or position and never reads the human preview.
-    """
-    if synthesis.subject_id != extraction.subject_id:
-        raise ValueError("Synthesis and extraction subjects differ")
-
-    def markers(refs: tuple[ExtractionEvidenceRefV1, ...]) -> str:
-        labels: set[str] = set()
-        for ref in refs:
-            label = source_labels.get(ref.source_document_id)
-            if label is None:
-                raise ValueError(
-                    "Canonical synthesis evidence source has no exact legacy source mapping: "
-                    f"{ref.source_document_id}"
-                )
-            match = re.fullmatch(r"S(\d{1,3})", label, re.IGNORECASE)
-            if match is None:
-                raise ValueError(f"Legacy source label is invalid for Assembly: {label!r}")
-            labels.add(label)
-        return " ".join(
-            f"[{label}]"
-            for label in sorted(
-                labels,
-                key=lambda item: (int(item[1:]), item),
-            )
-        )
-
-    blocks: list[str] = []
-
-    def append_claim(
-        text: str,
-        refs: tuple[ExtractionEvidenceRefV1, ...],
-        prefix: str = "",
-    ) -> None:
-        claim_markers = markers(refs)
-        blocks.append(f"{prefix}{text.strip()} {claim_markers}")
-
-    for paragraph in synthesis.lead:
-        append_claim(paragraph.text, paragraph.evidence_refs)
-    for section in synthesis.sections:
-        for paragraph in section.paragraphs:
-            append_claim(
-                paragraph.text,
-                paragraph.evidence_refs,
-                prefix=f"{section.heading}: ",
-            )
-    for entry in synthesis.timeline:
-        label = entry.date_text or (
-            entry.event_date.isoformat() if entry.event_date is not None else "Undated"
-        )
-        append_claim(entry.text, entry.evidence_refs, prefix=f"{label}: ")
-
-    return "\n\n".join(blocks) + ("\n" if blocks else "")
-
-
 # --- Canonical application service -----------------------------------------
 
 # The evidence pack already bounds what reaches the drafter; these caps only

@@ -79,7 +79,7 @@ SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT →
 
 `EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et déterministe en
 AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
-fonctionnelle de `PUBLICATION`, dont le corps reste `PublicationDocumentV3`. `READY` signifie
+fonctionnelle de `PUBLICATION`, dont le corps est `PublicationDocumentV4`. `READY` signifie
 que les artifacts canoniques sont valides et que la QA canonique a réussi ; il n'indique pas qu'un rendu PDF ou
 DOCX a été compilé. Le rendu constitue un pipeline distinct.
 
@@ -99,9 +99,9 @@ les champs legacy nécessaires aux anciens consommateurs.
 Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` et ne partage
 avec lui ni module ni service. Extraction consomme le corpus directement. Synthesis lit
 `ProductionExtractionV1`, puis Editorial Enrichment lie un contrat vide à l’extraction et à la
-synthèse. Assembly construit `PublicationDocumentV3` depuis le snapshot, le corpus, l’extraction,
-la synthèse et cet enrichment. La projection historique `ReferenceReport` reste limitée
-à certaines fonctions du Repair Desk. Le format portable Production State V5 conserve les quatre
+synthèse. Assembly construit `PublicationDocumentV4` depuis le snapshot, le corpus, l’extraction,
+la synthèse et cet enrichment, sans compiler de média ni rendre de document. Le format portable
+Production State V5 conserve les quatre
 artefacts canoniques avant Assembly, enrichissement éditorial compris.
 
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection

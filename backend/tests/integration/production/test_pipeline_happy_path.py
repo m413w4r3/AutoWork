@@ -407,7 +407,7 @@ async def test_complete_production_pipeline_reaches_ready(
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)
     assert "secondary-c2.security-lab.io" in str(publication_payload)
-    assert publication_payload["schema_version"] == "3"
+    assert publication_payload["schema_version"] == "4"
     assert publication_payload["title"] == synthesis_payload["title"]
     assert publication_payload["lead"] == synthesis_payload["lead"]
     assert publication_payload["sections"] == synthesis_payload["sections"]

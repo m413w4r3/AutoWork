@@ -9,27 +9,20 @@ context, so they fail if a repair ever reaches the narrative again.
 from __future__ import annotations
 
 import hashlib
-from datetime import date
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.production_parsers import (
-    ParsedSource,
-    ReferenceReport,
-    TechnicalExtraction,
-)
+from cti_app.application.production_parsers import TechnicalExtraction
 from cti_app.application.production_repairs import (
     EffectiveExtractionProjector,
     _impact_from_projection_hashes,
     classify_repair_impact,
     merge_repair_impacts,
     production_repair_correction_identity,
-    publication_projection_hash,
     repair_application_diagnostic,
     rule_bundle_projection_hash,
 )
-from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     ProductionDerivedOutput,
     ProductionEvidenceBasis,
@@ -51,8 +44,6 @@ RUN_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
 ARTIFACT_ID = UUID("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 SOURCE_ID = "S1"
 SOURCE_URL = "https://source.example/report"
-SYNTHESIS_TEXT = "Le groupe a exfiltré des données [S1]."
-
 HASH_VALUE = "a" * 64
 IP_VALUE = "203.0.113.7"
 DOMAIN_VALUE = "evil.lot41-desk.com"
@@ -64,23 +55,6 @@ def _sha256(value: str) -> str:
 
 def _repair_key(seed: str) -> str:
     return _sha256(seed)
-
-
-def _report() -> ReferenceReport:
-    return ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id=SOURCE_ID,
-                title="Rapport",
-                url=SOURCE_URL,
-                canonical_url=SOURCE_URL,
-                publisher="Publisher",
-                published_at=date(2026, 8, 12),
-                role=SourceRole.PRIMARY,
-            ),
-        ),
-        events=(),
-    )
 
 
 def _entry(
@@ -141,20 +115,15 @@ def _project(
         )
         .extraction
     )
-    report = _report()
-    # A legacy extraction has no canonical Synthesis evidence identity: only the
-    # publication and rule projections decide the impact.
+    # These repair projections have no synthesis change; the canonical fallback
+    # publication projection and rule-bundle hash decide the impact.
     impact = _impact_from_projection_hashes(
         previous,
         projected,
         previous_synthesis_projection_hash=None,
         new_synthesis_projection_hash=None,
-        previous_publication_projection_hash=publication_projection_hash(
-            report, previous, SYNTHESIS_TEXT
-        ),
-        new_publication_projection_hash=publication_projection_hash(
-            report, projected, SYNTHESIS_TEXT
-        ),
+        previous_publication_projection_hash=None,
+        new_publication_projection_hash=None,
         previous_rule_bundle_hash=rule_bundle_projection_hash(previous),
         new_rule_bundle_hash=rule_bundle_projection_hash(projected),
     )
@@ -203,7 +172,6 @@ def test_ioc_include_does_not_require_model(artifact_type: str, value: str) -> N
 def test_ioc_include_only_rebuilds_publication() -> None:
     """The synthesis artifact is byte-identical; only the publication moves."""
     key = _repair_key(HASH_VALUE)
-    report = _report()
     previous, projected, impact = _project(
         [_entry(repair_key=key, artifact_type="hash", value=HASH_VALUE)],
         [_decision(key, ProductionRepairAction.INCLUDE)],
@@ -217,9 +185,6 @@ def test_ioc_include_only_rebuilds_publication() -> None:
             ProductionDerivedOutput.CHECKPOINT,
         }
     ) | {ProductionDerivedOutput.PUBLICATION}
-    assert publication_projection_hash(
-        report, previous, SYNTHESIS_TEXT
-    ) != publication_projection_hash(report, projected, SYNTHESIS_TEXT)
     _assert_synthesis_untouched(previous, projected, impact)
 
 
@@ -262,18 +227,13 @@ def test_ioc_exclude_after_include_removes_it_from_the_publication_only() -> Non
         resolved_payloads={},
     ).extraction
 
-    report = _report()
     impact = _impact_from_projection_hashes(
         included,
         excluded,
         previous_synthesis_projection_hash=None,
         new_synthesis_projection_hash=None,
-        previous_publication_projection_hash=publication_projection_hash(
-            report, included, SYNTHESIS_TEXT
-        ),
-        new_publication_projection_hash=publication_projection_hash(
-            report, excluded, SYNTHESIS_TEXT
-        ),
+        previous_publication_projection_hash=None,
+        new_publication_projection_hash=None,
         previous_rule_bundle_hash=rule_bundle_projection_hash(included),
         new_rule_bundle_hash=rule_bundle_projection_hash(excluded),
     )

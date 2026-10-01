@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
+from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
@@ -28,6 +29,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_from_json
 from cti_app.domain.production_extraction import production_extraction_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
+from cti_app.domain.publication_document import parse_publication_document
 from cti_app.infrastructure.database.models.production import ProductionArtifactRow
 from tests.integration.production.support import ProductionScenario, grounded_editorial_proposal
 
@@ -40,10 +42,31 @@ pytestmark = pytest.mark.integration
 @pytest.mark.asyncio
 async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     production_scenario_factory: Callable[[Mapping[str, Mapping[str, object]]], ProductionScenario],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scenario = await _configured_scenario(production_scenario_factory)
     _install_canonical_synthesis(scenario)
     scenario.model.script.editorial_enrichment(grounded_editorial_proposal)
+
+    assembly_call_counts: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+    assemble = PublicationAssemblyService.assemble_publication
+
+    async def instrumented_assemble(self: object, **kwargs: object) -> ProductionArtifact:
+        before = (
+            scenario.diagram_compiler.calls,
+            len(scenario.model.provider_calls),
+            len(scenario.collection_transport.requests),
+        )
+        artifact = await assemble(self, **kwargs)  # type: ignore[arg-type]
+        after = (
+            scenario.diagram_compiler.calls,
+            len(scenario.model.provider_calls),
+            len(scenario.collection_transport.requests),
+        )
+        assembly_call_counts.append((before, after))
+        return artifact
+
+    monkeypatch.setattr(PublicationAssemblyService, "assemble_publication", instrumented_assemble)
     await scenario.start()
     run = await scenario.run_until_terminal()
     assert run.status is ProductionRunStatus.READY, (run.error_code, run.error_message)
@@ -53,12 +76,14 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
             item.stage: item for item in await uow.production_artifacts.list_for_run(run.id)
         }
     enrichment_artifact = artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT]
+    publication_artifact = artifacts[ProductionArtifactStage.PUBLICATION]
     assert enrichment_artifact.model_run_id is not None
     assert enrichment_artifact.raw_blob_id is not None
     assert enrichment_artifact.canonical_blob_id is not None
-    assert (
-        artifacts[ProductionArtifactStage.PUBLICATION].status is ProductionArtifactStatus.VERIFIED
-    )
+    assert publication_artifact.status is ProductionArtifactStatus.VERIFIED
+    assert publication_artifact.rendered_blob_id is None
+    assert len(assembly_call_counts) == 1
+    assert assembly_call_counts[0][0] == assembly_call_counts[0][1]
 
     extraction = production_extraction_from_json(
         await scenario.artifact_store.read_json(
@@ -93,6 +118,15 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
             f"<text>{enrichment.diagrams[0].key}</text></svg>"
         ).encode()
     )
+    assert publication_artifact.canonical_blob_id is not None
+    publication_payload = await scenario.artifact_store.read_json(
+        publication_artifact.canonical_blob_id
+    )
+    assert publication_payload["schema_version"] == "4"
+    publication = parse_publication_document(publication_payload)
+    assert len(publication.tables) == len(publication.diagrams) == 1
+    assert publication.tables[0].rows[0].cells
+    assert publication.diagrams[0].asset_id == compiled_asset_id
     assert len([call for call in scenario.model.calls if call.stage == "editorial_enrichment"]) == 1
 
 

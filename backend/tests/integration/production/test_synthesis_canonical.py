@@ -583,7 +583,7 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "3"
+    assert publication_payload["schema_version"] == "4"
     publication_text = json.dumps(publication_payload)
     assert publication_payload["title"] == synthesis.title
     assert [item["text"] for item in publication_payload["lead"]] == [

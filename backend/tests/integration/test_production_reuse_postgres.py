@@ -46,9 +46,11 @@ from cti_app.application.production_extraction import (
     extraction_input_hash,
     references_corpus_hash,
 )
-from cti_app.application.production_legacy_assembly import LegacyPublicationAssemblyService
 from cti_app.application.production_parsers import Q2FactProposal, Q2SourceOutput
-from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_references import (
+    production_reference_corpus_from_json,
+    production_reference_corpus_to_json,
+)
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     SynthesisClaimProposalV1,
@@ -64,6 +66,7 @@ from cti_app.application.production_workflow import (
     ProductionWorkflowOrchestrator,
     _references_input_hash,
 )
+from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.subject_production import (
     ProductionBatchService,
     SubjectProductionService,
@@ -1072,14 +1075,24 @@ async def _seed_reusable_article(
         synthesis=synthesis,
     )
 
-    publication = await LegacyPublicationAssemblyService(uow_factory, store).assemble_publication(
-        run_id=source_run.id,
-        subject_id=subject.id,
-        subject_title=title,
-        references_artifact=source_artifacts[ProductionArtifactStage.REFERENCES],
-        extraction_artifact=source_artifacts[ProductionArtifactStage.EXTRACTION],
-        synthesis_artifact=source_artifacts[ProductionArtifactStage.SYNTHESIS],
-    )
+    references = production_reference_corpus_from_json(await store.read_json(refs_blob_id))
+    async with uow_factory() as uow:
+        enrichment = editorial_enrichment_from_json(
+            await store.read_json(
+                source_artifacts[ProductionArtifactStage.EDITORIAL_ENRICHMENT].canonical_blob_id
+            )
+        )
+        publication = await PublicationAssemblyService(
+            store, uow.production_artifacts
+        ).assemble_publication(
+            run=source_run,
+            snapshot=snapshot,
+            references=references,
+            extraction=first_pass.extraction,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+        await uow.commit()
     return source_run, source_artifacts, publication
 
 
@@ -1513,45 +1526,31 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         synthesis=synthesis,
     )
 
-    assembly = LegacyPublicationAssemblyService(uow_factory, store)
-    assembly_inputs = (
-        source_artifacts[ProductionArtifactStage.REFERENCES],
-        source_artifacts[ProductionArtifactStage.EXTRACTION],
-        source_artifacts[ProductionArtifactStage.SYNTHESIS],
-    )
-    first_projection = (await assembly._load_inputs(*assembly_inputs))[2]
-    repeated_projection = (await assembly._load_inputs(*assembly_inputs))[2]
-    assert first_projection.encode("utf-8") == repeated_projection.encode("utf-8")
-    assert first_projection.count("[S1]") == 3
-    assert "The selected campaign was reported." in first_projection
-    assert "[S99]" not in first_projection
-
-    unmapped_ref = replace(synthesis.lead[0].evidence_refs[0], source_document_id=uuid4())
-    unmapped_paragraph = replace(synthesis.lead[0], evidence_refs=(unmapped_ref,))
-    unmapped_synthesis = replace(
-        synthesis,
-        lead=(unmapped_paragraph,),
-        sections=(replace(synthesis.sections[0], paragraphs=(unmapped_paragraph,)),),
-        timeline=(replace(synthesis.timeline[0], evidence_refs=(unmapped_ref,)),),
-    )
-    _, unmapped_canonical_id, _ = await store.store_stage_payloads(
-        canonical=production_synthesis_to_json(unmapped_synthesis)
-    )
-    with pytest.raises(ValueError, match="absent from canonical extraction"):
-        await assembly._load_inputs(
-            assembly_inputs[0],
-            assembly_inputs[1],
-            replace(assembly_inputs[2], canonical_blob_id=unmapped_canonical_id),
+    references_a = production_reference_corpus_from_json(
+        await store.read_json(
+            source_artifacts[ProductionArtifactStage.REFERENCES].canonical_blob_id
         )
-
-    publication_a = await assembly.assemble_publication(
-        run_id=run_a.id,
-        subject_id=subject.id,
-        subject_title=snapshot_a.subject_title,
-        references_artifact=source_artifacts[ProductionArtifactStage.REFERENCES],
-        extraction_artifact=source_artifacts[ProductionArtifactStage.EXTRACTION],
-        synthesis_artifact=source_artifacts[ProductionArtifactStage.SYNTHESIS],
     )
+    extraction_a = production_extraction_from_json(
+        await store.read_json(
+            source_artifacts[ProductionArtifactStage.EXTRACTION].canonical_blob_id
+        )
+    )
+    enrichment_a = editorial_enrichment_from_json(
+        await store.read_json(source_enrichment_artifact.canonical_blob_id)
+    )
+    async with uow_factory() as uow:
+        publication_a = await PublicationAssemblyService(
+            store, uow.production_artifacts
+        ).assemble_publication(
+            run=run_a,
+            snapshot=snapshot_a,
+            references=references_a,
+            extraction=extraction_a,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment_a,
+        )
+        await uow.commit()
 
     run_b, created_b = await production.create_run(subject.id, edition.id)
     assert created_b
@@ -1964,7 +1963,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
     ).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
-    assert all(item["document"]["schema_version"] == "3" for item in edition_json["publications"])
+    assert all(item["document"]["schema_version"] == "4" for item in edition_json["publications"])
     assert [item["document"]["title"] for item in edition_json["publications"]] == [
         "Article A",
         "Article B",

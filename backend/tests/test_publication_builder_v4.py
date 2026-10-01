@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 from dataclasses import replace
@@ -11,24 +13,47 @@ import cti_app.application.publication_builder as publication_builder
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     canonical_editorial_enrichment_hash,
+    canonical_synthesis_hash,
 )
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.publication_builder import (
+    PublicationAssemblyValidationError,
     _project_publication_iocs,
     _project_synthesis_publication,
-    _validate_publication_v3_lineage,
+    _validate_publication_lineage,
     _validate_synthesis_evidence_refs,
-    build_publication_document_v3,
+    build_publication_document_v4,
     compute_assembly_input_hash,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
+from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import (
     ExtractionProfile,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
+)
+from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
+    DiagramGroupV1,
+    DiagramNodeV1,
+    DiagramSpecV1,
+    EnrichmentDiagramDirection,
+    EnrichmentDiagramKind,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    ResolvedSourceFigureV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
+    SourceFigureLocatorV1,
+    TableColumnV1,
+    TableRowV1,
+    TableSpecV1,
+    source_figure_id,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -61,9 +86,11 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     ArtifactType,
-    PublicationDocumentV3,
+    PublicationAssemblyErrorCode,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationIndicatorGroupV1,
@@ -74,9 +101,424 @@ from cti_app.domain.publication import (
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
+    publication_document_v4_to_json,
 )
-from cti_app.domain.publication_document import serialize_publication_document
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+
+_EXTRA_SOURCE_ID = UUID(int=20)
+_DEFAULT_DIAGRAM_ASSET_ID = UUID(int=30)
+
+
+def _enrichment_with(
+    *,
+    extraction,
+    synthesis,
+    tables=(),
+    diagrams=(),
+    source_figures=(),
+):
+    return replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        tables=tables,
+        diagrams=diagrams,
+        source_figures=source_figures,
+    )
+
+
+def _table(ref: ExtractionEvidenceRefV1, *, key: str = "commands") -> TableSpecV1:
+    return TableSpecV1(
+        key=key,
+        kind=EnrichmentTableKind.COMMANDS,
+        title="Observed commands",
+        caption="Commands observed in the report",
+        columns=(
+            TableColumnV1("command", "Command"),
+            TableColumnV1("purpose", "Purpose"),
+        ),
+        rows=(TableRowV1(("-enc", "Execution"), (ref,)),),
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+    )
+
+
+def _diagram(
+    ref: ExtractionEvidenceRefV1,
+    *,
+    asset_id: UUID | None = _DEFAULT_DIAGRAM_ASSET_ID,
+    key: str = "infection_chain",
+) -> DiagramSpecV1:
+    return DiagramSpecV1(
+        key=key,
+        kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+        title="Infection chain",
+        caption="Observed execution flow",
+        direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+        nodes=(
+            DiagramNodeV1("loader", "Loader", (ref,)),
+            DiagramNodeV1("payload", "Payload", (ref,)),
+        ),
+        edges=(DiagramEdgeV1("loader", "payload", "loads", (ref,)),),
+        groups=(DiagramGroupV1("host", "Victim host", ("loader", "payload")),),
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+        compiled_asset_id=asset_id,
+    )
+
+
+def _resolved_figure(source_document_id: UUID, source_url: str) -> ResolvedSourceFigureV1:
+    locator = SourceFigureLocatorV1(page=1, figure_label="Network map")
+    sha256 = "d" * 64
+    return ResolvedSourceFigureV1(
+        figure_id=source_figure_id(
+            source_document_id=source_document_id,
+            sha256=sha256,
+            source=source_url,
+            locator=locator,
+        ),
+        blob_id=UUID(int=40),
+        sha256=sha256,
+        mime_type="image/png",
+        byte_size=128,
+        source_document_id=source_document_id,
+        source=source_url,
+        provenance="Archived image asset",
+        locator=locator,
+        decision=SourceFigureDecision.ACCEPTED,
+        decision_reason="matched_archived_blob",
+    )
+
+
+def _figure(
+    source_document_id: UUID,
+    source_url: str,
+    *,
+    key: str = "source_figure_01",
+    status: SourceFigureInclusionStatus = SourceFigureInclusionStatus.INCLUDED,
+    resolved: ResolvedSourceFigureV1 | None = None,
+) -> SourceFigureCandidateV1:
+    locator = resolved.locator if resolved is not None else SourceFigureLocatorV1(page=1)
+    return SourceFigureCandidateV1(
+        key=key,
+        source_document_id=source_document_id,
+        source_url=source_url,
+        caption="Source architecture",
+        provenance="Figure 1 from the source publication",
+        locator=locator,
+        inclusion_status=status,
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        resolved_figure=resolved,
+    )
+
+
+def _with_extra_source(snapshot, references, extraction, synthesis):
+    source = extraction.sources[0]
+    source_url = "https://example.com/extra-report"
+    extra_source = replace(
+        source,
+        source_document_id=_EXTRA_SOURCE_ID,
+        canonical_url=source_url,
+        content_sha256="e" * 64,
+        facts=tuple(
+            replace(fact, source_document_ids=(_EXTRA_SOURCE_ID,)) for fact in source.facts
+        ),
+    )
+    extra_reference = replace(
+        references.sources[0],
+        canonical_url=source_url,
+        source_collection_id=UUID(int=21),
+        source_document_id=_EXTRA_SOURCE_ID,
+        content_sha256="e" * 64,
+        role=SourceRole.INDEPENDENT,
+    )
+    references = replace(references, sources=(references.sources[0], extra_reference))
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(source, extra_source),
+    )
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    return snapshot, references, extraction, synthesis, source_url
+
+
+def _build_v4(enrichment=None):
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    if enrichment is None:
+        enrichment = build_empty_editorial_enrichment(
+            extraction=extraction,
+            synthesis=synthesis,
+        )
+    return build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+
+def test_empty_enrichment_has_no_rich_content() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    v4 = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    assert v4.tables == v4.diagrams == v4.figures == ()
+
+
+def test_table_is_projected_without_reformulation_and_keeps_evidence() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    table = _table(evidence)
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        tables=(table,),
+    )
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert document.tables[0].key == table.key
+    assert document.tables[0].caption == table.caption
+    assert document.tables[0].columns[0].label == table.columns[0].label
+    assert document.tables[0].rows[0].cells == table.rows[0].cells
+    assert document.tables[0].rows[0].evidence_refs == table.rows[0].evidence_refs
+    assert document.tables[0].placement == table.placement
+
+
+def test_diagram_is_projected_and_compiled_asset_id_is_preserved() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    diagram = _diagram(extraction_evidence_refs_v1(extraction)[0])
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis, diagrams=(diagram,))
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert document.diagrams == (
+        PublicationDiagramV1(
+            key=diagram.key,
+            kind=diagram.kind,
+            title=diagram.title,
+            caption=diagram.caption,
+            direction=diagram.direction,
+            nodes=diagram.nodes,
+            edges=diagram.edges,
+            groups=diagram.groups,
+            placement=diagram.placement,
+            asset_id=diagram.compiled_asset_id,
+        ),
+    )
+
+
+def test_diagram_without_compiled_asset_is_rejected() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        diagrams=(_diagram(extraction_evidence_refs_v1(extraction)[0], asset_id=None),),
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        build_publication_document_v4(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+    assert failure.value.code is PublicationAssemblyErrorCode.DIAGRAM_ASSET_MISSING
+
+
+@pytest.mark.parametrize(
+    "status", (SourceFigureInclusionStatus.PROPOSED, SourceFigureInclusionStatus.EXCLUDED)
+)
+def test_non_included_figures_are_silently_absent(status: SourceFigureInclusionStatus) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    snapshot, references, extraction, synthesis, source_url = _with_extra_source(
+        snapshot, references, extraction, synthesis
+    )
+    figure = _figure(_EXTRA_SOURCE_ID, source_url, status=status)
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        source_figures=(figure,),
+    )
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert document.figures == ()
+    assert _EXTRA_SOURCE_ID not in {source.source_document_id for source in document.sources}
+
+
+def test_included_figure_uses_content_addressed_asset_and_adds_its_source() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    snapshot, references, extraction, synthesis, source_url = _with_extra_source(
+        snapshot, references, extraction, synthesis
+    )
+    resolved = _resolved_figure(_EXTRA_SOURCE_ID, source_url)
+    figure = _figure(_EXTRA_SOURCE_ID, source_url, resolved=resolved)
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        source_figures=(figure,),
+    )
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert document.figures[0].asset_id == media_asset_id("d" * 64, "image/png")
+    assert document.figures[0].source_document_id == _EXTRA_SOURCE_ID
+    assert _EXTRA_SOURCE_ID in {source.source_document_id for source in document.sources}
+
+
+def test_included_figure_without_resolution_is_rejected() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        source_figures=(_figure(source.source_document_id, source.canonical_url, resolved=None),),
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        _build_v4(enrichment)
+    assert failure.value.code is PublicationAssemblyErrorCode.SOURCE_FIGURE_UNRESOLVED
+
+
+@pytest.mark.parametrize(
+    ("field", "expected_code"),
+    (
+        ("decision", PublicationAssemblyErrorCode.SOURCE_FIGURE_INVALID),
+        ("sha256", PublicationAssemblyErrorCode.SOURCE_FIGURE_METADATA_MISSING),
+        ("mime_type", PublicationAssemblyErrorCode.SOURCE_FIGURE_METADATA_MISSING),
+        ("byte_size", PublicationAssemblyErrorCode.SOURCE_FIGURE_METADATA_MISSING),
+    ),
+)
+def test_included_figure_with_invalid_resolution_is_rejected(field, expected_code) -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    resolved = _resolved_figure(source.source_document_id, source.canonical_url)
+    update = {field: SourceFigureDecision.PENDING} if field == "decision" else {field: None}
+    invalid_resolved = resolved.model_copy(update=update)
+    figure = _figure(source.source_document_id, source.canonical_url, resolved=resolved)
+    object.__setattr__(figure, "resolved_figure", invalid_resolved)
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        source_figures=(figure,),
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        _build_v4(enrichment)
+    assert failure.value.code is expected_code
+
+
+def test_enrichment_evidence_absent_from_extraction_is_rejected() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    invalid_ref = ExtractionEvidenceRefV1(
+        extraction.sources[0].source_document_id, EvidenceKind.FACT, "0" * 64
+    )
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        tables=(_table(invalid_ref),),
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        _build_v4(enrichment)
+    assert failure.value.code is PublicationAssemblyErrorCode.EVIDENCE_MISSING
+
+
+def test_table_and_diagram_sources_are_added_to_exact_source_union() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    snapshot, references, extraction, synthesis, _source_url = _with_extra_source(
+        snapshot, references, extraction, synthesis
+    )
+    extra_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.source_document_id == _EXTRA_SOURCE_ID
+    )
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        tables=(_table(extra_ref),),
+        diagrams=(_diagram(extra_ref, key="extra_flow", asset_id=UUID(int=31)),),
+    )
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert {source.source_document_id for source in document.sources} == {
+        *(source.source_document_id for source in extraction.sources),
+        _EXTRA_SOURCE_ID,
+    }
+
+
+@pytest.mark.parametrize("field", ("extraction_hash", "synthesis_hash"))
+def test_enrichment_lineage_mismatch_is_rejected(field: str) -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        **{field: "0" * 64},
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        _build_v4(enrichment)
+    assert failure.value.code is PublicationAssemblyErrorCode.INPUTS_MISMATCH
+
+
+def test_enrichment_subject_mismatch_is_rejected() -> None:
+    _snapshot, _references, extraction, synthesis = _canonical_inputs()
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        subject_id=UUID(int=99),
+    )
+
+    with pytest.raises(PublicationAssemblyValidationError) as failure:
+        _build_v4(enrichment)
+    assert failure.value.code is PublicationAssemblyErrorCode.INPUTS_MISMATCH
+
+
+def test_builder_is_deterministic_in_value_and_serialization() -> None:
+    first = _build_v4()
+    second = _build_v4()
+
+    assert first == second
+    assert json.dumps(
+        publication_document_v4_to_json(first), sort_keys=True, separators=(",", ":")
+    ) == json.dumps(publication_document_v4_to_json(second), sort_keys=True, separators=(",", ":"))
+
+
+# Canonical builder validation migrated from the former version-specific suite.
 
 
 def _canonical_inputs() -> tuple[
@@ -207,13 +649,17 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
             ProductionArtifactStore.canonical_json_bytes(production_synthesis_to_json(synthesis))
         ).hexdigest(),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(enrichment),
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
     }
 
     expected_hash = hashlib.sha256(
         ProductionArtifactStore.canonical_json_bytes(payload)
     ).hexdigest()
+    legacy_hash = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes({**payload, "assembly_policy_version": "1"})
+    ).hexdigest()
+    assert expected_hash != legacy_hash
     assert (
         compute_assembly_input_hash(
             snapshot=snapshot,
@@ -333,7 +779,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
 
     monkeypatch.setattr(
         publication_builder,
-        "PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION",
+        "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
         "changed-schema",
     )
     assert (
@@ -347,7 +793,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
         != original
     )
 
-    monkeypatch.setattr(publication_builder, "ASSEMBLY_POLICY_VERSION", "2")
+    monkeypatch.setattr(publication_builder, "ASSEMBLY_POLICY_VERSION", "3")
     assert (
         compute_assembly_input_hash(
             snapshot=snapshot,
@@ -372,10 +818,10 @@ def test_assembly_input_hash_api_excludes_runtime_and_renderer_inputs() -> None:
     assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 
 
-def test_publication_v3_validators_accept_matching_canonical_inputs() -> None:
+def test_publication_v4_validators_accept_matching_canonical_inputs() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
 
-    _validate_publication_v3_lineage(
+    _validate_publication_lineage(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
@@ -385,7 +831,7 @@ def test_publication_v3_validators_accept_matching_canonical_inputs() -> None:
 
 
 @pytest.mark.parametrize("artifact", ("snapshot", "references", "extraction", "synthesis"))
-def test_publication_v3_lineage_rejects_each_subject_mismatch(artifact: str) -> None:
+def test_publication_v4_lineage_rejects_each_subject_mismatch(artifact: str) -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     mismatched_subject_id = UUID(int=99)
     if artifact == "snapshot":
@@ -403,7 +849,7 @@ def test_publication_v3_lineage_rejects_each_subject_mismatch(artifact: str) -> 
         synthesis = replace(synthesis, subject_id=mismatched_subject_id)
 
     with pytest.raises(ValueError, match="same subject identity"):
-        _validate_publication_v3_lineage(
+        _validate_publication_lineage(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -411,12 +857,12 @@ def test_publication_v3_lineage_rejects_each_subject_mismatch(artifact: str) -> 
         )
 
 
-def test_publication_v3_lineage_rejects_extraction_snapshot_hash_mismatch() -> None:
+def test_publication_v4_lineage_rejects_extraction_snapshot_hash_mismatch() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     extraction = replace(extraction, production_input_hash="0" * 64)
 
     with pytest.raises(ValueError, match="production input snapshot"):
-        _validate_publication_v3_lineage(
+        _validate_publication_lineage(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -424,12 +870,12 @@ def test_publication_v3_lineage_rejects_extraction_snapshot_hash_mismatch() -> N
         )
 
 
-def test_publication_v3_lineage_rejects_synthesis_snapshot_hash_mismatch() -> None:
+def test_publication_v4_lineage_rejects_synthesis_snapshot_hash_mismatch() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     synthesis = replace(synthesis, production_input_hash="0" * 64)
 
     with pytest.raises(ValueError, match="production input snapshot"):
-        _validate_publication_v3_lineage(
+        _validate_publication_lineage(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -437,12 +883,12 @@ def test_publication_v3_lineage_rejects_synthesis_snapshot_hash_mismatch() -> No
         )
 
 
-def test_publication_v3_lineage_rejects_references_hash_mismatch() -> None:
+def test_publication_v4_lineage_rejects_references_hash_mismatch() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     extraction = replace(extraction, references_corpus_hash="0" * 64)
 
     with pytest.raises(ValueError, match="canonical references corpus"):
-        _validate_publication_v3_lineage(
+        _validate_publication_lineage(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -450,12 +896,12 @@ def test_publication_v3_lineage_rejects_references_hash_mismatch() -> None:
         )
 
 
-def test_publication_v3_lineage_rejects_extraction_hash_mismatch() -> None:
+def test_publication_v4_lineage_rejects_extraction_hash_mismatch() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     synthesis = replace(synthesis, extraction_hash="0" * 64)
 
     with pytest.raises(ValueError, match="canonical extraction"):
-        _validate_publication_v3_lineage(
+        _validate_publication_lineage(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -783,7 +1229,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
     )
 
 
-def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources() -> None:
+def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     source_a = extraction.sources[0]
     source_a_id = source_a.source_document_id
@@ -886,11 +1332,13 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
         ),
     )
 
-    document = build_publication_document_v3(
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    document = build_publication_document_v4(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=enrichment,
     )
     ref_a = PublicationEvidenceRefV1(
         fact_a.source_document_id,
@@ -902,8 +1350,8 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
         PublicationEvidenceKind(fact_b.kind.value),
         fact_b.evidence_key,
     )
-    expected = PublicationDocumentV3(
-        schema_version="3",
+    expected = PublicationDocumentV4(
+        schema_version="4",
         subject_id=snapshot.subject_id,
         publication_language="fr",
         title="Exact canonical title",
@@ -965,24 +1413,28 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
         uncertainties=(
             PublicationUncertaintyV1("Attribution remains uncertain.", (source_a_id, source_b_id)),
         ),
+        tables=(),
+        diagrams=(),
+        figures=(),
     )
     assert document == expected
 
     canonical_json = json.dumps(
-        serialize_publication_document(document),
+        publication_document_v4_to_json(document),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     )
-    repeated = build_publication_document_v3(
+    repeated = build_publication_document_v4(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        editorial_enrichment=enrichment,
     )
     assert (
         json.dumps(
-            serialize_publication_document(repeated),
+            publication_document_v4_to_json(repeated),
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
@@ -1004,10 +1456,16 @@ def test_publication_v3_builder_is_exact_deterministic_and_resolves_used_sources
         synthesis,
         extraction_hash=canonical_extraction_hash(missing_extraction),
     )
+    missing_enrichment = replace(
+        enrichment,
+        extraction_hash=canonical_extraction_hash(missing_extraction),
+        synthesis_hash=canonical_synthesis_hash(missing_synthesis),
+    )
     with pytest.raises(ValueError, match="absent from the canonical reference corpus"):
-        build_publication_document_v3(
+        build_publication_document_v4(
             snapshot=snapshot,
             references=missing_references,
             extraction=missing_extraction,
             synthesis=missing_synthesis,
+            editorial_enrichment=missing_enrichment,
         )

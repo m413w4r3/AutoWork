@@ -7,11 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.production_legacy_assembly import LegacyProductionQAService
 from cti_app.application.production_parsers import (
-    ParsedEvent,
-    ParsedSource,
-    ReferenceReport,
     TechnicalExtraction,
 )
 from cti_app.application.production_repairs import (
@@ -32,7 +28,6 @@ from cti_app.domain.production import (
     ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
-    ProductionArtifactStatus,
     ProductionDerivedOutput,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
@@ -223,59 +218,6 @@ def test_lot33_include_then_exclude_projects_exactly_the_last_decision() -> None
     assert len(included.extraction.items) == 1
     assert final.extraction == base
     assert final.excluded_repair_keys == (key,)
-
-
-@pytest.mark.asyncio
-async def test_lot33_qa_accepts_current_artifacts_with_independent_versions() -> None:
-    source_url = "https://source.example/report"
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title="Source",
-                url=source_url,
-                canonical_url=source_url,
-                publisher="Publisher",
-                published_at=None,
-                role=SourceRole.PRIMARY,
-            ),
-        ),
-        events=(
-            ParsedEvent(
-                local_id="E1",
-                event_date=date(2026, 1, 1),
-                source_ids=("S1",),
-                text="The event was reported.",
-            ),
-        ),
-    )
-    extraction = TechnicalExtraction(items=())
-
-    def current(stage: ProductionArtifactStage, version: int) -> ProductionArtifact:
-        return ProductionArtifact(
-            production_run_id=RUN_ID,
-            subject_id=SUBJECT_ID,
-            stage=stage,
-            version=version,
-            input_hash=(f"{version:x}" * 64)[:64],
-            status=ProductionArtifactStatus.VERIFIED,
-        )
-
-    result = await LegacyProductionQAService(lambda: None).run_qa(  # type: ignore[arg-type]
-        run_id=RUN_ID,
-        references_artifact=current(ProductionArtifactStage.REFERENCES, 3),
-        extraction_artifact=current(ProductionArtifactStage.EXTRACTION, 7),
-        synthesis_artifact=current(ProductionArtifactStage.SYNTHESIS, 4),
-        publication_artifact=current(ProductionArtifactStage.PUBLICATION, 8),
-        report=report,
-        extraction=extraction,
-        synthesis_text="Fait [S1]",
-        publication_markdown="Fait",
-        archived_urls={source_url},
-        research_date=date(2026, 1, 2),
-    )
-
-    assert result["passed"] is True
 
 
 def _snapshot() -> ProductionInputSnapshot:

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import inspect
 import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
@@ -33,11 +32,6 @@ from cti_app.application.production_extraction import (
     extraction_compatibility_view,
     is_current_source_checkpoint,
 )
-from cti_app.application.production_legacy_assembly import (
-    LegacyProductionQAService,
-    LegacyPublicationAssemblyService,
-    assembly_synthesis_text,
-)
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
     DisplayPolicy,
@@ -47,7 +41,6 @@ from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2RuleProposal,
     Q2SourceOutput,
-    ReferenceReport,
     TechnicalExtraction,
     reconcile_reference_report_with_archives,
     reference_report_from_json,
@@ -305,47 +298,6 @@ def _publication_item_projection(item: ExtractionItem) -> dict[str, Any]:
     }
 
 
-def publication_projection_payload(
-    report: ReferenceReport,
-    extraction: TechnicalExtraction,
-    synthesis_text: str,
-) -> dict[str, Any]:
-    """Build the functional inputs used by ``build_publication_document``."""
-    items = [_publication_item_projection(item) for item in extraction.items]
-    items.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
-    return {
-        "reference_report": {
-            "sources": [
-                {
-                    "id": source.local_id,
-                    "canonical_url": source.canonical_url,
-                    "title": source.title,
-                    "publisher": source.publisher,
-                    "published_at": (
-                        source.published_at.isoformat() if source.published_at else None
-                    ),
-                }
-                for source in sorted(report.sources, key=lambda source: source.local_id)
-            ],
-            "events": [
-                {
-                    "date": event.event_date.isoformat() if event.event_date else None,
-                    "source_ids": sorted(event.source_ids),
-                    "text": event.text,
-                }
-                for event in report.events
-            ],
-            "uncertainties": sorted(report.uncertainties),
-            "editorial_title": report.editorial_title,
-        },
-        "extraction": {
-            "items": items,
-            "uncertainties": sorted(extraction.uncertainties),
-        },
-        "synthesis_text": synthesis_text,
-    }
-
-
 def rule_bundle_projection_payload(extraction: TechnicalExtraction) -> dict[str, Any]:
     """Build the functional projection of the detection-rule bundle."""
     rules = [
@@ -368,14 +320,6 @@ def rule_bundle_projection_payload(extraction: TechnicalExtraction) -> dict[str,
 
 def _projection_hash(payload: dict[str, Any]) -> str:
     return _sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-
-
-def publication_projection_hash(
-    report: ReferenceReport,
-    extraction: TechnicalExtraction,
-    synthesis_text: str,
-) -> str:
-    return _projection_hash(publication_projection_payload(report, extraction, synthesis_text))
 
 
 def rule_bundle_projection_hash(extraction: TechnicalExtraction) -> str:
@@ -2900,30 +2844,8 @@ class ProductionRepairProjectionService:
             else:
                 hashes["synthesis_artifact_id"] = str(synthesis.id)
 
-        references = await uow.production_artifacts.get_current(
-            run.id, ProductionArtifactStage.REFERENCES.value
-        )
-        if references is None or references.canonical_blob_id is None:
-            return hashes
-        try:
-            # The one compatibility boundary: an AW-010 corpus is projected
-            # through its RAW, an imported legacy artifact is already a report.
-            report = await load_reference_projection(self._artifact_store, references)
-        except Exception:
-            return hashes
-        if report is None or synthesis is None:
-            return hashes
-        try:
-            # The exact text Assembly consumes, never the human preview.
-            synthesis_text = await assembly_synthesis_text(
-                self._artifact_store, report, previous_canonical, synthesis
-            )
-        except Exception:
-            return hashes
-        hashes["previous_publication"] = publication_projection_hash(
-            report, previous, synthesis_text
-        )
-        hashes["new_publication"] = publication_projection_hash(report, projected, synthesis_text)
+        hashes["previous_publication"] = _fallback_publication_projection_hash(previous)
+        hashes["new_publication"] = _fallback_publication_projection_hash(projected)
         return hashes
 
     async def project_effective_extraction(
@@ -3709,8 +3631,6 @@ class ProductionRepairMaterializationService:
         self,
         uow_factory: ProductionUnitOfWorkFactory,
         projection_service: ProductionRepairProjectionService | None = None,
-        publication_assembly_service: LegacyPublicationAssemblyService | None = None,
-        qa_service: LegacyProductionQAService | None = None,
         checkpoint_service: Any | None = None,
         artifact_store: ProductionArtifactStore | None = None,
         diagnostics: DiagnosticsLog | None = None,
@@ -3721,10 +3641,6 @@ class ProductionRepairMaterializationService:
         )
         resolved_store = artifact_store or getattr(self._projection, "_artifact_store", None)
         self._artifact_store = resolved_store
-        # Explicit injected services are kept for historical repair fixtures.
-        # Normal materialization uses the canonical V3 path below.
-        self._assembly = publication_assembly_service
-        self._qa = qa_service
         self._checkpoint = checkpoint_service
         self._diagnostics = diagnostics or DiagnosticsLog(None)
 
@@ -3893,29 +3809,19 @@ class ProductionRepairMaterializationService:
                     reused_synthesis=True,
                 )
             elif impact.kind is ProductionRepairImpactKind.RULE_BUNDLE_ONLY:
-                if self._assembly is None:
-                    # A changed canonical Extraction needs new lineage even
-                    # when only detection rules changed editorially.
-                    try:
-                        publication, qa_result = await self._materialize_publication_in_uow(
-                            uow,
-                            run=run,
-                            extraction=projection.artifact,
-                            repair_materialization=repair_audit,
-                        )
-                    except _EditorialEnrichmentRebuildRequired as exc:
-                        enrichment_rebuild = exc
-                    else:
-                        repair_audit["result_publication_artifact_id"] = str(publication.id)
-                else:
-                    await self._mark_stages_stale(
+                # A changed canonical Extraction needs new lineage even when
+                # only detection rules changed editorially.
+                try:
+                    publication, qa_result = await self._materialize_publication_in_uow(
                         uow,
-                        run.id,
-                        {ProductionArtifactStage.EDITORIAL_ENRICHMENT.value},
+                        run=run,
+                        extraction=projection.artifact,
+                        repair_materialization=repair_audit,
                     )
-                    qa_result = await self._qa_current_outputs_in_uow(
-                        uow, run=run, extraction=projection.artifact
-                    )
+                except _EditorialEnrichmentRebuildRequired as exc:
+                    enrichment_rebuild = exc
+                else:
+                    repair_audit["result_publication_artifact_id"] = str(publication.id)
             else:
                 await self._mark_stages_stale(
                     uow,
@@ -4155,70 +4061,12 @@ class ProductionRepairMaterializationService:
         one change: an Assembly or QA failure raises, the caller never
         commits, and the article stays exactly as it was before the repair.
         """
-        if self._assembly is None:
-            return await self._materialize_canonical_publication_in_uow(
-                uow,
-                run=run,
-                extraction=extraction,
-                repair_materialization=repair_materialization,
-            )
-        run_id = run.id
-        references = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.REFERENCES.value
-        )
-        # PUBLICATION_ONLY deliberately reuses the current Synthesis: its
-        # functional projection is unchanged, so no model call is owed.
-        synthesis = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.SYNTHESIS.value
-        )
-        if references is None or synthesis is None:
-            raise ProductionRepairProjectionError("publication_inputs_missing")
-        await self._mark_stages_stale(
+        return await self._materialize_canonical_publication_in_uow(
             uow,
-            run_id,
-            {
-                ProductionArtifactStage.EDITORIAL_ENRICHMENT.value,
-                ProductionArtifactStage.PUBLICATION.value,
-            },
+            run=run,
+            extraction=extraction,
+            repair_materialization=repair_materialization,
         )
-        title = await self._subject_title(uow, run_id, run.subject_id)
-        assembly_kwargs: dict[str, Any] = (
-            {"metadata_extra": {"repair_materialization": dict(repair_materialization)}}
-            if repair_materialization is not None
-            else {}
-        )
-        try:
-            parameters: Mapping[str, inspect.Parameter]
-            parameters = inspect.signature(self._assembly.assemble_publication_in_uow).parameters
-        except (TypeError, ValueError):
-            parameters = {}
-        accepts_metadata = "metadata_extra" in parameters or any(
-            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
-        )
-        if not accepts_metadata:
-            assembly_kwargs = {}
-        new_publication = await self._assembly.assemble_publication_in_uow(
-            uow,
-            run_id,
-            run.subject_id,
-            title,
-            references,
-            extraction,
-            synthesis,
-            **assembly_kwargs,
-        )
-        qa_result = await self._run_qa(
-            uow,
-            run_id,
-            references,
-            extraction,
-            synthesis,
-            new_publication,
-            run.subject_id,
-            run,
-        )
-        await self._ensure_qa_passed(qa_result)
-        return new_publication, qa_result
 
     async def _materialize_canonical_publication_in_uow(
         self,
@@ -4228,7 +4076,7 @@ class ProductionRepairMaterializationService:
         extraction: ProductionArtifact,
         repair_materialization: Mapping[str, Any] | None,
     ) -> tuple[ProductionArtifact, dict[str, Any]]:
-        """Rebind unchanged narrative to IOC repairs, then assemble V3 atomically."""
+        """Rebind unchanged narrative to IOC repairs, then assemble V4 atomically."""
         store = self._artifact_store
         if store is None or extraction.canonical_blob_id is None:
             raise ProductionRepairProjectionError("assembly_inputs_missing")
@@ -4368,6 +4216,7 @@ class ProductionRepairMaterializationService:
                 references=references,
                 extraction=canonical_extraction,
                 synthesis=synthesis,
+                editorial_enrichment=editorial_enrichment,
                 publication=document,
             )
             await self._ensure_qa_passed(qa_result)
@@ -4504,103 +4353,12 @@ class ProductionRepairMaterializationService:
         await uow.production_artifacts.append(artifact)
         return enrichment, artifact
 
-    async def _qa_current_outputs_in_uow(
-        self,
-        uow: Any,
-        *,
-        run: Any,
-        extraction: ProductionArtifact,
-    ) -> dict[str, Any] | None:
-        """QA the repaired Extraction against the outputs that stay current."""
-        run_id = run.id
-        references = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.REFERENCES.value
-        )
-        synthesis = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.SYNTHESIS.value
-        )
-        publication = await uow.production_artifacts.get_current(
-            run_id, ProductionArtifactStage.PUBLICATION.value
-        )
-        if references is None or synthesis is None or publication is None:
-            raise ProductionRepairProjectionError("qa_inputs_missing")
-        qa_result = await self._run_qa(
-            uow,
-            run_id,
-            references,
-            extraction,
-            synthesis,
-            publication,
-            run.subject_id,
-            run,
-        )
-        await self._ensure_qa_passed(qa_result)
-        return qa_result
-
     @staticmethod
     async def _mark_stages_stale(uow: Any, run_id: UUID, stages: set[str]) -> list[str]:
         marker = getattr(uow.production_artifacts, "mark_stages_stale", None)
         if not callable(marker):
             raise ProductionRepairProjectionError("production_artifact_stale_port_unavailable")
         return cast(list[str], await marker(run_id, stages))
-
-    async def _subject_title(self, uow: Any, run_id: UUID, subject_id: UUID) -> str:
-        snapshots = getattr(uow, "production_input_snapshots", None)
-        if snapshots is not None and callable(getattr(snapshots, "get_by_run", None)):
-            snapshot = await snapshots.get_by_run(run_id)
-            title = getattr(snapshot, "subject_title", None) if snapshot is not None else None
-            if isinstance(title, str) and title:
-                return title
-        return str(subject_id)
-
-    async def _run_qa(
-        self,
-        uow: Any,
-        run_id: UUID,
-        references: ProductionArtifact,
-        extraction: ProductionArtifact,
-        synthesis: ProductionArtifact,
-        publication: ProductionArtifact,
-        subject_id: UUID,
-        run: Any,
-    ) -> dict[str, Any]:
-        if self._artifact_store is None:
-            return {"passed": True, "checks": {}, "errors": [], "warnings": []}
-        if self._assembly is None or self._qa is None:
-            raise ProductionRepairProjectionError("publication_qa_inputs_missing")
-        report, extraction_value, synthesis_text = await self._assembly._load_inputs(
-            references, extraction, synthesis
-        )
-        publication_markdown = ""
-        if publication.rendered_blob_id is not None:
-            publication_markdown = await self._artifact_store.read_text(
-                publication.rendered_blob_id
-            )
-        collections = getattr(uow, "source_collections", None)
-        archived_urls = {
-            collection.canonical_url
-            for collection in (
-                await collections.list_for_subject(subject_id)
-                if collections is not None
-                and callable(getattr(collections, "list_for_subject", None))
-                else ()
-            )
-            if _enum_value(getattr(collection, "state", None))
-            in {"archived", "extracted", "completed"}
-        }
-        return await self._qa.run_qa(
-            run_id=run_id,
-            references_artifact=references,
-            extraction_artifact=extraction,
-            synthesis_artifact=synthesis,
-            publication_artifact=publication,
-            report=report,
-            extraction=extraction_value,
-            synthesis_text=synthesis_text,
-            publication_markdown=publication_markdown,
-            archived_urls=archived_urls,
-            research_date=getattr(run, "research_date", None),
-        )
 
     @staticmethod
     async def _ensure_qa_passed(qa_result: dict[str, Any]) -> None:

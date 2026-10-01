@@ -11,6 +11,11 @@ from cti_app.domain.blobs import utc_now
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
+# Media types accepted by the renderer-independent publication contract.
+SUPPORTED_MEDIA_MIME_TYPES = frozenset(
+    {"image/png", "image/jpeg", "image/svg+xml", "image/webp", "image/gif"}
+)
+
 
 class MediaAssetKind(StrEnum):
     DIAGRAM_SVG = "diagram_svg"

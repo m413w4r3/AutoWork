@@ -25,11 +25,14 @@ SYNTHESIS → ProductionSynthesisV1
   ↓
 EDITORIAL_ENRICHMENT → EditorialEnrichmentV1
   ↓
-ASSEMBLY → PublicationDocumentV3
+ASSEMBLY → PublicationDocumentV4
+        ↓
+future frontière RENDER
 ```
 
-`ASSEMBLY` écrit `PublicationDocumentV3` dans l'artifact `PUBLICATION`. La QA canonique passée,
-le run devient `READY`.
+`ASSEMBLY` écrit `PublicationDocumentV4` dans l'artifact `PUBLICATION`. `ASSEMBLY` ne compile aucun
+média et ne rend aucun document ; la frontière `RENDER` future consomme `PublicationDocumentV4`
+sans relire Synthesis ni Editorial Enrichment. La QA canonique passée, le run devient `READY`.
 
 ## Modèle
 
@@ -213,7 +216,7 @@ EDITORIAL_ENRICHMENT produit EditorialEnrichmentV1
         ↓
 ASSEMBLY lit aussi ProductionReferenceCorpusV1
         ↓
-PublicationDocumentV3 → QA canonique → READY
+PublicationDocumentV4 → QA canonique → READY
 ```
 
 `ProductionExtractionV1` est l’unique vérité factuelle de Synthesis. Le stage construit un pack
@@ -290,27 +293,33 @@ dans l’ordre canonique, labels en chaînes D2 entre guillemets doubles avec é
 `--omit-version`, `--stdout-format=svg`, salt dérivé du hash sémantique du diagramme), source sur
 stdin, SVG sur stdout, 10 s et 2 MiB au plus. Le SVG n’est accepté qu’après validation : XML
 analysable, racine `svg`, ni `script` ni `foreignObject`, références limitées aux fragments `#id`
-et aux polices `data:` embarquées par D2. La policy `diagram-d2-svg-v1` est distincte de la version
+et aux polices `data:` embarquées par D2. La policy `diagram-d2-svg-v2` est distincte de la version
 du binaire et évolue avec tout changement volontaire des bytes produits.
 
 Le stage `EDITORIAL_ENRICHMENT` compile les diagrammes et persiste les SVG avec les médias gérés par
 `MediaAssetStore`. `SourceFigureInventory` inventorie les figures locales ; `SourceFigureIngestor`
-valide et archive celles retenues. L’assemblage ne les projette pas encore dans
-`PublicationDocumentV3` : cette évolution relève d’AW-018. La compilation D2 ne remplace pas le
-renderer documentaire actuel.
+valide et archive celles retenues. Assembly projette les tables, les diagrammes déjà compilés
+(`compiled_asset_id` → `asset_id`) et les figures `INCLUDED` résolues dans `PublicationDocumentV4`.
+Les figures `PROPOSED` ou `EXCLUDED` n’y figurent jamais : Assembly ne décide rien éditorialement,
+ne compile aucun diagramme, ne télécharge aucune image et n’appelle aucun modèle. La compilation D2
+ne remplace pas le renderer documentaire actuel.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
-l’enrichissement avant de construire `PublicationDocumentV3`. Le titre, le lead, les sections, la
+l’enrichissement avant de construire `PublicationDocumentV4`. Le titre, le lead, les sections, la
 chronologie et les incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction.
 Les sources sont résolues par `source_document_id`. Le hash d’Assembly dépend des cinq entrées canoniques, de
-la version de document et de la policy, sans version de renderer. AW-015 inclut le hash de
-l’enrichissement dans l’identité d’Assembly sans changer le corps de `PublicationDocumentV3`.
-QA recalcule la projection canonique et compare le document exact. L'artifact `PUBLICATION`
-conserve le document canonique, sans rendu.
+la version de document (`4`) et de la policy (`2`), sans version de renderer, D2, Pandoc ni Typst :
+les mêmes entrées ne réutilisent donc jamais un ancien artifact d’une autre version. Le hash de l’enrichissement
+fait partie de l’identité d’Assembly depuis AW-015.
+`PublicationDocumentV4.sources` couvre exactement les sources utilisées, enrichissement compris.
+QA recalcule la projection V4 depuis les cinq entrées canoniques et compare le document exact.
+L'artifact `PUBLICATION` conserve le document canonique, sans rendu, sans source D2, sans SVG
+en ligne et sans Typst. Pandoc reste limité à la narration ; il ne rend ni tables, ni diagrammes,
+ni figures.
 
 AW-016 produit des propositions structurées. AW-017a, AW-017b et AW-017c fournissent la compilation
-des diagrammes, l’inventaire des figures et la persistance des médias. AW-018 reste nécessaire pour
-projeter l’enrichissement et les médias dans `PublicationDocumentV4`.
+des diagrammes, l’inventaire des figures et la persistance des médias. AW-018 projette
+l’enrichissement et les médias dans `PublicationDocumentV4`.
 
 ## ProductionBoard
 

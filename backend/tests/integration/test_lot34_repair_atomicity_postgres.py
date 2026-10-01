@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import itertools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from time import monotonic
@@ -25,14 +25,8 @@ from cti_app.application.edition_publication import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_legacy_assembly import LegacyPublicationAssemblyService
-from cti_app.application.production_parsers import (
-    ParsedSource,
-    ReferenceReport,
-    TechnicalExtraction,
-    reference_report_to_json,
-    technical_extraction_to_json,
-)
+from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionService,
@@ -40,8 +34,9 @@ from cti_app.application.production_repairs import (
     build_repair_evidence_pack,
     repair_key_for_rejection,
 )
+from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.domain.classification import TLP
-from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
@@ -57,7 +52,12 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
+from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_synthesis import production_synthesis_to_json
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.test_publication_builder_v4 import _canonical_inputs
 
 pytestmark = pytest.mark.integration
 
@@ -68,29 +68,12 @@ SOURCE_URL = "https://source.example/lot34-report"
 REJECTED_DOMAIN = "lot34-repaired.com"
 
 
-class _PassingQA:
-    """QA content is out of scope here; the transaction boundary is not."""
-
-    def __init__(self, passed: bool = True) -> None:
-        self.passed = passed
-        self.calls = 0
-
-    async def run_qa(self, **_kwargs: object) -> dict[str, object]:
-        self.calls += 1
-        return {
-            "passed": self.passed,
-            "checks": {},
-            "errors": [] if self.passed else ["lot34_forced_qa_failure"],
-            "warnings": [],
-        }
-
-
-class _PausingAssembly:
-    """Real assembly, held open exactly where LOT 33 committed too early."""
+class _PausingStore:
+    """Pause canonical blob persistence while the repair holds its locks."""
 
     def __init__(
         self,
-        inner: LegacyPublicationAssemblyService,
+        inner: ProductionArtifactStore,
         *,
         reached: asyncio.Event,
         release: asyncio.Event,
@@ -101,15 +84,15 @@ class _PausingAssembly:
         self.release = release
         self.error = error
 
-    async def _load_inputs(self, *args: Any) -> Any:
-        return await self._inner._load_inputs(*args)
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
 
-    async def assemble_publication_in_uow(self, *args: Any, **kwargs: Any) -> Any:
+    async def store_stage_payloads(self, *args: Any, **kwargs: Any) -> Any:
         self.reached.set()
         await self.release.wait()
         if self.error is not None:
             raise self.error
-        return await self._inner.assemble_publication_in_uow(*args, **kwargs)
+        return await self._inner.store_stage_payloads(*args, **kwargs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,23 +107,6 @@ class _Fixture:
     synthesis: ProductionArtifact
     publication: ProductionArtifact
     repair_key: str
-
-
-def _report() -> ReferenceReport:
-    return ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title="LOT 34 report",
-                url=SOURCE_URL,
-                canonical_url=SOURCE_URL,
-                publisher="Example",
-                published_at=None,
-                role=SourceRole.PRIMARY,
-            ),
-        ),
-        events=(),
-    )
 
 
 def _evidence_entry() -> dict[str, Any]:
@@ -192,17 +158,52 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         position=1,
     )
 
+    base_snapshot, base_references, base_extraction, base_synthesis = _canonical_inputs()
+    snapshot = replace(
+        base_snapshot,
+        production_run_id=run.id,
+        edition_id=edition.id,
+        subject_id=subject.id,
+        subject_title=subject.title,
+    )
+    reference_source = replace(base_references.sources[0], canonical_url=SOURCE_URL)
+    references_value = replace(
+        base_references,
+        subject_id=subject.id,
+        production_input_hash=snapshot.input_hash,
+        sources=(reference_source,),
+    )
+    extraction_source = replace(base_extraction.sources[0], canonical_url=SOURCE_URL)
+    extraction_value = replace(
+        base_extraction,
+        subject_id=subject.id,
+        production_input_hash=snapshot.input_hash,
+        references_corpus_hash=references_corpus_hash(references_value),
+        sources=(extraction_source,),
+    )
+    synthesis_value = replace(
+        base_synthesis,
+        subject_id=subject.id,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction_value),
+        title=subject.title,
+    )
+    enrichment_value = build_empty_editorial_enrichment(
+        extraction=extraction_value, synthesis=synthesis_value
+    )
     entry = _evidence_entry()
     evidence_id = await store.put_repair_evidence(build_repair_evidence_pack([entry]))
-    references_blob = await store.put_json(
-        reference_report_to_json(_report()), bucket="production-artifacts-canonical"
+    _, references_blob, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(references_value)
     )
-    extraction_blob = await store.put_json(
-        technical_extraction_to_json(TechnicalExtraction(items=(), rules=())),
-        bucket="production-artifacts-canonical",
+    _, extraction_blob, _ = await store.store_stage_payloads(
+        canonical=production_extraction_to_json(extraction_value)
     )
-    synthesis_blob = await store.put_text(
-        "Synthèse LOT 34.", bucket="production-artifacts-rendered"
+    _, synthesis_blob, _ = await store.store_stage_payloads(
+        canonical=production_synthesis_to_json(synthesis_value)
+    )
+    _, enrichment_blob, _ = await store.store_stage_payloads(
+        canonical=editorial_enrichment_to_json(enrichment_value)
     )
 
     references = ProductionArtifact(
@@ -252,7 +253,16 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         version=1,
         input_hash="3" * 64,
         status=ProductionArtifactStatus.VERIFIED,
-        rendered_blob_id=synthesis_blob,
+        canonical_blob_id=synthesis_blob,
+    )
+    enrichment = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=subject.id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash="4" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=enrichment_blob,
     )
 
     async with uow_factory() as uow:
@@ -260,22 +270,26 @@ async def _seed(uow_factory: UnitOfWorkFactory, tmp_path: Path) -> _Fixture:
         await uow.subjects.add(subject)
         await uow.edition_production_batches.add(batch)
         await uow.production_runs.add(run)
+        await uow.production_input_snapshots.add(snapshot)
         await uow.production_artifacts.append(references)
         await uow.production_artifacts.append(extraction)
         await uow.production_artifacts.append(synthesis)
+        await uow.production_artifacts.append(enrichment)
         await uow.edition_production_batch_items.append_many((item,))
         await uow.commit()
 
-    # The first document is built by the real assembly, so it carries the same
-    # ``input_artifacts`` proof a production run would record.
-    publication = await LegacyPublicationAssemblyService(uow_factory, store).assemble_publication(
-        run.id,
-        subject.id,
-        "LOT 34",
-        references,
-        extraction,
-        synthesis,
-    )
+    async with uow_factory() as uow:
+        publication = await PublicationAssemblyService(
+            store, uow.production_artifacts
+        ).assemble_publication(
+            run=run,
+            snapshot=snapshot,
+            references=references_value,
+            extraction=extraction_value,
+            synthesis=synthesis_value,
+            editorial_enrichment=enrichment_value,
+        )
+        await uow.commit()
 
     repair_key = repair_key_for_rejection(
         edition_id=edition.id,
@@ -319,18 +333,13 @@ def _service(
     uow_factory: UnitOfWorkFactory,
     fixture: _Fixture,
     *,
-    assembly: Any = None,
-    qa: Any = None,
+    artifact_store: Any = None,
 ) -> ProductionRepairMaterializationService:
     return ProductionRepairMaterializationService(
         uow_factory,
         projection_service=ProductionRepairProjectionService(uow_factory, fixture.store),
-        publication_assembly_service=(
-            assembly or LegacyPublicationAssemblyService(uow_factory, fixture.store)
-        ),
-        qa_service=qa or _PassingQA(),
         checkpoint_service=None,
-        artifact_store=fixture.store,
+        artifact_store=artifact_store or fixture.store,
     )
 
 
@@ -364,12 +373,11 @@ async def test_repair_materialization_is_one_commit_with_the_new_publication(
     assert extraction is not None and extraction.version == 2
     assert publication is not None and publication.id == result.publication_artifact.id
     assert publication.version == 2
-    # The Synthesis is deliberately reused: no Q4 is replayed.
-    assert synthesis is not None and synthesis.id == fixture.synthesis.id
+    assert synthesis is not None and synthesis.id != fixture.synthesis.id
     assert publication.metadata["input_artifacts"] == {
         "references_artifact_id": str(fixture.references.id),
         "extraction_artifact_id": str(extraction.id),
-        "synthesis_artifact_id": str(fixture.synthesis.id),
+        "synthesis_artifact_id": str(synthesis.id),
     }
     async with uow_factory() as uow:
         rows = await uow.production_artifacts.list_for_run(fixture.run.id)
@@ -387,12 +395,12 @@ async def test_concurrent_accept_can_only_freeze_the_repaired_publication(
     fixture = await _seed(uow_factory, tmp_path)
     reached = asyncio.Event()
     release = asyncio.Event()
-    assembly = _PausingAssembly(
-        LegacyPublicationAssemblyService(uow_factory, fixture.store),
+    pausing_store = _PausingStore(
+        fixture.store,
         reached=reached,
         release=release,
     )
-    service = _service(uow_factory, fixture, assembly=assembly)
+    service = _service(uow_factory, fixture, artifact_store=pausing_store)
     publication_service = EditionPublicationService(uow_factory, fixture.store)
 
     async def materialize() -> Any:
@@ -437,13 +445,13 @@ async def test_a_failed_repair_leaves_the_pre_repair_article_freezable(
     fixture = await _seed(uow_factory, tmp_path)
     reached = asyncio.Event()
     release = asyncio.Event()
-    assembly = _PausingAssembly(
-        LegacyPublicationAssemblyService(uow_factory, fixture.store),
+    pausing_store = _PausingStore(
+        fixture.store,
         reached=reached,
         release=release,
         error=RuntimeError("assembly exploded"),
     )
-    service = _service(uow_factory, fixture, assembly=assembly)
+    service = _service(uow_factory, fixture, artifact_store=pausing_store)
     publication_service = EditionPublicationService(uow_factory, fixture.store)
 
     async def materialize() -> None:
@@ -476,15 +484,22 @@ async def test_a_failed_repair_leaves_the_pre_repair_article_freezable(
     assert accepted.manifest.entries[0].document_artifact_id == fixture.publication.id
     async with uow_factory() as uow:
         rows = await uow.production_artifacts.list_for_run(fixture.run.id)
-    assert len(rows) == 4
+    assert len(rows) == 5
 
 
 @pytest.mark.asyncio
 async def test_a_failed_qa_rolls_the_whole_repair_back(
-    uow_factory: UnitOfWorkFactory, tmp_path: Path
+    uow_factory: UnitOfWorkFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     fixture = await _seed(uow_factory, tmp_path)
-    service = _service(uow_factory, fixture, qa=_PassingQA(passed=False))
+    service = _service(uow_factory, fixture)
+
+    async def failed_qa(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"passed": False, "checks": {}, "errors": ["forced"], "warnings": []}
+
+    monkeypatch.setattr(
+        "cti_app.application.production_repairs.ProductionQAService.run_qa", failed_qa
+    )
 
     with pytest.raises(Exception, match="production_repair_qa_failed"):
         await service.apply(
@@ -497,7 +512,7 @@ async def test_a_failed_qa_rolls_the_whole_repair_back(
 
     async with uow_factory() as uow:
         rows = await uow.production_artifacts.list_for_run(fixture.run.id)
-    assert len(rows) == 4
+    assert len(rows) == 5
     assert all(row.status is ProductionArtifactStatus.VERIFIED for row in rows)
 
 
@@ -557,4 +572,4 @@ async def test_a_concurrent_retry_makes_the_plan_stale_without_writing(
 
     async with uow_factory() as uow:
         rows = await uow.production_artifacts.list_for_run(fixture.run.id)
-    assert len(rows) == 4
+    assert len(rows) == 5

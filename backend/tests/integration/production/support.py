@@ -156,7 +156,11 @@ class _CatalogModelOutputStore:
 
 
 class _DeterministicDiagramCompiler:
+    def __init__(self) -> None:
+        self.calls = 0
+
     async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+        self.calls += 1
         source_bytes = f"test-diagram:{diagram.key}".encode()
         media_bytes = (
             f'<svg xmlns="http://www.w3.org/2000/svg"><text>{diagram.key}</text></svg>'
@@ -497,6 +501,7 @@ class ProductionScenario:
     artifact_store: ProductionArtifactStore = field(init=False)
     model_output_store: _CatalogModelOutputStore = field(init=False)
     model: ScriptedModelGateway = field(init=False)
+    diagram_compiler: _DeterministicDiagramCompiler = field(init=False)
     diagnostics: DiagnosticsLog = field(init=False)
     collection_transport: DeterministicSourceTransport = field(init=False)
     collection_service: SubjectCollectionService = field(init=False)
@@ -591,6 +596,7 @@ class ProductionScenario:
             self.model_output_store,
             diagnostics=self.diagnostics,
         )
+        self.diagram_compiler = _DeterministicDiagramCompiler()
         self.model.script.bind_sources(canonical_sources)
         allowed_domains = frozenset(urlsplit(url).hostname or "" for url in canonical_sources)
         policy = CollectionPolicy(allowed_domains=allowed_domains)
@@ -620,7 +626,7 @@ class ProductionScenario:
             artifact_store=self.artifact_store,
             diagnostics=self.diagnostics,
             pacing=ProductionPacingPolicy.zero(),
-            diagram_compiler=_DeterministicDiagramCompiler(),
+            diagram_compiler=self.diagram_compiler,
         )
 
     def restrict_core_sources(self, canonical_urls: Sequence[str]) -> None:

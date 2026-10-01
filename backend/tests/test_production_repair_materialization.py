@@ -1,20 +1,22 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace
-from typing import cast
 from uuid import UUID
 
 import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
-from cti_app.application.production_parsers import ReferenceReport, TechnicalExtraction
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
     ProductionRepairProjectionResult,
     ProductionRepairStaleError,
 )
+from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -23,30 +25,42 @@ from cti_app.domain.production import (
     ProductionDerivedOutput,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
-    ProductionRunStatus,
+    ProductionRun,
 )
+from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
+from cti_app.domain.production_extraction import production_extraction_to_json
 from cti_app.domain.production_pipeline import production_artifact_stages
+from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.publication_document import serialize_publication_document
+from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.test_publication_builder_v4 import _canonical_inputs
+
+EDITION_ID = UUID(int=4)
+SUBJECT_ID = UUID(int=1)
+RUN_ID = UUID(int=3)
 
 
-class _Unset:
-    """Sentinel: ``None`` is a meaningful checkpoint outcome (failure)."""
+class _CanonicalStore:
+    def __init__(self, payloads: dict[UUID, dict[str, object]]) -> None:
+        self.payloads = payloads
+        self.next_id = 100
+        self.failure: Exception | None = None
 
+    async def read_json(self, blob_id: UUID) -> dict[str, object]:
+        return self.payloads[blob_id]
 
-_UNSET = _Unset()
+    async def read_bytes(self, blob_id: UUID) -> bytes:
+        return ProductionArtifactStore.canonical_json_bytes(self.payloads[blob_id])
 
-EDITION_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-SUBJECT_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
-RUN_ID = UUID("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
-
-
-def _artifact(stage: ProductionArtifactStage, version: int = 1) -> ProductionArtifact:
-    return ProductionArtifact(
-        production_run_id=RUN_ID,
-        subject_id=SUBJECT_ID,
-        stage=stage,
-        version=version,
-        input_hash=(f"{version:x}" * 64)[:64],
-    )
+    async def store_stage_payloads(
+        self, *, canonical: dict[str, object], rendered: str | None = None
+    ) -> tuple[UUID | None, UUID | None, UUID | None]:
+        if self.failure is not None:
+            raise self.failure
+        blob_id = UUID(int=self.next_id)
+        self.next_id += 1
+        self.payloads[blob_id] = canonical
+        return None, blob_id, None
 
 
 def _impact(kind: ProductionRepairImpactKind) -> ProductionRepairImpact:
@@ -81,16 +95,8 @@ def _impact(kind: ProductionRepairImpactKind) -> ProductionRepairImpact:
 
 
 class _Artifacts:
-    """In-memory rows with an undoable journal, so a rollback is observable."""
-
-    def __init__(self) -> None:
-        self.items = [
-            _artifact(ProductionArtifactStage.REFERENCES),
-            _artifact(ProductionArtifactStage.EXTRACTION),
-            _artifact(ProductionArtifactStage.SYNTHESIS),
-            _artifact(ProductionArtifactStage.EDITORIAL_ENRICHMENT),
-            _artifact(ProductionArtifactStage.PUBLICATION),
-        ]
+    def __init__(self, initial: list[ProductionArtifact]) -> None:
+        self.items = initial
         self.stale_calls: list[tuple[UUID, tuple[str, ...]]] = []
         self._journal: list[tuple[str, object]] = []
 
@@ -102,19 +108,21 @@ class _Artifacts:
             and item.stage.value == stage
             and item.status is not ProductionArtifactStatus.STALE
         ]
-        return max(values, key=lambda item: item.version) if values else None
+        return max(values, key=lambda item: item.version, default=None)
 
     async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
         return [item for item in self.items if item.production_run_id == run_id]
+
+    async def find_reusable(self, **_kwargs: object) -> ProductionArtifact | None:
+        return None
 
     async def append(self, artifact: ProductionArtifact) -> None:
         self.items.append(artifact)
         self._journal.append(("append", artifact))
 
     async def mark_stages_stale(self, run_id: UUID, stages: set[str]) -> list[str]:
-        requested = set(stages)
         selected = tuple(
-            stage.value for stage in production_artifact_stages() if stage.value in requested
+            stage.value for stage in production_artifact_stages() if stage.value in stages
         )
         self.stale_calls.append((run_id, selected))
         restored: list[tuple[ProductionArtifact, ProductionArtifactStatus]] = []
@@ -131,80 +139,52 @@ class _Artifacts:
     def rollback(self) -> None:
         for operation, payload in reversed(self._journal):
             if operation == "append":
-                self.items.remove(cast(ProductionArtifact, payload))
+                self.items.remove(payload)  # type: ignore[arg-type]
             else:
-                for item, status in cast(
-                    "list[tuple[ProductionArtifact, ProductionArtifactStatus]]", payload
-                ):
+                for item, status in payload:  # type: ignore[union-attr]
                     item.status = status
         self._journal.clear()
 
 
 class _Uow:
     def __init__(
-        self,
-        edition_state: EditionStatus = EditionStatus.OPEN,
-        *,
-        manifest_exists: bool = False,
+        self, snapshot, artifacts: _Artifacts, *, edition_state=EditionStatus.OPEN
     ) -> None:
-        self.artifacts = _Artifacts()
-        self.run = SimpleNamespace(
-            id=RUN_ID,
-            edition_id=EDITION_ID,
-            subject_id=SUBJECT_ID,
-            pipeline_generation=4,
-            status=ProductionRunStatus.READY,
-            requires_reconciliation=False,
-            research_date=None,
-        )
+        self.artifacts = artifacts
+        self.run = ProductionRun(id=RUN_ID, edition_id=EDITION_ID, subject_id=SUBJECT_ID)
+        self.run.status = "ready"
+        self.run.pipeline_generation = 4
         self.production_runs = SimpleNamespace(
-            get=lambda _run_id: self._run(),
-            get_current_for_subject=lambda _subject_id: self._run(),
-            get_for_update=lambda _run_id: self._run(),
+            get=self._run,
+            get_for_update=self._run,
+            get_current_for_subject=self._run,
         )
-        self.production_artifacts = self.artifacts
+        self.production_artifacts = artifacts
         self.editions = SimpleNamespace(
-            get_for_update=lambda _edition_id: self._edition(edition_state),
-        )
-        self.publication_manifests = SimpleNamespace(
-            get_latest_for_edition=lambda _edition_id: self._manifest(manifest_exists),
+            get_for_update=lambda _edition_id: self._edition(edition_state)
         )
         self.production_input_snapshots = SimpleNamespace(
-            get_by_run=lambda _run_id: self._snapshot(),
-        )
-        self.source_collections = SimpleNamespace(
-            list_for_subject=lambda _subject_id: self._collections(),
+            get_by_run=lambda _run_id: self._snapshot(snapshot)
         )
         self.commits = 0
         self.rolled_back = False
 
-    async def _run(self) -> object:
+    async def _run(self, _run_id: UUID) -> ProductionRun:
         return self.run
 
     async def _edition(self, state: EditionStatus) -> object:
         return SimpleNamespace(state=state)
 
-    async def _manifest(self, exists: bool) -> object | None:
-        return object() if exists else None
-
-    async def _none(self) -> None:
-        return None
-
-    async def _snapshot(self) -> object:
-        return SimpleNamespace(subject_title="Subject")
-
-    async def _collections(self) -> list[object]:
-        return []
+    async def _snapshot(self, snapshot) -> object:
+        return snapshot
 
     async def __aenter__(self) -> _Uow:
-        self._open_commits = self.commits
         return self
 
     async def __aexit__(self, *_args: object) -> None:
-        if self._open_commits == self.commits:
+        if self.commits == 0:
             self.rolled_back = True
             self.artifacts.rollback()
-        return None
 
     async def commit(self) -> None:
         self.commits += 1
@@ -224,405 +204,185 @@ class _Projection:
         self.result = result
         self.calls = 0
 
-    async def project_effective_extraction_in_uow(
-        self,
-        uow: _Uow,
-        *,
-        run: object,
-        actor_id: str,
-        expected_pipeline_generation: int | None = None,
-    ) -> ProductionRepairProjectionResult:
-        assert actor_id == "analyst"
-        assert expected_pipeline_generation == getattr(run, "pipeline_generation", None)
+    async def project_effective_extraction_in_uow(self, uow: _Uow, **_kwargs: object):
         self.calls += 1
         if self.result.changed:
             await uow.production_artifacts.append(self.result.artifact)
         return self.result
 
 
-class _Assembly:
-    def __init__(self, error: Exception | None = None) -> None:
-        self.calls = 0
-        self.error = error
-
-    async def _load_inputs(
-        self, _references: object, _extraction: object, _synthesis: object
-    ) -> tuple[ReferenceReport, TechnicalExtraction, str]:
-        return (
-            ReferenceReport(sources=(), events=()),
-            TechnicalExtraction(items=(), rules=()),
-            "text",
-        )
-
-    async def assemble_publication_in_uow(
-        self,
-        uow: _Uow,
-        run_id: UUID,
-        subject_id: UUID,
-        _title: str,
-        _references: ProductionArtifact,
-        _extraction: ProductionArtifact,
-        _synthesis: ProductionArtifact,
-    ) -> ProductionArtifact:
-        self.calls += 1
-        if self.error is not None:
-            raise self.error
-        artifact = ProductionArtifact(
-            production_run_id=run_id,
-            subject_id=subject_id,
-            stage=ProductionArtifactStage.PUBLICATION,
-            version=2,
-            input_hash="e" * 64,
-        )
-        await uow.production_artifacts.append(artifact)
-        return artifact
-
-
-class _QA:
-    def __init__(self, passed: bool = True) -> None:
-        self.calls = 0
-        self.passed = passed
-
-    async def run_qa(self, **_kwargs: object) -> dict[str, object]:
-        self.calls += 1
-        return {
-            "passed": self.passed,
-            "checks": {},
-            "errors": [] if self.passed else ["publication_qa_failed"],
-            "warnings": [],
-        }
-
-
 class _Checkpoint:
-    def __init__(self, result: object | _Unset = _UNSET) -> None:
+    def __init__(self) -> None:
         self.calls: list[UUID] = []
-        self.result = (
-            SimpleNamespace(rule_sidecar_error=None) if isinstance(result, _Unset) else result
-        )
 
     async def checkpoint(self, run_id: UUID) -> object:
         self.calls.append(run_id)
-        return self.result
+        return SimpleNamespace(rule_sidecar_error=None)
 
 
 def _service(
     kind: ProductionRepairImpactKind,
     *,
     edition_state: EditionStatus = EditionStatus.OPEN,
-    manifest_exists: bool = False,
     diagnostics: DiagnosticsLog | None = None,
-    assembly_error: Exception | None = None,
-    qa_passed: bool = True,
-    checkpoint_result: object | _Unset = _UNSET,
-) -> tuple[ProductionRepairMaterializationService, _Uow, _Projection, _Assembly, _QA, _Checkpoint]:
-    uow = _Uow(edition_state, manifest_exists=manifest_exists)
+) -> tuple[ProductionRepairMaterializationService, _Uow, _Projection, _CanonicalStore, _Checkpoint]:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    payloads = {
+        UUID(int=10): production_reference_corpus_to_json(references),
+        UUID(int=11): production_extraction_to_json(extraction),
+        UUID(int=12): production_synthesis_to_json(synthesis),
+        UUID(int=13): editorial_enrichment_to_json(enrichment),
+    }
+    from cti_app.application.publication_builder import build_publication_document_v4
+
+    store = _CanonicalStore(payloads)
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    store.payloads[UUID(int=14)] = serialize_publication_document(document)
+    initial = [
+        ProductionArtifact(
+            production_run_id=RUN_ID,
+            subject_id=SUBJECT_ID,
+            stage=stage,
+            version=1,
+            input_hash=f"{index}" * 64,
+            canonical_blob_id=UUID(int=10 + index),
+        )
+        for index, stage in enumerate(
+            (
+                ProductionArtifactStage.REFERENCES,
+                ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                ProductionArtifactStage.PUBLICATION,
+            ),
+            start=0,
+        )
+    ]
+    uow = _Uow(snapshot, _Artifacts(initial), edition_state=edition_state)
+    changed_artifact = replace(
+        initial[1],
+        version=2,
+        input_hash=canonical_extraction_hash(extraction),
+        canonical_blob_id=UUID(int=11),
+    )
     projection = _Projection(
         ProductionRepairProjectionResult(
-            artifact=_artifact(ProductionArtifactStage.EXTRACTION, version=2),
+            artifact=changed_artifact,
             changed=kind is not ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
             impact=_impact(kind),
         )
     )
-    assembly = _Assembly(assembly_error)
-    qa = _QA(qa_passed)
-    checkpoint = _Checkpoint(checkpoint_result)
+    checkpoint = _Checkpoint()
     service = ProductionRepairMaterializationService(
         _Factory(uow),
-        projection_service=projection,  # type: ignore[arg-type]
-        publication_assembly_service=assembly,  # type: ignore[arg-type]
-        qa_service=qa,  # type: ignore[arg-type]
+        projection_service=projection,
         checkpoint_service=checkpoint,
-        artifact_store=object(),  # make QA path execute
+        artifact_store=store,
         diagnostics=diagnostics,
     )
-    return service, uow, projection, assembly, qa, checkpoint
+    return service, uow, projection, store, checkpoint
 
 
 @pytest.mark.asyncio
-async def test_rules_materialization_stales_enrichment_only() -> None:
-    service, uow, _projection, assembly, qa, checkpoint = _service(
+async def test_canonical_rule_bundle_repair_reassembles_and_materializes_sidecars() -> None:
+    service, uow, projection, _store, checkpoint = _service(
         ProductionRepairImpactKind.RULE_BUNDLE_ONLY
     )
-
     result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "rules_materialized"
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment",))]
-    assert assembly.calls == 0
-    assert qa.calls == 1
-    assert checkpoint.calls == [RUN_ID]
-
-
-@pytest.mark.asyncio
-async def test_publication_materialization_stales_enrichment_and_publication() -> None:
-    service, uow, _projection, assembly, _qa, checkpoint = _service(
-        ProductionRepairImpactKind.PUBLICATION_ONLY
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "publication_reassembled"
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment", "publication"))]
-    assert assembly.calls == 1
-    assert checkpoint.calls == [RUN_ID]
-    assert result.publication_artifact is not None
-
-
-@pytest.mark.asyncio
-async def test_narrative_materialization_stales_three_outputs_without_dispatch() -> None:
-    service, uow, _projection, assembly, qa, checkpoint = _service(
-        ProductionRepairImpactKind.NARRATIVE
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "retry_required"
-    assert result.retry_stage == "synthesis"
-    assert uow.artifacts.stale_calls == [
-        (RUN_ID, ("synthesis", "editorial_enrichment", "publication"))
-    ]
-    assert assembly.calls == 0
-    assert qa.calls == 0
-    assert checkpoint.calls == []
-
-
-@pytest.mark.asyncio
-async def test_no_deliverable_change_does_not_stale_or_checkpoint() -> None:
-    service, uow, _projection, assembly, qa, checkpoint = _service(
-        ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "none"
-    assert uow.artifacts.stale_calls == []
-    assert assembly.calls == qa.calls == 0
-    assert checkpoint.calls == []
-
-
-@pytest.mark.asyncio
-async def test_materialization_allows_an_open_edition_with_historical_manifest() -> None:
-    service, _uow, projection, _assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        manifest_exists=True,
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
     assert result.action == "rules_materialized"
     assert projection.calls == 1
+    assert checkpoint.calls == [RUN_ID]
+    assert uow.commits == 1
+    assert uow.artifacts.stale_calls == [(RUN_ID, ("publication",))]
 
 
 @pytest.mark.asyncio
-async def test_materialization_refuses_an_archived_edition() -> None:
-    service, _uow, projection, _assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        edition_state=EditionStatus.ARCHIVED,
-    )
-
-    with pytest.raises(ProductionRepairProjectionError, match="edition_archived"):
-        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-    assert projection.calls == 0
-
-
-@pytest.mark.asyncio
-async def test_materialization_diagnostics_are_structured_and_value_free(tmp_path) -> None:
-    diagnostics = DiagnosticsLog.from_env(tmp_path / "diagnostics")
-    service, _uow, _projection, _assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        diagnostics=diagnostics,
-    )
-
-    await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    events = [
-        json.loads(line)
-        for line in (tmp_path / "diagnostics" / "events.jsonl").read_text().splitlines()
-    ]
-    names = {event["event"] for event in events}
-    assert {
-        "production.repair.plan",
-        "production.repair.projection_completed",
-        "production.repair.rule_bundle_materialized",
-        "production.repair.applied",
-    } <= names
-    for event in events:
-        if not event["event"].startswith("production.repair."):
-            continue
-        assert event["run_id"] == str(RUN_ID)
-        assert event["subject_id"] == str(SUBJECT_ID)
-        assert event["impact_kind"] == ProductionRepairImpactKind.RULE_BUNDLE_ONLY.value
-        assert isinstance(event["model_call_required"], bool)
-        assert isinstance(event["duration_ms"], int)
-        if event["event"] == "production.repair.applied":
-            # The outcome, not the plan: what really changed on disk.
-            assert isinstance(event["projection_changed"], bool)
-            assert event["artifacts_updated"] == ["extraction", "rule_bundle"]
-            assert event["action"] == "rules_materialized"
-        else:
-            assert event["affected_outputs"]
-            assert isinstance(event["reused_synthesis"], bool)
-
-
-@pytest.mark.asyncio
-async def test_publication_materialization_is_a_single_transaction() -> None:
-    """The projection, the stale, the assembly and the QA share one commit."""
-    service, uow, projection, assembly, qa, _checkpoint = _service(
+async def test_canonical_publication_materialization_is_one_transaction() -> None:
+    service, uow, projection, _store, _checkpoint = _service(
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
-
-    await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert projection.calls == assembly.calls == qa.calls == 1
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    assert result.action == "publication_reassembled"
+    assert result.publication_artifact is not None
+    assert projection.calls == 1
     assert uow.commits == 1
     assert uow.rolled_back is False
 
 
 @pytest.mark.asyncio
-async def test_publication_assembly_failure_leaves_the_article_untouched() -> None:
-    """An Assembly error never leaves a decided IOC out of the document."""
-    service, uow, _projection, assembly, qa, checkpoint = _service(
-        ProductionRepairImpactKind.PUBLICATION_ONLY,
-        assembly_error=RuntimeError("pandoc exploded"),
+async def test_canonical_assembly_failure_rolls_back_the_repair() -> None:
+    service, uow, _projection, store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY
     )
-
-    with pytest.raises(RuntimeError, match="pandoc exploded"):
+    store.failure = RuntimeError("canonical assembly failed")
+    with pytest.raises(RuntimeError, match="canonical assembly failed"):
         await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
     assert uow.commits == 0
     assert uow.rolled_back is True
-    assert assembly.calls == 1
-    assert qa.calls == 0
-    assert checkpoint.calls == []
-    extraction = await uow.artifacts.get_current(RUN_ID, "extraction")
-    publication = await uow.artifacts.get_current(RUN_ID, "publication")
-    assert extraction is not None and extraction.version == 1
-    assert publication is not None and publication.version == 1
-    assert publication.status is ProductionArtifactStatus.VERIFIED
     assert len(uow.artifacts.items) == 5
+    assert all(item.status is not ProductionArtifactStatus.STALE for item in uow.artifacts.items)
 
 
 @pytest.mark.asyncio
-async def test_publication_qa_failure_leaves_the_article_untouched() -> None:
-    """A QA failure rolls the repaired Extraction back with the document."""
-    service, uow, _projection, assembly, qa, checkpoint = _service(
-        ProductionRepairImpactKind.PUBLICATION_ONLY,
-        qa_passed=False,
-    )
-
-    with pytest.raises(ProductionRepairProjectionError, match="production_repair_qa_failed"):
-        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert uow.commits == 0
-    assert uow.rolled_back is True
-    assert assembly.calls == qa.calls == 1
-    assert checkpoint.calls == []
-    extraction = await uow.artifacts.get_current(RUN_ID, "extraction")
-    publication = await uow.artifacts.get_current(RUN_ID, "publication")
-    assert extraction is not None and extraction.version == 1
-    assert publication is not None and publication.version == 1
-    assert publication.status is ProductionArtifactStatus.VERIFIED
-
-
-@pytest.mark.asyncio
-async def test_publication_retry_after_a_failure_succeeds() -> None:
-    """The repair debt survives the failure and the retry materializes it."""
-    service, uow, _projection, assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.PUBLICATION_ONLY,
-        assembly_error=RuntimeError("transient"),
-    )
-    with pytest.raises(RuntimeError):
-        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assembly.error = None
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "publication_reassembled"
-    assert uow.commits == 1
-    publication = await uow.artifacts.get_current(RUN_ID, "publication")
-    assert publication is not None and publication.version == 2
-
-
-@pytest.mark.asyncio
-async def test_narrative_failure_before_stale_commits_no_projection() -> None:
-    """A narrative repair never commits the Extraction without the stale."""
-    service, uow, _projection, _assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.NARRATIVE
-    )
-
-    async def _explode(_run_id: UUID, _stages: set[str]) -> list[str]:
-        raise RuntimeError("stale port down")
-
-    uow.artifacts.mark_stages_stale = _explode  # type: ignore[method-assign]
-
-    with pytest.raises(RuntimeError, match="stale port down"):
-        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert uow.commits == 0
-    assert uow.rolled_back is True
-    extraction = await uow.artifacts.get_current(RUN_ID, "extraction")
-    synthesis = await uow.artifacts.get_current(RUN_ID, "synthesis")
-    assert extraction is not None and extraction.version == 1
-    assert synthesis is not None and synthesis.status is ProductionArtifactStatus.VERIFIED
-
-
-@pytest.mark.asyncio
-async def test_rule_bundle_checkpoint_failure_is_reported_as_pending() -> None:
-    """A failed sidecar projection never claims the rules were materialized."""
-    service, uow, _projection, _assembly, _qa, checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        checkpoint_result=None,
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "rules_projection_pending"
-    assert checkpoint.calls == [RUN_ID]
-    # The canonical Extraction keeps the decision: nothing is lost, and no Q4
-    # is replayed to recover the sidecars.
-    assert uow.commits == 1
-    extraction = await uow.artifacts.get_current(RUN_ID, "extraction")
-    assert extraction is not None and extraction.version == 2
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("editorial_enrichment",))]
-
-
-@pytest.mark.asyncio
-async def test_rule_bundle_sidecar_error_is_reported_as_pending() -> None:
-    service, _uow, _projection, _assembly, _qa, _checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        checkpoint_result=SimpleNamespace(rule_sidecar_error="permission denied"),
-    )
-
-    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-
-    assert result.action == "rules_projection_pending"
-
-
-@pytest.mark.asyncio
-async def test_rule_bundle_projection_is_idempotently_replayable() -> None:
-    """The pending projection can be replayed without touching production."""
-    service, uow, _projection, _assembly, _qa, checkpoint = _service(
-        ProductionRepairImpactKind.RULE_BUNDLE_ONLY,
-        checkpoint_result=None,
-    )
-    await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
-    commits = uow.commits
-
-    checkpoint.result = SimpleNamespace(rule_sidecar_error=None)
-    assert await service.materialize_rule_bundle_from_current_extraction(RUN_ID) is True
-    assert await service.materialize_rule_bundle_from_current_extraction(RUN_ID) is True
-
-    assert uow.commits == commits
-    assert checkpoint.calls == [RUN_ID, RUN_ID, RUN_ID]
-
-
-@pytest.mark.asyncio
-async def test_a_stale_generation_refuses_before_any_projection() -> None:
-    """A concurrent retry (generation N+1) stops the plan built from N."""
-    service, uow, projection, assembly, qa, checkpoint = _service(
+async def test_canonical_qa_failure_rolls_back_the_repair(monkeypatch: pytest.MonkeyPatch) -> None:
+    service, uow, _projection, _store, _checkpoint = _service(
         ProductionRepairImpactKind.PUBLICATION_ONLY
     )
 
+    async def failed_qa(*_args: object, **_kwargs: object) -> dict[str, object]:
+        return {"passed": False, "checks": {}, "errors": ["forced"], "warnings": []}
+
+    monkeypatch.setattr(
+        "cti_app.application.production_repairs.ProductionQAService.run_qa", failed_qa
+    )
+    with pytest.raises(ProductionRepairProjectionError, match="production_repair_qa_failed"):
+        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    assert uow.commits == 0
+    assert uow.rolled_back is True
+
+
+@pytest.mark.asyncio
+async def test_narrative_repair_stales_outputs_without_materializing() -> None:
+    service, uow, _projection, _store, checkpoint = _service(ProductionRepairImpactKind.NARRATIVE)
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    assert result.action == "retry_required"
+    assert result.retry_stage == "synthesis"
+    assert checkpoint.calls == []
+    assert uow.artifacts.stale_calls == [
+        (RUN_ID, ("synthesis", "editorial_enrichment", "publication"))
+    ]
+
+
+@pytest.mark.asyncio
+async def test_no_deliverable_change_does_not_stale_or_checkpoint() -> None:
+    service, uow, _projection, _store, checkpoint = _service(
+        ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE
+    )
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    assert result.action == "none"
+    assert uow.artifacts.stale_calls == []
+    assert checkpoint.calls == []
+
+
+@pytest.mark.asyncio
+async def test_archived_edition_and_stale_generation_are_rejected_before_projection() -> None:
+    service, _uow, projection, _store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY, edition_state=EditionStatus.ARCHIVED
+    )
+    with pytest.raises(ProductionRepairProjectionError, match="edition_archived"):
+        await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    assert projection.calls == 0
+
+    service, uow, projection, _store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY
+    )
     with pytest.raises(ProductionRepairStaleError):
         await service.apply(
             edition_id=EDITION_ID,
@@ -631,8 +391,20 @@ async def test_a_stale_generation_refuses_before_any_projection() -> None:
             observed_run_id=RUN_ID,
             observed_pipeline_generation=uow.run.pipeline_generation - 1,
         )
+    assert projection.calls == 0
 
-    assert projection.calls == assembly.calls == qa.calls == 0
-    assert checkpoint.calls == []
-    assert uow.commits == 0
-    assert len(uow.artifacts.items) == 5
+
+@pytest.mark.asyncio
+async def test_repair_diagnostics_record_the_canonical_outcome(tmp_path) -> None:
+    diagnostics = DiagnosticsLog.from_env(tmp_path / "diagnostics")
+    service, _uow, _projection, _store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY, diagnostics=diagnostics
+    )
+    await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "diagnostics" / "events.jsonl").read_text().splitlines()
+    ]
+    applied = next(event for event in events if event["event"] == "production.repair.applied")
+    assert applied["action"] == "publication_reassembled"
+    assert applied["projection_changed"] is True

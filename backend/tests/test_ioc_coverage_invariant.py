@@ -1,11 +1,11 @@
-"""End-to-end IOC coverage invariant over a deterministic three-source corpus.
+"""IOC coverage invariant over a deterministic three-source corpus.
 
 The corpus is fixed: one source publishes an explicit IOC table for the
 requested subject (86 values), one mentions network values as prose context
 only, and one publishes another campaign's indicators.  The pipeline is
-exercised from the Q2 wire format down to ``collect_indicators`` and the
-publication document, comparing sets: a single explicit IOC lost anywhere
-between the parser and publication fails this module.
+exercised from the Q2 wire format down to ``collect_indicators``, comparing
+sets: a single explicit IOC lost between the parser and projection fails this
+module.
 """
 
 from __future__ import annotations
@@ -22,27 +22,19 @@ from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
     DisplayPolicy,
     IndicatorStatus,
-    ParsedEvent,
-    ParsedSource,
     Q2ArtifactProposal,
     Q2SourceOutput,
-    ReferenceReport,
     TechnicalExtraction,
     parse_q2_proposals_markdown,
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
-from cti_app.application.production_rendering import (
-    build_reference_numbering,
-    collect_indicators,
-    render_publication_markdown,
-)
+from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.production_source_evidence import (
     source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
-from cti_app.domain.discovery import SourceRole
 from cti_app.domain.publication import ArtifactType
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -209,44 +201,6 @@ def test_explicit_iocs_survive_the_extraction_artifact_round_trip() -> None:
     restored = technical_extraction_from_json(technical_extraction_to_json(extraction))
 
     assert _canonical_keys(collect_indicators(restored)) == _expected_keys()
-
-
-def test_explicit_iocs_reach_the_rendered_publication() -> None:
-    extraction = _corpus_extraction()
-    report = ReferenceReport(
-        sources=(
-            ParsedSource(
-                local_id="S1",
-                title="Nebula Serpent",
-                url="https://security-lab.io/nebula",
-                canonical_url="https://security-lab.io/nebula",
-                publisher="Security Lab",
-                published_at=None,
-                role=SourceRole.PRIMARY,
-            ),
-            ParsedSource(
-                local_id="S2",
-                title="Telemetry note",
-                url="https://partner-hosting.io/note",
-                canonical_url="https://partner-hosting.io/note",
-                publisher="Partner Hosting",
-                published_at=None,
-                role=SourceRole.INDEPENDENT,
-            ),
-        ),
-        events=(ParsedEvent(local_id="E1", event_date=None, source_ids=("S1",), text="Campagne."),),
-    )
-    synthesis = "La campagne Nebula Serpent a reconstruit son infrastructure [S1]."
-
-    numbering = build_reference_numbering(report, synthesis)
-    markdown = render_publication_markdown(
-        subject_title="[Nebula Serpent] Campagne",
-        report=report,
-        extraction=extraction,
-        synthesis_text=synthesis,
-        numbering=numbering,
-    )
-    assert all(f"`{value}`" in markdown for _, value in EXPECTED_EXPLICIT_IOCS)
 
 
 def test_similar_subdomains_stay_distinct_indicators() -> None:

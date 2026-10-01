@@ -9,17 +9,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from cti_app.domain.publication import PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION, PublicationDocumentV3
+from cti_app.domain.publication import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PublicationDocumentV4,
+    publication_document_v4_from_json,
+    publication_document_v4_to_json,
+)
 
-type CanonicalPublicationDocument = PublicationDocumentV3
+type CanonicalPublicationDocument = PublicationDocumentV4
 
 
 def validate_publication_document(
     value: Mapping[str, Any] | CanonicalPublicationDocument,
 ) -> CanonicalPublicationDocument:
     """Validate one parsed model or canonical JSON payload."""
-    if isinstance(value, PublicationDocumentV3):
-        if value.schema_version != PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION:
+    if isinstance(value, PublicationDocumentV4):
+        if value.schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
             )
@@ -27,9 +32,9 @@ def validate_publication_document(
     if not isinstance(value, Mapping):
         raise ValueError("publication document must be a JSON object")
     schema_version = value.get("schema_version")
-    if schema_version != PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION:
+    if schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
         raise ValueError(f"unsupported publication document schema_version={schema_version!r}")
-    return PublicationDocumentV3._from_json(value)
+    return publication_document_v4_from_json(value)
 
 
 def parse_publication_document(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
@@ -41,12 +46,14 @@ def serialize_publication_document(
     document: CanonicalPublicationDocument,
 ) -> dict[str, Any]:
     """Validate and serialize the canonical publication model."""
-    return validate_publication_document(document)._to_json()
+    return publication_document_v4_to_json(validate_publication_document(document))
 
 
 __all__ = [
     "CanonicalPublicationDocument",
     "parse_publication_document",
+    "publication_document_v4_from_json",
+    "publication_document_v4_to_json",
     "serialize_publication_document",
     "validate_publication_document",
 ]

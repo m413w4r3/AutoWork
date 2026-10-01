@@ -18,23 +18,16 @@ from cti_app.application.production_parsers import (
     DisplayPolicy,
     ExtractionItem,
     IndicatorStatus,
-    ParsedSource,
     Q2RuleProposal,
     Q2SourceOutput,
-    ReferenceReport,
     TechnicalExtraction,
     parse_q2_proposals_markdown,
     project_q2_source_output,
     technical_extraction_from_json,
     technical_extraction_to_json,
 )
-from cti_app.application.production_rendering import (
-    build_reference_numbering,
-    collect_indicators,
-    render_publication_markdown,
-)
+from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.production_state import ProductionStateSnapshotV5
-from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
 from cti_app.domain.publication import ArtifactType
 
@@ -228,26 +221,7 @@ def test_rules_are_not_iocs_or_publication_body() -> None:
         display_policy=DisplayPolicy.IOC_SECTION,
     )
     extraction = TechnicalExtraction(items=(legacy_rule_item,), rules=(rule,))
-    source = ParsedSource(
-        local_id="S1",
-        title="Source",
-        url="https://source.example/report",
-        canonical_url="https://source.example/report",
-        publisher="Source",
-        published_at=date(2026, 8, 1),
-        role=SourceRole.PRIMARY,
-    )
-    report = ReferenceReport(sources=(source,), events=())
-    publication = render_publication_markdown(
-        subject_title="Sujet",
-        report=report,
-        extraction=extraction,
-        synthesis_text="La règle est publiée [S1].",
-        numbering=build_reference_numbering(report, "La règle est publiée [S1]."),
-    )
-
     assert collect_indicators(extraction) == []
-    assert rule.body not in publication
 
 
 def _state() -> ProductionStateSnapshotV5:

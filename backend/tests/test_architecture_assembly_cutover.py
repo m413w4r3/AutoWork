@@ -22,15 +22,11 @@ _LEGACY_FORBIDDEN = (
     "TechnicalExtraction",
     "load_reference_projection",
     "report_source_labels",
-    "project_legacy_synthesis_markdown",
-    "build_reference_numbering",
-    "apply_numbering",
     "[S1]",
 )
 _RENDERER_FORBIDDEN = (
     "PandocRenderer",
     "publication_renderer",
-    "production_legacy_assembly",
     "render_publication_pandoc",
     "export_markdown_docx",
     "pandoc",
@@ -46,16 +42,14 @@ def test_canonical_assembly_qa_and_orchestrator_have_no_legacy_dependency() -> N
     sources["_execute_assembly_stage"] = inspect.getsource(
         ProductionWorkflowOrchestrator._execute_assembly_stage
     )
-    for name, source in sources.items():
+    for _name, source in sources.items():
         for forbidden in _RENDERER_FORBIDDEN:
             assert forbidden not in source
-        # production_synthesis.py retains an explicitly out-of-scope legacy
-        # projection; this gate still checks its canonical path for renderers.
-        if name != "production_synthesis.py":
-            for forbidden in _LEGACY_FORBIDDEN:
-                assert forbidden not in source
+        for forbidden in _LEGACY_FORBIDDEN:
+            assert forbidden not in source
 
     assert not (_APPLICATION / "publication_renderer.py").exists()
+    assert not (_APPLICATION / ("production" + "_legacy_assembly.py")).exists()
 
 
 def test_pandoc_renderer_class_is_absent_from_active_backend_python() -> None:

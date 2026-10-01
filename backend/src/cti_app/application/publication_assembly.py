@@ -10,7 +10,7 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
-    build_publication_document_v3,
+    build_publication_document_v4,
     compute_assembly_input_hash,
 )
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
@@ -74,11 +74,12 @@ class PublicationAssemblyService:
                 PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                 "Editorial enrichment does not match the production input snapshot",
             )
-        document = build_publication_document_v3(
+        document = build_publication_document_v4(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
             synthesis=synthesis,
+            editorial_enrichment=editorial_enrichment,
         )
 
         input_hash = compute_assembly_input_hash(

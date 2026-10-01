@@ -5,6 +5,7 @@ from __future__ import annotations
 import shutil
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 from uuid import UUID
@@ -23,8 +24,9 @@ from cti_app.application.pandoc_export import (
 from cti_app.application.pandoc_rendering import (
     PAGE_BREAK_MARKDOWN,
     WORD_STYLE_MAP,
-    _render_v3_citations,
+    _render_citations,
     render_edition_pandoc,
+    render_publication_pandoc,
 )
 from cti_app.application.production_normalization import (
     canonical_indicator_key,
@@ -48,17 +50,33 @@ from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
+from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
+    DiagramNodeV1,
+    EnrichmentDiagramDirection,
+    EnrichmentDiagramKind,
+    EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
+    EnrichmentTableKind,
+    SourceFigureLocatorV1,
+)
 from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
-    PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     ArtifactType,
-    PublicationDocumentV3,
+    PublicationDiagramV1,
+    PublicationDocumentV4,
     PublicationEvidenceKind,
     PublicationEvidenceRefV1,
     PublicationParagraphV1,
     PublicationSectionKind,
     PublicationSectionV1,
+    PublicationSourceFigureV1,
     PublicationSourceV1,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
+    PublicationTableV1,
     RichSpanKind,
 )
 
@@ -181,14 +199,14 @@ def _publication_source(source_id: UUID, url: str, title: str = "Example") -> Pu
     )
 
 
-def _multi_source_document() -> PublicationDocumentV3:
+def _multi_source_document() -> PublicationDocumentV4:
     first_id, second_id = UUID(int=1), UUID(int=2)
     refs = (
         PublicationEvidenceRefV1(first_id, PublicationEvidenceKind.FACT, "a" * 64),
         PublicationEvidenceRefV1(second_id, PublicationEvidenceKind.FACT, "b" * 64),
     )
-    return PublicationDocumentV3(
-        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    return PublicationDocumentV4(
+        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         subject_id=UUID(int=10),
         publication_language="fr",
         title="Citation test",
@@ -201,6 +219,9 @@ def _multi_source_document() -> PublicationDocumentV3:
             _publication_source(second_id, "https://example.test/2"),
         ),
         uncertainties=(),
+        tables=(),
+        diagrams=(),
+        figures=(),
     )
 
 
@@ -260,7 +281,7 @@ def test_semantic_annotation_prioritizes_entities_and_citations() -> None:
 def test_pandoc_renderer_renders_one_footnote_per_citation(
     source_ids: tuple[int, ...], expected: str
 ) -> None:
-    rendered = _render_v3_citations(
+    rendered = _render_citations(
         tuple(
             PublicationEvidenceRefV1(UUID(int=source_id), PublicationEvidenceKind.FACT, "a" * 64)
             for source_id in source_ids
@@ -315,11 +336,11 @@ def _edition_document(count: int) -> EditionDocumentV2:
     )
 
 
-def _publication(title: str) -> PublicationDocumentV3:
+def _publication(title: str) -> PublicationDocumentV4:
     source_id = UUID(int=1)
     evidence = PublicationEvidenceRefV1(source_id, PublicationEvidenceKind.FACT, "a" * 64)
-    return PublicationDocumentV3(
-        schema_version=PUBLICATION_DOCUMENT_V3_SCHEMA_VERSION,
+    return PublicationDocumentV4(
+        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         subject_id=UUID(int=1),
         publication_language="fr",
         title=title,
@@ -335,7 +356,70 @@ def _publication(title: str) -> PublicationDocumentV3:
         indicators=(),
         sources=(_publication_source(source_id, "https://example.test/article"),),
         uncertainties=(),
+        tables=(),
+        diagrams=(),
+        figures=(),
     )
+
+
+def test_pandoc_v4_renders_only_the_historical_narrative() -> None:
+    document = _publication("Narrative publication")
+    enrichment_refs = (ExtractionEvidenceRefV1(UUID(int=1), EvidenceKind.FACT, "b" * 64),)
+    enriched = replace(
+        document,
+        tables=(
+            PublicationTableV1(
+                key="commands",
+                kind=EnrichmentTableKind.COMMANDS,
+                title="Observed commands",
+                caption="Enrichment caption",
+                columns=(
+                    PublicationTableColumnV1("command", "Command"),
+                    PublicationTableColumnV1("purpose", "Purpose"),
+                ),
+                rows=(PublicationTableRowV1(("powershell", "Execution"), enrichment_refs),),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+            ),
+        ),
+        diagrams=(
+            PublicationDiagramV1(
+                key="infection_chain",
+                kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+                title="Enrichment diagram",
+                caption="Diagram caption",
+                direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+                nodes=(
+                    DiagramNodeV1("loader", "Loader", enrichment_refs),
+                    DiagramNodeV1("payload", "Payload", enrichment_refs),
+                ),
+                edges=(DiagramEdgeV1("loader", "payload", "loads", enrichment_refs),),
+                groups=(),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+                asset_id=UUID(int=3),
+            ),
+        ),
+        figures=(
+            PublicationSourceFigureV1(
+                key="source_figure",
+                asset_id=UUID(int=4),
+                sha256="b" * 64,
+                mime_type="image/png",
+                byte_size=128,
+                source_document_id=UUID(int=1),
+                source_url="https://example.test/figure.png",
+                caption="Figure caption",
+                provenance="Figure provenance",
+                locator=SourceFigureLocatorV1(page=1),
+                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+            ),
+        ),
+    )
+
+    assert render_publication_pandoc(enriched) == render_publication_pandoc(document)
+    rendered = render_publication_pandoc(enriched)
+    assert "Enrichment caption" not in rendered
+    assert "Enrichment diagram" not in rendered
+    assert "Figure caption" not in rendered
 
 
 @pytest.mark.parametrize(("publications", "breaks"), ((1, 0), (2, 1), (3, 2)))
