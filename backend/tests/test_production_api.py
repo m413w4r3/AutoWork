@@ -1994,7 +1994,7 @@ async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
     assert by_subject.json()["artifact_id"] == str(second_artifact.id)
 
 
-async def test_publication_artifact_response_omits_legacy_rendered_content(
+async def test_publication_artifact_response_has_no_rendered_content(
     api: AsyncClient,
     uow: _Uow,
 ) -> None:
@@ -2002,7 +2002,6 @@ async def test_publication_artifact_response_omits_legacy_rendered_content(
     run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
     await uow.production_runs.add(run)
     artifact = _artifact(run, ProductionArtifactStage.PUBLICATION)
-    artifact.rendered_blob_id = uuid4()
     await uow.production_artifacts.append(artifact)
 
     response = await api.get(f"/api/production/runs/{run.id}/artifacts/publication")

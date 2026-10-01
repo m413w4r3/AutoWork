@@ -730,23 +730,30 @@ def create_job_registry(
             EditionAssemblyService,
             register_publication_jobs,
         )
+        from cti_app.application.edition_release_materialization import (
+            EditionReleaseRematerializationService,
+        )
         from cti_app.application.edition_rendering import EditionRenderService
 
         if not isinstance(publication_assembly, EditionAssemblyService):
             raise TypeError("publication_assembly must be an EditionAssemblyService")
-        if edition_render_service is not None and not isinstance(
-            edition_render_service, EditionRenderService
-        ):
+        if not isinstance(edition_render_service, EditionRenderService):
             raise TypeError("edition_render_service must be an EditionRenderService")
+        if not isinstance(edition_release_rematerializer, EditionReleaseRematerializationService):
+            raise TypeError(
+                "edition_release_rematerializer must be an EditionReleaseRematerializationService"
+            )
+        if job_dispatcher is None:
+            raise TypeError("job_dispatcher is required to queue edition renders")
         if uow_factory is None or not callable(uow_factory):
             raise TypeError("uow_factory must be callable for publication assembly")
         register_publication_jobs(
             registry,
             cast(Any, uow_factory),
             publication_assembly,
-            cast(Any, edition_render_service),
+            edition_render_service,
             job_dispatcher,
-            release_rematerializer=cast(Any, edition_release_rematerializer),
+            edition_release_rematerializer,
         )
     return registry
 

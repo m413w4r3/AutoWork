@@ -2299,10 +2299,7 @@ async def _artifact_view_for_run(
         rendered = None
         canonical = None
         if store is not None:
-            if (
-                artifact.stage is not ProductionArtifactStage.PUBLICATION
-                and artifact.rendered_blob_id is not None
-            ):
+            if artifact.rendered_blob_id is not None:
                 rendered = await store.read_text(artifact.rendered_blob_id)
             if artifact.canonical_blob_id is not None:
                 canonical = await store.read_json(artifact.canonical_blob_id)

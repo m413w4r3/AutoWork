@@ -283,8 +283,7 @@ La structure cible du workspace édition est :
 ├── items/
 │   └── <position>-<slug>/
 │       ├── article/
-│       │   ├── publication.json
-│       │   └── publication.md
+│       │   └── publication.json
 │       ├── indicators/
 │       │   ├── indicators.json
 │       │   └── enrichment.json

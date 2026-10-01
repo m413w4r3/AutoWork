@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from typing import Any, cast
 from uuid import UUID
 
@@ -21,9 +20,11 @@ from cti_app.application.subject_content import (
     SubjectContentView,
     SubjectIndicatorView,
 )
-from cti_app.application.typst_compilation import (
-    TYPST_MAX_PDF_BYTES,
-    TypstCompilationError,
+from cti_app.application.typst_compilation import TypstCompilationError
+from cti_app.application.typst_render_output import (
+    TypstRenderOutputIntegrityError,
+    TypstRenderOutputStorageError,
+    read_verified_render_pdf,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.production import ProductionArtifactStatus
@@ -119,6 +120,11 @@ async def download_subject_publication_pdf(subject_id: UUID, request: Request) -
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "publication_not_available"},
         )
+    if publication.artifact.status is not ProductionArtifactStatus.VERIFIED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "publication_not_verified"},
+        )
 
     try:
         render = await _publication_render_service(request).render_pdf(publication.artifact.id)
@@ -139,26 +145,19 @@ async def download_subject_publication_pdf(subject_id: UUID, request: Request) -
             detail={"code": exc.code},
         ) from exc
 
-    assert render.output_blob_id is not None
     artifact_store = cast(ProductionArtifactStore, request.app.state.production_artifact_store)
     try:
-        content = await artifact_store.read_bytes(
-            render.output_blob_id,
-            max_bytes=TYPST_MAX_PDF_BYTES,
-        )
-    except Exception as exc:
+        content = await read_verified_render_pdf(artifact_store, render)
+    except TypstRenderOutputStorageError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail={"code": "publication_pdf_storage_error"},
         ) from exc
-    if (
-        len(content) != render.output_byte_size
-        or hashlib.sha256(content).hexdigest() != render.output_sha256
-    ):
+    except TypstRenderOutputIntegrityError as exc:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"code": "publication_pdf_integrity_mismatch"},
-        )
+        ) from exc
 
     return Response(
         content=content,

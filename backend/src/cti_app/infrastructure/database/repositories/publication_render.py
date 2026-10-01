@@ -6,15 +6,15 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.domain.publication_render import (
-    PublicationRender,
-    PublicationRenderAcquisition,
-    PublicationRenderAcquisitionOutcome,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
+from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
     invalid_succeeded_reacquisition_outcome,
-    publication_render_acquisition_outcome,
-    publication_render_retrying,
+    typst_render_acquisition_outcome,
+    typst_render_retrying,
 )
 from cti_app.infrastructure.database.models.publication_render import PublicationRenderRow
 
@@ -35,7 +35,7 @@ class SqlAlchemyPublicationRenderRepository:
 
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
-    ) -> PublicationRenderAcquisition:
+    ) -> TypstRenderAcquisition[PublicationRender]:
         """Atomically create, reuse, retry, or take over a render for its input hash."""
         while True:
             inserted_id = await self._session.scalar(
@@ -45,8 +45,8 @@ class SqlAlchemyPublicationRenderRepository:
                 .returning(PublicationRenderRow.id)
             )
             if inserted_id is not None:
-                return PublicationRenderAcquisition(
-                    PublicationRenderAcquisitionOutcome.ACQUIRED,
+                return TypstRenderAcquisition(
+                    TypstRenderAcquisitionOutcome.ACQUIRED,
                     proposed,
                 )
 
@@ -61,16 +61,16 @@ class SqlAlchemyPublicationRenderRepository:
                 # insert so this operation still never exposes an IntegrityError.
                 continue
             existing = _publication_render_from_row(row)
-            outcome = publication_render_acquisition_outcome(
+            outcome = typst_render_acquisition_outcome(
                 existing,
                 stale_running_before=stale_running_before,
             )
-            if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
-                updated = publication_render_retrying(existing, now=datetime.now(UTC))
+            if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+                updated = typst_render_retrying(existing, now=datetime.now(UTC))
                 _apply_publication_render(row, updated)
                 await self._session.flush()
-                return PublicationRenderAcquisition(outcome, updated)
-            return PublicationRenderAcquisition(outcome, existing)
+                return TypstRenderAcquisition(outcome, updated)
+            return TypstRenderAcquisition(outcome, existing)
 
     async def reacquire_invalid_succeeded(
         self,
@@ -78,18 +78,18 @@ class SqlAlchemyPublicationRenderRepository:
         *,
         observed_output_blob_id: UUID,
         observed_output_sha256: str,
-    ) -> PublicationRenderAcquisition:
+    ) -> TypstRenderAcquisition[PublicationRender]:
         """Take ownership of a corrupt cached output with a guarded transition."""
         update_result = await self._session.execute(
             update(PublicationRenderRow)
             .where(
                 PublicationRenderRow.id == proposed.id,
-                PublicationRenderRow.status == PublicationRenderStatus.SUCCEEDED.value,
+                PublicationRenderRow.status == TypstRenderStatus.SUCCEEDED.value,
                 PublicationRenderRow.output_blob_id == observed_output_blob_id,
                 PublicationRenderRow.output_sha256.is_not_distinct_from(observed_output_sha256),
             )
             .values(
-                status=PublicationRenderStatus.RUNNING.value,
+                status=TypstRenderStatus.RUNNING.value,
                 error_code=None,
                 error_message=None,
                 updated_at=datetime.now(UTC),
@@ -100,8 +100,8 @@ class SqlAlchemyPublicationRenderRepository:
         updated_row = update_result.scalar_one_or_none()
         if updated_row is not None:
             updated = _publication_render_from_row(updated_row)
-            return PublicationRenderAcquisition(
-                PublicationRenderAcquisitionOutcome.ACQUIRED,
+            return TypstRenderAcquisition(
+                TypstRenderAcquisitionOutcome.ACQUIRED,
                 updated,
             )
 
@@ -123,34 +123,17 @@ class SqlAlchemyPublicationRenderRepository:
             observed_output_blob_id=observed_output_blob_id,
             observed_output_sha256=observed_output_sha256,
         )
-        if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
-            updated = publication_render_retrying(existing, now=datetime.now(UTC))
+        if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+            updated = typst_render_retrying(existing, now=datetime.now(UTC))
             _apply_publication_render(row, updated)
             await self._session.flush()
-            return PublicationRenderAcquisition(outcome, updated)
-        return PublicationRenderAcquisition(outcome, existing)
+            return TypstRenderAcquisition(outcome, updated)
+        return TypstRenderAcquisition(outcome, existing)
 
     async def add(self, render: PublicationRender) -> PublicationRender:
         self._session.add(PublicationRenderRow(**_publication_render_row_values(render)))
         await self._session.flush()
         return render
-
-    async def mark_retrying(self, render_id: UUID) -> PublicationRender:
-        row = await self._session.get(PublicationRenderRow, render_id)
-        if row is None:
-            raise LookupError("publication_render_not_found")
-        updated = PublicationRender(
-            **{
-                **_publication_render_values(row),
-                "status": PublicationRenderStatus.RUNNING,
-                "error_code": None,
-                "error_message": None,
-                "updated_at": datetime.now(UTC),
-            }
-        )
-        _apply_publication_render(row, updated)
-        await self._session.flush()
-        return updated
 
     async def mark_succeeded(
         self,
@@ -171,7 +154,7 @@ class SqlAlchemyPublicationRenderRepository:
                 "output_blob_id": output_blob_id,
                 "output_sha256": output_sha256,
                 "output_byte_size": output_byte_size,
-                "status": PublicationRenderStatus.SUCCEEDED,
+                "status": TypstRenderStatus.SUCCEEDED,
                 "error_code": None,
                 "error_message": None,
                 "updated_at": datetime.now(UTC),
@@ -196,7 +179,7 @@ class SqlAlchemyPublicationRenderRepository:
                 **_publication_render_values(row),
                 "source_blob_id": source_blob_id,
                 "render_data_blob_id": render_data_blob_id,
-                "status": PublicationRenderStatus.FAILED,
+                "status": TypstRenderStatus.FAILED,
                 "error_code": error_code,
                 "error_message": error_message,
                 "updated_at": datetime.now(UTC),
@@ -210,7 +193,7 @@ class SqlAlchemyPublicationRenderRepository:
         row = await self._session.get(PublicationRenderRow, render_id)
         if row is None:
             raise LookupError("publication_render_not_found")
-        if row.status != PublicationRenderStatus.RUNNING.value:
+        if row.status != TypstRenderStatus.RUNNING.value:
             raise ValueError("publication_render_not_running")
         return row
 
@@ -227,14 +210,14 @@ def _publication_render_values(row: PublicationRenderRow) -> dict[str, Any]:
         "compiler_version": row.compiler_version,
         "font_bundle_version": row.font_bundle_version,
         "render_policy_version": row.render_policy_version,
-        "format": PublicationRenderFormat(row.format),
+        "format": TypstRenderFormat(row.format),
         "input_hash": row.input_hash,
         "source_blob_id": row.source_blob_id,
         "render_data_blob_id": row.render_data_blob_id,
         "output_blob_id": row.output_blob_id,
         "output_sha256": row.output_sha256,
         "output_byte_size": row.output_byte_size,
-        "status": PublicationRenderStatus(row.status),
+        "status": TypstRenderStatus(row.status),
         "error_code": row.error_code,
         "error_message": row.error_message,
         "created_at": row.created_at,

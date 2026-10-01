@@ -224,7 +224,8 @@ class _ReleaseRematerializer:
     def __init__(self) -> None:
         self.edition_ids: list[UUID] = []
 
-    async def materialize(self, edition_id: UUID) -> None:
+    async def materialize(self, edition_id: UUID, *, edition_render_id: UUID | None) -> None:
+        del edition_render_id
         self.edition_ids.append(edition_id)
 
 
@@ -427,7 +428,8 @@ async def test_api_rematerializes_release_with_verified_identity() -> None:
 @pytest.mark.asyncio
 async def test_api_returns_conflict_when_release_has_no_successful_render() -> None:
     class _NoSuccessfulRender:
-        async def materialize(self, _edition_id: UUID) -> None:
+        async def materialize(self, _edition_id: UUID, *, edition_render_id: UUID | None) -> None:
+            del edition_render_id
             raise EditionReleaseMaterializationError("edition_render_not_available")
 
     application = _api(_Uow(_edition(), _row(ProductionRunStatus.READY)))

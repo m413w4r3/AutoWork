@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any, cast
@@ -64,16 +65,6 @@ class _Artifacts:
             and artifact.status is not ProductionArtifactStatus.STALE
         ]
         return max(matches, key=lambda artifact: artifact.version) if matches else None
-
-
-class _PublicationArtifactWithoutRenderedBlob:
-    def __init__(self, artifact: ProductionArtifact) -> None:
-        self._artifact = artifact
-
-    def __getattr__(self, name: str) -> Any:
-        if name == "rendered_blob_id":
-            raise AssertionError("PUBLICATION must not read rendered_blob_id")
-        return getattr(self._artifact, name)
 
 
 class _Sources:
@@ -203,7 +194,6 @@ def _artifact(
     canonical_blob_id: UUID,
     *,
     version: int = 1,
-    rendered_blob_id: UUID | None = None,
 ) -> ProductionArtifact:
     return ProductionArtifact(
         id=uuid4(),
@@ -214,7 +204,6 @@ def _artifact(
         input_hash="a" * 64,
         raw_blob_id=uuid4(),
         canonical_blob_id=canonical_blob_id,
-        rendered_blob_id=rendered_blob_id,
     )
 
 
@@ -280,20 +269,9 @@ async def test_content_without_production_is_stable_404(subject: Subject) -> Non
 async def test_content_returns_current_artifact_without_raw_blob(subject: Subject) -> None:
     run = _run(generation=3)
     canonical_id = uuid4()
-    rendered_id = uuid4()
-    artifact = _PublicationArtifactWithoutRenderedBlob(
-        _artifact(
-            run,
-            ProductionArtifactStage.PUBLICATION,
-            canonical_id,
-            rendered_blob_id=rendered_id,
-        )
-    )
-    payloads = _Payloads({canonical_id: _document("Current title"), rendered_id: "# Current title"})
-    app = _app(
-        _Uow(subject, [run], [cast(ProductionArtifact, artifact)]),
-        payloads,
-    )
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, canonical_id)
+    payloads = _Payloads({canonical_id: _document("Current title")})
+    app = _app(_Uow(subject, [run], [artifact]), payloads)
 
     async with await _client(app) as api:
         response = await api.get(f"/api/subjects/{SUBJECT_ID}/content")
@@ -375,6 +353,32 @@ async def test_subject_publication_pdf_checks_output_integrity(subject: Subject)
 
     assert response.status_code == 500
     assert response.json()["detail"]["code"] == "publication_pdf_integrity_mismatch"
+
+
+@pytest.mark.anyio
+async def test_unverified_publication_keeps_its_preview_but_has_no_pdf(subject: Subject) -> None:
+    run = _run()
+    canonical_id = uuid4()
+    artifact = replace(
+        _artifact(run, ProductionArtifactStage.PUBLICATION, canonical_id),
+        status=ProductionArtifactStatus.NEEDS_REVIEW,
+    )
+    renderer = _PublicationRenderService()
+    app = _app(
+        _Uow(subject, [run], [artifact]),
+        _Payloads({canonical_id: _document("Needs review")}),
+        renderer,
+    )
+
+    async with await _client(app) as api:
+        content = await api.get(f"/api/subjects/{SUBJECT_ID}/content")
+        pdf = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert content.status_code == 200
+    assert content.json()["status"] == "needs_review"
+    assert pdf.status_code == 409
+    assert pdf.json()["detail"]["code"] == "publication_not_verified"
+    assert renderer.artifact_ids == []
 
 
 @pytest.mark.anyio

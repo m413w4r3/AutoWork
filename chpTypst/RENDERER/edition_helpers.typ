@@ -1,14 +1,22 @@
-#import "../UTILS/colors.typ": purple
+#import "../UTILS/colors.typ": light-grey, purple
 #import "../UTILS/helpers.typ": article, article-indexing
-#import "publication_helpers.typ":
-  publication-timeline-events,
-  render-publication-body
+#import "publication_helpers.typ": publication-timeline-events, render-publication-body
 
 #let has-text(value) = value != none and value != ""
 
 #let article-number(position) = {
   let value = str(position)
   if position < 10 { "0" + value } else { value }
+}
+
+#let render-edition-footer(edition) = context {
+  set text(size: 9pt)
+  line(length: 100%, stroke: 0.6pt + light-grey)
+  grid(
+    columns: (1fr, auto),
+    [#edition.edition.country — #edition.edition.period_start / #edition.edition.period_end],
+    [#counter(page).display() / #counter(page).final().first()],
+  )
 }
 
 #let render-edition(edition) = {

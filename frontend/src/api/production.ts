@@ -275,7 +275,7 @@ export interface ArtifactResponse {
   reused_from_artifact_id?: string | null;
   reused_from_created_at?: string | null;
   metadata: Record<string, unknown>;
-  /** Legacy rendered text remains available for non-PUBLICATION stages. */
+  /** Legacy rendered text; never present for the PUBLICATION stage. */
   rendered_content?: string | null;
   canonical_content:
     | PublicationDocumentV4

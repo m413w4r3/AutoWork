@@ -1,7 +1,6 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import FastAPI, Request
@@ -104,10 +103,6 @@ configure_logging(settings.log_level)
 
 
 logger = logging.getLogger(__name__)
-
-
-def _typst_bundle_paths() -> tuple[Path, Path, Path]:
-    return typst_bundle_paths()
 
 
 @asynccontextmanager
@@ -257,7 +252,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         uow_factory,
         production_artifact_store,
     )
-    chp_typst_root, font_bundle_root, typst_fonts_lock_path = _typst_bundle_paths()
+    chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_bundle_paths()
     typst_compiler = TypstSubprocessCompiler()
     media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
     edition_typst_renderer = EditionTypstRenderer()
@@ -322,7 +317,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     production_chain.bind(job_service, job_dispatcher)
     app.state.job_service = job_service
     app.state.job_dispatcher = job_dispatcher
-    app.state.edition_render_service = edition_render_service
     app.state.edition_service = EditionService(uow_factory)
     app.state.subject_service = SubjectService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
@@ -379,11 +373,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_dispatcher=job_dispatcher,
         repair_issue_reader=production_repair_issue_service,
     )
-    app.state.typst_compiler = typst_compiler
-    app.state.media_asset_store = media_asset_store
-    app.state.chp_typst_root = chp_typst_root
-    app.state.font_bundle_root = font_bundle_root
-    app.state.typst_fonts_lock_path = typst_fonts_lock_path
     app.state.edition_preview_service = EditionPreviewService(
         uow_factory,
         production_artifact_store,

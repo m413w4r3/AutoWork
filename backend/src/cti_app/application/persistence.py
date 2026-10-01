@@ -40,7 +40,7 @@ from cti_app.domain.edition_publication import (
     PublicationManifestExclusionV1,
     PublicationManifestV1,
 )
-from cti_app.domain.edition_render import EditionRender, EditionRenderAcquisition
+from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
@@ -80,7 +80,7 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SourceExtraction,
 )
-from cti_app.domain.publication_render import PublicationRender, PublicationRenderAcquisition
+from cti_app.domain.publication_render import PublicationRender
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.selection import (
@@ -88,6 +88,7 @@ from cti_app.domain.selection import (
     SelectionIdempotencyRecord,
     SubjectDiscoveryOrigin,
 )
+from cti_app.domain.typst_render import TypstRenderAcquisition
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
 
@@ -126,7 +127,7 @@ class PublicationRenderRepository(Protocol):
 
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
-    ) -> PublicationRenderAcquisition: ...
+    ) -> TypstRenderAcquisition[PublicationRender]: ...
 
     async def reacquire_invalid_succeeded(
         self,
@@ -134,11 +135,9 @@ class PublicationRenderRepository(Protocol):
         *,
         observed_output_blob_id: UUID,
         observed_output_sha256: str,
-    ) -> PublicationRenderAcquisition: ...
+    ) -> TypstRenderAcquisition[PublicationRender]: ...
 
     async def add(self, render: PublicationRender) -> PublicationRender: ...
-
-    async def mark_retrying(self, render_id: UUID) -> PublicationRender: ...
 
     async def mark_succeeded(
         self,
@@ -175,7 +174,7 @@ class EditionRenderRepository(Protocol):
 
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
-    ) -> EditionRenderAcquisition: ...
+    ) -> TypstRenderAcquisition[EditionRender]: ...
 
     async def reacquire_invalid_succeeded(
         self,
@@ -183,7 +182,7 @@ class EditionRenderRepository(Protocol):
         *,
         observed_output_blob_id: UUID,
         observed_output_sha256: str,
-    ) -> EditionRenderAcquisition: ...
+    ) -> TypstRenderAcquisition[EditionRender]: ...
 
     async def mark_succeeded(
         self,

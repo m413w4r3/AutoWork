@@ -6,12 +6,14 @@ import pytest
 
 from cti_app.domain.publication_render import (
     PublicationRender,
-    PublicationRenderAcquisition,
-    PublicationRenderAcquisitionOutcome,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
     compute_publication_render_input_hash,
-    publication_render_acquisition_outcome,
+)
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
+    typst_render_acquisition_outcome,
 )
 
 
@@ -27,7 +29,7 @@ def _identity() -> dict[str, object]:
         "compiler_version": "0.15.1",
         "font_bundle_version": "chp-fonts-v1",
         "render_policy_version": "typst-publication-v4-v1",
-        "format": PublicationRenderFormat.PDF,
+        "format": TypstRenderFormat.PDF,
     }
 
 
@@ -44,14 +46,14 @@ def _render(**overrides: object) -> PublicationRender:
         "compiler_version": "0.15.1",
         "font_bundle_version": "chp-fonts-v1",
         "render_policy_version": "typst-publication-v4-v1",
-        "format": PublicationRenderFormat.PDF,
+        "format": TypstRenderFormat.PDF,
         "input_hash": "b" * 64,
         "source_blob_id": None,
         "render_data_blob_id": None,
         "output_blob_id": None,
         "output_sha256": None,
         "output_byte_size": None,
-        "status": PublicationRenderStatus.RUNNING,
+        "status": TypstRenderStatus.RUNNING,
         "error_code": None,
         "error_message": None,
         "created_at": now,
@@ -89,12 +91,12 @@ def test_publication_render_has_the_exact_frozen_slotted_contract() -> None:
     render = _render()
     assert not hasattr(render, "__dict__")
     with pytest.raises(AttributeError):
-        render.status = PublicationRenderStatus.FAILED  # type: ignore[misc]
+        render.status = TypstRenderStatus.FAILED  # type: ignore[misc]
 
 
 def test_publication_render_validates_enum_and_status_invariants() -> None:
-    assert tuple(item.value for item in PublicationRenderFormat) == ("pdf",)
-    assert tuple(item.value for item in PublicationRenderStatus) == (
+    assert tuple(item.value for item in TypstRenderFormat) == ("pdf",)
+    assert tuple(item.value for item in TypstRenderStatus) == (
         "running",
         "succeeded",
         "failed",
@@ -105,9 +107,9 @@ def test_publication_render_validates_enum_and_status_invariants() -> None:
     with pytest.raises(ValueError, match="status"):
         _render(status="running")
     with pytest.raises(ValueError, match="output metadata"):
-        _render(status=PublicationRenderStatus.SUCCEEDED)
+        _render(status=TypstRenderStatus.SUCCEEDED)
     with pytest.raises(ValueError, match="error_code"):
-        _render(status=PublicationRenderStatus.FAILED)
+        _render(status=TypstRenderStatus.FAILED)
     with pytest.raises(ValueError, match="template_sha256"):
         _render(template_sha256="A" * 64)
     with pytest.raises(ValueError, match="font_bundle_version"):
@@ -161,7 +163,7 @@ def test_render_id_and_timestamps_do_not_affect_the_render_input_hash() -> None:
 
 
 def test_publication_render_acquisition_outcomes_are_typed_and_match_status() -> None:
-    assert tuple(item.value for item in PublicationRenderAcquisitionOutcome) == (
+    assert tuple(item.value for item in TypstRenderAcquisitionOutcome) == (
         "acquired",
         "reusable_succeeded",
         "in_progress",
@@ -169,20 +171,20 @@ def test_publication_render_acquisition_outcomes_are_typed_and_match_status() ->
     stale_before = datetime.now(UTC) - timedelta(seconds=30)
     running = _render()
 
-    acquisition = PublicationRenderAcquisition(
-        PublicationRenderAcquisitionOutcome.ACQUIRED,
+    acquisition = TypstRenderAcquisition(
+        TypstRenderAcquisitionOutcome.ACQUIRED,
         running,
     )
     assert (
-        publication_render_acquisition_outcome(
+        typst_render_acquisition_outcome(
             running,
             stale_running_before=stale_before,
         )
-        is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+        is TypstRenderAcquisitionOutcome.IN_PROGRESS
     )
     with pytest.raises(ValueError, match="does not match"):
-        PublicationRenderAcquisition(
-            PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
+        TypstRenderAcquisition(
+            TypstRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
             running,
         )
     assert acquisition.render is running

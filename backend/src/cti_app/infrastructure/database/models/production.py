@@ -148,6 +148,10 @@ class ProductionArtifactRow(Base):
             "reused_from_artifact_id IS NULL OR reused_from_artifact_id <> id",
             name="ck_artifact_reuse_not_self",
         ),
+        CheckConstraint(
+            "stage <> 'publication' OR rendered_blob_id IS NULL",
+            name="ck_artifact_publication_no_rendered_blob",
+        ),
         Index("ix_production_artifacts_run_stage_version", "production_run_id", "stage", "version"),
         Index(
             "ix_production_artifacts_reuse_lookup",

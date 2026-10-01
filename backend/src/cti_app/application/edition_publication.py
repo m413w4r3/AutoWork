@@ -40,20 +40,22 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_repairs import (
     publication_is_compatible_with_current_effective_inputs,
 )
+from cti_app.application.typst_render_output import (
+    TypstRenderOutputIntegrityError,
+    TypstRenderOutputStorageError,
+    read_verified_render_pdf,
+)
 from cti_app.domain.edition_publication import (
     EditionRelease,
     PublicationManifestEntryV1,
     PublicationManifestExclusionV1,
     PublicationManifestV1,
 )
-from cti_app.domain.edition_render import (
-    EditionRender,
-    EditionRenderDisplayStatus,
-    EditionRenderStatus,
-)
+from cti_app.domain.edition_render import EditionRender, EditionRenderDisplayStatus
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.typst_render import TypstRenderStatus
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,24 @@ class PublicationAssemblyError(PublicationError):
 
 class PublicationManifestNotFoundError(PublicationError):
     pass
+
+
+class ReleasePdfNotAvailableError(PublicationError):
+    """The latest release has no successfully rendered PDF yet."""
+
+
+class ReleasePdfUnreadableError(PublicationError):
+    """The rendered PDF recorded for the release cannot be served."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class EditionReleasePdf:
+    content: bytes
+    filename: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,7 +134,7 @@ class EditionReleaseStatus:
 
     @property
     def pdf_available(self) -> bool:
-        return self.render is not None and self.render.status is EditionRenderStatus.SUCCEEDED
+        return self.render is not None and self.render.status is TypstRenderStatus.SUCCEEDED
 
     @property
     def render_id(self) -> UUID | None:
@@ -122,18 +142,22 @@ class EditionReleaseStatus:
 
     @property
     def render_status(self) -> EditionRenderDisplayStatus:
-        if self.render is not None:
-            return EditionRenderDisplayStatus(self.render.status.value)
+        if self.render is not None and self.render.status is TypstRenderStatus.SUCCEEDED:
+            return EditionRenderDisplayStatus.SUCCEEDED
         if self.release is None:
             return EditionRenderDisplayStatus.NONE
+        # An active job supersedes a FAILED row: a retry stays visible as work in
+        # progress until the worker takes the row over.
         if self.render_job_status is JobStatus.QUEUED:
             return EditionRenderDisplayStatus.QUEUED
         if self.render_job_status is JobStatus.RUNNING:
             return EditionRenderDisplayStatus.RUNNING
+        if self.render is not None:
+            return EditionRenderDisplayStatus(self.render.status.value)
         if self.render_job_status in {JobStatus.FAILED, JobStatus.CANCELLED}:
             return EditionRenderDisplayStatus.FAILED
-        # Without a render row, only an active queued/running job proves work
-        # has started; otherwise the honest state is not_started.
+        # Without a render row, only an active job proves work has started;
+        # otherwise the honest state is not_started.
         return EditionRenderDisplayStatus.NOT_STARTED
 
     @property
@@ -161,7 +185,7 @@ class EditionReleaseStatus:
 
     @property
     def published_at(self) -> datetime | None:
-        if self.render is None or self.render.status is not EditionRenderStatus.SUCCEEDED:
+        if self.render is None or self.render.status is not TypstRenderStatus.SUCCEEDED:
             return None
         return self.render.updated_at
 
@@ -267,92 +291,17 @@ class EditionPublicationService:
     ) -> tuple[UUID | None, bool]:
         if self._job_service is None or self._job_dispatcher is None:
             return None, False
-        try:
-            jobs = await self._job_service.list_for_aggregate(
-                "edition", manifest.edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
-            )
-            job = _latest_assembly_job(jobs, manifest.id)
-            if job is None:
-                job = await self._submit_assembly_job(
-                    manifest,
-                    idempotency_key=f"publication-assemble-{manifest.id}",
-                    correlation_id=correlation_id,
-                    actor_id=actor_id,
-                    max_attempts=3,
-                )
-
-            # The policy is deliberately publication-specific.  A terminal
-            # failed job can be reused while it still has manual attempts;
-            # once exhausted (or cancelled), the successor gets a distinct
-            # deterministic idempotency key.
-            for _ in range(3):
-                if job.status is JobStatus.QUEUED:
-                    break
-                if job.status in {
-                    JobStatus.RUNNING,
-                    JobStatus.SUCCEEDED,
-                    JobStatus.WAITING_HUMAN,
-                }:
-                    return job.id, False
-                if job.status is JobStatus.FAILED and job.attempt < job.max_attempts:
-                    try:
-                        job = await self._job_service.retry(job.id, actor_id=actor_id)
-                    except InvalidJobTransitionError:
-                        # A concurrent accept may have repaired the same job.
-                        # Reload it and apply the state policy to the winner.
-                        job = await self._job_service.get(job.id)
-                    continue
-                if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
-                    previous_job_id = job.id
-                    job = await self._submit_assembly_job(
-                        manifest,
-                        idempotency_key=(
-                            f"publication-assemble-{manifest.id}-after-{previous_job_id}"
-                        ),
-                        correlation_id=correlation_id,
-                        actor_id=actor_id,
-                        max_attempts=job.max_attempts,
-                    )
-                    continue
-            else:
-                raise RuntimeError("publication assembly job state did not stabilize")
-        except Exception:
-            logger.exception(
-                "Unable to assure publication assembly job for manifest %s", manifest.id
-            )
-            return None, False
-
-        try:
-            await self._job_dispatcher.dispatch(job.id)
-        except Exception:
-            # The committed freeze is the durable result.  A later accept call
-            # will find this idempotent job and retry the dispatch.
-            logger.exception("Unable to dispatch publication assembly job %s", job.id)
-            return job.id, False
-        return job.id, True
-
-    async def _submit_assembly_job(
-        self,
-        manifest: PublicationManifestV1,
-        *,
-        idempotency_key: str,
-        correlation_id: str,
-        actor_id: str,
-        max_attempts: int,
-    ) -> Job:
-        try:
-            return await self._job_service.submit(  # type: ignore[union-attr]
-                kind=EDITION_ASSEMBLE_JOB_KIND,
-                aggregate_type="edition",
-                aggregate_id=manifest.edition_id,
-                idempotency_key=idempotency_key,
-                correlation_id=correlation_id,
-                input_parameters={"manifest_id": str(manifest.id)},
-                max_attempts=max_attempts,
-                actor_id=actor_id,
-            )
-        except DuplicateJobError as exc:
-            return await self._job_service.get(exc.existing_job_id)  # type: ignore[union-attr]
+        return await _ensure_queued_job(
+            self._job_service,
+            self._job_dispatcher,
+            kind=EDITION_ASSEMBLE_JOB_KIND,
+            edition_id=manifest.edition_id,
+            parameter_name="manifest_id",
+            parameter_value=manifest.id,
+            idempotency_prefix=f"publication-assemble-{manifest.id}",
+            correlation_id=correlation_id,
+            actor_id=actor_id,
+        )
 
     async def release_status(self, edition_id: UUID) -> EditionReleaseStatus:
         async with self._uow_factory() as uow:
@@ -365,10 +314,9 @@ class EditionPublicationService:
                 if manifest is not None
                 else None
             )
-            render_repository = getattr(uow, "edition_renders", None)
             render = (
-                await render_repository.get_latest_for_release(release.id)
-                if release is not None and render_repository is not None
+                await uow.edition_renders.get_latest_for_release(release.id)
+                if release is not None
                 else None
             )
             assembly_job = None
@@ -430,6 +378,34 @@ class EditionPublicationService:
                 ),
             )
 
+    async def read_release_pdf(self, edition_id: UUID) -> EditionReleasePdf:
+        """Return the verified PDF of the latest release's most recent successful render."""
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            release = (
+                await uow.edition_releases.get_by_manifest(manifest.id)
+                if manifest is not None
+                else None
+            )
+            render = (
+                await uow.edition_renders.get_latest_for_release(release.id)
+                if release is not None
+                else None
+            )
+            await uow.commit()
+        if edition is None or release is None:
+            raise PublicationManifestNotFoundError("edition_release_not_found")
+        if render is None or render.status is not TypstRenderStatus.SUCCEEDED:
+            raise ReleasePdfNotAvailableError("release_pdf_not_available")
+        try:
+            content = await read_verified_render_pdf(self._artifact_store, render)
+        except TypstRenderOutputStorageError as exc:
+            raise ReleasePdfUnreadableError("release_pdf_storage_error") from exc
+        except TypstRenderOutputIntegrityError as exc:
+            raise ReleasePdfUnreadableError("release_pdf_integrity_mismatch") from exc
+        return EditionReleasePdf(content=content, filename=edition.bulletin_pdf_filename())
+
     async def retry_render(
         self,
         edition_id: UUID,
@@ -446,16 +422,15 @@ class EditionPublicationService:
                 if manifest is not None
                 else None
             )
-            render_repository = getattr(uow, "edition_renders", None)
             render = (
-                await render_repository.get_latest_for_release(release.id)
-                if release is not None and render_repository is not None
+                await uow.edition_renders.get_latest_for_release(release.id)
+                if release is not None
                 else None
             )
             await uow.commit()
         if edition is None or release is None:
             raise PublicationManifestNotFoundError("edition_release_not_found")
-        if render is not None and render.status is EditionRenderStatus.SUCCEEDED:
+        if render is not None and render.status is TypstRenderStatus.SUCCEEDED:
             return await self.release_status(edition_id)
 
         await ensure_edition_render_job(
@@ -622,9 +597,9 @@ def register_publication_jobs(
     registry: JobRegistry,
     uow_factory: ProductionUnitOfWorkFactory,
     assembly_service: EditionAssemblyService,
-    render_service: EditionRenderService | None = None,
-    job_dispatcher: JobDispatcher | None = None,
-    release_rematerializer: EditionReleaseRematerializationService | None = None,
+    render_service: EditionRenderService,
+    job_dispatcher: JobDispatcher,
+    release_rematerializer: EditionReleaseRematerializationService,
 ) -> None:
     async def handle_assembly(parameters: JobParameters, context: JobExecutionContext) -> str:
         if not isinstance(parameters, EditionAssembleParameters):
@@ -650,17 +625,14 @@ def register_publication_jobs(
     async def handle_render(parameters: JobParameters, context: JobExecutionContext) -> str:
         if not isinstance(parameters, EditionRenderParameters):
             raise TypeError("Invalid edition render parameters")
-        if render_service is None:
-            raise RuntimeError("Edition render service is not configured")
         render = await render_service.render_pdf(parameters.edition_release_id)
-        if release_rematerializer is not None:
-            try:
-                await release_rematerializer.materialize(
-                    edition_release_id=render.edition_release_id,
-                    edition_render_id=render.id,
-                )
-            except Exception:
-                logger.exception("Unable to materialize edition release after render %s", render.id)
+        try:
+            await release_rematerializer.materialize(
+                edition_release_id=render.edition_release_id,
+                edition_render_id=render.id,
+            )
+        except Exception:
+            logger.exception("Unable to materialize edition release after render %s", render.id)
         try:
             await context.report_progress(1, 1, "PDF du bulletin prêt")
         except Exception:
@@ -803,14 +775,22 @@ async def _get_run_for_update(uow: Any, run_id: UUID) -> Any:
     return await getter(run_id) if getter is not None else await repository.get(run_id)
 
 
-def _latest_assembly_job(jobs: Any, manifest_id: UUID) -> Job | None:
+def _latest_job(jobs: Any, kind: str, parameter_name: str, parameter_value: UUID) -> Job | None:
     matching = [
         job
         for job in jobs
-        if job.kind == EDITION_ASSEMBLE_JOB_KIND
-        and str(job.input_parameters.get("manifest_id")) == str(manifest_id)
+        if job.kind == kind
+        and str(job.input_parameters.get(parameter_name)) == str(parameter_value)
     ]
     return max(matching, key=lambda job: (job.created_at, str(job.id)), default=None)
+
+
+def _latest_assembly_job(jobs: Any, manifest_id: UUID) -> Job | None:
+    return _latest_job(jobs, EDITION_ASSEMBLE_JOB_KIND, "manifest_id", manifest_id)
+
+
+def _latest_render_job(jobs: Any, edition_release_id: UUID) -> Job | None:
+    return _latest_job(jobs, EDITION_RENDER_JOB_KIND, "edition_release_id", edition_release_id)
 
 
 async def ensure_edition_render_job(
@@ -825,55 +805,81 @@ async def ensure_edition_render_job(
     """Idempotently queue and dispatch the PDF render for a committed release."""
     if job_service is None:
         return None, False
-    try:
-        jobs = await job_service.list_for_aggregate(
-            "edition", edition_id, kind=EDITION_RENDER_JOB_KIND
-        )
-        job = _latest_render_job(jobs, edition_release_id)
-        if job is None:
-            job = await _submit_render_job(
-                job_service,
-                edition_id=edition_id,
-                edition_release_id=edition_release_id,
-                idempotency_key=f"edition-render-{edition_release_id}",
-                correlation_id=correlation_id,
-                actor_id=actor_id,
-                max_attempts=3,
-            )
+    return await _ensure_queued_job(
+        job_service,
+        job_dispatcher,
+        kind=EDITION_RENDER_JOB_KIND,
+        edition_id=edition_id,
+        parameter_name="edition_release_id",
+        parameter_value=edition_release_id,
+        idempotency_prefix=f"edition-render-{edition_release_id}",
+        correlation_id=correlation_id,
+        actor_id=actor_id,
+    )
 
+
+async def _ensure_queued_job(
+    job_service: JobService,
+    job_dispatcher: JobDispatcher | None,
+    *,
+    kind: str,
+    edition_id: UUID,
+    parameter_name: str,
+    parameter_value: UUID,
+    idempotency_prefix: str,
+    correlation_id: str,
+    actor_id: str,
+) -> tuple[UUID | None, bool]:
+    """Reuse, repair or succeed the job for one frozen input, then dispatch it.
+
+    Failing to assure or dispatch the job never invalidates the committed
+    canonical state; a later call finds the same idempotent job and retries.
+    """
+
+    async def submit(idempotency_key: str, max_attempts: int) -> Job:
+        try:
+            return await job_service.submit(
+                kind=kind,
+                aggregate_type="edition",
+                aggregate_id=edition_id,
+                idempotency_key=idempotency_key,
+                correlation_id=correlation_id,
+                input_parameters={parameter_name: str(parameter_value)},
+                max_attempts=max_attempts,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            return await job_service.get(exc.existing_job_id)
+
+    try:
+        jobs = await job_service.list_for_aggregate("edition", edition_id, kind=kind)
+        job = _latest_job(jobs, kind, parameter_name, parameter_value)
+        if job is None:
+            job = await submit(idempotency_prefix, 3)
+
+        # A terminal failed job is reused while it still has manual attempts;
+        # once exhausted (or cancelled), the successor gets a distinct
+        # deterministic idempotency key.
         for _ in range(3):
             if job.status is JobStatus.QUEUED:
                 break
-            if job.status in {
-                JobStatus.RUNNING,
-                JobStatus.SUCCEEDED,
-                JobStatus.WAITING_HUMAN,
-            }:
+            if job.status in {JobStatus.RUNNING, JobStatus.SUCCEEDED, JobStatus.WAITING_HUMAN}:
                 return job.id, False
             if job.status is JobStatus.FAILED and job.attempt < job.max_attempts:
                 try:
                     job = await job_service.retry(job.id, actor_id=actor_id)
                 except InvalidJobTransitionError:
+                    # A concurrent caller may have repaired the same job.
+                    # Reload it and apply the state policy to the winner.
                     job = await job_service.get(job.id)
                 continue
             if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
-                previous_job_id = job.id
-                job = await _submit_render_job(
-                    job_service,
-                    edition_id=edition_id,
-                    edition_release_id=edition_release_id,
-                    idempotency_key=(
-                        f"edition-render-{edition_release_id}-after-{previous_job_id}"
-                    ),
-                    correlation_id=correlation_id,
-                    actor_id=actor_id,
-                    max_attempts=job.max_attempts,
-                )
+                job = await submit(f"{idempotency_prefix}-after-{job.id}", job.max_attempts)
                 continue
         else:
-            raise RuntimeError("edition render job state did not stabilize")
+            raise RuntimeError(f"{kind} job state did not stabilize")
     except Exception:
-        logger.exception("Unable to assure edition render job for release %s", edition_release_id)
+        logger.exception("Unable to assure %s job for %s %s", kind, parameter_name, parameter_value)
         return None, False
 
     if job_dispatcher is None:
@@ -881,44 +887,9 @@ async def ensure_edition_render_job(
     try:
         await job_dispatcher.dispatch(job.id)
     except Exception:
-        logger.exception("Unable to dispatch edition render job %s", job.id)
+        logger.exception("Unable to dispatch %s job %s", kind, job.id)
         return job.id, False
     return job.id, True
-
-
-async def _submit_render_job(
-    job_service: JobService,
-    *,
-    edition_id: UUID,
-    edition_release_id: UUID,
-    idempotency_key: str,
-    correlation_id: str,
-    actor_id: str,
-    max_attempts: int,
-) -> Job:
-    try:
-        return await job_service.submit(
-            kind=EDITION_RENDER_JOB_KIND,
-            aggregate_type="edition",
-            aggregate_id=edition_id,
-            idempotency_key=idempotency_key,
-            correlation_id=correlation_id,
-            input_parameters={"edition_release_id": str(edition_release_id)},
-            max_attempts=max_attempts,
-            actor_id=actor_id,
-        )
-    except DuplicateJobError as exc:
-        return await job_service.get(exc.existing_job_id)
-
-
-def _latest_render_job(jobs: Any, edition_release_id: UUID) -> Job | None:
-    matching = [
-        job
-        for job in jobs
-        if job.kind == EDITION_RENDER_JOB_KIND
-        and str(job.input_parameters.get("edition_release_id")) == str(edition_release_id)
-    ]
-    return max(matching, key=lambda job: (job.created_at, str(job.id)), default=None)
 
 
 __all__ = [
@@ -927,12 +898,15 @@ __all__ = [
     "EditionAssembleParameters",
     "EditionAssemblyService",
     "EditionPublicationService",
+    "EditionReleasePdf",
     "EditionReleaseStatus",
     "EditionRenderParameters",
     "PublicationAcceptResult",
     "PublicationAcceptanceError",
     "PublicationAssemblyError",
     "PublicationManifestNotFoundError",
+    "ReleasePdfNotAvailableError",
+    "ReleasePdfUnreadableError",
     "ensure_edition_render_job",
     "register_publication_jobs",
 ]

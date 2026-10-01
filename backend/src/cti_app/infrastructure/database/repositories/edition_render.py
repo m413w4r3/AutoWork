@@ -6,15 +6,15 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cti_app.domain.edition_render import (
-    EditionRender,
-    EditionRenderAcquisition,
-    EditionRenderAcquisitionOutcome,
-    EditionRenderFormat,
-    EditionRenderStatus,
-    edition_render_acquisition_outcome,
-    edition_render_retrying,
-    invalid_succeeded_edition_render_reacquisition_outcome,
+from cti_app.domain.edition_render import EditionRender
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
+    invalid_succeeded_reacquisition_outcome,
+    typst_render_acquisition_outcome,
+    typst_render_retrying,
 )
 from cti_app.infrastructure.database.models.edition_render import EditionRenderRow
 
@@ -49,7 +49,7 @@ class SqlAlchemyEditionRenderRepository:
             select(EditionRenderRow)
             .where(
                 EditionRenderRow.edition_release_id == edition_release_id,
-                EditionRenderRow.status == EditionRenderStatus.SUCCEEDED.value,
+                EditionRenderRow.status == TypstRenderStatus.SUCCEEDED.value,
             )
             .order_by(EditionRenderRow.created_at.desc(), EditionRenderRow.id.desc())
             .limit(1)
@@ -58,7 +58,7 @@ class SqlAlchemyEditionRenderRepository:
 
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
-    ) -> EditionRenderAcquisition:
+    ) -> TypstRenderAcquisition[EditionRender]:
         """Atomically create, reuse, retry, or take over a render for its input hash."""
         while True:
             inserted_id = await self._session.scalar(
@@ -68,8 +68,8 @@ class SqlAlchemyEditionRenderRepository:
                 .returning(EditionRenderRow.id)
             )
             if inserted_id is not None:
-                return EditionRenderAcquisition(
-                    EditionRenderAcquisitionOutcome.ACQUIRED,
+                return TypstRenderAcquisition(
+                    TypstRenderAcquisitionOutcome.ACQUIRED,
                     proposed,
                 )
 
@@ -84,16 +84,16 @@ class SqlAlchemyEditionRenderRepository:
                 # insert so this operation still never exposes an IntegrityError.
                 continue
             existing = _edition_render_from_row(row)
-            outcome = edition_render_acquisition_outcome(
+            outcome = typst_render_acquisition_outcome(
                 existing,
                 stale_running_before=stale_running_before,
             )
-            if outcome is EditionRenderAcquisitionOutcome.ACQUIRED:
-                updated = edition_render_retrying(existing, now=datetime.now(UTC))
+            if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+                updated = typst_render_retrying(existing, now=datetime.now(UTC))
                 _apply_edition_render(row, updated)
                 await self._session.flush()
-                return EditionRenderAcquisition(outcome, updated)
-            return EditionRenderAcquisition(outcome, existing)
+                return TypstRenderAcquisition(outcome, updated)
+            return TypstRenderAcquisition(outcome, existing)
 
     async def reacquire_invalid_succeeded(
         self,
@@ -101,18 +101,18 @@ class SqlAlchemyEditionRenderRepository:
         *,
         observed_output_blob_id: UUID,
         observed_output_sha256: str,
-    ) -> EditionRenderAcquisition:
+    ) -> TypstRenderAcquisition[EditionRender]:
         """Take ownership of a corrupt cached output with a guarded transition."""
         update_result = await self._session.execute(
             update(EditionRenderRow)
             .where(
                 EditionRenderRow.id == proposed.id,
-                EditionRenderRow.status == EditionRenderStatus.SUCCEEDED.value,
+                EditionRenderRow.status == TypstRenderStatus.SUCCEEDED.value,
                 EditionRenderRow.output_blob_id == observed_output_blob_id,
                 EditionRenderRow.output_sha256.is_not_distinct_from(observed_output_sha256),
             )
             .values(
-                status=EditionRenderStatus.RUNNING.value,
+                status=TypstRenderStatus.RUNNING.value,
                 error_code=None,
                 error_message=None,
                 updated_at=datetime.now(UTC),
@@ -123,8 +123,8 @@ class SqlAlchemyEditionRenderRepository:
         updated_row = update_result.scalar_one_or_none()
         if updated_row is not None:
             updated = _edition_render_from_row(updated_row)
-            return EditionRenderAcquisition(
-                EditionRenderAcquisitionOutcome.ACQUIRED,
+            return TypstRenderAcquisition(
+                TypstRenderAcquisitionOutcome.ACQUIRED,
                 updated,
             )
 
@@ -141,17 +141,17 @@ class SqlAlchemyEditionRenderRepository:
             )
 
         existing = _edition_render_from_row(row)
-        outcome = invalid_succeeded_edition_render_reacquisition_outcome(
+        outcome = invalid_succeeded_reacquisition_outcome(
             existing,
             observed_output_blob_id=observed_output_blob_id,
             observed_output_sha256=observed_output_sha256,
         )
-        if outcome is EditionRenderAcquisitionOutcome.ACQUIRED:
-            updated = edition_render_retrying(existing, now=datetime.now(UTC))
+        if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+            updated = typst_render_retrying(existing, now=datetime.now(UTC))
             _apply_edition_render(row, updated)
             await self._session.flush()
-            return EditionRenderAcquisition(outcome, updated)
-        return EditionRenderAcquisition(outcome, existing)
+            return TypstRenderAcquisition(outcome, updated)
+        return TypstRenderAcquisition(outcome, existing)
 
     async def mark_succeeded(
         self,
@@ -172,7 +172,7 @@ class SqlAlchemyEditionRenderRepository:
                 "output_blob_id": output_blob_id,
                 "output_sha256": output_sha256,
                 "output_byte_size": output_byte_size,
-                "status": EditionRenderStatus.SUCCEEDED,
+                "status": TypstRenderStatus.SUCCEEDED,
                 "error_code": None,
                 "error_message": None,
                 "updated_at": datetime.now(UTC),
@@ -197,7 +197,7 @@ class SqlAlchemyEditionRenderRepository:
                 **_edition_render_values(row),
                 "source_blob_id": source_blob_id,
                 "render_data_blob_id": render_data_blob_id,
-                "status": EditionRenderStatus.FAILED,
+                "status": TypstRenderStatus.FAILED,
                 "error_code": error_code,
                 "error_message": error_message,
                 "updated_at": datetime.now(UTC),
@@ -211,7 +211,7 @@ class SqlAlchemyEditionRenderRepository:
         row = await self._session.get(EditionRenderRow, render_id)
         if row is None:
             raise LookupError("edition_render_not_found")
-        if row.status != EditionRenderStatus.RUNNING.value:
+        if row.status != TypstRenderStatus.RUNNING.value:
             raise ValueError("edition_render_not_running")
         return row
 
@@ -228,14 +228,14 @@ def _edition_render_values(row: EditionRenderRow) -> dict[str, Any]:
         "compiler_version": row.compiler_version,
         "font_bundle_version": row.font_bundle_version,
         "render_policy_version": row.render_policy_version,
-        "format": EditionRenderFormat(row.format),
+        "format": TypstRenderFormat(row.format),
         "input_hash": row.input_hash,
         "source_blob_id": row.source_blob_id,
         "render_data_blob_id": row.render_data_blob_id,
         "output_blob_id": row.output_blob_id,
         "output_sha256": row.output_sha256,
         "output_byte_size": row.output_byte_size,
-        "status": EditionRenderStatus(row.status),
+        "status": TypstRenderStatus(row.status),
         "error_code": row.error_code,
         "error_message": row.error_message,
         "created_at": row.created_at,

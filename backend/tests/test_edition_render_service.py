@@ -33,19 +33,20 @@ from cti_app.domain.edition_render import (
     EDITION_RENDER_POLICY_VERSION,
     EDITION_RENDERER,
     EDITION_RENDERER_VERSION,
-    EDITION_TEMPLATE_VERSION,
     EditionRender,
-    EditionRenderAcquisition,
-    EditionRenderAcquisitionOutcome,
-    EditionRenderFormat,
-    EditionRenderStatus,
     compute_edition_render_input_hash,
-    edition_render_acquisition_outcome,
-    edition_render_retrying,
-    invalid_succeeded_edition_render_reacquisition_outcome,
 )
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
+)
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
+    invalid_succeeded_reacquisition_outcome,
+    typst_render_acquisition_outcome,
+    typst_render_retrying,
 )
 
 
@@ -55,13 +56,13 @@ def _identity() -> dict[str, object]:
         "edition_document_sha256": "1" * 64,
         "renderer": EDITION_RENDERER,
         "renderer_version": EDITION_RENDERER_VERSION,
-        "template_version": EDITION_TEMPLATE_VERSION,
+        "template_version": "chp-edition-v1",
         "template_sha256": "2" * 64,
         "compiler": "typst",
         "compiler_version": "0.15.1",
         "font_bundle_version": "chp-fonts-v1",
         "render_policy_version": EDITION_RENDER_POLICY_VERSION,
-        "format": EditionRenderFormat.PDF,
+        "format": TypstRenderFormat.PDF,
     }
 
 
@@ -113,14 +114,14 @@ def _proposed_render(identity: dict[str, object]) -> EditionRender:
         compiler_version=str(identity["compiler_version"]),
         font_bundle_version=str(identity["font_bundle_version"]),
         render_policy_version=str(identity["render_policy_version"]),
-        format=EditionRenderFormat(identity["format"]),  # type: ignore[arg-type]
+        format=TypstRenderFormat(identity["format"]),  # type: ignore[arg-type]
         input_hash=compute_edition_render_input_hash(**identity),  # type: ignore[arg-type]
         source_blob_id=None,
         render_data_blob_id=None,
         output_blob_id=None,
         output_sha256=None,
         output_byte_size=None,
-        status=EditionRenderStatus.RUNNING,
+        status=TypstRenderStatus.RUNNING,
         error_code=None,
         error_message=None,
         created_at=now,
@@ -135,21 +136,21 @@ class _FakeEditionRenders:
 
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
-    ) -> EditionRenderAcquisition:
+    ) -> TypstRenderAcquisition:
         async with self._lock:
             existing = self.renders_by_hash.get(proposed.input_hash)
             if existing is None:
                 self.renders_by_hash[proposed.input_hash] = proposed
-                return EditionRenderAcquisition(EditionRenderAcquisitionOutcome.ACQUIRED, proposed)
+                return TypstRenderAcquisition(TypstRenderAcquisitionOutcome.ACQUIRED, proposed)
 
-            outcome = edition_render_acquisition_outcome(
+            outcome = typst_render_acquisition_outcome(
                 existing,
                 stale_running_before=stale_running_before,
             )
-            if outcome is EditionRenderAcquisitionOutcome.ACQUIRED:
-                existing = edition_render_retrying(existing, now=datetime.now(UTC))
+            if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+                existing = typst_render_retrying(existing, now=datetime.now(UTC))
                 self.renders_by_hash[proposed.input_hash] = existing
-            return EditionRenderAcquisition(outcome, existing)
+            return TypstRenderAcquisition(outcome, existing)
 
 
 @pytest.mark.asyncio
@@ -168,14 +169,14 @@ async def test_fake_repository_acquisition_is_idempotent_for_one_input_hash() ->
 
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -184,7 +185,7 @@ async def test_fake_repository_acquisition_is_idempotent_for_one_input_hash() ->
     owner = next(
         acquisition
         for acquisition in acquisitions
-        if acquisition.outcome is EditionRenderAcquisitionOutcome.ACQUIRED
+        if acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
     )
     assert all(acquisition.render.id == owner.render.id for acquisition in acquisitions)
 
@@ -269,20 +270,20 @@ class _ServiceRenders:
 
     async def acquire_for_render(
         self, proposed: EditionRender, *, stale_running_before: datetime
-    ) -> EditionRenderAcquisition:
+    ) -> TypstRenderAcquisition:
         async with self.lock:
             existing = await self.get_by_input_hash(proposed.input_hash)
             if existing is None:
                 self.renders[proposed.id] = proposed
-                return EditionRenderAcquisition(EditionRenderAcquisitionOutcome.ACQUIRED, proposed)
-            outcome = edition_render_acquisition_outcome(
+                return TypstRenderAcquisition(TypstRenderAcquisitionOutcome.ACQUIRED, proposed)
+            outcome = typst_render_acquisition_outcome(
                 existing,
                 stale_running_before=stale_running_before,
             )
-            if outcome is EditionRenderAcquisitionOutcome.ACQUIRED:
-                existing = edition_render_retrying(existing, now=datetime.now(UTC))
+            if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+                existing = typst_render_retrying(existing, now=datetime.now(UTC))
                 self.renders[existing.id] = existing
-            return EditionRenderAcquisition(outcome, existing)
+            return TypstRenderAcquisition(outcome, existing)
 
     async def reacquire_invalid_succeeded(
         self,
@@ -290,24 +291,24 @@ class _ServiceRenders:
         *,
         observed_output_blob_id: Any,
         observed_output_sha256: str,
-    ) -> EditionRenderAcquisition:
+    ) -> TypstRenderAcquisition:
         async with self.lock:
             existing = self.renders.get(proposed.id)
             if existing is None:
                 self.renders[proposed.id] = proposed
-                return EditionRenderAcquisition(
-                    EditionRenderAcquisitionOutcome.ACQUIRED,
+                return TypstRenderAcquisition(
+                    TypstRenderAcquisitionOutcome.ACQUIRED,
                     proposed,
                 )
-            outcome = invalid_succeeded_edition_render_reacquisition_outcome(
+            outcome = invalid_succeeded_reacquisition_outcome(
                 existing,
                 observed_output_blob_id=observed_output_blob_id,
                 observed_output_sha256=observed_output_sha256,
             )
-            if outcome is EditionRenderAcquisitionOutcome.ACQUIRED:
-                existing = edition_render_retrying(existing, now=datetime.now(UTC))
+            if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+                existing = typst_render_retrying(existing, now=datetime.now(UTC))
                 self.renders[existing.id] = existing
-            return EditionRenderAcquisition(outcome, existing)
+            return TypstRenderAcquisition(outcome, existing)
 
     async def mark_succeeded(
         self,
@@ -327,7 +328,7 @@ class _ServiceRenders:
             output_blob_id=output_blob_id,
             output_sha256=output_sha256,
             output_byte_size=output_byte_size,
-            status=EditionRenderStatus.SUCCEEDED,
+            status=TypstRenderStatus.SUCCEEDED,
             error_code=None,
             error_message=None,
             updated_at=datetime.now(UTC),
@@ -349,7 +350,7 @@ class _ServiceRenders:
             current,
             source_blob_id=source_blob_id,
             render_data_blob_id=render_data_blob_id,
-            status=EditionRenderStatus.FAILED,
+            status=TypstRenderStatus.FAILED,
             error_code=error_code,
             error_message=error_message,
             updated_at=datetime.now(UTC),
@@ -535,7 +536,7 @@ async def test_edition_render_service_reuses_same_inputs_and_only_compiles_once(
     )
 
     assert first.id == second.id
-    assert first.status is EditionRenderStatus.SUCCEEDED
+    assert first.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 1
     assert renderer.documents == [document]
     assert len(renders.renders) == 1
@@ -641,15 +642,38 @@ async def test_failed_compile_keeps_release_and_retry_reacquires_same_render(
     with pytest.raises(TypstCompileFailedError):
         await service.render_pdf(release.id)
     failed = next(iter(renders.renders.values()))
-    assert failed.status is EditionRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert failed.error_code == "typst_compile_failed"
     assert service._uow_factory.releases[release.id] == release  # type: ignore[attr-defined]
 
     succeeded = await service.render_pdf(release.id)
 
     assert succeeded.id == failed.id
-    assert succeeded.status is EditionRenderStatus.SUCCEEDED
+    assert succeeded.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_unexpected_failure_is_recorded_as_failed_and_retry_reacquires_the_row(
+    tmp_path: Path,
+) -> None:
+    service, release, _document, renders, _store, _renderer, compiler, *_ = _service_fixture(
+        tmp_path
+    )
+    compiler.failures.append(RuntimeError("compiler crashed unexpectedly"))
+
+    with pytest.raises(edition_rendering.EditionRenderFailedError) as raised:
+        await service.render_pdf(release.id)
+
+    assert raised.value.code == "edition_render_failed"
+    failed = next(iter(renders.renders.values()))
+    assert failed.status is TypstRenderStatus.FAILED
+    assert failed.error_code == "edition_render_failed"
+
+    succeeded = await service.render_pdf(release.id)
+
+    assert succeeded.id == failed.id
+    assert succeeded.status is TypstRenderStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio

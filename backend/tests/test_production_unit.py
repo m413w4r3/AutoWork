@@ -286,6 +286,19 @@ class TestProductionArtifactValidation:
                 input_hash="invalid",
             )
 
+    def test_publication_artifact_carries_no_rendered_blob(self) -> None:
+        from cti_app.domain.production import ProductionArtifact
+
+        with pytest.raises(ValueError, match="PUBLICATION artifacts carry no rendered blob"):
+            ProductionArtifact(
+                production_run_id=uuid4(),
+                subject_id=uuid4(),
+                stage=ProductionArtifactStage.PUBLICATION,
+                version=1,
+                input_hash="a" * 64,
+                rendered_blob_id=uuid4(),
+            )
+
     def test_artifact_with_valid_sha256(self) -> None:
         from cti_app.domain.production import ProductionArtifact
 

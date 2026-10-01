@@ -17,12 +17,12 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import ProductionArtifact, ProductionArtifactStage, ProductionRun
-from cti_app.domain.publication_render import (
-    PublicationRender,
-    PublicationRenderAcquisition,
-    PublicationRenderAcquisitionOutcome,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
+from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine
 
@@ -97,14 +97,14 @@ def _render(artifact_id: UUID, *, input_hash: str | None = None) -> PublicationR
         compiler_version="0.15.1",
         font_bundle_version="test-font-bundle-v1",
         render_policy_version="test-render-policy-v1",
-        format=PublicationRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
         input_hash=input_hash or sha256(uuid4().bytes).hexdigest(),
         source_blob_id=None,
         render_data_blob_id=None,
         output_blob_id=None,
         output_sha256=None,
         output_byte_size=None,
-        status=PublicationRenderStatus.RUNNING,
+        status=TypstRenderStatus.RUNNING,
         error_code=None,
         error_message=None,
         created_at=now,
@@ -162,10 +162,10 @@ async def _acquire_concurrently(
     *,
     worker_count: int = 8,
     stale_running_before: datetime | None = None,
-) -> list[PublicationRenderAcquisition]:
+) -> list[TypstRenderAcquisition]:
     stale_before = stale_running_before or datetime.now(UTC) - timedelta(minutes=5)
 
-    async def acquire(candidate: PublicationRender) -> PublicationRenderAcquisition:
+    async def acquire(candidate: PublicationRender) -> TypstRenderAcquisition:
         async with uow_factory() as uow:
             result = await uow.publication_renders.acquire_for_render(
                 candidate,
@@ -217,7 +217,7 @@ async def test_publication_render_repository_round_trip_and_transitions(
             output_byte_size=42,
         )
         await uow.commit()
-    assert succeeded.status is PublicationRenderStatus.SUCCEEDED
+    assert succeeded.status is TypstRenderStatus.SUCCEEDED
     assert succeeded.output_byte_size == 42
     assert succeeded.output_blob_id is not None
 
@@ -236,7 +236,7 @@ async def test_publication_render_repository_round_trip_and_transitions(
             error_message="compiler exited with a failure",
         )
         await uow.commit()
-    assert failed.status is PublicationRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert failed.error_code == "typst_compile_failed"
 
 
@@ -366,14 +366,14 @@ async def test_concurrent_acquire_for_render_inserts_one_row(
 
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -381,7 +381,7 @@ async def test_concurrent_acquire_for_render_inserts_one_row(
     async with uow_factory() as uow:
         persisted = await uow.publication_renders.get_by_input_hash(proposed.input_hash)
     assert persisted is not None
-    assert persisted.status is PublicationRenderStatus.RUNNING
+    assert persisted.status is TypstRenderStatus.RUNNING
 
 
 async def test_concurrent_acquire_retries_a_failed_render_once(
@@ -402,14 +402,14 @@ async def test_concurrent_acquire_retries_a_failed_render_once(
 
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -429,14 +429,14 @@ async def test_concurrent_acquire_takes_over_stale_running_once_but_not_fresh_ro
     stale_acquisitions = await _acquire_concurrently(uow_factory, stale)
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in stale_acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in stale_acquisitions
         )
         == len(stale_acquisitions) - 1
@@ -448,7 +448,7 @@ async def test_concurrent_acquire_takes_over_stale_running_once_but_not_fresh_ro
         await uow.commit()
     fresh_acquisitions = await _acquire_concurrently(uow_factory, fresh)
     assert all(
-        acquisition.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+        acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
         for acquisition in fresh_acquisitions
     )
 
@@ -460,7 +460,7 @@ async def test_concurrent_invalid_succeeded_repair_has_one_owner(
     output_blob = await _persist_blob(uow_factory, b"invalid succeeded output fixture")
     succeeded = replace(
         _render(artifact.id),
-        status=PublicationRenderStatus.SUCCEEDED,
+        status=TypstRenderStatus.SUCCEEDED,
         output_blob_id=output_blob.id,
         output_sha256="d" * 64,
         output_byte_size=42,
@@ -468,9 +468,9 @@ async def test_concurrent_invalid_succeeded_repair_has_one_owner(
     async with uow_factory() as uow:
         await uow.publication_renders.add(succeeded)
         await uow.commit()
-    proposed = replace(succeeded, status=PublicationRenderStatus.RUNNING)
+    proposed = replace(succeeded, status=TypstRenderStatus.RUNNING)
 
-    async def reacquire() -> PublicationRenderAcquisition:
+    async def reacquire() -> TypstRenderAcquisition:
         async with uow_factory() as uow:
             result = await uow.publication_renders.reacquire_invalid_succeeded(
                 proposed,
@@ -483,14 +483,14 @@ async def test_concurrent_invalid_succeeded_repair_has_one_owner(
     acquisitions = await asyncio.gather(*(reacquire() for _ in range(8)))
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1

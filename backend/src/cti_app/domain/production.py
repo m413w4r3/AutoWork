@@ -1140,6 +1140,8 @@ class ProductionArtifact:
             raise ValueError("version must be >= 1")
         if len(self.input_hash) != 64 or any(c not in "0123456789abcdef" for c in self.input_hash):
             raise ValueError("input_hash must be lowercase SHA-256")
+        if self.stage is ProductionArtifactStage.PUBLICATION and self.rendered_blob_id is not None:
+            raise ValueError("PUBLICATION artifacts carry no rendered blob")
 
 
 _PRODUCTION_REPAIR_KEY_RE = re.compile(r"^[0-9a-f]{64}$")

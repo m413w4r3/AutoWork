@@ -14,7 +14,7 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.publication import router as publication_router
-from cti_app.application import edition_preview
+from cti_app.application import edition_preview, typst_render_execution
 from cti_app.application.edition_preview import (
     EditionPreviewService,
     EditionPreviewStaleError,
@@ -391,7 +391,7 @@ async def test_preview_pdf_uses_edition_typst_template_and_creates_no_rows(
         assert kwargs["manifest_name"] == "edition-renderer-manifest.json"
         return bundle
 
-    monkeypatch.setattr(edition_preview, "load_template_bundle", capture_template)
+    monkeypatch.setattr(typst_render_execution, "load_template_bundle", capture_template)
     service, uow, compiler = _configured_preview_service(tmp_path)
     preview = await service.preview(EDITION_ID)
 
@@ -466,3 +466,46 @@ async def test_preview_api_serializes_document_and_pdf_route_fences_staleness(
     assert uow.publication_manifests == []
     assert uow.edition_releases == []
     assert uow.edition_renders == []
+
+
+class _FailingPdfRenderer:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+
+    async def render(self, document: EditionDocumentV2) -> bytes:
+        del document
+        raise self._error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (edition_preview.EditionPreviewDocumentInvalidError("invalid"), 422),
+        (edition_preview.EditionPreviewMediaKindMismatchError("kind"), 422),
+        (edition_preview.EditionPreviewMediaIntegrityMismatchError("hash"), 422),
+        (edition_preview.EditionPreviewMediaMissingError("missing"), 503),
+        (edition_preview.EditionPreviewStorageFailedError("storage"), 503),
+    ],
+)
+async def test_preview_pdf_route_maps_render_failures_to_stable_codes(
+    error: edition_preview.EditionPreviewRenderError, expected_status: int
+) -> None:
+    service, _, _ = _service(
+        pdf_renderer=_FailingPdfRenderer(error),  # type: ignore[arg-type]
+    )
+    preview = await service.preview(EDITION_ID)
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.edition_preview_service = service
+    async with AsyncClient(
+        transport=ASGITransport(app=application),
+        base_url="http://test",
+    ) as client:
+        response = await client.get(
+            f"/api/editions/{EDITION_ID}/preview/pdf",
+            params={"preview_input_hash": preview.preview_input_hash},
+        )
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"]["code"] == error.code

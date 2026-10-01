@@ -18,11 +18,13 @@ from cti_app.application.typst_compilation import (
     TypstCompileRequest,
     TypstOutputInvalidError,
     TypstOutputTooLargeError,
+    load_font_bundle_snapshot,
     materialize_font_bundle,
 )
 from cti_app.application.typst_rendering import (
     TypstRenderSource,
     TypstTemplateBundle,
+    load_template_bundle,
 )
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.media_assets import MediaAssetKind
@@ -53,6 +55,29 @@ class TypstRenderWorkspaceError(TypstRenderExecutionError):
 
 
 @dataclass(frozen=True, slots=True)
+class TypstRenderExecutionErrorTypes[ErrorT: Exception]:
+    """The caller's stable error type for each execution failure."""
+
+    media_missing: type[ErrorT]
+    media_kind_mismatch: type[ErrorT]
+    media_integrity_mismatch: type[ErrorT]
+    storage_failed: type[ErrorT]
+
+
+def translate_execution_error[ErrorT: Exception](
+    error: TypstRenderExecutionError, types: TypstRenderExecutionErrorTypes[ErrorT]
+) -> ErrorT:
+    """Re-express a media/workspace failure with the caller's stable error type."""
+    if isinstance(error, TypstRenderMediaMissingError):
+        return types.media_missing(str(error))
+    if isinstance(error, TypstRenderMediaKindMismatchError):
+        return types.media_kind_mismatch(str(error))
+    if isinstance(error, TypstRenderMediaIntegrityMismatchError):
+        return types.media_integrity_mismatch(str(error))
+    return types.storage_failed(str(error))
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutedTypstRender:
     compiled_document: CompiledTypstDocument
     resolved_media: Mapping[UUID, bytes]
@@ -64,13 +89,12 @@ def load_typst_render_bundle_snapshots(
     font_bundle_root: Path,
     typst_fonts_lock_path: Path,
     manifest_name: str,
-    template_loader: Callable[..., TypstTemplateBundle],
-    font_loader: Callable[[Path, Path], FontBundleSnapshot],
 ) -> tuple[TypstTemplateBundle, FontBundleSnapshot]:
     """Load the immutable template and font bytes shared by preview and final renders."""
-    template_bundle = template_loader(chp_typst_root, manifest_name=manifest_name)
-    font_bundle = font_loader(font_bundle_root, typst_fonts_lock_path)
-    return template_bundle, font_bundle
+    return (
+        load_template_bundle(chp_typst_root, manifest_name=manifest_name),
+        load_font_bundle_snapshot(font_bundle_root, typst_fonts_lock_path),
+    )
 
 
 class TypstRenderExecutor:
@@ -139,7 +163,6 @@ class TypstRenderExecutor:
         template_bundle: TypstTemplateBundle,
         font_bundle: FontBundleSnapshot,
         resolved_media: Mapping[UUID, bytes] | None = None,
-        font_materializer: Callable[[FontBundleSnapshot, Path], tuple[Path, ...]] | None = None,
         on_workspace_ready: Callable[[], Awaitable[None]] | None = None,
     ) -> ExecutedTypstRender:
         """Build a private workspace, materialize fonts, compile, and validate PDF output."""
@@ -150,11 +173,8 @@ class TypstRenderExecutor:
         )
         try:
             with tempfile.TemporaryDirectory(prefix="autowork-typst-fonts-") as font_path:
-                materialize = font_materializer or materialize_font_bundle
-                font_paths = materialize(font_bundle, Path(font_path))
-                with tempfile.TemporaryDirectory(
-                    prefix="autowork-publication-render-"
-                ) as workspace_path:
+                font_paths = materialize_font_bundle(font_bundle, Path(font_path))
+                with tempfile.TemporaryDirectory(prefix="autowork-typst-render-") as workspace_path:
                     workspace_root = Path(workspace_path)
                     self._populate_workspace(workspace_root, template_bundle, render_source, media)
                     if on_workspace_ready is not None:

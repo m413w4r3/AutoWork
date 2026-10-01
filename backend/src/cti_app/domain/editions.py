@@ -85,6 +85,11 @@ class Edition:
             "version": self.version,
         }
 
+    def bulletin_pdf_filename(self, *, preview: bool = False) -> str:
+        """Build a download name from validated edition identity only."""
+        prefix = "bulletin-preview" if preview else "bulletin"
+        return f"{prefix}-{self.period_start:%Y-%m}-{self.country_code}.pdf"
+
     def _bump(self, now: datetime | None) -> None:
         self.version += 1
         self.updated_at = now or datetime.now(UTC)

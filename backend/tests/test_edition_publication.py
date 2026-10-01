@@ -23,6 +23,7 @@ from cti_app.application.edition_publication import (
     EditionAssembleParameters,
     EditionAssemblyService,
     EditionPublicationService,
+    EditionReleaseStatus,
     PublicationAcceptanceError,
     PublicationAssemblyError,
     register_publication_jobs,
@@ -44,13 +45,9 @@ from cti_app.domain.edition_publication import (
     PublicationManifestEntryV1,
     PublicationManifestV1,
 )
-from cti_app.domain.edition_render import (
-    EditionRender,
-    EditionRenderFormat,
-    EditionRenderStatus,
-)
+from cti_app.domain.edition_render import EditionRender, EditionRenderDisplayStatus
 from cti_app.domain.editions import Edition, EditionStatus
-from cti_app.domain.jobs import Job
+from cti_app.domain.jobs import Job, JobStatus
 from cti_app.domain.production import (
     EditionProductionBatch,
     ProductionArtifact,
@@ -70,6 +67,7 @@ from cti_app.domain.publication_document import (
     publication_document_v4_to_json,
 )
 from cti_app.domain.publication_review import PublicationDecision
+from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 
 def test_edition_release_only_stores_canonical_edition_document() -> None:
@@ -178,19 +176,101 @@ def _successful_edition_render(
         compiler_version="0.15.1",
         font_bundle_version="fonts-v1",
         render_policy_version="typst-edition-v2-v1",
-        format=EditionRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
         input_hash="b" * 64,
         source_blob_id=uuid4(),
         render_data_blob_id=uuid4(),
         output_blob_id=output_blob_id,
         output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
         output_byte_size=len(pdf_bytes),
-        status=EditionRenderStatus.SUCCEEDED,
+        status=TypstRenderStatus.SUCCEEDED,
         error_code=None,
         error_message=None,
         created_at=now,
         updated_at=now,
     )
+
+
+def _release_status(
+    *,
+    release: EditionRelease | None,
+    render: EditionRender | None,
+    render_job_status: JobStatus | None,
+) -> EditionReleaseStatus:
+    return EditionReleaseStatus(
+        edition_id=EDITION_ID,
+        edition_state=EditionStatus.OPEN,
+        manifest_id=uuid4(),
+        manifest_sha256="d" * 64,
+        release=release,
+        assembly_job_id=None,
+        assembly_status=None,
+        assembly_error_code=None,
+        assembly_error_message=None,
+        can_retry_assembly=False,
+        render=render,
+        render_job_id=uuid4() if render_job_status is not None else None,
+        render_job_status=render_job_status,
+        render_job_error_code=None,
+        render_job_error_message=None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("render_status", "job_status", "expected", "can_retry"),
+    [
+        (None, None, EditionRenderDisplayStatus.NOT_STARTED, True),
+        (None, JobStatus.QUEUED, EditionRenderDisplayStatus.QUEUED, False),
+        (None, JobStatus.FAILED, EditionRenderDisplayStatus.FAILED, True),
+        (TypstRenderStatus.FAILED, None, EditionRenderDisplayStatus.FAILED, True),
+        (TypstRenderStatus.FAILED, JobStatus.FAILED, EditionRenderDisplayStatus.FAILED, True),
+        # A retry job in flight must not be hidden behind the previous failed row.
+        (TypstRenderStatus.FAILED, JobStatus.QUEUED, EditionRenderDisplayStatus.QUEUED, False),
+        (TypstRenderStatus.FAILED, JobStatus.RUNNING, EditionRenderDisplayStatus.RUNNING, False),
+        (TypstRenderStatus.RUNNING, None, EditionRenderDisplayStatus.RUNNING, False),
+        (
+            TypstRenderStatus.SUCCEEDED,
+            JobStatus.QUEUED,
+            EditionRenderDisplayStatus.SUCCEEDED,
+            False,
+        ),
+    ],
+)
+def test_release_status_render_state_prefers_an_active_job_over_a_failed_row(
+    render_status: TypstRenderStatus | None,
+    job_status: JobStatus | None,
+    expected: EditionRenderDisplayStatus,
+    can_retry: bool,
+) -> None:
+    release = EditionRelease(
+        edition_id=EDITION_ID,
+        manifest_id=uuid4(),
+        edition_document_blob_id=uuid4(),
+        edition_document_sha256="e" * 64,
+    )
+    render: EditionRender | None = None
+    if render_status is not None:
+        succeeded = _successful_edition_render(release.id, _BlobStore())
+        render = (
+            succeeded
+            if render_status is TypstRenderStatus.SUCCEEDED
+            else replace(
+                succeeded,
+                status=render_status,
+                output_blob_id=None,
+                output_sha256=None,
+                output_byte_size=None,
+                error_code="typst_compile_failed"
+                if render_status is TypstRenderStatus.FAILED
+                else None,
+            )
+        )
+
+    status = _release_status(release=release, render=render, render_job_status=job_status)
+
+    assert status.render_status is expected
+    assert status.can_retry_render is can_retry
+    assert status.pdf_available is (render_status is TypstRenderStatus.SUCCEEDED)
 
 
 def test_edition_metadata_projection_is_the_versioned_publication_metadata() -> None:
@@ -449,7 +529,7 @@ class _EditionRenders:
                 render
                 for render in self.renders.values()
                 if render.edition_release_id == release_id
-                and render.status is EditionRenderStatus.SUCCEEDED
+                and render.status is TypstRenderStatus.SUCCEEDED
             ),
             key=lambda render: (render.created_at, str(render.id)),
             default=None,
@@ -715,7 +795,9 @@ async def test_assembly_handler_persists_release_then_queues_pdf_render(
         registry,
         lambda: uow,
         assembly,
+        render_service=SimpleNamespace(),  # type: ignore[arg-type]
         job_dispatcher=dispatcher,
+        release_rematerializer=SimpleNamespace(),  # type: ignore[arg-type]
     )  # type: ignore[arg-type]
 
     result = await registry.handler(EDITION_ASSEMBLE_JOB_KIND)(
@@ -760,6 +842,7 @@ async def test_render_handler_swallows_best_effort_materialization_failure() -> 
         lambda: uow,
         EditionAssemblyService(lambda: uow, blobs),  # type: ignore[arg-type]
         render_service=render_service,  # type: ignore[arg-type]
+        job_dispatcher=_Dispatcher(),
         release_rematerializer=rematerializer,  # type: ignore[arg-type]
     )  # type: ignore[arg-type]
 
@@ -773,7 +856,7 @@ async def test_render_handler_swallows_best_effort_materialization_failure() -> 
     assert rematerializer.calls == [
         {"edition_release_id": release_id, "edition_render_id": render.id}
     ]
-    assert render.status is EditionRenderStatus.SUCCEEDED
+    assert render.status is TypstRenderStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -1674,118 +1757,61 @@ async def test_edition_docx_download_route_is_removed() -> None:
     assert response.status_code == 404
 
 
-class _PdfRouteHarness:
-    def __init__(self) -> None:
-        self.manifest: Any = None
-        self.release: EditionRelease | None = None
-        self.render: EditionRender | None = None
-
-    def uow(self) -> Any:
-        harness = self
-
-        class Repositories:
-            @property
-            def publication_manifests(self) -> Repositories:
-                return self
-
-            @property
-            def edition_releases(self) -> Repositories:
-                return self
-
-            @property
-            def edition_renders(self) -> Repositories:
-                return self
-
-            async def get_latest_for_edition(self, edition_id: UUID) -> Any:
-                del edition_id
-                return harness.manifest
-
-            async def get_by_manifest(self, manifest_id: UUID) -> EditionRelease | None:
-                del manifest_id
-                return harness.release
-
-            async def get_latest_for_release(self, release_id: UUID) -> EditionRender | None:
-                del release_id
-                return harness.render
-
-            async def __aenter__(self) -> Repositories:
-                return self
-
-            async def __aexit__(self, *args: object) -> None:
-                del args
-
-            async def commit(self) -> None:
-                return None
-
-        return Repositories()
+def _single_article_row() -> EditionReviewReadItem:
+    return EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
 
 
 @pytest.mark.asyncio
 async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
-    harness = _PdfRouteHarness()
     blobs = _BlobStore()
+    uow = _Uow(_edition(), [_single_article_row()], blobs)
+    publication = EditionPublicationService(
+        lambda: uow,
+        blobs,
+        job_service=uow.jobs,
+    )  # type: ignore[arg-type]
     application = FastAPI()
     application.include_router(publication_router)
-    application.state.uow_factory = harness.uow
-    application.state.production_artifact_store = blobs
+    application.state.edition_publication_service = publication
+    application.state.identity_provider = LocalIdentityProvider()
+    url = f"/api/editions/{EDITION_ID}/release/pdf"
     async with AsyncClient(
         transport=ASGITransport(app=application), base_url="http://test"
     ) as client:
-        missing = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
-        assert missing.status_code == 404
+        assert (await client.get(url)).status_code == 404
 
-        document = EditionDocumentV2(
-            edition={
-                "country": "France",
-                "country_code": "FR",
-                "period_start": "2026-08-01",
-            },
-            publications=(),
+        accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+        assert (await client.get(url)).status_code == 404
+
+        release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
+            accepted.manifest.id
         )
-        document_blob_id, document_sha256 = await blobs.put_canonical_json(
-            document.to_json(), bucket="test-edition-document"
-        )
-        harness.release = EditionRelease(
-            edition_id=EDITION_ID,
-            manifest_id=uuid4(),
-            edition_document_blob_id=document_blob_id,
-            edition_document_sha256=document_sha256,
-        )
-        harness.manifest = type("Manifest", (), {"id": harness.release.manifest_id})()
-        unavailable = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+        unavailable = await client.get(url)
         assert unavailable.status_code == 409
         assert unavailable.json()["detail"]["code"] == "release_pdf_not_available"
 
         pdf = b"%PDF-release-route"
-        output_blob_id = await blobs.put_bytes(
-            pdf, bucket="test-edition-pdf", mime_type="application/pdf"
-        )
-        now = datetime.now(UTC)
-        harness.render = EditionRender(
-            id=uuid4(),
-            edition_release_id=harness.release.id,
-            renderer="typst",
-            renderer_version="edition-v2-typst-v1",
-            template_version="chp-edition-v1",
-            template_sha256="a" * 64,
-            compiler="typst",
-            compiler_version="0.15.1",
-            font_bundle_version="fonts-v1",
-            render_policy_version="typst-edition-v2-v1",
-            format=EditionRenderFormat.PDF,
-            input_hash="b" * 64,
-            source_blob_id=None,
-            render_data_blob_id=None,
-            output_blob_id=output_blob_id,
-            output_sha256=hashlib.sha256(pdf).hexdigest(),
-            output_byte_size=len(pdf),
-            status=EditionRenderStatus.SUCCEEDED,
-            error_code=None,
-            error_message=None,
-            created_at=now,
-            updated_at=now,
-        )
-        downloaded = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+        render = _successful_edition_render(release.id, blobs, pdf_bytes=pdf)
+        uow.edition_renders.add(render)
+        downloaded = await client.get(url)
+
+        assert render.output_blob_id is not None
+        blobs.blobs[render.output_blob_id] = b"%PDF-tampered!!!!"
+        tampered = await client.get(url)
 
     assert downloaded.status_code == 200
     assert downloaded.headers["content-type"] == "application/pdf"
@@ -1793,28 +1819,8 @@ async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
     assert downloaded.headers["content-disposition"] == (
         'attachment; filename="bulletin-2026-08-FR.pdf"'
     )
-
-    fallback_document = EditionDocumentV2(
-        edition={"country_code": "../../FR"},
-        publications=(),
-    )
-    fallback_blob_id, fallback_sha256 = await blobs.put_canonical_json(
-        fallback_document.to_json(), bucket="test-edition-document"
-    )
-    harness.release = replace(
-        harness.release,
-        edition_document_blob_id=fallback_blob_id,
-        edition_document_sha256=fallback_sha256,
-    )
-    async with AsyncClient(
-        transport=ASGITransport(app=application), base_url="http://test"
-    ) as fallback_client:
-        fallback_download = await fallback_client.get(f"/api/editions/{EDITION_ID}/release/pdf")
-
-    assert fallback_download.status_code == 200
-    assert fallback_download.headers["content-disposition"] == (
-        'attachment; filename="bulletin-0000-00-XX.pdf"'
-    )
+    assert tampered.status_code == 500
+    assert tampered.json()["detail"]["code"] == "release_pdf_integrity_mismatch"
 
 
 @pytest.mark.asyncio
@@ -1890,14 +1896,14 @@ async def test_retry_render_is_idempotent_and_published_at_comes_from_render() -
             compiler_version="0.15.1",
             font_bundle_version="fonts-v1",
             render_policy_version="typst-edition-v2-v1",
-            format=EditionRenderFormat.PDF,
+            format=TypstRenderFormat.PDF,
             input_hash="b" * 64,
             source_blob_id=None,
             render_data_blob_id=None,
             output_blob_id=uuid4(),
             output_sha256="c" * 64,
             output_byte_size=12,
-            status=EditionRenderStatus.SUCCEEDED,
+            status=TypstRenderStatus.SUCCEEDED,
             error_code=None,
             error_message=None,
             created_at=now - timedelta(minutes=2),

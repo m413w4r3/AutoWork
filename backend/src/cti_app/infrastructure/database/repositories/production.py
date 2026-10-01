@@ -459,11 +459,7 @@ class SqlAlchemyProductionArtifactRepository:
             status=artifact.status.value,
             raw_blob_id=artifact.raw_blob_id,
             canonical_blob_id=artifact.canonical_blob_id,
-            rendered_blob_id=(
-                artifact.rendered_blob_id
-                if artifact.stage is not ProductionArtifactStage.PUBLICATION
-                else None
-            ),
+            rendered_blob_id=artifact.rendered_blob_id,
             model_run_id=artifact.model_run_id,
             conversation_turn_id=artifact.conversation_turn_id,
             reused_from_artifact_id=artifact.reused_from_artifact_id,
@@ -1356,20 +1352,17 @@ def _production_artifact_from_row(row: ProductionArtifactRow) -> ProductionArtif
         ProductionArtifactStatus,
     )
 
-    stage = ProductionArtifactStage(row.stage)
     return ProductionArtifact(
         id=row.id,
         production_run_id=row.production_run_id,
         subject_id=row.subject_id,
-        stage=stage,
+        stage=ProductionArtifactStage(row.stage),
         version=row.version,
         input_hash=row.input_hash,
         status=ProductionArtifactStatus(row.status),
         raw_blob_id=row.raw_blob_id,
         canonical_blob_id=row.canonical_blob_id,
-        rendered_blob_id=(
-            row.rendered_blob_id if stage is not ProductionArtifactStage.PUBLICATION else None
-        ),
+        rendered_blob_id=row.rendered_blob_id,
         model_run_id=row.model_run_id,
         conversation_turn_id=row.conversation_turn_id,
         reused_from_artifact_id=row.reused_from_artifact_id,

@@ -17,6 +17,9 @@ Database ORM model organization by bounded context.
 | **model_execution.py** | Model lifecycle | ModelRuns, Conversations, Execution lifecycle |
 | **production.py** | Production runs | ProductionRuns, Artifacts, Batches |
 | **jobs.py** | Background jobs | Jobs, Events |
+| **edition_publication.py** | Frozen edition publication | PublicationManifests, EditionReleases |
+| **edition_render.py** | Typst renders of edition releases | EditionRenders |
+| **publication_render.py** | Typst renders of publication artifacts | PublicationRenders |
 
 ## Navigation Rules
 

@@ -12,11 +12,7 @@ from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.domain.blobs import BlobDescriptor, BlobRecord
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import EditionRelease, PublicationManifestV1
-from cti_app.domain.edition_render import (
-    EditionRender,
-    EditionRenderFormat,
-    EditionRenderStatus,
-)
+from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition
 from cti_app.domain.entities import Subject
 from cti_app.domain.production import (
@@ -26,11 +22,8 @@ from cti_app.domain.production import (
     ProductionBatchStatus,
     ProductionRun,
 )
-from cti_app.domain.publication_render import (
-    PublicationRender,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
-)
+from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 from cti_app.infrastructure.database.session import create_postgres_engine
 
 pytestmark = pytest.mark.integration
@@ -107,14 +100,14 @@ def _render(release_id: UUID, **overrides: object) -> EditionRender:
         "compiler_version": "0.15.1",
         "font_bundle_version": "test-font-bundle-v1",
         "render_policy_version": "typst-edition-v2-v1",
-        "format": EditionRenderFormat.PDF,
+        "format": TypstRenderFormat.PDF,
         "input_hash": sha256(uuid4().bytes).hexdigest(),
         "source_blob_id": None,
         "render_data_blob_id": None,
         "output_blob_id": None,
         "output_sha256": None,
         "output_byte_size": None,
-        "status": EditionRenderStatus.RUNNING,
+        "status": TypstRenderStatus.RUNNING,
         "error_code": None,
         "error_message": None,
         "created_at": now,
@@ -147,7 +140,7 @@ async def test_edition_render_repository_round_trip_and_failed_release_intact(
         persisted_release = await uow.edition_releases.get_by_manifest(release.manifest_id)
         await uow.commit()
 
-    assert failed.status is EditionRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert failed.error_code == "typst_compile_failed"
     assert persisted_release == release
 
@@ -157,7 +150,7 @@ async def test_edition_render_repository_round_trip_and_failed_release_intact(
         )
         await uow.commit()
     assert retried.render.id == proposed.id
-    assert retried.render.status is EditionRenderStatus.RUNNING
+    assert retried.render.status is TypstRenderStatus.RUNNING
 
 
 async def test_edition_render_blob_reachability_and_restrict_foreign_keys(
@@ -217,14 +210,14 @@ async def test_edition_render_blob_reachability_and_restrict_foreign_keys(
         compiler_version="0.15.1",
         font_bundle_version="test-font-bundle-v1",
         render_policy_version="test-render-policy-v1",
-        format=PublicationRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
         input_hash=sha256(uuid4().bytes).hexdigest(),
         source_blob_id=source_blob.id,
         render_data_blob_id=render_data_blob.id,
         output_blob_id=output_blob.id,
         output_sha256="e" * 64,
         output_byte_size=3,
-        status=PublicationRenderStatus.SUCCEEDED,
+        status=TypstRenderStatus.SUCCEEDED,
         error_code=None,
         error_message=None,
         created_at=now,

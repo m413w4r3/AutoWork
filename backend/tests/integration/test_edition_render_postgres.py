@@ -29,16 +29,16 @@ from cti_app.domain.edition_publication import (
     EditionRelease,
     PublicationManifestV1,
 )
-from cti_app.domain.edition_render import (
-    EditionRender,
-    EditionRenderAcquisition,
-    EditionRenderAcquisitionOutcome,
-    EditionRenderFormat,
-    EditionRenderStatus,
-)
+from cti_app.domain.edition_render import EditionRender
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import EditionProductionBatch, ProductionBatchStatus
 from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
+)
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 
 pytestmark = pytest.mark.integration
@@ -261,14 +261,14 @@ def _render(release_id: UUID, **overrides: object) -> EditionRender:
         "compiler_version": "0.15.1",
         "font_bundle_version": "test-font-bundle-v1",
         "render_policy_version": "typst-edition-v2-v1",
-        "format": EditionRenderFormat.PDF,
+        "format": TypstRenderFormat.PDF,
         "input_hash": sha256(uuid4().bytes).hexdigest(),
         "source_blob_id": None,
         "render_data_blob_id": None,
         "output_blob_id": None,
         "output_sha256": None,
         "output_byte_size": None,
-        "status": EditionRenderStatus.RUNNING,
+        "status": TypstRenderStatus.RUNNING,
         "error_code": None,
         "error_message": None,
         "created_at": now,
@@ -281,8 +281,8 @@ def _render(release_id: UUID, **overrides: object) -> EditionRender:
 async def _acquire_concurrently(
     uow_factory: UnitOfWorkFactory,
     proposed: EditionRender,
-) -> list[EditionRenderAcquisition]:
-    async def acquire() -> EditionRenderAcquisition:
+) -> list[TypstRenderAcquisition]:
+    async def acquire() -> TypstRenderAcquisition:
         async with uow_factory() as uow:
             result = await uow.edition_renders.acquire_for_render(
                 proposed,
@@ -304,14 +304,14 @@ async def test_concurrent_acquire_for_render_has_one_owner(
 
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -320,7 +320,7 @@ async def test_concurrent_acquire_for_render_has_one_owner(
     async with uow_factory() as uow:
         persisted = await uow.edition_renders.get_by_input_hash(proposed.input_hash)
     assert persisted is not None
-    assert persisted.status is EditionRenderStatus.RUNNING
+    assert persisted.status is TypstRenderStatus.RUNNING
 
 
 async def test_concurrent_retry_of_failed_render_has_one_owner(
@@ -340,14 +340,14 @@ async def test_concurrent_retry_of_failed_render_has_one_owner(
     acquisitions = await _acquire_concurrently(uow_factory, proposed)
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -382,9 +382,9 @@ async def test_concurrent_invalid_succeeded_reacquire_has_one_owner(
         )
         await uow.commit()
 
-    invalid = replace(succeeded, status=EditionRenderStatus.RUNNING)
+    invalid = replace(succeeded, status=TypstRenderStatus.RUNNING)
 
-    async def reacquire() -> EditionRenderAcquisition:
+    async def reacquire() -> TypstRenderAcquisition:
         async with uow_factory() as uow:
             result = await uow.edition_renders.reacquire_invalid_succeeded(
                 invalid,
@@ -397,14 +397,14 @@ async def test_concurrent_invalid_succeeded_reacquire_has_one_owner(
     acquisitions = await asyncio.gather(*(reacquire() for _ in range(8)))
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.ACQUIRED
+            acquisition.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
             for acquisition in acquisitions
         )
         == 1
     )
     assert (
         sum(
-            acquisition.outcome is EditionRenderAcquisitionOutcome.IN_PROGRESS
+            acquisition.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
             for acquisition in acquisitions
         )
         == len(acquisitions) - 1
@@ -441,7 +441,7 @@ async def test_concurrent_render_pdf_compiles_once_and_persists_one_row(
         persisted = await uow.edition_renders.get_latest_for_release(release.id)
     assert persisted is not None
     assert persisted.id == first.id
-    assert persisted.status is EditionRenderStatus.SUCCEEDED
+    assert persisted.status is TypstRenderStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -466,7 +466,7 @@ async def test_corrupted_render_pdf_blob_is_reacquired_and_rerendered(
     second = await service.render_pdf(release.id)
 
     assert second.id == first.id
-    assert second.status is EditionRenderStatus.SUCCEEDED
+    assert second.status is TypstRenderStatus.SUCCEEDED
     assert second.output_sha256 == sha256(compiler.content).hexdigest()
     assert compiler.call_count == 2
 
@@ -490,12 +490,12 @@ async def test_failed_render_keeps_release_and_retry_reacquires_same_row(
         failed = await uow.edition_renders.get_latest_for_release(release.id)
         persisted_release = await uow.edition_releases.get(release.id)
     assert failed is not None
-    assert failed.status is EditionRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert persisted_release == release
 
     retried = await service.render_pdf(release.id)
 
     assert retried.id == failed.id
-    assert retried.status is EditionRenderStatus.SUCCEEDED
+    assert retried.status is TypstRenderStatus.SUCCEEDED
     async with uow_factory() as uow:
         assert await uow.edition_releases.get(release.id) == release

@@ -115,12 +115,7 @@ class SubjectContentService:
             if run is None:
                 return None
             artifact = await current_publication_artifact(uow.production_artifacts, run.id)
-            if (
-                artifact is None
-                or artifact.stage is not ProductionArtifactStage.PUBLICATION
-                or artifact.status is not ProductionArtifactStatus.VERIFIED
-                or artifact.canonical_blob_id is None
-            ):
+            if artifact is None or artifact.canonical_blob_id is None:
                 return None
             return CurrentSubjectPublication(run=run, artifact=artifact)
 

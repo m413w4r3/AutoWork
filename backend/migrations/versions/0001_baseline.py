@@ -16,6 +16,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     core,
     discovery,
     edition_publication,
+    edition_render,
     editions,
     editorial,
     invariants,

@@ -227,7 +227,7 @@ class EditionWorkspaceMaterializer:
         release_path = edition_path / "release"
         self._write_canonical_json(release_path / "publication-manifest.json", manifest)
         self._write_canonical_json(release_path / "edition.json", edition)
-        self._write_pdf(release_path / "bulletin.pdf", pdf_content)
+        self._write_bytes(release_path / "bulletin.pdf", pdf_content)
         return release_path
 
     @staticmethod
@@ -329,11 +329,6 @@ class EditionWorkspaceMaterializer:
             os.replace(temporary, path)
         finally:
             temporary.unlink(missing_ok=True)
-
-    @classmethod
-    def _write_pdf(cls, path: Path, content: bytes) -> None:
-        """Atomically write the already rendered PDF projection."""
-        cls._write_bytes(path, content)
 
 
 class EditionProductionCheckpointService:

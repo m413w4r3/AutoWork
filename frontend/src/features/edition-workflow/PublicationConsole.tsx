@@ -62,6 +62,41 @@ function DownloadActions({
   );
 }
 
+function RenderStatus({ release }: { release: EditionReleaseResponse }) {
+  if (release.pdf_available) {
+    return (
+      <>
+        <h3 role="status">Bulletin publié</h3>
+        {release.published_at ? (
+          <p>Publié le {readableDate(release.published_at)}</p>
+        ) : null}
+      </>
+    );
+  }
+  if (release.render_status === "failed") {
+    return (
+      <>
+        <p role="status">Le rendu PDF a échoué.</p>
+        {release.render_error_code ? (
+          <p className="publication-console__diagnostic-code">
+            {release.render_error_code}
+          </p>
+        ) : null}
+        {release.render_error_message ? (
+          <p className="error-message">{release.render_error_message}</p>
+        ) : null}
+      </>
+    );
+  }
+  return (
+    <p role="status">
+      {release.render_status === "not_started"
+        ? "Le rendu PDF n’a pas encore démarré."
+        : "Génération du PDF en cours"}
+    </p>
+  );
+}
+
 function ArchivedPublication({
   editionId,
   release,
@@ -82,13 +117,7 @@ function ArchivedPublication({
           <h3>Assemblage canonique</h3>
           <p>Release assemblé</p>
           <h3>Rendu PDF</h3>
-          {release.render_status === "succeeded" ? (
-            <h4>Bulletin publié</h4>
-          ) : release.render_status === "failed" ? (
-            <p>Le rendu PDF a échoué.</p>
-          ) : (
-            <p>Génération du PDF en cours</p>
-          )}
+          <RenderStatus release={release} />
           <DownloadActions
             editionId={editionId}
             pdfAvailable={release.pdf_available}
@@ -145,8 +174,6 @@ export function PublicationConsole({
 
   const current = release.data;
   if (current.release_id) {
-    const renderFailed = current.render_status === "failed";
-    const renderNotStarted = current.render_status === "not_started";
     return (
       <section
         className="workflow-placeholder publication-console"
@@ -156,32 +183,7 @@ export function PublicationConsole({
         <h2>Assemblage canonique</h2>
         <p>Release assemblé</p>
         <h2>Rendu PDF</h2>
-        {current.pdf_available ? (
-          <>
-            <h3 role="status">Bulletin publié</h3>
-            {current.published_at ? (
-              <p>Publié le {readableDate(current.published_at)}</p>
-            ) : null}
-          </>
-        ) : renderFailed ? (
-          <>
-            <p role="status">Le rendu PDF a échoué.</p>
-            {current.render_error_code ? (
-              <p className="publication-console__diagnostic-code">
-                {current.render_error_code}
-              </p>
-            ) : null}
-            {current.render_error_message ? (
-              <p className="error-message">{current.render_error_message}</p>
-            ) : null}
-          </>
-        ) : (
-          <p role="status">
-            {renderNotStarted
-              ? "Le rendu PDF n’a pas encore démarré."
-              : "Génération du PDF en cours"}
-          </p>
-        )}
+        <RenderStatus release={current} />
         {!readOnly && current.can_retry_render && !current.pdf_available ? (
           <button
             className="button"

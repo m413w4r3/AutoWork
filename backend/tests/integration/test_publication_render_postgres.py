@@ -49,10 +49,9 @@ from cti_app.domain.publication_document import (
 from cti_app.domain.publication_render import (
     PUBLICATION_RENDER_POLICY_VERSION,
     PublicationRender,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
     compute_publication_render_input_hash,
 )
+from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.session import create_postgres_engine
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
@@ -304,7 +303,7 @@ async def test_publication_render_postgres_success_idempotency_and_template_iden
     first = await service.render_pdf(artifact.id)
     repeated = await service.render_pdf(artifact.id)
 
-    assert first.status is PublicationRenderStatus.SUCCEEDED
+    assert first.status is TypstRenderStatus.SUCCEEDED
     assert first.source_blob_id is not None
     assert first.render_data_blob_id is not None
     assert first.output_blob_id is not None
@@ -499,7 +498,7 @@ async def test_publication_render_postgres_real_typst_exit_scenario(
 
     render = await service.render_pdf(artifact.id)
 
-    assert render.status is PublicationRenderStatus.SUCCEEDED
+    assert render.status is TypstRenderStatus.SUCCEEDED
     assert (
         render.font_bundle_version
         == load_font_bundle_snapshot(
@@ -518,7 +517,7 @@ async def test_publication_render_postgres_real_typst_exit_scenario(
         compiler_version=render.compiler_version,
         font_bundle_version=render.font_bundle_version,
         render_policy_version=render.render_policy_version,
-        format=PublicationRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
     )
     assert render.source_blob_id is not None
     assert render.render_data_blob_id is not None
@@ -598,7 +597,7 @@ async def test_publication_render_postgres_concurrent_callers_compile_once(
     first, second = await concurrent_calls
 
     assert first == second
-    assert first.status is PublicationRenderStatus.SUCCEEDED
+    assert first.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 1
     assert first.output_sha256 == second.output_sha256
     rows = await _render_identity_rows(migrated_postgres_url, first.input_hash)
@@ -634,7 +633,7 @@ async def test_publication_render_postgres_retries_failed_input_in_same_row(
 
     retried = await service.render_pdf(artifact.id)
 
-    assert retried.status is PublicationRenderStatus.SUCCEEDED
+    assert retried.status is TypstRenderStatus.SUCCEEDED
     assert retried.error_code is None
     assert compiler.call_count == 2
     assert await _render_status_rows(migrated_postgres_url, artifact.id) == [("succeeded", None)]

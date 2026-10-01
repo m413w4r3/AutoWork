@@ -87,9 +87,9 @@ Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
 
    Dans l’onglet `Pipeline` de chacun des deux sujets, vérifier aussi les
    quatre étapes `Références`, `Extraction`, `Synthèse` et `Assemblage` à
-   l’état réussi. Les fichiers `items/001-…/article/publication.json`,
-   `items/001-…/article/publication.md` et leurs équivalents `002-…` doivent
-   être présents, non vides et correspondre au bon sujet.
+   l’état réussi. Les fichiers `items/001-…/article/publication.json` et son
+   équivalent `002-…` doivent être présents, non vides et correspondre au bon
+   sujet.
 
    Ouvrir `Diagnostics` sur chaque carte et noter pour chacune :
 
@@ -140,13 +140,11 @@ Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
        001-<subject-a-slug>/
          pipeline/production-state.json
          article/publication.json
-         article/publication.md
          sources/manifest.json       # si des sources sont présentes
          assets/manifest.json        # si des assets sont présents
        002-<subject-b-slug>/
          pipeline/production-state.json
          article/publication.json
-         article/publication.md
          sources/manifest.json       # si des sources sont présentes
          assets/manifest.json        # si des assets sont présents
      release/

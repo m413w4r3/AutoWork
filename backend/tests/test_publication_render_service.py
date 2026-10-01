@@ -14,7 +14,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.exc import IntegrityError
 
-from cti_app.application import publication_rendering
+from cti_app.application import publication_rendering, typst_render_execution
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -53,14 +53,16 @@ from cti_app.domain.publication_document import (
 from cti_app.domain.publication_render import (
     PUBLICATION_RENDER_POLICY_VERSION,
     PublicationRender,
-    PublicationRenderAcquisition,
-    PublicationRenderAcquisitionOutcome,
-    PublicationRenderFormat,
-    PublicationRenderStatus,
     compute_publication_render_input_hash,
+)
+from cti_app.domain.typst_render import (
+    TypstRenderAcquisition,
+    TypstRenderAcquisitionOutcome,
+    TypstRenderFormat,
+    TypstRenderStatus,
     invalid_succeeded_reacquisition_outcome,
-    publication_render_acquisition_outcome,
-    publication_render_retrying,
+    typst_render_acquisition_outcome,
+    typst_render_retrying,
 )
 
 
@@ -95,14 +97,14 @@ def _proposed_render(artifact_id: UUID, *, input_hash: str | None = None) -> Pub
         compiler_version="0.15.1",
         font_bundle_version="chp-fonts-v1",
         render_policy_version="typst-publication-v4-v1",
-        format=PublicationRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
         input_hash=input_hash or hashlib.sha256(uuid4().bytes).hexdigest(),
         source_blob_id=None,
         render_data_blob_id=None,
         output_blob_id=None,
         output_sha256=None,
         output_byte_size=None,
-        status=PublicationRenderStatus.RUNNING,
+        status=TypstRenderStatus.RUNNING,
         error_code=None,
         error_message=None,
         created_at=now,
@@ -131,25 +133,25 @@ class FakePublicationRenders:
 
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
-    ) -> PublicationRenderAcquisition:
+    ) -> TypstRenderAcquisition:
         existing = await self.get_by_input_hash(proposed.input_hash)
         if existing is None:
             self.renders[proposed.id] = proposed
-            return PublicationRenderAcquisition(
-                PublicationRenderAcquisitionOutcome.ACQUIRED,
+            return TypstRenderAcquisition(
+                TypstRenderAcquisitionOutcome.ACQUIRED,
                 proposed,
             )
-        outcome = publication_render_acquisition_outcome(
+        outcome = typst_render_acquisition_outcome(
             existing,
             stale_running_before=stale_running_before,
         )
-        if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
-            existing = publication_render_retrying(existing, now=datetime.now(UTC))
+        if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+            existing = typst_render_retrying(existing, now=datetime.now(UTC))
             self.renders[existing.id] = existing
-        elif outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS:
+        elif outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS:
             if self.in_progress_observed is not None:
                 self.in_progress_observed.set()
-        return PublicationRenderAcquisition(outcome, existing)
+        return TypstRenderAcquisition(outcome, existing)
 
     async def reacquire_invalid_succeeded(
         self,
@@ -157,7 +159,7 @@ class FakePublicationRenders:
         *,
         observed_output_blob_id: UUID,
         observed_output_sha256: str,
-    ) -> PublicationRenderAcquisition:
+    ) -> TypstRenderAcquisition:
         existing = self.renders.get(proposed.id)
         if existing is None:
             return await self.acquire_for_render(
@@ -169,28 +171,16 @@ class FakePublicationRenders:
             observed_output_blob_id=observed_output_blob_id,
             observed_output_sha256=observed_output_sha256,
         )
-        if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
-            existing = publication_render_retrying(existing, now=datetime.now(UTC))
+        if outcome is TypstRenderAcquisitionOutcome.ACQUIRED:
+            existing = typst_render_retrying(existing, now=datetime.now(UTC))
             self.renders[existing.id] = existing
-        return PublicationRenderAcquisition(outcome, existing)
+        return TypstRenderAcquisition(outcome, existing)
 
     async def add(self, render: PublicationRender) -> PublicationRender:
         if await self.get_by_input_hash(render.input_hash) is not None:
             raise ValueError("duplicate_publication_render_input_hash")
         self.renders[render.id] = render
         return render
-
-    async def mark_retrying(self, render_id: UUID) -> PublicationRender:
-        render = self.renders[render_id]
-        updated = replace(
-            render,
-            status=PublicationRenderStatus.RUNNING,
-            error_code=None,
-            error_message=None,
-            updated_at=datetime.now(UTC),
-        )
-        self.renders[render_id] = updated
-        return updated
 
     async def mark_succeeded(
         self,
@@ -203,7 +193,7 @@ class FakePublicationRenders:
         render_data_blob_id: UUID | None = None,
     ) -> PublicationRender:
         render = self.renders[render_id]
-        if render.status is not PublicationRenderStatus.RUNNING:
+        if render.status is not TypstRenderStatus.RUNNING:
             raise ValueError("publication_render_not_running")
         updated = replace(
             render,
@@ -212,7 +202,7 @@ class FakePublicationRenders:
             output_blob_id=output_blob_id,
             output_sha256=output_sha256,
             output_byte_size=output_byte_size,
-            status=PublicationRenderStatus.SUCCEEDED,
+            status=TypstRenderStatus.SUCCEEDED,
             error_code=None,
             error_message=None,
             updated_at=datetime.now(UTC),
@@ -230,13 +220,13 @@ class FakePublicationRenders:
         render_data_blob_id: UUID | None = None,
     ) -> PublicationRender:
         render = self.renders[render_id]
-        if render.status is not PublicationRenderStatus.RUNNING:
+        if render.status is not TypstRenderStatus.RUNNING:
             raise ValueError("publication_render_not_running")
         updated = replace(
             render,
             source_blob_id=source_blob_id,
             render_data_blob_id=render_data_blob_id,
-            status=PublicationRenderStatus.FAILED,
+            status=TypstRenderStatus.FAILED,
             error_code=error_code,
             error_message=error_message,
             updated_at=datetime.now(UTC),
@@ -512,7 +502,7 @@ async def test_fake_acquire_for_render_decision_table() -> None:
 
     empty = FakePublicationRenders()
     created = await empty.acquire_for_render(proposed, stale_running_before=stale_before)
-    assert created.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+    assert created.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
     assert created.render == proposed
 
     now = datetime.now(UTC)
@@ -520,28 +510,28 @@ async def test_fake_acquire_for_render_decision_table() -> None:
         (
             replace(
                 proposed,
-                status=PublicationRenderStatus.SUCCEEDED,
+                status=TypstRenderStatus.SUCCEEDED,
                 output_blob_id=uuid4(),
                 output_sha256="b" * 64,
                 output_byte_size=1,
             ),
-            PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
+            TypstRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
         ),
         (
             replace(
                 proposed,
-                status=PublicationRenderStatus.FAILED,
+                status=TypstRenderStatus.FAILED,
                 error_code="compile_failed",
             ),
-            PublicationRenderAcquisitionOutcome.ACQUIRED,
+            TypstRenderAcquisitionOutcome.ACQUIRED,
         ),
         (
             replace(proposed, updated_at=now),
-            PublicationRenderAcquisitionOutcome.IN_PROGRESS,
+            TypstRenderAcquisitionOutcome.IN_PROGRESS,
         ),
         (
             replace(proposed, updated_at=now - timedelta(minutes=10)),
-            PublicationRenderAcquisitionOutcome.ACQUIRED,
+            TypstRenderAcquisitionOutcome.ACQUIRED,
         ),
     )
     for existing, expected in cases:
@@ -553,8 +543,8 @@ async def test_fake_acquire_for_render_decision_table() -> None:
         )
         assert acquisition.outcome is expected
         assert acquisition.render.id == existing.id
-        if expected is PublicationRenderAcquisitionOutcome.ACQUIRED:
-            assert acquisition.render.status is PublicationRenderStatus.RUNNING
+        if expected is TypstRenderAcquisitionOutcome.ACQUIRED:
+            assert acquisition.render.status is TypstRenderStatus.RUNNING
             assert acquisition.render.error_code is None
             assert acquisition.render.error_message is None
 
@@ -566,14 +556,14 @@ async def test_fake_reacquire_invalid_succeeded_has_a_single_repair_owner() -> N
     output_sha256 = "c" * 64
     succeeded = replace(
         proposed,
-        status=PublicationRenderStatus.SUCCEEDED,
+        status=TypstRenderStatus.SUCCEEDED,
         output_blob_id=output_blob_id,
         output_sha256=output_sha256,
         output_byte_size=1,
     )
     repository = FakePublicationRenders()
     repository.renders[succeeded.id] = succeeded
-    repair_proposal = replace(succeeded, status=PublicationRenderStatus.RUNNING)
+    repair_proposal = replace(succeeded, status=TypstRenderStatus.RUNNING)
 
     owner = await repository.reacquire_invalid_succeeded(
         repair_proposal,
@@ -586,9 +576,9 @@ async def test_fake_reacquire_invalid_succeeded_has_a_single_repair_owner() -> N
         observed_output_sha256=output_sha256,
     )
 
-    assert owner.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
-    assert owner.render.status is PublicationRenderStatus.RUNNING
-    assert waiter.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+    assert owner.outcome is TypstRenderAcquisitionOutcome.ACQUIRED
+    assert owner.render.status is TypstRenderStatus.RUNNING
+    assert waiter.outcome is TypstRenderAcquisitionOutcome.IN_PROGRESS
 
     replaced_success = replace(
         succeeded,
@@ -601,7 +591,7 @@ async def test_fake_reacquire_invalid_succeeded_has_a_single_repair_owner() -> N
         observed_output_blob_id=output_blob_id,
         observed_output_sha256=output_sha256,
     )
-    assert stale_repair.outcome is PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED
+    assert stale_repair.outcome is TypstRenderAcquisitionOutcome.REUSABLE_SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -612,7 +602,7 @@ async def test_publication_render_service_happy_path_persists_content_and_hashes
 
     render = await service.render_pdf(artifact.id)
 
-    assert render.status is PublicationRenderStatus.SUCCEEDED
+    assert render.status is TypstRenderStatus.SUCCEEDED
     assert render.publication_artifact_id == artifact.id
     assert render.source_blob_id is not None
     assert render.render_data_blob_id is not None
@@ -669,7 +659,7 @@ async def test_publication_render_service_concurrent_calls_compile_once(
     first, second = await concurrent_calls
 
     assert first == second
-    assert first.status is PublicationRenderStatus.SUCCEEDED
+    assert first.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 1
     assert len(uow_factory.publication_renders.renders) == 1
 
@@ -782,7 +772,7 @@ async def test_render_uses_the_loaded_template_and_font_snapshots(
         template_sha256=template_bundle.sha256,
         compiler=TYPST_COMPILER,
         compiler_version=TYPST_COMPILER_VERSION,
-        format=PublicationRenderFormat.PDF,
+        format=TypstRenderFormat.PDF,
         font_bundle_version=render.font_bundle_version,
         render_policy_version=render.render_policy_version,
     )
@@ -806,7 +796,7 @@ async def test_render_maps_blob_reference_integrity_error_to_storage_error(
 
     assert isinstance(raised.value.__cause__, IntegrityError)
     failed = next(iter(uow_factory.publication_renders.renders.values()))
-    assert failed.status is PublicationRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert failed.error_code == "publication_render_storage_failed"
 
 
@@ -826,10 +816,10 @@ async def test_publication_render_service_retries_failed_input_using_same_row(
     retried = await service.render_pdf(artifact.id)
 
     assert raised.value is failure
-    assert failed.status is PublicationRenderStatus.FAILED
+    assert failed.status is TypstRenderStatus.FAILED
     assert failed.error_code == "typst_compile_failed"
     assert retried.id == failed.id
-    assert retried.status is PublicationRenderStatus.SUCCEEDED
+    assert retried.status is TypstRenderStatus.SUCCEEDED
     assert retried.error_code is None
     assert compiler.call_count == 2
 
@@ -910,7 +900,7 @@ async def test_publication_render_service_marks_missing_media_failed(
 
     render = next(iter(uow_factory.publication_renders.renders.values()))
     assert raised.value.code == "publication_render_media_missing"
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
     assert render.error_code == "publication_render_media_missing"
 
 
@@ -935,7 +925,7 @@ async def test_publication_render_service_marks_diagram_kind_mismatch_failed(
 
     render = next(iter(uow_factory.publication_renders.renders.values()))
     assert raised.value.code == "publication_render_media_kind_mismatch"
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
     assert render.error_code == "publication_render_media_kind_mismatch"
 
 
@@ -959,7 +949,7 @@ async def test_publication_render_service_writes_resolved_media_to_synthetic_pat
 
     render = await service.render_pdf(artifact.id)
 
-    assert render.status is PublicationRenderStatus.SUCCEEDED
+    assert render.status is TypstRenderStatus.SUCCEEDED
     assert compiler.workspace_snapshots[0][f"RENDERER/{ref.media_path}"] == content
 
 
@@ -975,7 +965,7 @@ async def test_publication_render_service_recompiles_if_cached_output_is_missing
     second = await service.render_pdf(artifact.id)
 
     assert second.id == first.id
-    assert second.status is PublicationRenderStatus.SUCCEEDED
+    assert second.status is TypstRenderStatus.SUCCEEDED
     assert compiler.call_count == 2
 
 
@@ -1007,7 +997,7 @@ async def test_publication_render_service_marks_figure_integrity_mismatch_failed
 
     render = next(iter(uow_factory.publication_renders.renders.values()))
     assert raised.value.code == "publication_render_media_integrity_mismatch"
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
     assert render.error_code == "publication_render_media_integrity_mismatch"
 
 
@@ -1035,7 +1025,7 @@ async def test_publication_render_service_maps_media_blob_integrity_failure(
 
     render = next(iter(uow_factory.publication_renders.renders.values()))
     assert raised.value.code == "publication_render_media_integrity_mismatch"
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
 
 
 @pytest.mark.parametrize(
@@ -1066,7 +1056,7 @@ async def test_publication_render_service_persists_typed_compiler_failures(
 
     render = next(iter(uow_factory.publication_renders.renders.values()))
     assert raised.value is failure
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
     assert render.error_code == failure.code
     assert render.source_blob_id is not None
     assert render.render_data_blob_id is not None
@@ -1089,7 +1079,7 @@ async def test_font_materialization_failure_maps_to_storage_error_and_cleans_tem
         attempted_paths.append(destination_root)
         raise OSError("font copy failed")
 
-    monkeypatch.setattr(publication_rendering, "materialize_font_bundle", fail_materialization)
+    monkeypatch.setattr(typst_render_execution, "materialize_font_bundle", fail_materialization)
 
     with pytest.raises(publication_rendering.PublicationRenderStorageFailedError):
         await service.render_pdf(artifact.id)
@@ -1097,5 +1087,5 @@ async def test_font_materialization_failure_maps_to_storage_error_and_cleans_tem
     assert len(attempted_paths) == 1
     assert not attempted_paths[0].exists()
     render = next(iter(uow_factory.publication_renders.renders.values()))
-    assert render.status is PublicationRenderStatus.FAILED
+    assert render.status is TypstRenderStatus.FAILED
     assert render.error_code == "publication_render_storage_failed"

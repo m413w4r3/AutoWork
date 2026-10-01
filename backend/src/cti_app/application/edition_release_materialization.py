@@ -14,9 +14,12 @@ from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
-from cti_app.application.typst_compilation import TYPST_MAX_PDF_BYTES
+from cti_app.application.typst_render_output import (
+    TypstRenderOutputIntegrityError,
+    read_verified_render_pdf,
+)
 from cti_app.domain.edition_publication import PublicationManifestV1
-from cti_app.domain.edition_render import EditionRenderStatus
+from cti_app.domain.typst_render import TypstRenderStatus
 
 
 class EditionReleaseMaterializationError(ValueError):
@@ -97,7 +100,7 @@ class EditionReleaseRematerializationService:
             if (
                 render is None
                 or render.edition_release_id != release.id
-                or render.status is not EditionRenderStatus.SUCCEEDED
+                or render.status is not TypstRenderStatus.SUCCEEDED
             ):
                 raise EditionReleaseMaterializationError("edition_render_not_available")
             manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest.id)
@@ -131,18 +134,12 @@ class EditionReleaseRematerializationService:
         if not isinstance(edition_payload, dict):
             raise EditionReleaseMaterializationError("edition_document_blob_invalid")
 
-        assert render.output_blob_id is not None
-        assert render.output_sha256 is not None
-        assert render.output_byte_size is not None
-        pdf_content = await self._artifact_store.read_bytes(
-            render.output_blob_id,
-            max_bytes=TYPST_MAX_PDF_BYTES,
-        )
-        if (
-            len(pdf_content) != render.output_byte_size
-            or hashlib.sha256(pdf_content).hexdigest() != render.output_sha256
-        ):
-            raise EditionReleaseMaterializationError("edition_render_output_integrity_mismatch")
+        try:
+            pdf_content = await read_verified_render_pdf(self._artifact_store, render)
+        except TypstRenderOutputIntegrityError as exc:
+            raise EditionReleaseMaterializationError(
+                "edition_render_output_integrity_mismatch"
+            ) from exc
 
         return await self._workspace_materializer.materialize_release(
             period=period,
