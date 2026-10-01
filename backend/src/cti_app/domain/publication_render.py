@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
@@ -25,6 +25,12 @@ class PublicationRenderStatus(StrEnum):
     FAILED = "failed"
 
 
+class PublicationRenderAcquisitionOutcome(StrEnum):
+    ACQUIRED = "acquired"
+    REUSABLE_SUCCEEDED = "reusable_succeeded"
+    IN_PROGRESS = "in_progress"
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationRender:
     id: UUID
@@ -35,6 +41,8 @@ class PublicationRender:
     template_sha256: str
     compiler: str
     compiler_version: str
+    font_bundle_version: str
+    render_policy_version: str
     format: PublicationRenderFormat
     input_hash: str
     source_blob_id: UUID | None
@@ -58,6 +66,8 @@ class PublicationRender:
             "template_version",
             "compiler",
             "compiler_version",
+            "font_bundle_version",
+            "render_policy_version",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
@@ -106,6 +116,70 @@ class PublicationRender:
             raise ValueError("succeeded publication renders require complete output metadata")
         if self.status is PublicationRenderStatus.FAILED and self.error_code is None:
             raise ValueError("failed publication renders require error_code")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationRenderAcquisition:
+    outcome: PublicationRenderAcquisitionOutcome
+    render: PublicationRender
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, PublicationRenderAcquisitionOutcome):
+            raise ValueError("outcome must be a PublicationRenderAcquisitionOutcome")
+        if not isinstance(self.render, PublicationRender):
+            raise ValueError("render must be a PublicationRender")
+        expected_status = {
+            PublicationRenderAcquisitionOutcome.ACQUIRED: PublicationRenderStatus.RUNNING,
+            PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED: (
+                PublicationRenderStatus.SUCCEEDED
+            ),
+            PublicationRenderAcquisitionOutcome.IN_PROGRESS: PublicationRenderStatus.RUNNING,
+        }[self.outcome]
+        if self.render.status is not expected_status:
+            raise ValueError("acquisition outcome does not match the render status")
+
+
+def publication_render_acquisition_outcome(
+    render: PublicationRender, *, stale_running_before: datetime
+) -> PublicationRenderAcquisitionOutcome:
+    """Choose the owner/reuse/wait result for an existing render row."""
+    if render.status is PublicationRenderStatus.SUCCEEDED:
+        return PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED
+    if render.status is PublicationRenderStatus.FAILED:
+        return PublicationRenderAcquisitionOutcome.ACQUIRED
+    if render.updated_at < stale_running_before:
+        return PublicationRenderAcquisitionOutcome.ACQUIRED
+    return PublicationRenderAcquisitionOutcome.IN_PROGRESS
+
+
+def invalid_succeeded_reacquisition_outcome(
+    render: PublicationRender,
+    *,
+    observed_output_blob_id: UUID,
+    observed_output_sha256: str,
+) -> PublicationRenderAcquisitionOutcome:
+    """Choose a repair result without granting two callers the same ownership."""
+    if render.status is PublicationRenderStatus.RUNNING:
+        return PublicationRenderAcquisitionOutcome.IN_PROGRESS
+    if render.status is PublicationRenderStatus.FAILED:
+        return PublicationRenderAcquisitionOutcome.ACQUIRED
+    if (
+        render.output_blob_id == observed_output_blob_id
+        and render.output_sha256 == observed_output_sha256
+    ):
+        return PublicationRenderAcquisitionOutcome.ACQUIRED
+    return PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED
+
+
+def publication_render_retrying(render: PublicationRender, *, now: datetime) -> PublicationRender:
+    """Return a running value for an atomic retry/takeover persistence transition."""
+    return replace(
+        render,
+        status=PublicationRenderStatus.RUNNING,
+        error_code=None,
+        error_message=None,
+        updated_at=now,
+    )
 
 
 def _require_sha256(value: str, field_name: str) -> None:

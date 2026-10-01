@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 
 def resolve_bundle_files(
@@ -26,7 +26,13 @@ def resolve_bundle_files(
     resolved_files: list[tuple[str, Path]] = []
     for relative_path in sorted(files):
         posix_path = PurePosixPath(relative_path)
-        if posix_path.is_absolute() or "\\" in relative_path:
+        windows_path = PureWindowsPath(relative_path)
+        if (
+            posix_path.is_absolute()
+            or windows_path.is_absolute()
+            or windows_path.drive
+            or "\\" in relative_path
+        ):
             raise error(f"Manifest path must stay inside the bundle: {relative_path!r}")
         candidate = root.joinpath(*posix_path.parts)
         try:
@@ -49,12 +55,20 @@ def hash_bundle_files(resolved_files: Sequence[tuple[str, Path]], *, error: type
     boundaries unambiguous. Callers must pass `resolved_files` already sorted
     by relative path (as returned by `resolve_bundle_files`).
     """
-    digest = hashlib.sha256()
+    contents: list[tuple[str, bytes]] = []
     for relative_path, absolute_path in resolved_files:
         try:
             file_bytes = absolute_path.read_bytes()
         except OSError as exc:
             raise error(f"Manifest-listed file cannot be read: {relative_path!r}") from exc
+        contents.append((relative_path, file_bytes))
+    return hash_bundle_contents(contents)
+
+
+def hash_bundle_contents(files: Sequence[tuple[str, bytes]]) -> str:
+    """Hash in-memory `(relative_path, content)` pairs with the bundle framing."""
+    digest = hashlib.sha256()
+    for relative_path, file_bytes in sorted(files, key=lambda item: item[0]):
         path_bytes = relative_path.encode("utf-8")
         digest.update(len(path_bytes).to_bytes(8, "big"))
         digest.update(path_bytes)

@@ -5,6 +5,7 @@ import {
   selectionWireItem,
   selectionWireLastDecision,
 } from "./support/selectionWire";
+import type { PublicationDocumentV4 } from "../src/api/production";
 
 test("Sujet : sélection, production, revue et publication DOCX", async ({
   page,
@@ -27,8 +28,8 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
   const evidenceFactKey = "d".repeat(64);
   const evidenceEventKey = "1".repeat(64);
   const evidenceIndicatorKey = "2".repeat(64);
-  const publicationV3 = {
-    schema_version: "3",
+  const publicationV4 = {
+    schema_version: "4",
     subject_id: subjectId,
     publication_language: "fr",
     title: synthesisTitle,
@@ -117,7 +118,10 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
         source_document_ids: [vendorDocumentId],
       },
     ],
-  };
+    tables: [],
+    diagrams: [],
+    figures: [],
+  } satisfies PublicationDocumentV4;
   let batchReads = 0;
   let batchStarted = false;
   let selectionConfirmed = false;
@@ -382,8 +386,8 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
           artifact_version: 1,
           artifact_input_hash: hash,
           status: "verified",
-          schema_version: "3",
-          canonical_content: publicationV3,
+          schema_version: "4",
+          canonical_content: publicationV4,
           rendered_content: null,
         },
       });
@@ -599,7 +603,7 @@ test("Sujet : sélection, production, revue et publication DOCX", async ({
           status: "verified",
           metadata: {},
           rendered_content: null,
-          canonical_content: publicationV3,
+          canonical_content: publicationV4,
         },
       });
       return;

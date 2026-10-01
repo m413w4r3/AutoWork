@@ -79,7 +79,7 @@ from cti_app.domain.production import (
     SampleAcquisitionAttempt,
     SourceExtraction,
 )
-from cti_app.domain.publication_render import PublicationRender
+from cti_app.domain.publication_render import PublicationRender, PublicationRenderAcquisition
 from cti_app.domain.publication_review import PublicationReviewDecision
 from cti_app.domain.reference_corpus import ReferenceMember, ReferenceMemberDispute
 from cti_app.domain.selection import (
@@ -122,6 +122,18 @@ class PublicationRenderRepository(Protocol):
     async def get(self, render_id: UUID) -> PublicationRender | None: ...
 
     async def get_by_input_hash(self, input_hash: str) -> PublicationRender | None: ...
+
+    async def acquire_for_render(
+        self, proposed: PublicationRender, *, stale_running_before: datetime
+    ) -> PublicationRenderAcquisition: ...
+
+    async def reacquire_invalid_succeeded(
+        self,
+        proposed: PublicationRender,
+        *,
+        observed_output_blob_id: UUID,
+        observed_output_sha256: str,
+    ) -> PublicationRenderAcquisition: ...
 
     async def add(self, render: PublicationRender) -> PublicationRender: ...
 

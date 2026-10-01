@@ -6,9 +6,12 @@ import pytest
 
 from cti_app.domain.publication_render import (
     PublicationRender,
+    PublicationRenderAcquisition,
+    PublicationRenderAcquisitionOutcome,
     PublicationRenderFormat,
     PublicationRenderStatus,
     compute_publication_render_input_hash,
+    publication_render_acquisition_outcome,
 )
 
 
@@ -22,9 +25,9 @@ def _identity() -> dict[str, object]:
         "template_sha256": "2" * 64,
         "compiler": "typst",
         "compiler_version": "0.15.1",
-        "format": PublicationRenderFormat.PDF,
         "font_bundle_version": "chp-fonts-v1",
         "render_policy_version": "typst-publication-v4-v1",
+        "format": PublicationRenderFormat.PDF,
     }
 
 
@@ -39,6 +42,8 @@ def _render(**overrides: object) -> PublicationRender:
         "template_sha256": "a" * 64,
         "compiler": "typst",
         "compiler_version": "0.15.1",
+        "font_bundle_version": "chp-fonts-v1",
+        "render_policy_version": "typst-publication-v4-v1",
         "format": PublicationRenderFormat.PDF,
         "input_hash": "b" * 64,
         "source_blob_id": None,
@@ -66,6 +71,8 @@ def test_publication_render_has_the_exact_frozen_slotted_contract() -> None:
         "template_sha256",
         "compiler",
         "compiler_version",
+        "font_bundle_version",
+        "render_policy_version",
         "format",
         "input_hash",
         "source_blob_id",
@@ -103,6 +110,14 @@ def test_publication_render_validates_enum_and_status_invariants() -> None:
         _render(status=PublicationRenderStatus.FAILED)
     with pytest.raises(ValueError, match="template_sha256"):
         _render(template_sha256="A" * 64)
+    with pytest.raises(ValueError, match="font_bundle_version"):
+        _render(font_bundle_version=" \t ")
+    with pytest.raises(ValueError, match="render_policy_version"):
+        _render(render_policy_version="")
+    with pytest.raises(ValueError, match="font_bundle_version"):
+        _render(font_bundle_version=123)
+    with pytest.raises(ValueError, match="render_policy_version"):
+        _render(render_policy_version=None)
 
 
 def test_publication_render_input_hash_is_deterministic_and_tracks_every_input() -> None:
@@ -143,3 +158,31 @@ def test_render_id_and_timestamps_do_not_affect_the_render_input_hash() -> None:
     assert first.input_hash == second.input_hash == input_hash
     assert first.id != second.id
     assert first.created_at != second.created_at
+
+
+def test_publication_render_acquisition_outcomes_are_typed_and_match_status() -> None:
+    assert tuple(item.value for item in PublicationRenderAcquisitionOutcome) == (
+        "acquired",
+        "reusable_succeeded",
+        "in_progress",
+    )
+    stale_before = datetime.now(UTC) - timedelta(seconds=30)
+    running = _render()
+
+    acquisition = PublicationRenderAcquisition(
+        PublicationRenderAcquisitionOutcome.ACQUIRED,
+        running,
+    )
+    assert (
+        publication_render_acquisition_outcome(
+            running,
+            stale_running_before=stale_before,
+        )
+        is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        PublicationRenderAcquisition(
+            PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
+            running,
+        )
+    assert acquisition.render is running

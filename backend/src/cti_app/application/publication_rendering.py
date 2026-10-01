@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import tempfile
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from time import monotonic
 from uuid import UUID, uuid4
 
 from cti_app.application.media_assets import MediaAssetStore
@@ -22,14 +25,15 @@ from cti_app.application.typst_compilation import (
     TypstCompilationError,
     TypstCompiler,
     TypstCompileRequest,
-    compute_font_bundle_version,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
 )
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstRenderer,
     TypstRenderSource,
-    compute_template_bundle_hash,
-    resolve_template_bundle_files,
+    TypstTemplateBundle,
+    load_template_bundle,
 )
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.media_assets import MediaAssetKind
@@ -41,6 +45,8 @@ from cti_app.domain.publication_document import (
 from cti_app.domain.publication_render import (
     PUBLICATION_RENDER_POLICY_VERSION,
     PublicationRender,
+    PublicationRenderAcquisition,
+    PublicationRenderAcquisitionOutcome,
     PublicationRenderFormat,
     PublicationRenderStatus,
     compute_publication_render_input_hash,
@@ -92,6 +98,10 @@ class PublicationRenderStorageFailedError(PublicationRenderError):
     code = "publication_render_storage_failed"
 
 
+class PublicationRenderInProgressError(PublicationRenderError):
+    code = "publication_render_in_progress"
+
+
 class PublicationRenderService:
     def __init__(
         self,
@@ -102,17 +112,29 @@ class PublicationRenderService:
         renderer: TypstRenderer,
         compiler: TypstCompiler,
         chp_typst_root: Path,
-        font_paths: tuple[Path, ...],
+        font_bundle_root: Path,
         typst_fonts_lock_path: Path,
+        wait_poll_interval_seconds: float = 0.1,
+        wait_timeout_seconds: float = 60.0,
+        running_lease_seconds: float = 300.0,
     ) -> None:
+        if wait_poll_interval_seconds <= 0:
+            raise ValueError("wait_poll_interval_seconds must be positive")
+        if wait_timeout_seconds <= 0:
+            raise ValueError("wait_timeout_seconds must be positive")
+        if running_lease_seconds <= 0:
+            raise ValueError("running_lease_seconds must be positive")
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._media_asset_store = media_asset_store
         self._renderer = renderer
         self._compiler = compiler
         self._chp_typst_root = chp_typst_root
-        self._font_paths = font_paths
+        self._font_bundle_root = font_bundle_root
         self._typst_fonts_lock_path = typst_fonts_lock_path
+        self._wait_poll_interval_seconds = wait_poll_interval_seconds
+        self._wait_timeout_seconds = wait_timeout_seconds
+        self._running_lease_seconds = running_lease_seconds
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
         async with self._uow_factory() as uow:
@@ -130,111 +152,137 @@ class PublicationRenderService:
                     "Publication render requires a verified PUBLICATION artifact "
                     "with a canonical blob"
                 )
+            await uow.commit()
 
-            try:
-                payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            except (ValueError, KeyError) as exc:
-                raise PublicationRenderDocumentInvalidError(
-                    "Publication artifact does not contain valid PublicationDocumentV4 JSON"
-                ) from exc
-            except Exception as exc:
-                raise PublicationRenderStorageFailedError(
-                    "Unable to read the canonical publication blob"
-                ) from exc
-            try:
-                document = publication_document_v4_from_json(payload)
-            except (ValueError, KeyError) as exc:
-                raise PublicationRenderDocumentInvalidError(
-                    "Publication artifact does not contain a valid PublicationDocumentV4"
-                ) from exc
+        try:
+            payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
+        except (ValueError, KeyError) as exc:
+            raise PublicationRenderDocumentInvalidError(
+                "Publication artifact does not contain valid PublicationDocumentV4 JSON"
+            ) from exc
+        except Exception as exc:
+            raise PublicationRenderStorageFailedError(
+                "Unable to read the canonical publication blob"
+            ) from exc
+        try:
+            document = publication_document_v4_from_json(payload)
+        except (ValueError, KeyError) as exc:
+            raise PublicationRenderDocumentInvalidError(
+                "Publication artifact does not contain a valid PublicationDocumentV4"
+            ) from exc
 
-            publication_content_sha256 = hashlib.sha256(
-                ProductionArtifactStore.canonical_json_bytes(
-                    publication_document_v4_to_json(document)
-                )
-            ).hexdigest()
-            try:
-                template_version, template_sha256 = compute_template_bundle_hash(
-                    self._chp_typst_root
-                )
-                font_bundle_version = compute_font_bundle_version(
-                    self._chp_typst_root, self._typst_fonts_lock_path
-                )
-            except (TemplateBundleInvalidError, FontBundleInvalidError) as exc:
-                raise PublicationRenderTemplateInvalidError(str(exc)) from exc
-
-            input_hash = compute_publication_render_input_hash(
-                publication_artifact_id=artifact.id,
-                publication_content_sha256=publication_content_sha256,
-                renderer=PUBLICATION_RENDERER,
-                renderer_version=PUBLICATION_RENDERER_VERSION,
-                template_version=template_version,
-                template_sha256=template_sha256,
-                compiler=TYPST_COMPILER,
-                compiler_version=TYPST_COMPILER_VERSION,
-                format=PublicationRenderFormat.PDF,
-                font_bundle_version=font_bundle_version,
-                render_policy_version=PUBLICATION_RENDER_POLICY_VERSION,
+        publication_content_sha256 = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(publication_document_v4_to_json(document))
+        ).hexdigest()
+        try:
+            template_bundle = load_template_bundle(self._chp_typst_root)
+            font_bundle = load_font_bundle_snapshot(
+                self._font_bundle_root, self._typst_fonts_lock_path
             )
-            existing = await uow.publication_renders.get_by_input_hash(input_hash)
-            if existing is not None and existing.status is PublicationRenderStatus.SUCCEEDED:
-                output_valid = False
-                if existing.output_blob_id is not None:
-                    try:
-                        output = await self._artifact_store.read_bytes(
-                            existing.output_blob_id,
-                            max_bytes=TYPST_MAX_PDF_BYTES,
-                        )
-                        output_valid = (
-                            len(output) == existing.output_byte_size
-                            and hashlib.sha256(output).hexdigest() == existing.output_sha256
-                        )
-                    except Exception:
-                        output_valid = False
-                if output_valid:
-                    await uow.commit()
-                    return existing
+        except (TemplateBundleInvalidError, FontBundleInvalidError) as exc:
+            raise PublicationRenderTemplateInvalidError(str(exc)) from exc
+        template_version = template_bundle.template_version
+        template_sha256 = template_bundle.sha256
+        font_bundle_version = font_bundle.font_bundle_version
 
-            now = datetime.now(UTC)
-            if existing is None:
-                render_id = uuid4()
-                running = PublicationRender(
-                    id=render_id,
-                    publication_artifact_id=artifact.id,
-                    renderer=PUBLICATION_RENDERER,
-                    renderer_version=PUBLICATION_RENDERER_VERSION,
-                    template_version=template_version,
-                    template_sha256=template_sha256,
-                    compiler=TYPST_COMPILER,
-                    compiler_version=TYPST_COMPILER_VERSION,
-                    format=PublicationRenderFormat.PDF,
-                    input_hash=input_hash,
-                    source_blob_id=None,
-                    render_data_blob_id=None,
-                    output_blob_id=None,
-                    output_sha256=None,
-                    output_byte_size=None,
+        input_hash = compute_publication_render_input_hash(
+            publication_artifact_id=artifact.id,
+            publication_content_sha256=publication_content_sha256,
+            renderer=PUBLICATION_RENDERER,
+            renderer_version=PUBLICATION_RENDERER_VERSION,
+            template_version=template_version,
+            template_sha256=template_sha256,
+            compiler=TYPST_COMPILER,
+            compiler_version=TYPST_COMPILER_VERSION,
+            format=PublicationRenderFormat.PDF,
+            font_bundle_version=font_bundle_version,
+            render_policy_version=PUBLICATION_RENDER_POLICY_VERSION,
+        )
+        now = datetime.now(UTC)
+        proposed = PublicationRender(
+            id=uuid4(),
+            publication_artifact_id=artifact.id,
+            renderer=PUBLICATION_RENDERER,
+            renderer_version=PUBLICATION_RENDERER_VERSION,
+            template_version=template_version,
+            template_sha256=template_sha256,
+            compiler=TYPST_COMPILER,
+            compiler_version=TYPST_COMPILER_VERSION,
+            font_bundle_version=font_bundle_version,
+            render_policy_version=PUBLICATION_RENDER_POLICY_VERSION,
+            format=PublicationRenderFormat.PDF,
+            input_hash=input_hash,
+            source_blob_id=None,
+            render_data_blob_id=None,
+            output_blob_id=None,
+            output_sha256=None,
+            output_byte_size=None,
+            status=PublicationRenderStatus.RUNNING,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+
+        wait_deadline: float | None = None
+        acquisition: PublicationRenderAcquisition | None = None
+        while True:
+            if acquisition is None:
+                async with self._uow_factory() as uow:
+                    acquisition = await uow.publication_renders.acquire_for_render(
+                        proposed,
+                        stale_running_before=(
+                            datetime.now(UTC) - timedelta(seconds=self._running_lease_seconds)
+                        ),
+                    )
+                    await uow.commit()
+
+            if acquisition.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
+                render_id = acquisition.render.id
+                break
+
+            if acquisition.outcome is PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED:
+                if await self._cached_output_is_valid(acquisition.render):
+                    return acquisition.render
+                succeeded = acquisition.render
+                assert succeeded.output_blob_id is not None
+                assert succeeded.output_sha256 is not None
+                retrying = replace(
+                    succeeded,
                     status=PublicationRenderStatus.RUNNING,
                     error_code=None,
                     error_message=None,
-                    created_at=now,
-                    updated_at=now,
+                    updated_at=datetime.now(UTC),
                 )
-                await uow.publication_renders.add(running)
+                async with self._uow_factory() as uow:
+                    acquisition = await uow.publication_renders.reacquire_invalid_succeeded(
+                        retrying,
+                        observed_output_blob_id=succeeded.output_blob_id,
+                        observed_output_sha256=succeeded.output_sha256,
+                    )
+                    await uow.commit()
+                continue
+
+            if wait_deadline is None:
+                wait_deadline = monotonic() + self._wait_timeout_seconds
+            completed = await self._wait_for_render(input_hash, wait_deadline=wait_deadline)
+            if completed is None or completed.status is PublicationRenderStatus.FAILED:
+                acquisition = None
             else:
-                render_id = existing.id
-                await uow.publication_renders.mark_retrying(render_id)
-            await uow.commit()
+                acquisition = PublicationRenderAcquisition(
+                    PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
+                    completed,
+                )
 
         source_blob_id: UUID | None = None
         render_data_blob_id: UUID | None = None
         try:
             try:
-                render_source = self._renderer.render(document)
+                render_source = self._renderer.render(document, template_bundle)
+            except TemplateBundleInvalidError as exc:
+                raise PublicationRenderTemplateInvalidError(str(exc)) from exc
             except ValueError as exc:
                 raise PublicationRenderDocumentInvalidError(str(exc)) from exc
-            except OSError as exc:
-                raise PublicationRenderTemplateInvalidError(str(exc)) from exc
 
             resolved_media: dict[UUID, bytes] = {}
             for media_ref in render_source.media_refs:
@@ -287,58 +335,71 @@ class PublicationRenderService:
                     ) from exc
 
             try:
-                workspace = tempfile.TemporaryDirectory(prefix="autowork-publication-render-")
+                with tempfile.TemporaryDirectory(prefix="autowork-typst-fonts-") as font_path:
+                    font_paths = materialize_font_bundle(font_bundle, Path(font_path))
+                    with tempfile.TemporaryDirectory(
+                        prefix="autowork-publication-render-"
+                    ) as workspace_path:
+                        workspace_root = Path(workspace_path)
+                        self._populate_workspace(
+                            workspace_root, template_bundle, render_source, resolved_media
+                        )
+                        try:
+                            source_blob_id = await self._artifact_store.put_bytes(
+                                render_source.source_bytes,
+                                bucket=PUBLICATION_RENDER_SOURCE_BUCKET,
+                                mime_type="text/plain; charset=utf-8",
+                            )
+                            render_data_blob_id = await self._artifact_store.put_bytes(
+                                render_source.render_data_bytes,
+                                bucket=PUBLICATION_RENDER_DATA_BUCKET,
+                                mime_type="application/json",
+                            )
+                        except Exception as exc:
+                            raise PublicationRenderStorageFailedError(
+                                "Unable to persist Typst source or render data"
+                            ) from exc
+
+                        compiled: CompiledTypstDocument = await self._compiler.compile(
+                            TypstCompileRequest(
+                                workspace_root=workspace_root,
+                                entrypoint_relative_path="RENDERER/publication.typ",
+                                font_paths=font_paths,
+                            )
+                        )
+                        try:
+                            output_blob_id = await self._artifact_store.put_bytes(
+                                compiled.content,
+                                bucket=PUBLICATION_RENDER_OUTPUT_BUCKET,
+                                mime_type="application/pdf",
+                            )
+                        except Exception as exc:
+                            raise PublicationRenderStorageFailedError(
+                                "Unable to persist the compiled publication PDF"
+                            ) from exc
             except OSError as exc:
                 raise PublicationRenderStorageFailedError(
-                    "Unable to create the Typst render workspace"
+                    f"Unable to materialize Typst render inputs: {exc}"
                 ) from exc
-            with workspace as workspace_path:
-                workspace_root = Path(workspace_path)
-                self._populate_workspace(workspace_root, render_source, resolved_media)
-                try:
-                    source_blob_id = await self._artifact_store.put_bytes(
-                        render_source.source_bytes,
-                        bucket=PUBLICATION_RENDER_SOURCE_BUCKET,
-                        mime_type="text/plain; charset=utf-8",
-                    )
-                    render_data_blob_id = await self._artifact_store.put_bytes(
-                        render_source.render_data_bytes,
-                        bucket=PUBLICATION_RENDER_DATA_BUCKET,
-                        mime_type="application/json",
-                    )
-                except Exception as exc:
-                    raise PublicationRenderStorageFailedError(
-                        "Unable to persist Typst source or render data"
-                    ) from exc
 
-                compiled: CompiledTypstDocument = await self._compiler.compile(
-                    TypstCompileRequest(
-                        workspace_root=workspace_root,
-                        entrypoint_relative_path="RENDERER/publication.typ",
-                        font_paths=self._font_paths,
+            try:
+                async with self._uow_factory() as uow:
+                    succeeded = await uow.publication_renders.mark_succeeded(
+                        render_id,
+                        output_blob_id=output_blob_id,
+                        output_sha256=compiled.sha256,
+                        output_byte_size=compiled.byte_size,
+                        source_blob_id=source_blob_id,
+                        render_data_blob_id=render_data_blob_id,
                     )
-                )
-                try:
-                    output_blob_id = await self._artifact_store.put_bytes(
-                        compiled.content,
-                        bucket=PUBLICATION_RENDER_OUTPUT_BUCKET,
-                        mime_type="application/pdf",
-                    )
-                except Exception as exc:
-                    raise PublicationRenderStorageFailedError(
-                        "Unable to persist the compiled publication PDF"
-                    ) from exc
-
-            async with self._uow_factory() as uow:
-                succeeded = await uow.publication_renders.mark_succeeded(
-                    render_id,
-                    output_blob_id=output_blob_id,
-                    output_sha256=compiled.sha256,
-                    output_byte_size=compiled.byte_size,
-                    source_blob_id=source_blob_id,
-                    render_data_blob_id=render_data_blob_id,
-                )
-                await uow.commit()
+                    await uow.commit()
+            except Exception as exc:
+                # BlobCatalogService commits every catalog row before put_bytes
+                # returns. If a reference still disappears before this commit,
+                # keep the database integrity failure behind the service API.
+                raise PublicationRenderStorageFailedError(
+                    "Unable to persist the compiled publication render"
+                ) from exc
             return succeeded
         except (PublicationRenderError, TypstCompilationError) as exc:
             try:
@@ -355,22 +416,57 @@ class PublicationRenderService:
                 exc.add_note(f"Could not persist PublicationRender failure: {mark_failed_exc}")
             raise
 
+    async def _cached_output_is_valid(self, render: PublicationRender) -> bool:
+        if render.status is not PublicationRenderStatus.SUCCEEDED or render.output_blob_id is None:
+            return False
+        try:
+            output = await self._artifact_store.read_bytes(
+                render.output_blob_id,
+                max_bytes=TYPST_MAX_PDF_BYTES,
+            )
+        except Exception:
+            return False
+        return (
+            len(output) == render.output_byte_size
+            and hashlib.sha256(output).hexdigest() == render.output_sha256
+        )
+
+    async def _wait_for_render(
+        self, input_hash: str, *, wait_deadline: float
+    ) -> PublicationRender | None:
+        while True:
+            remaining = wait_deadline - monotonic()
+            if remaining <= 0:
+                raise PublicationRenderInProgressError(
+                    f"Publication render {input_hash} is still in progress"
+                )
+            await asyncio.sleep(min(self._wait_poll_interval_seconds, remaining))
+            async with self._uow_factory() as uow:
+                render = await uow.publication_renders.get_by_input_hash(input_hash)
+                await uow.commit()
+            if render is None or render.status is PublicationRenderStatus.FAILED:
+                return None
+            if render.status is PublicationRenderStatus.SUCCEEDED:
+                return render
+            if render.updated_at < datetime.now(UTC) - timedelta(
+                seconds=self._running_lease_seconds
+            ):
+                return None
+
     def _populate_workspace(
         self,
         workspace_root: Path,
+        template_bundle: TypstTemplateBundle,
         render_source: TypstRenderSource,
         resolved_media: dict[UUID, bytes],
     ) -> None:
         try:
-            bundle_files = resolve_template_bundle_files(self._chp_typst_root)
-            for relative_path, source_path in bundle_files:
-                destination = workspace_root.joinpath(*PurePosixPath(relative_path).parts)
+            for template_file in template_bundle.files:
+                destination = workspace_root.joinpath(
+                    *PurePosixPath(template_file.relative_path).parts
+                )
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(source_path.read_bytes())
-        except TemplateBundleInvalidError as exc:
-            raise PublicationRenderTemplateInvalidError(
-                f"Unable to materialize Typst template bundle: {exc}"
-            ) from exc
+                destination.write_bytes(template_file.content)
         except OSError as exc:
             raise PublicationRenderStorageFailedError(
                 f"Unable to materialize Typst template bundle: {exc}"

@@ -11,6 +11,8 @@ UV ?= uv
 PNPM ?= pnpm
 D2_BINARY ?= d2
 TYPST_BINARY ?= typst
+FONT_BUNDLE_ROOT ?= $(CURDIR)/chpTypst
+export FONT_BUNDLE_ROOT
 
 PYTHON_VERSION ?= 3.12
 

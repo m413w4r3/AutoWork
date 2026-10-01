@@ -10,11 +10,13 @@ from pathlib import Path
 import pytest
 from pypdf import PdfWriter
 
+from cti_app.application.typst_bundle import hash_bundle_contents
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TYPST_MAX_PDF_BYTES,
     CompiledTypstDocument,
     FontBundleInvalidError,
+    FontBundleSnapshot,
     TypstCompileFailedError,
     TypstCompileRequest,
     TypstCompilerUnavailableError,
@@ -23,6 +25,9 @@ from cti_app.application.typst_compilation import (
     TypstOutputInvalidError,
     TypstOutputTooLargeError,
     compute_font_bundle_version,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
+    resolve_font_bundle_paths,
 )
 from cti_app.infrastructure.typst_compiler import (
     AsyncioTypstProcessRunner,
@@ -356,7 +361,7 @@ async def test_process_runner_kills_and_reaps_on_timeout(
 
 
 def test_font_bundle_hash_uses_the_template_framing_scheme(tmp_path: Path) -> None:
-    root = tmp_path / "chpTypst"
+    root = tmp_path / "font-bundle"
     (root / "fonts").mkdir(parents=True)
     file_a = b"font-a-bytes"
     file_b = b"font-b-bytes"
@@ -384,9 +389,56 @@ def test_font_bundle_hash_uses_the_template_framing_scheme(tmp_path: Path) -> No
     assert compute_font_bundle_version(root, lock_path) == expected.hexdigest()
 
 
+def test_font_snapshot_hashes_and_materializes_the_loaded_bytes(tmp_path: Path) -> None:
+    root = tmp_path / "font-bundle"
+    (root / "fonts").mkdir(parents=True)
+    original = b"font-bytes-before-change"
+    (root / "fonts" / "regular.ttf").write_bytes(original)
+    lock_path = tmp_path / "typst-fonts.lock"
+    lock_path.write_text(
+        json.dumps({"font_bundle_label": "snapshot-fonts-v1", "files": ["fonts/regular.ttf"]}),
+        encoding="utf-8",
+    )
+
+    snapshot = load_font_bundle_snapshot(root, lock_path)
+    (root / "fonts" / "regular.ttf").write_bytes(b"changed after snapshot")
+    destination = tmp_path / "materialized-fonts"
+    destination.mkdir()
+    font_paths = materialize_font_bundle(snapshot, destination)
+
+    assert isinstance(snapshot, FontBundleSnapshot)
+    assert snapshot.files == (("fonts/regular.ttf", original),)
+    assert snapshot.font_bundle_version == hash_bundle_contents(snapshot.files)
+    assert font_paths == (destination / "fonts",)
+    assert (destination / "fonts" / "regular.ttf").read_bytes() == original
+
+
+def test_font_search_roots_come_from_manifest_file_directories(tmp_path: Path) -> None:
+    root = tmp_path / "font-bundle"
+    relative_files = (
+        "HankenGrotesk/HankenGrotesk-Regular.ttf",
+        "CascadiaCode/ttf/CascadiaCode.ttf",
+        "CascadiaCode/ttf/static/CascadiaCode-Regular.ttf",
+    )
+    for relative_path in relative_files:
+        file_path = root / relative_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(b"font")
+    lock_path = tmp_path / "typst-fonts.lock"
+    lock_path.write_text(
+        json.dumps({"font_bundle_label": "test-fonts-v1", "files": list(relative_files)}),
+        encoding="utf-8",
+    )
+
+    assert resolve_font_bundle_paths(root, lock_path) == (
+        root / "HankenGrotesk",
+        root / "CascadiaCode" / "ttf",
+    )
+
+
 @pytest.mark.parametrize("listed_path", ("../outside.ttf", "/outside.ttf"))
 def test_font_bundle_hash_rejects_paths_outside_root(tmp_path: Path, listed_path: str) -> None:
-    root = tmp_path / "chpTypst"
+    root = tmp_path / "font-bundle"
     root.mkdir()
     lock_path = tmp_path / "typst-fonts.lock"
     lock_path.write_text(
@@ -399,7 +451,7 @@ def test_font_bundle_hash_rejects_paths_outside_root(tmp_path: Path, listed_path
 
 
 def test_font_bundle_hash_rejects_missing_listed_file(tmp_path: Path) -> None:
-    root = tmp_path / "chpTypst"
+    root = tmp_path / "font-bundle"
     root.mkdir()
     lock_path = tmp_path / "typst-fonts.lock"
     lock_path.write_text(

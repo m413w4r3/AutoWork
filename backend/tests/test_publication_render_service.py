@@ -1,22 +1,29 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from cti_app.application import publication_rendering
 from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import PublicationRenderUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.typst_bundle import hash_bundle_contents
 from cti_app.application.typst_compilation import (
+    TYPST_COMPILER,
+    TYPST_COMPILER_VERSION,
     CompiledTypstDocument,
+    FontBundleSnapshot,
     TypstCompilationError,
     TypstCompileFailedError,
     TypstCompileRequest,
@@ -26,7 +33,12 @@ from cti_app.application.typst_compilation import (
     TypstOutputInvalidError,
     TypstOutputTooLargeError,
 )
-from cti_app.application.typst_rendering import TypstMediaRef, TypstRenderer, TypstRenderSource
+from cti_app.application.typst_rendering import (
+    TypstMediaRef,
+    TypstRenderer,
+    TypstRenderSource,
+    TypstTemplateBundle,
+)
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import (
@@ -39,8 +51,16 @@ from cti_app.domain.publication_document import (
     publication_document_v4_to_json,
 )
 from cti_app.domain.publication_render import (
+    PUBLICATION_RENDER_POLICY_VERSION,
     PublicationRender,
+    PublicationRenderAcquisition,
+    PublicationRenderAcquisitionOutcome,
+    PublicationRenderFormat,
     PublicationRenderStatus,
+    compute_publication_render_input_hash,
+    invalid_succeeded_reacquisition_outcome,
+    publication_render_acquisition_outcome,
+    publication_render_retrying,
 )
 
 
@@ -62,6 +82,34 @@ def _document() -> PublicationDocumentV4:
     )
 
 
+def _proposed_render(artifact_id: UUID, *, input_hash: str | None = None) -> PublicationRender:
+    now = datetime.now(UTC)
+    return PublicationRender(
+        id=uuid4(),
+        publication_artifact_id=artifact_id,
+        renderer="typst",
+        renderer_version="publication-v4-typst-v1",
+        template_version="unit-template-v1",
+        template_sha256="a" * 64,
+        compiler="typst",
+        compiler_version="0.15.1",
+        font_bundle_version="chp-fonts-v1",
+        render_policy_version="typst-publication-v4-v1",
+        format=PublicationRenderFormat.PDF,
+        input_hash=input_hash or hashlib.sha256(uuid4().bytes).hexdigest(),
+        source_blob_id=None,
+        render_data_blob_id=None,
+        output_blob_id=None,
+        output_sha256=None,
+        output_byte_size=None,
+        status=PublicationRenderStatus.RUNNING,
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
+    )
+
+
 class FakeProductionArtifacts:
     def __init__(self, artifacts: dict[UUID, ProductionArtifact]) -> None:
         self.artifacts = artifacts
@@ -73,12 +121,58 @@ class FakeProductionArtifacts:
 class FakePublicationRenders:
     def __init__(self) -> None:
         self.renders: dict[UUID, PublicationRender] = {}
+        self.in_progress_observed: asyncio.Event | None = None
 
     async def get_by_input_hash(self, input_hash: str) -> PublicationRender | None:
         return next(
             (render for render in self.renders.values() if render.input_hash == input_hash),
             None,
         )
+
+    async def acquire_for_render(
+        self, proposed: PublicationRender, *, stale_running_before: datetime
+    ) -> PublicationRenderAcquisition:
+        existing = await self.get_by_input_hash(proposed.input_hash)
+        if existing is None:
+            self.renders[proposed.id] = proposed
+            return PublicationRenderAcquisition(
+                PublicationRenderAcquisitionOutcome.ACQUIRED,
+                proposed,
+            )
+        outcome = publication_render_acquisition_outcome(
+            existing,
+            stale_running_before=stale_running_before,
+        )
+        if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
+            existing = publication_render_retrying(existing, now=datetime.now(UTC))
+            self.renders[existing.id] = existing
+        elif outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS:
+            if self.in_progress_observed is not None:
+                self.in_progress_observed.set()
+        return PublicationRenderAcquisition(outcome, existing)
+
+    async def reacquire_invalid_succeeded(
+        self,
+        proposed: PublicationRender,
+        *,
+        observed_output_blob_id: UUID,
+        observed_output_sha256: str,
+    ) -> PublicationRenderAcquisition:
+        existing = self.renders.get(proposed.id)
+        if existing is None:
+            return await self.acquire_for_render(
+                proposed,
+                stale_running_before=datetime.min.replace(tzinfo=UTC),
+            )
+        outcome = invalid_succeeded_reacquisition_outcome(
+            existing,
+            observed_output_blob_id=observed_output_blob_id,
+            observed_output_sha256=observed_output_sha256,
+        )
+        if outcome is PublicationRenderAcquisitionOutcome.ACQUIRED:
+            existing = publication_render_retrying(existing, now=datetime.now(UTC))
+            self.renders[existing.id] = existing
+        return PublicationRenderAcquisition(outcome, existing)
 
     async def add(self, render: PublicationRender) -> PublicationRender:
         if await self.get_by_input_hash(render.input_hash) is not None:
@@ -234,10 +328,16 @@ class FakeRenderer:
         self.media_refs = media_refs
         self.call_count = 0
 
-    def render(self, document: PublicationDocumentV4) -> TypstRenderSource:
+    def render(
+        self, document: PublicationDocumentV4, template_bundle: TypstTemplateBundle
+    ) -> TypstRenderSource:
         del document
         self.call_count += 1
-        source_bytes = b'#let publication = json("render-data.json")\n'
+        source_bytes = next(
+            file.content
+            for file in template_bundle.files
+            if file.relative_path == "RENDERER/publication.typ"
+        )
         render_data = b'{"schema_version":"typst-publication-model-v1"}'
         return TypstRenderSource(
             source_bytes=source_bytes,
@@ -249,12 +349,21 @@ class FakeRenderer:
 
 
 class FakeCompiler:
-    def __init__(self, failures: tuple[Exception, ...] = ()) -> None:
+    def __init__(
+        self,
+        failures: tuple[Exception, ...] = (),
+        *,
+        compile_started: asyncio.Event | None = None,
+        release_compile: asyncio.Event | None = None,
+    ) -> None:
         self.failures = list(failures)
         self.call_count = 0
         self.requests: list[TypstCompileRequest] = []
         self.workspace_snapshots: list[dict[str, bytes]] = []
+        self.font_snapshots: list[dict[str, bytes]] = []
         self.content = b"%PDF-canned-publication"
+        self.compile_started = compile_started
+        self.release_compile = release_compile
 
     async def compile(self, request: TypstCompileRequest) -> CompiledTypstDocument:
         self.call_count += 1
@@ -266,6 +375,19 @@ class FakeCompiler:
                 if path.is_file()
             }
         )
+        font_root = Path(os.path.commonpath([str(path) for path in request.font_paths]))
+        self.font_snapshots.append(
+            {
+                path.relative_to(font_root).as_posix(): path.read_bytes()
+                for search_root in request.font_paths
+                for path in search_root.rglob("*")
+                if path.is_file()
+            }
+        )
+        if self.compile_started is not None:
+            self.compile_started.set()
+        if self.release_compile is not None:
+            await self.release_compile.wait()
         if self.failures:
             raise self.failures.pop(0)
         return CompiledTypstDocument(
@@ -355,17 +477,20 @@ def _make_service(
         ),
         encoding="utf-8",
     )
-    lock_path = tmp_path / "typst-fonts.lock"
-    lock_path.write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(
-        publication_rendering,
-        "compute_template_bundle_hash",
-        lambda _: ("unit-template-v1", "a" * 64),
+    font_bundle_root = tmp_path / "typst-fonts"
+    font_files = (
+        "HankenGrotesk/HankenGrotesk-Regular.ttf",
+        "CascadiaCode/ttf/CascadiaCode.ttf",
+        "CascadiaCode/ttf/static/CascadiaCode-Regular.ttf",
     )
-    monkeypatch.setattr(
-        publication_rendering,
-        "compute_font_bundle_version",
-        lambda *_: "unit-fonts-v1",
+    for relative_path in font_files:
+        font_path = font_bundle_root / relative_path
+        font_path.parent.mkdir(parents=True, exist_ok=True)
+        font_path.write_bytes(b"test font")
+    lock_path = tmp_path / "typst-fonts.lock"
+    lock_path.write_text(
+        json.dumps({"font_bundle_label": "unit-fonts-v1", "files": list(font_files)}),
+        encoding="utf-8",
     )
     service = publication_rendering.PublicationRenderService(
         uow_factory=cast(PublicationRenderUnitOfWorkFactory, uow_factory),
@@ -374,10 +499,109 @@ def _make_service(
         renderer=cast(TypstRenderer, renderer),
         compiler=fake_compiler,
         chp_typst_root=template_root,
-        font_paths=(),
+        font_bundle_root=font_bundle_root,
         typst_fonts_lock_path=lock_path,
     )
     return service, artifact, uow_factory, artifact_store, media_assets, fake_compiler
+
+
+@pytest.mark.asyncio
+async def test_fake_acquire_for_render_decision_table() -> None:
+    proposed = _proposed_render(uuid4())
+    stale_before = datetime.now(UTC) - timedelta(seconds=30)
+
+    empty = FakePublicationRenders()
+    created = await empty.acquire_for_render(proposed, stale_running_before=stale_before)
+    assert created.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+    assert created.render == proposed
+
+    now = datetime.now(UTC)
+    cases = (
+        (
+            replace(
+                proposed,
+                status=PublicationRenderStatus.SUCCEEDED,
+                output_blob_id=uuid4(),
+                output_sha256="b" * 64,
+                output_byte_size=1,
+            ),
+            PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED,
+        ),
+        (
+            replace(
+                proposed,
+                status=PublicationRenderStatus.FAILED,
+                error_code="compile_failed",
+            ),
+            PublicationRenderAcquisitionOutcome.ACQUIRED,
+        ),
+        (
+            replace(proposed, updated_at=now),
+            PublicationRenderAcquisitionOutcome.IN_PROGRESS,
+        ),
+        (
+            replace(proposed, updated_at=now - timedelta(minutes=10)),
+            PublicationRenderAcquisitionOutcome.ACQUIRED,
+        ),
+    )
+    for existing, expected in cases:
+        repository = FakePublicationRenders()
+        repository.renders[existing.id] = existing
+        acquisition = await repository.acquire_for_render(
+            replace(proposed, id=uuid4()),
+            stale_running_before=stale_before,
+        )
+        assert acquisition.outcome is expected
+        assert acquisition.render.id == existing.id
+        if expected is PublicationRenderAcquisitionOutcome.ACQUIRED:
+            assert acquisition.render.status is PublicationRenderStatus.RUNNING
+            assert acquisition.render.error_code is None
+            assert acquisition.render.error_message is None
+
+
+@pytest.mark.asyncio
+async def test_fake_reacquire_invalid_succeeded_has_a_single_repair_owner() -> None:
+    proposed = _proposed_render(uuid4())
+    output_blob_id = uuid4()
+    output_sha256 = "c" * 64
+    succeeded = replace(
+        proposed,
+        status=PublicationRenderStatus.SUCCEEDED,
+        output_blob_id=output_blob_id,
+        output_sha256=output_sha256,
+        output_byte_size=1,
+    )
+    repository = FakePublicationRenders()
+    repository.renders[succeeded.id] = succeeded
+    repair_proposal = replace(succeeded, status=PublicationRenderStatus.RUNNING)
+
+    owner = await repository.reacquire_invalid_succeeded(
+        repair_proposal,
+        observed_output_blob_id=output_blob_id,
+        observed_output_sha256=output_sha256,
+    )
+    waiter = await repository.reacquire_invalid_succeeded(
+        repair_proposal,
+        observed_output_blob_id=output_blob_id,
+        observed_output_sha256=output_sha256,
+    )
+
+    assert owner.outcome is PublicationRenderAcquisitionOutcome.ACQUIRED
+    assert owner.render.status is PublicationRenderStatus.RUNNING
+    assert waiter.outcome is PublicationRenderAcquisitionOutcome.IN_PROGRESS
+
+    replaced_success = replace(
+        succeeded,
+        output_blob_id=uuid4(),
+        output_sha256="d" * 64,
+    )
+    repository.renders[succeeded.id] = replaced_success
+    stale_repair = await repository.reacquire_invalid_succeeded(
+        repair_proposal,
+        observed_output_blob_id=output_blob_id,
+        observed_output_sha256=output_sha256,
+    )
+    assert stale_repair.outcome is PublicationRenderAcquisitionOutcome.REUSABLE_SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -407,7 +631,47 @@ async def test_publication_render_service_happy_path_persists_content_and_hashes
         "publication-renders-output",
     ]
     assert compiler.call_count == 1
+    assert len(compiler.requests[0].font_paths) == 2
+    assert all(not path.exists() for path in compiler.requests[0].font_paths)
+    assert compiler.font_snapshots[0] == {
+        "HankenGrotesk/HankenGrotesk-Regular.ttf": b"test font",
+        "CascadiaCode/ttf/CascadiaCode.ttf": b"test font",
+        "CascadiaCode/ttf/static/CascadiaCode-Regular.ttf": b"test font",
+    }
     assert uow_factory.publication_renders.renders[render.id] == render
+
+
+@pytest.mark.asyncio
+async def test_publication_render_service_concurrent_calls_compile_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    compile_started = asyncio.Event()
+    release_compile = asyncio.Event()
+    compiler = FakeCompiler(
+        compile_started=compile_started,
+        release_compile=release_compile,
+    )
+    service, artifact, uow_factory, _, _, compiler = _make_service(
+        tmp_path,
+        monkeypatch,
+        compiler=compiler,
+    )
+    in_progress_observed = asyncio.Event()
+    uow_factory.publication_renders.in_progress_observed = in_progress_observed
+
+    concurrent_calls = asyncio.gather(
+        service.render_pdf(artifact.id),
+        service.render_pdf(artifact.id),
+    )
+    await compile_started.wait()
+    await in_progress_observed.wait()
+    release_compile.set()
+    first, second = await concurrent_calls
+
+    assert first == second
+    assert first.status is PublicationRenderStatus.SUCCEEDED
+    assert compiler.call_count == 1
+    assert len(uow_factory.publication_renders.renders) == 1
 
 
 @pytest.mark.asyncio
@@ -428,20 +692,122 @@ async def test_publication_render_service_creates_new_row_when_template_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, artifact, _, _, _, compiler = _make_service(tmp_path, monkeypatch)
-    template_hashes = iter((("template-v1", "a" * 64), ("template-v2", "b" * 64)))
-    monkeypatch.setattr(
-        publication_rendering,
-        "compute_template_bundle_hash",
-        lambda _: next(template_hashes),
-    )
 
     first = await service.render_pdf(artifact.id)
+    template_file = service._chp_typst_root / "UTILS/helpers.typ"
+    template_file.write_bytes(template_file.read_bytes() + b" changed")
     second = await service.render_pdf(artifact.id)
 
     assert first.id != second.id
     assert first.input_hash != second.input_hash
     assert first.publication_artifact_id == second.publication_artifact_id == artifact.id
     assert compiler.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_publication_render_service_creates_new_row_when_font_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, artifact, _, _, _, compiler = _make_service(tmp_path, monkeypatch)
+
+    first = await service.render_pdf(artifact.id)
+    font_file = service._font_bundle_root / "HankenGrotesk/HankenGrotesk-Regular.ttf"
+    font_file.write_bytes(font_file.read_bytes() + b" changed")
+    second = await service.render_pdf(artifact.id)
+
+    assert first.id != second.id
+    assert first.input_hash != second.input_hash
+    assert first.publication_artifact_id == second.publication_artifact_id == artifact.id
+    assert compiler.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_render_uses_the_loaded_template_and_font_snapshots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, artifact, _, store, _, compiler = _make_service(tmp_path, monkeypatch)
+    loaded_templates: list[TypstTemplateBundle] = []
+    loaded_fonts: list[FontBundleSnapshot] = []
+    original_load_template = publication_rendering.load_template_bundle
+    original_load_fonts = publication_rendering.load_font_bundle_snapshot
+
+    def capture_template(root: Path) -> TypstTemplateBundle:
+        bundle = original_load_template(root)
+        loaded_templates.append(bundle)
+        return bundle
+
+    def mutate_sources_after_font_snapshot(root: Path, lock_path: Path) -> FontBundleSnapshot:
+        snapshot = original_load_fonts(root, lock_path)
+        loaded_fonts.append(snapshot)
+        (service._chp_typst_root / "UTILS/helpers.typ").unlink()
+        (root / "HankenGrotesk/HankenGrotesk-Regular.ttf").unlink()
+        return snapshot
+
+    monkeypatch.setattr(publication_rendering, "load_template_bundle", capture_template)
+    monkeypatch.setattr(
+        publication_rendering,
+        "load_font_bundle_snapshot",
+        mutate_sources_after_font_snapshot,
+    )
+
+    render = await service.render_pdf(artifact.id)
+
+    template_bundle = loaded_templates[0]
+    font_bundle = loaded_fonts[0]
+    assert render.template_sha256 == template_bundle.sha256
+    assert render.font_bundle_version == font_bundle.font_bundle_version
+    assert render.render_policy_version == PUBLICATION_RENDER_POLICY_VERSION
+    expected_templates = {file.relative_path: file.content for file in template_bundle.files}
+    observed_templates = {
+        path: content
+        for path, content in compiler.workspace_snapshots[0].items()
+        if path in expected_templates
+    }
+    assert observed_templates == expected_templates
+    assert hash_bundle_contents(tuple(observed_templates.items())) == render.template_sha256
+    assert compiler.font_snapshots[0] == dict(font_bundle.files)
+    assert hash_bundle_contents(tuple(compiler.font_snapshots[0].items())) == (
+        font_bundle.font_bundle_version
+    )
+    assert store.default_payload is not None
+    publication_content_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(store.default_payload)
+    ).hexdigest()
+    assert render.input_hash == compute_publication_render_input_hash(
+        publication_artifact_id=artifact.id,
+        publication_content_sha256=publication_content_sha256,
+        renderer=publication_rendering.PUBLICATION_RENDERER,
+        renderer_version=publication_rendering.PUBLICATION_RENDERER_VERSION,
+        template_version=template_bundle.template_version,
+        template_sha256=template_bundle.sha256,
+        compiler=TYPST_COMPILER,
+        compiler_version=TYPST_COMPILER_VERSION,
+        format=PublicationRenderFormat.PDF,
+        font_bundle_version=render.font_bundle_version,
+        render_policy_version=render.render_policy_version,
+    )
+
+
+@pytest.mark.asyncio
+async def test_render_maps_blob_reference_integrity_error_to_storage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, artifact, uow_factory, _, _, _ = _make_service(tmp_path, monkeypatch)
+
+    async def fail_mark_succeeded(*_args: object, **_kwargs: object) -> None:
+        raise IntegrityError(
+            "UPDATE publication_renders", {}, RuntimeError("foreign key violation")
+        )
+
+    monkeypatch.setattr(uow_factory.publication_renders, "mark_succeeded", fail_mark_succeeded)
+
+    with pytest.raises(publication_rendering.PublicationRenderStorageFailedError) as raised:
+        await service.render_pdf(artifact.id)
+
+    assert isinstance(raised.value.__cause__, IntegrityError)
+    failed = next(iter(uow_factory.publication_renders.renders.values()))
+    assert failed.status is PublicationRenderStatus.FAILED
+    assert failed.error_code == "publication_render_storage_failed"
 
 
 @pytest.mark.asyncio
@@ -705,3 +1071,31 @@ async def test_publication_render_service_persists_typed_compiler_failures(
     assert render.source_blob_id is not None
     assert render.render_data_blob_id is not None
     assert compiler.call_count == 1
+    assert not compiler.requests[0].workspace_root.exists()
+    assert all(not path.exists() for path in compiler.requests[0].font_paths)
+
+
+@pytest.mark.asyncio
+async def test_font_materialization_failure_maps_to_storage_error_and_cleans_temp_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, artifact, uow_factory, _, _, _ = _make_service(tmp_path, monkeypatch)
+    attempted_paths: list[Path] = []
+
+    def fail_materialization(
+        snapshot: FontBundleSnapshot, destination_root: Path
+    ) -> tuple[Path, ...]:
+        del snapshot
+        attempted_paths.append(destination_root)
+        raise OSError("font copy failed")
+
+    monkeypatch.setattr(publication_rendering, "materialize_font_bundle", fail_materialization)
+
+    with pytest.raises(publication_rendering.PublicationRenderStorageFailedError):
+        await service.render_pdf(artifact.id)
+
+    assert len(attempted_paths) == 1
+    assert not attempted_paths[0].exists()
+    render = next(iter(uow_factory.publication_renders.renders.values()))
+    assert render.status is PublicationRenderStatus.FAILED
+    assert render.error_code == "publication_render_storage_failed"

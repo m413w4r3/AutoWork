@@ -9,7 +9,12 @@ from uuid import UUID
 
 import pytest
 
-from cti_app.application.typst_rendering import TypstRenderer, _timeline_source_urls
+from cti_app.application.typst_rendering import (
+    TypstRenderer,
+    TypstTemplateBundle,
+    _timeline_source_urls,
+    load_template_bundle,
+)
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
@@ -36,11 +41,15 @@ _SUBJECT_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 _INJECTION_TEXT = '#import "x"\n$math$ [] {} \\ "—été"'
 
 
-def _renderer(tmp_path: Path) -> TypstRenderer:
+def _renderer(tmp_path: Path) -> tuple[TypstRenderer, TypstTemplateBundle]:
     entrypoint = tmp_path / "RENDERER" / "publication.typ"
     entrypoint.parent.mkdir(parents=True)
     entrypoint.write_bytes(b'#let publication = json("render-data.json")\n')
-    return TypstRenderer(tmp_path)
+    (tmp_path / "renderer-manifest.json").write_text(
+        json.dumps({"template_version": "test-v1", "files": ["RENDERER/publication.typ"]}),
+        encoding="utf-8",
+    )
+    return TypstRenderer(), load_template_bundle(tmp_path)
 
 
 def _ref(source_document_id: UUID, token: str) -> PublicationEvidenceRefV1:
@@ -193,11 +202,12 @@ def _figure_at(
 
 
 def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_path: Path) -> None:
-    renderer = _renderer(tmp_path)
+    renderer, bundle = _renderer(tmp_path)
+    (tmp_path / "RENDERER" / "publication.typ").write_bytes(b"changed after bundle load")
     document = _document()
 
-    first = renderer.render(document)
-    second = renderer.render(document)
+    first = renderer.render(document, bundle)
+    second = renderer.render(document, bundle)
     data = json.loads(first.render_data_bytes)
 
     assert first.source_bytes == b'#let publication = json("render-data.json")\n'
@@ -230,9 +240,9 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     tmp_path: Path,
 ) -> None:
-    renderer = _renderer(tmp_path)
+    renderer, bundle = _renderer(tmp_path)
     document = _full_document()
-    data = json.loads(renderer.render(document).render_data_bytes)
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
 
     assert data["language"] == "fr"
     assert data["title"] == "Intrusion report"
@@ -287,11 +297,11 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     ]
     assert data["body_blocks"][2] == {"type": "section_heading", "text": _INJECTION_TEXT}
     assert data["body_blocks"][3] == {"type": "paragraph", "text": "Section body"}
-    assert "—été".encode() in renderer.render(document).render_data_bytes
+    assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
 
 
 def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Path) -> None:
-    renderer = _renderer(tmp_path)
+    renderer, bundle = _renderer(tmp_path)
     placement_specs = (
         ("after_timeline", EnrichmentPlacementKind.AFTER_TIMELINE, None),
         ("after_lead", EnrichmentPlacementKind.AFTER_LEAD, None),
@@ -326,7 +336,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
         for position, suffix in enumerate(("z_first", "a_second"))
     )
     document = _full_document(tables=tables, diagrams=diagrams, figures=figures)
-    data = json.loads(renderer.render(document).render_data_bytes)
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
     blocks = data["body_blocks"]
 
     expected_by_placement = {
@@ -366,7 +376,9 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     assert caption_block["rows"] == [["-enc", "Execution"]]
 
     diagram_ref = next(
-        ref for ref in renderer.render(document).media_refs if ref.asset_id == diagrams[0].asset_id
+        ref
+        for ref in renderer.render(document, bundle).media_refs
+        if ref.asset_id == diagrams[0].asset_id
     )
     assert diagram_ref.expected_kind is MediaAssetKind.DIAGRAM_SVG
     assert diagram_ref.expected_mime_type == "image/svg+xml"
@@ -378,7 +390,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
 def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
     tmp_path: Path,
 ) -> None:
-    renderer = _renderer(tmp_path)
+    renderer, bundle = _renderer(tmp_path)
     shared_asset_id = UUID("30000000-0000-4000-8000-000000000001")
     first = _figure_at(
         "figure_one",
@@ -402,7 +414,7 @@ def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
         ),
     )
     document = _full_document(figures=(first, second))
-    rendered = renderer.render(document)
+    rendered = renderer.render(document, bundle)
     data = json.loads(rendered.render_data_bytes)
     figure_blocks = [block for block in data["body_blocks"] if block["type"] == "figure"]
 
@@ -440,12 +452,12 @@ def test_empty_evidence_reference_list_maps_to_zero_source_urls() -> None:
 def test_figure_media_extension_matches_mime_type(
     tmp_path: Path, mime_type: str, extension: str
 ) -> None:
-    renderer = _renderer(tmp_path)
+    renderer, bundle = _renderer(tmp_path)
     figure = replace(
         _figure(key="figure_ext"),
         asset_id=UUID(int=500 + len(extension)),
         mime_type=mime_type,
     )
-    rendered = renderer.render(_document(figures=(figure,)))
+    rendered = renderer.render(_document(figures=(figure,)), bundle)
 
     assert rendered.media_refs[0].media_path.endswith(extension)

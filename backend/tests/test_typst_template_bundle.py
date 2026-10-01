@@ -9,6 +9,7 @@ import pytest
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     compute_template_bundle_hash,
+    load_template_bundle,
 )
 
 _MANIFEST_FILES = (
@@ -62,6 +63,27 @@ def test_same_bundle_has_same_hash_and_uses_manifest_version(template_bundle: Pa
     assert first[1] == digest.hexdigest()
 
 
+def test_template_bundle_is_frozen_and_keeps_the_hashed_bytes(template_bundle: Path) -> None:
+    bundle = load_template_bundle(template_bundle)
+    listed_file = template_bundle / _MANIFEST_FILES[0]
+    original_bytes = listed_file.read_bytes()
+
+    assert bundle.template_version == "chp-article-v1"
+    assert bundle.sha256 == compute_template_bundle_hash(template_bundle)[1]
+    assert next(
+        file.content for file in bundle.files if file.relative_path == _MANIFEST_FILES[0]
+    ) == (original_bytes)
+    with pytest.raises(AttributeError):
+        bundle.template_version = "changed"  # type: ignore[misc]
+
+    listed_file.write_bytes(b"changed after snapshot")
+
+    assert bundle.sha256 != compute_template_bundle_hash(template_bundle)[1]
+    assert next(
+        file.content for file in bundle.files if file.relative_path == _MANIFEST_FILES[0]
+    ) == (original_bytes)
+
+
 def test_manifest_listed_file_bytes_change_the_hash(template_bundle: Path) -> None:
     before = compute_template_bundle_hash(template_bundle)
     listed_file = template_bundle / _MANIFEST_FILES[0]
@@ -112,3 +134,26 @@ def test_parent_traversal_manifest_path_is_rejected_before_reading_outside(
 
     with pytest.raises(TemplateBundleInvalidError, match="escapes the bundle"):
         compute_template_bundle_hash(template_bundle)
+
+
+@pytest.mark.parametrize("listed_path", ("/outside.typ", "C:/outside.typ", "UTILS\\helpers.typ"))
+def test_absolute_and_backslash_manifest_paths_are_rejected(
+    template_bundle: Path, listed_path: str
+) -> None:
+    manifest = {"template_version": "chp-article-v1", "files": [listed_path]}
+    (template_bundle / "renderer-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(TemplateBundleInvalidError):
+        load_template_bundle(template_bundle)
+
+
+def test_duplicate_manifest_paths_are_rejected(template_bundle: Path) -> None:
+    relative_path = _MANIFEST_FILES[0]
+    manifest = {
+        "template_version": "chp-article-v1",
+        "files": [relative_path, relative_path],
+    }
+    (template_bundle / "renderer-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(TemplateBundleInvalidError, match="duplicate"):
+        load_template_bundle(template_bundle)

@@ -1,0 +1,5 @@
+# Shell-sourced lock: upstream font archives and their verified SHA-256 digests.
+CASCADIA_CODE_ARCHIVE_URL=https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip
+CASCADIA_CODE_ARCHIVE_SHA256=e67a68ee3386db63f48b9054bd196ea752bc6a4ebb4df35adce6733da50c8474
+HANKEN_GROTESK_ARCHIVE_URL=https://codeload.github.com/marcologous/hanken-grotesk/tar.gz/14e98f835af573f4ed1851ae30c8ecb0e229b04d
+HANKEN_GROTESK_ARCHIVE_SHA256=d85337cf28eb4cbfd41fd797756c6b1b2b769e389db5684cd6e51780a86de46e

@@ -11,10 +11,22 @@ from typing import Any, NoReturn
 import pytest
 from pypdf import PdfReader
 
-from cti_app.application.typst_compilation import TYPST_COMPILER_VERSION, TypstCompileRequest
+from cti_app.application.typst_compilation import (
+    TYPST_COMPILER_VERSION,
+    TypstCompileRequest,
+    load_font_bundle_snapshot,
+    materialize_font_bundle,
+)
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
+
+
+@pytest.fixture(scope="session")
+def font_bundle_root() -> Path:
+    configured_root = os.environ.get("FONT_BUNDLE_ROOT")
+    return Path(configured_root) if configured_root else _REPOSITORY_ROOT / "chpTypst"
 
 
 def _skip_unless_ci(reason: str) -> NoReturn:
@@ -30,8 +42,9 @@ def typst_binary() -> str:
 
     CI installs Typst once via scripts/install-typst.sh and exposes it as
     TYPST_BINARY/PATH (see .github/workflows/ci.yml), matching the existing D2
-    pattern. Local runs without a pinned Typst on PATH skip instead of
-    re-downloading per test session.
+    pattern. FONT_BUNDLE_ROOT selects the matching installed font bundle and
+    falls back to the local ignored chpTypst fonts when available. Local runs
+    without a pinned Typst on PATH skip instead of re-downloading per session.
     """
     binary = os.environ.get("TYPST_BINARY") or shutil.which("typst")
     if binary is None:
@@ -148,18 +161,17 @@ def _build_runtime_workspace(repository_root: Path, workspace_root: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_real_typst_compiles_representative_workspace_deterministically(
-    tmp_path: Path, typst_binary: str
+    tmp_path: Path, typst_binary: str, font_bundle_root: Path
 ) -> None:
     workspace_root = tmp_path / "workspace"
     _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root)
-    chp_typst_root = _REPOSITORY_ROOT / "chpTypst"
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "font-snapshot"
+    font_root.mkdir()
     request = TypstCompileRequest(
         workspace_root=workspace_root,
         entrypoint_relative_path="RENDERER/publication.typ",
-        font_paths=(
-            chp_typst_root / "HankenGrotesk",
-            chp_typst_root / "CascadiaCode" / "ttf",
-        ),
+        font_paths=materialize_font_bundle(font_snapshot, font_root),
     )
     compiler = TypstSubprocessCompiler(binary=str(typst_binary))
 

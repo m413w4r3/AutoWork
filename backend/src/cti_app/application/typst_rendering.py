@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from cti_app.application.typst_bundle import hash_bundle_files, resolve_bundle_files
+from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
 from cti_app.domain.publication import (
@@ -62,14 +62,38 @@ class TypstRenderSource:
     media_refs: tuple[TypstMediaRef, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class TemplateFile:
+    relative_path: str
+    content: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class TypstTemplateBundle:
+    template_version: str
+    sha256: str
+    files: tuple[TemplateFile, ...]
+
+
 class TypstRenderer:
     """Build deterministic data and return the fixed production entrypoint."""
 
-    def __init__(self, chp_typst_root: Path) -> None:
-        self._chp_typst_root = chp_typst_root
-
-    def render(self, document: PublicationDocumentV4) -> TypstRenderSource:
-        source_bytes = (self._chp_typst_root / "RENDERER" / "publication.typ").read_bytes()
+    def render(
+        self, document: PublicationDocumentV4, template_bundle: TypstTemplateBundle
+    ) -> TypstRenderSource:
+        entrypoint = next(
+            (
+                file
+                for file in template_bundle.files
+                if file.relative_path == "RENDERER/publication.typ"
+            ),
+            None,
+        )
+        if entrypoint is None:
+            raise TemplateBundleInvalidError(
+                "Typst renderer manifest does not include RENDERER/publication.typ"
+            )
+        source_bytes = entrypoint.content
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         rich_by_placement: dict[
             tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]
@@ -242,21 +266,30 @@ def _load_renderer_manifest(chp_typst_root: Path) -> tuple[Path, str, tuple[str,
     return root, template_version, tuple(files)
 
 
-def resolve_template_bundle_files(chp_typst_root: Path) -> tuple[tuple[str, Path], ...]:
-    """Return each renderer-manifest file as `(relative_path, validated absolute path)`.
-
-    Used both to compute the template hash and to materialize a render
-    workspace, so the two can never see a different file set.
-    """
-    root, _, files = _load_renderer_manifest(chp_typst_root)
-    return resolve_bundle_files(root, files, error=TemplateBundleInvalidError)
+def load_template_bundle(chp_typst_root: Path) -> TypstTemplateBundle:
+    """Read and hash the exact manifest-listed template bytes in one operation."""
+    root, template_version, files = _load_renderer_manifest(chp_typst_root)
+    resolved_files = resolve_bundle_files(root, files, error=TemplateBundleInvalidError)
+    contents: list[TemplateFile] = []
+    for relative_path, source_path in resolved_files:
+        try:
+            content = source_path.read_bytes()
+        except OSError as exc:
+            raise TemplateBundleInvalidError(
+                f"Manifest-listed file cannot be read: {relative_path!r}"
+            ) from exc
+        contents.append(TemplateFile(relative_path=relative_path, content=content))
+    return TypstTemplateBundle(
+        template_version=template_version,
+        sha256=hash_bundle_contents(tuple((file.relative_path, file.content) for file in contents)),
+        files=tuple(contents),
+    )
 
 
 def compute_template_bundle_hash(chp_typst_root: Path) -> tuple[str, str]:
     """Return the manifest version and stable hash of exactly its listed files."""
-    root, template_version, files = _load_renderer_manifest(chp_typst_root)
-    resolved_files = resolve_bundle_files(root, files, error=TemplateBundleInvalidError)
-    return template_version, hash_bundle_files(resolved_files, error=TemplateBundleInvalidError)
+    bundle = load_template_bundle(chp_typst_root)
+    return bundle.template_version, bundle.sha256
 
 
 def _display_date(date_text: str | None, event_date: date | None) -> str:

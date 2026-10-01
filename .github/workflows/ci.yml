@@ -43,6 +43,10 @@ jobs:
           ../scripts/install-typst.sh "$RUNNER_TEMP/typst"
           echo "$RUNNER_TEMP/typst" >> "$GITHUB_PATH"
           echo "TYPST_BINARY=$RUNNER_TEMP/typst/typst" >> "$GITHUB_ENV"
+      - name: Install pinned Typst fonts for publication render tests
+        run: |
+          ../scripts/install-typst-fonts.sh "$RUNNER_TEMP/typst-fonts"
+          echo "FONT_BUNDLE_ROOT=$RUNNER_TEMP/typst-fonts" >> "$GITHUB_ENV"
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: "3.12"
@@ -52,6 +56,36 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src tests
       - run: uv run pytest
+
+  typst-renderer-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build backend image with pinned Typst fonts
+        run: docker build -f infra/backend.Dockerfile -t autowork-backend-smoke .
+      - name: Compile the production renderer with bundled fonts and no network
+        run: |
+          docker run --rm --network none autowork-backend-smoke sh -eu -c '
+            typst --version
+            test -s /app/chpTypst/RENDERER/publication.typ
+            test -s /app/chpTypst/UTILS/chap.png
+            python3 -c "import json,pathlib,sys; root=pathlib.Path(\"/usr/local/share/autowork/typst-fonts\"); files=json.loads(pathlib.Path(\"/usr/local/share/autowork/typst-fonts.lock\").read_text())[\"files\"]; missing=[name for name in files if not (root/name).is_file() or (root/name).stat().st_size == 0]; print(\"missing or empty manifest fonts:\", missing) if missing else None; sys.exit(bool(missing))"
+            workspace=$(mktemp -d)
+            trap "rm -rf $workspace" EXIT
+            mkdir -p "$workspace/RENDERER" "$workspace/UTILS"
+            cp -R /app/chpTypst/RENDERER/. "$workspace/RENDERER/"
+            cp -R /app/chpTypst/UTILS/. "$workspace/UTILS/"
+            test -s "$workspace/UTILS/chap.png"
+            cat > "$workspace/RENDERER/render-data.json" <<EOF
+          {"schema_version":"typst-publication-model-v1","language":"fr","title":"Font bundle smoke","timeline":[],"body_blocks":[{"type":"paragraph","text":"Bundled font compile smoke."}],"indicators":{"ips":[],"domains":[],"urls":[],"emails":[],"hashes":[]},"uncertainties":[],"sources":[]}
+          EOF
+            typst compile --root "$workspace" \
+              --font-path /usr/local/share/autowork/typst-fonts/HankenGrotesk \
+              --font-path /usr/local/share/autowork/typst-fonts/CascadiaCode/ttf \
+              --ignore-system-fonts --creation-timestamp 0 \
+              "$workspace/RENDERER/publication.typ" "$workspace/output.pdf"
+            test -s "$workspace/output.pdf"
+          '
 
   frontend:
     runs-on: ubuntu-latest

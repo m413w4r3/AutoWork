@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { PublicationDocumentV4 } from "../src/api/production";
 
 import {
   selectionWireBoard,
@@ -203,6 +204,7 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
 
   const content = (subjectId: string) => {
     const isA = subjectId === subjectA;
+    const articleTitle = isA ? "Article A" : "Article B";
     return {
       subject_id: subjectId,
       run_id: isA ? runA : runB,
@@ -211,24 +213,27 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
       artifact_version: 1,
       artifact_input_hash: hash,
       status: "verified",
-      schema_version: "2",
+      schema_version: "4",
       canonical_content: {
-        schema_version: "2",
-        title: isA ? "Article A" : "Article B",
-        timeline: [],
-        synthesis: [
-          [
-            {
-              kind: "text",
-              text: isA ? "Contenu A." : "Contenu B.",
-              source_ids: [],
-            },
-          ],
+        schema_version: "4",
+        subject_id: subjectId,
+        publication_language: "fr",
+        title: `${articleTitle} — contenu canonique`,
+        lead: [
+          {
+            text: isA ? "Contenu A." : "Contenu B.",
+            evidence_refs: [],
+          },
         ],
+        sections: [],
+        timeline: [],
         indicators: [],
         sources: [],
         uncertainties: [],
-      },
+        tables: [],
+        diagrams: [],
+        figures: [],
+      } satisfies PublicationDocumentV4,
       rendered_content: null,
     };
   };
@@ -534,6 +539,12 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await expect(
     page.getByRole("heading", { name: "Article A", level: 1 }),
   ).toBeVisible();
+  await expect(
+    page.getByRole("heading", {
+      name: "Article A — contenu canonique",
+      level: 3,
+    }),
+  ).toBeVisible();
   await page.getByRole("button", { name: "Pipeline" }).click();
   await page.getByText("Diagnostic", { exact: true }).click();
   await expect(
@@ -544,6 +555,12 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await page.getByRole("link", { name: "Ouvrir" }).nth(1).click();
   await expect(
     page.getByRole("heading", { name: "Article B", level: 1 }),
+  ).toBeVisible();
+  await expect(
+    page.getByRole("heading", {
+      name: "Article B — contenu canonique",
+      level: 3,
+    }),
   ).toBeVisible();
   await page.goBack();
   await expect(
