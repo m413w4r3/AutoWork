@@ -275,8 +275,8 @@ export interface ArtifactResponse {
   reused_from_artifact_id?: string | null;
   reused_from_created_at?: string | null;
   metadata: Record<string, unknown>;
-  /** Publication Markdown is downloadable alongside the canonical document. */
-  rendered_content: string | null;
+  /** Legacy rendered text remains available for non-PUBLICATION stages. */
+  rendered_content?: string | null;
   canonical_content:
     | PublicationDocumentV4
     | ProductionExtractionV1

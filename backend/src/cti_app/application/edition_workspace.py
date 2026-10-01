@@ -95,7 +95,6 @@ class EditionWorkspaceMaterializer:
         subject_title: str,
         production_state: ProductionStateSnapshotV5,
         publication: Mapping[str, Any] | None = None,
-        rendered_content: str | None = None,
         sources: Sequence[Mapping[str, Any]] = (),
         assets: Sequence[Mapping[str, Any]] = (),
         rules: Sequence[DetectionRule] | None = None,
@@ -127,10 +126,6 @@ class EditionWorkspaceMaterializer:
             publication_path = item_path / "article" / "publication.json"
             self._write_json(publication_path, dict(publication))
             files.append(publication_path)
-        if rendered_content is not None:
-            rendered_path = item_path / "article" / "publication.md"
-            self._write_text(rendered_path, rendered_content)
-            files.append(rendered_path)
         if sources:
             sources_path = item_path / "sources" / "manifest.json"
             self._write_json(sources_path, {"canonical": False, "sources": list(sources)})
@@ -223,8 +218,7 @@ class EditionWorkspaceMaterializer:
         edition_id: UUID,
         manifest: Mapping[str, Any],
         edition: Mapping[str, Any],
-        markdown: str,
-        docx: bytes,
+        pdf_content: bytes,
     ) -> Path:
         """Write the release projection after canonical persistence succeeds."""
         edition_path = self._prepare_edition_path(
@@ -233,8 +227,7 @@ class EditionWorkspaceMaterializer:
         release_path = edition_path / "release"
         self._write_canonical_json(release_path / "publication-manifest.json", manifest)
         self._write_canonical_json(release_path / "edition.json", edition)
-        self._write_text(release_path / "edition.md", markdown)
-        self._write_bytes(release_path / "bulletin.docx", docx)
+        self._write_pdf(release_path / "bulletin.pdf", pdf_content)
         return release_path
 
     @staticmethod
@@ -337,6 +330,11 @@ class EditionWorkspaceMaterializer:
         finally:
             temporary.unlink(missing_ok=True)
 
+    @classmethod
+    def _write_pdf(cls, path: Path, content: bytes) -> None:
+        """Atomically write the already rendered PDF projection."""
+        cls._write_bytes(path, content)
+
 
 class EditionProductionCheckpointService:
     """Persist a terminal production projection without affecting production."""
@@ -376,7 +374,7 @@ class EditionProductionCheckpointService:
                 }:
                     return None
                 raise
-            publication, rendered = await self._optional_publication(run_id)
+            publication = await self._optional_publication(run_id)
             sources, assets = await self._optional_asset_manifests(context.subject_id)
             extraction = legacy_technical_extraction_from_payload(
                 state.artifacts.extraction.canonical_content
@@ -390,7 +388,6 @@ class EditionProductionCheckpointService:
                 subject_title=context.subject_title,
                 production_state=state,
                 publication=publication,
-                rendered_content=rendered,
                 sources=sources,
                 assets=assets,
                 rules=extraction.rules,
@@ -441,18 +438,14 @@ class EditionProductionCheckpointService:
                 subject_title=subject_title,
             )
 
-    async def _optional_publication(self, run_id: UUID) -> tuple[dict[str, Any] | None, str | None]:
+    async def _optional_publication(self, run_id: UUID) -> dict[str, Any] | None:
         async with self._uow_factory() as uow:
             artifact = await current_publication_artifact(uow.production_artifacts, run_id)
         if artifact is None:
-            return None, None
-        publication: dict[str, Any] | None = None
-        rendered: str | None = None
+            return None
         if artifact.canonical_blob_id is not None:
-            publication = await self._artifact_store.read_json(artifact.canonical_blob_id)
-        if artifact.rendered_blob_id is not None:
-            rendered = await self._artifact_store.read_text(artifact.rendered_blob_id)
-        return publication, rendered
+            return await self._artifact_store.read_json(artifact.canonical_blob_id)
+        return None
 
     async def _optional_asset_manifests(
         self, subject_id: UUID

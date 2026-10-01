@@ -183,11 +183,7 @@ class SqlAlchemyEditionReleaseRepository:
                 edition_id=release.edition_id,
                 manifest_id=release.manifest_id,
                 edition_document_blob_id=release.edition_document_blob_id,
-                markdown_blob_id=release.markdown_blob_id,
-                docx_blob_id=release.docx_blob_id,
                 edition_document_sha256=release.edition_document_sha256,
-                markdown_sha256=release.markdown_sha256,
-                docx_sha256=release.docx_sha256,
                 created_at=release.created_at,
             )
             .on_conflict_do_nothing(index_elements=[EditionReleaseRow.manifest_id])
@@ -195,6 +191,10 @@ class SqlAlchemyEditionReleaseRepository:
         result = await self._session.execute(statement)
         await self._session.flush()
         return bool(getattr(result, "rowcount", 0))
+
+    async def get(self, release_id: UUID) -> EditionRelease | None:
+        row = await self._session.get(EditionReleaseRow, release_id)
+        return _release_from_row(row) if row else None
 
     async def get_by_manifest(self, manifest_id: UUID) -> EditionRelease | None:
         row = await self._session.scalar(
@@ -236,10 +236,6 @@ def _release_from_row(row: EditionReleaseRow) -> EditionRelease:
         edition_id=row.edition_id,
         manifest_id=row.manifest_id,
         edition_document_blob_id=row.edition_document_blob_id,
-        markdown_blob_id=row.markdown_blob_id,
-        docx_blob_id=row.docx_blob_id,
         edition_document_sha256=row.edition_document_sha256,
-        markdown_sha256=row.markdown_sha256,
-        docx_sha256=row.docx_sha256,
         created_at=row.created_at,
     )

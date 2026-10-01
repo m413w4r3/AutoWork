@@ -1,4 +1,5 @@
 import { ApiError, type EditionStatus } from "./editions";
+import type { PublicationDocumentV4 } from "./production";
 import type { ProductionReconciliation, ProductionStage } from "./production";
 
 export type { ProductionReconciliation };
@@ -65,6 +66,8 @@ export type SupplementalSourceRepairState =
 
 export type AssemblyJobStatus =
   "queued" | "running" | "waiting_human" | "succeeded" | "failed" | "cancelled";
+export type EditionRenderDisplayStatus =
+  "none" | "not_started" | "queued" | "running" | "failed" | "succeeded";
 
 export interface PublicationAcceptResponse {
   edition_id: string;
@@ -84,8 +87,12 @@ export interface EditionReleaseResponse {
   manifest_sha256: string | null;
   release_id: string | null;
   json_available: boolean;
-  markdown_available: boolean;
-  docx_available: boolean;
+  render_id: string | null;
+  render_status: EditionRenderDisplayStatus;
+  render_error_code: string | null;
+  render_error_message: string | null;
+  can_retry_render: boolean;
+  pdf_available: boolean;
   published_at: string | null;
   assembly_job_id: string | null;
   assembly_status: AssemblyJobStatus | null;
@@ -102,13 +109,34 @@ export interface EditionPreviewArtifact {
   input_hash: string;
 }
 
+export interface EditionDocumentV2 {
+  schema_version: "2";
+  edition: {
+    id: string;
+    country: string;
+    country_code: string;
+    period_start: string;
+    period_end: string;
+    tlp: string;
+    languages: string[];
+    state: string;
+    version: number;
+    created_at: string;
+    updated_at: string;
+  };
+  publications: Array<{
+    position: number;
+    subject_id: string;
+    document: PublicationDocumentV4;
+  }>;
+}
+
 export interface EditionPreviewResponse {
   edition_id: string;
   edition_version: number;
   preview_input_hash: string;
   artifacts: EditionPreviewArtifact[];
-  canonical_markdown: string;
-  sanitized_html: string;
+  document: EditionDocumentV2;
   stale: boolean;
 }
 
@@ -582,8 +610,19 @@ export function getEditionRelease(
   return request(`/api/editions/${encodeURIComponent(editionId)}/release`);
 }
 
-export function editionDocxUrl(editionId: string): string {
-  return `/api/editions/${encodeURIComponent(editionId)}/release/docx`;
+export function releasePdfUrl(editionId: string): string {
+  return `/api/editions/${encodeURIComponent(editionId)}/release/pdf`;
+}
+
+export function retryEditionRender(
+  editionId: string,
+): Promise<EditionReleaseResponse> {
+  return request(
+    `/api/editions/${encodeURIComponent(editionId)}/release/render`,
+    {
+      method: "POST",
+    },
+  );
 }
 
 /**
@@ -607,14 +646,11 @@ export function getEditionPreview(
   );
 }
 
-export function editionPreviewDocxUrl(
+export function editionPreviewPdfUrl(
   editionId: string,
-  previewInputHash?: string | null,
+  previewInputHash: string,
 ): string {
-  const query = previewInputHash
-    ? `?preview_input_hash=${encodeURIComponent(previewInputHash)}`
-    : "";
-  return `/api/editions/${encodeURIComponent(editionId)}/preview/docx${query}`;
+  return `/api/editions/${encodeURIComponent(editionId)}/preview/pdf?preview_input_hash=${encodeURIComponent(previewInputHash)}`;
 }
 
 export async function includeReviewItem(

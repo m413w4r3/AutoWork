@@ -273,7 +273,7 @@ async def test_publication_render_database_checks_reject_invalid_rows(
                 await connection.execute(statement, values)
 
     try:
-        await assert_rejected(format="docx")
+        await assert_rejected(format="html")
         await assert_rejected(status="cancelled")
         await assert_rejected(input_hash="A" * 64)
         await assert_rejected(template_sha256="B" * 64)

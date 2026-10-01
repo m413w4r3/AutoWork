@@ -2,32 +2,8 @@
 
 from __future__ import annotations
 
-import shutil
-import xml.etree.ElementTree as ET
-import zipfile
-from dataclasses import replace
 from datetime import date
-from pathlib import Path
-from uuid import UUID
 
-import pytest
-
-from cti_app.application.docx_postprocessing import (
-    TEMPLATE_PART_PATTERN,
-    edition_template_values,
-)
-from cti_app.application.pandoc_export import (
-    DEFAULT_REFERENCE_DOC,
-    export_markdown_docx,
-    export_publication_docx,
-)
-from cti_app.application.pandoc_rendering import (
-    PAGE_BREAK_MARKDOWN,
-    WORD_STYLE_MAP,
-    _render_citations,
-    render_edition_pandoc,
-    render_publication_pandoc,
-)
 from cti_app.application.production_normalization import (
     canonical_indicator_key,
     display_indicator_value,
@@ -49,40 +25,11 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_rendering import collect_indicators
 from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.domain.discovery import SourceRole
-from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
-from cti_app.domain.production_editorial_enrichment import (
-    DiagramEdgeV1,
-    DiagramNodeV1,
-    EnrichmentDiagramDirection,
-    EnrichmentDiagramKind,
-    EnrichmentPlacementKind,
-    EnrichmentPlacementV1,
-    EnrichmentTableKind,
-    SourceFigureLocatorV1,
-)
-from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
-from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
-    PublicationEvidenceKind,
-    PublicationEvidenceRefV1,
-    PublicationParagraphV1,
-    PublicationSectionKind,
-    PublicationSectionV1,
-    PublicationSourceV1,
     RichSpanKind,
 )
-from cti_app.domain.publication_document import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
-    PublicationDiagramV1,
-    PublicationDocumentV4,
-    PublicationSourceFigureV1,
-    PublicationTableColumnV1,
-    PublicationTableRowV1,
-    PublicationTableV1,
-)
 
-ROOT = Path(__file__).parents[2]
 HASH = "37e123bd" + "a" * 52 + "4066"
 
 
@@ -188,45 +135,6 @@ def _report() -> ReferenceReport:
     )
 
 
-def _publication_source(source_id: UUID, url: str, title: str = "Example") -> PublicationSourceV1:
-    return PublicationSourceV1(
-        source_document_id=source_id,
-        canonical_url=url,
-        title=title,
-        publisher="Example",
-        published_at=None,
-        tier=ProductionReferenceTier.CORE,
-        kind=ProductionReferenceKind.PUBLICATION,
-        role=SourceRole.PRIMARY,
-    )
-
-
-def _multi_source_document() -> PublicationDocumentV4:
-    first_id, second_id = UUID(int=1), UUID(int=2)
-    refs = (
-        PublicationEvidenceRefV1(first_id, PublicationEvidenceKind.FACT, "a" * 64),
-        PublicationEvidenceRefV1(second_id, PublicationEvidenceKind.FACT, "b" * 64),
-    )
-    return PublicationDocumentV4(
-        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
-        subject_id=UUID(int=10),
-        publication_language="fr",
-        title="Citation test",
-        lead=(PublicationParagraphV1("Information vérifiée", refs),),
-        sections=(),
-        timeline=(),
-        indicators=(),
-        sources=(
-            _publication_source(first_id, "https://example.test/1"),
-            _publication_source(second_id, "https://example.test/2"),
-        ),
-        uncertainties=(),
-        tables=(),
-        diagrams=(),
-        figures=(),
-    )
-
-
 def test_indicator_normalization_and_collection_are_explicit() -> None:
     assert canonical_indicator_key("Example[.]COM", ArtifactType.DOMAIN) == "example.com"
     assert normalize_indicator_value("2001:0db8::1", ArtifactType.IP) == "2001:db8::1"
@@ -272,32 +180,6 @@ def test_semantic_annotation_prioritizes_entities_and_citations() -> None:
     assert next(span for span in spans if span.kind is RichSpanKind.CITATION).source_ids == ("S1",)
 
 
-@pytest.mark.parametrize(
-    ("source_ids", "expected"),
-    [
-        ((1,), " ^[https://example.test/1]"),
-        ((1, 2), " ^[https://example.test/1 ; https://example.test/2]"),
-        ((1, 1, 2), " ^[https://example.test/1 ; https://example.test/2]"),
-    ],
-)
-def test_pandoc_renderer_renders_one_footnote_per_citation(
-    source_ids: tuple[int, ...], expected: str
-) -> None:
-    rendered = _render_citations(
-        tuple(
-            PublicationEvidenceRefV1(UUID(int=source_id), PublicationEvidenceKind.FACT, "a" * 64)
-            for source_id in source_ids
-        ),
-        {
-            str(UUID(int=1)): "https://example.test/1",
-            str(UUID(int=2)): "https://example.test/2",
-        },
-    )
-
-    assert rendered == expected
-    assert "^[https://example.test/1]^[https://example.test/2]" not in rendered
-
-
 def test_synthesis_validator_allows_ioc_section_values_in_body() -> None:
     accepted = validate_synthesis(
         "Le domaine cloudlanecdn[.]com sert au C2 [S1].", _report(), _extraction()
@@ -322,225 +204,3 @@ def test_synthesis_validator_allows_ioc_section_values_in_body() -> None:
     spans = SemanticAnnotator().annotate("Le domaine cloudlanecdn.com répond.", both)
     ioc = next(span for span in spans if span.kind is RichSpanKind.IOC)
     assert ioc.text == "cloudlanecdn[.]com"
-
-
-def _edition_document(count: int) -> EditionDocumentV2:
-    return EditionDocumentV2(
-        edition={"period_start": "2026-07-01", "country": "Iran"},
-        publications=tuple(
-            EditionPublicationV2(
-                position=position,
-                subject_id=UUID(int=position),
-                document=_publication(f"Publication {position}"),
-            )
-            for position in range(1, count + 1)
-        ),
-    )
-
-
-def _publication(title: str) -> PublicationDocumentV4:
-    source_id = UUID(int=1)
-    evidence = PublicationEvidenceRefV1(source_id, PublicationEvidenceKind.FACT, "a" * 64)
-    return PublicationDocumentV4(
-        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
-        subject_id=UUID(int=1),
-        publication_language="fr",
-        title=title,
-        lead=(PublicationParagraphV1("Contenu", (evidence,)),),
-        sections=(
-            PublicationSectionV1(
-                PublicationSectionKind.OVERVIEW,
-                "Synthèse",
-                (PublicationParagraphV1("Synthèse du sujet", (evidence,)),),
-            ),
-        ),
-        timeline=(),
-        indicators=(),
-        sources=(_publication_source(source_id, "https://example.test/article"),),
-        uncertainties=(),
-        tables=(),
-        diagrams=(),
-        figures=(),
-    )
-
-
-def test_pandoc_v4_renders_only_the_historical_narrative() -> None:
-    document = _publication("Narrative publication")
-    enrichment_refs = (ExtractionEvidenceRefV1(UUID(int=1), EvidenceKind.FACT, "b" * 64),)
-    enriched = replace(
-        document,
-        tables=(
-            PublicationTableV1(
-                key="commands",
-                kind=EnrichmentTableKind.COMMANDS,
-                title="Observed commands",
-                caption="Enrichment caption",
-                columns=(
-                    PublicationTableColumnV1("command", "Command"),
-                    PublicationTableColumnV1("purpose", "Purpose"),
-                ),
-                rows=(PublicationTableRowV1(("powershell", "Execution"), enrichment_refs),),
-                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
-            ),
-        ),
-        diagrams=(
-            PublicationDiagramV1(
-                key="infection_chain",
-                kind=EnrichmentDiagramKind.INFECTION_CHAIN,
-                title="Enrichment diagram",
-                caption="Diagram caption",
-                direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
-                nodes=(
-                    DiagramNodeV1("loader", "Loader", enrichment_refs),
-                    DiagramNodeV1("payload", "Payload", enrichment_refs),
-                ),
-                edges=(DiagramEdgeV1("loader", "payload", "loads", enrichment_refs),),
-                groups=(),
-                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
-                asset_id=UUID(int=3),
-            ),
-        ),
-        figures=(
-            PublicationSourceFigureV1(
-                key="source_figure",
-                asset_id=UUID(int=4),
-                sha256="b" * 64,
-                mime_type="image/png",
-                byte_size=128,
-                source_document_id=UUID(int=1),
-                source_url="https://example.test/figure.png",
-                caption="Figure caption",
-                provenance="Figure provenance",
-                locator=SourceFigureLocatorV1(page=1),
-                placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
-            ),
-        ),
-    )
-
-    assert render_publication_pandoc(enriched) == render_publication_pandoc(document)
-    rendered = render_publication_pandoc(enriched)
-    assert "Enrichment caption" not in rendered
-    assert "Enrichment diagram" not in rendered
-    assert "Figure caption" not in rendered
-
-
-@pytest.mark.parametrize(("publications", "breaks"), ((1, 0), (2, 1), (3, 2)))
-def test_edition_markdown_separates_publications_with_one_page_break(
-    publications: int, breaks: int
-) -> None:
-    markdown = render_edition_pandoc(_edition_document(publications))
-
-    assert markdown.count(PAGE_BREAK_MARKDOWN) == breaks
-    assert not markdown.startswith(PAGE_BREAK_MARKDOWN)
-    assert not markdown.rstrip().endswith(PAGE_BREAK_MARKDOWN)
-
-
-def test_reference_doc_contains_every_mapped_style() -> None:
-    with zipfile.ZipFile(DEFAULT_REFERENCE_DOC) as archive:
-        root = ET.fromstring(archive.read("word/styles.xml"))
-    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
-    names = {
-        node.attrib[f"{namespace}val"]
-        for node in root.iter(f"{namespace}name")
-        if f"{namespace}val" in node.attrib
-    }
-    assert {style for style in WORD_STYLE_MAP.values() if style is not None} <= names
-
-
-@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
-def test_real_pandoc_export_produces_an_openable_docx(tmp_path: Path) -> None:
-    document = _publication("Cavern")
-    output = export_publication_docx(document, tmp_path / "publication.docx")
-    with zipfile.ZipFile(output) as archive:
-        assert archive.testzip() is None
-        styles = archive.read("word/styles.xml")
-        assert b"Titre partie bulletin" in styles
-
-
-@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
-def test_real_pandoc_export_renders_multi_source_citation_as_word_footnote(
-    tmp_path: Path,
-) -> None:
-    output = export_publication_docx(_multi_source_document(), tmp_path / "multi-source.docx")
-    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-    with zipfile.ZipFile(output) as archive:
-        document_root = ET.fromstring(archive.read("word/document.xml"))
-        footnotes_root = ET.fromstring(archive.read("word/footnotes.xml"))
-
-    references = document_root.findall(f".//{{{namespace}}}footnoteReference")
-    assert len(references) == 1
-    assert "[https://" not in "".join(document_root.itertext())
-
-    cited = [
-        "".join(footnote.itertext())
-        for footnote in footnotes_root.findall(f"{{{namespace}}}footnote")
-        if "https://example.test" in "".join(footnote.itertext())
-    ]
-    assert len(cited) == 1
-    assert "https://example.test/1" in cited[0]
-    assert "https://example.test/2" in cited[0]
-    assert cited[0].index("example.test/1") < cited[0].index("example.test/2")
-
-
-def _header_and_footer_text(archive: zipfile.ZipFile) -> str:
-    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-    return "".join(
-        "".join(ET.fromstring(archive.read(name)).itertext())
-        for name in sorted(archive.namelist())
-        if TEMPLATE_PART_PATTERN.match(name)
-    ).replace(f"{{{namespace}}}", "")
-
-
-@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
-@pytest.mark.parametrize(("publications", "breaks"), ((1, 0), (2, 1), (3, 2)))
-def test_real_pandoc_export_writes_one_word_page_break_between_publications(
-    tmp_path: Path, publications: int, breaks: int
-) -> None:
-    edition = _edition_document(publications)
-    output = export_markdown_docx(
-        render_edition_pandoc(edition),
-        tmp_path / f"edition-{publications}.docx",
-        template_values=edition_template_values(edition.edition),
-    )
-    namespace = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-    with zipfile.ZipFile(output) as archive:
-        document_root = ET.fromstring(archive.read("word/document.xml"))
-
-    page_breaks = [
-        node
-        for node in document_root.iter(f"{{{namespace}}}br")
-        if node.attrib.get(f"{{{namespace}}}type") == "page"
-    ]
-    assert len(page_breaks) == breaks
-
-
-@pytest.mark.skipif(shutil.which("pandoc") is None, reason="Pandoc is not installed")
-@pytest.mark.parametrize(
-    ("period_start", "expected"),
-    (("2026-07-01", "juillet 2026"), ("2026-08-01", "août 2026")),
-)
-def test_real_pandoc_export_stamps_the_edition_month_into_the_template(
-    tmp_path: Path, period_start: str, expected: str
-) -> None:
-    edition = EditionDocumentV2(
-        edition={"period_start": period_start, "country": "Iran"},
-        publications=_edition_document(1).publications,
-    )
-    output = export_markdown_docx(
-        render_edition_pandoc(edition),
-        tmp_path / f"edition-{period_start}.docx",
-        template_values=edition_template_values(edition.edition),
-    )
-
-    with zipfile.ZipFile(output) as archive:
-        text = _header_and_footer_text(archive)
-
-    assert expected in text
-    assert "Iran" in text
-    # The historical template metadata must not survive the export.
-    assert "Juillet 2024" not in text
-    assert "Bulletin n°32" not in text
-    assert "XXX" not in text
-    assert "{{" not in text

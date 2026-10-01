@@ -3,6 +3,7 @@ import { useState } from "react";
 
 import {
   getSubjectContent,
+  subjectPublicationPdfUrl,
   type SubjectContentResponse,
 } from "../../api/subjectContent";
 import { collectedSourceDownloadUrl } from "../../api/collection";
@@ -159,6 +160,11 @@ function PublicationContent({ content }: { content: SubjectContentResponse }) {
       <div className="subject-article__meta">
         <p className="eyebrow">Article</p>
         <p id="subject-article-heading">Version {content.artifact_version}</p>
+        {content.status === "verified" ? (
+          <a href={subjectPublicationPdfUrl(content.subject_id)}>
+            Télécharger le PDF
+          </a>
+        ) : null}
       </div>
       <PublicationDocumentView document={content.canonical_content} />
     </section>

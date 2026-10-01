@@ -10,6 +10,9 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.publication import router
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseMaterializationError,
+)
 from cti_app.application.edition_review import (
     EditionReviewReadItem,
     EditionReviewService,
@@ -419,6 +422,23 @@ async def test_api_rematerializes_release_with_verified_identity() -> None:
     assert response.status_code == 200
     assert response.json() == {"edition_id": str(EDITION_ID), "materialized": True}
     assert rematerializer.edition_ids == [EDITION_ID]
+
+
+@pytest.mark.asyncio
+async def test_api_returns_conflict_when_release_has_no_successful_render() -> None:
+    class _NoSuccessfulRender:
+        async def materialize(self, _edition_id: UUID) -> None:
+            raise EditionReleaseMaterializationError("edition_render_not_available")
+
+    application = _api(_Uow(_edition(), _row(ProductionRunStatus.READY)))
+    application.state.edition_release_rematerializer = _NoSuccessfulRender()
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/editions/{EDITION_ID}/release/materialize")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "edition_render_not_available"
 
 
 @pytest.mark.asyncio

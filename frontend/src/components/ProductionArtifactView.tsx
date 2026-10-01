@@ -1299,6 +1299,9 @@ export function ProductionArtifactView({
     );
   }
 
+  const legacyRenderedContent =
+    stage === "publication" ? null : artifact.rendered_content;
+
   const referencesCorpus =
     stage === "references" &&
     isProductionReferenceCorpus(artifact.canonical_content)
@@ -1385,10 +1388,10 @@ export function ProductionArtifactView({
         />
       ) : null}
 
-      {synthesisDocument && artifact.rendered_content ? (
+      {synthesisDocument && legacyRenderedContent ? (
         <details className="artifact-rendered-preview">
           <summary>Aperçu Markdown (projection temporaire)</summary>
-          <pre>{artifact.rendered_content}</pre>
+          <pre>{legacyRenderedContent}</pre>
         </details>
       ) : null}
 
@@ -1396,10 +1399,10 @@ export function ProductionArtifactView({
         stage !== "extraction" &&
         !referencesCorpus &&
         !synthesisDocument &&
-        artifact.rendered_content && (
+        legacyRenderedContent && (
           <div className="artifact-content">
             <div className="rendered-markdown">
-              <pre>{artifact.rendered_content}</pre>
+              <pre>{legacyRenderedContent}</pre>
             </div>
           </div>
         )}
@@ -1417,7 +1420,7 @@ export function ProductionArtifactView({
           </div>
         )}
 
-      {!artifact.rendered_content && !artifact.canonical_content && (
+      {!legacyRenderedContent && !artifact.canonical_content && (
         <p>Aucun contenu à afficher.</p>
       )}
 

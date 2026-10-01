@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import zipfile
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
@@ -19,7 +18,6 @@ from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
 )
-from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
@@ -1958,18 +1956,10 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         artifact.id for artifact in target_publications
     ]
 
-    release = await EditionAssemblyService(
-        uow_factory,
-        store,
-        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
-    ).assemble(accepted.manifest.id)
+    release = await EditionAssemblyService(uow_factory, store).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
     assert all(item["document"]["schema_version"] == "4" for item in edition_json["publications"])
     assert [item["document"]["title"] for item in edition_json["publications"]] == [
         "Article A",
         "Article B",
     ]
-    docx = await store.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
-    with zipfile.ZipFile(BytesIO(docx)) as archive:
-        document_xml = archive.read("word/document.xml")
-    assert document_xml.index(b"Article A") < document_xml.index(b"Article B")

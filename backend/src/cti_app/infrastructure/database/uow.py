@@ -25,6 +25,7 @@ from cti_app.application.persistence import (
     EditionProductionBatchItemRepository,
     EditionProductionBatchRepository,
     EditionReleaseRepository,
+    EditionRenderRepository,
     EditionRepository,
     GoodwareBaselineRepository,
     HumanDecisionRepository,
@@ -111,6 +112,9 @@ from cti_app.infrastructure.database.repositories.edition_publication import (
     SqlAlchemyPublicationManifestExclusionRepository,
     SqlAlchemyPublicationManifestRepository,
 )
+from cti_app.infrastructure.database.repositories.edition_render import (
+    SqlAlchemyEditionRenderRepository,
+)
 from cti_app.infrastructure.database.repositories.editions import (
     SqlAlchemyEditionAuditRepository,
     SqlAlchemyEditionRepository,
@@ -168,6 +172,7 @@ class SqlAlchemyUnitOfWork:
     blobs: BlobRepository
     media_assets: MediaAssetRepository
     publication_renders: PublicationRenderRepository
+    edition_renders: EditionRenderRepository
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
@@ -240,6 +245,7 @@ class SqlAlchemyUnitOfWork:
         self.blobs = SqlAlchemyBlobRepository(self._session)
         self.media_assets = SqlAlchemyMediaAssetRepository(self._session)
         self.publication_renders = SqlAlchemyPublicationRenderRepository(self._session)
+        self.edition_renders = SqlAlchemyEditionRenderRepository(self._session)
         self.goodware_baselines = SqlAlchemyGoodwareBaselineRepository(self._session)
         self.investigation_goodware_baselines = SqlAlchemyInvestigationGoodwareBaselineRepository(
             self._session

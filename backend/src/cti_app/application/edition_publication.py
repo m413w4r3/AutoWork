@@ -2,19 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
-import tempfile
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, cast
 from uuid import UUID
 
 from pydantic import ConfigDict
 
-from cti_app.application.docx_postprocessing import edition_template_values
 from cti_app.application.edition_document import (
     EditionDocumentArtifactRef,
     EditionDocumentBuildError,
@@ -22,6 +17,11 @@ from cti_app.application.edition_document import (
 )
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
+)
+from cti_app.application.edition_rendering import (
+    EDITION_RENDER_JOB_KIND,
+    EditionRenderParameters,
+    EditionRenderService,
 )
 from cti_app.application.edition_review import (
     EditionReviewService,
@@ -35,9 +35,7 @@ from cti_app.application.jobs import (
     JobRegistry,
     JobService,
 )
-from cti_app.application.pandoc_export import export_markdown_docx
-from cti_app.application.pandoc_rendering import render_edition_pandoc
-from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.persistence import JobUnitOfWorkFactory, ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_repairs import (
     publication_is_compatible_with_current_effective_inputs,
@@ -48,6 +46,11 @@ from cti_app.domain.edition_publication import (
     PublicationManifestExclusionV1,
     PublicationManifestV1,
 )
+from cti_app.domain.edition_render import (
+    EditionRender,
+    EditionRenderDisplayStatus,
+    EditionRenderStatus,
+)
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import InvalidJobTransitionError, Job, JobStatus
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -57,9 +60,6 @@ logger = logging.getLogger(__name__)
 EDITION_ASSEMBLE_JOB_KIND = "publication.edition.assemble"
 MANIFEST_BLOB_BUCKET = "publication-manifests"
 EDITION_DOCUMENT_BLOB_BUCKET = "edition-documents"
-EDITION_MARKDOWN_BLOB_BUCKET = "edition-markdown"
-EDITION_DOCX_BLOB_BUCKET = "edition-docx"
-MAX_DOCX_BYTES = 32 * 1024 * 1024
 
 
 class PublicationError(ValueError):
@@ -102,22 +102,68 @@ class EditionReleaseStatus:
     assembly_error_code: str | None
     assembly_error_message: str | None
     can_retry_assembly: bool
+    render: EditionRender | None
+    render_job_id: UUID | None
+    render_job_status: JobStatus | None
+    render_job_error_code: str | None
+    render_job_error_message: str | None
 
     @property
     def json_available(self) -> bool:
         return self.release is not None
 
     @property
-    def markdown_available(self) -> bool:
-        return self.release is not None
+    def pdf_available(self) -> bool:
+        return self.render is not None and self.render.status is EditionRenderStatus.SUCCEEDED
 
     @property
-    def docx_available(self) -> bool:
-        return self.release is not None
+    def render_id(self) -> UUID | None:
+        return self.render.id if self.render is not None else None
+
+    @property
+    def render_status(self) -> EditionRenderDisplayStatus:
+        if self.render is not None:
+            return EditionRenderDisplayStatus(self.render.status.value)
+        if self.release is None:
+            return EditionRenderDisplayStatus.NONE
+        if self.render_job_status is JobStatus.QUEUED:
+            return EditionRenderDisplayStatus.QUEUED
+        if self.render_job_status is JobStatus.RUNNING:
+            return EditionRenderDisplayStatus.RUNNING
+        if self.render_job_status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+            return EditionRenderDisplayStatus.FAILED
+        # Without a render row, only an active queued/running job proves work
+        # has started; otherwise the honest state is not_started.
+        return EditionRenderDisplayStatus.NOT_STARTED
+
+    @property
+    def render_error_code(self) -> str | None:
+        return (
+            self.render.error_code
+            if self.render is not None and self.render.error_code is not None
+            else self.render_job_error_code
+        )
+
+    @property
+    def render_error_message(self) -> str | None:
+        return (
+            self.render.error_message
+            if self.render is not None and self.render.error_message is not None
+            else self.render_job_error_message
+        )
+
+    @property
+    def can_retry_render(self) -> bool:
+        return self.release is not None and self.render_status in {
+            EditionRenderDisplayStatus.NOT_STARTED,
+            EditionRenderDisplayStatus.FAILED,
+        }
 
     @property
     def published_at(self) -> datetime | None:
-        return self.release.created_at if self.release is not None else None
+        if self.render is None or self.render.status is not EditionRenderStatus.SUCCEEDED:
+            return None
+        return self.render.updated_at
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,20 +172,6 @@ class _ResolvedPublicationInputs:
     batch_id: UUID
     entries: tuple[PublicationManifestEntryV1, ...]
     exclusions: tuple[PublicationManifestExclusionV1, ...]
-
-
-class _WorkspaceReleaseMaterializer(Protocol):
-    async def materialize_release(
-        self,
-        *,
-        period: Any,
-        country_code: str,
-        edition_id: UUID,
-        manifest: Mapping[str, Any],
-        edition: Mapping[str, Any],
-        markdown: str,
-        docx: bytes,
-    ) -> Any: ...
 
 
 class EditionPublicationService:
@@ -333,13 +365,25 @@ class EditionPublicationService:
                 if manifest is not None
                 else None
             )
+            render_repository = getattr(uow, "edition_renders", None)
+            render = (
+                await render_repository.get_latest_for_release(release.id)
+                if release is not None and render_repository is not None
+                else None
+            )
             assembly_job = None
+            render_job = None
             jobs = getattr(uow, "jobs", None)
             if jobs is not None and manifest is not None:
                 assembly_jobs = await jobs.list_for_aggregate(
                     "edition", edition_id, kind=EDITION_ASSEMBLE_JOB_KIND
                 )
                 assembly_job = _latest_assembly_job(assembly_jobs, manifest.id)
+            if jobs is not None and release is not None:
+                render_jobs = await jobs.list_for_aggregate(
+                    "edition", edition_id, kind=EDITION_RENDER_JOB_KIND
+                )
+                render_job = _latest_render_job(render_jobs, release.id)
             current_inputs_match = False
             if manifest is not None and release is None:
                 try:
@@ -377,15 +421,52 @@ class EditionPublicationService:
                     assembly_job.error_message if assembly_job is not None else None
                 ),
                 can_retry_assembly=can_retry_assembly,
+                render=render,
+                render_job_id=render_job.id if render_job is not None else None,
+                render_job_status=render_job.status if render_job is not None else None,
+                render_job_error_code=(render_job.error_code if render_job is not None else None),
+                render_job_error_message=(
+                    render_job.error_message if render_job is not None else None
+                ),
             )
 
-    async def read_docx(self, edition_id: UUID) -> tuple[EditionReleaseStatus, bytes]:
-        status = await self.release_status(edition_id)
-        if status.release is None:
-            raise PublicationManifestNotFoundError("edition_release_not_available")
-        return status, await self._artifact_store.read_bytes(
-            status.release.docx_blob_id, max_bytes=MAX_DOCX_BYTES
+    async def retry_render(
+        self,
+        edition_id: UUID,
+        *,
+        actor_id: str,
+        correlation_id: str = "-",
+    ) -> EditionReleaseStatus:
+        """Ensure the render job for the current release without changing its inputs."""
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get(edition_id)
+            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            release = (
+                await uow.edition_releases.get_by_manifest(manifest.id)
+                if manifest is not None
+                else None
+            )
+            render_repository = getattr(uow, "edition_renders", None)
+            render = (
+                await render_repository.get_latest_for_release(release.id)
+                if release is not None and render_repository is not None
+                else None
+            )
+            await uow.commit()
+        if edition is None or release is None:
+            raise PublicationManifestNotFoundError("edition_release_not_found")
+        if render is not None and render.status is EditionRenderStatus.SUCCEEDED:
+            return await self.release_status(edition_id)
+
+        await ensure_edition_render_job(
+            self._job_service,
+            self._job_dispatcher,
+            edition_id=edition_id,
+            edition_release_id=release.id,
+            correlation_id=correlation_id,
+            actor_id=actor_id,
         )
+        return await self.release_status(edition_id)
 
 
 class EditionAssemblyService:
@@ -395,21 +476,9 @@ class EditionAssemblyService:
         self,
         uow_factory: ProductionUnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
-        *,
-        workspace_materializer: _WorkspaceReleaseMaterializer | None = None,
-        rematerialization_service: EditionReleaseRematerializationService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
-        self._rematerialization_service = rematerialization_service or (
-            EditionReleaseRematerializationService(
-                uow_factory,
-                artifact_store,
-                workspace_materializer,
-            )
-            if workspace_materializer is not None
-            else None
-        )
 
     async def assemble(
         self, manifest_id: UUID, *, context: JobExecutionContext | None = None
@@ -484,39 +553,15 @@ class EditionAssemblyService:
                         else exc.code
                     )
                     raise PublicationAssemblyError(code) from exc
-            markdown = render_edition_pandoc(edition_document)
             edition_json = edition_document.to_json()
             edition_blob_id, edition_hash = await self._artifact_store.put_canonical_json(
                 edition_json, bucket=EDITION_DOCUMENT_BLOB_BUCKET
-            )
-            markdown_bytes = markdown.encode("utf-8")
-            markdown_hash = hashlib.sha256(markdown_bytes).hexdigest()
-            markdown_blob_id = await self._artifact_store.put_text(
-                markdown, bucket=EDITION_MARKDOWN_BLOB_BUCKET
-            )
-            with tempfile.TemporaryDirectory(prefix="autowork-edition-docx-") as directory:
-                docx_path = Path(directory) / "bulletin.docx"
-                export_markdown_docx(
-                    markdown,
-                    docx_path,
-                    template_values=edition_template_values(edition_document.edition),
-                )
-                docx = docx_path.read_bytes()
-            docx_hash = hashlib.sha256(docx).hexdigest()
-            docx_blob_id = await self._artifact_store.put_bytes(
-                docx,
-                bucket=EDITION_DOCX_BLOB_BUCKET,
-                mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
             candidate_release = EditionRelease(
                 edition_id=manifest.edition_id,
                 manifest_id=manifest.id,
                 edition_document_blob_id=edition_blob_id,
-                markdown_blob_id=markdown_blob_id,
-                docx_blob_id=docx_blob_id,
                 edition_document_sha256=edition_hash,
-                markdown_sha256=markdown_hash,
-                docx_sha256=docx_hash,
             )
         else:
             candidate_release = None
@@ -557,14 +602,6 @@ class EditionAssemblyService:
                     release = persisted
             await uow.commit()
 
-        if self._rematerialization_service is not None:
-            try:
-                await self._rematerialization_service.materialize(
-                    manifest.edition_id,
-                    manifest_id=manifest.id,
-                )
-            except Exception:
-                logger.exception("Unable to materialize edition release workspace")
         if context is not None:
             try:
                 await context.report_progress(1, 1, "Bulletin publié")
@@ -585,18 +622,55 @@ def register_publication_jobs(
     registry: JobRegistry,
     uow_factory: ProductionUnitOfWorkFactory,
     assembly_service: EditionAssemblyService,
+    render_service: EditionRenderService | None = None,
+    job_dispatcher: JobDispatcher | None = None,
+    release_rematerializer: EditionReleaseRematerializationService | None = None,
 ) -> None:
-    async def handle(parameters: JobParameters, context: JobExecutionContext) -> str:
+    async def handle_assembly(parameters: JobParameters, context: JobExecutionContext) -> str:
         if not isinstance(parameters, EditionAssembleParameters):
             raise TypeError("Invalid edition assembly parameters")
         release = await assembly_service.assemble(parameters.manifest_id, context=context)
+        await ensure_edition_render_job(
+            JobService(cast(JobUnitOfWorkFactory, uow_factory), registry),
+            job_dispatcher,
+            edition_id=release.edition_id,
+            edition_release_id=release.id,
+            correlation_id=await context.correlation_id(),
+            actor_id="system:worker",
+        )
         return f"edition-release://{release.edition_id}/{release.id}"
 
-    del uow_factory
     registry.register(
         EDITION_ASSEMBLE_JOB_KIND,
         EditionAssembleParameters,
-        handle,
+        handle_assembly,
+        resume_after_worker_loss=True,
+    )
+
+    async def handle_render(parameters: JobParameters, context: JobExecutionContext) -> str:
+        if not isinstance(parameters, EditionRenderParameters):
+            raise TypeError("Invalid edition render parameters")
+        if render_service is None:
+            raise RuntimeError("Edition render service is not configured")
+        render = await render_service.render_pdf(parameters.edition_release_id)
+        if release_rematerializer is not None:
+            try:
+                await release_rematerializer.materialize(
+                    edition_release_id=render.edition_release_id,
+                    edition_render_id=render.id,
+                )
+            except Exception:
+                logger.exception("Unable to materialize edition release after render %s", render.id)
+        try:
+            await context.report_progress(1, 1, "PDF du bulletin prêt")
+        except Exception:
+            logger.exception("Unable to report edition render progress for %s", render.id)
+        return f"edition-render://{render.edition_release_id}/{render.id}"
+
+    registry.register(
+        EDITION_RENDER_JOB_KIND,
+        EditionRenderParameters,
+        handle_render,
         resume_after_worker_loss=True,
     )
 
@@ -739,15 +813,126 @@ def _latest_assembly_job(jobs: Any, manifest_id: UUID) -> Job | None:
     return max(matching, key=lambda job: (job.created_at, str(job.id)), default=None)
 
 
+async def ensure_edition_render_job(
+    job_service: JobService | None,
+    job_dispatcher: JobDispatcher | None,
+    *,
+    edition_id: UUID,
+    edition_release_id: UUID,
+    correlation_id: str,
+    actor_id: str,
+) -> tuple[UUID | None, bool]:
+    """Idempotently queue and dispatch the PDF render for a committed release."""
+    if job_service is None:
+        return None, False
+    try:
+        jobs = await job_service.list_for_aggregate(
+            "edition", edition_id, kind=EDITION_RENDER_JOB_KIND
+        )
+        job = _latest_render_job(jobs, edition_release_id)
+        if job is None:
+            job = await _submit_render_job(
+                job_service,
+                edition_id=edition_id,
+                edition_release_id=edition_release_id,
+                idempotency_key=f"edition-render-{edition_release_id}",
+                correlation_id=correlation_id,
+                actor_id=actor_id,
+                max_attempts=3,
+            )
+
+        for _ in range(3):
+            if job.status is JobStatus.QUEUED:
+                break
+            if job.status in {
+                JobStatus.RUNNING,
+                JobStatus.SUCCEEDED,
+                JobStatus.WAITING_HUMAN,
+            }:
+                return job.id, False
+            if job.status is JobStatus.FAILED and job.attempt < job.max_attempts:
+                try:
+                    job = await job_service.retry(job.id, actor_id=actor_id)
+                except InvalidJobTransitionError:
+                    job = await job_service.get(job.id)
+                continue
+            if job.status in {JobStatus.FAILED, JobStatus.CANCELLED}:
+                previous_job_id = job.id
+                job = await _submit_render_job(
+                    job_service,
+                    edition_id=edition_id,
+                    edition_release_id=edition_release_id,
+                    idempotency_key=(
+                        f"edition-render-{edition_release_id}-after-{previous_job_id}"
+                    ),
+                    correlation_id=correlation_id,
+                    actor_id=actor_id,
+                    max_attempts=job.max_attempts,
+                )
+                continue
+        else:
+            raise RuntimeError("edition render job state did not stabilize")
+    except Exception:
+        logger.exception("Unable to assure edition render job for release %s", edition_release_id)
+        return None, False
+
+    if job_dispatcher is None:
+        return job.id, False
+    try:
+        await job_dispatcher.dispatch(job.id)
+    except Exception:
+        logger.exception("Unable to dispatch edition render job %s", job.id)
+        return job.id, False
+    return job.id, True
+
+
+async def _submit_render_job(
+    job_service: JobService,
+    *,
+    edition_id: UUID,
+    edition_release_id: UUID,
+    idempotency_key: str,
+    correlation_id: str,
+    actor_id: str,
+    max_attempts: int,
+) -> Job:
+    try:
+        return await job_service.submit(
+            kind=EDITION_RENDER_JOB_KIND,
+            aggregate_type="edition",
+            aggregate_id=edition_id,
+            idempotency_key=idempotency_key,
+            correlation_id=correlation_id,
+            input_parameters={"edition_release_id": str(edition_release_id)},
+            max_attempts=max_attempts,
+            actor_id=actor_id,
+        )
+    except DuplicateJobError as exc:
+        return await job_service.get(exc.existing_job_id)
+
+
+def _latest_render_job(jobs: Any, edition_release_id: UUID) -> Job | None:
+    matching = [
+        job
+        for job in jobs
+        if job.kind == EDITION_RENDER_JOB_KIND
+        and str(job.input_parameters.get("edition_release_id")) == str(edition_release_id)
+    ]
+    return max(matching, key=lambda job: (job.created_at, str(job.id)), default=None)
+
+
 __all__ = [
     "EDITION_ASSEMBLE_JOB_KIND",
+    "EDITION_RENDER_JOB_KIND",
     "EditionAssembleParameters",
     "EditionAssemblyService",
     "EditionPublicationService",
     "EditionReleaseStatus",
+    "EditionRenderParameters",
     "PublicationAcceptResult",
     "PublicationAcceptanceError",
     "PublicationAssemblyError",
     "PublicationManifestNotFoundError",
+    "ensure_edition_render_job",
     "register_publication_jobs",
 ]

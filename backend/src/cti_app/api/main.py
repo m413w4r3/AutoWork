@@ -1,6 +1,7 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from fastapi import FastAPI, Request
@@ -36,7 +37,7 @@ from cti_app.application.discovery.fusion import FusionService
 from cti_app.application.discovery.manual_source_edits import ManualSourceEditService
 from cti_app.application.discovery.runs import DiscoveryRunService
 from cti_app.application.discovery.service import DiscoveryService
-from cti_app.application.edition_preview import EditionPreviewService
+from cti_app.application.edition_preview import EditionPreviewPdfRenderer, EditionPreviewService
 from cti_app.application.edition_publication import (
     EditionAssemblyService,
     EditionPublicationService,
@@ -44,8 +45,10 @@ from cti_app.application.edition_publication import (
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
 )
+from cti_app.application.edition_rendering import EditionRenderService
 from cti_app.application.edition_review import EditionRepairReadService, EditionReviewService
 from cti_app.application.edition_rule_archive import EditionRuleArchiveService
+from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
@@ -59,6 +62,7 @@ from cti_app.application.http_collection import (
 )
 from cti_app.application.identity import LocalIdentityProvider
 from cti_app.application.jobs import DuplicateJobError, JobService, create_job_registry
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.model_conversations import ModelConversationService
 from cti_app.application.persistence import UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -73,9 +77,12 @@ from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionService,
 )
+from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.selection import SelectionService
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.application.subjects import SubjectService
+from cti_app.application.typst_paths import typst_bundle_paths
+from cti_app.application.typst_rendering import TypstRenderer
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
@@ -85,6 +92,7 @@ from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.health import InfrastructureReadinessChecker
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.integrations.model_factory import (
     create_bridge_capabilities_provider,
     create_model_gateway,
@@ -96,6 +104,10 @@ configure_logging(settings.log_level)
 
 
 logger = logging.getLogger(__name__)
+
+
+def _typst_bundle_paths() -> tuple[Path, Path, Path]:
+    return typst_bundle_paths()
 
 
 @asynccontextmanager
@@ -244,11 +256,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     publication_assembly = EditionAssemblyService(
         uow_factory,
         production_artifact_store,
-        workspace_materializer=edition_workspace_materializer,
-        rematerialization_service=edition_release_rematerializer,
+    )
+    chp_typst_root, font_bundle_root, typst_fonts_lock_path = _typst_bundle_paths()
+    typst_compiler = TypstSubprocessCompiler()
+    media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
+    edition_typst_renderer = EditionTypstRenderer()
+    edition_render_service = EditionRenderService(
+        uow_factory=uow_factory,
+        artifact_store=production_artifact_store,
+        media_asset_store=media_asset_store,
+        renderer=edition_typst_renderer,
+        compiler=typst_compiler,
+        chp_typst_root=chp_typst_root,
+        font_bundle_root=font_bundle_root,
+        typst_fonts_lock_path=typst_fonts_lock_path,
+    )
+    edition_preview_pdf_renderer = EditionPreviewPdfRenderer(
+        renderer=edition_typst_renderer,
+        media_asset_store=media_asset_store,
+        compiler=typst_compiler,
+        chp_typst_root=chp_typst_root,
+        font_bundle_root=font_bundle_root,
+        typst_fonts_lock_path=typst_fonts_lock_path,
+    )
+    publication_render_service = PublicationRenderService(
+        uow_factory=uow_factory,
+        artifact_store=production_artifact_store,
+        media_asset_store=media_asset_store,
+        renderer=TypstRenderer(),
+        compiler=typst_compiler,
+        chp_typst_root=chp_typst_root,
+        font_bundle_root=font_bundle_root,
+        typst_fonts_lock_path=typst_fonts_lock_path,
     )
     subject_content_service = SubjectContentService(uow_factory, production_artifact_store)
     production_chain = ProductionStageChain(production_pacing)
+    job_dispatcher = DramatiqJobDispatcher()
     registry = create_job_registry(
         model_gateway,
         discovery_service,
@@ -260,22 +303,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cumulative_discovery_service=cumulative_discovery_service,
         production_checkpoint=production_checkpoint,
         publication_assembly=publication_assembly,
+        edition_render_service=edition_render_service,
+        job_dispatcher=job_dispatcher,
         bridge_transport=bridge_provider,
         production_diagram_compiler=D2DiagramCompiler(),
+        edition_release_rematerializer=edition_release_rematerializer,
     )
     app.state.readiness = readiness
     app.state.uow_factory = uow_factory
     app.state.production_artifact_store = production_artifact_store
     app.state.subject_content_service = subject_content_service
+    app.state.publication_render_service = publication_render_service
     app.state.production_diagnostics = production_diagnostics
     app.state.production_pacing = production_pacing
     job_service = JobService(uow_factory, registry)
-    job_dispatcher = DramatiqJobDispatcher()
     discovery_run_service = DiscoveryRunService(uow_factory, job_service, job_dispatcher)
     # Registry must exist before the service consuming it, so bind only once both are ready.
     production_chain.bind(job_service, job_dispatcher)
     app.state.job_service = job_service
     app.state.job_dispatcher = job_dispatcher
+    app.state.edition_render_service = edition_render_service
     app.state.edition_service = EditionService(uow_factory)
     app.state.subject_service = SubjectService(uow_factory)
     app.state.identity_provider = LocalIdentityProvider()
@@ -332,10 +379,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         job_dispatcher=job_dispatcher,
         repair_issue_reader=production_repair_issue_service,
     )
+    app.state.typst_compiler = typst_compiler
+    app.state.media_asset_store = media_asset_store
+    app.state.chp_typst_root = chp_typst_root
+    app.state.font_bundle_root = font_bundle_root
+    app.state.typst_fonts_lock_path = typst_fonts_lock_path
     app.state.edition_preview_service = EditionPreviewService(
         uow_factory,
         production_artifact_store,
         repair_issue_reader=production_repair_issue_service,
+        pdf_renderer=edition_preview_pdf_renderer,
     )
     app.state.edition_rule_archive_service = EditionRuleArchiveService(
         uow_factory,

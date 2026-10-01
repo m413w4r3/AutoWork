@@ -40,6 +40,7 @@ from cti_app.domain.edition_publication import (
     PublicationManifestExclusionV1,
     PublicationManifestV1,
 )
+from cti_app.domain.edition_render import EditionRender, EditionRenderAcquisition
 from cti_app.domain.editions import Edition, EditionAuditEvent, EditionStatus
 from cti_app.domain.editorial import AnalystDecision, HumanDecision
 from cti_app.domain.entities import ProvenanceEvent, Sample, SourceDocument, Subject
@@ -159,6 +160,51 @@ class PublicationRenderRepository(Protocol):
         source_blob_id: UUID | None = None,
         render_data_blob_id: UUID | None = None,
     ) -> PublicationRender: ...
+
+
+class EditionRenderRepository(Protocol):
+    async def get(self, render_id: UUID) -> EditionRender | None: ...
+
+    async def get_by_input_hash(self, input_hash: str) -> EditionRender | None: ...
+
+    async def get_latest_for_release(self, edition_release_id: UUID) -> EditionRender | None: ...
+
+    async def get_latest_succeeded_for_release(
+        self, edition_release_id: UUID
+    ) -> EditionRender | None: ...
+
+    async def acquire_for_render(
+        self, proposed: EditionRender, *, stale_running_before: datetime
+    ) -> EditionRenderAcquisition: ...
+
+    async def reacquire_invalid_succeeded(
+        self,
+        proposed: EditionRender,
+        *,
+        observed_output_blob_id: UUID,
+        observed_output_sha256: str,
+    ) -> EditionRenderAcquisition: ...
+
+    async def mark_succeeded(
+        self,
+        render_id: UUID,
+        *,
+        output_blob_id: UUID,
+        output_sha256: str,
+        output_byte_size: int,
+        source_blob_id: UUID | None = None,
+        render_data_blob_id: UUID | None = None,
+    ) -> EditionRender: ...
+
+    async def mark_failed(
+        self,
+        render_id: UUID,
+        *,
+        error_code: str,
+        error_message: str | None = None,
+        source_blob_id: UUID | None = None,
+        render_data_blob_id: UUID | None = None,
+    ) -> EditionRender: ...
 
 
 class GoodwareBaselineRepository(Protocol):
@@ -717,6 +763,7 @@ class UnitOfWork(Protocol):
     blobs: BlobRepository
     media_assets: MediaAssetRepository
     publication_renders: PublicationRenderRepository
+    edition_renders: EditionRenderRepository
     goodware_baselines: GoodwareBaselineRepository
     investigation_goodware_baselines: InvestigationGoodwareBaselineRepository
     reference_members: ReferenceMemberRepository
@@ -1110,6 +1157,7 @@ class ProductionUnitOfWork(Protocol):
     publication_manifest_entries: PublicationManifestEntryRepository
     publication_manifest_exclusions: PublicationManifestExclusionRepository
     edition_releases: EditionReleaseRepository
+    edition_renders: EditionRenderRepository
     # A repair reads the archived source back to verify a corrected value,
     # so the archived document and its blob are part of this contract.
     source_documents: SourceDocumentRepository
@@ -1177,6 +1225,8 @@ class PublicationManifestExclusionRepository(Protocol):
 
 class EditionReleaseRepository(Protocol):
     async def add_if_absent(self, release: EditionRelease) -> bool: ...
+
+    async def get(self, release_id: UUID) -> EditionRelease | None: ...
 
     async def get_by_manifest(self, manifest_id: UUID) -> EditionRelease | None: ...
 

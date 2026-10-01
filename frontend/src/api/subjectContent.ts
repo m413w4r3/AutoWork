@@ -11,7 +11,6 @@ export interface SubjectContentResponse {
   status: string;
   schema_version: string;
   canonical_content: PublicationDocumentV4;
-  rendered_content: string | null;
 }
 
 export interface SubjectIndicatorResponse {
@@ -47,6 +46,10 @@ export function getSubjectContent(
   return requestOrNull(
     `/api/subjects/${encodeURIComponent(subjectId)}/content`,
   );
+}
+
+export function subjectPublicationPdfUrl(subjectId: string): string {
+  return `/api/subjects/${encodeURIComponent(subjectId)}/publication/pdf`;
 }
 
 export function getSubjectIndicators(

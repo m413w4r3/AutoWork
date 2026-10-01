@@ -4,10 +4,8 @@ import asyncio
 import hashlib
 import json
 import shutil
-import zipfile
-from dataclasses import replace
-from datetime import date, datetime
-from io import BytesIO
+from dataclasses import fields, replace
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any
@@ -19,23 +17,37 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.publication import router as publication_router
 from cti_app.application.edition_document import edition_metadata_projection
-from cti_app.application.edition_preview import EditionPreviewService
 from cti_app.application.edition_publication import (
+    EDITION_ASSEMBLE_JOB_KIND,
+    EDITION_RENDER_JOB_KIND,
+    EditionAssembleParameters,
     EditionAssemblyService,
     EditionPublicationService,
     PublicationAcceptanceError,
     PublicationAssemblyError,
+    register_publication_jobs,
 )
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseMaterializationError,
+    EditionReleaseRematerializationService,
+)
+from cti_app.application.edition_rendering import EditionRenderParameters, EditionRenderService
 from cti_app.application.edition_review import EditionReviewReadItem, EditionReviewService
 from cti_app.application.edition_workspace import EditionWorkspaceMaterializer
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.jobs import DuplicateJobError
+from cti_app.application.jobs import DuplicateJobError, JobRegistry
 from cti_app.domain.classification import TLP
 from cti_app.domain.edition_publication import (
     EditionDocumentV2,
     EditionPublicationV2,
+    EditionRelease,
     PublicationManifestEntryV1,
     PublicationManifestV1,
+)
+from cti_app.domain.edition_render import (
+    EditionRender,
+    EditionRenderFormat,
+    EditionRenderStatus,
 )
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.jobs import Job
@@ -58,6 +70,18 @@ from cti_app.domain.publication_document import (
     publication_document_v4_to_json,
 )
 from cti_app.domain.publication_review import PublicationDecision
+
+
+def test_edition_release_only_stores_canonical_edition_document() -> None:
+    assert [field.name for field in fields(EditionRelease)] == [
+        "id",
+        "edition_id",
+        "manifest_id",
+        "edition_document_blob_id",
+        "edition_document_sha256",
+        "created_at",
+    ]
+
 
 EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
 SUBJECT_A = UUID("22222222-2222-4222-8222-222222222222")
@@ -130,6 +154,42 @@ def _document(title: str) -> PublicationDocumentV4:
         tables=(),
         diagrams=(),
         figures=(),
+    )
+
+
+def _successful_edition_render(
+    release_id: UUID,
+    blobs: _BlobStore,
+    *,
+    pdf_bytes: bytes = b"%PDF-1.7\ncanonical edition pdf\n",
+    created_at: datetime | None = None,
+) -> EditionRender:
+    output_blob_id = uuid4()
+    blobs.blobs[output_blob_id] = pdf_bytes
+    now = created_at or datetime.now(UTC)
+    return EditionRender(
+        id=uuid4(),
+        edition_release_id=release_id,
+        renderer="typst",
+        renderer_version="edition-v2-typst-v1",
+        template_version="chp-edition-v1",
+        template_sha256="a" * 64,
+        compiler="typst",
+        compiler_version="0.15.1",
+        font_bundle_version="fonts-v1",
+        render_policy_version="typst-edition-v2-v1",
+        format=EditionRenderFormat.PDF,
+        input_hash="b" * 64,
+        source_blob_id=uuid4(),
+        render_data_blob_id=uuid4(),
+        output_blob_id=output_blob_id,
+        output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        output_byte_size=len(pdf_bytes),
+        status=EditionRenderStatus.SUCCEEDED,
+        error_code=None,
+        error_message=None,
+        created_at=now,
+        updated_at=now,
     )
 
 
@@ -272,6 +332,12 @@ class _ReleaseRepo:
     async def get_by_manifest(self, manifest_id: UUID) -> Any:
         return self.releases.get(manifest_id)
 
+    async def get(self, release_id: UUID) -> Any:
+        return next(
+            (release for release in self.releases.values() if release.id == release_id),
+            None,
+        )
+
     async def get_for_edition(self, edition_id: UUID) -> Any:
         return next(
             (
@@ -366,6 +432,36 @@ class _Audit:
         del event
 
 
+class _EditionRenders:
+    def __init__(self) -> None:
+        self.renders: dict[UUID, EditionRender] = {}
+
+    async def get_latest_for_release(self, release_id: UUID) -> EditionRender | None:
+        return max(
+            (render for render in self.renders.values() if render.edition_release_id == release_id),
+            key=lambda render: (render.created_at, str(render.id)),
+            default=None,
+        )
+
+    async def get_latest_succeeded_for_release(self, release_id: UUID) -> EditionRender | None:
+        return max(
+            (
+                render
+                for render in self.renders.values()
+                if render.edition_release_id == release_id
+                and render.status is EditionRenderStatus.SUCCEEDED
+            ),
+            key=lambda render: (render.created_at, str(render.id)),
+            default=None,
+        )
+
+    async def get(self, render_id: UUID) -> EditionRender | None:
+        return self.renders.get(render_id)
+
+    def add(self, render: EditionRender) -> None:
+        self.renders[render.id] = render
+
+
 class _Uow:
     def __init__(
         self,
@@ -413,7 +509,9 @@ class _Uow:
         self.publication_manifest_entries = _Entries()
         self.publication_manifest_exclusions = _Exclusions()
         self.edition_releases = _ReleaseRepo()
+        self.edition_renders = _EditionRenders()
         self.edition_audit = _Audit()
+        self.job_events = _Audit()
         self.jobs = _Jobs()
 
     async def _get_batch(self, edition_id: UUID) -> EditionProductionBatch | None:
@@ -459,6 +557,18 @@ class _Jobs:
         self.jobs[job.id] = job
         return job
 
+    async def add_if_absent(self, job: Job) -> bool:
+        if any(existing.idempotency_key == job.idempotency_key for existing in self.jobs.values()):
+            return False
+        self.jobs[job.id] = job
+        return True
+
+    async def get_by_idempotency_key(self, idempotency_key: str) -> Job | None:
+        return next(
+            (job for job in self.jobs.values() if job.idempotency_key == idempotency_key),
+            None,
+        )
+
     async def get(self, job_id: UUID) -> Job:
         return self.jobs[job_id]
 
@@ -499,10 +609,10 @@ def _job_for_manifest(
         job.start()
     elif status == "failed":
         job.start()
-        job.fail("pandoc_failed", "Pandoc failed", details={"private": "hidden"})
+        job.fail("edition_assembly_failed", "Assembly failed", details={"private": "hidden"})
     elif status == "failed_exhausted":
         job.start()
-        job.fail("pandoc_failed", "Pandoc failed", details={"private": "hidden"})
+        job.fail("edition_assembly_failed", "Assembly failed", details={"private": "hidden"})
     elif status == "cancelled":
         job.request_cancellation()
     elif status == "succeeded":
@@ -544,10 +654,126 @@ class _Dispatcher:
             raise RuntimeError("redis unavailable")
 
 
-class _BrokenReleaseMaterializer:
-    async def materialize_release(self, **kwargs: Any) -> None:
-        del kwargs
+class _PublicationJobContext:
+    async def correlation_id(self) -> str:
+        return "test-publication-job"
+
+    async def report_progress(self, current: int, total: int, message: str) -> None:
+        del current, total, message
+
+
+class _SuccessfulRenderService:
+    def __init__(self, render: EditionRender) -> None:
+        self.render = render
+        self.release_ids: list[UUID] = []
+
+    async def render_pdf(self, release_id: UUID) -> EditionRender:
+        self.release_ids.append(release_id)
+        return self.render
+
+
+class _FailingRematerializer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, UUID]] = []
+
+    async def materialize(self, **kwargs: UUID) -> None:
+        self.calls.append(kwargs)
         raise OSError("workspace unavailable")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_fails", [False, True])
+async def test_assembly_handler_persists_release_then_queues_pdf_render(
+    dispatch_fails: bool,
+) -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    dispatcher = _Dispatcher(fail=dispatch_fails)
+    accepted = await EditionPublicationService(
+        lambda: uow,
+        blobs,
+        job_service=uow.jobs,
+    ).accept(EDITION_ID, actor_id="analyst")  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
+    registry = JobRegistry()
+    register_publication_jobs(
+        registry,
+        lambda: uow,
+        assembly,
+        job_dispatcher=dispatcher,
+    )  # type: ignore[arg-type]
+
+    result = await registry.handler(EDITION_ASSEMBLE_JOB_KIND)(
+        EditionAssembleParameters(manifest_id=accepted.manifest.id),
+        _PublicationJobContext(),  # type: ignore[arg-type]
+    )
+    release = await uow.edition_releases.get_by_manifest(accepted.manifest.id)
+    render_jobs = [job for job in uow.jobs.jobs.values() if job.kind == EDITION_RENDER_JOB_KIND]
+
+    assert release is not None
+    assert [field.name for field in fields(release)] == [
+        "id",
+        "edition_id",
+        "manifest_id",
+        "edition_document_blob_id",
+        "edition_document_sha256",
+        "created_at",
+    ]
+    assert result == f"edition-release://{EDITION_ID}/{release.id}"
+    assert len(render_jobs) == 1
+    assert render_jobs[0].input_parameters == {"edition_release_id": str(release.id)}
+    assert render_jobs[0].status.value == "queued"
+    assert dispatcher.calls == [render_jobs[0].id]
+    assert registry.validate(
+        EDITION_RENDER_JOB_KIND,
+        {"edition_release_id": str(release.id)},
+    ).model_dump(mode="json") == {"edition_release_id": str(release.id)}
+    assert registry.resumes_after_worker_loss(EDITION_RENDER_JOB_KIND)
+
+
+@pytest.mark.asyncio
+async def test_render_handler_swallows_best_effort_materialization_failure() -> None:
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [], blobs)
+    release_id = uuid4()
+    render = _successful_edition_render(release_id, blobs)
+    render_service = _SuccessfulRenderService(render)
+    rematerializer = _FailingRematerializer()
+    registry = JobRegistry()
+    register_publication_jobs(
+        registry,
+        lambda: uow,
+        EditionAssemblyService(lambda: uow, blobs),  # type: ignore[arg-type]
+        render_service=render_service,  # type: ignore[arg-type]
+        release_rematerializer=rematerializer,  # type: ignore[arg-type]
+    )  # type: ignore[arg-type]
+
+    result = await registry.handler(EDITION_RENDER_JOB_KIND)(
+        EditionRenderParameters(edition_release_id=release_id),
+        _PublicationJobContext(),  # type: ignore[arg-type]
+    )
+
+    assert result == f"edition-render://{release_id}/{render.id}"
+    assert render_service.release_ids == [release_id]
+    assert rematerializer.calls == [
+        {"edition_release_id": release_id, "edition_render_id": render.id}
+    ]
+    assert render.status is EditionRenderStatus.SUCCEEDED
 
 
 @pytest.mark.asyncio
@@ -827,89 +1053,6 @@ async def test_accept_refuses_an_include_until_its_projection_is_materialized() 
     assert uow.editions.edition.state is EditionStatus.OPEN
 
 
-@pytest.mark.asyncio
-async def test_preview_is_read_only_and_uses_the_same_edition_document_as_final() -> None:
-    row = EditionReviewReadItem(
-        position=1,
-        subject_id=SUBJECT_A,
-        title="Alpha",
-        run_id=RUN_A,
-        pipeline_generation=2,
-        run_status=ProductionRunStatus.READY,
-        document_artifact_id=ARTIFACT_A,
-        document_artifact_version=1,
-        document_input_hash="a" * 64,
-        document_artifact_status=ProductionArtifactStatus.VERIFIED,
-        error_code=None,
-        error_message=None,
-        effective_decision=None,
-    )
-    blobs = _BlobStore()
-    uow = _Uow(_edition(), [row], blobs)
-    preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
-    before = uow.editions.edition.snapshot()
-
-    preview = await preview_service.preview(EDITION_ID)
-
-    assert preview.stale is False
-    assert preview.artifacts[0].artifact_id == ARTIFACT_A
-    assert uow.publication_manifests.manifest is None
-    assert uow.editions.edition.snapshot() == before
-
-    accepted = await EditionPublicationService(lambda: uow, blobs).accept(
-        EDITION_ID, actor_id="analyst"
-    )
-    release = await EditionAssemblyService(lambda: uow, blobs).assemble(accepted.manifest_id)
-    final_document = await blobs.read_json(release.edition_document_blob_id)
-    assert EditionDocumentV2.from_json(final_document) == preview.document
-
-
-@pytest.mark.asyncio
-async def test_preview_becomes_stale_when_the_current_publication_artifact_changes() -> None:
-    row = EditionReviewReadItem(
-        position=1,
-        subject_id=SUBJECT_A,
-        title="Alpha",
-        run_id=RUN_A,
-        pipeline_generation=2,
-        run_status=ProductionRunStatus.READY,
-        document_artifact_id=ARTIFACT_A,
-        document_artifact_version=1,
-        document_input_hash="a" * 64,
-        document_artifact_status=ProductionArtifactStatus.VERIFIED,
-        error_code=None,
-        error_message=None,
-        effective_decision=None,
-    )
-    blobs = _BlobStore()
-    uow = _Uow(_edition(), [row], blobs)
-    preview_service = EditionPreviewService(lambda: uow, blobs)  # type: ignore[arg-type]
-    previous = await preview_service.preview(EDITION_ID)
-
-    replacement_id = uuid4()
-    replacement_blob = uuid4()
-    blobs.blobs[replacement_blob] = json.dumps(
-        publication_document_v4_to_json(_document("Replacement"))
-    ).encode()
-    replacement = _artifact(replacement_id, RUN_A, SUBJECT_A, replacement_blob)
-    replacement.input_hash = "b" * 64
-    uow.production_artifacts.artifacts = {replacement_id: replacement}
-    uow.edition_review_read_model.rows[0] = replace(
-        row,
-        document_artifact_id=replacement_id,
-        document_input_hash="b" * 64,
-    )
-
-    current = await preview_service.preview(
-        EDITION_ID,
-        previous_preview_input_hash=previous.preview_input_hash,
-    )
-
-    assert current.stale is True
-    assert current.preview_input_hash != previous.preview_input_hash
-    assert current.document.publications[0].document.title == "Replacement"
-
-
 @pytest.mark.parametrize(
     ("excluded_positions", "expected_positions"),
     (
@@ -920,7 +1063,7 @@ async def test_preview_becomes_stale_when_the_current_publication_artifact_chang
         ((1, 3), [2]),
     ),
 )
-async def test_accept_and_docx_preserve_editorial_positions_with_exclusions(
+async def test_accept_preserves_editorial_positions_with_exclusions(
     excluded_positions: tuple[int, ...], expected_positions: list[int]
 ) -> None:
     subjects = (SUBJECT_A, SUBJECT_B, SUBJECT_C)
@@ -968,11 +1111,7 @@ async def test_accept_and_docx_preserve_editorial_positions_with_exclusions(
         if position not in excluded_positions
     ]
 
-    content = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
-    with zipfile.ZipFile(BytesIO(content)) as archive:
-        document_xml = archive.read("word/document.xml")
-    for position, title in enumerate(titles, start=1):
-        assert (title.encode() in document_xml) is (position not in excluded_positions)
+    assert edition_json["schema_version"] == "2"
 
 
 def test_manifest_and_edition_document_allow_multiple_editorial_gaps() -> None:
@@ -1075,7 +1214,7 @@ async def test_accept_in_assembling_repairs_failed_job_without_new_manifest() ->
     first = await service.accept(EDITION_ID, actor_id="analyst")
     job = jobs.jobs[first.job_id]
     job.start()
-    job.fail("pandoc_failed", "Pandoc failed")
+    job.fail("edition_assembly_failed", "Assembly failed")
     second = await service.accept(EDITION_ID, actor_id="analyst")
 
     assert second.manifest_id == first.manifest_id
@@ -1130,7 +1269,7 @@ async def test_empty_review_is_rejected_without_freeze() -> None:
 
 
 @pytest.mark.asyncio
-async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
+async def test_assembly_reads_manifest_artifact_id_and_persists_canonical_document(
     tmp_path: Path,
 ) -> None:
     row = EditionReviewReadItem(
@@ -1152,31 +1291,16 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     accepted = await publication.accept(EDITION_ID, actor_id="analyst")
-    assembly = EditionAssemblyService(
-        lambda: uow,
-        blobs,
-        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
-    )  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
-    content = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
     edition_document = await blobs.read_json(release.edition_document_blob_id)
 
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert edition_document["schema_version"] == "2"
     assert edition_document["publications"][0]["document"]["schema_version"] == "4"
-    assert content[:2] == b"PK"
-    with zipfile.ZipFile(BytesIO(content)) as archive:
-        document_xml = archive.read("word/document.xml")
-        assert b"Alpha" in document_xml
     release_path = tmp_path / "editions/2026-08_FR/release"
-    assert sorted(path.name for path in release_path.iterdir()) == [
-        "bulletin.docx",
-        "edition.json",
-        "edition.md",
-        "publication-manifest.json",
-    ]
-    assert (release_path / "bulletin.docx").read_bytes() == content
+    assert not release_path.exists()
     await assembly.assemble(accepted.manifest_id)
     assert uow.edition_releases.add_calls == 1
 
@@ -1184,7 +1308,12 @@ async def test_assembly_reads_manifest_artifact_id_and_publishes_real_docx(
 @pytest.mark.asyncio
 async def test_manual_target_two_articles_is_frozen_and_rematerializable(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    async def reject_render(*_args: Any, **_kwargs: Any) -> EditionRender:
+        raise AssertionError("rematerialization must not render")
+
+    monkeypatch.setattr(EditionRenderService, "render_pdf", reject_render)
     rows = [
         EditionReviewReadItem(
             position=position,
@@ -1220,11 +1349,7 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
     accepted = await EditionPublicationService(lambda: uow, blobs).accept(
         EDITION_ID, actor_id="analyst"
     )  # type: ignore[arg-type]
-    assembly = EditionAssemblyService(
-        lambda: uow,
-        blobs,
-        workspace_materializer=EditionWorkspaceMaterializer(tmp_path / "editions"),
-    )  # type: ignore[arg-type]
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
     assert [entry.position for entry in accepted.manifest.entries] == [1, 2]
@@ -1234,39 +1359,80 @@ async def test_manual_target_two_articles_is_frozen_and_rematerializable(
         "Article A",
         "Article B",
     ]
-    original_docx = await blobs.read_bytes(release.docx_blob_id, max_bytes=32 * 1024 * 1024)
-    with zipfile.ZipFile(BytesIO(original_docx)) as archive:
-        document_xml = archive.read("word/document.xml")
-    assert document_xml.index(b"Article A") < document_xml.index(b"Article B")
-
     release_path = tmp_path / "editions/2026-08_FR/release"
+    assert not release_path.exists()
     manifest_blob_id = uow.publication_manifests.blob_id
     assert manifest_blob_id is not None
     canonical_bytes = {
         "publication-manifest.json": blobs.blobs[manifest_blob_id],
         "edition.json": blobs.blobs[release.edition_document_blob_id],
-        "edition.md": blobs.blobs[release.markdown_blob_id],
-        "bulletin.docx": blobs.blobs[release.docx_blob_id],
     }
-    assert {name: (release_path / name).read_bytes() for name in canonical_bytes} == canonical_bytes
+    rematerializer = EditionReleaseRematerializationService(
+        lambda: uow,
+        blobs,
+        EditionWorkspaceMaterializer(tmp_path / "editions"),
+    )  # type: ignore[arg-type]
+    with pytest.raises(
+        EditionReleaseMaterializationError,
+        match="edition_render_not_available",
+    ):
+        await rematerializer.materialize(EDITION_ID)
+    assert not release_path.exists()
+
+    render = _successful_edition_render(release.id, blobs)
+    assert render.output_blob_id is not None
+    uow.edition_renders.add(render)
+    pdf_bytes = blobs.blobs[render.output_blob_id]
+    materialized_path = await rematerializer.materialize(EDITION_ID)
+    expected_bytes = {
+        **canonical_bytes,
+        "bulletin.pdf": blobs.blobs[render.output_blob_id],
+    }
+    assert materialized_path == release_path
+    assert {path.name for path in release_path.iterdir()} == set(expected_bytes)
+    assert {name: (release_path / name).read_bytes() for name in expected_bytes} == expected_bytes
+    assert not (release_path / "edition.md").exists()
+    assert not (release_path / "bulletin.docx").exists()
     manifest_id = accepted.manifest.id
     release_id = release.id
     shutil.rmtree(release_path)
     assert not release_path.exists()
     assert uow.edition_releases.release is release
 
-    rematerialized = await assembly.assemble(accepted.manifest_id)
+    blobs.blobs[render.output_blob_id] = b"corrupted pdf"
+    with pytest.raises(
+        EditionReleaseMaterializationError,
+        match="edition_render_output_integrity_mismatch",
+    ):
+        await rematerializer.materialize(EDITION_ID)
+    assert not release_path.exists()
+    blobs.blobs[render.output_blob_id] = pdf_bytes
 
-    assert rematerialized is release
-    assert rematerialized.id == release_id
+    document_bytes = blobs.blobs[release.edition_document_blob_id]
+    blobs.blobs[release.edition_document_blob_id] = document_bytes + b" "
+    with pytest.raises(
+        EditionReleaseMaterializationError,
+        match="edition_document_blob_mismatch",
+    ):
+        await rematerializer.materialize(EDITION_ID)
+    assert not release_path.exists()
+    blobs.blobs[release.edition_document_blob_id] = document_bytes
+
+    rematerialized_path = await rematerializer.materialize(
+        EDITION_ID,
+        edition_render_id=render.id,
+    )
+
+    assert rematerialized_path == release_path
+    assert {name: (release_path / name).read_bytes() for name in expected_bytes} == expected_bytes
+    assert release.id == release_id
     assert uow.edition_releases.add_calls == 1
     assert uow.publication_manifests.manifest.id == manifest_id
-    assert {name: (release_path / name).read_bytes() for name in canonical_bytes} == canonical_bytes
-    assert (release_path / "bulletin.docx").read_bytes() == original_docx
+    assert {path.name for path in release_path.iterdir()} == set(expected_bytes)
 
 
 @pytest.mark.asyncio
-async def test_assembly_filesystem_failure_keeps_canonical_release_published() -> None:
+async def test_assembly_does_not_write_release_workspace(tmp_path: Path) -> None:
     row = EditionReviewReadItem(
         position=1,
         subject_id=SUBJECT_A,
@@ -1286,17 +1452,14 @@ async def test_assembly_filesystem_failure_keeps_canonical_release_published() -
     uow = _Uow(_edition(), [row], blobs)
     publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
     accepted = await publication.accept(EDITION_ID, actor_id="analyst")
-    assembly = EditionAssemblyService(
-        lambda: uow,
-        blobs,
-        workspace_materializer=_BrokenReleaseMaterializer(),  # type: ignore[arg-type]
-    )
+    assembly = EditionAssemblyService(lambda: uow, blobs)  # type: ignore[arg-type]
 
     release = await assembly.assemble(accepted.manifest_id)
 
     assert release.edition_id == EDITION_ID
     assert uow.editions.edition.state is EditionStatus.OPEN
     assert uow.edition_releases.release is release
+    assert not (tmp_path / "editions/2026-08_FR/release").exists()
 
 
 @pytest.mark.asyncio
@@ -1471,7 +1634,7 @@ async def test_release_endpoint_exposes_public_assembly_failure_state() -> None:
     accepted = await service.accept(EDITION_ID, actor_id="analyst")
     job = jobs.jobs[next(iter(jobs.jobs))]
     job.start()
-    job.fail("pandoc_failed", "Public Pandoc failure", details={"secret": "not public"})
+    job.fail("edition_assembly_failed", "Public assembly failure", details={"secret": "not public"})
 
     application = FastAPI()
     application.include_router(publication_router)
@@ -1487,7 +1650,289 @@ async def test_release_endpoint_exposes_public_assembly_failure_state() -> None:
     assert "edition_status" not in body
     assert body["assembly_job_id"] == str(job.id)
     assert body["assembly_status"] == "failed"
-    assert body["assembly_error_code"] == "pandoc_failed"
-    assert body["assembly_error_message"] == "Public Pandoc failure"
+    assert body["assembly_error_code"] == "edition_assembly_failed"
+    assert body["assembly_error_message"] == "Public assembly failure"
     assert body["can_retry_assembly"] is True
+    assert body["render_id"] is None
+    assert body["render_status"] == "none"
+    assert body["render_error_code"] is None
+    assert body["render_error_message"] is None
+    assert body["can_retry_render"] is False
+    assert body["pdf_available"] is False
     assert "error_details" not in body
+
+
+@pytest.mark.asyncio
+async def test_edition_docx_download_route_is_removed() -> None:
+    application = FastAPI()
+    application.include_router(publication_router)
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.get(f"/api/editions/{EDITION_ID}/release/docx")
+
+    assert response.status_code == 404
+
+
+class _PdfRouteHarness:
+    def __init__(self) -> None:
+        self.manifest: Any = None
+        self.release: EditionRelease | None = None
+        self.render: EditionRender | None = None
+
+    def uow(self) -> Any:
+        harness = self
+
+        class Repositories:
+            @property
+            def publication_manifests(self) -> Repositories:
+                return self
+
+            @property
+            def edition_releases(self) -> Repositories:
+                return self
+
+            @property
+            def edition_renders(self) -> Repositories:
+                return self
+
+            async def get_latest_for_edition(self, edition_id: UUID) -> Any:
+                del edition_id
+                return harness.manifest
+
+            async def get_by_manifest(self, manifest_id: UUID) -> EditionRelease | None:
+                del manifest_id
+                return harness.release
+
+            async def get_latest_for_release(self, release_id: UUID) -> EditionRender | None:
+                del release_id
+                return harness.render
+
+            async def __aenter__(self) -> Repositories:
+                return self
+
+            async def __aexit__(self, *args: object) -> None:
+                del args
+
+            async def commit(self) -> None:
+                return None
+
+        return Repositories()
+
+
+@pytest.mark.asyncio
+async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
+    harness = _PdfRouteHarness()
+    blobs = _BlobStore()
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.uow_factory = harness.uow
+    application.state.production_artifact_store = blobs
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        missing = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+        assert missing.status_code == 404
+
+        document = EditionDocumentV2(
+            edition={
+                "country": "France",
+                "country_code": "FR",
+                "period_start": "2026-08-01",
+            },
+            publications=(),
+        )
+        document_blob_id, document_sha256 = await blobs.put_canonical_json(
+            document.to_json(), bucket="test-edition-document"
+        )
+        harness.release = EditionRelease(
+            edition_id=EDITION_ID,
+            manifest_id=uuid4(),
+            edition_document_blob_id=document_blob_id,
+            edition_document_sha256=document_sha256,
+        )
+        harness.manifest = type("Manifest", (), {"id": harness.release.manifest_id})()
+        unavailable = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+        assert unavailable.status_code == 409
+        assert unavailable.json()["detail"]["code"] == "release_pdf_not_available"
+
+        pdf = b"%PDF-release-route"
+        output_blob_id = await blobs.put_bytes(
+            pdf, bucket="test-edition-pdf", mime_type="application/pdf"
+        )
+        now = datetime.now(UTC)
+        harness.render = EditionRender(
+            id=uuid4(),
+            edition_release_id=harness.release.id,
+            renderer="typst",
+            renderer_version="edition-v2-typst-v1",
+            template_version="chp-edition-v1",
+            template_sha256="a" * 64,
+            compiler="typst",
+            compiler_version="0.15.1",
+            font_bundle_version="fonts-v1",
+            render_policy_version="typst-edition-v2-v1",
+            format=EditionRenderFormat.PDF,
+            input_hash="b" * 64,
+            source_blob_id=None,
+            render_data_blob_id=None,
+            output_blob_id=output_blob_id,
+            output_sha256=hashlib.sha256(pdf).hexdigest(),
+            output_byte_size=len(pdf),
+            status=EditionRenderStatus.SUCCEEDED,
+            error_code=None,
+            error_message=None,
+            created_at=now,
+            updated_at=now,
+        )
+        downloaded = await client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "application/pdf"
+    assert downloaded.content == pdf
+    assert downloaded.headers["content-disposition"] == (
+        'attachment; filename="bulletin-2026-08-FR.pdf"'
+    )
+
+    fallback_document = EditionDocumentV2(
+        edition={"country_code": "../../FR"},
+        publications=(),
+    )
+    fallback_blob_id, fallback_sha256 = await blobs.put_canonical_json(
+        fallback_document.to_json(), bucket="test-edition-document"
+    )
+    harness.release = replace(
+        harness.release,
+        edition_document_blob_id=fallback_blob_id,
+        edition_document_sha256=fallback_sha256,
+    )
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as fallback_client:
+        fallback_download = await fallback_client.get(f"/api/editions/{EDITION_ID}/release/pdf")
+
+    assert fallback_download.status_code == 200
+    assert fallback_download.headers["content-disposition"] == (
+        'attachment; filename="bulletin-0000-00-XX.pdf"'
+    )
+
+
+@pytest.mark.asyncio
+async def test_retry_render_is_idempotent_and_published_at_comes_from_render() -> None:
+    row = EditionReviewReadItem(
+        position=1,
+        subject_id=SUBJECT_A,
+        title="Alpha",
+        run_id=RUN_A,
+        pipeline_generation=2,
+        run_status=ProductionRunStatus.READY,
+        document_artifact_id=ARTIFACT_A,
+        document_artifact_version=1,
+        document_input_hash="a" * 64,
+        document_artifact_status=ProductionArtifactStatus.VERIFIED,
+        error_code=None,
+        error_message=None,
+        effective_decision=None,
+    )
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [row], blobs)
+    jobs = _Jobs()
+    uow.jobs = jobs
+    dispatcher = _Dispatcher()
+    publication = EditionPublicationService(
+        lambda: uow,
+        blobs,
+        job_service=jobs,
+        job_dispatcher=dispatcher,
+    )  # type: ignore[arg-type]
+    accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+    release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
+        accepted.manifest.id
+    )
+    manifest_ids = set(uow.publication_manifests.manifests)
+    release_ids = {item.id for item in uow.edition_releases.releases.values()}
+
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.edition_publication_service = publication
+    application.state.identity_provider = LocalIdentityProvider()
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        first = await client.post(f"/api/editions/{EDITION_ID}/release/render")
+        second = await client.post(f"/api/editions/{EDITION_ID}/release/render")
+        assert first.status_code == second.status_code == 200
+        render_jobs = [job for job in jobs.jobs.values() if job.kind == EDITION_RENDER_JOB_KIND]
+        assert render_jobs, [(job.kind, job.input_parameters) for job in jobs.jobs.values()]
+        observed_status = await publication.release_status(EDITION_ID)
+        assert observed_status.release is not None
+        assert observed_status.release.id == release.id
+        assert observed_status.render_job_status is not None, [
+            (job.kind, job.aggregate_type, job.aggregate_id, job.input_parameters)
+            for job in jobs.jobs.values()
+        ]
+        assert first.json()["render_status"] == "queued"
+        assert second.json()["render_status"] == "queued"
+        assert len(render_jobs) == 1
+        assert render_jobs[0].input_parameters["edition_release_id"] == str(release.id)
+        assert set(uow.publication_manifests.manifests) == manifest_ids
+        assert {item.id for item in uow.edition_releases.releases.values()} == release_ids
+
+        now = datetime.now(UTC)
+        render = EditionRender(
+            id=uuid4(),
+            edition_release_id=release.id,
+            renderer="typst",
+            renderer_version="edition-v2-typst-v1",
+            template_version="chp-edition-v1",
+            template_sha256="a" * 64,
+            compiler="typst",
+            compiler_version="0.15.1",
+            font_bundle_version="fonts-v1",
+            render_policy_version="typst-edition-v2-v1",
+            format=EditionRenderFormat.PDF,
+            input_hash="b" * 64,
+            source_blob_id=None,
+            render_data_blob_id=None,
+            output_blob_id=uuid4(),
+            output_sha256="c" * 64,
+            output_byte_size=12,
+            status=EditionRenderStatus.SUCCEEDED,
+            error_code=None,
+            error_message=None,
+            created_at=now - timedelta(minutes=2),
+            updated_at=now,
+        )
+        uow.edition_renders.renders[render.id] = render
+        dispatch_count = len(dispatcher.calls)
+        published = await client.post(f"/api/editions/{EDITION_ID}/release/render")
+
+    assert published.status_code == 200
+    assert published.json()["render_id"] == str(render.id)
+    assert published.json()["render_status"] == "succeeded"
+    assert published.json()["pdf_available"] is True
+    assert published.json()["published_at"] == now.isoformat()
+    assert len(dispatcher.calls) == dispatch_count
+
+
+@pytest.mark.asyncio
+async def test_retry_render_returns_404_when_edition_has_no_release() -> None:
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [], blobs)
+    publication = EditionPublicationService(
+        lambda: uow,
+        blobs,
+        job_service=uow.jobs,
+        job_dispatcher=_Dispatcher(),
+    )  # type: ignore[arg-type]
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.edition_publication_service = publication
+    application.state.identity_provider = LocalIdentityProvider()
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        response = await client.post(f"/api/editions/{EDITION_ID}/release/render")
+
+    assert response.status_code == 404

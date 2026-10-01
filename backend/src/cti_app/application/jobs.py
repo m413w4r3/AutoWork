@@ -645,8 +645,11 @@ def create_job_registry(
     seed_enrichment: object | None = None,
     production_checkpoint: object | None = None,
     publication_assembly: object | None = None,
+    edition_render_service: object | None = None,
+    job_dispatcher: JobDispatcher | None = None,
     bridge_transport: object | None = None,
     production_diagram_compiler: object | None = None,
+    edition_release_rematerializer: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
     registry.register("demo.deterministic", DemoJobParameters, demo_job_handler)
@@ -727,12 +730,24 @@ def create_job_registry(
             EditionAssemblyService,
             register_publication_jobs,
         )
+        from cti_app.application.edition_rendering import EditionRenderService
 
         if not isinstance(publication_assembly, EditionAssemblyService):
             raise TypeError("publication_assembly must be an EditionAssemblyService")
+        if edition_render_service is not None and not isinstance(
+            edition_render_service, EditionRenderService
+        ):
+            raise TypeError("edition_render_service must be an EditionRenderService")
         if uow_factory is None or not callable(uow_factory):
             raise TypeError("uow_factory must be callable for publication assembly")
-        register_publication_jobs(registry, cast(Any, uow_factory), publication_assembly)
+        register_publication_jobs(
+            registry,
+            cast(Any, uow_factory),
+            publication_assembly,
+            cast(Any, edition_render_service),
+            job_dispatcher,
+            release_rematerializer=cast(Any, edition_release_rematerializer),
+        )
     return registry
 
 

@@ -24,17 +24,7 @@ _LEGACY_FORBIDDEN = (
     "report_source_labels",
     "[S1]",
 )
-_RENDERER_FORBIDDEN = (
-    "PandocRenderer",
-    "publication_renderer",
-    "render_publication_pandoc",
-    "export_markdown_docx",
-    "pandoc",
-    "Pandoc",
-    "DOCX",
-    "OOXML",
-    "reference-doc",
-)
+_RENDERER_FORBIDDEN = ("publication_renderer",)
 
 
 def test_canonical_assembly_qa_and_orchestrator_have_no_legacy_dependency() -> None:
@@ -52,16 +42,6 @@ def test_canonical_assembly_qa_and_orchestrator_have_no_legacy_dependency() -> N
     assert not (_APPLICATION / ("production" + "_legacy_assembly.py")).exists()
 
 
-def test_pandoc_renderer_class_is_absent_from_active_backend_python() -> None:
-    active_python = Path(__file__).resolve().parents[1] / "src" / "cti_app"
-    occurrences = [
-        path.relative_to(active_python)
-        for path in active_python.rglob("*.py")
-        if "PandocRenderer" in path.read_text()
-    ]
-    assert occurrences == []
-
-
 def test_editorial_enrichment_contract_has_no_renderer_or_compiler_dependency() -> None:
     for path in (
         _APPLICATION / "production_editorial_enrichment.py",
@@ -77,5 +57,5 @@ def test_editorial_enrichment_contract_has_no_renderer_or_compiler_dependency() 
         imported.extend(
             node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)
         )
-        for forbidden in ("pandoc", "typst", "d2", "mermaid", "graphviz", "tikz"):
+        for forbidden in ("typst", "d2", "mermaid", "graphviz", "tikz"):
             assert all(forbidden not in name.lower() for name in imported)

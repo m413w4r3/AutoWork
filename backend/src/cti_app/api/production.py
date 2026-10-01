@@ -2299,12 +2299,15 @@ async def _artifact_view_for_run(
         rendered = None
         canonical = None
         if store is not None:
-            if artifact.rendered_blob_id is not None:
+            if (
+                artifact.stage is not ProductionArtifactStage.PUBLICATION
+                and artifact.rendered_blob_id is not None
+            ):
                 rendered = await store.read_text(artifact.rendered_blob_id)
             if artifact.canonical_blob_id is not None:
                 canonical = await store.read_json(artifact.canonical_blob_id)
 
-        return {
+        response = {
             "artifact_id": str(artifact.id),
             "stage": artifact.stage.value,
             "version": artifact.version,
@@ -2317,9 +2320,11 @@ async def _artifact_view_for_run(
             ),
             "reused_from_created_at": artifact.metadata.get("reused_from_created_at"),
             "metadata": artifact.metadata,
-            "rendered_content": rendered,
             "canonical_content": canonical,
         }
+        if artifact.stage is not ProductionArtifactStage.PUBLICATION:
+            response["rendered_content"] = rendered
+        return response
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/references")

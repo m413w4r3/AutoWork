@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Sequence
+from datetime import date
 from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
 
@@ -19,6 +23,7 @@ from cti_app.application.collection import SupplementalSource
 from cti_app.application.collection_errors import CollectionNotAllowedError
 from cti_app.application.edition_preview import (
     EditionPreviewError,
+    EditionPreviewRenderError,
     EditionPreviewService,
     EditionPreviewStaleError,
 )
@@ -49,6 +54,7 @@ from cti_app.application.edition_rule_archive import (
     EditionRuleArchiveService,
 )
 from cti_app.application.identity import IdentityProvider
+from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
 from cti_app.application.production_references import load_reference_projection
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
@@ -72,6 +78,9 @@ from cti_app.application.production_repairs import (
     repair_application_diagnostic,
     repair_issue_execution_state,
 )
+from cti_app.application.typst_compilation import TYPST_MAX_PDF_BYTES
+from cti_app.domain.edition_publication import EditionDocumentV2
+from cti_app.domain.edition_render import EditionRenderDisplayStatus, EditionRenderStatus
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
@@ -334,8 +343,12 @@ class EditionReleaseView(BaseModel):
     manifest_sha256: str | None
     release_id: UUID | None
     json_available: bool
-    markdown_available: bool
-    docx_available: bool
+    render_id: UUID | None
+    render_status: EditionRenderDisplayStatus
+    render_error_code: str | None
+    render_error_message: str | None
+    can_retry_render: bool
+    pdf_available: bool
     published_at: str | None
     assembly_job_id: UUID | None
     assembly_status: JobStatus | None
@@ -362,8 +375,7 @@ class EditionPreviewView(BaseModel):
     edition_version: int
     preview_input_hash: str
     artifacts: list[EditionPreviewArtifactView]
-    canonical_markdown: str
-    sanitized_html: str
+    document: dict[str, Any]
     stale: bool
 
 
@@ -1377,6 +1389,22 @@ async def get_edition_release(edition_id: UUID, request: Request) -> EditionRele
         _raise_publication_error(exc)
 
 
+@router.post(
+    "/editions/{edition_id}/release/render",
+    response_model=EditionReleaseView,
+)
+async def retry_edition_render(edition_id: UUID, request: Request) -> EditionReleaseView:
+    try:
+        release = await _publication_service(request).retry_render(
+            edition_id,
+            actor_id=await _actor_id(request),
+            correlation_id=get_correlation_id(),
+        )
+        return _release_view(release)
+    except Exception as exc:
+        _raise_publication_error(exc)
+
+
 @router.get("/editions/{edition_id}/preview", response_model=EditionPreviewView)
 async def get_edition_preview(
     edition_id: UUID,
@@ -1404,8 +1432,7 @@ async def get_edition_preview(
             )
             for artifact in preview.artifacts
         ],
-        canonical_markdown=preview.canonical_markdown,
-        sanitized_html=preview.sanitized_html,
+        document=preview.document.to_json(),
         stale=preview.stale,
     )
 
@@ -1415,7 +1442,9 @@ async def get_edition_preview(
     response_model=EditionReleaseMaterializationView,
 )
 async def materialize_edition_release(
-    edition_id: UUID, request: Request
+    edition_id: UUID,
+    request: Request,
+    edition_render_id: UUID | None = None,
 ) -> EditionReleaseMaterializationView:
     """Rebuild only the disposable release projection from canonical storage."""
     materializer = getattr(request.app.state, "edition_release_rematerializer", None)
@@ -1426,7 +1455,10 @@ async def materialize_edition_release(
         )
     await _actor_id(request)
     try:
-        await materializer.materialize(edition_id)
+        if edition_render_id is None:
+            await materializer.materialize(edition_id)
+        else:
+            await materializer.materialize(edition_id, edition_render_id=edition_render_id)
     except EditionReleaseMaterializationError as exc:
         code = str(exc)
         status_code = (
@@ -1443,16 +1475,73 @@ async def materialize_edition_release(
     return EditionReleaseMaterializationView(edition_id=edition_id, materialized=True)
 
 
-@router.get("/editions/{edition_id}/release/docx")
-async def download_edition_docx(edition_id: UUID, request: Request) -> Response:
+@router.get("/editions/{edition_id}/release/pdf")
+async def download_edition_pdf(edition_id: UUID, request: Request) -> Response:
+    async with request.app.state.uow_factory() as uow:
+        manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+        release = (
+            await uow.edition_releases.get_by_manifest(manifest.id)
+            if manifest is not None
+            else None
+        )
+        render_repository = getattr(uow, "edition_renders", None)
+        render = (
+            await render_repository.get_latest_for_release(release.id)
+            if release is not None and render_repository is not None
+            else None
+        )
+        await uow.commit()
+    if release is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "edition_release_not_found"},
+        )
+    if render is None or render.status is not EditionRenderStatus.SUCCEEDED:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "release_pdf_not_available"},
+        )
+    assert render.output_blob_id is not None
     try:
-        _, content = await _publication_service(request).read_docx(edition_id)
+        content = await request.app.state.production_artifact_store.read_bytes(
+            render.output_blob_id,
+            max_bytes=TYPST_MAX_PDF_BYTES,
+        )
     except Exception as exc:
-        _raise_publication_error(exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "release_pdf_storage_error"},
+        ) from exc
+    if (
+        len(content) != render.output_byte_size
+        or hashlib.sha256(content).hexdigest() != render.output_sha256
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "release_pdf_integrity_mismatch"},
+        )
+
+    try:
+        document_bytes = await request.app.state.production_artifact_store.read_bytes(
+            release.edition_document_blob_id,
+            max_bytes=MAX_ARTIFACT_BYTES,
+        )
+        if hashlib.sha256(document_bytes).hexdigest() != release.edition_document_sha256:
+            raise ValueError("edition_document_integrity_mismatch")
+        payload = json.loads(document_bytes)
+        if not isinstance(payload, dict):
+            raise ValueError("edition_document_invalid")
+        document = EditionDocumentV2.from_json(payload)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "edition_document_integrity_mismatch"},
+        ) from exc
+    filename = _release_pdf_filename(document)
     return Response(
         content=content,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f'attachment; filename="bulletin-{edition_id}.docx"'},
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -1473,25 +1562,23 @@ async def download_edition_rules(edition_id: UUID, request: Request) -> Response
     )
 
 
-@router.get("/editions/{edition_id}/preview/docx")
-async def download_edition_preview_docx(
+@router.get("/editions/{edition_id}/preview/pdf")
+async def download_edition_preview_pdf(
     edition_id: UUID,
     request: Request,
-    preview_input_hash: Annotated[str | None, Query(pattern=_SHA256_PATTERN)] = None,
+    preview_input_hash: Annotated[str, Query(pattern=_SHA256_PATTERN)],
 ) -> Response:
     try:
-        content = await _preview_service(request).docx(
+        preview_pdf = await _preview_service(request).preview_pdf(
             edition_id,
             expected_preview_input_hash=preview_input_hash,
         )
     except Exception as exc:
         _raise_publication_error(exc)
     return Response(
-        content=content,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={
-            "Content-Disposition": f'attachment; filename="bulletin-{edition_id}-preview.docx"'
-        },
+        content=preview_pdf.content,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{preview_pdf.filename}"'},
     )
 
 
@@ -1676,8 +1763,12 @@ def _release_view(release: EditionReleaseStatus) -> EditionReleaseView:
         manifest_sha256=release.manifest_sha256,
         release_id=release.release.id if release.release is not None else None,
         json_available=release.json_available,
-        markdown_available=release.markdown_available,
-        docx_available=release.docx_available,
+        render_id=release.render_id,
+        render_status=release.render_status,
+        render_error_code=release.render_error_code,
+        render_error_message=release.render_error_message,
+        can_retry_render=release.can_retry_render,
+        pdf_available=release.pdf_available,
         published_at=release.published_at.isoformat() if release.published_at else None,
         assembly_job_id=release.assembly_job_id,
         assembly_status=release.assembly_status,
@@ -1685,6 +1776,25 @@ def _release_view(release: EditionReleaseStatus) -> EditionReleaseView:
         assembly_error_message=release.assembly_error_message,
         can_retry_assembly=release.can_retry_assembly,
     )
+
+
+def _release_pdf_filename(document: EditionDocumentV2) -> str:
+    period_start = document.edition.get("period_start")
+    try:
+        if not isinstance(period_start, str) or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}", period_start
+        ):
+            raise ValueError("period_start is missing or invalid")
+        period = date.fromisoformat(period_start).strftime("%Y-%m")
+    except ValueError:
+        period = "0000-00"
+    country_code = document.edition.get("country_code")
+    country = (
+        country_code.upper()
+        if isinstance(country_code, str) and re.fullmatch(r"[A-Za-z]{2}", country_code)
+        else "XX"
+    )
+    return f"bulletin-{period}-{country}.pdf"
 
 
 def _raise_review_error(exc: Exception) -> NoReturn:
@@ -1732,6 +1842,13 @@ def _raise_publication_error(exc: Exception) -> NoReturn:
             status_code=status.HTTP_409_CONFLICT,
             detail={"code": "edition_preview_stale"},
         ) from exc
+    if isinstance(exc, EditionPreviewRenderError):
+        status_code = (
+            status.HTTP_422_UNPROCESSABLE_CONTENT
+            if exc.code in {"edition_preview_document_invalid", "typst_output_invalid"}
+            else status.HTTP_503_SERVICE_UNAVAILABLE
+        )
+        raise HTTPException(status_code=status_code, detail={"code": exc.code}) from exc
     if isinstance(exc, EditionPreviewError):
         code = str(exc)
         if code == "edition_not_found":

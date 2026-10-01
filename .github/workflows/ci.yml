@@ -31,8 +31,6 @@ jobs:
         working-directory: backend
     steps:
       - uses: actions/checkout@v4
-      - name: Install Pandoc for DOCX publication tests
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y pandoc
       - name: Install pinned D2 for diagram compilation tests
         run: |
           ../scripts/install-d2.sh "$RUNNER_TEMP/d2"
@@ -63,6 +61,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build backend image with pinned Typst fonts
         run: docker build -f infra/backend.Dockerfile -t autowork-backend-smoke .
+      - name: backend image does not contain pandoc
+        run: docker run --rm --entrypoint sh autowork-backend-smoke -c '! command -v pandoc'
       - name: Compile the production renderer with bundled fonts and no network
         run: |
           docker run --rm --network none autowork-backend-smoke sh -eu -c '
@@ -85,6 +85,7 @@ jobs:
               --ignore-system-fonts --creation-timestamp 0 \
               "$workspace/RENDERER/publication.typ" "$workspace/output.pdf"
             test -s "$workspace/output.pdf"
+            python /app/scripts/typst_edition_smoke.py
           '
 
   frontend:

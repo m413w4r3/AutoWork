@@ -24,6 +24,14 @@ from cti_app.application.edition_publication import (
     EDITION_ASSEMBLE_JOB_KIND,
     EditionAssemblyService,
 )
+from cti_app.application.edition_release_materialization import (
+    EditionReleaseRematerializationService,
+)
+from cti_app.application.edition_rendering import (
+    EDITION_RENDER_JOB_KIND,
+    EditionRenderService,
+)
+from cti_app.application.edition_typst_rendering import EditionTypstRenderer
 from cti_app.application.edition_workspace import (
     EditionProductionCheckpointService,
     EditionWorkspaceMaterializer,
@@ -39,6 +47,7 @@ from cti_app.application.jobs import (
     JobService,
     create_job_registry,
 )
+from cti_app.application.media_assets import MediaAssetStore
 from cti_app.application.persistence import JobUnitOfWork, UnitOfWork
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_jobs import (
@@ -47,6 +56,7 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
+from cti_app.application.typst_paths import typst_bundle_paths
 from cti_app.application.virustotal import VirusTotalCapabilities, VirusTotalRoutingPolicy
 from cti_app.application.virustotal_persistence import VirusTotalObservationService
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
@@ -59,6 +69,7 @@ from cti_app.infrastructure.database.session import create_postgres_engine, crea
 from cti_app.infrastructure.database.uow import SqlAlchemyUnitOfWork
 from cti_app.infrastructure.http import AsyncioPinnedHttpTransport
 from cti_app.infrastructure.jobs import DramatiqJobDispatcher
+from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from cti_app.infrastructure.virustotal import (
     VirusTotalHttpAdapter,
     create_virustotal_direct_http_client,
@@ -80,6 +91,7 @@ EXECUTE_JOB_TIME_LIMIT_MS = int(get_settings().job_actor_time_limit_seconds * 10
 DURABLE_RESUME_JOB_KINDS = frozenset(
     {
         EDITION_ASSEMBLE_JOB_KIND,
+        EDITION_RENDER_JOB_KIND,
         DISCOVERY_JOB_KIND,
         # Le batch reprocessé est committé avant son handoff cumulative : perdre
         # le worker entre les deux doit reprendre le MÊME attempt (donc le même
@@ -257,6 +269,19 @@ async def _execute_job(job_id: UUID) -> int | None:
         production_artifact_store = ProductionArtifactStore(
             BlobCatalogService(blob_store, uow_factory)
         )
+        chp_typst_root, font_bundle_root, typst_fonts_lock_path = typst_bundle_paths()
+        typst_compiler = TypstSubprocessCompiler()
+        media_asset_store = MediaAssetStore(production_artifact_store, uow_factory)
+        edition_render_service = EditionRenderService(
+            uow_factory=uow_factory,
+            artifact_store=production_artifact_store,
+            media_asset_store=media_asset_store,
+            renderer=EditionTypstRenderer(),
+            compiler=typst_compiler,
+            chp_typst_root=chp_typst_root,
+            font_bundle_root=font_bundle_root,
+            typst_fonts_lock_path=typst_fonts_lock_path,
+        )
         edition_workspace_materializer = EditionWorkspaceMaterializer(
             settings.edition_workspace_root
         )
@@ -270,7 +295,11 @@ async def _execute_job(job_id: UUID) -> int | None:
         publication_assembly = EditionAssemblyService(
             uow_factory,
             production_artifact_store,
-            workspace_materializer=edition_workspace_materializer,
+        )
+        edition_release_rematerializer = EditionReleaseRematerializationService(
+            uow_factory,
+            production_artifact_store,
+            edition_workspace_materializer,
         )
         production_pacing = ProductionPacingPolicy.from_settings(settings)
         production_chain = ProductionStageChain(production_pacing)
@@ -286,8 +315,11 @@ async def _execute_job(job_id: UUID) -> int | None:
             seed_enrichment=seed_enrichment,
             production_checkpoint=production_checkpoint,
             publication_assembly=publication_assembly,
+            edition_render_service=edition_render_service,
+            job_dispatcher=job_dispatcher,
             bridge_transport=bridge_provider,
             production_diagram_compiler=D2DiagramCompiler(),
+            edition_release_rematerializer=edition_release_rematerializer,
         )
         job_service = JobService(uow_factory, registry)
         production_chain.bind(job_service, job_dispatcher)

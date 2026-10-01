@@ -7,14 +7,17 @@
   if url in result { result } else { result + (url,) }
 })
 
-#let render-publication-timeline(events) = {
-  section-title[Chronologie]
-  let positional-events = events.map(event => (
+#let publication-timeline-events(publication) = {
+  publication.timeline.map(event => (
     event.display_date,
     event.text,
     unique-urls(event.source_urls),
   ))
-  timeline(positional-events)
+}
+
+#let render-publication-timeline(events) = {
+  section-title[Chronologie]
+  timeline(events)
 }
 
 #let render-table(item) = {
@@ -78,11 +81,7 @@
   }
 }
 
-#let render-publication(publication) = {
-  heading(level: 1)[#publication.title]
-
-  render-publication-timeline(publication.timeline)
-
+#let render-publication-body(publication) = {
   for item in publication.body_blocks {
     render-body-block(item)
   }
@@ -107,4 +106,12 @@
     #section-title[Sources]
     #source-list(publication.sources)
   ]
+}
+
+#let render-publication(publication) = {
+  heading(level: 1)[#publication.title]
+
+  render-publication-timeline(publication-timeline-events(publication))
+
+  render-publication-body(publication)
 }

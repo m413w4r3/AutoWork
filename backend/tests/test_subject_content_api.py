@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -10,6 +12,10 @@ from httpx import ASGITransport, AsyncClient
 
 from cti_app.api.subject_content import router
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.application.publication_rendering import (
+    PublicationRenderDocumentInvalidError,
+    PublicationRenderStorageFailedError,
+)
 from cti_app.application.subject_content import SubjectContentService
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument, Subject
@@ -58,6 +64,16 @@ class _Artifacts:
             and artifact.status is not ProductionArtifactStatus.STALE
         ]
         return max(matches, key=lambda artifact: artifact.version) if matches else None
+
+
+class _PublicationArtifactWithoutRenderedBlob:
+    def __init__(self, artifact: ProductionArtifact) -> None:
+        self._artifact = artifact
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "rendered_blob_id":
+            raise AssertionError("PUBLICATION must not read rendered_blob_id")
+        return getattr(self._artifact, name)
 
 
 class _Sources:
@@ -115,6 +131,12 @@ class _Payloads:
         assert isinstance(value, str)
         return value
 
+    async def read_bytes(self, blob_id: UUID, *, max_bytes: int) -> bytes:
+        value = self.values[blob_id]
+        assert isinstance(value, bytes)
+        assert len(value) <= max_bytes
+        return value
+
 
 class _ExplodingPayloads(_Payloads):
     async def read_json(self, blob_id: UUID) -> dict[str, Any]:
@@ -124,12 +146,33 @@ class _ExplodingPayloads(_Payloads):
         raise AssertionError(f"assets must not read blob {blob_id}")
 
 
-def _app(uow: _Uow, payloads: _Payloads) -> FastAPI:
+class _PublicationRenderService:
+    def __init__(self, *, result: object | None = None, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.artifact_ids: list[UUID] = []
+
+    async def render_pdf(self, artifact_id: UUID) -> object:
+        self.artifact_ids.append(artifact_id)
+        if self.error is not None:
+            raise self.error
+        assert self.result is not None
+        return self.result
+
+
+def _app(
+    uow: _Uow,
+    payloads: _Payloads,
+    publication_render_service: _PublicationRenderService | None = None,
+) -> FastAPI:
     app = FastAPI()
     app.include_router(router)
     app.state.subject_content_service = SubjectContentService(
         cast(UnitOfWorkFactory, lambda: uow), payloads
     )
+    app.state.production_artifact_store = payloads
+    if publication_render_service is not None:
+        app.state.publication_render_service = publication_render_service
     return app
 
 
@@ -238,14 +281,19 @@ async def test_content_returns_current_artifact_without_raw_blob(subject: Subjec
     run = _run(generation=3)
     canonical_id = uuid4()
     rendered_id = uuid4()
-    artifact = _artifact(
-        run,
-        ProductionArtifactStage.PUBLICATION,
-        canonical_id,
-        rendered_blob_id=rendered_id,
+    artifact = _PublicationArtifactWithoutRenderedBlob(
+        _artifact(
+            run,
+            ProductionArtifactStage.PUBLICATION,
+            canonical_id,
+            rendered_blob_id=rendered_id,
+        )
     )
     payloads = _Payloads({canonical_id: _document("Current title"), rendered_id: "# Current title"})
-    app = _app(_Uow(subject, [run], [artifact]), payloads)
+    app = _app(
+        _Uow(subject, [run], [cast(ProductionArtifact, artifact)]),
+        payloads,
+    )
 
     async with await _client(app) as api:
         response = await api.get(f"/api/subjects/{SUBJECT_ID}/content")
@@ -257,8 +305,124 @@ async def test_content_returns_current_artifact_without_raw_blob(subject: Subjec
     assert body["pipeline_generation"] == 3
     assert body["artifact_id"] == str(artifact.id)
     assert body["canonical_content"]["title"] == "Current title"
-    assert body["rendered_content"] == "# Current title"
+    assert "rendered_content" not in body
     assert "raw_blob" not in body
+
+
+@pytest.mark.anyio
+async def test_subject_publication_pdf_uses_current_verified_artifact(
+    subject: Subject,
+) -> None:
+    previous_run = _run(created_at=datetime.now(UTC), generation=1)
+    current_run = _run(created_at=datetime.now(UTC) + timedelta(seconds=1), generation=2)
+    previous_artifact = _artifact(
+        previous_run,
+        ProductionArtifactStage.PUBLICATION,
+        uuid4(),
+    )
+    current_artifact = _artifact(
+        current_run,
+        ProductionArtifactStage.PUBLICATION,
+        uuid4(),
+        version=2,
+    )
+    output_blob_id = uuid4()
+    pdf_bytes = b"%PDF-1.7\npublication"
+    render = SimpleNamespace(
+        output_blob_id=output_blob_id,
+        output_byte_size=len(pdf_bytes),
+        output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+    renderer = _PublicationRenderService(result=render)
+    payloads = _Payloads({output_blob_id: pdf_bytes})
+    app = _app(
+        _Uow(subject, [previous_run, current_run], [previous_artifact, current_artifact]),
+        payloads,
+        renderer,
+    )
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == "application/pdf"
+    assert response.headers["content-disposition"] == (
+        f'attachment; filename="publication-{SUBJECT_ID}.pdf"'
+    )
+    assert response.content == pdf_bytes
+    assert renderer.artifact_ids == [current_artifact.id]
+
+
+@pytest.mark.anyio
+async def test_subject_publication_pdf_checks_output_integrity(subject: Subject) -> None:
+    run = _run()
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, uuid4())
+    output_blob_id = uuid4()
+    pdf_bytes = b"%PDF-1.7\npublication"
+    render = SimpleNamespace(
+        output_blob_id=output_blob_id,
+        output_byte_size=len(pdf_bytes),
+        output_sha256="0" * 64,
+    )
+    app = _app(
+        _Uow(subject, [run], [artifact]),
+        _Payloads({output_blob_id: pdf_bytes}),
+        _PublicationRenderService(result=render),
+    )
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "publication_pdf_integrity_mismatch"
+
+
+@pytest.mark.anyio
+async def test_subject_publication_pdf_is_not_available_without_publication(
+    subject: Subject,
+) -> None:
+    app = _app(_Uow(subject, [_run()]), _Payloads({}), _PublicationRenderService())
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "publication_not_available"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error", "expected_status", "expected_code"),
+    [
+        (
+            PublicationRenderDocumentInvalidError("invalid document"),
+            422,
+            "publication_render_document_invalid",
+        ),
+        (
+            PublicationRenderStorageFailedError("storage unavailable"),
+            503,
+            "publication_render_storage_failed",
+        ),
+    ],
+)
+async def test_subject_publication_pdf_maps_render_errors(
+    subject: Subject,
+    error: Exception,
+    expected_status: int,
+    expected_code: str,
+) -> None:
+    run = _run()
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, uuid4())
+    renderer = _PublicationRenderService(error=error)
+    app = _app(_Uow(subject, [run], [artifact]), _Payloads({}), renderer)
+
+    async with await _client(app) as api:
+        response = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert response.status_code == expected_status
+    assert response.json()["detail"]["code"] == expected_code
+    assert renderer.artifact_ids == [artifact.id]
 
 
 @pytest.mark.anyio

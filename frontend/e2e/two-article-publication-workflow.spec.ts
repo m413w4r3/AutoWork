@@ -7,7 +7,7 @@ import {
   selectionWireLastDecision,
 } from "./support/selectionWire";
 
-test("Édition : production séquentielle de deux sujets, revue et DOCX", async ({
+test("Édition : production séquentielle de deux sujets, revue et PDF", async ({
   page,
 }) => {
   // The longest journey in the suite: Selection of two subjects, sequential
@@ -234,7 +234,6 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
         diagrams: [],
         figures: [],
       } satisfies PublicationDocumentV4,
-      rendered_content: null,
     };
   };
 
@@ -403,8 +402,12 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
           manifest_sha256: hash,
           release_id: releasePublished ? "release-1" : null,
           json_available: releasePublished,
-          markdown_available: releasePublished,
-          docx_available: releasePublished,
+          render_id: releasePublished ? "render-1" : null,
+          render_status: releasePublished ? "succeeded" : "none",
+          render_error_code: null,
+          render_error_message: null,
+          can_retry_render: false,
+          pdf_available: releasePublished,
           published_at: releasePublished ? "2026-08-29T00:20:00Z" : null,
           assembly_job_id: "assembly-job-1",
           assembly_status: releasePublished ? "succeeded" : "queued",
@@ -572,14 +575,13 @@ test("Édition : production séquentielle de deux sujets, revue et DOCX", async 
   await page.getByRole("link", { name: "Publication" }).click();
   await expect(page).toHaveURL(`/editions/${editionId}/publication`);
   await expect(
-    page.getByRole("heading", { name: "Manifest figé" }),
+    page.getByRole("heading", { name: "Assemblage canonique" }),
   ).toBeVisible();
+  await expect(page.getByText("Manifest figé")).toBeVisible();
+  await expect(page.getByText("Bulletin publié")).toBeVisible();
   await expect(
-    page.getByRole("heading", { name: "Bulletin publié" }),
-  ).toBeVisible();
-  await expect(
-    page.getByRole("link", { name: "Télécharger le bulletin DOCX" }),
-  ).toHaveAttribute("href", `/api/editions/${editionId}/release/docx`);
+    page.getByRole("link", { name: "Télécharger le PDF" }),
+  ).toHaveAttribute("href", `/api/editions/${editionId}/release/pdf`);
 
   expect(seenPaths).toEqual(
     expect.arrayContaining([

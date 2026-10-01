@@ -16,8 +16,12 @@ const baseRelease: EditionReleaseResponse = {
   manifest_sha256: "a".repeat(64),
   release_id: null,
   json_available: false,
-  markdown_available: false,
-  docx_available: false,
+  render_id: null,
+  render_status: "none",
+  render_error_code: null,
+  render_error_message: null,
+  can_retry_render: false,
+  pdf_available: false,
   published_at: null,
   assembly_job_id: "job-1",
   assembly_status: "queued",
@@ -82,8 +86,21 @@ describe("PublicationConsole", () => {
     },
   );
 
+  it.each(["queued", "running"] as const)(
+    "poll le rendu PDF quand son job est %s",
+    (render_status) => {
+      expect(
+        publicationPollingInterval({
+          ...baseRelease,
+          release_id: "release-1",
+          render_status,
+        }),
+      ).toBe(2_000);
+    },
+  );
+
   it.each([
-    ["queued", "En attente"],
+    ["queued", "Assemblage en cours"],
     ["running", "Assemblage en cours"],
     ["succeeded", "Assemblage terminé"],
   ] as const)("%s n’affiche pas de retry", async (assembly_status, label) => {
@@ -209,11 +226,11 @@ describe("PublicationConsole", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
-  it("affiche une erreur publique, les diagnostics et le retry avec le POST Accept", async () => {
+  it("affiche une erreur publique, les diagnostics et le retry d’assemblage", async () => {
     const { fetchMock } = renderConsole({
       ...baseRelease,
       assembly_status: "failed",
-      assembly_error_code: "pandoc_failed",
+      assembly_error_code: "edition_assembly_failed",
       assembly_error_message: "Le document n’a pas pu être assemblé.",
       can_retry_assembly: true,
     });
@@ -225,7 +242,7 @@ describe("PublicationConsole", () => {
     expect(
       screen.getByText("Le document n’a pas pu être assemblé."),
     ).toBeInTheDocument();
-    expect(screen.getByText("pandoc_failed")).not.toBeVisible();
+    expect(screen.getByText("edition_assembly_failed")).not.toBeVisible();
     await user.click(
       screen.getByRole("button", { name: "Relancer l'assemblage" }),
     );
@@ -244,27 +261,70 @@ describe("PublicationConsole", () => {
     ).toBeUndefined();
   });
 
-  it("affiche le lien DOCX sans fetcher le binaire", async () => {
+  it("affiche le lien PDF et sépare assemblage canonique et rendu", async () => {
     const release = {
       ...baseRelease,
       edition_state: "open" as const,
       assembly_status: "succeeded" as const,
       release_id: "release-1",
-      docx_available: true,
+      json_available: true,
+      render_id: "render-1",
+      render_status: "succeeded" as const,
+      pdf_available: true,
       published_at: "2026-08-29T10:00:00Z",
     };
     const { fetchMock } = renderConsole(release);
-    const link = await screen.findByRole("link", {
-      name: "Télécharger le bulletin DOCX",
-    });
-    expect(link).toHaveAttribute(
-      "href",
-      "/api/editions/edition-1/release/docx",
-    );
+    expect(
+      await screen.findByRole("heading", { name: "Assemblage canonique" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Release assemblé")).toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Rendu PDF" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Bulletin publié")).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: "Télécharger le PDF" });
+    expect(link).toHaveAttribute("href", "/api/editions/edition-1/release/pdf");
     expect(link).toHaveAttribute("download");
     expect(
-      fetchMock.mock.calls.every(([input]) => !urlOf(input).endsWith("/docx")),
+      fetchMock.mock.calls.every(([input]) => !urlOf(input).endsWith("/pdf")),
     ).toBe(true);
+  });
+
+  it("relance uniquement le rendu PDF après un échec", async () => {
+    const { fetchMock } = renderConsole({
+      ...baseRelease,
+      release_id: "release-1",
+      json_available: true,
+      assembly_status: "succeeded",
+      render_status: "failed",
+      render_id: "render-1",
+      render_error_code: "typst_compile_failed",
+      render_error_message: "Le PDF ne peut pas être compilé.",
+      can_retry_render: true,
+    });
+    const user = userEvent.setup();
+
+    expect(await screen.findByText("typst_compile_failed")).toBeInTheDocument();
+    expect(
+      screen.getByText("Le PDF ne peut pas être compilé."),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Relancer le rendu" }));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(
+          ([input, init]) =>
+            init?.method === "POST" &&
+            urlOf(input) === "/api/editions/edition-1/release/render",
+        ),
+      ).toBe(true),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          init?.method === "POST" &&
+          urlOf(input) === "/api/editions/edition-1/publication/accept",
+      ),
+    ).toBe(false);
   });
 
   it("ne répercute pas automatiquement une publication dans Edition", async () => {
@@ -273,13 +333,14 @@ describe("PublicationConsole", () => {
       edition_state: "open" as const,
       release_id: "release-1",
       assembly_status: "succeeded" as const,
+      json_available: true,
+      render_status: "succeeded" as const,
+      pdf_available: true,
     };
     const { client } = renderConsole(release);
     const invalidate = vi.spyOn(client, "invalidateQueries");
 
-    expect(
-      await screen.findByRole("heading", { name: "Bulletin publié" }),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Bulletin publié")).toBeInTheDocument();
     expect(invalidate).not.toHaveBeenCalled();
   });
 
@@ -289,7 +350,7 @@ describe("PublicationConsole", () => {
       edition_state: "open" as const,
       assembly_status: "succeeded" as const,
       release_id: "release-1",
-      docx_available: true,
+      json_available: true,
       published_at: "2026-08-29T10:00:00Z",
     };
     const { fetchMock } = renderConsole(release);
@@ -306,12 +367,18 @@ describe("PublicationConsole", () => {
     ).toBe(true);
   });
 
-  it("conserve le téléchargement en mode ARCHIVED et n’affiche pas de commande", async () => {
-    const release = { ...baseRelease, docx_available: true };
+  it("conserve les téléchargements en mode ARCHIVED et n’affiche pas de commande", async () => {
+    const release = {
+      ...baseRelease,
+      release_id: "release-1",
+      json_available: true,
+      render_status: "succeeded" as const,
+      pdf_available: true,
+    };
     renderConsole(release, true);
     expect(
       await screen.findByRole("link", {
-        name: "Télécharger le bulletin DOCX",
+        name: "Télécharger le PDF",
       }),
     ).toBeInTheDocument();
     expect(
@@ -326,7 +393,7 @@ describe("PublicationConsole", () => {
       await screen.findByRole("heading", { name: "Édition archivée" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("link", { name: "Télécharger le bulletin DOCX" }),
+      screen.queryByRole("link", { name: "Télécharger le PDF" }),
     ).not.toBeInTheDocument();
   });
 });

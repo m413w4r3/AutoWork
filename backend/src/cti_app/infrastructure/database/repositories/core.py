@@ -72,11 +72,13 @@ from cti_app.infrastructure.database.models.edition_publication import (
     EditionReleaseRow,
     PublicationManifestRow,
 )
+from cti_app.infrastructure.database.models.edition_render import EditionRenderRow
 from cti_app.infrastructure.database.models.model_execution import (
     ModelConversationTurnRow,
     ModelRunRow,
 )
 from cti_app.infrastructure.database.models.production import ProductionRepairCorrectionRow
+from cti_app.infrastructure.database.models.publication_render import PublicationRenderRow
 
 
 def _insert_succeeded(result: object) -> bool:
@@ -225,15 +227,35 @@ class SqlAlchemyBlobRepository:
             .select_from(EditionReleaseRow)
             .where(EditionReleaseRow.edition_document_blob_id == blob_id)
         )
-        release_markdown_count = await self._session.scalar(
+        edition_render_source_count = await self._session.scalar(
             select(func.count())
-            .select_from(EditionReleaseRow)
-            .where(EditionReleaseRow.markdown_blob_id == blob_id)
+            .select_from(EditionRenderRow)
+            .where(EditionRenderRow.source_blob_id == blob_id)
         )
-        release_docx_count = await self._session.scalar(
+        edition_render_data_count = await self._session.scalar(
             select(func.count())
-            .select_from(EditionReleaseRow)
-            .where(EditionReleaseRow.docx_blob_id == blob_id)
+            .select_from(EditionRenderRow)
+            .where(EditionRenderRow.render_data_blob_id == blob_id)
+        )
+        edition_render_output_count = await self._session.scalar(
+            select(func.count())
+            .select_from(EditionRenderRow)
+            .where(EditionRenderRow.output_blob_id == blob_id)
+        )
+        publication_render_source_count = await self._session.scalar(
+            select(func.count())
+            .select_from(PublicationRenderRow)
+            .where(PublicationRenderRow.source_blob_id == blob_id)
+        )
+        publication_render_data_count = await self._session.scalar(
+            select(func.count())
+            .select_from(PublicationRenderRow)
+            .where(PublicationRenderRow.render_data_blob_id == blob_id)
+        )
+        publication_render_output_count = await self._session.scalar(
+            select(func.count())
+            .select_from(PublicationRenderRow)
+            .where(PublicationRenderRow.output_blob_id == blob_id)
         )
         repair_correction_count = await self._session.scalar(
             select(func.count())
@@ -260,8 +282,12 @@ class SqlAlchemyBlobRepository:
             + int(code_feature_payload_count or 0)
             + int(manifest_count or 0)
             + int(release_json_count or 0)
-            + int(release_markdown_count or 0)
-            + int(release_docx_count or 0)
+            + int(edition_render_source_count or 0)
+            + int(edition_render_data_count or 0)
+            + int(edition_render_output_count or 0)
+            + int(publication_render_source_count or 0)
+            + int(publication_render_data_count or 0)
+            + int(publication_render_output_count or 0)
             + int(repair_correction_count or 0)
         )
 

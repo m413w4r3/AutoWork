@@ -1,0 +1,13 @@
+{
+  "template_version": "chp-edition-v1",
+  "files": [
+    "RENDERER/edition.typ",
+    "RENDERER/edition_helpers.typ",
+    "RENDERER/publication_helpers.typ",
+    "UTILS/document_style.typ",
+    "UTILS/helpers.typ",
+    "UTILS/colors.typ",
+    "UTILS/header_footer.typ",
+    "UTILS/chap.png"
+  ]
+}

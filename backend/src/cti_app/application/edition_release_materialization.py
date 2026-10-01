@@ -10,10 +10,13 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
+from cti_app.application.typst_compilation import TYPST_MAX_PDF_BYTES
 from cti_app.domain.edition_publication import PublicationManifestV1
-
-MAX_RELEASE_DOCX_BYTES = 32 * 1024 * 1024
+from cti_app.domain.edition_render import EditionRenderStatus
 
 
 class EditionReleaseMaterializationError(ValueError):
@@ -29,8 +32,7 @@ class ReleaseWorkspaceMaterializer(Protocol):
         edition_id: UUID,
         manifest: Mapping[str, Any],
         edition: Mapping[str, Any],
-        markdown: str,
-        docx: bytes,
+        pdf_content: bytes,
     ) -> Path: ...
 
 
@@ -47,24 +49,57 @@ class EditionReleaseRematerializationService:
         self._artifact_store = artifact_store
         self._workspace_materializer = workspace_materializer
 
-    async def materialize(self, edition_id: UUID, *, manifest_id: UUID | None = None) -> Path:
+    async def materialize(
+        self,
+        edition_id: UUID | None = None,
+        *,
+        manifest_id: UUID | None = None,
+        edition_render_id: UUID | None = None,
+        edition_release_id: UUID | None = None,
+    ) -> Path:
         if self._workspace_materializer is None:
             raise EditionReleaseMaterializationError("workspace_materializer_unavailable")
+        if (edition_id is None) == (edition_release_id is None):
+            raise ValueError("Specify exactly one of edition_id or edition_release_id")
 
         async with self._uow_factory() as uow:
-            edition = await uow.editions.get(edition_id)
-            if edition is None:
-                raise EditionReleaseMaterializationError("edition_not_found")
-            manifest = (
-                await uow.publication_manifests.get(manifest_id)
-                if manifest_id is not None
-                else await uow.publication_manifests.get_latest_for_edition(edition_id)
+            if edition_release_id is not None:
+                release = await uow.edition_releases.get(edition_release_id)
+                if release is None:
+                    raise EditionReleaseMaterializationError("edition_release_not_found")
+                edition = await uow.editions.get(release.edition_id)
+                manifest = await uow.publication_manifests.get(release.manifest_id)
+                if edition is None:
+                    raise EditionReleaseMaterializationError("edition_not_found")
+                if manifest is None or manifest.edition_id != release.edition_id:
+                    raise EditionReleaseMaterializationError("manifest_not_found")
+            else:
+                assert edition_id is not None
+                edition = await uow.editions.get(edition_id)
+                if edition is None:
+                    raise EditionReleaseMaterializationError("edition_not_found")
+                manifest = (
+                    await uow.publication_manifests.get(manifest_id)
+                    if manifest_id is not None
+                    else await uow.publication_manifests.get_latest_for_edition(edition_id)
+                )
+                if manifest is None or manifest.edition_id != edition_id:
+                    raise EditionReleaseMaterializationError("manifest_not_found")
+                release = await uow.edition_releases.get_by_manifest(manifest.id)
+                if release is None:
+                    raise EditionReleaseMaterializationError("edition_release_not_found")
+
+            render = (
+                await uow.edition_renders.get(edition_render_id)
+                if edition_render_id is not None
+                else await uow.edition_renders.get_latest_succeeded_for_release(release.id)
             )
-            if manifest is None or manifest.edition_id != edition_id:
-                raise EditionReleaseMaterializationError("manifest_not_found")
-            release = await uow.edition_releases.get_by_manifest(manifest.id)
-            if release is None:
-                raise EditionReleaseMaterializationError("edition_release_not_found")
+            if (
+                render is None
+                or render.edition_release_id != release.id
+                or render.status is not EditionRenderStatus.SUCCEEDED
+            ):
+                raise EditionReleaseMaterializationError("edition_render_not_available")
             manifest_blob_id = await uow.publication_manifests.get_blob_id(manifest.id)
             if manifest_blob_id is None:
                 raise EditionReleaseMaterializationError("manifest_blob_missing")
@@ -80,66 +115,56 @@ class EditionReleaseRematerializationService:
         if blob_manifest != manifest:
             raise EditionReleaseMaterializationError("manifest_blob_mismatch")
 
-        edition_payload = await self._artifact_store.read_json(release.edition_document_blob_id)
-        markdown = await self._artifact_store.read_text(release.markdown_blob_id)
-        docx = await self._artifact_store.read_bytes(
-            release.docx_blob_id, max_bytes=MAX_RELEASE_DOCX_BYTES
+        edition_bytes = await self._artifact_store.read_bytes(
+            release.edition_document_blob_id,
+            max_bytes=MAX_ARTIFACT_BYTES,
         )
         self._verify_payload_hash(
-            edition_payload,
+            edition_bytes,
             release.edition_document_sha256,
-            json_payload=True,
             error_code="edition_document_blob_mismatch",
         )
-        self._verify_payload_hash(
-            markdown.encode("utf-8"),
-            release.markdown_sha256,
-            error_code="edition_markdown_blob_mismatch",
+        try:
+            edition_payload = json.loads(edition_bytes)
+        except (TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise EditionReleaseMaterializationError("edition_document_blob_invalid") from exc
+        if not isinstance(edition_payload, dict):
+            raise EditionReleaseMaterializationError("edition_document_blob_invalid")
+
+        assert render.output_blob_id is not None
+        assert render.output_sha256 is not None
+        assert render.output_byte_size is not None
+        pdf_content = await self._artifact_store.read_bytes(
+            render.output_blob_id,
+            max_bytes=TYPST_MAX_PDF_BYTES,
         )
-        self._verify_payload_hash(
-            docx,
-            release.docx_sha256,
-            error_code="edition_docx_blob_mismatch",
-        )
+        if (
+            len(pdf_content) != render.output_byte_size
+            or hashlib.sha256(pdf_content).hexdigest() != render.output_sha256
+        ):
+            raise EditionReleaseMaterializationError("edition_render_output_integrity_mismatch")
 
         return await self._workspace_materializer.materialize_release(
             period=period,
             country_code=country_code,
-            edition_id=edition_id,
+            edition_id=release.edition_id,
             manifest=manifest_payload,
             edition=edition_payload,
-            markdown=markdown,
-            docx=docx,
+            pdf_content=pdf_content,
         )
 
     @staticmethod
     def _verify_payload_hash(
-        payload: Mapping[str, Any] | bytes,
+        payload: bytes,
         expected: str,
         *,
         error_code: str,
-        json_payload: bool = False,
     ) -> None:
-        if json_payload:
-            if isinstance(payload, bytes):
-                raise TypeError("JSON payload must be a mapping")
-            encoded = json.dumps(
-                payload,
-                ensure_ascii=False,
-                allow_nan=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        else:
-            if not isinstance(payload, bytes):
-                raise TypeError("Binary payload must be bytes")
-            encoded = payload
-        if hashlib.sha256(encoded).hexdigest() != expected:
+        if hashlib.sha256(payload).hexdigest() != expected:
             raise EditionReleaseMaterializationError(error_code)
 
 
 __all__ = [
-    "MAX_RELEASE_DOCX_BYTES",
     "EditionReleaseMaterializationError",
     "EditionReleaseRematerializationService",
 ]

@@ -1,14 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { useRef, useState } from "react";
+import { useRef } from "react";
 
-import {
-  editionPreviewDocxUrl,
-  getEditionPreview,
-} from "../../api/publication";
+import { editionPreviewPdfUrl, getEditionPreview } from "../../api/publication";
+import { PublicationDocumentView } from "../../components/ProductionArtifactView";
 
 export function EditionPreviewPanel({ editionId }: { editionId: string }) {
   const previousHash = useRef<string | null>(null);
-  const [view, setView] = useState<"bulletin" | "markdown">("bulletin");
   const preview = useQuery({
     queryKey: ["edition-preview", editionId],
     queryFn: async () => {
@@ -55,44 +52,52 @@ export function EditionPreviewPanel({ editionId }: { editionId: string }) {
           changé. Actualisez-la avant téléchargement.
         </p>
       ) : null}
-      <nav className="workbench-tabs" aria-label="Format de prévisualisation">
-        <button
-          type="button"
-          aria-pressed={view === "bulletin"}
-          onClick={() => setView("bulletin")}
-        >
-          Vue bulletin
-        </button>
-        <button
-          type="button"
-          aria-pressed={view === "markdown"}
-          onClick={() => setView("markdown")}
-        >
-          Markdown canonique
-        </button>
-      </nav>
-      {view === "bulletin" ? (
-        <iframe
-          className="edition-preview__frame"
-          title="Vue bulletin"
-          sandbox=""
-          srcDoc={current.sanitized_html}
-        />
-      ) : (
-        <pre className="edition-preview__markdown">
-          {current.canonical_markdown}
-        </pre>
-      )}
+      <div className="edition-preview__document">
+        <section aria-label="Métadonnées du bulletin">
+          <h3>
+            {current.document.edition.country} (
+            {current.document.edition.country_code})
+          </h3>
+          <dl>
+            <div>
+              <dt>Période</dt>
+              <dd>
+                {current.document.edition.period_start} –{" "}
+                {current.document.edition.period_end}
+              </dd>
+            </div>
+            <div>
+              <dt>TLP</dt>
+              <dd>{current.document.edition.tlp}</dd>
+            </div>
+            <div>
+              <dt>Langues</dt>
+              <dd>{current.document.edition.languages.join(", ")}</dd>
+            </div>
+          </dl>
+        </section>
+        {current.document.publications
+          .slice()
+          .sort((left, right) => left.position - right.position)
+          .map((publication) => (
+            <section key={publication.position}>
+              <h3>Article {String(publication.position).padStart(2, "0")}</h3>
+              <PublicationDocumentView document={publication.document} />
+            </section>
+          ))}
+      </div>
       <p>
         {current.stale ? (
-          "Téléchargement désactivé tant que la prévisualisation est obsolète."
+          <button className="button" type="button" disabled>
+            Télécharger le PDF de prévisualisation
+          </button>
         ) : (
           <a
             className="button"
-            href={editionPreviewDocxUrl(editionId, current.preview_input_hash)}
+            href={editionPreviewPdfUrl(editionId, current.preview_input_hash)}
             download
           >
-            Télécharger DOCX de prévisualisation
+            Télécharger le PDF de prévisualisation
           </a>
         )}
       </p>

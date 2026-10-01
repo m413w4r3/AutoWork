@@ -73,7 +73,6 @@ async def test_edition_layout_is_deterministic_and_does_not_copy_sample_bytes(
         subject_title="Sujet ../../extérieur",
         production_state=state,
         publication={"schema_version": "1", "title": "Sujet"},
-        rendered_content="# Sujet\n",
         assets=({"id": "sample-1", "blob_id": "blob-1", "size": "999"},),
     )
     second = await materializer.materialize(
@@ -85,7 +84,6 @@ async def test_edition_layout_is_deterministic_and_does_not_copy_sample_bytes(
         subject_title="Sujet ../../extérieur",
         production_state=state,
         publication={"schema_version": "1", "title": "Sujet"},
-        rendered_content="# Sujet\n",
         assets=({"id": "sample-1", "blob_id": "blob-1", "size": "999"},),
     )
 
@@ -100,6 +98,8 @@ async def test_edition_layout_is_deterministic_and_does_not_copy_sample_bytes(
         (first.item_path / "pipeline/production-state.json").read_text(encoding="utf-8")
     )
     assert saved_state == state.model_dump(mode="json")
+    assert (first.item_path / "article/publication.json").exists()
+    assert not (first.item_path / "article/publication.md").exists()
     assert not (first.item_path / "assets/sample-1").exists()
     assert not (tmp_path / "outside").exists()
     assert list(first.item_path.glob("**/*.tmp")) == []

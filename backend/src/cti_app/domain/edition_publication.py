@@ -303,24 +303,19 @@ class EditionDocumentV2:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class EditionRelease:
+    id: UUID = field(default_factory=uuid4)
     edition_id: UUID
     manifest_id: UUID
     edition_document_blob_id: UUID
-    markdown_blob_id: UUID
-    docx_blob_id: UUID
     edition_document_sha256: str
-    markdown_sha256: str
-    docx_sha256: str
-    id: UUID = field(default_factory=uuid4)
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
-        for name in ("edition_document_sha256", "markdown_sha256", "docx_sha256"):
-            value = getattr(self, name)
-            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-                raise ValueError(f"{name} must be lowercase SHA-256")
+        value = self.edition_document_sha256
+        if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+            raise ValueError("edition_document_sha256 must be lowercase SHA-256")
 
 
 __all__ = [

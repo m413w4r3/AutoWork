@@ -14,25 +14,47 @@ est défini dans `domain/production_pipeline.py` :
 | `EDITORIAL_ENRICHMENT` | `EDITORIAL_ENRICHMENT` |
 | `ASSEMBLY` | `PUBLICATION` |
 
-```text
-ProductionInputSnapshot
-  ↓
-REFERENCES → ProductionReferenceCorpusV1
-  ↓
-EXTRACTION → ProductionExtractionV1
-  ↓
-SYNTHESIS → ProductionSynthesisV1
-  ↓
-EDITORIAL_ENRICHMENT → EditorialEnrichmentV1
-  ↓
-ASSEMBLY → PublicationDocumentV4
-        ↓
-future frontière RENDER
+```mermaid
+flowchart TD
+  snapshot[ProductionInputSnapshot] --> references[REFERENCES: ProductionReferenceCorpusV1]
+  references --> extraction[EXTRACTION: ProductionExtractionV1]
+  extraction --> synthesis[SYNTHESIS: ProductionSynthesisV1]
+  synthesis --> enrichment[EDITORIAL_ENRICHMENT: EditorialEnrichmentV1]
+  enrichment --> assembly[ASSEMBLY: PublicationDocumentV4]
+  assembly --> preview[Subject preview: projection frontend V4]
+  assembly --> render[PublicationRender] --> pdf[Typst PDF article]
 ```
 
-`ASSEMBLY` écrit `PublicationDocumentV4` dans l'artifact `PUBLICATION`. `ASSEMBLY` ne compile aucun
-média et ne rend aucun document ; la frontière `RENDER` future consomme `PublicationDocumentV4`
-sans relire Synthesis ni Editorial Enrichment. La QA canonique passée, le run devient `READY`.
+`ASSEMBLY` écrit `PublicationDocumentV4` dans l'artifact `PUBLICATION`. Il ne compile aucun média
+et ne rend aucun document. Le preview Subject projette directement le V4 côté frontend ; son PDF
+est produit par le rendu AW-019 `PublicationRender`, sans relire Synthesis ni Editorial Enrichment.
+La QA canonique passée, le run devient `READY`, indépendamment du rendu.
+
+## Rendu de publication et de bulletin
+
+La publication d'un Subject et le bulletin d'édition ont des rendus séparés :
+
+```mermaid
+flowchart TD
+  publication[PublicationDocumentV4] --> publication_render[PublicationRender] --> article_pdf[Typst PDF]
+  manifest[PublicationManifestV1] --> document[EditionDocumentV2]
+  document --> release[EditionRelease: JSON uniquement]
+  release --> render[EditionRender: ligne identifiée par input_hash]
+  render --> edition_pdf[Typst PDF du bulletin]
+```
+
+`EditionRelease` fige le `PublicationManifestV1` et le `EditionDocumentV2` en JSON. Il ne contient
+pas le PDF. Chaque ligne `EditionRender` référence ce release et son identité `input_hash`, calculée
+sur l'identifiant et le hash du release/document, le renderer et sa version, le template et son
+hash, le compilateur et sa version, le bundle de polices, la policy de rendu et le format. Les jobs
+`publication.edition.assemble` et `publication.edition.render` séparent le gel JSON de la compilation
+Typst. Un retry du rendu reprend le même release et ne rejoue ni Assembly ni Production.
+
+Le preview édition affiche `EditionDocumentV2`. Son PDF de preview est servi par
+`GET /api/editions/{id}/preview/pdf?preview_input_hash=<sha256>`. Le PDF final est disponible par
+`GET /api/editions/{id}/release/pdf` ; `POST /api/editions/{id}/release/render` demande ou relance
+le rendu. Le PDF d'un Subject est servi par `GET /api/subjects/{id}/publication/pdf`. Les anciennes
+routes de téléchargement DOCX ont été supprimées.
 
 ## Modèle
 
@@ -308,14 +330,15 @@ Assembly vérifie le lineage du snapshot, des références, de l’extraction, d
 l’enrichissement avant de construire `PublicationDocumentV4`. Le titre, le lead, les sections, la
 chronologie et les incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction.
 Les sources sont résolues par `source_document_id`. Le hash d’Assembly dépend des cinq entrées canoniques, de
-la version de document (`4`) et de la policy (`2`), sans version de renderer, D2, Pandoc ni Typst :
+la version de document (`4`) et de la policy (`2`), sans version de renderer, D2 ni Typst :
 les mêmes entrées ne réutilisent donc jamais un ancien artifact d’une autre version. Le hash de l’enrichissement
 fait partie de l’identité d’Assembly depuis AW-015.
 `PublicationDocumentV4.sources` couvre exactement les sources utilisées, enrichissement compris.
 QA recalcule la projection V4 depuis les cinq entrées canoniques et compare le document exact.
 L'artifact `PUBLICATION` conserve le document canonique, sans rendu, sans source D2, sans SVG
-en ligne et sans Typst. Pandoc reste limité à la narration ; il ne rend ni tables, ni diagrammes,
-ni figures.
+en ligne et sans Typst.
+
+Pandoc est l'ancien renderer supprimé en AW-020.
 
 AW-016 produit des propositions structurées. AW-017a, AW-017b et AW-017c fournissent la compilation
 des diagrammes, l’inventaire des figures et la persistance des médias. AW-018 projette

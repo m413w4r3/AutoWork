@@ -249,7 +249,6 @@ describe("SubjectWorkbench", () => {
             diagrams: [],
             figures: [],
           },
-          rendered_content: null,
         }),
       );
     });
@@ -259,6 +258,9 @@ describe("SubjectWorkbench", () => {
     expect(
       await screen.findByRole("heading", { name: "Article canonique" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("link", { name: "Télécharger le PDF" }),
+    ).toHaveAttribute("href", `/api/subjects/${subjectId}/publication/pdf`);
     expect(screen.getByRole("button", { name: "Article" })).toHaveAttribute(
       "aria-pressed",
       "true",
@@ -302,7 +304,6 @@ describe("SubjectWorkbench", () => {
               diagrams: [],
               figures: [],
             },
-            rendered_content: null,
           }),
         );
       }
@@ -345,5 +346,32 @@ describe("SubjectWorkbench", () => {
         requestUrl(url).includes("download"),
       ),
     ).toBe(false);
+  });
+
+  it("n’affiche pas le lien PDF sans publication", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = requestUrl(input);
+      if (url === `/api/subjects/${subjectId}`) {
+        return Promise.resolve(Response.json(canonicalSubject));
+      }
+      if (url === `/api/subjects/${subjectId}/content`) {
+        return Promise.resolve(
+          Response.json(
+            { detail: { code: "subject_content_not_found" } },
+            { status: 404 },
+          ),
+        );
+      }
+      return Promise.reject(new Error(`Unexpected request: ${url}`));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderWorkbench();
+
+    expect(
+      await screen.findByRole("heading", { name: "Aucun contenu" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: "Télécharger le PDF" }),
+    ).not.toBeInTheDocument();
   });
 });

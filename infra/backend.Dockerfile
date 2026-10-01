@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install --no-install-recommends --yes ca-certificates curl pandoc unzip xz-utils \
+    && apt-get install --no-install-recommends --yes ca-certificates curl unzip xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY infra/d2.lock /usr/local/share/autowork/d2.lock
@@ -22,6 +22,7 @@ COPY infra/typst.lock /usr/local/share/autowork/typst.lock
 COPY scripts/install-typst.sh /usr/local/bin/install-typst
 RUN TYPST_LOCK_FILE=/usr/local/share/autowork/typst.lock \
     TARGETARCH="$TARGETARCH" /usr/local/bin/install-typst /usr/local/bin
+RUN typst --version && ! command -v pandoc
 
 COPY infra/typst-fonts.lock /usr/local/share/autowork/typst-fonts.lock
 COPY infra/typst-fonts-sources.lock /usr/local/share/autowork/typst-fonts-sources.lock
@@ -31,11 +32,11 @@ RUN TYPST_FONTS_LOCK_FILE=/usr/local/share/autowork/typst-fonts.lock \
     /usr/local/bin/install-typst-fonts /usr/local/share/autowork/typst-fonts
 
 COPY chpTypst /app/chpTypst
+COPY scripts/typst_edition_smoke.py /app/scripts/typst_edition_smoke.py
 
 COPY backend/pyproject.toml backend/uv.lock backend/README.md backend/alembic.ini ./
 COPY backend/migrations ./migrations
 COPY backend/src ./src
-COPY backend/assets ./assets
 RUN uv sync --frozen --no-dev --no-group analysis
 
 ENV PATH="/app/.venv/bin:$PATH" \

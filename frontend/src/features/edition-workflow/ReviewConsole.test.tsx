@@ -6,13 +6,89 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type {
   EditionRepairPage,
   EditionReview,
+  EditionPreviewResponse,
   ReviewItem,
 } from "../../api/publication";
+import type { PublicationDocumentV4 } from "../../api/production";
 import { ReviewConsole } from "./ReviewConsole";
 import { reviewPollingInterval } from "./reviewPolling";
 
 const EDITION_ID = "edition-1";
 const HASH = "a".repeat(64);
+
+function publicationDocument(
+  subjectId: string,
+  title: string,
+): PublicationDocumentV4 {
+  return {
+    schema_version: "4",
+    subject_id: subjectId,
+    publication_language: "fr",
+    title,
+    lead: [],
+    sections: [],
+    timeline: [],
+    indicators: [],
+    sources: [],
+    uncertainties: [],
+    tables: [],
+    diagrams: [],
+    figures: [],
+  };
+}
+
+function editionPreview(stale = false): EditionPreviewResponse {
+  return {
+    edition_id: EDITION_ID,
+    edition_version: 4,
+    preview_input_hash: HASH,
+    artifacts: [
+      {
+        position: 1,
+        subject_id: "subject-1",
+        artifact_id: "artifact-1",
+        artifact_version: 2,
+        input_hash: HASH,
+      },
+      {
+        position: 2,
+        subject_id: "subject-2",
+        artifact_id: "artifact-2",
+        artifact_version: 1,
+        input_hash: HASH,
+      },
+    ],
+    document: {
+      schema_version: "2",
+      edition: {
+        id: EDITION_ID,
+        country: "France",
+        country_code: "FR",
+        period_start: "2026-08-01",
+        period_end: "2026-08-31",
+        tlp: "GREEN",
+        languages: ["fr"],
+        state: "OPEN",
+        version: 4,
+        created_at: "2026-08-01T00:00:00+00:00",
+        updated_at: "2026-08-01T00:00:00+00:00",
+      },
+      publications: [
+        {
+          position: 2,
+          subject_id: "subject-2",
+          document: publicationDocument("subject-2", "Deuxième article"),
+        },
+        {
+          position: 1,
+          subject_id: "subject-1",
+          document: publicationDocument("subject-1", "Premier article"),
+        },
+      ],
+    },
+    stale,
+  };
+}
 
 interface FetchMock {
   mock: {
@@ -133,29 +209,12 @@ const emptyRepairPage: EditionRepairPage = {
 function renderReview(
   review: EditionReview,
   postResponse: () => Response | Promise<Response> = decisionResponse,
+  previewResponse: EditionPreviewResponse = editionPreview(),
 ) {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     if (init?.method === "POST") return Promise.resolve(postResponse());
     if (urlOf(input).includes("/preview")) {
-      return Promise.resolve(
-        Response.json({
-          edition_id: EDITION_ID,
-          edition_version: 4,
-          preview_input_hash: HASH,
-          artifacts: [
-            {
-              position: 1,
-              subject_id: "subject-1",
-              artifact_id: "artifact-1",
-              artifact_version: 2,
-              input_hash: HASH,
-            },
-          ],
-          canonical_markdown: "# Bulletin",
-          sanitized_html: "<h1>Bulletin</h1>",
-          stale: false,
-        }),
-      );
+      return Promise.resolve(Response.json(previewResponse));
     }
     return Promise.resolve(
       Response.json(
@@ -175,7 +234,7 @@ function renderReview(
   return { client, fetchMock };
 }
 
-it("affiche la prévisualisation canonique et son téléchargement DOCX", async () => {
+it("affiche les articles structurés dans l’ordre et le lien de prévisualisation PDF", async () => {
   const { fetchMock } = renderReview(makeReview());
   const user = userEvent.setup();
 
@@ -183,18 +242,52 @@ it("affiche la prévisualisation canonique et son téléchargement DOCX", async 
     await screen.findByRole("button", { name: "Prévisualisation" }),
   );
 
-  expect(await screen.findByTitle("Vue bulletin")).toBeInTheDocument();
+  expect(
+    await screen.findByRole("heading", { name: "France (FR)" }),
+  ).toBeInTheDocument();
+  const articleHeadings = await screen.findAllByRole("heading", {
+    name: /^Article \d{2}$/,
+  });
+  expect(articleHeadings.map((heading) => heading.textContent)).toEqual([
+    "Article 01",
+    "Article 02",
+  ]);
+  expect(screen.getByText("Premier article")).toBeInTheDocument();
+  expect(screen.getByText("Deuxième article")).toBeInTheDocument();
   expect(
     screen.getByRole("link", {
-      name: "Télécharger DOCX de prévisualisation",
+      name: "Télécharger le PDF de prévisualisation",
     }),
   ).toHaveAttribute(
     "href",
-    `/api/editions/${EDITION_ID}/preview/docx?preview_input_hash=${HASH}`,
+    `/api/editions/${EDITION_ID}/preview/pdf?preview_input_hash=${HASH}`,
   );
   expect(
     fetchMock.mock.calls.some(([input]) => urlOf(input).includes("/preview")),
   ).toBe(true);
+});
+
+it("désactive le téléchargement PDF quand la prévisualisation est obsolète", async () => {
+  renderReview(makeReview(), decisionResponse, editionPreview(true));
+  const user = userEvent.setup();
+
+  await user.click(
+    await screen.findByRole("button", { name: "Prévisualisation" }),
+  );
+
+  expect(
+    await screen.findByRole("button", {
+      name: "Télécharger le PDF de prévisualisation",
+    }),
+  ).toBeDisabled();
+  expect(
+    screen.getByText(/Actualisez-la avant téléchargement\./),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("link", {
+      name: "Télécharger le PDF de prévisualisation",
+    }),
+  ).not.toBeInTheDocument();
 });
 
 function postCalls(fetchMock: FetchMock) {

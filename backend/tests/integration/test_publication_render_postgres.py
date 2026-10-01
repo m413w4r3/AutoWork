@@ -13,7 +13,6 @@ from dataclasses import replace
 from datetime import date
 from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -457,15 +456,11 @@ async def test_publication_render_postgres_real_typst_exit_scenario(
     monkeypatch.setattr(socket.socket, "connect", block_external_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", block_external_connect_ex)
 
-    from cti_app.application import pandoc_export, pandoc_rendering
     from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 
     def unexpected_path(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("The Typst publication render called a legacy compiler path")
 
-    monkeypatch.setattr(pandoc_rendering, "render_publication_pandoc", unexpected_path)
-    monkeypatch.setattr(pandoc_export, "render_publication_pandoc", unexpected_path)
-    monkeypatch.setattr(pandoc_export, "subprocess", SimpleNamespace(run=unexpected_path))
     monkeypatch.setattr(D2DiagramCompiler, "compile", unexpected_path)
 
     blob_store = FilesystemBlobStore(tmp_path / "blobs")

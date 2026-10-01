@@ -186,7 +186,6 @@ it("ne rend pas une publication dont le schema n'est pas V4", async () => {
         version: 1,
         status: "verified",
         metadata: {},
-        rendered_content: null,
         canonical_content: {
           schema_version: "3",
           title: "Publication legacy à ne pas afficher",
@@ -224,7 +223,6 @@ it("affiche la publication V4 et ses enrichissements", async () => {
           version: 1,
           status: "verified",
           metadata: {},
-          rendered_content: null,
           canonical_content: {
             schema_version: "4",
             subject_id: SYNTHESIS_SUBJECT_ID,
@@ -421,7 +419,6 @@ it("affiche une publication V4 sans enrichissement comme une publication narrati
         version: 1,
         status: "verified",
         metadata: {},
-        rendered_content: null,
         canonical_content: {
           schema_version: "4",
           subject_id: SYNTHESIS_SUBJECT_ID,

@@ -2,9 +2,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   acceptEditionPublication,
-  editionDocxUrl,
   editionRulesUrl,
   getEditionRelease,
+  releasePdfUrl,
+  retryEditionRender,
   type EditionReleaseResponse,
 } from "../../api/publication";
 import { ApiError } from "../../api/editions";
@@ -32,16 +33,24 @@ function invalidatePublication(
   void queryClient.invalidateQueries({ queryKey: ["editions"] });
 }
 
-function DownloadAction({ editionId }: { editionId: string }) {
+function DownloadActions({
+  editionId,
+  pdfAvailable,
+}: {
+  editionId: string;
+  pdfAvailable: boolean;
+}) {
   return (
     <div className="publication-console__downloads">
-      <a
-        className="button publication-console__download"
-        href={editionDocxUrl(editionId)}
-        download
-      >
-        Télécharger le bulletin DOCX
-      </a>
+      {pdfAvailable ? (
+        <a
+          className="button publication-console__download"
+          href={releasePdfUrl(editionId)}
+          download
+        >
+          Télécharger le PDF
+        </a>
+      ) : null}
       <a
         className="button publication-console__download publication-console__download--rules"
         href={editionRulesUrl(editionId)}
@@ -68,8 +77,23 @@ function ArchivedPublication({
       <p className="eyebrow">Publication</p>
       <h2>Édition archivée</h2>
       <p>Cette édition est disponible en lecture seule.</p>
-      {release?.docx_available ? (
-        <DownloadAction editionId={editionId} />
+      {release?.json_available ? (
+        <>
+          <h3>Assemblage canonique</h3>
+          <p>Release assemblé</p>
+          <h3>Rendu PDF</h3>
+          {release.render_status === "succeeded" ? (
+            <h4>Bulletin publié</h4>
+          ) : release.render_status === "failed" ? (
+            <p>Le rendu PDF a échoué.</p>
+          ) : (
+            <p>Génération du PDF en cours</p>
+          )}
+          <DownloadActions
+            editionId={editionId}
+            pdfAvailable={release.pdf_available}
+          />
+        </>
       ) : null}
     </section>
   );
@@ -90,6 +114,11 @@ export function PublicationConsole({
   });
   const accept = useMutation({
     mutationFn: () => acceptEditionPublication(editionId),
+    retry: false,
+    onSuccess: () => invalidatePublication(queryClient, editionId),
+  });
+  const retryRender = useMutation({
+    mutationFn: () => retryEditionRender(editionId),
     retry: false,
     onSuccess: () => invalidatePublication(queryClient, editionId),
   });
@@ -116,19 +145,64 @@ export function PublicationConsole({
 
   const current = release.data;
   if (current.release_id) {
+    const renderFailed = current.render_status === "failed";
+    const renderNotStarted = current.render_status === "not_started";
     return (
       <section
         className="workflow-placeholder publication-console"
         aria-live="polite"
       >
         <p className="eyebrow">Publication</p>
-        <h2>Bulletin publié</h2>
-        {current.published_at ? (
-          <p>Publié le {readableDate(current.published_at)}</p>
+        <h2>Assemblage canonique</h2>
+        <p>Release assemblé</p>
+        <h2>Rendu PDF</h2>
+        {current.pdf_available ? (
+          <>
+            <h3 role="status">Bulletin publié</h3>
+            {current.published_at ? (
+              <p>Publié le {readableDate(current.published_at)}</p>
+            ) : null}
+          </>
+        ) : renderFailed ? (
+          <>
+            <p role="status">Le rendu PDF a échoué.</p>
+            {current.render_error_code ? (
+              <p className="publication-console__diagnostic-code">
+                {current.render_error_code}
+              </p>
+            ) : null}
+            {current.render_error_message ? (
+              <p className="error-message">{current.render_error_message}</p>
+            ) : null}
+          </>
+        ) : (
+          <p role="status">
+            {renderNotStarted
+              ? "Le rendu PDF n’a pas encore démarré."
+              : "Génération du PDF en cours"}
+          </p>
+        )}
+        {!readOnly && current.can_retry_render && !current.pdf_available ? (
+          <button
+            className="button"
+            type="button"
+            disabled={retryRender.isPending}
+            onClick={() => retryRender.mutate()}
+          >
+            {retryRender.isPending ? "Relancement…" : "Relancer le rendu"}
+          </button>
         ) : null}
-        {current.docx_available ? (
-          <DownloadAction editionId={editionId} />
+        {!readOnly && retryRender.error ? (
+          <p className="error-message" role="alert">
+            {retryRender.error instanceof Error
+              ? retryRender.error.message
+              : "Le rendu PDF n’a pas pu être relancé."}
+          </p>
         ) : null}
+        <DownloadActions
+          editionId={editionId}
+          pdfAvailable={current.pdf_available}
+        />
       </section>
     );
   }
@@ -140,7 +214,7 @@ export function PublicationConsole({
       : current.assembly_status === "running"
         ? "Assemblage en cours"
         : current.assembly_status === "queued"
-          ? "En attente"
+          ? "Assemblage en cours"
           : current.assembly_status === "waiting_human"
             ? "Intervention requise pour poursuivre l'assemblage."
             : current.assembly_status === "cancelled"
@@ -155,8 +229,8 @@ export function PublicationConsole({
       aria-live="polite"
     >
       <p className="eyebrow">Publication</p>
-      <h2>Manifest figé</h2>
-      <p>Assemblage du bulletin</p>
+      <h2>Assemblage canonique</h2>
+      <p>Manifest figé</p>
       <p role="status">{failed ? "L'assemblage a échoué." : statusLabel}</p>
       {failed && current.assembly_error_message ? (
         <p className="error-message">{current.assembly_error_message}</p>

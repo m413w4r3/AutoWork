@@ -80,8 +80,8 @@ SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT →
 `EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et déterministe en
 AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
 fonctionnelle de `PUBLICATION`, dont le corps est `PublicationDocumentV4`. `READY` signifie
-que les artifacts canoniques sont valides et que la QA canonique a réussi ; il n'indique pas qu'un rendu PDF ou
-DOCX a été compilé. Le rendu constitue un pipeline distinct.
+que les artifacts canoniques sont valides et que la QA canonique a réussi ; le rendu PDF constitue
+un pipeline distinct.
 
 Les artifacts et diagnostics de chaque étape sont adressés par le run et sa génération de
 pipeline. La progression se lit depuis le batch et les runs en base. Une annulation d’un batch
@@ -112,11 +112,32 @@ de regroupement éditorial et n’ajoute aucun statut de production à l’édit
 La review est distincte de la production. Elle travaille sur le `ProductionRun`, sa génération,
 l’artifact de document et son hash d’entrée. L’acceptation crée un manifeste de publication
 append-only qui fige l’ordre et les références exactes. L’assemblage lit uniquement ce manifeste
-et produit les rendus Markdown/DOCX de façon déterministe.
+et crée les JSON canoniques `EditionDocumentV2` et `EditionRelease`.
+
+La frontière d'article est `PublicationDocumentV4 → PublicationRender → Typst PDF`. Le preview
+Subject est une projection frontend directe du V4 ; `GET /api/subjects/{id}/publication/pdf` sert
+le PDF AW-019. Pour l'édition, `PublicationManifestV1 → EditionDocumentV2 → EditionRelease →
+EditionRender → Typst PDF` rend un seul document Typst à partir des articles ordonnés du manifeste.
+`EditionRelease` reste JSON uniquement et ne contient pas le PDF.
+
+Les jobs `publication.edition.assemble` et `publication.edition.render` séparent la création du
+release de son rendu. `EditionRender` est une ligne distincte, identifiée par `input_hash` calculé
+sur le release/document, les versions du renderer, du template, du compilateur, du bundle de
+polices, la policy de rendu et le format. Un retry du rendu réutilise le release et ne rejoue pas
+Assembly ni Production.
+
+Le preview édition affiche `EditionDocumentV2` côté frontend ; son PDF est servi par
+`GET /api/editions/{id}/preview/pdf?preview_input_hash=<sha256>`. Le PDF final est servi par
+`GET /api/editions/{id}/release/pdf`, et `POST /api/editions/{id}/release/render` lance ou relance
+le rendu. Les routes de téléchargement DOCX ont été supprimées.
 
 Une nouvelle génération ou un nouveau run ne réécrit pas les décisions, snapshots, artifacts ou
 manifestes historiques. Les blobs résident dans MinIO ; PostgreSQL ne stocke que leurs métadonnées
 et références SHA-256.
+
+Le workspace d'édition matérialise la release sous
+`release/{publication-manifest.json,edition.json,bulletin.pdf}`. Il reste une projection
+reconstructible du release JSON et de l'`EditionRender` PDF.
 
 ## Écrans principaux
 

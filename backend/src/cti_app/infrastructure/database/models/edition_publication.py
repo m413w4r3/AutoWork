@@ -130,14 +130,6 @@ class EditionReleaseRow(Base):
             "AND edition_document_sha256 ~ '^[0-9a-f]{64}$'",
             name="ck_edition_release_json_hash",
         ),
-        CheckConstraint(
-            "char_length(markdown_sha256) = 64 AND markdown_sha256 ~ '^[0-9a-f]{64}$'",
-            name="ck_edition_release_markdown_hash",
-        ),
-        CheckConstraint(
-            "char_length(docx_sha256) = 64 AND docx_sha256 ~ '^[0-9a-f]{64}$'",
-            name="ck_edition_release_docx_hash",
-        ),
         Index("ix_edition_releases_edition", "edition_id", "created_at"),
     )
 
@@ -153,13 +145,5 @@ class EditionReleaseRow(Base):
     edition_document_blob_id: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
     )
-    markdown_blob_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
-    )
-    docx_blob_id: Mapped[UUID] = mapped_column(
-        Uuid(as_uuid=True), ForeignKey("blobs.id", ondelete="RESTRICT"), nullable=False
-    )
     edition_document_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    markdown_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
-    docx_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

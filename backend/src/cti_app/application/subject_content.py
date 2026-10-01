@@ -16,15 +16,18 @@ from cti_app.application.production_normalization import (
 from cti_app.application.production_parsers import DisplayPolicy, IndicatorStatus
 from cti_app.domain.classification import TLP
 from cti_app.domain.entities import Sample, SourceDocument
-from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionRun,
+)
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import parse_publication_document
 
 
 class ArtifactPayloadReader(Protocol):
     async def read_json(self, blob_id: UUID) -> dict[str, Any]: ...
-
-    async def read_text(self, blob_id: UUID) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,7 +41,12 @@ class SubjectContentView:
     status: ProductionArtifactStatus
     schema_version: str
     canonical_content: dict[str, Any]
-    rendered_content: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CurrentSubjectPublication:
+    run: ProductionRun
+    artifact: ProductionArtifact
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,33 +89,40 @@ class SubjectContentService:
         self._artifact_store = artifact_store
 
     async def content(self, subject_id: UUID) -> SubjectContentView | None:
+        publication = await self.current_publication(subject_id)
+        if publication is None:
+            return None
+
+        artifact = publication.artifact
+        assert artifact.canonical_blob_id is not None
+        canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
+        document = parse_publication_document(canonical)
+        return SubjectContentView(
+            subject_id=subject_id,
+            run_id=publication.run.id,
+            pipeline_generation=publication.run.pipeline_generation,
+            artifact_id=artifact.id,
+            artifact_version=artifact.version,
+            artifact_input_hash=artifact.input_hash,
+            status=artifact.status,
+            schema_version=document.schema_version,
+            canonical_content=canonical,
+        )
+
+    async def current_publication(self, subject_id: UUID) -> CurrentSubjectPublication | None:
         async with self._uow_factory() as uow:
             run = await uow.production_runs.get_current_for_subject(subject_id)
             if run is None:
                 return None
             artifact = await current_publication_artifact(uow.production_artifacts, run.id)
-            if artifact is None or artifact.canonical_blob_id is None:
+            if (
+                artifact is None
+                or artifact.stage is not ProductionArtifactStage.PUBLICATION
+                or artifact.status is not ProductionArtifactStatus.VERIFIED
+                or artifact.canonical_blob_id is None
+            ):
                 return None
-
-            canonical = await self._artifact_store.read_json(artifact.canonical_blob_id)
-            document = parse_publication_document(canonical)
-            rendered = (
-                await self._artifact_store.read_text(artifact.rendered_blob_id)
-                if artifact.rendered_blob_id is not None
-                else None
-            )
-            return SubjectContentView(
-                subject_id=subject_id,
-                run_id=run.id,
-                pipeline_generation=run.pipeline_generation,
-                artifact_id=artifact.id,
-                artifact_version=artifact.version,
-                artifact_input_hash=artifact.input_hash,
-                status=artifact.status,
-                schema_version=document.schema_version,
-                canonical_content=canonical,
-                rendered_content=rendered,
-            )
+            return CurrentSubjectPublication(run=run, artifact=artifact)
 
     async def indicators(self, subject_id: UUID) -> list[SubjectIndicatorView]:
         async with self._uow_factory() as uow:

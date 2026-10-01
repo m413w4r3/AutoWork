@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from time import monotonic
 from uuid import UUID, uuid4
 
@@ -20,23 +19,25 @@ from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
     TYPST_MAX_PDF_BYTES,
-    CompiledTypstDocument,
     FontBundleInvalidError,
     TypstCompilationError,
     TypstCompiler,
-    TypstCompileRequest,
     load_font_bundle_snapshot,
     materialize_font_bundle,
+)
+from cti_app.application.typst_render_execution import (
+    TypstRenderExecutor,
+    TypstRenderMediaIntegrityMismatchError,
+    TypstRenderMediaKindMismatchError,
+    TypstRenderMediaMissingError,
+    TypstRenderStorageError,
+    TypstRenderWorkspaceError,
 )
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstRenderer,
-    TypstRenderSource,
-    TypstTemplateBundle,
     load_template_bundle,
 )
-from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
-from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.publication_document import (
     publication_document_v4_from_json,
@@ -129,6 +130,10 @@ class PublicationRenderService:
         self._media_asset_store = media_asset_store
         self._renderer = renderer
         self._compiler = compiler
+        self._typst_executor = TypstRenderExecutor(
+            media_asset_store=media_asset_store,
+            compiler=compiler,
+        )
         self._chp_typst_root = chp_typst_root
         self._font_bundle_root = font_bundle_root
         self._typst_fonts_lock_path = typst_fonts_lock_path
@@ -284,102 +289,56 @@ class PublicationRenderService:
             except ValueError as exc:
                 raise PublicationRenderDocumentInvalidError(str(exc)) from exc
 
-            resolved_media: dict[UUID, bytes] = {}
-            for media_ref in render_source.media_refs:
+            try:
+                resolved_media = await self._typst_executor.resolve_media(render_source)
+            except TypstRenderMediaMissingError as exc:
+                raise PublicationRenderMediaMissingError(str(exc)) from exc
+            except TypstRenderMediaKindMismatchError as exc:
+                raise PublicationRenderMediaKindMismatchError(str(exc)) from exc
+            except TypstRenderMediaIntegrityMismatchError as exc:
+                raise PublicationRenderMediaIntegrityMismatchError(str(exc)) from exc
+            except TypstRenderStorageError as exc:
+                raise PublicationRenderStorageFailedError(str(exc)) from exc
+
+            async def persist_render_inputs() -> None:
+                nonlocal source_blob_id, render_data_blob_id
                 try:
-                    manifest = await self._media_asset_store.get(media_ref.asset_id)
+                    source_blob_id = await self._artifact_store.put_bytes(
+                        render_source.source_bytes,
+                        bucket=PUBLICATION_RENDER_SOURCE_BUCKET,
+                        mime_type="text/plain; charset=utf-8",
+                    )
+                    render_data_blob_id = await self._artifact_store.put_bytes(
+                        render_source.render_data_bytes,
+                        bucket=PUBLICATION_RENDER_DATA_BUCKET,
+                        mime_type="application/json",
+                    )
                 except Exception as exc:
                     raise PublicationRenderStorageFailedError(
-                        f"Unable to load media manifest {media_ref.asset_id}"
-                    ) from exc
-                if manifest is None:
-                    raise PublicationRenderMediaMissingError(
-                        f"Media asset {media_ref.asset_id} does not exist"
-                    )
-                if media_ref.expected_kind is MediaAssetKind.DIAGRAM_SVG:
-                    if (
-                        manifest.kind is not MediaAssetKind.DIAGRAM_SVG
-                        or manifest.mime_type != "image/svg+xml"
-                    ):
-                        raise PublicationRenderMediaKindMismatchError(
-                            "Diagram media asset "
-                            f"{media_ref.asset_id} has an invalid kind or MIME type"
-                        )
-                elif media_ref.expected_kind is MediaAssetKind.SOURCE_FIGURE:
-                    if (
-                        manifest.asset_id != media_ref.asset_id
-                        or manifest.sha256 != media_ref.expected_sha256
-                        or manifest.mime_type != media_ref.expected_mime_type
-                        or manifest.byte_size != media_ref.expected_byte_size
-                        or manifest.kind is not MediaAssetKind.SOURCE_FIGURE
-                    ):
-                        raise PublicationRenderMediaIntegrityMismatchError(
-                            "Figure media asset "
-                            f"{media_ref.asset_id} does not match its canonical reference"
-                        )
-                try:
-                    resolved_media[media_ref.asset_id] = await self._media_asset_store.read(
-                        media_ref.asset_id
-                    )
-                except BlobIntegrityError as exc:
-                    raise PublicationRenderMediaIntegrityMismatchError(
-                        f"Media asset {media_ref.asset_id} failed its integrity check"
-                    ) from exc
-                except EntityNotFoundError as exc:
-                    raise PublicationRenderMediaMissingError(
-                        f"Media asset {media_ref.asset_id} does not exist"
-                    ) from exc
-                except Exception as exc:
-                    raise PublicationRenderStorageFailedError(
-                        f"Unable to read media asset {media_ref.asset_id}"
+                        "Unable to persist Typst source or render data"
                     ) from exc
 
             try:
-                with tempfile.TemporaryDirectory(prefix="autowork-typst-fonts-") as font_path:
-                    font_paths = materialize_font_bundle(font_bundle, Path(font_path))
-                    with tempfile.TemporaryDirectory(
-                        prefix="autowork-publication-render-"
-                    ) as workspace_path:
-                        workspace_root = Path(workspace_path)
-                        self._populate_workspace(
-                            workspace_root, template_bundle, render_source, resolved_media
-                        )
-                        try:
-                            source_blob_id = await self._artifact_store.put_bytes(
-                                render_source.source_bytes,
-                                bucket=PUBLICATION_RENDER_SOURCE_BUCKET,
-                                mime_type="text/plain; charset=utf-8",
-                            )
-                            render_data_blob_id = await self._artifact_store.put_bytes(
-                                render_source.render_data_bytes,
-                                bucket=PUBLICATION_RENDER_DATA_BUCKET,
-                                mime_type="application/json",
-                            )
-                        except Exception as exc:
-                            raise PublicationRenderStorageFailedError(
-                                "Unable to persist Typst source or render data"
-                            ) from exc
-
-                        compiled: CompiledTypstDocument = await self._compiler.compile(
-                            TypstCompileRequest(
-                                workspace_root=workspace_root,
-                                entrypoint_relative_path="RENDERER/publication.typ",
-                                font_paths=font_paths,
-                            )
-                        )
-                        try:
-                            output_blob_id = await self._artifact_store.put_bytes(
-                                compiled.content,
-                                bucket=PUBLICATION_RENDER_OUTPUT_BUCKET,
-                                mime_type="application/pdf",
-                            )
-                        except Exception as exc:
-                            raise PublicationRenderStorageFailedError(
-                                "Unable to persist the compiled publication PDF"
-                            ) from exc
-            except OSError as exc:
+                executed = await self._typst_executor.execute(
+                    render_source=render_source,
+                    template_bundle=template_bundle,
+                    font_bundle=font_bundle,
+                    resolved_media=resolved_media,
+                    font_materializer=materialize_font_bundle,
+                    on_workspace_ready=persist_render_inputs,
+                )
+            except TypstRenderWorkspaceError as exc:
+                raise PublicationRenderStorageFailedError(str(exc)) from exc
+            compiled = executed.compiled_document
+            try:
+                output_blob_id = await self._artifact_store.put_bytes(
+                    compiled.content,
+                    bucket=PUBLICATION_RENDER_OUTPUT_BUCKET,
+                    mime_type="application/pdf",
+                )
+            except Exception as exc:
                 raise PublicationRenderStorageFailedError(
-                    f"Unable to materialize Typst render inputs: {exc}"
+                    "Unable to persist the compiled publication PDF"
                 ) from exc
 
             try:
@@ -452,41 +411,3 @@ class PublicationRenderService:
                 seconds=self._running_lease_seconds
             ):
                 return None
-
-    def _populate_workspace(
-        self,
-        workspace_root: Path,
-        template_bundle: TypstTemplateBundle,
-        render_source: TypstRenderSource,
-        resolved_media: dict[UUID, bytes],
-    ) -> None:
-        try:
-            for template_file in template_bundle.files:
-                destination = workspace_root.joinpath(
-                    *PurePosixPath(template_file.relative_path).parts
-                )
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(template_file.content)
-        except OSError as exc:
-            raise PublicationRenderStorageFailedError(
-                f"Unable to materialize Typst template bundle: {exc}"
-            ) from exc
-
-        renderer_directory = workspace_root / "RENDERER"
-        try:
-            renderer_directory.mkdir(parents=True, exist_ok=True)
-            (renderer_directory / "render-data.json").write_bytes(render_source.render_data_bytes)
-            media_directory = renderer_directory / "media"
-            media_directory.mkdir(parents=True, exist_ok=True)
-            for media_ref in render_source.media_refs:
-                media_relative_path = PurePosixPath(media_ref.media_path)
-                if media_relative_path.is_absolute() or "\\" in media_ref.media_path:
-                    raise ValueError(f"Invalid workspace media path {media_ref.media_path!r}")
-                media_path = renderer_directory.joinpath(*media_relative_path.parts)
-                media_path.resolve().relative_to(renderer_directory.resolve())
-                media_path.parent.mkdir(parents=True, exist_ok=True)
-                media_path.write_bytes(resolved_media[media_ref.asset_id])
-        except (OSError, ValueError, KeyError) as exc:
-            raise PublicationRenderStorageFailedError(
-                f"Unable to write Typst render workspace data: {exc}"
-            ) from exc

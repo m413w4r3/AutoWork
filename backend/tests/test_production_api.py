@@ -1994,6 +1994,44 @@ async def test_publication_artifact_by_run_does_not_follow_subject_current_run(
     assert by_subject.json()["artifact_id"] == str(second_artifact.id)
 
 
+async def test_publication_artifact_response_omits_legacy_rendered_content(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION)
+    artifact.rendered_blob_id = uuid4()
+    await uow.production_artifacts.append(artifact)
+
+    response = await api.get(f"/api/production/runs/{run.id}/artifacts/publication")
+
+    assert response.status_code == 200, response.text
+    assert "rendered_content" not in response.json()
+
+
+async def test_legacy_synthesis_artifact_keeps_rendered_content(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    artifact = _artifact(run, ProductionArtifactStage.SYNTHESIS)
+    rendered_blob_id = uuid4()
+    artifact.rendered_blob_id = rendered_blob_id
+    store = production_app.state.production_artifact_store
+    store.payloads[rendered_blob_id] = "legacy synthesis text"
+    await uow.production_artifacts.append(artifact)
+
+    response = await api.get(f"/api/subjects/{subject_id}/production/artifacts/synthesis")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["rendered_content"] == "legacy synthesis text"
+
+
 async def test_retry_by_run_changes_only_the_requested_run(
     api: AsyncClient,
     uow: _Uow,

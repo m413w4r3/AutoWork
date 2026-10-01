@@ -25,6 +25,9 @@ adressés par SHA-256. Un workspace ou une conversation ne peut jamais être une
 | `production_artifacts` | Résultats versionnés des étapes de production, référencés par hash. |
 | `source_extractions` | Checkpoints d’extraction adressés par contenu, indépendants du Subject et du run. |
 | `publication_manifests` | Ordre et artifacts exacts retenus pour une publication, append-only. |
+| `edition_releases` | Snapshot JSON du manifest et de l'`EditionDocumentV2`, sans bytes de rendu. |
+| `edition_renders` | Rendus PDF d'un release, identifiés par `input_hash` et référencés au blob store. |
+| `publication_renders` | Rendus PDF d'un artifact `PublicationDocumentV4`, référencés au blob store. |
 | `blobs` | Catalogue des objets MinIO, unicité par bucket logique et SHA-256. |
 
 La baseline finale ne contient aucune table `editorial_groups`. Elle ne contient pas non plus de
@@ -72,7 +75,31 @@ en nouveaux artifacts et reprend à `ASSEMBLY` après revue. `PUBLICATION` est r
 Assembly et ne fait pas partie du snapshot portable.
 
 `ASSEMBLY` produit l'artifact canonique `PUBLICATION` sans rendu. `READY` valide la production
-canonique et sa QA, indépendamment de tout export PDF ou DOCX.
+canonique et sa QA, indépendamment du rendu PDF d'un article ou d'un bulletin.
+
+## Documents publiés et rendus
+
+La chaîne Subject est `PublicationDocumentV4 → PublicationRender → Typst PDF`. Le preview Subject
+est la projection frontend directe du V4 ; `GET /api/subjects/{id}/publication/pdf` demande ou
+retourne le rendu AW-019.
+
+La chaîne édition est `PublicationManifestV1 → EditionDocumentV2 → EditionRelease → EditionRender
+→ Typst PDF`. `EditionRelease` conserve seulement le snapshot JSON du manifest et du document
+d'édition. `EditionRender` est une ligne distincte qui pointe vers le release et le blob PDF.
+
+L'`input_hash` d'un `EditionRender` couvre l'identifiant du release, le hash du document d'édition,
+le renderer et sa version, le template et son hash, le compilateur et sa version, le bundle de
+polices, la policy de rendu et le format. Il exclut les identifiants de job et les autres données
+d'exécution. Une nouvelle tentative du job `publication.edition.render` réutilise le même release ;
+elle ne relance pas `publication.edition.assemble` ni les `ProductionRun`. Assembly et rendu sont
+deux jobs indépendants : `publication.edition.assemble` puis `publication.edition.render`.
+
+Le preview édition projette `EditionDocumentV2` côté frontend. Son PDF est servi par
+`GET /api/editions/{id}/preview/pdf?preview_input_hash=<sha256>`. Le rendu final est consultable par
+`GET /api/editions/{id}/release/pdf` et relançable par
+`POST /api/editions/{id}/release/render`. Le workspace édition matérialise
+`release/{publication-manifest.json, edition.json, bulletin.pdf}` ; ces fichiers restent des
+projections reconstructibles.
 
 ### Extraction : artifact borné et checkpoints source-level
 
@@ -126,6 +153,12 @@ octets ne sont pas renvoyés par les endpoints de liste.
 Les workspaces sont des projections locales avec un manifeste `"canonical": false`. Ils sont
 reconstructibles, best-effort et sans effet sur PostgreSQL ou MinIO lorsqu’ils sont modifiés ou
 supprimés.
+
+La release matérialisée dans le workspace d'édition comprend
+`release/{publication-manifest.json, edition.json, bulletin.pdf}`. Le PDF est aussi un blob adressé
+par SHA-256 et rattaché à l'`EditionRender`; les deux JSON matérialisent le release canonique.
+
+Pandoc est l'ancien renderer supprimé en AW-020.
 
 ## Migrations
 

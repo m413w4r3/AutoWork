@@ -5,8 +5,9 @@ Statut : accepté — 2026-08-28
 Historique de version : le contrat de publication a évolué de V2 à V3, puis à V4.
 Depuis AW-018, `PublicationDocumentV4` est le seul contrat canonique écrit ; il ajoute tables,
 diagrammes (spécification sémantique + `asset_id` du média compilé) et figures-source incluses,
-sans source D2, SVG, Typst ni Markdown. Le rendu Pandoc est un dérivé du document canonique et sa
-version n'entre pas dans le hash d'Assembly.
+sans source D2, SVG, Typst ni Markdown. Le PDF Typst est un dérivé du document canonique et la
+version du renderer n'entre pas dans le hash d'Assembly. Pandoc est l'ancien renderer supprimé en
+AW-020.
 
 ## Contexte
 
@@ -97,7 +98,7 @@ Le passage à V2 est un changement de schéma explicite. Une nouvelle version ne
 Si une lecture V1 reste nécessaire pendant la migration, elle passe par un lecteur ou adaptateur
 explicite vers la représentation interne courante.
 
-Le document canonique reste indépendant de Markdown, DOCX ou de tout autre renderer.
+Le document canonique reste indépendant de tout format de sortie ou renderer.
 
 ### 5. La production cible utilise une pipeline unique et statique
 
@@ -298,8 +299,7 @@ La structure cible du workspace édition est :
 └── release/
     ├── publication-manifest.json
     ├── edition.json
-    ├── edition.md
-    └── bulletin.docx
+    └── bulletin.pdf
 ```
 
 Chaque manifeste de workspace indique explicitement qu'il n'est pas canonique. Les écritures sont
@@ -352,9 +352,24 @@ Seul le use case qui crée avec succès ce manifeste peut faire passer une édit
 gel.
 
 L'assemblage d'édition lit uniquement les artifact IDs et hashes présents dans le manifeste. Il ne
-résout jamais un "artifact courant" pendant le rendu. Il construit un document d'édition
-renderer-independent puis produit les représentations Markdown/DOCX de manière déterministe et
-sans appel à un LLM.
+résout jamais un "artifact courant" pendant le rendu. Il construit le document renderer-independent
+`EditionDocumentV2`, puis le fige dans un `EditionRelease` JSON-only. Le job
+`publication.edition.assemble` produit ce release ; le job `publication.edition.render` compile
+ensuite un PDF Typst séparé.
+
+La chaîne Subject est `PublicationDocumentV4 → PublicationRender → Typst PDF`. La chaîne édition
+est `PublicationManifestV1 → EditionDocumentV2 → EditionRelease → EditionRender → Typst PDF`.
+Chaque ligne `EditionRender` référence un release et porte un `input_hash` dérivé de l'identifiant
+du release, du hash du document, des identités et versions renderer/template/compilateur, du hash
+du template, du bundle de polices, de la policy et du format. Un retry de rendu ne recrée ni
+manifest ni release et ne rejoue pas Production.
+
+Le preview Subject est une projection frontend de `PublicationDocumentV4` ; son PDF AW-019 est
+disponible par `GET /api/subjects/{id}/publication/pdf`. Le preview édition projette
+`EditionDocumentV2` côté frontend et expose
+`GET /api/editions/{id}/preview/pdf?preview_input_hash=<sha256>`. Le PDF final est servi par
+`GET /api/editions/{id}/release/pdf` et son rendu peut être demandé ou relancé par
+`POST /api/editions/{id}/release/render`.
 
 Une modification après gel nécessite un retour explicite en review et la création ultérieure d'un
 nouveau manifeste ; un manifeste déjà créé reste immutable et historique.

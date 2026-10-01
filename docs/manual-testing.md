@@ -9,11 +9,11 @@ git rev-parse HEAD
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
-docker compose exec worker pandoc --version
+docker compose exec worker typst --version
 ```
 
-Conserver le SHA et la version Pandoc observés dans le compte-rendu. Pandoc
-doit être disponible dans `worker` avant d’accepter une publication.
+Conserver le SHA et la version Typst observés dans le compte-rendu. Le worker
+doit pouvoir produire le PDF final.
 
 Les workspaces explorables directement depuis l’hôte sont :
 
@@ -103,11 +103,20 @@ Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
 
 4. Vérifier que A et B sont inclus, puis cliquer sur `Accepter la production`.
    Naviguer vers `/editions/{edition_id}/publication`, attendre `Bulletin
-   publié`, puis vérifier la présence du lien :
+   publié`, puis vérifier que le preview affiche `EditionDocumentV2` et que le
+   téléchargement PDF est disponible. `EditionRelease` contient uniquement
+   les JSON gelés ; son rendu est une ligne `EditionRender` indépendante.
 
    ```text
-   Télécharger le bulletin DOCX
+   GET /api/subjects/{subject_id}/publication/pdf
+   GET /api/editions/{edition_id}/preview/pdf?preview_input_hash=<sha256>
+   POST /api/editions/{edition_id}/release/render
+   GET /api/editions/{edition_id}/release/pdf
    ```
+
+   Les jobs `publication.edition.assemble` et `publication.edition.render`
+   séparent le gel JSON de la compilation Typst. Un retry de rendu ne relance
+   ni Assembly ni Production.
 
 5. Définir le workspace de cette édition avec le vrai chemin observé :
 
@@ -117,8 +126,8 @@ Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
    find "$EDITION_WORKSPACE" -maxdepth 4 -type f | sort
    python -m json.tool "$EDITION_WORKSPACE/release/publication-manifest.json"
    python -m json.tool "$EDITION_WORKSPACE/release/edition.json"
-   unzip -p "$EDITION_WORKSPACE/release/bulletin.docx" word/document.xml \
-     | rg -n 'Article A|Article B'
+   test -s "$EDITION_WORKSPACE/release/bulletin.pdf"
+   sha256sum "$EDITION_WORKSPACE/release/bulletin.pdf"
    ```
 
    Le suffixe `2026-08_IR` est un exemple : utiliser `YYYY-MM_<country_code>`
@@ -143,21 +152,21 @@ Ce scénario vise exactement deux sujets sélectionnés, dans l’ordre
      release/
        publication-manifest.json
        edition.json
-       edition.md
-       bulletin.docx
+       bulletin.pdf
    ```
 
-   Les quatre fichiers de `release/` doivent être présents. Vérifier que le
-   manifest contient exactement deux entrées, positions 1 et 2, et que le XML
-   DOCX contient A avant B.
+   Les trois fichiers de `release/` doivent être présents. Vérifier que le
+   manifest contient exactement deux entrées, positions 1 et 2, et ouvrir le
+   PDF pour confirmer que les articles A puis B suivent cet ordre. Le fichier
+   PDF correspond à un `EditionRender` identifié par `input_hash`.
 
-6. Télécharger le DOCX depuis l’interface, puis comparer le téléchargement au
+6. Télécharger le PDF depuis l’interface, puis comparer le téléchargement au
    fichier du workspace :
 
    ```bash
-   export DOWNLOADED_DOCX='<chemin-vers-le-docx-téléchargé>'
-   sha256sum "$DOWNLOADED_DOCX" \
-     "$EDITION_WORKSPACE/release/bulletin.docx"
+   export DOWNLOADED_PDF='<chemin-vers-le-pdf-téléchargé>'
+   sha256sum "$DOWNLOADED_PDF" \
+     "$EDITION_WORKSPACE/release/bulletin.pdf"
    ```
 
    Les deux hashes doivent être identiques.
@@ -239,8 +248,8 @@ docker compose ps
 curl -fsS "http://localhost:8000/api/editions/$EDITION_ID/release"
 ```
 
-La réponse doit toujours exposer la release publiée, et l’interface doit
-toujours afficher Review/release et le lien DOCX. La base PostgreSQL, MinIO et
+La réponse doit toujours exposer la release JSON publiée, et l’interface doit
+toujours afficher Review/release et le lien PDF. La base PostgreSQL, MinIO et
 les workspaces montés doivent avoir conservé leurs données.
 
 **NE JAMAIS utiliser `docker compose down -v` sur des données manuelles que
@@ -249,11 +258,11 @@ l’on souhaite conserver.**
 ## Workspace jetable et rematérialisation canonique
 
 La release locale est une projection jetable. Sauvegarder d’abord le hash du
-DOCX canonique/local, puis supprimer uniquement le répertoire ciblé :
+PDF canonique/local, puis supprimer uniquement le répertoire ciblé :
 
 ```bash
 export RELEASE_WORKSPACE="$EDITION_WORKSPACE/release"
-sha256sum "$RELEASE_WORKSPACE/bulletin.docx"
+sha256sum "$RELEASE_WORKSPACE/bulletin.pdf"
 rm -rf -- "$RELEASE_WORKSPACE"
 test ! -e "$RELEASE_WORKSPACE"
 ```
@@ -266,16 +275,17 @@ curl -fsS -X POST \
   "http://localhost:8000/api/editions/$EDITION_ID/release/materialize"
 test -f "$RELEASE_WORKSPACE/publication-manifest.json"
 test -f "$RELEASE_WORKSPACE/edition.json"
-test -f "$RELEASE_WORKSPACE/edition.md"
-test -f "$RELEASE_WORKSPACE/bulletin.docx"
-sha256sum "$RELEASE_WORKSPACE/bulletin.docx"
+test -f "$RELEASE_WORKSPACE/bulletin.pdf"
+sha256sum "$RELEASE_WORKSPACE/bulletin.pdf"
 ```
 
-La release, le manifest et le DOCX doivent être restés lisibles pendant que la
-projection locale était absente, et le hash du DOCX restauré doit être
+La release JSON, le manifest et le PDF doivent être restés lisibles pendant que
+la projection locale était absente, et le hash du PDF restauré doit être
 identique à celui sauvegardé avant suppression. Cette opération ne crée ni
-Release ni Manifest et ne fait aucun appel modèle ; elle lit uniquement
-PostgreSQL et les blobs canoniques.
+EditionRelease ni PublicationManifest et ne fait aucun appel modèle ; elle lit
+uniquement PostgreSQL et les blobs canoniques. Pour tester un rendu indépendant,
+appeler `POST /api/editions/{edition_id}/release/render`, puis télécharger le
+résultat par `GET /api/editions/{edition_id}/release/pdf`.
 
 ## Arrêt
 

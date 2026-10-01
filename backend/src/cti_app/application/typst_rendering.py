@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import UUID
 
@@ -27,6 +27,7 @@ from cti_app.domain.publication_document import (
 )
 
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v1"
+_PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _MEDIA_EXTENSIONS = {
     "image/svg+xml": ".svg",
     "image/png": ".png",
@@ -59,6 +60,19 @@ class TypstRenderSource:
     source_sha256: str
     render_data_bytes: bytes
     render_data_sha256: str
+    media_refs: tuple[TypstMediaRef, ...]
+    entrypoint_relative_path: str = "RENDERER/publication.typ"
+    render_data_relative_path: str = "RENDERER/render-data.json"
+
+
+@dataclass(frozen=True, slots=True)
+class TypstPublicationModelV1:
+    title: str
+    timeline: list[dict[str, Any]]
+    body_blocks: list[dict[str, Any]]
+    indicators: dict[str, list[str]]
+    uncertainties: list[str]
+    sources: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
 
 
@@ -94,121 +108,17 @@ class TypstRenderer:
                 "Typst renderer manifest does not include RENDERER/publication.typ"
             )
         source_bytes = entrypoint.content
-        media_refs_by_id: dict[UUID, TypstMediaRef] = {}
-        rich_by_placement: dict[
-            tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]
-        ] = {}
-
-        def media_ref(
-            *,
-            asset_id: UUID,
-            expected_kind: MediaAssetKind,
-            expected_mime_type: str,
-            expected_sha256: str | None,
-            expected_byte_size: int | None,
-        ) -> TypstMediaRef:
-            extension = _MEDIA_EXTENSIONS.get(expected_mime_type)
-            if extension is None:
-                raise ValueError(f"Unsupported Typst media MIME type: {expected_mime_type}")
-            candidate = TypstMediaRef(
-                asset_id=asset_id,
-                expected_kind=expected_kind,
-                expected_mime_type=expected_mime_type,
-                expected_sha256=expected_sha256,
-                expected_byte_size=expected_byte_size,
-                media_path=f"media/{asset_id}{extension}",
-            )
-            existing = media_refs_by_id.get(asset_id)
-            if existing is not None:
-                if existing != candidate:
-                    raise ValueError(f"Publication asset {asset_id} has conflicting media metadata")
-                return existing
-            media_refs_by_id[asset_id] = candidate
-            return candidate
-
-        def add_rich(
-            kind: EnrichmentPlacementKind,
-            section_index: int | None,
-            block: dict[str, Any],
-        ) -> None:
-            if kind is EnrichmentPlacementKind.AFTER_SECTION and (
-                section_index is None or section_index >= len(document.sections)
-            ):
-                raise ValueError(f"Enrichment placement refers to missing section {section_index}")
-            rich_by_placement.setdefault((kind, section_index), []).append(block)
-
-        for table in document.tables:
-            add_rich(
-                table.placement.kind,
-                table.placement.section_index,
-                _table_block(table),
-            )
-        for diagram in document.diagrams:
-            add_rich(
-                diagram.placement.kind,
-                diagram.placement.section_index,
-                _diagram_block(diagram, media_ref),
-            )
-        for figure in document.figures:
-            add_rich(
-                figure.placement.kind,
-                figure.placement.section_index,
-                _figure_block(figure, media_ref),
-            )
-
-        body_blocks: list[dict[str, Any]] = []
-        body_blocks.extend(
-            rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
-        )
-        body_blocks.extend({"type": "paragraph", "text": item.text} for item in document.lead)
-        body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
-        for section_index, section in enumerate(document.sections):
-            body_blocks.append({"type": "section_heading", "text": section.heading})
-            body_blocks.extend(
-                {"type": "paragraph", "text": paragraph.text} for paragraph in section.paragraphs
-            )
-            body_blocks.extend(
-                rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
-            )
-        body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.END, None), ()))
-
-        sources_by_id = {source.source_document_id: source for source in document.sources}
-        timeline = [
-            {
-                "display_date": _display_date(entry.date_text, entry.event_date),
-                "text": entry.text,
-                "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
-            }
-            for entry in document.timeline
-        ]
-
-        indicators: dict[str, list[str]] = {
-            key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
-        }
-        for group in document.indicators:
-            indicators[_INDICATOR_KEYS[group.artifact_type]] = [
-                item.value for item in group.indicators
-            ]
+        model = project_publication_to_typst_model(document)
 
         render_data: dict[str, Any] = {
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
             "language": document.publication_language,
-            "title": document.title,
-            "timeline": timeline,
-            "body_blocks": body_blocks,
-            "indicators": indicators,
-            "uncertainties": [item.text for item in document.uncertainties],
-            "sources": [
-                {
-                    "title": source.title,
-                    "publisher": source.publisher,
-                    "date": source.published_at.isoformat()
-                    if source.published_at is not None
-                    else None,
-                    "url": source.canonical_url,
-                }
-                for source in document.sources
-            ],
+            "title": model.title,
+            "timeline": model.timeline,
+            "body_blocks": model.body_blocks,
+            "indicators": model.indicators,
+            "uncertainties": model.uncertainties,
+            "sources": model.sources,
         }
         render_data_bytes = json.dumps(
             render_data,
@@ -221,16 +131,133 @@ class TypstRenderer:
             source_sha256=hashlib.sha256(source_bytes).hexdigest(),
             render_data_bytes=render_data_bytes,
             render_data_sha256=hashlib.sha256(render_data_bytes).hexdigest(),
-            media_refs=tuple(media_refs_by_id.values()),
+            media_refs=model.media_refs,
         )
+
+
+def project_publication_to_typst_model(
+    document: PublicationDocumentV4,
+) -> TypstPublicationModelV1:
+    """Project one canonical V4 publication into shared Typst article data."""
+    media_refs_by_id: dict[UUID, TypstMediaRef] = {}
+    rich_by_placement: dict[tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]] = {}
+
+    def media_ref(
+        *,
+        asset_id: UUID,
+        expected_kind: MediaAssetKind,
+        expected_mime_type: str,
+        expected_sha256: str | None,
+        expected_byte_size: int | None,
+    ) -> TypstMediaRef:
+        extension = _MEDIA_EXTENSIONS.get(expected_mime_type)
+        if extension is None:
+            raise ValueError(f"Unsupported Typst media MIME type: {expected_mime_type}")
+        candidate = TypstMediaRef(
+            asset_id=asset_id,
+            expected_kind=expected_kind,
+            expected_mime_type=expected_mime_type,
+            expected_sha256=expected_sha256,
+            expected_byte_size=expected_byte_size,
+            media_path=f"media/{asset_id}{extension}",
+        )
+        existing = media_refs_by_id.get(asset_id)
+        if existing is not None:
+            if existing != candidate:
+                raise ValueError(f"Publication asset {asset_id} has conflicting media metadata")
+            return existing
+        media_refs_by_id[asset_id] = candidate
+        return candidate
+
+    def add_rich(
+        kind: EnrichmentPlacementKind,
+        section_index: int | None,
+        block: dict[str, Any],
+    ) -> None:
+        if kind is EnrichmentPlacementKind.AFTER_SECTION and (
+            section_index is None or section_index >= len(document.sections)
+        ):
+            raise ValueError(f"Enrichment placement refers to missing section {section_index}")
+        rich_by_placement.setdefault((kind, section_index), []).append(block)
+
+    for table in document.tables:
+        add_rich(
+            table.placement.kind,
+            table.placement.section_index,
+            _table_block(table),
+        )
+    for diagram in document.diagrams:
+        add_rich(
+            diagram.placement.kind,
+            diagram.placement.section_index,
+            _diagram_block(diagram, media_ref),
+        )
+    for figure in document.figures:
+        add_rich(
+            figure.placement.kind,
+            figure.placement.section_index,
+            _figure_block(figure, media_ref),
+        )
+
+    body_blocks: list[dict[str, Any]] = []
+    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ()))
+    body_blocks.extend({"type": "paragraph", "text": item.text} for item in document.lead)
+    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
+    for section_index, section in enumerate(document.sections):
+        body_blocks.append({"type": "section_heading", "text": section.heading})
+        body_blocks.extend(
+            {"type": "paragraph", "text": paragraph.text} for paragraph in section.paragraphs
+        )
+        body_blocks.extend(
+            rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
+        )
+    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.END, None), ()))
+
+    sources_by_id = {source.source_document_id: source for source in document.sources}
+    timeline = [
+        {
+            "display_date": _display_date(entry.date_text, entry.event_date),
+            "text": entry.text,
+            "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
+        }
+        for entry in document.timeline
+    ]
+
+    indicators: dict[str, list[str]] = {
+        key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
+    }
+    for group in document.indicators:
+        indicators[_INDICATOR_KEYS[group.artifact_type]] = [item.value for item in group.indicators]
+
+    return TypstPublicationModelV1(
+        title=document.title,
+        timeline=timeline,
+        body_blocks=body_blocks,
+        indicators=indicators,
+        uncertainties=[item.text for item in document.uncertainties],
+        sources=[
+            {
+                "title": source.title,
+                "publisher": source.publisher,
+                "date": source.published_at.isoformat()
+                if source.published_at is not None
+                else None,
+                "url": source.canonical_url,
+            }
+            for source in document.sources
+        ],
+        media_refs=tuple(media_refs_by_id.values()),
+    )
 
 
 class TemplateBundleInvalidError(ValueError):
     """Raised when the renderer manifest or one of its listed files is invalid."""
 
 
-def _load_renderer_manifest(chp_typst_root: Path) -> tuple[Path, str, tuple[str, ...]]:
-    """Read renderer-manifest.json, returning (resolved root, version, files)."""
+def _load_renderer_manifest(
+    chp_typst_root: Path, manifest_name: str = _PUBLICATION_RENDERER_MANIFEST
+) -> tuple[Path, str, tuple[str, ...]]:
+    """Read one renderer manifest, returning (resolved root, version, files)."""
     try:
         root = chp_typst_root.resolve(strict=True)
     except OSError as exc:
@@ -240,7 +267,15 @@ def _load_renderer_manifest(chp_typst_root: Path) -> tuple[Path, str, tuple[str,
     if not root.is_dir():
         raise TemplateBundleInvalidError(f"Typst template root is not a directory: {root}")
 
-    manifest_path = root / "renderer-manifest.json"
+    manifest_relative_path = PurePosixPath(manifest_name)
+    if (
+        manifest_relative_path.is_absolute()
+        or "\\" in manifest_name
+        or ".." in manifest_relative_path.parts
+        or len(manifest_relative_path.parts) != 1
+    ):
+        raise TemplateBundleInvalidError("Typst renderer manifest name must be a relative filename")
+    manifest_path = root / manifest_name
     try:
         manifest = json.loads(manifest_path.read_bytes())
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -266,9 +301,13 @@ def _load_renderer_manifest(chp_typst_root: Path) -> tuple[Path, str, tuple[str,
     return root, template_version, tuple(files)
 
 
-def load_template_bundle(chp_typst_root: Path) -> TypstTemplateBundle:
+def load_template_bundle(
+    chp_typst_root: Path,
+    *,
+    manifest_name: str = _PUBLICATION_RENDERER_MANIFEST,
+) -> TypstTemplateBundle:
     """Read and hash the exact manifest-listed template bytes in one operation."""
-    root, template_version, files = _load_renderer_manifest(chp_typst_root)
+    root, template_version, files = _load_renderer_manifest(chp_typst_root, manifest_name)
     resolved_files = resolve_bundle_files(root, files, error=TemplateBundleInvalidError)
     contents: list[TemplateFile] = []
     for relative_path, source_path in resolved_files:
@@ -286,9 +325,13 @@ def load_template_bundle(chp_typst_root: Path) -> TypstTemplateBundle:
     )
 
 
-def compute_template_bundle_hash(chp_typst_root: Path) -> tuple[str, str]:
+def compute_template_bundle_hash(
+    chp_typst_root: Path,
+    *,
+    manifest_name: str = _PUBLICATION_RENDERER_MANIFEST,
+) -> tuple[str, str]:
     """Return the manifest version and stable hash of exactly its listed files."""
-    bundle = load_template_bundle(chp_typst_root)
+    bundle = load_template_bundle(chp_typst_root, manifest_name=manifest_name)
     return bundle.template_version, bundle.sha256
 
 
