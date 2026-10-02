@@ -4122,6 +4122,8 @@ class ProductionRepairMaterializationService:
             )
             relevance_projection = projection_execution.projection
             relevance_projection_artifact = projection_execution.artifact
+            if relevance_projection_artifact is None:
+                raise ProductionRepairProjectionError("relevance_projection_unavailable")
             synthesis = production_synthesis_from_json(
                 await store.read_json(synthesis_artifact.canonical_blob_id)
             )

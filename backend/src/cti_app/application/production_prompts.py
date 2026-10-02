@@ -16,12 +16,15 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v2-text-blocks"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v3-reserve-context"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v1"
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v1"
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v3"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v4-reserve-context"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = "editorial-enrichment-block-contract-v1"
 EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v1"
+RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v1"
+RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v1"
+RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v1"
 CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,

@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import Any
 from uuid import UUID
 
+from cti_app.domain.production import ExtractionProfile
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
@@ -18,9 +19,9 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
 )
 
-RELEVANCE_PROJECTION_SCHEMA_VERSION = 1
-RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-deterministic-v1"
-DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v1"
+RELEVANCE_PROJECTION_SCHEMA_VERSION = 2
+RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-model-proposal-v2"
+DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v2"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -54,6 +55,29 @@ class RelevanceDecisionProvenance(StrEnum):
     DETERMINISTIC_POLICY = "deterministic_policy"
     MODEL_PROPOSAL = "model_proposal"
     HUMAN_REVIEW = "human_review"
+
+
+class RelevanceSourcePairRelation(StrEnum):
+    SAME_ACTIVITY = "same_activity"
+    TECHNICAL_COMPARISON = "technical_comparison"
+    LINK_NOT_DEMONSTRATED = "link_not_demonstrated"
+    CONTRADICTION = "contradiction"
+
+
+class RelevanceProposalRejectionReason(StrEnum):
+    MALFORMED_BLOCK = "malformed_block"
+    UNKNOWN_HANDLE = "unknown_handle"
+    UNKNOWN_CLASSIFICATION = "unknown_classification"
+    UNKNOWN_REASON_CODE = "unknown_reason_code"
+    INVALID_REASON_FOR_CLASSIFICATION = "invalid_reason_for_classification"
+    DUPLICATE_TARGET = "duplicate_target"
+    MISSING_TARGET_HANDLE = "missing_target_handle"
+    RELATION_NOT_DOCUMENTED = "relation_not_documented"
+    GENERIC_FILENAME_GUARD = "generic_filename_guard"
+    FOOTER_CONTACT_GUARD = "footer_contact_guard"
+    RELATION_REQUIRES_TWO_FULL_SOURCES = "relation_requires_two_full_sources"
+    RELATION_MISSING_REASON = "relation_missing_reason"
+    RELATION_DUPLICATE_SOURCE_PAIR = "relation_duplicate_source_pair"
 
 
 def _canonical_json(payload: Any) -> bytes:
@@ -129,6 +153,58 @@ class RelevanceClassificationItemV1:
 
 
 @dataclass(frozen=True, slots=True)
+class RelevanceSourcePairRelationV1:
+    relation: RelevanceSourcePairRelation
+    reason: str
+    supporting_evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+    provenance: RelevanceDecisionProvenance = RelevanceDecisionProvenance.MODEL_PROPOSAL
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.relation, RelevanceSourcePairRelation):
+            raise ValueError("Projection source-pair relation is invalid")
+        if not isinstance(self.provenance, RelevanceDecisionProvenance):
+            raise ValueError("Projection source-pair provenance is invalid")
+        if not isinstance(self.reason, str) or not self.reason.strip() or len(self.reason) > 1200:
+            raise ValueError("Projection source-pair relation requires a bounded reason")
+        if (
+            not isinstance(self.supporting_evidence_refs, tuple)
+            or len(self.supporting_evidence_refs) < 2
+        ):
+            raise ValueError("Projection source-pair relations require evidence references")
+        if any(
+            not isinstance(ref, ExtractionEvidenceRefV1) for ref in self.supporting_evidence_refs
+        ):
+            raise ValueError("Projection source-pair evidence references are invalid")
+        refs = tuple(sorted(set(self.supporting_evidence_refs), key=evidence_ref_sort_key))
+        if len({ref.source_document_id for ref in refs}) != 2:
+            raise ValueError("Projection source-pair relations must reference exactly two sources")
+        object.__setattr__(self, "supporting_evidence_refs", refs)
+
+    @property
+    def source_pair(self) -> tuple[UUID, UUID]:
+        ordered = sorted({ref.source_document_id for ref in self.supporting_evidence_refs}, key=str)
+        return ordered[0], ordered[1]
+
+
+@dataclass(frozen=True, slots=True)
+class RelevanceProposalRejectionV1:
+    block_id: str
+    reason_code: RelevanceProposalRejectionReason
+    raw_sha256: str
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.block_id, str)
+            or not self.block_id.strip()
+            or len(self.block_id) > 80
+        ):
+            raise ValueError("Projection rejected block identity is invalid")
+        if not isinstance(self.reason_code, RelevanceProposalRejectionReason):
+            raise ValueError("Projection rejected block reason is invalid")
+        _sha256(self.raw_sha256, "Projection rejected block hash")
+
+
+@dataclass(frozen=True, slots=True)
 class RelevanceProjectionV1:
     subject_id: UUID
     production_input_hash: str
@@ -136,6 +212,8 @@ class RelevanceProjectionV1:
     input_hash: str
     extraction_evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
     classifications: tuple[RelevanceClassificationItemV1, ...]
+    source_pair_relations: tuple[RelevanceSourcePairRelationV1, ...] = ()
+    model_proposal_rejections: tuple[RelevanceProposalRejectionV1, ...] = ()
     schema_version: int = RELEVANCE_PROJECTION_SCHEMA_VERSION
     policy_version: str = RELEVANCE_PROJECTION_POLICY_VERSION
     classifier_version: str = DEFAULT_RELEVANCE_CLASSIFIER_VERSION
@@ -163,6 +241,16 @@ class RelevanceProjectionV1:
             not isinstance(item, RelevanceClassificationItemV1) for item in self.classifications
         ):
             raise ValueError("Projection classifications are invalid")
+        if not isinstance(self.source_pair_relations, tuple) or any(
+            not isinstance(item, RelevanceSourcePairRelationV1)
+            for item in self.source_pair_relations
+        ):
+            raise ValueError("Projection source-pair relations are invalid")
+        if not isinstance(self.model_proposal_rejections, tuple) or any(
+            not isinstance(item, RelevanceProposalRejectionV1)
+            for item in self.model_proposal_rejections
+        ):
+            raise ValueError("Projection model proposal rejections are invalid")
         valid_refs = set(self.extraction_evidence_refs)
         if len(valid_refs) != len(self.extraction_evidence_refs):
             raise ValueError("Projection extraction evidence refs must be unique")
@@ -177,6 +265,9 @@ class RelevanceProjectionV1:
             raise ValueError("Projection must classify each extraction item exactly once")
         if set(classified_refs) != valid_refs:
             raise ValueError("Projection must classify every extraction evidence item")
+        relation_pairs = [item.source_pair for item in self.source_pair_relations]
+        if len(relation_pairs) != len(set(relation_pairs)):
+            raise ValueError("Projection source-pair relations must be unique per source pair")
         object.__setattr__(
             self,
             "extraction_evidence_refs",
@@ -189,6 +280,16 @@ class RelevanceProjectionV1:
                 sorted(
                     self.classifications,
                     key=lambda item: evidence_ref_sort_key(item.evidence_ref),
+                )
+            ),
+        )
+        object.__setattr__(
+            self,
+            "source_pair_relations",
+            tuple(
+                sorted(
+                    self.source_pair_relations,
+                    key=lambda item: tuple(map(str, item.source_pair)),
                 )
             ),
         )
@@ -233,6 +334,25 @@ def _projection_payload(
             }
             for item in projection.classifications
         ],
+        "source_pair_relations": [
+            {
+                "relation": item.relation.value,
+                "reason": item.reason,
+                "provenance": item.provenance.value,
+                "supporting_evidence_refs": [
+                    _ref_payload(ref) for ref in item.supporting_evidence_refs
+                ],
+            }
+            for item in projection.source_pair_relations
+        ],
+        "model_proposal_rejections": [
+            {
+                "block_id": item.block_id,
+                "reason_code": item.reason_code.value,
+                "raw_sha256": item.raw_sha256,
+            }
+            for item in projection.model_proposal_rejections
+        ],
     }
     if include_hash:
         payload["projection_hash"] = projection.projection_hash
@@ -256,6 +376,8 @@ def relevance_projection_from_json(payload: Any) -> RelevanceProjectionV1:
         "input_hash",
         "extraction_evidence_refs",
         "classifications",
+        "source_pair_relations",
+        "model_proposal_rejections",
         "projection_hash",
     }
     if not isinstance(payload, dict) or set(payload) != keys:
@@ -286,6 +408,32 @@ def relevance_projection_from_json(payload: Any) -> RelevanceProjectionV1:
         )
         if len(classifications) != len(payload["classifications"]):
             raise ValueError("Projection classification fields are invalid")
+        source_pair_relations = tuple(
+            RelevanceSourcePairRelationV1(
+                relation=RelevanceSourcePairRelation(item["relation"]),
+                reason=item["reason"],
+                provenance=RelevanceDecisionProvenance(item["provenance"]),
+                supporting_evidence_refs=tuple(
+                    _ref_from_json(ref) for ref in item["supporting_evidence_refs"]
+                ),
+            )
+            for item in payload["source_pair_relations"]
+            if isinstance(item, dict)
+            and set(item) == {"relation", "reason", "provenance", "supporting_evidence_refs"}
+        )
+        if len(source_pair_relations) != len(payload["source_pair_relations"]):
+            raise ValueError("Projection source-pair relation fields are invalid")
+        rejections = tuple(
+            RelevanceProposalRejectionV1(
+                block_id=item["block_id"],
+                reason_code=RelevanceProposalRejectionReason(item["reason_code"]),
+                raw_sha256=item["raw_sha256"],
+            )
+            for item in payload["model_proposal_rejections"]
+            if isinstance(item, dict) and set(item) == {"block_id", "reason_code", "raw_sha256"}
+        )
+        if len(rejections) != len(payload["model_proposal_rejections"]):
+            raise ValueError("Projection model proposal rejection fields are invalid")
         projection = RelevanceProjectionV1(
             schema_version=payload["schema_version"],
             policy_version=payload["policy_version"],
@@ -298,6 +446,8 @@ def relevance_projection_from_json(payload: Any) -> RelevanceProjectionV1:
                 _ref_from_json(ref) for ref in payload["extraction_evidence_refs"]
             ),
             classifications=classifications,
+            source_pair_relations=source_pair_relations,
+            model_proposal_rejections=rejections,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("Relevance projection payload is invalid") from exc
@@ -320,3 +470,12 @@ def validate_relevance_projection_lineage(
         raise ValueError("Projection extraction hash does not match canonical extraction")
     if set(projection.extraction_evidence_refs) != set(extraction_evidence_refs_v1(extraction)):
         raise ValueError("Projection lineage references differ from canonical extraction")
+    source_by_id = {source.source_document_id: source for source in extraction.sources}
+    for relation in projection.source_pair_relations:
+        if not set(relation.supporting_evidence_refs) <= set(projection.extraction_evidence_refs):
+            raise ValueError("Projection source-pair relation references are unknown")
+        if any(
+            source_by_id[ref.source_document_id].profile is not ExtractionProfile.FULL
+            for ref in relation.supporting_evidence_refs
+        ):
+            raise ValueError("Projection source-pair relations require FULL sources")

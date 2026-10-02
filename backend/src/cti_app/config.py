@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     production_subject_jitter_max_seconds: float = Field(default=90.0, ge=0)
     production_model_jitter_min_seconds: float = Field(default=8.0, ge=0)
     production_model_jitter_max_seconds: float = Field(default=20.0, ge=0)
+    production_relevance_classifier_enabled: bool = True
     # Palier de repos long inséré périodiquement pour laisser le bridge
     # ChatGPT récupérer. Zéro désactive le palier.
     production_cooldown_every_n_subjects: int = Field(default=3, ge=0)

@@ -7,14 +7,22 @@ import json
 import re
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.production_relevance_model import (
+    ModelRelevanceClassifier,
+    ModelRelevanceProposalExecution,
+    RelevanceProposalStatus,
+)
+from cti_app.application.production_synthesis import (
+    build_synthesis_access_policy,
+    canonical_extraction_hash,
+)
 from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
@@ -33,11 +41,15 @@ from cti_app.domain.production_references import (
 from cti_app.domain.production_relevance import (
     DEFAULT_RELEVANCE_CLASSIFIER_VERSION,
     RELEVANCE_PROJECTION_POLICY_VERSION,
+    RELEVANCE_PROJECTION_SCHEMA_VERSION,
     RelevanceClassification,
     RelevanceClassificationItemV1,
     RelevanceDecisionProvenance,
     RelevanceProjectionV1,
+    RelevanceProposalRejectionReason,
+    RelevanceProposalRejectionV1,
     RelevanceReasonCode,
+    RelevanceSourcePairRelationV1,
     relevance_projection_from_json,
     relevance_projection_to_json,
     validate_relevance_projection_lineage,
@@ -228,9 +240,9 @@ def _classify_item(
     if kind is EvidenceKind.INDICATOR:
         value = str(payload.get("value") or "").strip().casefold()
         malicious_role = _contains_marker(text, _MALICIOUS_ROLE_MARKERS)
-        if value in _GENERIC_FILENAMES and not malicious_role:
+        if value in _GENERIC_FILENAMES:
             return decision(RelevanceClassification.CONTEXT, RelevanceReasonCode.GENERIC_FILENAME)
-        if _EMAIL.search(value) and not malicious_role:
+        if _EMAIL.search(value):
             return decision(RelevanceClassification.CONTEXT, RelevanceReasonCode.FOOTER_CONTACT)
         if other_actor and not scope_match:
             return decision(
@@ -353,7 +365,7 @@ def relevance_projection_input_hash(
         "production_input_hash": snapshot.input_hash,
         "subject_id": str(snapshot.subject_id),
         "extraction_hash": canonical_extraction_hash(extraction),
-        "projection_schema_version": 1,
+        "projection_schema_version": RELEVANCE_PROJECTION_SCHEMA_VERSION,
         "policy_version": RELEVANCE_PROJECTION_POLICY_VERSION,
         "classifier_version": classifier_version,
     }
@@ -366,6 +378,8 @@ def build_relevance_projection(
     extraction: ProductionExtractionV1,
     *,
     classifier: RelevanceClassifier | None = None,
+    source_pair_relations: tuple[RelevanceSourcePairRelationV1, ...] = (),
+    model_proposal_rejections: tuple[RelevanceProposalRejectionV1, ...] = (),
 ) -> RelevanceProjectionV1:
     if snapshot.subject_id != extraction.subject_id:
         raise ValueError("Projection snapshot and extraction subjects differ")
@@ -385,6 +399,8 @@ def build_relevance_projection(
         ),
         extraction_evidence_refs=extraction_evidence_refs_v1(extraction),
         classifications=selected_classifier.classify(snapshot, extraction, evidence),
+        source_pair_relations=source_pair_relations,
+        model_proposal_rejections=model_proposal_rejections,
         classifier_version=selected_classifier.version,
     )
     validate_relevance_projection_lineage(
@@ -396,13 +412,21 @@ def build_relevance_projection(
 class RelevanceProjectionExecutionStatus(StrEnum):
     SUCCEEDED = "succeeded"
     REUSED = "reused"
+    NEEDS_REVIEW = "needs_review"
 
 
 @dataclass(frozen=True, slots=True)
 class RelevanceProjectionExecution:
     status: RelevanceProjectionExecutionStatus
-    artifact: ProductionArtifact
+    artifact: ProductionArtifact | None
     projection: RelevanceProjectionV1
+    model_calls: int = 0
+    model_run_id: UUID | None = None
+    invocation_hash: str | None = None
+    parse_identity: str | None = None
+    error_code: str | None = None
+    error: str | None = None
+    details: Mapping[str, Any] | None = None
 
 
 async def persist_relevance_projection_in_uow(
@@ -413,6 +437,7 @@ async def persist_relevance_projection_in_uow(
     artifact_store: ProductionArtifactStore,
     *,
     mark_downstream_stale: bool = True,
+    artifact_metadata: Mapping[str, Any] | None = None,
 ) -> RelevanceProjectionExecution:
     """Persist or reuse a projection in a caller-owned transaction."""
     if run.subject_id != snapshot.subject_id or projection.subject_id != snapshot.subject_id:
@@ -466,6 +491,7 @@ async def persist_relevance_projection_in_uow(
                 item.classification is RelevanceClassification.INDETERMINATE
                 for item in projection.classifications
             ),
+            **dict(artifact_metadata or {}),
         },
     )
     await uow.production_artifacts.append(artifact)
@@ -486,10 +512,19 @@ class ProductionRelevanceProjectionService:
         uow_factory: ProductionUnitOfWorkFactory,
         artifact_store: ProductionArtifactStore,
         classifier: RelevanceClassifier | None = None,
+        *,
+        model_gateway: Any | None = None,
+        model_enabled: bool = True,
+        model_classifier: ModelRelevanceClassifier | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
         self._classifier = classifier or DeterministicRelevanceClassifier()
+        self._model_classifier = None
+        if model_enabled:
+            self._model_classifier = model_classifier or (
+                ModelRelevanceClassifier(model_gateway) if model_gateway is not None else None
+            )
 
     async def execute(
         self,
@@ -511,11 +546,173 @@ class ProductionRelevanceProjectionService:
         )
         if extraction.subject_id != snapshot.subject_id:
             raise ValueError("Projection extraction subject differs from its snapshot")
-        projection = build_relevance_projection(snapshot, extraction, classifier=self._classifier)
+        classifier = self._model_classifier or self._classifier
+        projection = build_relevance_projection(snapshot, extraction, classifier=classifier)
+        proposal: ModelRelevanceProposalExecution | None = None
+        artifact_metadata: dict[str, Any] = {}
+        if self._model_classifier is not None:
+            try:
+                async with self._uow_factory() as policy_uow:
+                    access_policy = await build_synthesis_access_policy(
+                        snapshot, extraction, policy_uow.source_documents
+                    )
+            except (AttributeError, TypeError, ValueError) as exc:
+                return RelevanceProjectionExecution(
+                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
+                    artifact=None,
+                    projection=projection,
+                    error_code="relevance_classifier_access_policy_unavailable",
+                    error="The model access policy for the exact extraction is unavailable.",
+                    details={"reason": str(exc)},
+                )
+            if access_policy.do_not_submit:
+                return RelevanceProjectionExecution(
+                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
+                    artifact=None,
+                    projection=projection,
+                    error_code="relevance_classifier_policy_blocked",
+                    error="The source access policy forbids a model submission.",
+                    details={
+                        "do_not_submit": True,
+                        "external_llm_allowed": access_policy.external_llm_allowed,
+                    },
+                )
+            proposal = await self._model_classifier.propose(
+                run, snapshot, extraction, access_policy
+            )
+            if proposal.status is RelevanceProposalStatus.NEEDS_REVIEW:
+                return RelevanceProjectionExecution(
+                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
+                    artifact=None,
+                    projection=projection,
+                    model_calls=proposal.model_calls,
+                    model_run_id=proposal.model_run_id,
+                    invocation_hash=proposal.invocation_hash,
+                    parse_identity=proposal.parse_identity,
+                    error_code=proposal.error_code,
+                    error=proposal.error,
+                    details=proposal.details,
+                )
+            projection = self._merge_model_proposals(projection, extraction, proposal)
+            artifact_metadata = {
+                "model_classifier_enabled": True,
+                "model_calls": proposal.model_calls,
+                "model_run_id": str(proposal.model_run_id) if proposal.model_run_id else None,
+                "model_invocation_hash": proposal.invocation_hash,
+                "model_parse_identity": proposal.parse_identity,
+                "model_proposal_rejection_count": len(projection.model_proposal_rejections),
+                "source_pair_relation_count": len(projection.source_pair_relations),
+            }
         async with self._uow_factory() as uow:
             execution = await persist_relevance_projection_in_uow(
-                uow, run, snapshot, projection, self._artifact_store
+                uow,
+                run,
+                snapshot,
+                projection,
+                self._artifact_store,
+                artifact_metadata=artifact_metadata,
             )
             if execution.status is RelevanceProjectionExecutionStatus.SUCCEEDED:
                 await uow.commit()
-            return execution
+            if proposal is None:
+                return execution
+            return replace(
+                execution,
+                model_calls=proposal.model_calls,
+                model_run_id=proposal.model_run_id,
+                invocation_hash=proposal.invocation_hash,
+                parse_identity=proposal.parse_identity,
+                details={
+                    **dict(proposal.details),
+                    "model_proposal_rejection_count": len(projection.model_proposal_rejections),
+                    "source_pair_relation_count": len(projection.source_pair_relations),
+                },
+            )
+
+    @staticmethod
+    def _merge_model_proposals(
+        baseline: RelevanceProjectionV1,
+        extraction: ProductionExtractionV1,
+        proposal: ModelRelevanceProposalExecution,
+    ) -> RelevanceProjectionV1:
+        evidence = dict(extraction_evidence_elements(extraction))
+        decisions = {item.evidence_ref: item for item in baseline.classifications}
+        rejections = list(proposal.rejections)
+        seen: set[ExtractionEvidenceRefV1] = set()
+        for item in proposal.classifications:
+            if item.evidence_ref in seen:
+                rejections.append(
+                    RelevanceProposalRejectionV1(
+                        item.block_id,
+                        RelevanceProposalRejectionReason.DUPLICATE_TARGET,
+                        item.raw_sha256,
+                    )
+                )
+                continue
+            seen.add(item.evidence_ref)
+            payload = evidence[item.evidence_ref]
+            if item.evidence_ref.kind is EvidenceKind.INDICATOR:
+                value = str(payload.get("value") or "").strip().casefold()
+                if value in _GENERIC_FILENAMES:
+                    rejections.append(
+                        RelevanceProposalRejectionV1(
+                            item.block_id,
+                            RelevanceProposalRejectionReason.GENERIC_FILENAME_GUARD,
+                            item.raw_sha256,
+                        )
+                    )
+                    continue
+                if _EMAIL.search(value):
+                    rejections.append(
+                        RelevanceProposalRejectionV1(
+                            item.block_id,
+                            RelevanceProposalRejectionReason.FOOTER_CONTACT_GUARD,
+                            item.raw_sha256,
+                        )
+                    )
+                    continue
+            supporting = tuple(
+                sorted(
+                    {item.evidence_ref, *item.supporting_evidence_refs},
+                    key=evidence_ref_sort_key,
+                )
+            )
+            if (
+                item.evidence_ref.kind is EvidenceKind.INDICATOR
+                and item.classification
+                in {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
+                and len(supporting) < 2
+            ):
+                rejections.append(
+                    RelevanceProposalRejectionV1(
+                        item.block_id,
+                        RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED,
+                        item.raw_sha256,
+                    )
+                )
+                decisions[item.evidence_ref] = RelevanceClassificationItemV1(
+                    evidence_ref=item.evidence_ref,
+                    classification=RelevanceClassification.INDETERMINATE,
+                    reason_code=RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+                    supporting_evidence_refs=supporting,
+                    provenance=RelevanceDecisionProvenance.MODEL_PROPOSAL,
+                )
+                continue
+            decisions[item.evidence_ref] = RelevanceClassificationItemV1(
+                evidence_ref=item.evidence_ref,
+                classification=item.classification,
+                reason_code=item.reason_code,
+                supporting_evidence_refs=supporting,
+                provenance=RelevanceDecisionProvenance.MODEL_PROPOSAL,
+            )
+
+        projection = replace(
+            baseline,
+            classifications=tuple(decisions.values()),
+            source_pair_relations=proposal.source_pair_relations,
+            model_proposal_rejections=tuple(rejections),
+        )
+        validate_relevance_projection_lineage(
+            projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+        )
+        return projection

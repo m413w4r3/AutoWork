@@ -63,6 +63,10 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     synthesis_access_policy_hash,
 )
+from cti_app.application.production_wire_archive import (
+    record_wire_parse_diagnostics,
+    verified_raw_output_text,
+)
 from cti_app.application.source_figure_inventory import (
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
@@ -129,9 +133,9 @@ if TYPE_CHECKING:
     from cti_app.application.production_stages import EditorialEnrichmentService
 
 EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v1"
-EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 1
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 2
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v3-subject-relevance-projection"
+    "editorial-enrichment-evidence-pack-v4-reserves-contradictions"
 )
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v2"
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
@@ -1024,6 +1028,8 @@ class EditorialEnrichmentEvidencePackV1:
     current_synthesis: Mapping[str, Any]
     narrative_evidence: tuple[Mapping[str, Any], ...]
     technical_evidence: tuple[Mapping[str, Any], ...]
+    reserve_evidence: tuple[Mapping[str, Any], ...]
+    source_pair_relations: tuple[Mapping[str, Any], ...]
     projection_hash: str | None = None
     policy_version: str = EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
@@ -1161,6 +1167,8 @@ def _prompt_evidence_record(
             "context": payload["context"],
             "evidence": payload["evidence_quote"],
         }
+    elif kind is EvidenceKind.UNCERTAINTY:
+        values = {"text": payload["text"]}
     else:
         values = {
             "type": payload["rule_type"],
@@ -1253,12 +1261,30 @@ def build_editorial_enrichment_evidence_pack(
             RelevanceClassification.INDETERMINATE,
         }
 
+    counter_refs = {
+        ref
+        for ref in entries
+        if projection is not None
+        and projection.classification_for(ref).classification
+        is RelevanceClassification.COUNTER_INDICATION
+    }
+    relation_refs = (
+        {
+            ref
+            for relation in projection.source_pair_relations
+            for ref in relation.supporting_evidence_refs
+        }
+        if projection is not None
+        else set()
+    )
+    reserve_refs = counter_refs | relation_refs
     narrative_refs = {
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
         and admitted(ref)
+        and ref not in counter_refs
     }
     technical_candidates = sorted(
         (
@@ -1266,6 +1292,7 @@ def build_editorial_enrichment_evidence_pack(
             for ref, payload in entries.items()
             if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
             and admitted(ref)
+            and ref not in counter_refs
             and (
                 str(payload.get("context") or "").strip()
                 or str(payload.get("evidence_quote") or "").strip()
@@ -1304,6 +1331,15 @@ def build_editorial_enrichment_evidence_pack(
     )
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(ordered_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
+    ordered_reserve_refs = tuple(
+        sorted(
+            reserve_refs,
+            key=lambda ref: (authority_key(ref), evidence_ref_sort_key(ref)),
+        )
+    )
+    reserve_handle_for_ref = {
+        ref: f"R{index:03d}" for index, ref in enumerate(ordered_reserve_refs, start=1)
+    }
     narrative_evidence = tuple(
         _prompt_evidence_record(
             handle_for_ref[ref],
@@ -1324,11 +1360,37 @@ def build_editorial_enrichment_evidence_pack(
         for ref in ordered_refs
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
     )
+    reserve_evidence = tuple(
+        MappingProxyType(
+            _prompt_evidence_record(
+                reserve_handle_for_ref[ref],
+                ref.kind,
+                entries[ref],
+                source=source_by_id[ref.source_document_id],
+            )
+        )
+        for ref in ordered_reserve_refs
+    )
+    source_pair_relations = tuple(
+        MappingProxyType(
+            {
+                "relation": relation.relation.value,
+                "reason": relation.reason,
+                "provenance": relation.provenance.value,
+                "supporting_handles": tuple(
+                    reserve_handle_for_ref[ref] for ref in relation.supporting_evidence_refs
+                ),
+            }
+        )
+        for relation in (projection.source_pair_relations if projection is not None else ())
+    )
     return EditorialEnrichmentEvidencePackV1(
         publication_language=synthesis.publication_language,
         current_synthesis=MappingProxyType(_synthesis_prompt_projection(synthesis, handle_for_ref)),
         narrative_evidence=tuple(MappingProxyType(record) for record in narrative_evidence),
         technical_evidence=tuple(MappingProxyType(record) for record in technical_evidence),
+        reserve_evidence=reserve_evidence,
+        source_pair_relations=source_pair_relations,
         projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
     )
@@ -1348,6 +1410,8 @@ def editorial_enrichment_evidence_pack_hash(
                 "current_synthesis": dict(pack.current_synthesis),
                 "narrative_evidence": [dict(item) for item in pack.narrative_evidence],
                 "technical_evidence": [dict(item) for item in pack.technical_evidence],
+                "reserve_evidence": [dict(item) for item in pack.reserve_evidence],
+                "source_pair_relations": [dict(item) for item in pack.source_pair_relations],
                 "relevance_projection_hash": pack.projection_hash,
             }
         )
@@ -1504,6 +1568,12 @@ def build_editorial_enrichment_model_request(
             "relevance_projection_hash": evidence_pack.projection_hash,
             "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
             "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
+            "reserves_and_contradictions_non_authoritative": {
+                "evidence": [dict(record) for record in evidence_pack.reserve_evidence],
+                "source_pair_relations": [
+                    dict(record) for record in evidence_pack.source_pair_relations
+                ],
+            },
         },
         "editorial_guidance": {
             "table_kinds": [item.value for item in EnrichmentTableKind],
@@ -2166,24 +2236,13 @@ class ProductionEditorialEnrichmentService:
         self, run: ModelRun, *, expected_text: str | None = None
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Verify archived output bytes before normalizing or parsing them."""
-        reference = run.raw_output_reference or (
-            run.output_references[0] if run.output_references else None
+        return await verified_raw_output_text(
+            self._model_gateway,
+            run,
+            error_prefix="editorial_enrichment",
+            error_field="wire_error_code",
+            expected_text=expected_text,
         )
-        if not reference or not run.raw_output_sha256:
-            return None, {"wire_error_code": "editorial_enrichment_raw_output_archive_missing"}
-        try:
-            raw_bytes = await self._model_gateway.read_output(reference)
-        except Exception:
-            return None, {"wire_error_code": "editorial_enrichment_raw_output_archive_unreadable"}
-        digest = hashlib.sha256(raw_bytes).hexdigest()
-        if digest != run.raw_output_sha256:
-            return None, {"wire_error_code": "editorial_enrichment_raw_output_hash_mismatch"}
-        if expected_text is not None and raw_bytes != expected_text.encode("utf-8"):
-            return None, {"wire_error_code": "editorial_enrichment_raw_output_response_mismatch"}
-        try:
-            return raw_bytes.decode("utf-8"), None
-        except UnicodeDecodeError:
-            return None, {"wire_error_code": "editorial_enrichment_raw_output_encoding_invalid"}
 
     async def _record_wire_parse(
         self,
@@ -2194,8 +2253,6 @@ class ProductionEditorialEnrichmentService:
         """Persist parse identity and the normalized strict proposal beside raw bytes."""
         assert run.raw_output_sha256 is not None
         identity = editorial_enrichment_parse_identity(run.raw_output_sha256, evidence_pack)
-        if run.parser_stage == "editorial_enrichment" and run.normalization_version == identity:
-            return identity
         validation_errors: list[dict[str, Any]] = [
             {
                 "path": ["blocks", item.block_id],
@@ -2212,31 +2269,25 @@ class ProductionEditorialEnrichmentService:
                     "value_sha256": run.raw_output_sha256,
                 }
             )
-        normalized_reference: str | None = None
-        normalized_sha256: str | None = None
         transformations = [
             *parsed.transformations,
             f"editorial_enrichment_parser:{EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION}",
             f"editorial_enrichment_contract:{EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION}",
             f"editorial_enrichment_prompt:{EDITORIAL_ENRICHMENT_PROMPT_VERSION}",
         ]
+        normalized = None
         if parsed.proposal is not None:
             normalized = parsed.proposal.model_dump_json().encode("utf-8")
-            normalized_sha256 = hashlib.sha256(normalized).hexdigest()
-            normalized_reference = await self._model_gateway.archive_output(
-                normalized, mime_type="application/json; charset=utf-8"
-            )
             transformations.append("editorial_enrichment_text_blocks_to_strict_proposal")
-        await self._model_gateway.record_output_diagnostics(
-            run.id,
-            normalized_reference=normalized_reference,
-            normalized_sha256=normalized_sha256,
+        return await record_wire_parse_diagnostics(
+            self._model_gateway,
+            run,
             parser_stage="editorial_enrichment",
-            normalization_version=identity,
+            parse_identity=identity,
+            validation_errors=validation_errors,
             transformations=tuple(transformations),
-            validation_errors=tuple(validation_errors),
+            normalized_output=normalized,
         )
-        return identity
 
     async def _ingest_source_figures(self, inventory: SourceFigureInventoryResult) -> None:
         if not inventory.accepted:

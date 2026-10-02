@@ -1,0 +1,722 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import replace
+from types import SimpleNamespace
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+
+from cti_app.application.model_gateway import (
+    ModelExecution,
+    ModelGatewayError,
+    ModelRequest,
+    ModelSubmissionReconciliationRequiredError,
+)
+from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
+    build_editorial_enrichment_model_request,
+    editorial_enrichment_evidence_pack_hash,
+)
+from cti_app.application.production_relevance import (
+    ProductionRelevanceProjectionService,
+    RelevanceProjectionExecutionStatus,
+    build_relevance_projection,
+)
+from cti_app.application.production_relevance_model import (
+    ModelRelevanceClassifier,
+    RelevanceProposalStatus,
+    build_relevance_model_evidence_pack,
+    parse_relevance_classifier_wire,
+)
+from cti_app.application.production_synthesis import (
+    SynthesisAccessPolicyV1,
+    SynthesisAccessSourceV1,
+    build_synthesis_evidence_pack,
+    build_synthesis_model_request,
+    canonical_extraction_hash,
+    extraction_evidence_elements,
+    synthesis_evidence_pack_hash,
+)
+from cti_app.domain.classification import TLP
+from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
+from cti_app.domain.production import (
+    ProductionArtifact,
+    ProductionArtifactStage,
+    ProductionArtifactStatus,
+    ProductionInputSnapshot,
+    ProductionRun,
+    SynthesisMode,
+)
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_to_json,
+)
+from cti_app.domain.production_references import ProductionEditorialRole
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceDecisionProvenance,
+    RelevanceProposalRejectionReason,
+    RelevanceSourcePairRelation,
+    relevance_projection_from_json,
+)
+from cti_app.domain.production_synthesis import (
+    SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
+    ProductionSynthesisV1,
+)
+from cti_app.domain.publication import ArtifactType
+from tests.test_production_relevance_domain import (
+    _extraction,
+    _fact,
+    _indicator,
+    _snapshot,
+    _source,
+)
+
+
+def _world() -> tuple[ProductionInputSnapshot, ProductionExtractionV1, tuple[UUID, UUID]]:
+    snapshot = _snapshot()
+    primary_id, counter_id = uuid4(), uuid4()
+    primary = _source(
+        primary_id,
+        facts=(
+            _fact(primary_id, "MOIS Bitcoin operation", context="A MOIS-linked Bitcoin operation."),
+            _fact(primary_id, "Campaign period", context="The operation ran in 2025."),
+        ),
+        indicators=(
+            _indicator(
+                primary_id,
+                "198.51.100.27",
+                ArtifactType.IP,
+                context="MOIS malware command-and-control server.",
+            ),
+            _indicator(
+                primary_id,
+                "config.json",
+                ArtifactType.FILENAME,
+                context="A MOIS malware report mentions config.json.",
+            ),
+        ),
+    )
+    counter = _source(
+        counter_id,
+        editorial_role=ProductionEditorialRole.COUNTER_ANALYSIS,
+        facts=(
+            _fact(
+                counter_id,
+                "Bitcoin observations are unattributed",
+                context="The vendor says it cannot attribute this activity to an actor.",
+            ),
+        ),
+    )
+    return snapshot, _extraction(snapshot, (primary, counter)), (primary_id, counter_id)
+
+
+def _access_policy(snapshot: ProductionInputSnapshot, source_ids: tuple[UUID, ...]):
+    sources = tuple(
+        SynthesisAccessSourceV1(source_id, TLP.CLEAR, True, False) for source_id in source_ids
+    )
+    return SynthesisAccessPolicyV1(
+        subject_tlp=snapshot.subject_tlp,
+        effective_tlp=TLP.CLEAR,
+        external_llm_allowed=True,
+        do_not_submit=False,
+        sources=sources,
+    )
+
+
+def _wire_classification(
+    handle: str,
+    classification: str,
+    reason: str,
+    *,
+    supporting: str = "",
+    block_id: str = "C001",
+) -> str:
+    rows = [
+        f"@@ CLASSIFICATION {block_id} @@",
+        f"handle: {handle}",
+        f"classification: {classification}",
+        f"reason_code: {reason}",
+    ]
+    if supporting:
+        rows.append(f"supporting_handles: {supporting}")
+    rows.append("END CLASSIFICATION")
+    return "\n".join(rows)
+
+
+def _wire_relation(handles: str, *, relation: str = "CONTRADICTION") -> str:
+    return "\n".join(
+        (
+            "@@ RELATION R001 @@",
+            f"relation: {relation}",
+            "reason: One report attributes the activity; the other states it is unattributed.",
+            f"supporting_handles: {handles}",
+            "END RELATION",
+        )
+    )
+
+
+def _ref_for(extraction, kind: EvidenceKind, value: str):
+    return next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is kind and value in {str(payload.get("value")), str(payload.get("text"))}
+    )
+
+
+class _FakeGateway:
+    def __init__(self, responses: list[str] | Exception) -> None:
+        self.responses = responses if isinstance(responses, Exception) else list(responses)
+        self.calls: list[ModelRequest] = []
+        self.runs: dict[UUID, ModelRun] = {}
+        self.outputs: dict[str, bytes] = {}
+        self.diagnostics: list[dict[str, object]] = []
+        self._normalized_counter = 0
+
+    async def draft(self, request: ModelRequest, output_schema: object | None = None):
+        del output_schema
+        self.calls.append(request)
+        if isinstance(self.responses, Exception):
+            raise self.responses
+        text = self.responses.pop(0)
+        run = ModelRun(
+            provider=ModelProvider.FAKE,
+            model_role=ModelRole.DRAFTING,
+            requested_model="fake-relevance-model",
+            prompt_template_id=request.prompt_template_id,
+            prompt_template_version=request.prompt_template_version,
+            authorized_input_hash=hashlib.sha256(request.text.encode()).hexdigest(),
+            evidence_pack_hash=request.evidence_pack_hash,
+            parameters=dict(request.parameters),
+            id=request.run_id or uuid4(),
+        )
+        raw = text.encode()
+        reference = f"model-output://{run.id}"
+        run.raw_output_reference = reference
+        run.raw_output_sha256 = hashlib.sha256(raw).hexdigest()
+        run.raw_output_chars = len(text)
+        run.succeed(
+            actual_model_version="fake-v1",
+            duration_ms=1,
+            usage=ModelUsage(total_tokens=1),
+            output_references=(reference,),
+            response_id=None,
+        )
+        self.outputs[reference] = raw
+        self.runs[run.id] = run
+        return ModelExecution(run=run, output_text=text)
+
+    async def get_run(self, run_id: UUID):
+        return self.runs.get(run_id)
+
+    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000):
+        raw = self.outputs[reference]
+        if len(raw) > max_bytes:
+            raise ValueError("too large")
+        return raw
+
+    async def archive_output(self, content: bytes, *, mime_type: str):
+        del mime_type
+        self._normalized_counter += 1
+        reference = f"model-normalized://{self._normalized_counter}"
+        self.outputs[reference] = content
+        return reference
+
+    async def record_output_diagnostics(self, run_id: UUID, **values: object) -> None:
+        self.diagnostics.append({"run_id": run_id, **values})
+        run = self.runs[run_id]
+        run.normalized_output_reference = values["normalized_reference"]  # type: ignore[assignment]
+        run.normalized_output_sha256 = values["normalized_sha256"]  # type: ignore[assignment]
+        run.parser_stage = values["parser_stage"]  # type: ignore[assignment]
+        run.normalization_version = values["normalization_version"]  # type: ignore[assignment]
+        run.transformations = values["transformations"]  # type: ignore[assignment]
+        run.validation_errors = values["validation_errors"]  # type: ignore[assignment]
+
+
+class _MemoryArtifacts:
+    def __init__(self) -> None:
+        self.items: list[ProductionArtifact] = []
+        self.stale: list[tuple[UUID, str]] = []
+
+    async def get_current(self, run_id: UUID, stage: str):
+        matches = [
+            artifact
+            for artifact in self.items
+            if artifact.production_run_id == run_id
+            and artifact.stage.value == stage
+            and artifact.status is not ProductionArtifactStatus.STALE
+        ]
+        return max(matches, key=lambda artifact: artifact.version, default=None)
+
+    async def list_for_run(self, run_id: UUID):
+        return [artifact for artifact in self.items if artifact.production_run_id == run_id]
+
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.items.append(artifact)
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        self.stale.append((run_id, stage))
+
+
+class _MemoryStore:
+    def __init__(self, payloads: dict[UUID, bytes] | None = None) -> None:
+        self.payloads = payloads or {}
+
+    async def read_json(self, blob_id: UUID):
+        return json.loads(self.payloads[blob_id])
+
+    async def read_bytes(self, blob_id: UUID):
+        return self.payloads[blob_id]
+
+    async def store_stage_payloads(self, *, canonical: dict[str, object]):
+        blob_id = uuid4()
+        self.payloads[blob_id] = ProductionArtifactStore.canonical_json_bytes(canonical)
+        return None, blob_id, None
+
+
+class _MemoryUow:
+    def __init__(self, documents: dict[UUID, object], artifacts: _MemoryArtifacts) -> None:
+        self.source_documents = _MemorySourceDocuments(documents)
+        self.production_artifacts = artifacts
+        self.commits = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _MemorySourceDocuments:
+    def __init__(self, documents: dict[UUID, object]) -> None:
+        self.documents = documents
+
+    async def get(self, source_id: UUID):
+        return self.documents.get(source_id)
+
+
+class _MemoryUowFactory:
+    def __init__(self, uow: _MemoryUow) -> None:
+        self.uow = uow
+
+    def __call__(self):
+        return self.uow
+
+
+def _service_world(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    source_ids: tuple[UUID, ...],
+    gateway: _FakeGateway,
+) -> Any:
+    documents = {
+        source_id: SimpleNamespace(
+            id=source_id,
+            subject_id=snapshot.subject_id,
+            tlp=TLP.CLEAR,
+            external_llm_allowed=True,
+            do_not_submit=False,
+        )
+        for source_id in source_ids
+    }
+    artifacts = _MemoryArtifacts()
+    uow = _MemoryUow(documents, artifacts)
+    extraction_blob_id = uuid4()
+    store = _MemoryStore(
+        {
+            extraction_blob_id: ProductionArtifactStore.canonical_json_bytes(
+                production_extraction_to_json(extraction)
+            )
+        }
+    )
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash="a" * 64,
+        canonical_blob_id=extraction_blob_id,
+    )
+    service = ProductionRelevanceProjectionService(
+        _MemoryUowFactory(uow),
+        store,  # type: ignore[arg-type]
+        model_gateway=gateway,
+    )
+    return SimpleNamespace(
+        service=service,
+        run=run,
+        extraction_artifact=extraction_artifact,
+        store=store,
+        artifacts=artifacts,
+        uow=uow,
+    )
+
+
+@pytest.mark.asyncio
+async def test_model_proposals_merge_with_deterministic_fallback_and_guards() -> None:
+    snapshot, extraction, source_ids = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    by_value = {
+        payload.get("value"): ref for ref, payload in extraction_evidence_elements(extraction)
+    }
+    handles = {ref: handle for handle, ref in pack._handle_to_ref.items()}
+    primary = by_value["MOIS Bitcoin operation"]
+    omitted = by_value["Campaign period"]
+    ioc = by_value["198.51.100.27"]
+    generic = by_value["config.json"]
+    counter = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if payload.get("value") == "Bitcoin observations are unattributed"
+    )
+    raw = "\n".join(
+        (
+            _wire_classification(
+                handles[primary], "CONTEXT", "context_source_without_relation", block_id="C001"
+            ),
+            _wire_classification(
+                handles[ioc],
+                "DIRECT",
+                "malicious_subject_relation",
+                supporting=handles[primary],
+                block_id="C002",
+            ),
+            _wire_classification(
+                handles[generic],
+                "DIRECT",
+                "malicious_subject_relation",
+                supporting=handles[primary],
+                block_id="C003",
+            ),
+            _wire_classification(
+                handles[counter],
+                "COUNTER_INDICATION",
+                "explicit_counter_analysis",
+                block_id="C004",
+            ),
+            _wire_relation(f"{handles[primary]}, {handles[counter]}"),
+            _wire_classification("E999", "DIRECT", "malicious_subject_relation", block_id="C006"),
+        )
+    )
+    gateway = _FakeGateway([raw])
+    world = _service_world(snapshot, extraction, source_ids, gateway)
+
+    result = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert result.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert result.model_calls == 1
+    decisions = {item.evidence_ref: item for item in result.projection.classifications}
+    assert decisions[primary].classification is RelevanceClassification.CONTEXT
+    assert decisions[primary].provenance is RelevanceDecisionProvenance.MODEL_PROPOSAL
+    assert decisions[omitted].classification is RelevanceClassification.DIRECT
+    assert decisions[omitted].provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+    assert decisions[ioc].classification is RelevanceClassification.DIRECT
+    assert decisions[ioc].provenance is RelevanceDecisionProvenance.MODEL_PROPOSAL
+    assert decisions[generic].classification is RelevanceClassification.CONTEXT
+    assert decisions[generic].reason_code.value == "generic_filename"
+    assert len(result.projection.source_pair_relations) == 1
+    assert (
+        result.projection.source_pair_relations[0].relation
+        is RelevanceSourcePairRelation.CONTRADICTION
+    )
+    rejection_codes = {item.reason_code for item in result.projection.model_proposal_rejections}
+    assert RelevanceProposalRejectionReason.GENERIC_FILENAME_GUARD in rejection_codes
+    assert RelevanceProposalRejectionReason.UNKNOWN_HANDLE in rejection_codes
+    assert gateway.calls[0].web_search is False
+    assert all(str(source_id) not in gateway.calls[0].text for source_id in source_ids)
+    assert result.artifact is not None
+    stored = await world.store.read_json(result.artifact.canonical_blob_id)
+    restored = relevance_projection_from_json(stored)
+    assert restored.source_pair_relations == result.projection.source_pair_relations
+    assert world.artifacts.items[0].metadata["model_calls"] == 1
+
+
+def test_model_direct_ioc_without_documented_relation_is_downgraded() -> None:
+    snapshot, extraction, _ = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    ioc_ref = _ref_for(extraction, EvidenceKind.INDICATOR, "198.51.100.27")
+    handle = pack._handle_for_ref[ioc_ref]
+    parsed = parse_relevance_classifier_wire(
+        _wire_classification(handle, "DIRECT", "malicious_subject_relation"),
+        pack,
+        extraction,
+    )
+    baseline = build_relevance_projection(snapshot, extraction)
+    from cti_app.application.production_relevance_model import ModelRelevanceProposalExecution
+
+    merged = ProductionRelevanceProjectionService._merge_model_proposals(
+        baseline,
+        extraction,
+        ModelRelevanceProposalExecution(
+            status=RelevanceProposalStatus.SUCCEEDED,
+            classifications=parsed.classifications,
+            rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+        ),
+    )
+
+    decision = merged.classification_for(ioc_ref)
+    assert decision.classification is RelevanceClassification.INDETERMINATE
+    assert decision.provenance is RelevanceDecisionProvenance.MODEL_PROPOSAL
+    assert any(
+        item.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
+        for item in merged.model_proposal_rejections
+    )
+
+
+def test_wire_parser_keeps_valid_blocks_around_citations_fences_and_malformed_block() -> None:
+    snapshot, extraction, _ = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    ref = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    handle = pack._handle_for_ref[ref]
+    raw = "\n".join(
+        (
+            "```text",
+            "citeturn0search0",
+            "@@ CLASSIFICATION BAD @@",
+            f"handle: {handle}",
+            "classification: CONTEXT",
+            "END CLASSIFICATION",
+            _wire_classification(
+                handle,
+                "CONTEXT",
+                "context_source_without_relation",
+                block_id="GOOD",
+            ),
+            "```",
+        )
+    )
+
+    parsed = parse_relevance_classifier_wire(raw, pack, extraction)
+
+    assert len(parsed.classifications) == 1
+    assert parsed.classifications[0].evidence_ref == ref
+    assert parsed.rejections[0].reason_code is RelevanceProposalRejectionReason.MALFORMED_BLOCK
+    assert parsed.transformations
+
+
+@pytest.mark.asyncio
+async def test_model_classifier_replays_parser_changes_and_invokes_on_prompt_changes() -> None:
+    snapshot, extraction, source_ids = _world()
+    access = _access_policy(snapshot, source_ids)
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    target = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    text = _wire_classification(
+        pack._handle_for_ref[target], "CONTEXT", "context_source_without_relation"
+    )
+    gateway = _FakeGateway([text, text])
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+
+    first = await ModelRelevanceClassifier(gateway).propose(run, snapshot, extraction, access)
+    parser_bump = await ModelRelevanceClassifier(
+        gateway, parser_version="subject-relevance-wire-v2"
+    ).propose(run, snapshot, extraction, access)
+    prompt_bump = await ModelRelevanceClassifier(
+        gateway, prompt_version="subject-relevance-classifier-v2"
+    ).propose(run, snapshot, extraction, access)
+
+    assert first.status is RelevanceProposalStatus.SUCCEEDED
+    assert first.model_calls == 1
+    assert parser_bump.status is RelevanceProposalStatus.SUCCEEDED
+    assert parser_bump.model_calls == 0
+    assert parser_bump.invocation_hash == first.invocation_hash
+    assert parser_bump.parse_identity != first.parse_identity
+    assert prompt_bump.model_calls == 1
+    assert prompt_bump.invocation_hash != first.invocation_hash
+    assert len(gateway.calls) == 2
+    assert gateway.diagnostics[0]["parser_stage"] == "relevance_classifier"
+
+
+@pytest.mark.asyncio
+async def test_unintelligible_and_ambiguous_model_results_require_review_without_fallback() -> None:
+    snapshot, extraction, source_ids = _world()
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    access = _access_policy(snapshot, source_ids)
+    unintelligible_gateway = _FakeGateway(["I do not understand the evidence."])
+    unintelligible = await ModelRelevanceClassifier(unintelligible_gateway).propose(
+        run, snapshot, extraction, access
+    )
+    assert unintelligible.status is RelevanceProposalStatus.NEEDS_REVIEW
+    assert unintelligible.model_calls == 1
+    assert not unintelligible.classifications
+
+    ambiguous_gateway = _FakeGateway(
+        ModelSubmissionReconciliationRequiredError(details={"phase": "submit"})
+    )
+    world = _service_world(snapshot, extraction, source_ids, ambiguous_gateway)
+    result = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert result.status is RelevanceProjectionExecutionStatus.NEEDS_REVIEW
+    assert result.model_calls == 1
+    assert result.error_code == "model_submission_reconciliation_required"
+    assert result.artifact is None
+    assert world.artifacts.items == []
+    assert len(ambiguous_gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_requires_review_and_disabled_policy_uses_deterministic_default() -> (
+    None
+):
+    snapshot, extraction, source_ids = _world()
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    access = _access_policy(snapshot, source_ids)
+    failed = await ModelRelevanceClassifier(
+        _FakeGateway(ModelGatewayError("provider authentication failed"))
+    ).propose(run, snapshot, extraction, access)
+    assert failed.status is RelevanceProposalStatus.NEEDS_REVIEW
+    assert failed.error_code == "relevance_classifier_model_call_failed"
+    assert failed.model_calls == 1
+
+    gateway = _FakeGateway(["unused"])
+    disabled = _service_world(snapshot, extraction, source_ids, gateway)
+    disabled.service = ProductionRelevanceProjectionService(
+        _MemoryUowFactory(disabled.uow),
+        disabled.store,  # type: ignore[arg-type]
+        model_gateway=gateway,
+        model_enabled=False,
+    )
+    result = await disabled.service.execute(disabled.run, snapshot, disabled.extraction_artifact)
+    assert result.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert result.model_calls == 0
+    assert gateway.calls == []
+    assert all(
+        item.provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+        for item in result.projection.classifications
+    )
+
+
+def test_reserve_and_contradiction_context_is_handle_addressed_and_leak_guard_clean() -> None:
+    snapshot, extraction, source_ids = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    by_ref = {ref: handle for handle, ref in pack._handle_to_ref.items()}
+    first = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    second = _ref_for(extraction, EvidenceKind.FACT, "Bitcoin observations are unattributed")
+    output = "\n".join(
+        (
+            _wire_classification(
+                by_ref[second],
+                "COUNTER_INDICATION",
+                "explicit_counter_analysis",
+                block_id="C002",
+            ),
+            _wire_relation(f"{by_ref[first]}, {by_ref[second]}"),
+        )
+    )
+    parsed = parse_relevance_classifier_wire(output, pack, extraction)
+    assert parsed.source_pair_relations, parsed.rejections
+    baseline = build_relevance_projection(snapshot, extraction)
+    from cti_app.application.production_relevance_model import ModelRelevanceProposalExecution
+
+    projection = ProductionRelevanceProjectionService._merge_model_proposals(
+        baseline,
+        extraction,
+        ModelRelevanceProposalExecution(
+            status=RelevanceProposalStatus.SUCCEEDED,
+            classifications=parsed.classifications,
+            source_pair_relations=parsed.source_pair_relations,
+        ),
+    )
+    synthesis_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    policy = _access_policy(snapshot, source_ids)
+    synthesis_request = build_synthesis_model_request(
+        ProductionRun(
+            id=snapshot.production_run_id,
+            subject_id=snapshot.subject_id,
+            edition_id=snapshot.edition_id,
+        ),
+        snapshot,
+        extraction,
+        synthesis_pack,
+        policy,
+        SynthesisMode.FRESH,
+    )
+    synthesis = ProductionSynthesisV1(
+        schema_version=1,
+        subject_id=snapshot.subject_id,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=snapshot.subject_title,
+        lead=(),
+        sections=(),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    enrichment_pack = build_editorial_enrichment_evidence_pack(
+        snapshot, extraction, synthesis, projection
+    )
+    enrichment_request = build_editorial_enrichment_model_request(
+        ProductionRun(
+            id=snapshot.production_run_id,
+            subject_id=snapshot.subject_id,
+            edition_id=snapshot.edition_id,
+        ),
+        snapshot,
+        extraction,
+        synthesis,
+        enrichment_pack,
+        policy,
+    )
+
+    assert synthesis_pack.reserve_evidence
+    assert synthesis_pack.source_pair_relations[0]["relation"] == "contradiction"
+    assert "NON-AUTHORITATIVE CONTEXT" in synthesis_request.text
+    assert all(str(source_id) not in synthesis_request.text for source_id in source_ids)
+    assert "reserves_and_contradictions_non_authoritative" in enrichment_request.text
+    assert all(str(source_id) not in enrichment_request.text for source_id in source_ids)
+    assert enrichment_pack.reserve_evidence
+    assert synthesis_evidence_pack_hash(synthesis_pack) != ""
+    assert editorial_enrichment_evidence_pack_hash(enrichment_pack) != ""
+    with pytest.raises(ValueError, match="synthesis_unknown_evidence"):
+        synthesis_pack.resolve_handle(str(synthesis_pack.reserve_evidence[0]["handle"]))
+
+
+def test_model_relevance_context_and_projection_are_subject_specific_for_shared_capture() -> None:
+    first_snapshot, first_extraction, _ = _world()
+    second_snapshot = replace(
+        first_snapshot,
+        subject_id=uuid4(),
+        production_run_id=uuid4(),
+        subject_title="Different malware campaign",
+        actor_or_campaign="Different actor",
+        reuse_basis_hash="",
+        input_hash="",
+    )
+    second_extraction = _extraction(second_snapshot, first_extraction.sources)
+
+    first_pack = build_relevance_model_evidence_pack(first_snapshot, first_extraction)
+    second_pack = build_relevance_model_evidence_pack(second_snapshot, second_extraction)
+    first_projection = build_relevance_projection(first_snapshot, first_extraction)
+    second_projection = build_relevance_projection(second_snapshot, second_extraction)
+
+    assert first_pack.evidence_items == second_pack.evidence_items
+    assert first_pack.evidence_pack_hash != second_pack.evidence_pack_hash
+    assert first_projection.input_hash != second_projection.input_hash
+    assert first_projection.projection_hash != second_projection.projection_hash

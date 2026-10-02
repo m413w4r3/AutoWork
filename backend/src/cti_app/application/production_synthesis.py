@@ -43,6 +43,10 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
     SYNTHESIS_WIRE_PARSER_VERSION,
 )
+from cti_app.application.production_wire_archive import (
+    record_wire_parse_diagnostics,
+    verified_raw_output_text,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.model_runs import ModelRun, ModelRunStatus
 from cti_app.domain.production import (
@@ -96,9 +100,9 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v4-subject-relevance-projection"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v5-reserves-contradictions"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v3-subject-relevance-projection"
-SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
+SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v1"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
@@ -949,6 +953,14 @@ def _prompt_evidence_record(
             "context": payload["context"],
             "evidence": payload["evidence_quote"],
         }
+    if kind is EvidenceKind.UNCERTAINTY:
+        return {
+            "handle": handle,
+            "kind": kind.value,
+            "source_role": source.role.value,
+            "editorial_role": source.editorial_role.value,
+            "text": payload["text"],
+        }
     return {
         "handle": handle,
         "kind": kind.value,
@@ -972,6 +984,8 @@ class SynthesisEvidencePackV1:
     period_end: date
     narrative_evidence: tuple[Mapping[str, Any], ...]
     technical_evidence: tuple[Mapping[str, Any], ...]
+    reserve_evidence: tuple[Mapping[str, Any], ...]
+    source_pair_relations: tuple[Mapping[str, Any], ...]
     uncertainties: tuple[str, ...]
     projection_hash: str | None = None
     policy_version: str = SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION
@@ -1028,18 +1042,37 @@ def build_synthesis_evidence_pack(
             RelevanceClassification.INDETERMINATE,
         }
 
+    counter_refs = {
+        ref
+        for ref in entries
+        if projection is not None
+        and projection.classification_for(ref).classification
+        is RelevanceClassification.COUNTER_INDICATION
+    }
+    relation_refs = (
+        {
+            ref
+            for relation in projection.source_pair_relations
+            for ref in relation.supporting_evidence_refs
+        }
+        if projection is not None
+        else set()
+    )
+    reserve_refs = counter_refs | relation_refs
     narrative_refs = {
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
         and admitted(ref)
+        and ref not in counter_refs
     }
     technical_candidates = [
         ref
         for ref, payload in entries.items()
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
         and admitted(ref)
+        and ref not in counter_refs
         and (str(payload["context"]).strip() or str(payload["evidence_quote"]).strip())
     ]
     technical_refs = set(
@@ -1073,6 +1106,13 @@ def build_synthesis_evidence_pack(
     )
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(catalogue_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
+    reserve_catalogue_refs = sorted(
+        reserve_refs,
+        key=lambda ref: (authority_key(ref), evidence_ref_sort_key(ref)),
+    )
+    reserve_handle_for_ref = {
+        ref: f"R{index:03d}" for index, ref in enumerate(reserve_catalogue_refs, start=1)
+    }
 
     narrative_evidence = tuple(
         _prompt_evidence_record(
@@ -1094,6 +1134,30 @@ def build_synthesis_evidence_pack(
         for ref in catalogue_refs
         if ref in technical_refs
     )
+    reserve_evidence = tuple(
+        MappingProxyType(
+            _prompt_evidence_record(
+                reserve_handle_for_ref[ref],
+                ref.kind,
+                entries[ref],
+                source=source_by_id[ref.source_document_id],
+            )
+        )
+        for ref in reserve_catalogue_refs
+    )
+    source_pair_relations = tuple(
+        MappingProxyType(
+            {
+                "relation": relation.relation.value,
+                "reason": relation.reason,
+                "provenance": relation.provenance.value,
+                "supporting_handles": tuple(
+                    reserve_handle_for_ref[ref] for ref in relation.supporting_evidence_refs
+                ),
+            }
+        )
+        for relation in (projection.source_pair_relations if projection is not None else ())
+    )
     uncertainties = build_synthesis_uncertainties(extraction, projection=projection)
 
     return SynthesisEvidencePackV1(
@@ -1105,6 +1169,8 @@ def build_synthesis_evidence_pack(
         period_end=snapshot.period_end,
         narrative_evidence=narrative_evidence,
         technical_evidence=technical_evidence,
+        reserve_evidence=reserve_evidence,
+        source_pair_relations=source_pair_relations,
         uncertainties=tuple(item.text for item in uncertainties),
         projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
@@ -1127,6 +1193,8 @@ def synthesis_evidence_pack_hash(evidence_pack: SynthesisEvidencePackV1) -> str:
         "period_end": evidence_pack.period_end.isoformat(),
         "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
         "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
+        "reserve_evidence": [dict(record) for record in evidence_pack.reserve_evidence],
+        "source_pair_relations": [dict(record) for record in evidence_pack.source_pair_relations],
         "uncertainties": list(evidence_pack.uncertainties),
         "relevance_projection_hash": evidence_pack.projection_hash,
     }
@@ -1328,6 +1396,24 @@ def build_synthesis_model_request(
     for record in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence):
         prompt_lines.extend(_render_evidence_record(record))
         prompt_lines.append("")
+    if evidence_pack.reserve_evidence or evidence_pack.source_pair_relations:
+        prompt_lines.extend(
+            (
+                "@@RESERVES / CONTRADICTIONS — NON-AUTHORITATIVE CONTEXT@@",
+                "These R handles preserve qualifications and source-pair analysis.",
+                "They are not claim evidence handles and must not be presented as confirmed facts.",
+            )
+        )
+        for record in evidence_pack.reserve_evidence:
+            prompt_lines.extend(_render_evidence_record(record))
+            prompt_lines.append("")
+        for relation in evidence_pack.source_pair_relations:
+            prompt_lines.append(
+                "SOURCE PAIR RELATION: "
+                f"{relation['relation']} — {relation['reason']} "
+                f"(handles: {', '.join(relation['supporting_handles'])})"
+            )
+        prompt_lines.append("@@END RESERVES / CONTRADICTIONS@@")
     if evidence_pack.uncertainties:
         prompt_lines.append("@@ANALYTICAL UNCERTAINTIES@@")
         prompt_lines.extend(evidence_pack.uncertainties)
@@ -2758,24 +2844,12 @@ class ProductionSynthesisService:
         self, run: ModelRun, *, expected_text: str | None = None
     ) -> tuple[str | None, dict[str, Any] | None]:
         """Verify archived bytes against the immutable response digest before parsing."""
-        reference = run.raw_output_reference or (
-            run.output_references[0] if run.output_references else None
+        return await verified_raw_output_text(
+            self._model_gateway,
+            run,
+            error_prefix="synthesis",
+            expected_text=expected_text,
         )
-        if not reference or not run.raw_output_sha256:
-            return None, {"error_code": "synthesis_raw_output_archive_missing"}
-        try:
-            raw_bytes = await self._model_gateway.read_output(reference)
-        except Exception:
-            return None, {"error_code": "synthesis_raw_output_archive_unreadable"}
-        digest = hashlib.sha256(raw_bytes).hexdigest()
-        if digest != run.raw_output_sha256:
-            return None, {"error_code": "synthesis_raw_output_hash_mismatch"}
-        if expected_text is not None and raw_bytes != expected_text.encode("utf-8"):
-            return None, {"error_code": "synthesis_raw_output_response_mismatch"}
-        try:
-            return raw_bytes.decode("utf-8"), None
-        except UnicodeDecodeError:
-            return None, {"error_code": "synthesis_raw_output_encoding_invalid"}
 
     async def _record_wire_parse(
         self,
@@ -2788,9 +2862,6 @@ class ProductionSynthesisService:
         """Persist parser identity and normalized strict proposal beside raw output."""
         assert run.raw_output_sha256 is not None
         identity = synthesis_parse_identity(run.raw_output_sha256, evidence_pack)
-        normalization_version = identity
-        if run.parser_stage == "synthesis" and run.normalization_version == normalization_version:
-            return identity
         validation_errors: list[dict[str, Any]] = [
             {
                 "path": ["blocks", item.block_id],
@@ -2807,31 +2878,25 @@ class ProductionSynthesisService:
                     "value_sha256": run.raw_output_sha256,
                 }
             )
-        normalized_reference: str | None = None
-        normalized_sha256: str | None = None
         transformations = [
             *parsed.transformations,
             f"synthesis_parser:{SYNTHESIS_WIRE_PARSER_VERSION}",
             f"synthesis_contract:{SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",
             f"synthesis_prompt:{SYNTHESIS_PROMPT_VERSION}",
         ]
+        normalized = None
         if parsed.proposal is not None:
             normalized = parsed.proposal.model_dump_json().encode("utf-8")
-            normalized_sha256 = hashlib.sha256(normalized).hexdigest()
-            normalized_reference = await self._model_gateway.archive_output(
-                normalized, mime_type="application/json; charset=utf-8"
-            )
             transformations.append("synthesis_text_blocks_to_strict_proposal")
-        await self._model_gateway.record_output_diagnostics(
-            run.id,
-            normalized_reference=normalized_reference,
-            normalized_sha256=normalized_sha256,
+        return await record_wire_parse_diagnostics(
+            self._model_gateway,
+            run,
             parser_stage="synthesis",
-            normalization_version=normalization_version,
+            parse_identity=identity,
+            validation_errors=validation_errors,
             transformations=tuple(transformations),
-            validation_errors=tuple(validation_errors),
+            normalized_output=normalized,
         )
-        return identity
 
     async def _draft(
         self,

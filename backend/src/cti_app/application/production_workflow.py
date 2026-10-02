@@ -499,7 +499,12 @@ class ProductionWorkflowOrchestrator:
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
         self._relevance_projection = (
-            ProductionRelevanceProjectionService(production_uow_factory, artifact_store)
+            ProductionRelevanceProjectionService(
+                production_uow_factory,
+                artifact_store,
+                model_gateway=self._model_gateway,
+                model_enabled=get_settings().production_relevance_classifier_enabled,
+            )
             if artifact_store is not None
             else None
         )
@@ -1422,18 +1427,41 @@ class ProductionWorkflowOrchestrator:
     def _relevance_projection_execution_result(
         execution: RelevanceProjectionExecution,
     ) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "stage": ProductionStage.RELEVANCE_PROJECTION.value,
-            "status": (
-                "reused"
-                if execution.status is RelevanceProjectionExecutionStatus.REUSED
-                else "success"
-            ),
-            "artifact_id": str(execution.artifact.id),
-            "input_hash": execution.projection.input_hash,
-            "projection_hash": execution.projection.projection_hash,
-            "classification_count": len(execution.projection.classifications),
+            "model_calls": execution.model_calls,
         }
+        if execution.model_run_id is not None:
+            result["model_run_id"] = str(execution.model_run_id)
+        result.update(
+            {
+                "status": (
+                    "reused"
+                    if execution.status is RelevanceProjectionExecutionStatus.REUSED
+                    else (
+                        "needs_review"
+                        if execution.status is RelevanceProjectionExecutionStatus.NEEDS_REVIEW
+                        else "success"
+                    )
+                ),
+                "input_hash": execution.projection.input_hash,
+                "projection_hash": execution.projection.projection_hash,
+                "classification_count": len(execution.projection.classifications),
+            }
+        )
+        if execution.artifact is not None:
+            result["artifact_id"] = str(execution.artifact.id)
+        if execution.invocation_hash is not None:
+            result["invocation_hash"] = execution.invocation_hash
+        if execution.parse_identity is not None:
+            result["parse_identity"] = execution.parse_identity
+        if execution.error_code is not None:
+            result["error_code"] = execution.error_code
+        if execution.error is not None:
+            result["error"] = execution.error
+        if execution.details:
+            result["details"] = dict(execution.details)
+        return result
 
     @staticmethod
     def _synthesis_execution_result(
