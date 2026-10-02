@@ -1045,6 +1045,9 @@ def test_archived_source_chunks_preserve_word_boundaries_and_overlap(
     chunks = production_extraction.archived_source_chunks(source_text)
 
     assert len(chunks) > 1
+    raw_words = source_text.split()
+    retained_words = {word for chunk in chunks for word in chunk.split()}
+    assert sum(word in retained_words for word in raw_words) == len(raw_words)
     assert all(not chunk.endswith("Address-po") for chunk in chunks)
     assert all(not chunk.startswith("rt ") for chunk in chunks)
     assert any("Address-port" in chunk for chunk in chunks)
@@ -1926,6 +1929,8 @@ async def test_evidence_rejections_are_reported_for_the_repair_desk() -> None:
     ]
     # Only repair-addressable kinds (artifacts, rules) reach the Repair Desk.
     assert rejected == [("artifact", "ghost.security-lab.io")]
+    assert len(execution.rejections) == 1
+    assert execution.rejections[0].rejection.reason_code == "source_evidence_missing"
     assert execution.rejections[0].source.canonical_url == CORE_URL
     assert execution.rejections[0].model_run_id is not None
 

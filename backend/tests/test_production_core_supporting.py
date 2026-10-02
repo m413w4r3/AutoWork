@@ -8,6 +8,7 @@ from cti_app.application.production_prompts import (
     ProductionPromptTemplates,
 )
 from cti_app.application.production_references import (
+    PRODUCTION_REFERENCE_PARSER_VERSION,
     load_legacy_reference_report,
     parse_production_reference_proposals,
     production_reference_corpus_from_json,
@@ -355,22 +356,33 @@ text: Ignored legacy event
 def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
     # The Bridge serializes ChatGPT's rendered links as `[label](href)` and the
     # href carries ChatGPT's tracking parameter.
-    parsed = parse_production_reference_proposals(
+    raw = (
         "## SOURCE S1\n"
         "title: Etherhiding\n"
         "url: [https://example.test/blog/report/]"
         "(https://example.test/blog/report/?utm_source=chatgpt.com)\n"
         "role: primary\n"
         "kind: publication\n"
-        "reason: Primary coverage\n",
-        date(2026, 8, 1),
+        "reason: Primary coverage\n"
+        "## SOURCE S2\n"
+        "url: file:///tmp/local.txt\n"
+        "kind: publication\n"
+        "reason: Not an HTTP source\n"
+        "## SOURCE S3\n"
+        "url: https://missing-reason.example/report\n"
+        "kind: publication\n"
     )
+    parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
 
     assert parsed.value is not None
+    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v2"
+    assert raw.count("## SOURCE ") == 3
     assert [proposal.canonical_url for proposal in parsed.value] == [
         "https://example.test/blog/report"
     ]
-    assert "reference_invalid_url" not in parsed.warnings
+    assert len(parsed.value) == 1
+    assert parsed.warnings == ["reference_invalid_url", "reference_missing_reason"]
+    assert len(parsed.dropped_blocks) == 2
 
 
 def test_production_reference_proposal_requires_reason_and_accepts_no_new_sources() -> None:

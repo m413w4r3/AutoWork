@@ -101,6 +101,18 @@ def test_line_oriented_batch_parser_recovers_each_source_and_keeps_raw_text() ->
 
     first, second, third, fourth = parsed.sources
     assert parsed.usable
+    assert sum(line.startswith("- ") for line in raw.splitlines()) == 3
+    retained_items = sum(
+        len(source.output.artifacts)
+        + len(source.output.facts)
+        + len(source.output.events)
+        + len(source.output.rules)
+        + len(source.output.uncertainties)
+        for source in parsed.sources
+        if source.output is not None
+    )
+    assert retained_items == 3
+    assert sum(source.error_code == "batch_source_unavailable" for source in parsed.sources) == 1
     assert first.usable
     assert first.output is not None
     assert first.output.artifacts[0].value == "clearview.ai"

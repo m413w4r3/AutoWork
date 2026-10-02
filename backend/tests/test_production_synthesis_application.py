@@ -438,6 +438,7 @@ def test_timeline_resolves_english_and_french_dates_and_handles_relative_wording
     extraction = make_extraction(subject_id, (source,))
 
     timeline = build_synthesis_timeline(extraction)
+    assert len(timeline) == len(date_texts) + 1
     resolved = [
         entry
         for entry in timeline
@@ -460,6 +461,7 @@ def test_timeline_resolves_english_and_french_dates_and_handles_relative_wording
 
     warnings: list[str] = []
     filtered_timeline = build_synthesis_timeline(extraction, warnings=warnings)
+    assert len(filtered_timeline) == len(date_texts)
     assert "Also that year" not in {entry.date_text for entry in filtered_timeline}
     assert filtered_timeline[-1].date_text is None
     assert warnings == ["Dropped 1 timeline event with unresolvable date wording."]

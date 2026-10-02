@@ -392,6 +392,45 @@ def test_real_unescaped_quote_sample_is_plain_text_not_a_json_error() -> None:
     ]
 
 
+def test_offline_dirty_wire_replay_counts_retained_and_rejected_proposals() -> None:
+    raw = (
+        "FACT unknown_category\n- ignored proposal\n"
+        "FACT malware\n- ExampleRAT\n"
+        "IOC confirmed domain\n"
+        '- clearview.ai :: Reconnaissance target :chatgpt-content-reference{index="0"}\n'
+        "IOC confirmed domain\n- <redacted>\n"
+        "UNCERTAINTIES\n"
+        '- The value "362091310" appears in "outputIPandport362091310.txt".\n'
+    )
+    raw_items = [line for line in raw.splitlines() if line.startswith("- ")]
+
+    parsed = parse_q2_proposals_markdown(raw)
+
+    assert len(raw_items) == 5
+    assert parsed.usable, parsed.errors
+    assert parsed.value is not None
+    parsed_items = (
+        len(parsed.value.facts)
+        + len(parsed.value.events)
+        + len(parsed.value.artifacts)
+        + len(parsed.value.rules)
+        + len(parsed.value.uncertainties)
+    )
+    assert parsed_items == 4
+    assert parsed.warnings == ["q2_unknown_fact_category"]
+    assert len(parsed.dropped_blocks) == 1
+    assert parsed.value.artifacts[0].context == "Reconnaissance target"
+    assert parsed.value.uncertainties == [
+        'The value "362091310" appears in "outputIPandport362091310.txt".'
+    ]
+
+    verified = verify_q2_proposals((Q2ProposalSubmission(output=parsed.value, source_ids=("S1",)),))
+    assert len(verified.diagnostics) == 3
+    assert sum(item.status is ProposalStatus.VERIFIED for item in verified.diagnostics) == 2
+    assert len(verified.rejected) == 1
+    assert [item.reason_code for item in verified.rejected] == ["redacted_placeholder"]
+
+
 def test_unexpected_structure_ends_group_and_bullets_do_not_inherit_metadata() -> None:
     result = parse_q2_proposals_markdown(
         """IOC confirmed domain
