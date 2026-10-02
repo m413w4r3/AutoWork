@@ -250,6 +250,7 @@ class _Extractions:
         "source_text_contract_version",
         "model_policy_version",
         "routing_policy_version",
+        "profile_policy_version",
     )
 
     def __init__(self) -> None:
@@ -272,6 +273,7 @@ class _Extractions:
                 "source_text_contract_version": row.source_text_contract_version,
                 "model_policy_version": row.model_policy_version,
                 "routing_policy_version": row.routing_policy_version,
+                "profile_policy_version": row.profile_policy_version,
             }
         )
 
@@ -585,7 +587,7 @@ async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
     profiles = {source.canonical_url: source.profile for source in extraction.sources}
     assert profiles[CORE_A_URL] is ExtractionProfile.FULL
     assert profiles[CORE_B_URL] is ExtractionProfile.FULL
-    assert profiles[SUPPORT_URL] is ExtractionProfile.IOC_RULES
+    assert profiles[SUPPORT_URL] is ExtractionProfile.FULL
     assert [source.tier for source in extraction.sources] == [
         ProductionReferenceTier.CORE,
         ProductionReferenceTier.CORE,
@@ -599,9 +601,9 @@ async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
     # The metadata stays a bounded projection: counts and versions only.
     assert "facts" not in artifact.metadata
     assert artifact.metadata["source_count"] == 3
-    assert artifact.metadata["full_source_count"] == 2
-    assert artifact.metadata["ioc_rules_source_count"] == 1
-    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-v1"
+    assert artifact.metadata["full_source_count"] == 3
+    assert artifact.metadata["ioc_rules_source_count"] == 0
+    assert artifact.metadata["profile_policy_version"] == "production-reference-role-depth-v2"
     assert artifact.metadata["contract_version"]
     assert "ExampleRAT" not in repr(artifact.metadata)
 

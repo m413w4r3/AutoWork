@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "8"
+REFERENCES_PROMPT_VERSION = "9"
 
 # AW-011 canonical extraction. The archived document is the only source
 # material: each prompt is a pure function of that capture and of the requested
@@ -155,6 +155,15 @@ class ProductionPromptTemplates:
 13. Write at most five analytical uncertainties in French. Include only
     doubtful attribution, contradictory figures or dates, confidence limits,
     or an unestablished relationship. Omit routine limitations and banalities.
+14. Keep source provenance and editorial authority separate. `role` records
+    whether the publisher is primary, independent, a relay, an aggregator, a
+    social account, or unknown. `editorial-role` records how this source should
+    contribute: `primary` for the core publication, `corroboration` for an
+    independent account, `context` for contextual material or a technical
+    annex, and `counter-analysis` for material that qualifies or contradicts a
+    substantive claim. A technical resource that provides only an IOC/rule
+    annex is `context`; a technical resource with its own relevant analysis is
+    `corroboration` or `counter-analysis`.
 
 **Output format** — plain Markdown, no code fence, no JSON:
 
@@ -169,6 +178,7 @@ url: https://...
 publisher: <publisher>
 published-at: YYYY-MM-DD
 role: primary|independent|relay|aggregator|social|unknown
+editorial-role: primary|corroboration|context|counter-analysis
 kind: publication|technical_resource
 reason: <short explanation of relevance to the Subject>
 

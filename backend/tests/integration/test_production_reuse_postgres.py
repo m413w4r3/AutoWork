@@ -171,6 +171,7 @@ def _source_identity(extraction: SourceExtraction) -> dict[str, str]:
         "source_text_contract_version": extraction.source_text_contract_version,
         "model_policy_version": extraction.model_policy_version,
         "routing_policy_version": extraction.routing_policy_version,
+        "profile_policy_version": extraction.profile_policy_version,
     }
 
 
@@ -215,6 +216,7 @@ async def test_source_extraction_checkpoint_identity_is_durable(
         "source_text_contract_version": "text-v2",
         "model_policy_version": "model-v2",
         "routing_policy_version": "routing-v2",
+        "profile_policy_version": "profile-v2",
     }
     for field_name, value in changes.items():
         changed = replace(source, id=uuid4(), **{field_name: value})

@@ -60,6 +60,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
@@ -232,6 +233,7 @@ class _CheckpointRepository:
         "source_text_contract_version",
         "model_policy_version",
         "routing_policy_version",
+        "profile_policy_version",
     )
 
     def __init__(self) -> None:
@@ -255,6 +257,7 @@ class _CheckpointRepository:
                 "source_text_contract_version": row.source_text_contract_version,
                 "model_policy_version": row.model_policy_version,
                 "routing_policy_version": row.routing_policy_version,
+                "profile_policy_version": row.profile_policy_version,
             }
         )
 
@@ -535,14 +538,21 @@ def _reference(
     document_id: UUID | None,
     sha256: str | None,
     role: SourceRole = SourceRole.PRIMARY,
-    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
+    kind: ProductionReferenceKind | None = None,
+    editorial_role: ProductionEditorialRole | None = None,
     state: CollectionState = CollectionState.ARCHIVED,
 ) -> ProductionReferenceSourceV1:
     return ProductionReferenceSourceV1(
         canonical_url=url,
         tier=tier,
-        kind=kind,
+        kind=kind
+        or (
+            ProductionReferenceKind.TECHNICAL_RESOURCE
+            if tier is ProductionReferenceTier.TECHNICAL
+            else ProductionReferenceKind.PUBLICATION
+        ),
         role=role,
+        editorial_role=editorial_role,
         title=f"Archived {url}",
         publisher="Publisher",
         published_at=date(2026, 7, 10),
@@ -692,11 +702,11 @@ def test_plan_profile_follows_tier_and_never_role() -> None:
     profiles = {source.canonical_url: source.profile for source in plan.sources}
     for index in range(5):
         assert profiles[f"https://example.test/core-{index}"] is ExtractionProfile.FULL
-    assert profiles["https://example.test/other-0"] is ExtractionProfile.IOC_RULES
-    assert profiles["https://example.test/other-1"] is ExtractionProfile.IOC_RULES
+    assert profiles["https://example.test/other-0"] is ExtractionProfile.FULL
+    assert profiles["https://example.test/other-1"] is ExtractionProfile.FULL
     assert profiles["https://example.test/other-2"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-3"] is ExtractionProfile.IOC_RULES
-    assert plan.profile_policy_version == "production-reference-tier-v1"
+    assert plan.profile_policy_version == "production-reference-role-depth-v2"
 
 
 def test_plan_and_hashes_are_stable_when_corpus_order_changes() -> None:
@@ -1126,7 +1136,7 @@ async def test_only_locally_proven_proposals_become_canonical() -> None:
     )
 
 
-async def test_ioc_rules_projects_away_narrative_content() -> None:
+async def test_supporting_publication_uses_full_profile() -> None:
     world = _World()
     subject_id = uuid4()
     snapshot = _snapshot(subject_id)
@@ -1171,7 +1181,7 @@ async def test_ioc_rules_projects_away_narrative_content() -> None:
     assert execution.extraction is not None
     by_url = {source.canonical_url: source for source in execution.extraction.sources}
     support = by_url[SUPPORT_URL]
-    assert support.profile is ExtractionProfile.IOC_RULES
+    assert support.profile is ExtractionProfile.FULL
     assert support.facts == ()
     assert support.events == ()
     assert [indicator.value for indicator in support.indicators] == ["loader.security-lab.io"]
@@ -1235,7 +1245,8 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     assert first.status is ExtractionExecutionStatus.SUCCEEDED
     assert len(gateway.calls) == 1
 
-    # The same bytes, reached through a SUPPORTING and a TECHNICAL capture.
+    # The same bytes, reached through a FULL SUPPORTING publication and a
+    # technical annex with the lighter IOC_RULES profile.
     support_corpus = _corpus(
         subject_id=subject_id,
         input_hash=snapshot.input_hash,
@@ -1277,7 +1288,7 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     by_url = {source.canonical_url: source for source in second.extraction.sources}
     # The FULL checkpoint of the same bytes satisfies the lighter profile.
     assert by_url[MIRROR_URL].reuse_state is ExtractionReuseState.REUSED
-    assert by_url[MIRROR_URL].facts == ()  # projected from the FULL checkpoint
+    assert by_url[MIRROR_URL].facts  # reused without losing its FULL narrative output
     assert [indicator.value for indicator in by_url[MIRROR_URL].indicators] == [
         "evil.security-lab.io",
         "CVE-2026-12345",
@@ -1495,9 +1506,10 @@ async def test_ioc_rules_batch_keeps_an_unambiguous_source_mapping() -> None:
         references.append(
             _reference(
                 url=url,
-                tier=ProductionReferenceTier.SUPPORTING,
+                tier=ProductionReferenceTier.TECHNICAL,
                 document_id=document_id,
                 sha256=sha256,
+                editorial_role=ProductionEditorialRole.CONTEXT,
             )
         )
         outputs[marker] = Q2SourceOutput(
@@ -1550,9 +1562,10 @@ async def test_ambiguous_batch_handle_falls_back_to_individual_readings() -> Non
         references.append(
             _reference(
                 url=url,
-                tier=ProductionReferenceTier.SUPPORTING,
+                tier=ProductionReferenceTier.TECHNICAL,
                 document_id=document_id,
                 sha256=sha256,
+                editorial_role=ProductionEditorialRole.CONTEXT,
             )
         )
         outputs[marker] = Q2SourceOutput(
@@ -1902,8 +1915,8 @@ async def test_a_batch_never_mixes_diffusion_policies() -> None:
         world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
     )
 
-    # The restricted SUPPORTING capture is never batched with the TECHNICAL
-    # one that may leave: each is sent alone, under its own policy.
+    # The restricted FULL publication is never batched with the TECHNICAL
+    # IOC_RULES annex that may leave: each uses its own policy.
     assert gateway.extract_calls == 0
     assert len(gateway.draft_calls) == len(gateway.calls)
     restricted = [call for call in gateway.calls if "loader.security-lab.io" in call.text]

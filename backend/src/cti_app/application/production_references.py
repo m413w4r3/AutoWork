@@ -27,6 +27,7 @@ from cti_app.application.production_parsers import (
 from cti_app.domain.collection import CollectionFailureReason, CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
@@ -41,7 +42,7 @@ if TYPE_CHECKING:
 
 # AW-010 contract versions. They participate in the functional REFERENCES
 # identity: a parser or schema change invalidates the stored corpus.
-PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v2"
+PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v3"
 PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
 
 #: Corpus warnings that restate availability and are recomputed on each build.
@@ -66,6 +67,7 @@ _SOURCE_KEYS = {
     "tier",
     "kind",
     "role",
+    "editorial_role",
     "title",
     "publisher",
     "published_at",
@@ -90,6 +92,7 @@ class ProductionReferenceProposal:
     role: SourceRole
     kind: ProductionReferenceKind
     relevance_reason: str
+    editorial_role: ProductionEditorialRole = ProductionEditorialRole.CONTEXT
 
     @property
     def tier(self) -> ProductionReferenceTier:
@@ -180,6 +183,7 @@ def build_production_reference_corpus(
             tier=ProductionReferenceTier.CORE,
             kind=ProductionReferenceKind.PUBLICATION,
             role=core.role,
+            editorial_role=ProductionEditorialRole.PRIMARY,
             title=core.title,
             publisher=core.publisher,
             published_at=core.published_at,
@@ -195,6 +199,7 @@ def build_production_reference_corpus(
                 tier=proposal.tier,
                 kind=proposal.kind,
                 role=proposal.role,
+                editorial_role=proposal.editorial_role,
                 title=proposal.title,
                 publisher=proposal.publisher,
                 published_at=proposal.published_at,
@@ -300,6 +305,11 @@ def production_reference_corpus_to_json(
                 "tier": source.tier.value,
                 "kind": source.kind.value,
                 "role": source.role.value,
+                "editorial_role": (
+                    source.editorial_role.value
+                    if source.editorial_role is not None
+                    else ProductionEditorialRole.CONTEXT.value
+                ),
                 "title": source.title,
                 "publisher": source.publisher,
                 "published_at": (
@@ -346,8 +356,12 @@ def production_reference_corpus_from_json(
         raise ValueError("Production reference warnings must be strings")
 
     sources: list[ProductionReferenceSourceV1] = []
+    legacy_source_keys = _SOURCE_KEYS - {"editorial_role"}
     for raw_source in raw_sources:
-        if not isinstance(raw_source, Mapping) or set(raw_source) != _SOURCE_KEYS:
+        if not isinstance(raw_source, Mapping) or frozenset(raw_source) not in {
+            frozenset(_SOURCE_KEYS),
+            frozenset(legacy_source_keys),
+        }:
             raise ValueError("Production reference source has an invalid shape")
         candidates = raw_source["discovery_candidate_ids"]
         if not isinstance(candidates, list):
@@ -358,6 +372,15 @@ def production_reference_corpus_from_json(
                 tier=_enum(ProductionReferenceTier, raw_source["tier"], "tier"),
                 kind=_enum(ProductionReferenceKind, raw_source["kind"], "kind"),
                 role=_enum(SourceRole, raw_source["role"], "role"),
+                editorial_role=(
+                    _enum(
+                        ProductionEditorialRole,
+                        raw_source["editorial_role"],
+                        "editorial_role",
+                    )
+                    if "editorial_role" in raw_source
+                    else None
+                ),
                 title=_optional_string(raw_source, "title"),
                 publisher=_optional_string(raw_source, "publisher"),
                 published_at=_optional_date(raw_source, "published_at"),
@@ -451,6 +474,31 @@ def parse_production_reference_proposals(
             role = SourceRole.UNKNOWN
             result.warnings.append("reference_unknown_role")
 
+        raw_editorial_role = (values.get("editorial-role") or "").strip()
+        if raw_editorial_role:
+            try:
+                editorial_role = ProductionEditorialRole(
+                    _fold(raw_editorial_role).replace("-", "_").replace(" ", "_")
+                )
+            except ValueError:
+                editorial_role = (
+                    ProductionEditorialRole.CONTEXT
+                    if kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+                    else ProductionEditorialRole.CORROBORATION
+                    if role is SourceRole.INDEPENDENT
+                    else ProductionEditorialRole.CONTEXT
+                )
+                result.warnings.append("reference_unknown_editorial_role")
+        else:
+            editorial_role = (
+                ProductionEditorialRole.CONTEXT
+                if kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+                else ProductionEditorialRole.CORROBORATION
+                if role is SourceRole.INDEPENDENT
+                else ProductionEditorialRole.CONTEXT
+            )
+            result.warnings.append("reference_editorial_role_defaulted")
+
         if canonical_url in seen_urls:
             result.warnings.append("reference_duplicate_url_ignored")
             result.dropped_blocks.append(block.raw())
@@ -465,6 +513,7 @@ def parse_production_reference_proposals(
                 role=role,
                 kind=kind,
                 relevance_reason=relevance_reason,
+                editorial_role=editorial_role,
             )
         )
 

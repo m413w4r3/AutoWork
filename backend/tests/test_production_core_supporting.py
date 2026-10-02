@@ -69,8 +69,9 @@ def test_references_prompt_separates_linked_technical_sources_without_following_
         assert linked_resource in one_line
     assert "same subject" in one_line
     assert "Do not turn every hyperlink into a SOURCE" in one_line
-    assert REFERENCES_PROMPT_VERSION == "8"
+    assert REFERENCES_PROMPT_VERSION == "9"
     assert "kind: publication|technical_resource" in one_line
+    assert "editorial-role: primary|corroboration|context|counter-analysis" in one_line
     assert "reason: <short explanation of relevance to the Subject>" in one_line
     assert "editorial-title:" in one_line
     assert "## EVENT R1" in one_line
@@ -337,6 +338,7 @@ editorial-title: Legacy title
 title: First
 url: https://example.test/report?utm_source=mail
 role: primary
+editorial-role: counter-analysis
 kind: publication
 reason: Primary coverage of the subject
 ## SOURCE S2
@@ -379,6 +381,7 @@ text: Ignored legacy event
     ]
     assert parsed.value[0].kind is ProductionReferenceKind.PUBLICATION
     assert parsed.value[0].tier is ProductionReferenceTier.SUPPORTING
+    assert parsed.value[0].editorial_role.value == "counter_analysis"
     assert parsed.value[1].kind is ProductionReferenceKind.PUBLICATION
     assert "reference_invalid_url" in parsed.warnings
     assert "reference_future_date" in parsed.warnings
@@ -396,6 +399,7 @@ def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
         "url: [https://example.test/blog/report/]"
         "(https://example.test/blog/report/?utm_source=chatgpt.com)\n"
         "role: primary\n"
+        "editorial-role: primary\n"
         "kind: publication\n"
         "reason: Primary coverage\n"
         "## SOURCE S2\n"
@@ -409,7 +413,7 @@ def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
     parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
 
     assert parsed.value is not None
-    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v2"
+    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v3"
     assert raw.count("## SOURCE ") == 3
     assert [proposal.canonical_url for proposal in parsed.value] == [
         "https://example.test/blog/report"

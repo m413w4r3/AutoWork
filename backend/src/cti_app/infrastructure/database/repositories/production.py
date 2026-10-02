@@ -670,6 +670,7 @@ class SqlAlchemySourceExtractionRepository:
         source_text_contract_version: str,
         model_policy_version: str,
         routing_policy_version: str,
+        profile_policy_version: str,
     ) -> SourceExtraction | None:
         values = {
             "source_content_sha256": source_content_sha256,
@@ -681,6 +682,7 @@ class SqlAlchemySourceExtractionRepository:
             "source_text_contract_version": source_text_contract_version,
             "model_policy_version": model_policy_version,
             "routing_policy_version": routing_policy_version,
+            "profile_policy_version": profile_policy_version,
         }
         row = await self._session.scalar(
             select(SourceExtractionRow).where(
@@ -724,6 +726,7 @@ class SqlAlchemySourceExtractionRepository:
                 == extraction.source_text_contract_version,
                 SourceExtractionRow.model_policy_version == extraction.model_policy_version,
                 SourceExtractionRow.routing_policy_version == extraction.routing_policy_version,
+                SourceExtractionRow.profile_policy_version == extraction.profile_policy_version,
             )
             .with_for_update()
         )
@@ -1329,6 +1332,7 @@ def _source_extraction_values(extraction: SourceExtraction) -> dict[str, object]
         "source_text_contract_version": extraction.source_text_contract_version,
         "model_policy_version": extraction.model_policy_version,
         "routing_policy_version": extraction.routing_policy_version,
+        "profile_policy_version": extraction.profile_policy_version,
         "status": extraction.status.value,
         "canonical_blob_id": extraction.canonical_blob_id,
         "raw_blob_id": extraction.raw_blob_id,
@@ -1350,6 +1354,7 @@ def _source_extraction_from_row(row: SourceExtractionRow) -> SourceExtraction:
         source_text_contract_version=row.source_text_contract_version,
         model_policy_version=row.model_policy_version,
         routing_policy_version=row.routing_policy_version,
+        profile_policy_version=row.profile_policy_version,
         status=SourceExtractionStatus(row.status),
         canonical_blob_id=row.canonical_blob_id,
         raw_blob_id=row.raw_blob_id,

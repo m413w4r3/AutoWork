@@ -20,11 +20,13 @@ from uuid import UUID
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
     DetectionRuleType,
     ExtractionProfile,
     ProductionEvidenceBasis,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
@@ -32,20 +34,10 @@ from cti_app.domain.publication import ArtifactType
 
 PRODUCTION_EXTRACTION_SCHEMA_VERSION = 1
 
-#: AW-011 profile policy: ``ProductionReferenceTier`` alone decides FULL vs
-#: IOC_RULES, never ``SourceRole``.  It participates in functional hashes.
-EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-tier-v1"
-
 EXTRACTION_TIER_ORDER: dict[ProductionReferenceTier, int] = {
     ProductionReferenceTier.CORE: 0,
     ProductionReferenceTier.SUPPORTING: 1,
     ProductionReferenceTier.TECHNICAL: 2,
-}
-
-EXTRACTION_PROFILE_BY_TIER: dict[ProductionReferenceTier, ExtractionProfile] = {
-    ProductionReferenceTier.CORE: ExtractionProfile.FULL,
-    ProductionReferenceTier.SUPPORTING: ExtractionProfile.IOC_RULES,
-    ProductionReferenceTier.TECHNICAL: ExtractionProfile.IOC_RULES,
 }
 
 #: Categories a FULL extraction must be able to carry.  CVE/IOC technical
@@ -103,12 +95,45 @@ class ProductionExtractionOmissionReason(StrEnum):
     SOURCE_EXTRACTION_FAILED = "source_extraction_failed"
 
 
-def extraction_profile_for_tier(tier: ProductionReferenceTier) -> ExtractionProfile:
-    """The AW-011 profile policy, keyed exclusively by the frozen tier."""
-    try:
-        return EXTRACTION_PROFILE_BY_TIER[tier]
-    except (KeyError, TypeError) as exc:
-        raise ValueError("Extraction tier is invalid") from exc
+class ExtractionProfileReasonCode(StrEnum):
+    """Why the versioned editorial policy selected one analysis depth."""
+
+    CORE_PRIMARY_SOURCE = "core_primary_source"
+    INDEPENDENT_CORROBORATION = "independent_corroboration"
+    COUNTER_ANALYSIS = "counter_analysis"
+    SUPPORTING_PRIMARY_ANALYSIS = "supporting_primary_analysis"
+    TECHNICAL_ANALYSIS = "technical_analysis"
+    CONTEXTUAL_PUBLICATION = "contextual_publication"
+    TECHNICAL_ANNEX = "technical_annex"
+
+
+def extraction_profile_decision(
+    *,
+    tier: ProductionReferenceTier,
+    kind: ProductionReferenceKind,
+    editorial_role: ProductionEditorialRole,
+) -> tuple[ExtractionProfile, ExtractionProfileReasonCode]:
+    """Select depth from typed REFERENCES authority and source kind.
+
+    CORE remains the narrative center. Independent corroboration and
+    counter-analysis receive FULL extraction at any complementary tier. A
+    technical resource marked as context is a technical annex and stays
+    IOC_RULES; other publications and analytically authoritative resources
+    receive FULL extraction.
+    """
+    if tier is ProductionReferenceTier.CORE:
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE
+    if editorial_role is ProductionEditorialRole.COUNTER_ANALYSIS:
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.COUNTER_ANALYSIS
+    if editorial_role is ProductionEditorialRole.CORROBORATION:
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION
+    if kind is ProductionReferenceKind.TECHNICAL_RESOURCE:
+        if editorial_role is ProductionEditorialRole.CONTEXT:
+            return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.TECHNICAL_ANNEX
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.TECHNICAL_ANALYSIS
+    if editorial_role is ProductionEditorialRole.PRIMARY:
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.SUPPORTING_PRIMARY_ANALYSIS
+    return ExtractionProfile.FULL, ExtractionProfileReasonCode.CONTEXTUAL_PUBLICATION
 
 
 def _require_text(value: Any, *, label: str) -> str:
@@ -298,6 +323,8 @@ class ProductionSourceExtractionV1:
     indicators: tuple[ExtractionIndicatorV1, ...]
     rules: tuple[ExtractionRuleV1, ...]
     uncertainties: tuple[str, ...]
+    editorial_role: ProductionEditorialRole | None = None
+    profile_reason_code: ExtractionProfileReasonCode | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.source_document_id, UUID):
@@ -321,8 +348,33 @@ class ProductionSourceExtractionV1:
             raise ValueError("Extraction source role is invalid")
         if not isinstance(self.profile, ExtractionProfile):
             raise ValueError("Extraction source profile is invalid")
-        if self.profile is not extraction_profile_for_tier(self.tier):
-            raise ValueError("Extraction source profile does not match its reference tier")
+        editorial_role = self.editorial_role
+        if editorial_role is None:
+            editorial_role = (
+                ProductionEditorialRole.PRIMARY
+                if self.tier is ProductionReferenceTier.CORE
+                else ProductionEditorialRole.CORROBORATION
+                if self.profile is ExtractionProfile.FULL
+                else ProductionEditorialRole.CONTEXT
+            )
+            object.__setattr__(self, "editorial_role", editorial_role)
+        elif not isinstance(editorial_role, ProductionEditorialRole):
+            raise ValueError("Extraction source editorial role is invalid")
+        reason_code = self.profile_reason_code
+        if reason_code is None:
+            _, expected_reason = extraction_profile_decision(
+                tier=self.tier,
+                kind=self.kind,
+                editorial_role=editorial_role,
+            )
+            reason_code = (
+                expected_reason
+                if self.profile is ExtractionProfile.FULL
+                else ExtractionProfileReasonCode.TECHNICAL_ANNEX
+            )
+            object.__setattr__(self, "profile_reason_code", reason_code)
+        elif not isinstance(reason_code, ExtractionProfileReasonCode):
+            raise ValueError("Extraction source profile reason code is invalid")
         if self.checkpoint_id is not None and not isinstance(self.checkpoint_id, UUID):
             raise ValueError("Extraction checkpoint identity must be a UUID or None")
         if not isinstance(self.reuse_state, ExtractionReuseState):
@@ -498,7 +550,9 @@ _SOURCE_KEYS = frozenset(
         "tier",
         "kind",
         "role",
+        "editorial_role",
         "profile",
+        "profile_reason_code",
         "checkpoint_id",
         "reuse_state",
         "facts",
@@ -672,7 +726,17 @@ def _source_to_json(source: ProductionSourceExtractionV1) -> dict[str, Any]:
         "tier": source.tier.value,
         "kind": source.kind.value,
         "role": source.role.value,
+        "editorial_role": (
+            source.editorial_role.value
+            if source.editorial_role is not None
+            else ProductionEditorialRole.CONTEXT.value
+        ),
         "profile": source.profile.value,
+        "profile_reason_code": (
+            source.profile_reason_code.value
+            if source.profile_reason_code is not None
+            else ExtractionProfileReasonCode.CONTEXTUAL_PUBLICATION.value
+        ),
         "checkpoint_id": str(source.checkpoint_id) if source.checkpoint_id is not None else None,
         "reuse_state": source.reuse_state.value,
         "facts": [_fact_to_json(fact) for fact in source.facts],
@@ -779,7 +843,13 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
         tier=_enum(ProductionReferenceTier, payload["tier"], "tier"),
         kind=_enum(ProductionReferenceKind, payload["kind"], "kind"),
         role=_enum(SourceRole, payload["role"], "role"),
+        editorial_role=_enum(ProductionEditorialRole, payload["editorial_role"], "editorial_role"),
         profile=_enum(ExtractionProfile, payload["profile"], "profile"),
+        profile_reason_code=_enum(
+            ExtractionProfileReasonCode,
+            payload["profile_reason_code"],
+            "profile_reason_code",
+        ),
         checkpoint_id=_optional_uuid(payload["checkpoint_id"], "checkpoint_id"),
         reuse_state=_enum(ExtractionReuseState, payload["reuse_state"], "reuse_state"),
         facts=tuple(_fact_from_json(item) for item in _require_array(payload["facts"], "facts")),

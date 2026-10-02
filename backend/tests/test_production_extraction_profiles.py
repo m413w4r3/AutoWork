@@ -1,10 +1,4 @@
-"""AW-011 extraction policy: tier-driven profiles and the architecture cutover.
-
-The tier of the frozen ``ProductionReferenceCorpusV1`` is the only authority
-for FULL vs IOC_RULES. These tests lock that policy and the architecture guard
-that keeps the canonical extraction module free of the retired REFERENCES
-wire-format dependencies.
-"""
+"""AW-011 extraction policy and the architecture cutover."""
 
 from __future__ import annotations
 
@@ -20,14 +14,18 @@ import pytest
 from cti_app.application import production_extraction, production_workflow
 from cti_app.application.production_extraction import (
     build_extraction_plan,
-    extraction_profile_for_tier,
 )
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionProfile,
 )
+from cti_app.domain.production_extraction import (
+    ExtractionProfileReasonCode,
+)
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
@@ -46,12 +44,14 @@ def _record(
     role: SourceRole,
     document_id: UUID | None,
     sha256: str | None,
+    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
+    editorial_role: ProductionEditorialRole | None = None,
     state: CollectionState = CollectionState.ARCHIVED,
 ) -> ProductionReferenceSourceV1:
     return ProductionReferenceSourceV1(
         canonical_url=url,
         tier=tier,
-        kind=ProductionReferenceKind.PUBLICATION,
+        kind=kind,
         role=role,
         title=f"Archived {url}",
         publisher="Publisher",
@@ -68,6 +68,7 @@ def _record(
             source_document_id=document_id,
             content_sha256=sha256,
         ),
+        editorial_role=editorial_role,
     )
 
 
@@ -83,27 +84,77 @@ def _corpus(*sources: ProductionReferenceSourceV1) -> ProductionReferenceCorpusV
     )
 
 
-TIER_POLICY = (
-    (ProductionReferenceTier.CORE, SourceRole.PRIMARY, ExtractionProfile.FULL),
-    (ProductionReferenceTier.CORE, SourceRole.INDEPENDENT, ExtractionProfile.FULL),
-    (ProductionReferenceTier.CORE, SourceRole.RELAY, ExtractionProfile.FULL),
-    (ProductionReferenceTier.CORE, SourceRole.AGGREGATOR, ExtractionProfile.FULL),
-    (ProductionReferenceTier.CORE, SourceRole.UNKNOWN, ExtractionProfile.FULL),
-    (ProductionReferenceTier.SUPPORTING, SourceRole.PRIMARY, ExtractionProfile.IOC_RULES),
-    (ProductionReferenceTier.SUPPORTING, SourceRole.INDEPENDENT, ExtractionProfile.IOC_RULES),
-    (ProductionReferenceTier.TECHNICAL, SourceRole.PRIMARY, ExtractionProfile.IOC_RULES),
-    (ProductionReferenceTier.TECHNICAL, SourceRole.UNKNOWN, ExtractionProfile.IOC_RULES),
+PROFILE_POLICY = (
+    (
+        ProductionReferenceTier.CORE,
+        ProductionReferenceKind.PUBLICATION,
+        SourceRole.PRIMARY,
+        ProductionEditorialRole.PRIMARY,
+        ExtractionProfile.FULL,
+        ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE,
+    ),
+    (
+        ProductionReferenceTier.SUPPORTING,
+        ProductionReferenceKind.PUBLICATION,
+        SourceRole.INDEPENDENT,
+        ProductionEditorialRole.CORROBORATION,
+        ExtractionProfile.FULL,
+        ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION,
+    ),
+    (
+        ProductionReferenceTier.SUPPORTING,
+        ProductionReferenceKind.PUBLICATION,
+        SourceRole.PRIMARY,
+        ProductionEditorialRole.COUNTER_ANALYSIS,
+        ExtractionProfile.FULL,
+        ExtractionProfileReasonCode.COUNTER_ANALYSIS,
+    ),
+    (
+        ProductionReferenceTier.SUPPORTING,
+        ProductionReferenceKind.PUBLICATION,
+        SourceRole.PRIMARY,
+        ProductionEditorialRole.CONTEXT,
+        ExtractionProfile.FULL,
+        ExtractionProfileReasonCode.CONTEXTUAL_PUBLICATION,
+    ),
+    (
+        ProductionReferenceTier.TECHNICAL,
+        ProductionReferenceKind.TECHNICAL_RESOURCE,
+        SourceRole.PRIMARY,
+        ProductionEditorialRole.CONTEXT,
+        ExtractionProfile.IOC_RULES,
+        ExtractionProfileReasonCode.TECHNICAL_ANNEX,
+    ),
+    (
+        ProductionReferenceTier.TECHNICAL,
+        ProductionReferenceKind.TECHNICAL_RESOURCE,
+        SourceRole.INDEPENDENT,
+        ProductionEditorialRole.CORROBORATION,
+        ExtractionProfile.FULL,
+        ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION,
+    ),
+    (
+        ProductionReferenceTier.TECHNICAL,
+        ProductionReferenceKind.TECHNICAL_RESOURCE,
+        SourceRole.INDEPENDENT,
+        ProductionEditorialRole.CONTEXT,
+        ExtractionProfile.IOC_RULES,
+        ExtractionProfileReasonCode.TECHNICAL_ANNEX,
+    ),
 )
 
 
-@pytest.mark.parametrize(("tier", "role", "expected"), TIER_POLICY)
-def test_profile_is_decided_by_tier_never_by_role(
+@pytest.mark.parametrize(
+    ("tier", "kind", "role", "editorial_role", "expected", "reason_code"), PROFILE_POLICY
+)
+def test_profile_uses_editorial_authority_and_source_kind(
     tier: ProductionReferenceTier,
+    kind: ProductionReferenceKind,
     role: SourceRole,
+    editorial_role: ProductionEditorialRole,
     expected: ExtractionProfile,
+    reason_code: ExtractionProfileReasonCode,
 ) -> None:
-    assert extraction_profile_for_tier(tier) is expected
-
     corpus = _corpus(
         _record(
             "https://example.test/declared-core",
@@ -118,13 +169,20 @@ def test_profile_is_decided_by_tier_never_by_role(
             role=role,
             document_id=uuid4(),
             sha256="b" * 64,
+            kind=kind,
+            editorial_role=editorial_role,
         ),
     )
     plan = build_extraction_plan(corpus)
 
-    profiles = {source.canonical_url: source.profile for source in plan.sources}
-
-    assert profiles[f"https://example.test/{tier.value}-{role.value}"] is expected
+    planned = next(
+        source
+        for source in plan.sources
+        if source.canonical_url == f"https://example.test/{tier.value}-{role.value}"
+    )
+    assert planned.profile is expected
+    assert planned.profile_reason_code is reason_code
+    assert planned.editorial_role is editorial_role
 
 
 def test_policy_version_participates_in_the_plan() -> None:
@@ -140,7 +198,72 @@ def test_policy_version_participates_in_the_plan() -> None:
 
     plan = build_extraction_plan(corpus)
 
-    assert plan.profile_policy_version == "production-reference-tier-v1"
+    assert plan.profile_policy_version == EXTRACTION_PROFILE_POLICY_VERSION
+
+
+def test_policy_version_change_invalidates_source_checkpoint_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    identity_before = production_extraction.source_checkpoint_identity(
+        content_sha256="b" * 64,
+        profile=ExtractionProfile.FULL,
+        prompt_version=production_extraction.source_prompt_version(ExtractionProfile.FULL),
+    )
+
+    monkeypatch.setattr(
+        production_extraction,
+        "EXTRACTION_PROFILE_POLICY_VERSION",
+        "production-reference-role-depth-v3",
+    )
+    identity_after = production_extraction.source_checkpoint_identity(
+        content_sha256="b" * 64,
+        profile=ExtractionProfile.FULL,
+        prompt_version=production_extraction.source_prompt_version(ExtractionProfile.FULL),
+    )
+
+    assert identity_before["profile_policy_version"] != identity_after["profile_policy_version"]
+    assert identity_before != identity_after
+
+
+def test_same_source_capture_keeps_subject_independent_extraction_identity() -> None:
+    shared_document_id = uuid4()
+    shared_hash = "d" * 64
+    core_source = _record(
+        "https://example.test/core",
+        tier=ProductionReferenceTier.CORE,
+        role=SourceRole.PRIMARY,
+        document_id=uuid4(),
+        sha256="c" * 64,
+        editorial_role=ProductionEditorialRole.PRIMARY,
+    )
+    shared_source = _record(
+        "https://example.test/independent-analysis",
+        tier=ProductionReferenceTier.SUPPORTING,
+        role=SourceRole.INDEPENDENT,
+        document_id=shared_document_id,
+        sha256=shared_hash,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+    )
+
+    first_plan = build_extraction_plan(_corpus(core_source, shared_source))
+    second_plan = build_extraction_plan(_corpus(core_source, shared_source))
+    first = next(source for source in first_plan.sources if source.content_sha256 == shared_hash)
+    second = next(source for source in second_plan.sources if source.content_sha256 == shared_hash)
+    first_identity = production_extraction.source_checkpoint_identity(
+        content_sha256=first.content_sha256,
+        profile=first.profile,
+        prompt_version=production_extraction.source_prompt_version(first.profile),
+    )
+    second_identity = production_extraction.source_checkpoint_identity(
+        content_sha256=second.content_sha256,
+        profile=second.profile,
+        prompt_version=production_extraction.source_prompt_version(second.profile),
+    )
+
+    assert first_plan.subject_id != second_plan.subject_id
+    assert first.computation_key == second.computation_key
+    assert first_identity == second_identity
+    assert "subject_id" not in first_identity
 
 
 def test_ineligible_source_never_reaches_the_plan() -> None:
@@ -198,13 +321,12 @@ def test_canonical_module_has_no_legacy_references_dependency() -> None:
         assert re.search(rf"\b{name}\b", source) is None
 
 
-def test_canonical_module_never_decides_the_profile_from_source_role() -> None:
+def test_canonical_module_uses_the_versioned_profile_policy() -> None:
     source = _canonical_source()
 
-    # No role-keyed FULL decision may exist: the tier is the only authority.
-    assert re.search(r"SourceRole\.PRIMARY\s*(?:is|==)\s*", source) is None
-    assert re.search(r"role\s*(?:is|==)\s*SourceRole\.PRIMARY", source) is None
-    assert "extraction_profile_for_tier" in source
+    assert "extraction_profile_decision" in source
+    assert "extraction_profile_for_tier" not in source
+    assert "EXTRACTION_PROFILE_POLICY_VERSION" in source
 
 
 def test_live_extraction_stage_no_longer_calls_the_legacy_planner() -> None:

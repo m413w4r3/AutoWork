@@ -105,7 +105,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_from_json,
 )
-from cti_app.domain.production_references import ProductionReferenceTier
+from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -124,7 +124,9 @@ if TYPE_CHECKING:
 
 EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v1"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 1
-EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = "editorial-enrichment-evidence-pack-v1"
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
+    "editorial-enrichment-evidence-pack-v2-multi-source-authority"
+)
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v2"
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = "editorial-enrichment-routing-policy-v1"
@@ -1122,7 +1124,11 @@ def canonical_synthesis_hash(synthesis: ProductionSynthesisV1) -> str:
 
 
 def _prompt_evidence_record(
-    handle: str, kind: EvidenceKind, payload: Mapping[str, Any]
+    handle: str,
+    kind: EvidenceKind,
+    payload: Mapping[str, Any],
+    *,
+    source: Any,
 ) -> dict[str, Any]:
     """Expose only safe extraction metadata; detection rule bodies stay local."""
     if kind is EvidenceKind.FACT:
@@ -1156,7 +1162,13 @@ def _prompt_evidence_record(
             "context": payload["context"],
             "evidence": payload["evidence_quote"],
         }
-    return {"handle": handle, "kind": kind.value, **values}
+    return {
+        "handle": handle,
+        "kind": kind.value,
+        "source_role": source.role.value,
+        "editorial_role": source.editorial_role.value,
+        **values,
+    }
 
 
 def _synthesis_prompt_projection(
@@ -1222,7 +1234,6 @@ def build_editorial_enrichment_evidence_pack(
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
-        and source_by_id[ref.source_document_id].tier is ProductionReferenceTier.CORE
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
     }
     technical_candidates = sorted(
@@ -1240,16 +1251,49 @@ def build_editorial_enrichment_evidence_pack(
     included_refs = (
         narrative_refs | set(technical_candidates) | set(synthesis_evidence_refs(synthesis))
     )
-    ordered_refs = tuple(sorted(included_refs, key=evidence_ref_sort_key))
+
+    def authority_key(ref: ExtractionEvidenceRefV1) -> tuple[int, int, str, str]:
+        source = source_by_id[ref.source_document_id]
+        editorial_role = source.editorial_role
+        assert editorial_role is not None
+        role_order = {
+            ProductionEditorialRole.PRIMARY: 0,
+            ProductionEditorialRole.CORROBORATION: 1,
+            ProductionEditorialRole.COUNTER_ANALYSIS: 2,
+            ProductionEditorialRole.CONTEXT: 3,
+        }
+        return (
+            0 if source.tier is ProductionReferenceTier.CORE else 1,
+            role_order[editorial_role],
+            source.canonical_url,
+            str(source.source_document_id),
+        )
+
+    ordered_refs = tuple(
+        sorted(
+            included_refs,
+            key=lambda ref: (authority_key(ref), evidence_ref_sort_key(ref)),
+        )
+    )
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(ordered_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
     narrative_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
+        _prompt_evidence_record(
+            handle_for_ref[ref],
+            ref.kind,
+            entries[ref],
+            source=source_by_id[ref.source_document_id],
+        )
         for ref in ordered_refs
-        if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
+        if ref in narrative_refs
     )
     technical_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
+        _prompt_evidence_record(
+            handle_for_ref[ref],
+            ref.kind,
+            entries[ref],
+            source=source_by_id[ref.source_document_id],
+        )
         for ref in ordered_refs
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
     )

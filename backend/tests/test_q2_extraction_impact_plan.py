@@ -38,6 +38,7 @@ from cti_app.domain.production_extraction import (
     ProductionSourceExtractionV1,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
@@ -57,13 +58,21 @@ def _source(
     document_id: UUID | None = None,
     sha256: str | None = None,
     role: SourceRole = SourceRole.PRIMARY,
+    kind: ProductionReferenceKind | None = None,
+    editorial_role: ProductionEditorialRole | None = None,
     state: CollectionState = CollectionState.ARCHIVED,
 ) -> ProductionReferenceSourceV1:
     return ProductionReferenceSourceV1(
         canonical_url=url,
         tier=tier,
-        kind=ProductionReferenceKind.PUBLICATION,
+        kind=kind
+        or (
+            ProductionReferenceKind.TECHNICAL_RESOURCE
+            if tier is ProductionReferenceTier.TECHNICAL
+            else ProductionReferenceKind.PUBLICATION
+        ),
         role=role,
+        editorial_role=editorial_role,
         title=f"Archived {url}",
         publisher="Publisher",
         published_at=date(2026, 7, 10),
@@ -133,7 +142,7 @@ def test_plan_order_is_tier_then_url_then_document_identity() -> None:
     assert [source.profile for source in plan.sources] == [
         ExtractionProfile.FULL,
         ExtractionProfile.FULL,
-        ExtractionProfile.IOC_RULES,
+        ExtractionProfile.FULL,
         ExtractionProfile.IOC_RULES,
     ]
 
@@ -204,7 +213,9 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
             tier=source.tier,
             kind=source.kind,
             role=source.role,
+            editorial_role=source.editorial_role,
             profile=source.profile,
+            profile_reason_code=source.profile_reason_code,
             checkpoint_id=uuid4(),
             reuse_state=reuse_state,
             facts=(),
@@ -258,7 +269,7 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
     assert progress["confirmed_iocs"] == 1
     assert progress["rules_total"] == 1
     assert progress["yara_rules"] == 1
-    assert progress["profile_policy_version"] == "production-reference-tier-v1"
+    assert progress["profile_policy_version"] == "production-reference-role-depth-v2"
 
 
 def test_a_blocking_source_is_failed_and_the_others_stay_pending() -> None:

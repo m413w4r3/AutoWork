@@ -68,13 +68,20 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionEventV1,
     ExtractionFactV1,
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -85,6 +92,7 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
+from cti_app.domain.publication import ArtifactType
 
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
 _DOCUMENT_ID = UUID("b8f83b7b-7088-409a-9667-4f93758c18e1")
@@ -134,6 +142,14 @@ def _source(
     document_id: UUID = _DOCUMENT_ID,
     *,
     facts: tuple[ExtractionFactV1, ...] | None = None,
+    events: tuple[ExtractionEventV1, ...] = (),
+    indicators: tuple[ExtractionIndicatorV1, ...] = (),
+    tier: ProductionReferenceTier = ProductionReferenceTier.CORE,
+    profile: ExtractionProfile = ExtractionProfile.FULL,
+    role: SourceRole = SourceRole.PRIMARY,
+    editorial_role: ProductionEditorialRole | None = None,
+    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
+    url_suffix: str = "report",
 ) -> ProductionSourceExtractionV1:
     if facts is None:
         facts = (
@@ -149,17 +165,18 @@ def _source(
         )
     return ProductionSourceExtractionV1(
         source_document_id=document_id,
-        canonical_url="https://example.test/report",
+        canonical_url=f"https://example.test/{url_suffix}",
         content_sha256="b" * 64,
-        tier=ProductionReferenceTier.CORE,
-        kind=ProductionReferenceKind.PUBLICATION,
-        role=SourceRole.PRIMARY,
-        profile=ExtractionProfile.FULL,
+        tier=tier,
+        kind=kind,
+        role=role,
+        editorial_role=editorial_role,
+        profile=profile,
         checkpoint_id=None,
         reuse_state=ExtractionReuseState.FRESH,
         facts=facts,
-        events=(),
-        indicators=(),
+        events=events,
+        indicators=indicators,
         rules=(),
         uncertainties=(),
     )
@@ -170,6 +187,7 @@ def _extraction(
     facts: tuple[ExtractionFactV1, ...] | None = None,
     subject_id: UUID = _SUBJECT_ID,
     input_hash: str = _INPUT_HASH,
+    sources: tuple[ProductionSourceExtractionV1, ...] | None = None,
 ) -> ProductionExtractionV1:
     return ProductionExtractionV1(
         schema_version=1,
@@ -177,7 +195,7 @@ def _extraction(
         production_input_hash=input_hash,
         references_corpus_hash="c" * 64,
         profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
-        sources=(_source(facts=facts),),
+        sources=sources or (_source(facts=facts),),
         omitted_sources=(),
         warnings=(),
     )
@@ -263,6 +281,135 @@ def test_evidence_pack_is_stable_private_and_resolves_exact_refs() -> None:
     assert first.resolve_handle("E001") == extraction_evidence_refs_v1(extraction)[0]
     assert "source_document_id" not in json.dumps([dict(item) for item in first.narrative_evidence])
     assert all("body" not in record for record in first.technical_evidence)
+
+
+def test_supporting_full_narrative_evidence_is_available_after_core():
+    snapshot = _snapshot()
+    core_id, supporting_id, annex_id = uuid4(), uuid4(), uuid4()
+    core = _source(
+        core_id,
+        facts=(
+            ExtractionFactV1(
+                category="actors",
+                value="Core actor",
+                attack_id=None,
+                context="",
+                evidence_quote="Core actor",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(core_id,),
+            ),
+        ),
+        events=(
+            ExtractionEventV1(
+                event_date=date(2026, 1, 2),
+                date_text=None,
+                text="The core operation began.",
+                context="",
+                evidence_quote="The core operation began.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(core_id,),
+            ),
+        ),
+        url_suffix="core",
+    )
+    supporting = _source(
+        supporting_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        profile=ExtractionProfile.FULL,
+        role=SourceRole.INDEPENDENT,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        facts=(
+            ExtractionFactV1(
+                category="malware",
+                value="Independent tool",
+                attack_id=None,
+                context="",
+                evidence_quote="Independent tool",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(supporting_id,),
+            ),
+        ),
+        events=(
+            ExtractionEventV1(
+                event_date=date(2026, 1, 3),
+                date_text=None,
+                text="Independent analysis confirmed the activity.",
+                context="",
+                evidence_quote="Independent analysis confirmed the activity.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(supporting_id,),
+            ),
+        ),
+        url_suffix="supporting",
+    )
+    annex = _source(
+        annex_id,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        profile=ExtractionProfile.IOC_RULES,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        facts=(
+            ExtractionFactV1(
+                category="files",
+                value="Annex-only narrative must stay technical",
+                attack_id=None,
+                context="",
+                evidence_quote="Annex-only narrative must stay technical",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(annex_id,),
+            ),
+        ),
+        indicators=(
+            ExtractionIndicatorV1(
+                value="annex.example",
+                artifact_type=ArtifactType.DOMAIN,
+                indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                context="Published in an IOC annex.",
+                evidence_quote="annex.example",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(annex_id,),
+            ),
+        ),
+        url_suffix="technical-annex",
+    )
+    extraction = _extraction(
+        subject_id=snapshot.subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(supporting, annex, core),
+    )
+    synthesis = _synthesis(extraction)
+
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    core_positions = [
+        index
+        for index, record in enumerate(pack.narrative_evidence)
+        if record["source_role"] == "primary"
+    ]
+    supporting_positions = [
+        index
+        for index, record in enumerate(pack.narrative_evidence)
+        if record["source_role"] == "independent"
+    ]
+
+    independent_kinds = {
+        record["kind"]
+        for record in pack.narrative_evidence
+        if record["source_role"] == "independent"
+    }
+    assert independent_kinds == {
+        "fact",
+        "event",
+    }
+    assert max(core_positions) < min(supporting_positions)
+    assert all(
+        record["editorial_role"] == ProductionEditorialRole.CORROBORATION.value
+        for record in pack.narrative_evidence
+        if record["source_role"] == "independent"
+    )
+    assert "Annex-only narrative must stay technical" not in str(pack.narrative_evidence)
+    assert [record["value"] for record in pack.technical_evidence] == ["annex.example"]
+    assert str(supporting_id) not in json.dumps([dict(item) for item in pack.narrative_evidence])
+    assert str(annex_id) not in json.dumps([dict(item) for item in pack.technical_evidence])
 
 
 def test_proposal_materializes_tables_diagrams_and_empty_decisions() -> None:

@@ -373,6 +373,9 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
+EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-role-depth-v2"
+
+
 class DetectionRuleType(StrEnum):
     YARA = "yara"
     SIGMA = "sigma"
@@ -703,6 +706,7 @@ class SourceExtraction:
     source_text_contract_version: str
     model_policy_version: str
     routing_policy_version: str
+    profile_policy_version: str = EXTRACTION_PROFILE_POLICY_VERSION
     status: SourceExtractionStatus = SourceExtractionStatus.RUNNING
     canonical_blob_id: UUID | None = None
     raw_blob_id: UUID | None = None
@@ -723,6 +727,7 @@ class SourceExtraction:
             ("source_text_contract_version", self.source_text_contract_version),
             ("model_policy_version", self.model_policy_version),
             ("routing_policy_version", self.routing_policy_version),
+            ("profile_policy_version", self.profile_policy_version),
         ):
             if not value.strip():
                 raise ValueError(f"{name} is required")

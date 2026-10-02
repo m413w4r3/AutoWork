@@ -23,6 +23,15 @@ class ProductionReferenceKind(StrEnum):
     TECHNICAL_RESOURCE = "technical_resource"
 
 
+class ProductionEditorialRole(StrEnum):
+    """A source's editorial authority within the publication being produced."""
+
+    PRIMARY = "primary"
+    CORROBORATION = "corroboration"
+    CONTEXT = "context"
+    COUNTER_ANALYSIS = "counter_analysis"
+
+
 class ProductionReferenceResearchStatus(StrEnum):
     COMPLETED = "completed"
 
@@ -74,6 +83,7 @@ class ProductionReferenceSourceV1:
     relevance_reason: str | None
     proposed_by_model: bool
     eligible_for_extraction: bool
+    editorial_role: ProductionEditorialRole | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -88,6 +98,24 @@ class ProductionReferenceSourceV1:
             raise ValueError("Reference kind is invalid")
         if not isinstance(self.role, SourceRole):
             raise ValueError("Reference role is invalid")
+        if self.editorial_role is None:
+            inferred = (
+                ProductionEditorialRole.PRIMARY
+                if self.tier is ProductionReferenceTier.CORE
+                else ProductionEditorialRole.CONTEXT
+                if self.kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+                else ProductionEditorialRole.CORROBORATION
+                if self.role is SourceRole.INDEPENDENT
+                else ProductionEditorialRole.CONTEXT
+            )
+            object.__setattr__(self, "editorial_role", inferred)
+        elif not isinstance(self.editorial_role, ProductionEditorialRole):
+            raise ValueError("Reference editorial role is invalid")
+        if (
+            self.tier is ProductionReferenceTier.CORE
+            and self.editorial_role is not ProductionEditorialRole.PRIMARY
+        ):
+            raise ValueError("CORE references must retain primary editorial authority")
         if not isinstance(self.collection_state, CollectionState):
             raise ValueError("Reference collection state is invalid")
         if self.title is not None and not isinstance(self.title, str):

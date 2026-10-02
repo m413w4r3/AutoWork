@@ -20,17 +20,18 @@ from cti_app.domain.production_extraction import (
     ExtractionFactV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
+    ExtractionProfileReasonCode,
     ExtractionReuseState,
     ExtractionRuleV1,
     ProductionExtractionOmissionReason,
     ProductionExtractionOmissionV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
-    extraction_profile_for_tier,
     production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
@@ -70,7 +71,7 @@ def _source(
         tier=tier,
         kind=ProductionReferenceKind.PUBLICATION,
         role=SourceRole.PRIMARY,
-        profile=profile or extraction_profile_for_tier(tier),
+        profile=profile or ExtractionProfile.FULL,
         checkpoint_id=_CHECKPOINT_ID,
         reuse_state=reuse_state,
         facts=(
@@ -225,36 +226,35 @@ def test_duplicate_source_url_is_rejected() -> None:
         _extraction(first, second)
 
 
-@pytest.mark.parametrize(
-    ("tier", "profile"),
-    [
-        (ProductionReferenceTier.CORE, ExtractionProfile.IOC_RULES),
-        (ProductionReferenceTier.SUPPORTING, ExtractionProfile.FULL),
-        (ProductionReferenceTier.TECHNICAL, ExtractionProfile.FULL),
-    ],
-)
-def test_profile_must_match_the_reference_tier(
-    tier: ProductionReferenceTier, profile: ExtractionProfile
-) -> None:
-    with pytest.raises(ValueError, match="profile does not match"):
-        _source(tier=tier, profile=profile)
+def test_supporting_full_profile_reason_is_persisted() -> None:
+    source = ProductionSourceExtractionV1(
+        source_document_id=_DOCUMENT_ID,
+        canonical_url="https://example.test/independent-analysis",
+        content_sha256=_SHA,
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        profile=ExtractionProfile.FULL,
+        profile_reason_code=ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION,
+        checkpoint_id=_CHECKPOINT_ID,
+        reuse_state=ExtractionReuseState.FRESH,
+        facts=(),
+        events=(),
+        indicators=(),
+        rules=(),
+        uncertainties=(),
+    )
 
+    payload = production_extraction_to_json(_extraction(source))["sources"][0]
 
-@pytest.mark.parametrize(
-    ("tier", "profile"),
-    [
-        (ProductionReferenceTier.CORE, ExtractionProfile.FULL),
-        (ProductionReferenceTier.SUPPORTING, ExtractionProfile.IOC_RULES),
-        (ProductionReferenceTier.TECHNICAL, ExtractionProfile.IOC_RULES),
-    ],
-)
-def test_profile_policy_is_keyed_by_tier_only(
-    tier: ProductionReferenceTier, profile: ExtractionProfile
-) -> None:
-    assert extraction_profile_for_tier(tier) is profile
-    source = _source(tier=tier)
-    assert source.profile is profile
-    assert source.role is SourceRole.PRIMARY
+    assert payload["tier"] == ProductionReferenceTier.SUPPORTING.value
+    assert payload["profile"] == ExtractionProfile.FULL.value
+    assert payload["editorial_role"] == ProductionEditorialRole.CORROBORATION.value
+    assert (
+        payload["profile_reason_code"]
+        == ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION.value
+    )
 
 
 def test_provenance_must_include_the_owning_document() -> None:

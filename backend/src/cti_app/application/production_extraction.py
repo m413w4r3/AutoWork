@@ -3,8 +3,8 @@
 The EXTRACTION stage never looks a source up: it consumes the frozen
 ``ProductionReferenceCorpusV1`` of REFERENCES, resolves every eligible source by
 its exact ``source_document_id``, reads the archived decoded blob, verifies its
-SHA-256 against the corpus before any model call, applies the tier policy
-(CORE -> FULL, SUPPORTING/TECHNICAL -> IOC_RULES), reuses durable source
+SHA-256 against the corpus before any model call, applies the versioned
+editorial-role and source-kind profile policy, reuses durable source
 checkpoints, asks ``ModelGateway`` for source-local Q2 wire text and
 aggregates only evidence-gated proposals into ``ProductionExtractionV1``.
 
@@ -96,6 +96,7 @@ from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelRunStatus
 from cti_app.domain.production import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     DetectionRule,
     ExtractionProfile,
@@ -110,23 +111,24 @@ from cti_app.domain.production import (
     model_run_awaits_reconciliation,
 )
 from cti_app.domain.production_extraction import (
-    EXTRACTION_PROFILE_POLICY_VERSION,
     EXTRACTION_TIER_ORDER,
     PRODUCTION_EXTRACTION_SCHEMA_VERSION,
     ExtractionEventV1,
     ExtractionFactV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
+    ExtractionProfileReasonCode,
     ExtractionReuseState,
     ExtractionRuleV1,
     ProductionExtractionOmissionReason,
     ProductionExtractionOmissionV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
-    extraction_profile_for_tier,
+    extraction_profile_decision,
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceTier,
@@ -242,7 +244,7 @@ BeforeModelCall = Callable[[], Awaitable[None]]
 
 @dataclass(frozen=True, slots=True)
 class PlannedExtractionSource:
-    """One eligible corpus source, with the profile its tier imposes."""
+    """One eligible source and its deterministic editorial profile decision."""
 
     source_document_id: UUID
     canonical_url: str
@@ -250,7 +252,9 @@ class PlannedExtractionSource:
     tier: ProductionReferenceTier
     kind: ProductionReferenceKind
     role: SourceRole
+    editorial_role: ProductionEditorialRole
     profile: ExtractionProfile
+    profile_reason_code: ExtractionProfileReasonCode
     title: str | None
     collection_state: CollectionState
     position: int = 0
@@ -308,8 +312,8 @@ def references_corpus_hash(corpus: ProductionReferenceCorpusV1) -> str:
 def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan:
     """Plan one extraction run exclusively from the canonical REFERENCES corpus.
 
-    The tier of the corpus is the only authority: ``SourceRole`` never decides
-    FULL vs IOC_RULES. The plan is canonicalized by tier, URL and document
+    Editorial authority and source kind select the profile; tier remains the
+    stable source priority. The plan is canonicalized by tier, URL and document
     identity, so loading the same corpus in another source order yields the same
     plan and the same input hash.
     """
@@ -345,6 +349,12 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
             )
             warnings.append(f"reference_not_eligible:{source.tier.value}:{source.canonical_url}")
             continue
+        assert source.editorial_role is not None
+        profile, profile_reason_code = extraction_profile_decision(
+            tier=source.tier,
+            kind=source.kind,
+            editorial_role=source.editorial_role,
+        )
         planned.append(
             PlannedExtractionSource(
                 source_document_id=source.source_document_id,
@@ -353,7 +363,9 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
                 tier=source.tier,
                 kind=source.kind,
                 role=source.role,
-                profile=extraction_profile_for_tier(source.tier),
+                editorial_role=source.editorial_role,
+                profile=profile,
+                profile_reason_code=profile_reason_code,
                 title=source.title,
                 collection_state=source.collection_state,
             )
@@ -449,6 +461,7 @@ def source_checkpoint_identity(
     return {
         "source_content_sha256": content_sha256,
         "profile": profile.value,
+        "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
         "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
         "prompt_version": prompt_version,
         "parser_version": EXTRACTION_RESPONSE_PARSER_VERSION,
@@ -970,7 +983,9 @@ def build_canonical_source_extraction(
         tier=planned.tier,
         kind=planned.kind,
         role=planned.role,
+        editorial_role=planned.editorial_role,
         profile=planned.profile,
+        profile_reason_code=planned.profile_reason_code,
         checkpoint_id=checkpoint_id,
         reuse_state=reuse_state,
         facts=facts,
@@ -1327,6 +1342,7 @@ class ProductionExtractionService:
             source_text_contract_version=identity["source_text_contract_version"],
             model_policy_version=identity["model_policy_version"],
             routing_policy_version=identity["routing_policy_version"],
+            profile_policy_version=identity["profile_policy_version"],
             status=SourceExtractionStatus.VERIFIED,
             canonical_blob_id=canonical_blob_id,
             raw_blob_id=raw_blob_id,
@@ -1644,6 +1660,7 @@ class _ExtractionRun:
                         "kind": "source",
                         "source_content_sha256": planned.content_sha256,
                         "profile": planned.profile.value,
+                        "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
                         "prompt_version": prompt_version,
                         "source_text_contract_version": source_text_contract_version(),
                         "chunk_index": index,
@@ -1720,6 +1737,7 @@ class _ExtractionRun:
             unit_identity={
                 "kind": "batch",
                 "batch_identity": batch_identity,
+                "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
                 "prompt_version": CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION,
                 "source_text_contract_version": source_text_contract_version(),
             },

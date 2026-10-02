@@ -81,7 +81,11 @@ from cti_app.domain.production_extraction import (
     ProductionSourceExtractionV1,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionReferenceKind, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
 from cti_app.domain.production_synthesis import (
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
@@ -198,6 +202,10 @@ def make_source(
     source_id: UUID,
     *,
     tier: ProductionReferenceTier = ProductionReferenceTier.CORE,
+    profile: ExtractionProfile | None = None,
+    role: SourceRole = SourceRole.PRIMARY,
+    editorial_role: ProductionEditorialRole | None = None,
+    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
     facts: tuple[ExtractionFactV1, ...] = (),
     events: tuple[ExtractionEventV1, ...] = (),
     indicators: tuple[ExtractionIndicatorV1, ...] = (),
@@ -210,9 +218,11 @@ def make_source(
         canonical_url=f"https://example.com/{url_suffix}",
         content_sha256=hashlib.sha256(url_suffix.encode()).hexdigest(),
         tier=tier,
-        kind=ProductionReferenceKind.PUBLICATION,
-        role=SourceRole.PRIMARY,
-        profile=(
+        kind=kind,
+        role=role,
+        editorial_role=editorial_role,
+        profile=profile
+        or (
             ExtractionProfile.FULL
             if tier is ProductionReferenceTier.CORE
             else ExtractionProfile.IOC_RULES
@@ -308,6 +318,55 @@ def test_refs_hash_and_prompt_handles_are_stable_across_source_load_order():
         raise AssertionError("unknown handles must not be approximated")
 
 
+def test_supporting_full_facts_and_events_follow_core_narrative_evidence():
+    subject_id = uuid4()
+    core_id, supporting_id = uuid4(), uuid4()
+    core = make_source(
+        core_id,
+        facts=(make_fact(core_id, "CoreReport"),),
+        events=(make_event(core_id, "The core incident began.", date(2026, 1, 3)),),
+        url_suffix="core-primary",
+    )
+    supporting = make_source(
+        supporting_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        profile=ExtractionProfile.FULL,
+        role=SourceRole.INDEPENDENT,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        facts=(make_fact(supporting_id, "IndependentResearch"),),
+        events=(
+            make_event(
+                supporting_id,
+                "The independent analysis confirmed activity.",
+                date(2026, 1, 4),
+            ),
+        ),
+        url_suffix="supporting-independent",
+    )
+    extraction = make_extraction(subject_id, (supporting, core))
+
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    records = pack.narrative_evidence
+    core_positions = [
+        index for index, record in enumerate(records) if record["source_role"] == "primary"
+    ]
+    supporting_positions = [
+        index for index, record in enumerate(records) if record["source_role"] == "independent"
+    ]
+
+    assert {record["kind"] for record in records if record["source_role"] == "independent"} == {
+        "fact",
+        "event",
+    }
+    assert max(core_positions) < min(supporting_positions)
+    assert all(
+        record["editorial_role"] == ProductionEditorialRole.CORROBORATION.value
+        for record in records
+        if record["source_role"] == "independent"
+    )
+    assert str(supporting_id) not in str(records)
+
+
 def test_changed_fact_payload_changes_its_evidence_key():
     subject_id, source_id = uuid4(), uuid4()
     original_fact = make_fact(source_id, "FooRAT")
@@ -371,7 +430,17 @@ def test_technical_pack_is_contextual_body_free_deterministic_and_bounded():
     rule_only = make_extraction(subject_id, (rule_only_source,))
     rule_pack = build_synthesis_evidence_pack(make_snapshot(subject_id), rule_only)
     rule_record = rule_pack.technical_evidence[0]
-    assert set(rule_record) == {"handle", "kind", "type", "name", "sha256", "context", "evidence"}
+    assert set(rule_record) == {
+        "handle",
+        "kind",
+        "source_role",
+        "editorial_role",
+        "type",
+        "name",
+        "sha256",
+        "context",
+        "evidence",
+    }
     assert body not in str(rule_pack.technical_evidence)
 
 

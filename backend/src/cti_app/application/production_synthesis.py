@@ -62,7 +62,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionReferenceTier
+from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION,
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v2-uncertainty-cleanup-cap-10"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v3-multi-source-authority"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v2-date-approximation-and-dedupe"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
@@ -899,13 +899,19 @@ def _all_evidence_entries(
 
 
 def _prompt_evidence_record(
-    handle: str, kind: EvidenceKind, payload: Mapping[str, Any]
+    handle: str,
+    kind: EvidenceKind,
+    payload: Mapping[str, Any],
+    *,
+    source: Any,
 ) -> dict[str, Any]:
     """Project source-local extraction evidence without internal document IDs."""
     if kind is EvidenceKind.FACT:
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_role": source.role.value,
+            "editorial_role": source.editorial_role.value,
             "category": payload["category"],
             "value": payload["value"],
             "attack_id": payload["attack_id"],
@@ -916,6 +922,8 @@ def _prompt_evidence_record(
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_role": source.role.value,
+            "editorial_role": source.editorial_role.value,
             "event_date": payload["event_date"],
             "date_text": payload["date_text"],
             "text": payload["text"],
@@ -926,6 +934,8 @@ def _prompt_evidence_record(
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_role": source.role.value,
+            "editorial_role": source.editorial_role.value,
             "value": payload["value"],
             "type": payload["artifact_type"],
             "context": payload["context"],
@@ -934,6 +944,8 @@ def _prompt_evidence_record(
     return {
         "handle": handle,
         "kind": kind.value,
+        "source_role": source.role.value,
+        "editorial_role": source.editorial_role.value,
         "type": payload["rule_type"],
         "name": payload["name"],
         "sha256": payload["sha256"],
@@ -994,7 +1006,6 @@ def build_synthesis_evidence_pack(
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
-        and source_by_id[ref.source_document_id].tier is ProductionReferenceTier.CORE
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
     }
     technical_candidates = [
@@ -1007,17 +1018,51 @@ def build_synthesis_evidence_pack(
         sorted(technical_candidates, key=evidence_ref_sort_key)[:MAX_TECHNICAL_EVIDENCE_V1]
     )
 
-    catalogue_refs = sorted(narrative_refs | technical_refs, key=evidence_ref_sort_key)
+    def authority_key(ref: ExtractionEvidenceRefV1) -> tuple[int, int, str, str]:
+        source = source_by_id[ref.source_document_id]
+        editorial_role = source.editorial_role
+        assert editorial_role is not None
+        role_order = {
+            ProductionEditorialRole.PRIMARY: 0,
+            ProductionEditorialRole.CORROBORATION: 1,
+            ProductionEditorialRole.COUNTER_ANALYSIS: 2,
+            ProductionEditorialRole.CONTEXT: 3,
+        }
+        return (
+            0 if source.tier is ProductionReferenceTier.CORE else 1,
+            role_order[editorial_role],
+            source.canonical_url,
+            str(source.source_document_id),
+        )
+
+    catalogue_refs = sorted(
+        narrative_refs | technical_refs,
+        key=lambda ref: (
+            0 if ref in narrative_refs else 1,
+            authority_key(ref),
+            evidence_ref_sort_key(ref),
+        ),
+    )
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(catalogue_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
 
     narrative_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
+        _prompt_evidence_record(
+            handle_for_ref[ref],
+            ref.kind,
+            entries[ref],
+            source=source_by_id[ref.source_document_id],
+        )
         for ref in catalogue_refs
         if ref in narrative_refs
     )
     technical_evidence = tuple(
-        _prompt_evidence_record(handle_for_ref[ref], ref.kind, entries[ref])
+        _prompt_evidence_record(
+            handle_for_ref[ref],
+            ref.kind,
+            entries[ref],
+            source=source_by_id[ref.source_document_id],
+        )
         for ref in catalogue_refs
         if ref in technical_refs
     )

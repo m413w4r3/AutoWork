@@ -710,6 +710,7 @@ url: https://core.example/report
 publisher: Core Publisher
 published-at: 2026-08-01
 role: relay
+editorial-role: context
 kind: publication
 reason: Duplicates a snapshot core URL
 
@@ -720,6 +721,7 @@ url: https://annex.example/iocs
 publisher: Annex publisher
 published-at: 2026-08-02
 role: independent
+editorial-role: context
 kind: technical_resource
 reason: IOC annex for the same incident
 

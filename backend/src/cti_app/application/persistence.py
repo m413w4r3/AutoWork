@@ -1028,6 +1028,7 @@ class SourceExtractionRepository(Protocol):
         source_text_contract_version: str,
         model_policy_version: str,
         routing_policy_version: str,
+        profile_policy_version: str,
     ) -> SourceExtraction | None: ...
 
     async def list_for_url(self, canonical_url: str) -> Sequence[SourceExtraction]: ...

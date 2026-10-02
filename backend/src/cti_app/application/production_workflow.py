@@ -304,6 +304,8 @@ def _canonical_extraction_progress(
                 "canonical_url": planned.canonical_url,
                 "tier": planned.tier.value,
                 "profile": planned.profile.value,
+                "editorial_role": planned.editorial_role.value,
+                "profile_reason_code": planned.profile_reason_code.value,
                 "status": status,
                 "reuse_state": source.reuse_state.value if source is not None else None,
                 "ioc_count": len(source.indicators) if source is not None else 0,
