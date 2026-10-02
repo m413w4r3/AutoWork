@@ -58,11 +58,13 @@ def test_canonical_synthesis_has_no_legacy_evidence_or_conversation_path() -> No
     assert not re.search(r"web_search\s*=\s*True\b", synthesis_source + workflow_branch)
 
 
-def test_canonical_synthesis_uses_gateway_structured_proposal_without_source_fetch() -> None:
+def test_canonical_synthesis_uses_gateway_text_blocks_without_source_fetch() -> None:
     source = SYNTHESIS.read_text()
 
     assert "class SynthesisProposalV1" in source
-    assert "model_gateway.draft(request, SynthesisProposalV1)" in source
+    assert "parse_synthesis_proposal_wire" in source
+    assert "model_gateway.draft(request)" in source
+    assert "model_gateway.draft(request, SynthesisProposalV1)" not in source
 
     for forbidden in (
         "parse_document(",

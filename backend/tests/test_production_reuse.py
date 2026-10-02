@@ -31,7 +31,6 @@ from cti_app.application.production_stages import ReferenceResearchService
 from cti_app.application.production_synthesis import (
     ProductionSynthesisExecution,
     SynthesisExecutionStatus,
-    SynthesisProposalV1,
     build_synthesis_evidence_pack,
     synthesis_input_hash,
 )
@@ -1376,14 +1375,33 @@ class _SynthesisUow:
 
 
 class _SynthesisGateway:
-    """A drafting gateway double; every request is recorded."""
+    """A drafting gateway double returning text blocks; every request is recorded."""
 
     def __init__(self, proposal: dict[str, object]) -> None:
         self.proposal = proposal
         self.requests: list[ModelRequest] = []
+        self.runs: dict[UUID, ModelRun] = {}
+        self.outputs: dict[str, bytes] = {}
 
-    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+    def _wire_text(self) -> str:
+        lines = ["@@LEAD@@"]
+        lead = cast(list[dict[str, Any]], self.proposal["lead"])
+        for index, claim in enumerate(lead, start=1):
+            lines.extend(
+                (
+                    f"@@CLAIM L{index:03d}@@",
+                    f"EVIDENCE: {', '.join(claim['evidence_handles'])}",
+                    f"TEXT: {claim['text']}",
+                )
+            )
+        return "\n".join(lines)
+
+    async def draft(
+        self, request: ModelRequest, output_schema: object | None = None
+    ) -> ModelExecution:
         self.requests.append(request)
+        text = self._wire_text()
+        raw_bytes = text.encode("utf-8")
         run = ModelRun(
             provider=ModelProvider.OPENAI,
             model_role=ModelRole.DRAFTING,
@@ -1395,18 +1413,41 @@ class _SynthesisGateway:
             parameters=dict(request.parameters),
             id=request.run_id or uuid4(),
         )
+        reference = f"model-output://{run.id}"
+        run.raw_output_reference = reference
+        run.raw_output_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+        run.raw_output_chars = len(text)
         run.succeed(
             actual_model_version="gpt-5",
             duration_ms=3,
             usage=ModelUsage(total_tokens=7),
-            output_references=("model-output://1",),
+            output_references=(reference,),
             response_id=None,
         )
-        return ModelExecution(
-            run=run,
-            output_text="raw answer",
-            structured_output=SynthesisProposalV1.model_validate(self.proposal),
-        )
+        self.outputs[reference] = raw_bytes
+        self.runs[run.id] = run
+        return ModelExecution(run=run, output_text=text)
+
+    async def get_run(self, run_id: UUID) -> ModelRun | None:
+        return self.runs.get(run_id)
+
+    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000) -> bytes:
+        return self.outputs[reference]
+
+    async def archive_output(self, content: bytes, *, mime_type: str) -> str:
+        del mime_type
+        reference = f"model-normalized://{len(self.outputs)}"
+        self.outputs[reference] = content
+        return reference
+
+    async def record_output_diagnostics(self, run_id: UUID, **values: object) -> None:
+        run = self.runs[run_id]
+        run.normalized_output_reference = values["normalized_reference"]  # type: ignore[assignment]
+        run.normalized_output_sha256 = values["normalized_sha256"]  # type: ignore[assignment]
+        run.parser_stage = values["parser_stage"]  # type: ignore[assignment]
+        run.normalization_version = values["normalization_version"]  # type: ignore[assignment]
+        run.transformations = values["transformations"]  # type: ignore[assignment]
+        run.validation_errors = values["validation_errors"]  # type: ignore[assignment]
 
 
 class _RefusingDraftGateway:
@@ -1415,7 +1456,9 @@ class _RefusingDraftGateway:
     def __init__(self) -> None:
         self.requests: list[ModelRequest] = []
 
-    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+    async def draft(
+        self, request: ModelRequest, output_schema: object | None = None
+    ) -> ModelExecution:
         self.requests.append(request)
         raise AssertionError("exact synthesis reuse must not submit a drafting request")
 
