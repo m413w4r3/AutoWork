@@ -24,7 +24,7 @@ from cti_app.application.production_parsers import (
     reconcile_reference_report_with_archives,
     reference_report_from_json,
 )
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionFailureReason, CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -48,6 +48,7 @@ PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
 _AVAILABILITY_WARNING_PREFIXES = (
     "core_source_unavailable:",
     "supporting_source_unavailable:",
+    "source_collection_failure:",
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -105,6 +106,7 @@ class ReferenceCollectionObservation:
     state: CollectionState = CollectionState.UNAVAILABLE
     source_document_id: UUID | None = None
     content_sha256: str | None = None
+    failure_reason_code: CollectionFailureReason | None = None
 
 
 async def observe_reference_collections(
@@ -145,6 +147,7 @@ async def observe_reference_collections(
             state=_collection_state(collection.state),
             source_document_id=document_id,
             content_sha256=content_sha256,
+            failure_reason_code=_collection_failure_reason(collection),
         )
     return observations
 
@@ -228,7 +231,18 @@ def build_production_reference_corpus(
         warnings=(),
     )
     availability: list[str] = []
+    collection_failures: list[str] = []
     for source in corpus.sources:
+        diagnostic_observation = observations.get(source.canonical_url)
+        if (
+            diagnostic_observation is not None
+            and diagnostic_observation.failure_reason_code is not None
+        ):
+            collection_failures.append(
+                "source_collection_failure:"
+                f"{source.canonical_url}:"
+                f"{diagnostic_observation.failure_reason_code.value}"
+            )
         if source.eligible_for_extraction:
             continue
         prefix = (
@@ -240,7 +254,7 @@ def build_production_reference_corpus(
     kept = tuple(
         warning for warning in warnings if not warning.startswith(_AVAILABILITY_WARNING_PREFIXES)
     )
-    return replace(corpus, warnings=(*kept, *availability))
+    return replace(corpus, warnings=(*kept, *availability, *collection_failures))
 
 
 def production_reference_corpus_metadata(corpus: ProductionReferenceCorpusV1) -> dict[str, int]:
@@ -617,6 +631,18 @@ def _collection_state(value: Any) -> CollectionState:
         return CollectionState(str(getattr(value, "value", value)))
     except ValueError:
         return CollectionState.UNAVAILABLE
+
+
+def _collection_failure_reason(value: Any) -> CollectionFailureReason | None:
+    reason = getattr(value, "failure_reason_code", None)
+    if isinstance(reason, CollectionFailureReason):
+        return reason
+    if isinstance(reason, str):
+        try:
+            return CollectionFailureReason(reason)
+        except ValueError:
+            return None
+    return None
 
 
 def _optional_field(value: str | None) -> str | None:

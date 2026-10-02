@@ -9,12 +9,15 @@ from cti_app.application.production_prompts import (
 )
 from cti_app.application.production_references import (
     PRODUCTION_REFERENCE_PARSER_VERSION,
+    ProductionReferenceProposal,
+    ReferenceCollectionObservation,
+    build_production_reference_corpus,
     load_legacy_reference_report,
     parse_production_reference_proposals,
     production_reference_corpus_from_json,
     production_reference_corpus_to_json,
 )
-from cti_app.domain.collection import CollectionState
+from cti_app.domain.collection import CollectionFailureReason, CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -216,6 +219,37 @@ def test_production_reference_corpus_round_trip_orders_sources_and_excludes_lega
     assert "editorial_title" not in payload
     with pytest.raises(ValueError, match="invalid shape"):
         production_reference_corpus_from_json({**payload, "production_run_id": str(uuid4())})
+
+
+def test_reference_projection_keeps_the_precise_collection_failure_reason() -> None:
+    url = "https://cisa.gov/advisories/missing.pdf"
+    corpus = build_production_reference_corpus(
+        subject_id=uuid4(),
+        research_date=date(2026, 10, 2),
+        production_input_hash="a" * 64,
+        core_sources=(),
+        proposals=(
+            ProductionReferenceProposal(
+                canonical_url=url,
+                title="CISA advisory",
+                publisher="CISA",
+                published_at=None,
+                role=SourceRole.INDEPENDENT,
+                kind=ProductionReferenceKind.PUBLICATION,
+                relevance_reason="Official advisory about the subject",
+            ),
+        ),
+        observations={
+            url: ReferenceCollectionObservation(
+                state=CollectionState.UNAVAILABLE,
+                failure_reason_code=CollectionFailureReason.OBSOLETE_URL_404,
+            )
+        },
+        warnings=(),
+    )
+
+    payload = production_reference_corpus_to_json(corpus)
+    assert f"source_collection_failure:{url}:obsolete_url_404" in payload["warnings"]
 
 
 @pytest.mark.parametrize(

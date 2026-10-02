@@ -11,8 +11,11 @@ from cti_app.domain.collection import (
     Claim,
     ClaimKind,
     CollectionAttempt,
+    CollectionFailureReason,
     CollectionPolicySnapshot,
+    CollectionResolutionProvenance,
     CollectionState,
+    CollectionTransportClassification,
     DerivedArtifact,
     Indicator,
     IndicatorKind,
@@ -254,6 +257,11 @@ def _source_collection_values(collection: SourceCollection) -> dict[str, object]
         "fetch_started_at": collection.fetch_started_at,
         "fetch_lease_expires_at": collection.fetch_lease_expires_at,
         "error_reason": collection.error_reason,
+        "failure_reason_code": (
+            collection.failure_reason_code.value
+            if collection.failure_reason_code is not None
+            else None
+        ),
         "attempt_count": collection.attempt_count,
         "created_at": collection.created_at,
         "updated_at": collection.updated_at,
@@ -292,6 +300,11 @@ def _source_collection_from_row(row: SourceCollectionRow) -> SourceCollection:
         fetch_started_at=row.fetch_started_at,
         fetch_lease_expires_at=row.fetch_lease_expires_at,
         error_reason=row.error_reason,
+        failure_reason_code=(
+            CollectionFailureReason(row.failure_reason_code)
+            if row.failure_reason_code is not None
+            else None
+        ),
         attempt_count=row.attempt_count,
         created_at=row.created_at,
         updated_at=row.updated_at,
@@ -323,6 +336,18 @@ def _collection_attempt_values(attempt: CollectionAttempt) -> dict[str, object]:
         "allowed_headers": attempt.allowed_headers,
         "outcome": attempt.outcome.value,
         "failure_reason": attempt.failure_reason,
+        "reason_code": attempt.reason_code.value if attempt.reason_code is not None else None,
+        "transport_classification": (
+            attempt.transport_classification.value
+            if attempt.transport_classification is not None
+            else None
+        ),
+        "candidate_resolution_url": attempt.candidate_resolution_url,
+        "candidate_resolution_provenance": (
+            attempt.candidate_resolution_provenance.value
+            if attempt.candidate_resolution_provenance is not None
+            else None
+        ),
     }
 
 
@@ -349,6 +374,20 @@ def _collection_attempt_from_row(row: CollectionAttemptRow) -> CollectionAttempt
         allowed_headers=row.allowed_headers,
         outcome=AttemptOutcome(row.outcome),
         failure_reason=row.failure_reason,
+        reason_code=(
+            CollectionFailureReason(row.reason_code) if row.reason_code is not None else None
+        ),
+        transport_classification=(
+            CollectionTransportClassification(row.transport_classification)
+            if row.transport_classification is not None
+            else None
+        ),
+        candidate_resolution_url=row.candidate_resolution_url,
+        candidate_resolution_provenance=(
+            CollectionResolutionProvenance(row.candidate_resolution_provenance)
+            if row.candidate_resolution_provenance is not None
+            else None
+        ),
     )
 
 

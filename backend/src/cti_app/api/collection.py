@@ -67,6 +67,10 @@ class AttemptView(BaseModel):
     content_encoding: str | None
     outcome: str
     failure_reason: str | None
+    reason_code: str | None
+    transport_classification: str | None
+    candidate_resolution_url: str | None
+    candidate_resolution_provenance: str | None
 
 
 class ArchiveReceiptView(BaseModel):
@@ -97,6 +101,7 @@ class SourceView(BaseModel):
     source_document_id: UUID | None
     attempt_count: int
     error_reason: str | None
+    failure_reason_code: str | None
     fetch_lease_expires_at: str | None
     latest_attempt: AttemptView | None
     title: str
@@ -522,6 +527,9 @@ def _source_view(
         source_document_id=source.source_document_id,
         attempt_count=source.attempt_count,
         error_reason=source.error_reason,
+        failure_reason_code=(
+            source.failure_reason_code.value if source.failure_reason_code is not None else None
+        ),
         fetch_lease_expires_at=(
             source.fetch_lease_expires_at.isoformat() if source.fetch_lease_expires_at else None
         ),
@@ -610,6 +618,18 @@ def _attempt_view(attempt: CollectionAttempt) -> AttemptView:
         content_encoding=attempt.content_encoding,
         outcome=attempt.outcome.value,
         failure_reason=attempt.failure_reason,
+        reason_code=attempt.reason_code.value if attempt.reason_code is not None else None,
+        transport_classification=(
+            attempt.transport_classification.value
+            if attempt.transport_classification is not None
+            else None
+        ),
+        candidate_resolution_url=attempt.candidate_resolution_url,
+        candidate_resolution_provenance=(
+            attempt.candidate_resolution_provenance.value
+            if attempt.candidate_resolution_provenance is not None
+            else None
+        ),
     )
 
 

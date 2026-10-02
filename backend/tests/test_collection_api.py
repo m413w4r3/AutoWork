@@ -211,6 +211,11 @@ async def test_retry_endpoint_processes_only_requested_source(tmp_path: Path) ->
         sources = (await client.get(f"/api/subjects/{subject.id}/workbench")).json()["sources"]
         completed = next(item for item in sources if item["state"] == "archived")
         unavailable = next(item for item in sources if item["state"] == "unavailable")
+        assert unavailable["failure_reason_code"] == "obsolete_url_404"
+        assert unavailable["latest_attempt"]["http_status"] == 404
+        assert unavailable["latest_attempt"]["reason_code"] == "obsolete_url_404"
+        assert unavailable["latest_attempt"]["detected_content_type"] == "text/plain"
+        assert unavailable["latest_attempt"]["encoded_size"] == len(b"missing")
 
         retried = await client.post(f"/api/subjects/{subject.id}/sources/{unavailable['id']}/retry")
 

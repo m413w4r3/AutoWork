@@ -27,13 +27,23 @@ from cti_app.application.collection import (
 from cti_app.application.collection_review import CollectionReviewService
 from cti_app.application.http_collection import (
     CollectionPolicy,
+    DnsResolver,
+    DownloadTransientError,
+    HttpTransport,
     PinnedHttpRequest,
     RawHttpResponse,
     SafeHttpCollector,
 )
 from cti_app.application.jobs import JobCancelledError, JobExecutionContext, JobHandlerError
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import CollectionState, SourceOriginKind
+from cti_app.domain.collection import (
+    CollectionAttempt,
+    CollectionFailureReason,
+    CollectionState,
+    CollectionTransportClassification,
+    SourceCollection,
+    SourceOriginKind,
+)
 from cti_app.domain.discovery import (
     CandidateTopic,
     DiscoveryBatch,
@@ -296,6 +306,31 @@ def service(
     )
 
 
+async def _run_one_attempt(
+    url: str,
+    transport: HttpTransport,
+    root: Path,
+    *,
+    resolver: DnsResolver | None = None,
+) -> tuple[
+    InMemoryCollectionUnitOfWorkFactory,
+    SubjectCollectionService,
+    SourceCollection,
+    CollectionState,
+    CollectionAttempt,
+]:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, (url,))
+    app = SubjectCollectionService(
+        factory,
+        SafeHttpCollector(transport, resolver or Resolver()),
+        FilesystemBlobStore(root),
+    )
+    source = (await app.initialize(subject.id))[0]
+    state = await app.archive_one(source.id, uuid4())
+    return factory, app, source, state, (await app.attempts(source.id))[-1]
+
+
 async def test_collection_operations_use_subject_edition_when_group_differs(
     tmp_path: Path,
 ) -> None:
@@ -412,6 +447,7 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
             source.id,
             content=content,
             declared_mime_type="text/html",
+            final_url="https://blocked.example/final-report",
             actor_id="analyst-1",
         )
 
@@ -437,6 +473,9 @@ async def test_manual_content_archives_blocked_source_and_records_provenance(
     assert payload["source_document_id"] == str(archived.source_document_id)
     assert payload["decoded_blob_id"] == str(archived.decoded_blob_id)
     assert payload["requested_url"] == archived.canonical_url
+    assert payload["original_url"] == archived.canonical_url
+    assert payload["final_url"] == "https://blocked.example/final-report"
+    assert manual_events[0].occurred_at.tzinfo is not None
     assert UUID(payload["manual_lease_id"])
     # No collector event: the analyst supplied the content, not the collector.
     assert not [event for event in factory.provenance if event.event_type == "source.archived"]
@@ -934,6 +973,250 @@ async def test_timeout_like_failure_does_not_stop_next_source(tmp_path: Path) ->
     assert states["https://next.example/report"] is CollectionState.ARCHIVED
 
 
+async def test_404_is_persisted_as_an_obsolete_url_diagnostic(tmp_path: Path) -> None:
+    url = "https://example.test/obsolete.pdf"
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        url,
+        Transport([RawHttpResponse(404, {"content-type": "text/html"}, b"not found")]),
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.UNAVAILABLE
+    assert (
+        factory.collections[source.id].failure_reason_code
+        is CollectionFailureReason.OBSOLETE_URL_404
+    )
+    assert attempt.http_status == 404
+    assert attempt.final_url == url
+    assert attempt.redirect_chain == ()
+    assert attempt.declared_content_type == "text/html"
+    assert attempt.detected_content_type == "text/plain"
+    assert attempt.encoded_size == len(b"not found")
+    assert attempt.reason_code is CollectionFailureReason.OBSOLETE_URL_404
+    assert attempt.transport_classification is CollectionTransportClassification.HTTP
+
+
+async def test_403_is_a_blocked_access_diagnostic(tmp_path: Path) -> None:
+    url = "https://example.test/private.pdf"
+    body = b"<!doctype html><html><body>Access denied</body></html>"
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        url,
+        Transport([RawHttpResponse(403, {"content-type": "text/html"}, body)]),
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.BLOCKED
+    assert (
+        factory.collections[source.id].failure_reason_code is CollectionFailureReason.ACCESS_BLOCKED
+    )
+    assert attempt.http_status == 403
+    assert attempt.detected_content_type == "text/html"
+    assert attempt.encoded_size == len(body)
+    assert attempt.reason_code is CollectionFailureReason.ACCESS_BLOCKED
+    assert attempt.transport_classification is CollectionTransportClassification.BLOCKED
+
+
+async def test_timeout_is_classified_separately_from_other_transport_failures(
+    tmp_path: Path,
+) -> None:
+    class TimeoutTransport:
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            del request
+            raise DownloadTransientError(
+                "Collection timeout exceeded",
+                reason_code=CollectionFailureReason.TIMEOUT,
+                transport_classification=CollectionTransportClassification.TIMEOUT,
+            )
+
+    _factory, _app, _source, state, attempt = await _run_one_attempt(
+        "https://example.test/timeout.pdf", TimeoutTransport(), tmp_path / "blobs"
+    )
+
+    assert state is CollectionState.FAILED_RETRYABLE
+    assert attempt.reason_code is CollectionFailureReason.TIMEOUT
+    assert attempt.transport_classification is CollectionTransportClassification.TIMEOUT
+    assert attempt.http_status is None
+    assert attempt.final_url == "https://example.test/timeout.pdf"
+
+
+async def test_dns_and_tls_failures_keep_distinct_transport_classifications(
+    tmp_path: Path,
+) -> None:
+    class DnsFailureResolver:
+        async def resolve(self, hostname: str) -> Sequence[str]:
+            del hostname
+            raise OSError("resolver unavailable")
+
+    class TlsFailureTransport:
+        async def request(self, request: PinnedHttpRequest) -> RawHttpResponse:
+            del request
+            raise DownloadTransientError(
+                "TLS handshake or validation failed",
+                reason_code=CollectionFailureReason.TLS_ERROR,
+                transport_classification=CollectionTransportClassification.TLS,
+            )
+
+    _dns_factory, _dns_app, _dns_source, dns_state, dns_attempt = await _run_one_attempt(
+        "https://dns.example/report.pdf",
+        Transport([]),
+        tmp_path / "dns-blobs",
+        resolver=DnsFailureResolver(),
+    )
+    _tls_factory, _tls_app, _tls_source, tls_state, tls_attempt = await _run_one_attempt(
+        "https://tls.example/report.pdf", TlsFailureTransport(), tmp_path / "tls-blobs"
+    )
+
+    assert dns_state is CollectionState.FAILED_RETRYABLE
+    assert dns_attempt.reason_code is CollectionFailureReason.DNS_ERROR
+    assert dns_attempt.transport_classification is CollectionTransportClassification.DNS
+    assert tls_state is CollectionState.FAILED_RETRYABLE
+    assert tls_attempt.reason_code is CollectionFailureReason.TLS_ERROR
+    assert tls_attempt.transport_classification is CollectionTransportClassification.TLS
+
+
+async def test_html_served_for_pdf_url_is_archived_with_non_pdf_reason(tmp_path: Path) -> None:
+    url = "https://example.test/advisory.pdf"
+    body = b"<!doctype html><html><body>Temporary page</body></html>"
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        url,
+        Transport([RawHttpResponse(200, {"content-type": "application/pdf"}, body)]),
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.FAILED_TERMINAL
+    assert factory.collections[source.id].source_document_id is not None
+    assert (
+        factory.collections[source.id].failure_reason_code
+        is CollectionFailureReason.NON_PDF_CONTENT
+    )
+    assert attempt.outcome.value == "error"
+    assert attempt.http_status == 200
+    assert attempt.declared_content_type == "application/pdf"
+    assert attempt.detected_content_type == "text/html"
+    assert attempt.encoded_size == len(body)
+    assert attempt.reason_code is CollectionFailureReason.NON_PDF_CONTENT
+    assert (
+        len(
+            [
+                blob
+                for blob in factory.blobs.values()
+                if blob.descriptor.logical_bucket == "source-raw"
+            ]
+        )
+        == 1
+    )
+
+
+async def test_corrupt_pdf_is_archived_with_a_parse_failure_reason(tmp_path: Path) -> None:
+    url = "https://example.test/corrupt.pdf"
+    body = b"%PDF-1.4\nnot a valid PDF body\n"
+    factory, _app, source, state, attempt = await _run_one_attempt(
+        url,
+        Transport([RawHttpResponse(200, {"content-type": "application/pdf"}, body)]),
+        tmp_path / "blobs",
+    )
+
+    assert state is CollectionState.FAILED_TERMINAL
+    assert factory.collections[source.id].source_document_id is not None
+    assert (
+        factory.collections[source.id].failure_reason_code
+        is CollectionFailureReason.PDF_PARSE_FAILURE
+    )
+    assert attempt.reason_code is CollectionFailureReason.PDF_PARSE_FAILURE
+    assert attempt.http_status == 200
+    assert attempt.detected_content_type == "application/pdf"
+    assert attempt.encoded_size == len(body)
+
+
+async def test_redirect_chain_and_same_host_alternate_are_provenanced(tmp_path: Path) -> None:
+    original = "https://cisa.gov/advisories/old-report.pdf"
+    alternate = "https://www.cisa.gov/advisories/current-report.pdf"
+    transport = Transport(
+        [
+            RawHttpResponse(302, {"location": alternate}, b""),
+            RawHttpResponse(200, {"content-type": "text/html"}, HTML),
+        ]
+    )
+    factory, app, source, state, attempt = await _run_one_attempt(
+        original, transport, tmp_path / "blobs"
+    )
+
+    assert state is CollectionState.FAILED_TERMINAL
+    assert source.requested_url == original
+    assert attempt.final_url == alternate
+    assert attempt.redirect_chain == (alternate,)
+    assert attempt.candidate_resolution_url == alternate
+    assert attempt.candidate_resolution_provenance.value == "same_site_http_redirect"
+    archived_event = next(
+        event for event in factory.provenance if event.event_type == "source.archived"
+    )
+    assert archived_event.payload["original_url"] == original
+    assert archived_event.payload["final_url"] == alternate
+    assert archived_event.payload["candidate_resolution_url"] == alternate
+    assert (await app.list_sources(source.subject_id))[0].requested_url == original
+
+
+async def test_ssrf_unsafe_redirect_remains_blocked(tmp_path: Path) -> None:
+    private_target = "http://127.0.0.1/private.pdf"
+    transport = Transport([RawHttpResponse(302, {"location": private_target}, b"")])
+    _factory, _app, _source, state, attempt = await _run_one_attempt(
+        "https://example.test/report.pdf", transport, tmp_path / "blobs"
+    )
+
+    assert state is CollectionState.BLOCKED
+    assert len(transport.requests) == 1
+    assert attempt.final_url == private_target
+    assert attempt.redirect_chain == (private_target,)
+    assert attempt.http_status == 302
+    assert attempt.reason_code is CollectionFailureReason.UNSAFE_DESTINATION
+    assert attempt.transport_classification is CollectionTransportClassification.BLOCKED
+
+
+async def test_duplicate_bytes_share_blobs_and_keep_two_url_provenances(tmp_path: Path) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(
+        factory,
+        ("https://one.example/report", "https://two.example/report"),
+    )
+    app = service(factory, Transport([response(HTML), response(HTML)]), tmp_path / "blobs")
+    sources = await app.initialize(subject.id)
+
+    for source in sources:
+        assert await app.archive_one(source.id, uuid4()) is CollectionState.ARCHIVED
+
+    events = [event for event in factory.provenance if event.event_type == "source.archived"]
+    assert len(events) == 2
+    assert {event.payload["original_url"] for event in events} == {
+        "https://one.example/report",
+        "https://two.example/report",
+    }
+    assert len({event.payload["raw_blob_id"] for event in events}) == 1
+    assert len({event.payload["decoded_blob_id"] for event in events}) == 1
+    assert len({event.payload["source_document_id"] for event in events}) == 2
+
+
+async def test_no_success_stage_details_include_precise_collection_cause(
+    tmp_path: Path,
+) -> None:
+    factory = InMemoryCollectionUnitOfWorkFactory()
+    subject = selected_subject(factory, ("https://example.test/missing.pdf",))
+    app = service(
+        factory,
+        Transport([RawHttpResponse(404, {"content-type": "text/html"}, b"not found")]),
+        tmp_path / "blobs",
+    )
+    context = cast(JobExecutionContext, NoopContext(uuid4()))
+
+    with pytest.raises(JobHandlerError) as failure:
+        await app.collect_subject(subject.id, context.job_id, context)
+
+    diagnostics = failure.value.details["collection_failures"]
+    assert diagnostics[0]["reason_code"] == "obsolete_url_404"
+    assert diagnostics[0]["http_status"] == 404
+    assert diagnostics[0]["detected_content_type"] == "text/plain"
+    assert diagnostics[0]["encoded_size"] == len(b"not found")
+
+
 async def test_size_limit_does_not_stop_next_source(tmp_path: Path) -> None:
     factory = InMemoryCollectionUnitOfWorkFactory()
     subject = selected_subject(
@@ -957,6 +1240,12 @@ async def test_size_limit_does_not_stop_next_source(tmp_path: Path) -> None:
     states = {item.requested_url: item.state for item in await app.list_sources(subject.id)}
     assert states["https://large.example/report"] is CollectionState.FAILED_TERMINAL
     assert states["https://next.example/report"] is CollectionState.ARCHIVED
+    large = next(
+        item
+        for item in await app.list_sources(subject.id)
+        if item.requested_url == "https://large.example/report"
+    )
+    assert (await app.attempts(large.id))[-1].reason_code is CollectionFailureReason.SIZE_LIMIT
 
 
 async def test_blob_store_failure_remains_systemic(tmp_path: Path) -> None:

@@ -247,6 +247,17 @@ def _supplemental_failure_warning(
     for key in ("failed_retryable", "blocked", "unavailable", "failed_terminal"):
         if key in details:
             parts.append(f"{key}={details[key]}")
+    failures = details.get("collection_failures")
+    if isinstance(failures, list):
+        reason_codes = sorted(
+            {
+                item["reason_code"]
+                for item in failures
+                if isinstance(item, dict) and isinstance(item.get("reason_code"), str)
+            }
+        )
+        if reason_codes:
+            parts.append(f"reason_code={','.join(reason_codes)}")
     return ":".join(parts)
 
 

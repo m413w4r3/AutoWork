@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from pydantic import ConfigDict, Field
@@ -18,6 +19,7 @@ from cti_app.application.collection_errors import (
     CollectionItemNotFoundError,
     CollectionNotAllowedError,
 )
+from cti_app.application.extraction import DocumentParsingError, parse_document
 from cti_app.application.http_collection import (
     CollectedResponse,
     CollectionError,
@@ -40,7 +42,9 @@ from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.domain.collection import (
     AttemptOutcome,
     CollectionAttempt,
+    CollectionFailureReason,
     CollectionPolicySnapshot,
+    CollectionResolutionProvenance,
     CollectionState,
     DetectedMimeType,
     SourceCollection,
@@ -667,7 +671,10 @@ class SubjectCollectionService:
                 "source_collection_no_success",
                 "Aucune publication n'a pu être archivée.",
                 transient=summary.failed_retryable > 0,
-                details=asdict(summary),
+                details={
+                    **asdict(summary),
+                    "collection_failures": await self._failure_diagnostics(sources),
+                },
             )
         return output_reference
 
@@ -746,21 +753,28 @@ class SubjectCollectionService:
                     position[1],
                     f"Archivage de la source {position[0]}/{position[1]}",
                 )
+        processing_failure = _pdf_processing_failure(collection.requested_url, response)
         await self._archive(
             collection.id,
             started_at,
             response,
             acquisition=_CollectorAcquisition(job_id=job_id),
             candidate=candidate,
+            processing_failure=processing_failure,
+        )
+        resulting_state = (
+            _processing_failure_state(processing_failure)
+            if processing_failure is not None
+            else CollectionState.ARCHIVED
         )
         self._log_source_result(
             collection,
             job_id,
-            CollectionState.ARCHIVED,
+            resulting_state,
             operation_started,
             size=response.decoded_size,
         )
-        return CollectionState.ARCHIVED
+        return resulting_state
 
     async def archive_manual_content(
         self,
@@ -835,6 +849,7 @@ class SubjectCollectionService:
                 content_encoding="identity",
                 acquired_at=datetime.now(UTC),
             )
+            processing_failure = _pdf_processing_failure(collection.requested_url, response)
             receipt = await self._archive(
                 collection_id,
                 started_at,
@@ -844,6 +859,7 @@ class SubjectCollectionService:
                     actor_id=actor_id,
                     declared_mime_type=declared_mime_type,
                 ),
+                processing_failure=processing_failure,
             )
             if receipt is None:
                 raise RuntimeError("manual archive did not produce a receipt")
@@ -1061,6 +1077,7 @@ class SubjectCollectionService:
         *,
         acquisition: _CollectorAcquisition | _ManualAcquisition,
         candidate: SourceCandidate | None = None,
+        processing_failure: tuple[CollectionFailureReason, str] | None = None,
     ) -> ManualArchiveReceipt | None:
         """Persist one acquisition: same evidence, two honest audit contexts.
 
@@ -1146,6 +1163,7 @@ class SubjectCollectionService:
                 self._policy_snapshot.id,
                 job_id=collector.job_id if collector else None,
                 manual_lease_id=manual.manual_lease_id if manual else None,
+                processing_failure=processing_failure,
             )
             await uow.source_documents.add(document)
             await uow.collection_attempts.append(attempt)
@@ -1165,6 +1183,13 @@ class SubjectCollectionService:
                     source_document_id=document.id,
                     decoded_blob_id=decoded_blob.id,
                 )
+            if processing_failure is not None:
+                reason_code, reason = processing_failure
+                collection.fail_processing(
+                    reason=reason,
+                    reason_code=reason_code,
+                    state=_processing_failure_state(processing_failure),
+                )
             await uow.source_collections.save(collection)
             evidence = {
                 "attempt_id": str(attempt.id),
@@ -1176,6 +1201,7 @@ class SubjectCollectionService:
                 "decoded_blob_id": str(decoded_blob.id),
                 "content_encoding": response.content_encoding,
             }
+            payload: dict[str, object]
             if manual is not None:
                 # The analyst supplied this content. Recording a collector
                 # download here would be a lie the audit can never undo.
@@ -1189,6 +1215,7 @@ class SubjectCollectionService:
                     "detected_mime_type": response.detected_content_type.value,
                     "size": response.decoded_size,
                     "requested_url": response.requested_url,
+                    "original_url": response.requested_url,
                     "final_url": response.final_url,
                     "correlation_id": get_correlation_id(),
                 }
@@ -1196,7 +1223,20 @@ class SubjectCollectionService:
                 assert collector is not None
                 event_type = "source.archived"
                 actor = "system:collector"
-                payload = {**evidence, "job_id": str(collector.job_id)}
+                payload = {
+                    **evidence,
+                    "job_id": str(collector.job_id),
+                    "requested_url": response.requested_url,
+                    "original_url": response.requested_url,
+                    "final_url": response.final_url,
+                    "redirect_chain": list(response.redirect_chain),
+                    "candidate_resolution_url": attempt.candidate_resolution_url,
+                    "candidate_resolution_provenance": (
+                        attempt.candidate_resolution_provenance.value
+                        if attempt.candidate_resolution_provenance is not None
+                        else None
+                    ),
+                }
             await uow.provenance.append(
                 ProvenanceEvent(
                     subject_id=collection.subject_id,
@@ -1263,6 +1303,7 @@ class SubjectCollectionService:
                 CollectionState.FAILED_RETRYABLE,
                 attempt_id=attempt.id,
                 reason=reason,
+                reason_code=CollectionFailureReason.INTERRUPTED,
             )
             await uow.source_collections.save(collection)
             await uow.commit()
@@ -1290,7 +1331,7 @@ class SubjectCollectionService:
                 declared_content_type=(
                     error.headers.get("content-type", "").split(";", 1)[0] or None
                 ),
-                detected_content_type=None,
+                detected_content_type=error.detected_content_type,
                 encoded_size=error.encoded_size,
                 encoded_sha256=None,
                 decoded_size=None,
@@ -1299,6 +1340,18 @@ class SubjectCollectionService:
                 allowed_headers=error.headers,
                 outcome=error.outcome,
                 failure_reason=str(error),
+                reason_code=error.reason_code,
+                transport_classification=error.transport_classification,
+                candidate_resolution_url=_same_site_redirect_candidate(
+                    collection.requested_url, error.final_url, error.redirect_chain
+                ),
+                candidate_resolution_provenance=(
+                    CollectionResolutionProvenance.SAME_SITE_HTTP_REDIRECT
+                    if _same_site_redirect_candidate(
+                        collection.requested_url, error.final_url, error.redirect_chain
+                    )
+                    else None
+                ),
             )
             state = (
                 CollectionState.FAILED_RETRYABLE
@@ -1310,10 +1363,60 @@ class SubjectCollectionService:
                 else CollectionState.UNAVAILABLE
             )
             await uow.collection_attempts.append(attempt)
-            collection.fail(state, attempt_id=attempt.id, reason=str(error))
+            collection.fail(
+                state,
+                attempt_id=attempt.id,
+                reason=str(error),
+                reason_code=error.reason_code,
+            )
             await uow.source_collections.save(collection)
             await uow.commit()
             return state
+
+    async def _failure_diagnostics(
+        self, sources: Sequence[SourceCollection]
+    ) -> list[dict[str, object]]:
+        failures: list[dict[str, object]] = []
+        async with self._uow_factory() as uow:
+            for source in sources:
+                current = await uow.source_collections.get(source.id)
+                if current is None or current.state in _COLLECTED_STATES:
+                    continue
+                attempts = await uow.collection_attempts.list_for_collection(source.id)
+                latest = attempts[-1] if attempts else None
+                failures.append(
+                    {
+                        "collection_id": str(source.id),
+                        "requested_url": source.requested_url,
+                        "state": current.state.value,
+                        "reason_code": (
+                            current.failure_reason_code.value
+                            if current.failure_reason_code is not None
+                            else latest.reason_code.value
+                            if latest and latest.reason_code is not None
+                            else None
+                        ),
+                        "failure_reason": current.error_reason,
+                        "http_status": latest.http_status if latest else None,
+                        "final_url": latest.final_url if latest else None,
+                        "redirect_chain": list(latest.redirect_chain) if latest else [],
+                        "declared_content_type": (latest.declared_content_type if latest else None),
+                        "detected_content_type": (latest.detected_content_type if latest else None),
+                        "encoded_size": latest.encoded_size if latest else None,
+                        "transport_classification": (
+                            latest.transport_classification.value
+                            if latest and latest.transport_classification is not None
+                            else None
+                        ),
+                        "candidate_resolution_url": (
+                            latest.candidate_resolution_url if latest else None
+                        ),
+                        "candidate_resolution_provenance": (
+                            latest.candidate_resolution_provenance if latest else None
+                        ),
+                    }
+                )
+        return failures
 
 
 def register_collection_jobs(registry: JobRegistry, service: SubjectCollectionService) -> None:
@@ -1396,7 +1499,20 @@ def _successful_attempt(
     *,
     job_id: UUID | None,
     manual_lease_id: UUID | None,
+    processing_failure: tuple[CollectionFailureReason, str] | None = None,
 ) -> CollectionAttempt:
+    failure_reason_code = processing_failure[0] if processing_failure else None
+    failure_reason = processing_failure[1] if processing_failure else None
+    outcome = (
+        AttemptOutcome.BLOCKED
+        if failure_reason_code is CollectionFailureReason.ACCESS_BLOCKED
+        else AttemptOutcome.ERROR
+        if processing_failure is not None
+        else AttemptOutcome.SUCCEEDED
+    )
+    resolution_url = _same_site_redirect_candidate(
+        response.requested_url, response.final_url, response.redirect_chain
+    )
     return CollectionAttempt(
         collection_id=collection.id,
         job_id=job_id,
@@ -1416,8 +1532,15 @@ def _successful_attempt(
         decoded_sha256=response.decoded_sha256,
         content_encoding=response.content_encoding,
         allowed_headers=response.headers,
-        outcome=AttemptOutcome.SUCCEEDED,
-        failure_reason=None,
+        outcome=outcome,
+        failure_reason=failure_reason,
+        reason_code=failure_reason_code,
+        candidate_resolution_url=resolution_url,
+        candidate_resolution_provenance=(
+            CollectionResolutionProvenance.SAME_SITE_HTTP_REDIRECT
+            if resolution_url is not None
+            else None
+        ),
     )
 
 
@@ -1454,7 +1577,96 @@ def _interrupted_attempt(
         allowed_headers={},
         outcome=AttemptOutcome.INTERRUPTED,
         failure_reason=reason,
+        reason_code=CollectionFailureReason.INTERRUPTED,
     )
+
+
+def _same_site_redirect_candidate(
+    requested_url: str,
+    final_url: str | None,
+    redirect_chain: Sequence[str],
+) -> str | None:
+    if not final_url or not redirect_chain:
+        return None
+    try:
+        requested = urlsplit(requested_url)
+        final = urlsplit(final_url)
+    except ValueError:
+        return None
+    if (
+        requested.hostname is None
+        or final.hostname is None
+        or not _same_site_host(requested.hostname, final.hostname)
+        or final.scheme.casefold() != "https"
+        or final.port not in {None, 443}
+        or final_url == requested_url
+    ):
+        return None
+    return final_url
+
+
+def _same_site_host(first: str, second: str) -> bool:
+    first_host = first.casefold().rstrip(".")
+    second_host = second.casefold().rstrip(".")
+    return (
+        first_host == second_host
+        or first_host.endswith(f".{second_host}")
+        or second_host.endswith(f".{first_host}")
+    )
+
+
+def _pdf_processing_failure(
+    requested_url: str, response: CollectedResponse
+) -> tuple[CollectionFailureReason, str] | None:
+    path = urlsplit(requested_url).path.casefold()
+    declared_as_pdf = response.declared_content_type == DetectedMimeType.PDF.value
+    expects_pdf = path.endswith(".pdf") or declared_as_pdf
+    if not expects_pdf:
+        return None
+    if response.detected_content_type is not DetectedMimeType.PDF:
+        preview = response.decoded_body[: 128 * 1024].decode("utf-8", errors="ignore").casefold()
+        challenge_markers = (
+            "captcha",
+            "cloudflare challenge",
+            "challenge-platform",
+            "verify you are human",
+            "checking your browser",
+        )
+        if response.detected_content_type is DetectedMimeType.HTML and any(
+            marker in preview for marker in challenge_markers
+        ):
+            return (
+                CollectionFailureReason.ACCESS_BLOCKED,
+                "Access denied by a bot-protection challenge instead of a PDF",
+            )
+        return (
+            CollectionFailureReason.NON_PDF_CONTENT,
+            "The requested PDF URL served "
+            f"{response.detected_content_type.value} (declared "
+            f"{response.declared_content_type or 'unknown'})",
+        )
+    try:
+        parse_document(response.decoded_body, DetectedMimeType.PDF)
+    except DocumentParsingError as exc:
+        if exc.code == "pdf_timeout":
+            return (CollectionFailureReason.TIMEOUT, str(exc))
+        if exc.code in {
+            "pdf_too_large",
+            "pdf_too_many_pages",
+            "pdf_text_too_large",
+            "pdf_metadata_too_large",
+        }:
+            return (CollectionFailureReason.SIZE_LIMIT, str(exc))
+        return (CollectionFailureReason.PDF_PARSE_FAILURE, str(exc))
+    return None
+
+
+def _processing_failure_state(
+    failure: tuple[CollectionFailureReason, str] | None,
+) -> CollectionState:
+    if failure is not None and failure[0] is CollectionFailureReason.ACCESS_BLOCKED:
+        return CollectionState.BLOCKED
+    return CollectionState.FAILED_TERMINAL
 
 
 async def _discovery_source(

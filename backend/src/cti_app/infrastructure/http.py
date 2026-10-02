@@ -12,6 +12,10 @@ from cti_app.application.http_collection import (
     RawHttpResponse,
     UnsupportedContentError,
 )
+from cti_app.domain.collection import (
+    CollectionFailureReason,
+    CollectionTransportClassification,
+)
 
 
 class AsyncioPinnedHttpTransport:
@@ -25,6 +29,9 @@ class AsyncioPinnedHttpTransport:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         ssl_context = ssl.create_default_context() if parsed.scheme == "https" else None
         server_hostname = host if ssl_context is not None else None
+        response_status: int | None = None
+        response_headers: dict[str, str] = {}
+        response_size: int | None = None
         try:
             async with asyncio.timeout(request.timeout_seconds):
                 reader, writer = await asyncio.open_connection(
@@ -59,7 +66,9 @@ class AsyncioPinnedHttpTransport:
                         or not parts[1].isdigit()
                     ):
                         raise DownloadTransientError("Invalid HTTP status line")
+                    response_status = int(parts[1])
                     headers = await _read_headers(reader)
+                    response_headers = headers
                     content_length = headers.get("content-length")
                     expected_length: int | None = None
                     if content_length is not None:
@@ -70,34 +79,90 @@ class AsyncioPinnedHttpTransport:
                         if expected_length < 0:
                             raise DownloadTransientError("Negative Content-Length")
                         if expected_length > request.max_wire_bytes:
-                            raise DownloadTooLargeError("Content-Length exceeds the download limit")
+                            raise DownloadTooLargeError(
+                                "Content-Length exceeds the download limit"
+                            ).with_context(
+                                final_url=request.url,
+                                redirect_chain=(),
+                                http_status=int(parts[1]),
+                                headers=headers,
+                                encoded_size=expected_length,
+                            )
                     transfer_encoding = headers.get("transfer-encoding", "").casefold().strip()
-                    if transfer_encoding == "chunked":
-                        body = await _read_chunked(reader, request.max_wire_bytes)
-                    elif transfer_encoding:
-                        raise UnsupportedContentError(
-                            f"Unsupported Transfer-Encoding: {transfer_encoding}"
+                    try:
+                        if transfer_encoding == "chunked":
+                            body = await _read_chunked(reader, request.max_wire_bytes)
+                        elif transfer_encoding:
+                            raise UnsupportedContentError(
+                                f"Unsupported Transfer-Encoding: {transfer_encoding}"
+                            )
+                        elif expected_length is not None:
+                            body = await _read_exact_body(reader, expected_length)
+                        else:
+                            body = await _read_bounded(reader, request.max_wire_bytes)
+                    except CollectionError as exc:
+                        exc.with_context(
+                            final_url=request.url,
+                            redirect_chain=(),
+                            http_status=int(parts[1]),
+                            headers=headers,
                         )
-                    elif expected_length is not None:
-                        body = await _read_exact_body(reader, expected_length)
-                    else:
-                        body = await _read_bounded(reader, request.max_wire_bytes)
+                        raise
+                    response_size = len(body)
                     return RawHttpResponse(status=int(parts[1]), headers=headers, encoded_body=body)
                 finally:
                     writer.close()
                     await writer.wait_closed()
         except TimeoutError as exc:
-            raise DownloadTransientError("Collection timeout exceeded") from exc
+            raise DownloadTransientError(
+                "Collection timeout exceeded",
+                reason_code=CollectionFailureReason.TIMEOUT,
+                transport_classification=CollectionTransportClassification.TIMEOUT,
+            ).with_context(
+                final_url=request.url,
+                redirect_chain=(),
+                http_status=response_status,
+                headers=response_headers or None,
+                encoded_size=response_size,
+            ) from exc
         except ssl.SSLError as exc:
-            raise DownloadTransientError("TLS handshake or validation failed") from exc
+            raise DownloadTransientError(
+                "TLS handshake or validation failed",
+                reason_code=CollectionFailureReason.TLS_ERROR,
+                transport_classification=CollectionTransportClassification.TLS,
+            ).with_context(
+                final_url=request.url,
+                redirect_chain=(),
+                http_status=response_status,
+                headers=response_headers or None,
+                encoded_size=response_size,
+            ) from exc
         except asyncio.IncompleteReadError as exc:
-            raise DownloadTransientError("Remote response was truncated") from exc
+            raise DownloadTransientError("Remote response was truncated").with_context(
+                final_url=request.url,
+                redirect_chain=(),
+                http_status=response_status,
+                headers=response_headers or None,
+                encoded_size=response_size,
+            ) from exc
         except CollectionError:
             raise
         except OSError as exc:
-            raise DownloadTransientError("Remote connection failed") from exc
+            raise DownloadTransientError("Remote connection failed").with_context(
+                final_url=request.url,
+                redirect_chain=(),
+                http_status=response_status,
+                headers=response_headers or None,
+                encoded_size=response_size,
+            ) from exc
         except (UnicodeError, ValueError) as exc:
-            raise DownloadTransientError("Invalid HTTP protocol response") from exc
+            raise DownloadTransientError("Invalid HTTP protocol response").with_context(
+                final_url=request.url,
+                redirect_chain=(),
+                http_status=response_status,
+                headers=response_headers or None,
+                encoded_size=response_size,
+            ) from exc
 
 
 async def _read_headers(reader: asyncio.StreamReader) -> dict[str, str]:

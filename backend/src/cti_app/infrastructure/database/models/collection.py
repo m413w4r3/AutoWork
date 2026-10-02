@@ -132,6 +132,7 @@ class SourceCollectionRow(Base):
     fetch_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     fetch_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_reason: Mapped[str | None] = mapped_column(Text)
+    failure_reason_code: Mapped[str | None] = mapped_column(String(64))
     attempt_count: Mapped[int] = mapped_column(nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -230,6 +231,10 @@ class CollectionAttemptRow(Base):
     allowed_headers: Mapped[dict[str, str]] = mapped_column(JSONB, nullable=False)
     outcome: Mapped[str] = mapped_column(String(32), nullable=False)
     failure_reason: Mapped[str | None] = mapped_column(Text)
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    transport_classification: Mapped[str | None] = mapped_column(String(32))
+    candidate_resolution_url: Mapped[str | None] = mapped_column(Text)
+    candidate_resolution_provenance: Mapped[str | None] = mapped_column(String(64))
 
 
 class DerivedArtifactRow(Base):

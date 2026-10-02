@@ -15,7 +15,9 @@ from urllib.parse import SplitResult, urljoin, urlsplit
 
 from cti_app.domain.collection import (
     AttemptOutcome,
+    CollectionFailureReason,
     CollectionPolicySnapshot,
+    CollectionTransportClassification,
     DetectedMimeType,
 )
 
@@ -26,14 +28,29 @@ CancellationCheck = Callable[[], Awaitable[None]]
 class CollectionError(RuntimeError):
     outcome = AttemptOutcome.ERROR
     retryable = False
+    default_reason_code = CollectionFailureReason.TRANSPORT_ERROR
+    default_transport_classification: CollectionTransportClassification | None = None
 
-    def __init__(self, message: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: CollectionFailureReason | None = None,
+        transport_classification: CollectionTransportClassification | None = None,
+    ) -> None:
         super().__init__(message)
+        self.reason_code = reason_code or self.default_reason_code
+        self.transport_classification = (
+            transport_classification
+            if transport_classification is not None
+            else self.default_transport_classification
+        )
         self.final_url: str | None = None
         self.redirect_chain: tuple[str, ...] = ()
         self.http_status: int | None = None
         self.headers: dict[str, str] = {}
         self.encoded_size: int | None = None
+        self.detected_content_type: str | None = None
 
     def with_context(
         self,
@@ -43,33 +60,58 @@ class CollectionError(RuntimeError):
         http_status: int | None = None,
         headers: dict[str, str] | None = None,
         encoded_size: int | None = None,
+        detected_content_type: str | None = None,
     ) -> CollectionError:
         self.final_url = final_url
         self.redirect_chain = tuple(redirect_chain)
-        self.http_status = http_status
-        self.headers = _allowed_headers(headers or {})
-        self.encoded_size = encoded_size
+        if http_status is not None:
+            self.http_status = http_status
+        if headers is not None:
+            self.headers = _allowed_headers(headers)
+        if encoded_size is not None:
+            self.encoded_size = encoded_size
+        if detected_content_type is not None:
+            self.detected_content_type = detected_content_type
         return self
 
 
 class UnsafeAddressError(CollectionError):
     outcome = AttemptOutcome.BLOCKED
+    default_reason_code = CollectionFailureReason.UNSAFE_DESTINATION
+    default_transport_classification = CollectionTransportClassification.BLOCKED
+
+
+class AccessBlockedError(CollectionError):
+    outcome = AttemptOutcome.BLOCKED
+    default_reason_code = CollectionFailureReason.ACCESS_BLOCKED
+    default_transport_classification = CollectionTransportClassification.BLOCKED
+
+
+class ObsoleteUrlError(CollectionError):
+    outcome = AttemptOutcome.UNAVAILABLE
+    default_reason_code = CollectionFailureReason.OBSOLETE_URL_404
+    default_transport_classification = CollectionTransportClassification.HTTP
 
 
 class DownloadTooLargeError(CollectionError):
     outcome = AttemptOutcome.TOO_LARGE
+    default_reason_code = CollectionFailureReason.SIZE_LIMIT
 
 
 class DownloadUnavailableError(CollectionError):
     outcome = AttemptOutcome.UNAVAILABLE
+    default_reason_code = CollectionFailureReason.HTTP_ERROR
+    default_transport_classification = CollectionTransportClassification.HTTP
 
 
 class DownloadTransientError(CollectionError):
     retryable = True
+    default_reason_code = CollectionFailureReason.TRANSPORT_ERROR
+    default_transport_classification = CollectionTransportClassification.TRANSPORT
 
 
 class UnsupportedContentError(CollectionError):
-    pass
+    default_reason_code = CollectionFailureReason.UNSUPPORTED_CONTENT
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,24 +231,35 @@ class SafeHttpCollector:
     ) -> CollectedResponse:
         current = requested_url.strip()
         redirects: list[str] = []
+        last_redirect_response: RawHttpResponse | None = None
         deadline = time.monotonic() + self.policy.timeout_seconds
         for redirect_count in range(self.policy.max_redirects + 1):
             if cancellation_check is not None:
                 await cancellation_check()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DownloadTransientError("Total collection timeout exceeded")
+                raise DownloadTransientError(
+                    "Total collection timeout exceeded",
+                    reason_code=CollectionFailureReason.TIMEOUT,
+                    transport_classification=CollectionTransportClassification.TIMEOUT,
+                ).with_context(final_url=current, redirect_chain=redirects)
             try:
                 parsed = _validate_url(current, self.policy)
                 approved_ip = await self._resolve_and_pin(
                     parsed.hostname or "", remaining, cancellation_check
                 )
             except CollectionError as exc:
-                exc.with_context(final_url=current, redirect_chain=redirects)
+                _attach_fetch_error_context(
+                    exc, current, redirects, last_redirect_response, self.policy
+                )
                 raise
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise DownloadTransientError("Total collection timeout exceeded")
+                raise DownloadTransientError(
+                    "Total collection timeout exceeded",
+                    reason_code=CollectionFailureReason.TIMEOUT,
+                    transport_classification=CollectionTransportClassification.TIMEOUT,
+                ).with_context(final_url=current, redirect_chain=redirects)
             try:
                 if cancellation_check is not None:
                     await cancellation_check()
@@ -220,7 +273,9 @@ class SafeHttpCollector:
                     )
                 )
             except CollectionError as exc:
-                exc.with_context(final_url=current, redirect_chain=redirects)
+                _attach_fetch_error_context(
+                    exc, current, redirects, last_redirect_response, self.policy
+                )
                 raise
             if response.status in {301, 302, 303, 307, 308}:
                 location = response.headers.get("location")
@@ -233,6 +288,7 @@ class SafeHttpCollector:
                         http_status=response.status,
                         headers=response.headers,
                         encoded_size=len(response.encoded_body),
+                        detected_content_type=_sniff_response_type(response, self.policy),
                     )
                 if redirect_count >= self.policy.max_redirects:
                     raise DownloadUnavailableError("Maximum redirect count exceeded").with_context(
@@ -241,12 +297,25 @@ class SafeHttpCollector:
                         http_status=response.status,
                         headers=response.headers,
                         encoded_size=len(response.encoded_body),
+                        detected_content_type=_sniff_response_type(response, self.policy),
                     )
+                last_redirect_response = response
                 current = urljoin(current, location)
                 redirects.append(current)
                 continue
-            if response.status in {408, 425, 429} or response.status >= 500:
-                raise DownloadTransientError(
+            if response.status in {401, 403}:
+                raise AccessBlockedError(
+                    f"Remote server denied access with HTTP {response.status}"
+                ).with_context(
+                    final_url=current,
+                    redirect_chain=redirects,
+                    http_status=response.status,
+                    headers=response.headers,
+                    encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
+                )
+            if response.status in {404, 410}:
+                raise ObsoleteUrlError(
                     f"Remote server returned HTTP {response.status}"
                 ).with_context(
                     final_url=current,
@@ -254,6 +323,33 @@ class SafeHttpCollector:
                     http_status=response.status,
                     headers=response.headers,
                     encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
+                )
+            if response.status == 408:
+                raise DownloadTransientError(
+                    "Remote server timed out with HTTP 408",
+                    reason_code=CollectionFailureReason.TIMEOUT,
+                    transport_classification=CollectionTransportClassification.TIMEOUT,
+                ).with_context(
+                    final_url=current,
+                    redirect_chain=redirects,
+                    http_status=response.status,
+                    headers=response.headers,
+                    encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
+                )
+            if response.status in {425, 429} or response.status >= 500:
+                raise DownloadTransientError(
+                    f"Remote server returned HTTP {response.status}",
+                    reason_code=CollectionFailureReason.HTTP_ERROR,
+                    transport_classification=CollectionTransportClassification.HTTP,
+                ).with_context(
+                    final_url=current,
+                    redirect_chain=redirects,
+                    http_status=response.status,
+                    headers=response.headers,
+                    encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
                 )
             if response.status < 200 or response.status >= 300:
                 raise DownloadUnavailableError(
@@ -264,6 +360,7 @@ class SafeHttpCollector:
                     http_status=response.status,
                     headers=response.headers,
                     encoded_size=len(response.encoded_body),
+                    detected_content_type=_sniff_response_type(response, self.policy),
                 )
             try:
                 decoded_body, content_encoding = _decode_body(
@@ -317,11 +414,23 @@ class SafeHttpCollector:
                     await cancellation_check()
                 second = tuple(dict.fromkeys(await self._resolver.resolve(hostname)))
         except TimeoutError as exc:
-            raise DownloadTransientError("DNS resolution exceeded the total timeout") from exc
+            raise DownloadTransientError(
+                "DNS resolution exceeded the total timeout",
+                reason_code=CollectionFailureReason.TIMEOUT,
+                transport_classification=CollectionTransportClassification.TIMEOUT,
+            ) from exc
         except OSError as exc:
-            raise DownloadTransientError("DNS resolution failed") from exc
+            raise DownloadTransientError(
+                "DNS resolution failed",
+                reason_code=CollectionFailureReason.DNS_ERROR,
+                transport_classification=CollectionTransportClassification.DNS,
+            ) from exc
         if not first or not second:
-            raise DownloadTransientError("DNS resolution returned no address")
+            raise DownloadTransientError(
+                "DNS resolution returned no address",
+                reason_code=CollectionFailureReason.DNS_ERROR,
+                transport_classification=CollectionTransportClassification.DNS,
+            )
         if set(first) != set(second):
             raise UnsafeAddressError("DNS answers changed before connection")
         for value in first:
@@ -441,6 +550,35 @@ def _detect_mime(body: bytes) -> DetectedMimeType:
 
 def _content_type(value: str | None) -> str | None:
     return value.split(";", 1)[0].strip().casefold() if value else None
+
+
+def _sniff_response_type(response: RawHttpResponse, policy: CollectionPolicy) -> str | None:
+    """Best-effort content sniffing for error responses, within collector limits."""
+    try:
+        decoded, _encoding = _decode_body(response.encoded_body, response.headers, policy)
+        return _detect_mime(decoded).value
+    except CollectionError:
+        return None
+
+
+def _attach_fetch_error_context(
+    error: CollectionError,
+    current_url: str,
+    redirect_chain: Sequence[str],
+    last_redirect_response: RawHttpResponse | None,
+    policy: CollectionPolicy,
+) -> None:
+    if last_redirect_response is None:
+        error.with_context(final_url=current_url, redirect_chain=redirect_chain)
+        return
+    error.with_context(
+        final_url=current_url,
+        redirect_chain=redirect_chain,
+        http_status=last_redirect_response.status,
+        headers=last_redirect_response.headers,
+        encoded_size=len(last_redirect_response.encoded_body),
+        detected_content_type=_sniff_response_type(last_redirect_response, policy),
+    )
 
 
 def _allowed_headers(headers: dict[str, str]) -> dict[str, str]:

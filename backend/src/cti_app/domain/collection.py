@@ -37,6 +37,35 @@ class AttemptOutcome(StrEnum):
     INTERRUPTED = "interrupted"
 
 
+class CollectionFailureReason(StrEnum):
+    ACCESS_BLOCKED = "access_blocked"
+    HTTP_ERROR = "http_error"
+    OBSOLETE_URL_404 = "obsolete_url_404"
+    TIMEOUT = "timeout"
+    TRANSPORT_ERROR = "transport_error"
+    DNS_ERROR = "dns_error"
+    TLS_ERROR = "tls_error"
+    UNSAFE_DESTINATION = "unsafe_destination"
+    SIZE_LIMIT = "size_limit"
+    UNSUPPORTED_CONTENT = "unsupported_content"
+    NON_PDF_CONTENT = "non_pdf_content"
+    PDF_PARSE_FAILURE = "pdf_parse_failure"
+    INTERRUPTED = "interrupted"
+
+
+class CollectionTransportClassification(StrEnum):
+    BLOCKED = "blocked"
+    DNS = "dns"
+    HTTP = "http"
+    TLS = "tls"
+    TIMEOUT = "timeout"
+    TRANSPORT = "transport"
+
+
+class CollectionResolutionProvenance(StrEnum):
+    SAME_SITE_HTTP_REDIRECT = "same_site_http_redirect"
+
+
 class DetectedMimeType(StrEnum):
     HTML = "text/html"
     PDF = "application/pdf"
@@ -137,6 +166,7 @@ class SourceCollection:
     fetch_started_at: datetime | None = None
     fetch_lease_expires_at: datetime | None = None
     error_reason: str | None = None
+    failure_reason_code: CollectionFailureReason | None = None
     attempt_count: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -195,6 +225,7 @@ class SourceCollection:
         self.fetch_started_at = timestamp
         self.fetch_lease_expires_at = timestamp + lease_duration
         self.error_reason = None
+        self.failure_reason_code = None
         self.attempt_count += 1
         self._touch(timestamp)
         return True
@@ -238,6 +269,7 @@ class SourceCollection:
         self.fetch_started_at = timestamp
         self.fetch_lease_expires_at = timestamp + lease_duration
         self.error_reason = None
+        self.failure_reason_code = None
         self.attempt_count += 1
         self._touch(timestamp)
         return True
@@ -282,6 +314,8 @@ class SourceCollection:
         self.source_document_id = source_document_id
         self.decoded_blob_id = decoded_blob_id
         self.state = CollectionState.ARCHIVED
+        self.error_reason = None
+        self.failure_reason_code = None
         self._clear_fetch_lease()
         self._touch()
 
@@ -321,7 +355,14 @@ class SourceCollection:
         self.state = CollectionState.COMPLETED
         self._touch()
 
-    def fail(self, state: CollectionState, *, attempt_id: UUID, reason: str) -> None:
+    def fail(
+        self,
+        state: CollectionState,
+        *,
+        attempt_id: UUID,
+        reason: str,
+        reason_code: CollectionFailureReason | None = None,
+    ) -> None:
         if state not in {
             CollectionState.UNAVAILABLE,
             CollectionState.BLOCKED,
@@ -334,16 +375,32 @@ class SourceCollection:
         self.latest_attempt_id = attempt_id
         self.state = state
         self.error_reason = _clean_reason(reason)
+        self.failure_reason_code = reason_code
         self._clear_fetch_lease()
         self._touch()
 
-    def fail_processing(self, *, reason: str, retryable: bool = False) -> None:
+    def fail_processing(
+        self,
+        *,
+        reason: str,
+        reason_code: CollectionFailureReason | None = None,
+        retryable: bool = False,
+        state: CollectionState | None = None,
+    ) -> None:
         if self.state not in {CollectionState.ARCHIVED, CollectionState.EXTRACTED}:
             raise ValueError("Only archived evidence can record a processing failure")
-        self.state = (
+        resolved_state = state or (
             CollectionState.FAILED_RETRYABLE if retryable else CollectionState.FAILED_TERMINAL
         )
+        if resolved_state not in {
+            CollectionState.BLOCKED,
+            CollectionState.FAILED_RETRYABLE,
+            CollectionState.FAILED_TERMINAL,
+        }:
+            raise ValueError("Invalid collection processing failure state")
+        self.state = resolved_state
         self.error_reason = _clean_reason(reason)
+        self.failure_reason_code = reason_code
         self._clear_fetch_lease()
         self._touch()
 
@@ -359,6 +416,7 @@ class SourceCollection:
         elif self.state is not CollectionState.FETCHING:
             self.state = CollectionState.PENDING
         self.error_reason = None
+        self.failure_reason_code = None
         self._clear_fetch_lease()
         self._touch()
 
@@ -444,6 +502,10 @@ class CollectionAttempt:
     outcome: AttemptOutcome
     failure_reason: str | None
     manual_lease_id: UUID | None = None
+    reason_code: CollectionFailureReason | None = None
+    transport_classification: CollectionTransportClassification | None = None
+    candidate_resolution_url: str | None = None
+    candidate_resolution_provenance: CollectionResolutionProvenance | None = None
     id: UUID = field(default_factory=uuid4)
 
     def __post_init__(self) -> None:
@@ -468,6 +530,12 @@ class CollectionAttempt:
                 )
         elif not self.failure_reason:
             raise ValueError("A failed attempt requires a reason")
+        elif self.reason_code is None:
+            raise ValueError("A failed attempt requires a structured reason code")
+        if (self.candidate_resolution_url is None) != (
+            self.candidate_resolution_provenance is None
+        ):
+            raise ValueError("A candidate resolution URL requires its provenance")
 
 
 @dataclass(frozen=True, slots=True)
