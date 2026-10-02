@@ -2,22 +2,20 @@
 
 These tests drive ``ProductionWorkflowOrchestrator._execute_extraction_stage``
 against a fake world: the stage reads the frozen corpus, resolves the exact
-archived documents, asks the gateway for one structured capability, verifies
-the proposals locally and persists a single ``ProductionExtractionV1``.
+archived documents, asks the gateway for Q2 wire text, verifies the proposals
+locally and persists a single ``ProductionExtractionV1``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import re
 from datetime import date
 from types import SimpleNamespace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import BaseModel
 
 from cti_app.application.model_gateway import (
     ModelRequest,
@@ -31,7 +29,6 @@ from cti_app.application.production_parsers import (
     Q2RuleProposal,
     Q2SourceOutput,
 )
-from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
@@ -61,6 +58,11 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
     is_eligible_for_extraction,
+)
+from tests.test_production_extraction_service import (
+    _batch_blocks,
+    _JsonTextGateway,
+    _q2_wire_output,
 )
 
 CORE_A_URL = "https://example.test/core-a"
@@ -329,12 +331,11 @@ class _World:
 
 
 class _Gateway:
-    """One fake provider answering the requested structured capability."""
+    """One fake provider answering with the canonical Q2 wire format."""
 
     def __init__(self, outputs: dict[str, Q2SourceOutput] | None = None) -> None:
         self.outputs = dict(outputs or {})
         self.calls: list[ModelRequest] = []
-        self.schemas: list[type[Any]] = []
         self.ambiguous = False
 
     def output_for(self, text: str) -> Q2SourceOutput:
@@ -343,7 +344,7 @@ class _Gateway:
                 return output
         return Q2SourceOutput()
 
-    def _execution(self, output: object) -> SimpleNamespace:
+    def _execution(self, output_text: str) -> SimpleNamespace:
         return SimpleNamespace(
             run=SimpleNamespace(
                 id=uuid4(),
@@ -352,59 +353,26 @@ class _Gateway:
                 error_message=None,
                 error_details=None,
             ),
-            structured_output=output,
-            output_text=None,
+            structured_output=None,
+            output_text=output_text,
             metadata={},
         )
 
-    async def extract(self, request: ModelRequest, output_schema: type[Any]) -> SimpleNamespace:
+    async def draft(self, request: ModelRequest) -> SimpleNamespace:
         self.calls.append(request)
-        self.schemas.append(output_schema)
         if self.ambiguous:
             raise ModelSubmissionReconciliationRequiredError(
                 "The submission state is unknown",
                 details={"provider_reference": "opaque"},
             )
-        if output_schema is Q2BatchResponse:
-            blocks = _batch_blocks(request.text)
-            return self._execution(
-                Q2BatchResponse(
-                    sources=[
-                        Q2BatchSourceOutput(batch_id=handle, output=self.output_for(body))
-                        for handle, body in blocks
-                    ]
-                )
+        if request.prompt_template_id.endswith("-batch"):
+            output_text = "\n\n".join(
+                f"@@Q2:{handle}@@\n{_q2_wire_output(self.output_for(body))}"
+                for handle, body in _batch_blocks(request.text)
             )
-        return self._execution(self.output_for(request.text))
-
-
-def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
-    matches = list(re.finditer(r"@@Q2:(B\d+)@@", prompt))
-    blocks: list[tuple[str, str]] = []
-    for index, match in enumerate(matches):
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(prompt)
-        blocks.append((match.group(1), prompt[match.end() : end]))
-    return tuple(blocks)
-
-
-class _JsonTextGateway(_Gateway):
-    """A second provider answering in text, validated against the schema."""
-
-    def _execution(self, output: object) -> SimpleNamespace:
-        assert isinstance(output, BaseModel)
-        text = output.model_dump_json()
-        return SimpleNamespace(
-            run=SimpleNamespace(
-                id=uuid4(),
-                status=ModelRunStatus.SUCCEEDED,
-                error_code=None,
-                error_message=None,
-                error_details=None,
-            ),
-            structured_output=type(output).model_validate_json(text),
-            output_text=text,
-            metadata={},
-        )
+        else:
+            output_text = _q2_wire_output(self.output_for(request.text))
+        return self._execution(output_text)
 
 
 # --- scenario helpers -------------------------------------------------------

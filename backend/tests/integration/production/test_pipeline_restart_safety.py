@@ -11,10 +11,8 @@ from unittest.mock import patch
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import BaseModel
 
 from cti_app.application.model_gateway import ModelRequest
-from cti_app.application.production_parsers import parse_q2_proposals_markdown
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -151,7 +149,7 @@ def _references(urls: tuple[str, ...]) -> str:
 def _q2(index: int) -> str:
     return (
         "FACT malware\n"
-        "- ExampleRAT :: The source documents the ExampleRAT family.\n\n"
+        f"- ExampleRAT :: ExampleRAT source {index}\n\n"
         "IOC confirmed domain\n"
         f"- source-{index}.security-lab.io :: Infrastructure observed in source {index}."
     )
@@ -367,19 +365,17 @@ async def test_restart_mid_q2_reuses_only_the_durable_completed_checkpoints(
     await scenario.start()
     await _run_prefix(scenario, 2)
 
-    original_extract = scenario.model.extract
+    original_draft = scenario.model.draft
     extraction_calls = 0
 
-    async def crash_before_third_source(
-        request: ModelRequest, output_schema: type[BaseModel]
-    ) -> Any:
+    async def crash_before_third_source(request: ModelRequest, *args: Any, **kwargs: Any) -> Any:
         nonlocal extraction_calls
         extraction_calls += 1
         if extraction_calls == 3:
             raise ProcessCrash("process lost before the third source")
-        return await original_extract(request, output_schema)
+        return await original_draft(request, *args, **kwargs)
 
-    with patch.object(scenario.model, "extract", new=crash_before_third_source):
+    with patch.object(scenario.model, "draft", new=crash_before_third_source):
         with pytest.raises(ProcessCrash):
             await scenario.runner.run_next()
 
@@ -497,15 +493,11 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     assert model_run.status is ModelRunStatus.NEEDS_REVIEW
     assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
 
-    # The operator adopts the structured answer the provider produced.
-    parsed = parse_q2_proposals_markdown(
-        _q2(1).replace(
-            "Infrastructure observed in source 1.",
-            "Infrastructure observed in source 1 during visible recovery.",
-        )
+    # The operator adopts the line-oriented answer the provider produced.
+    visible_text = _q2(1).replace(
+        "Infrastructure observed in source 1.",
+        "Infrastructure observed in source 1 during visible recovery.",
     )
-    assert parsed.value is not None
-    visible_text = parsed.value.model_dump_json()
     visible = VisibleRecovery(bridge_run_id, visible_text)
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
         _configure_gateway(restarted, urls, references=False)

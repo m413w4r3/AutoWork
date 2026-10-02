@@ -20,6 +20,7 @@ from cti_app.application.production_parsers import (
     ParsedSource,
     Q2SourceOutput,
     parse_q2_proposals_markdown,
+    sanitize_bridge_output_text,
 )
 from cti_app.domain.production import ExtractionProfile
 
@@ -118,7 +119,7 @@ def _split_batch_blocks(text: str) -> tuple[list[tuple[str, str]], list[str]]:
     def close() -> None:
         nonlocal current_id, current_lines
         if current_id is not None:
-            blocks.append((current_id, "\n".join(current_lines).strip()))
+            blocks.append((current_id, "\n".join(current_lines)))
         current_id = None
         current_lines = []
 
@@ -141,17 +142,17 @@ def _split_batch_blocks(text: str) -> tuple[list[tuple[str, str]], list[str]]:
 
 def parse_q2_batch_response(
     text: str,
-    expected_sources: Mapping[str, ParsedSource] | Sequence[Q2BatchSource],
+    expected_sources: (Mapping[str, ParsedSource] | Sequence[Q2BatchSource] | Sequence[str]),
 ) -> Q2BatchParseResult:
     """Parse source blocks while keeping malformed blocks source-local."""
 
-    expected = (
-        {_normalize_batch_id(item.batch_id): item.source for item in expected_sources}
-        if not isinstance(expected_sources, Mapping)
-        else {
-            _normalize_batch_id(batch_id): source for batch_id, source in expected_sources.items()
-        }
-    )
+    if isinstance(expected_sources, Mapping):
+        expected_ids = tuple(expected_sources.keys())
+    else:
+        expected_ids = tuple(
+            item if isinstance(item, str) else item.batch_id for item in expected_sources
+        )
+    expected = {_normalize_batch_id(batch_id): None for batch_id in expected_ids}
     blocks, warnings = _split_batch_blocks(text)
     occurrences: dict[str, list[str]] = {}
     for batch_id, body in blocks:
@@ -176,7 +177,7 @@ def parse_q2_batch_response(
             )
             continue
         body = entries[0]
-        normalized = body.strip()
+        normalized = sanitize_bridge_output_text(body).strip()
         if not normalized:
             results.append(
                 Q2BatchSourceResult(

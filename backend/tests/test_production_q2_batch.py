@@ -84,3 +84,31 @@ def test_archive_batch_attribution_never_moves_content_between_captures() -> Non
     assert attribution.result_for("B2").error_code == "batch_source_missing"
     assert attribution.result_for("B3").output is output
     assert "batch_source_unknown" in attribution.warnings
+
+
+def test_line_oriented_batch_parser_recovers_each_source_and_keeps_raw_text() -> None:
+    raw = (
+        "@@Q2:B1@@\nIOC contextual domain\n"
+        '- clearview.ai :: Reconnaissance :chatgpt-content-reference{index="0"}\n'
+        "@@Q2:B2@@\nUNAVAILABLE\n"
+        "@@Q2:B3@@\nEMPTY\n"
+        "@@Q2:B4@@\nIOC contextual domain\n"
+        "- indicator.example :: infrastructure secondaire\n"
+        "UNCERTAINTIES\n- L'attribution reste incertaine.\n"
+    )
+
+    parsed = production_q2_batch.parse_q2_batch_response(raw, ("B1", "B2", "B3", "B4"))
+
+    first, second, third, fourth = parsed.sources
+    assert parsed.usable
+    assert first.usable
+    assert first.output is not None
+    assert first.output.artifacts[0].value == "clearview.ai"
+    assert first.output.artifacts[0].context == "Reconnaissance"
+    assert ':chatgpt-content-reference{index="0"}' in first.raw_block
+    assert second.error_code == "batch_source_unavailable"
+    assert third.usable
+    assert third.output == Q2SourceOutput()
+    assert fourth.usable
+    assert fourth.output is not None
+    assert fourth.output.uncertainties == ["L'attribution reste incertaine."]

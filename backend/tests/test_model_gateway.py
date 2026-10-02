@@ -98,6 +98,44 @@ class SequencedResponsesTransport:
         return self._responses[min(self.retrieve_calls, len(self._responses) - 1)]
 
 
+class TerminalFailureThenSuccessTransport:
+    """The bridge closes the first `failures` attempts as failed, then answers."""
+
+    def __init__(
+        self, *, failures: int, retryable: bool = True, bridge_status: str | None = "failed"
+    ) -> None:
+        self.failures = failures
+        self.retryable = retryable
+        self.bridge_status = bridge_status
+        self.idempotency_keys: list[str | None] = []
+
+    async def create(
+        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+    ) -> dict[str, Any]:
+        del payload
+        self.idempotency_keys.append(idempotency_key)
+        if len(self.idempotency_keys) <= self.failures:
+            raise BridgeTransportError(
+                "bridge_server_error",
+                "contrat DOM de la réponse non résolu",
+                retryable=self.retryable,
+                phase="generation",
+                submission_state="post_submission",
+                bridge_run_id=f"resp_failed_{len(self.idempotency_keys)}",
+                bridge_status=self.bridge_status,
+            )
+        return {
+            "id": "resp_ok",
+            "status": "completed",
+            "model": "chatgpt-web",
+            "output_text": "answered",
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+
+    async def retrieve(self, response_id: str) -> dict[str, Any]:
+        raise AssertionError("not used")
+
+
 class FailingResponsesTransport:
     async def create(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
@@ -345,6 +383,67 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
     }
 
 
+@pytest.fixture
+def no_bridge_retry_delay(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "cti_app.application.model_gateway._BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS", 0
+    )
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+@pytest.mark.parametrize("retryable", [True, False])
+async def test_bridge_confirmed_terminal_failure_is_replayed_as_a_new_attempt(
+    retryable: bool,
+) -> None:
+    transport = TerminalFailureThenSuccessTransport(failures=2, retryable=retryable)
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    execution = await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert execution.output_text == "answered"
+    assert run.status is ModelRunStatus.SUCCEEDED
+    assert run.submission_attempt == 3
+    assert transport.idempotency_keys == [f"{run.id}:a1", f"{run.id}:a2", f"{run.id}:a3"]
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+async def test_bridge_terminal_failure_retries_are_bounded_then_reconciled() -> None:
+    transport = TerminalFailureThenSuccessTransport(failures=99)
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert len(transport.idempotency_keys) == 3
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_attempt == 3
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+@pytest.mark.parametrize(
+    ("retryable", "bridge_status"),
+    [(True, None), (True, "running")],
+)
+async def test_unconfirmed_bridge_failure_is_never_replayed(
+    retryable: bool, bridge_status: str | None
+) -> None:
+    transport = TerminalFailureThenSuccessTransport(
+        failures=1, retryable=retryable, bridge_status=bridge_status
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    assert len(transport.idempotency_keys) == 1
+    assert model_uow.state[model_request.run_id].status is ModelRunStatus.NEEDS_REVIEW
+
+
 async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() -> None:
     transport = SubmissionAwareResponsesTransport(submission_state="pre_submission")
     gateway, model_uow, _ = gateway_with_transport(transport)
@@ -386,6 +485,7 @@ async def test_qwen_trusted_gateway_runs_when_external_llm_is_forbidden() -> Non
         request(
             external_llm_allowed=False,
             routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+            provider=ModelProvider.QWEN,
         )
     )
 
@@ -407,7 +507,7 @@ def test_sanitizer_removes_secrets_paths_and_internal_metadata() -> None:
     assert len(cleaned.authorized_input_hash) == 64
 
 
-def test_router_prefers_qwen_for_bulk_and_openai_for_premium_drafting() -> None:
+def test_router_sends_bulk_and_premium_drafting_to_the_bridge() -> None:
     transport = SequencedResponsesTransport([])
     gateway, _, _ = gateway_with_transport(transport)
     router = gateway._router
@@ -425,7 +525,7 @@ def test_router_prefers_qwen_for_bulk_and_openai_for_premium_drafting() -> None:
         routing_hint=ModelRoutingHint.DISCOVERY_MERGE,
     )
 
-    assert router.select(bulk, ModelRole.STRUCTURED_EXTRACTION).provider is ModelProvider.QWEN
+    assert router.select(bulk, ModelRole.STRUCTURED_EXTRACTION).provider is ModelProvider.OPENAI
     assert router.select(premium, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
     assert router.select(discovery_merge, ModelRole.DRAFTING).provider is ModelProvider.OPENAI
 
@@ -654,6 +754,7 @@ async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
     model_request = request(
         external_llm_allowed=False,
         routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+        provider=ModelProvider.QWEN,
         run_id=uuid4(),
     )
     assert model_request.run_id is not None
@@ -825,6 +926,22 @@ async def test_production_factory_builds_gemini_fail_closed_for_structured_outpu
             request(external_llm_allowed=True, routing_hint=ModelRoutingHint.BULK_EXTRACTION),
             _Extraction,
         )
+
+
+async def test_bridge_generation_has_no_client_read_timeout() -> None:
+    from typing import cast
+
+    from cti_app.application.persistence import UnitOfWorkFactory
+    from cti_app.config import Settings
+    from cti_app.integrations.model_factory import create_model_gateway
+
+    # The bridge owns the generation deadline; a client read timeout would
+    # abandon a live run and send it to manual reconciliation.
+    gateway = create_model_gateway(Settings(_env_file=None), cast(UnitOfWorkFactory, lambda: None))
+    bridge = gateway._router.by_backend(ModelBackend.CHATGPT_BRIDGE, ModelRole.RESEARCH)
+
+    transport = bridge._transport  # type: ignore[attr-defined]
+    assert transport._timeout is None
 
 
 async def test_production_factory_routes_editorial_enrichment_independently() -> None:

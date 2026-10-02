@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -150,16 +151,211 @@ class SynthesisUncertaintyV1:
         )
 
 
+_MONTH_NUMBERS = {
+    "jan": 1,
+    "january": 1,
+    "janv": 1,
+    "janvier": 1,
+    "feb": 2,
+    "february": 2,
+    "fev": 2,
+    "fevr": 2,
+    "fevrier": 2,
+    "mar": 3,
+    "march": 3,
+    "mars": 3,
+    "apr": 4,
+    "april": 4,
+    "avril": 4,
+    "may": 5,
+    "mai": 5,
+    "jun": 6,
+    "june": 6,
+    "juin": 6,
+    "jul": 7,
+    "july": 7,
+    "juil": 7,
+    "juillet": 7,
+    "aug": 8,
+    "august": 8,
+    "aout": 8,
+    "sep": 9,
+    "sept": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "octobre": 10,
+    "nov": 11,
+    "november": 11,
+    "novembre": 11,
+    "dec": 12,
+    "december": 12,
+    "decembre": 12,
+}
+_MONTH_PATTERN = "|".join(
+    re.escape(month) for month in sorted(_MONTH_NUMBERS, key=len, reverse=True)
+)
+
+
+_PERIOD_MONTHS = (
+    (r"\b[hs]1\b|\bfirst half\b|\bpremier semestre\b", 1),
+    (r"\b[hs]2\b|\bsecond half\b|\b(?:second|deuxieme) semestre\b", 7),
+    (r"\bspring\b|\bprintemps\b", 3),
+    (r"\bsummer\b|\bete\b", 6),
+    (r"\bautumn\b|\bfall\b|\bautomne\b", 9),
+    (r"\bwinter\b|\bhiver\b", 12),
+)
+
+
+def _fold_temporal_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    unaccented = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", unaccented).split())
+
+
+def _date_from_parts(year: str, month: int, day: int) -> date | None:
+    try:
+        return date(int(year), month, day)
+    except ValueError:
+        return None
+
+
+def _year_approximation(year: str, qualifier: str | None) -> date | None:
+    month = {"early": 1, "mid": 7, "late": 10, None: 1}.get(qualifier)
+    return None if month is None else _date_from_parts(year, month, 1)
+
+
+def resolve_timeline_date_text(value: str | None) -> date | None:
+    """Resolve common English and French date wording to a sorting approximation."""
+    if not value:
+        return None
+    iso_match = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", value)
+    if iso_match:
+        try:
+            return date.fromisoformat(iso_match.group(0))
+        except ValueError:
+            return None
+
+    text = _fold_temporal_text(value)
+    quarter_match = re.search(r"\b([qt])\s*([1-4])\s+(\d{4})\b", text)
+    if quarter_match is None:
+        quarter_match = re.search(r"\b(\d{4})\s+[qt]\s*([1-4])\b", text)
+        if quarter_match:
+            year, quarter = quarter_match.groups()
+        else:
+            year = quarter = ""
+    else:
+        _, quarter, year = quarter_match.groups()
+    if quarter_match:
+        return _date_from_parts(year, (int(quarter) - 1) * 3 + 1, 1)
+
+    period_year = re.search(r"\b(\d{4})\b", text)
+    if period_year is not None:
+        for pattern, month in _PERIOD_MONTHS:
+            if re.search(pattern, text):
+                return _date_from_parts(period_year.group(1), month, 1)
+
+    day_month_match = re.search(rf"\b(\d{{1,2}})\s+({_MONTH_PATTERN})\s+(\d{{4}})\b", text)
+    if day_month_match:
+        day, month_name, year = day_month_match.groups()
+        return _date_from_parts(year, _MONTH_NUMBERS[month_name], int(day))
+    month_day_match = re.search(rf"\b({_MONTH_PATTERN})\s+(\d{{1,2}})\s+(\d{{4}})\b", text)
+    if month_day_match:
+        month_name, day, year = month_day_match.groups()
+        return _date_from_parts(year, _MONTH_NUMBERS[month_name], int(day))
+
+    month_year_match = re.search(rf"\b({_MONTH_PATTERN})\s+(\d{{4}})\b", text)
+    if month_year_match:
+        month_name, year = month_year_match.groups()
+        prefix = text[: month_year_match.start()].strip()
+        qualifier = {
+            "early": "early",
+            "beginning": "early",
+            "start": "early",
+            "debut": "early",
+            "debut de": "early",
+            "debut du": "early",
+            "mid": "mid",
+            "middle": "mid",
+            "mi": "mid",
+            "milieu": "mid",
+            "milieu de": "mid",
+            "milieu du": "mid",
+            "late": "late",
+            "end": "late",
+            "fin": "late",
+            "fin de": "late",
+            "fin du": "late",
+        }.get(prefix)
+        day = {"early": 1, "mid": 15, "late": 25, None: 1}.get(qualifier)
+        return _date_from_parts(year, _MONTH_NUMBERS[month_name], day or 1)
+
+    year_match = re.search(r"\b(\d{4})\b", text)
+    if year_match is None:
+        return None
+    year = year_match.group(1)
+    prefix = text[: year_match.start()].strip()
+    suffix = text[year_match.end() :].strip()
+    if suffix:
+        return None
+    qualifier = {
+        "": None,
+        "in": None,
+        "during": None,
+        "around": None,
+        "about": None,
+        "circa": None,
+        "en": None,
+        "vers": None,
+        "early": "early",
+        "beginning": "early",
+        "start": "early",
+        "debut": "early",
+        "debut de": "early",
+        "debut du": "early",
+        "mid": "mid",
+        "middle": "mid",
+        "mi": "mid",
+        "milieu": "mid",
+        "milieu de": "mid",
+        "milieu du": "mid",
+        "late": "late",
+        "end": "late",
+        "fin": "late",
+        "fin de": "late",
+        "fin du": "late",
+    }.get(prefix, "unrecognized")
+    if qualifier == "unrecognized":
+        return None
+    return _year_approximation(year, qualifier)
+
+
+def _timeline_text_key(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    unaccented = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return " ".join(re.findall(r"[^\W_]+", unaccented))
+
+
 def timeline_sort_key(
     entry: SynthesisTimelineEntryV1,
-) -> tuple[bool, date, tuple[tuple[str, str, str], ...], str, str]:
-    """Dated entries by date then evidence identity, followed by undated entries."""
+) -> tuple[int, date, int, tuple[tuple[str, str, str], ...], str, str, str, str]:
+    """Sort by exact or approximated date, with a deterministic total tie-break."""
+    sort_date = entry.event_date or resolve_timeline_date_text(entry.date_text)
+    if sort_date is not None:
+        date_bucket = 0
+    elif entry.date_text is None:
+        date_bucket = 1
+    else:
+        date_bucket = 2
     return (
-        entry.event_date is None,
-        entry.event_date or date.max,
+        date_bucket,
+        sort_date or date.max,
+        int(entry.event_date is None),
         tuple(evidence_ref_sort_key(ref) for ref in entry.evidence_refs),
-        entry.text,
+        _timeline_text_key(entry.date_text or ""),
+        _timeline_text_key(entry.text),
         entry.date_text or "",
+        entry.text,
     )
 
 

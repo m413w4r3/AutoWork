@@ -76,11 +76,15 @@ class Settings(BaseSettings):
     model_route_web_research: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
-    model_route_bulk_extraction: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = "qwen"
+    model_route_bulk_extraction: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
     model_route_ambiguous_clustering: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
-    model_route_standard_draft: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = "qwen"
+    model_route_standard_draft: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
+        "chatgpt_bridge"
+    )
     model_route_premium_synthesis: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )

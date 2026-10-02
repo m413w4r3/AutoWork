@@ -5,7 +5,7 @@ The EXTRACTION stage never looks a source up: it consumes the frozen
 its exact ``source_document_id``, reads the archived decoded blob, verifies its
 SHA-256 against the corpus before any model call, applies the tier policy
 (CORE -> FULL, SUPPORTING/TECHNICAL -> IOC_RULES), reuses durable source
-checkpoints, asks ``ModelGateway`` for the source-local structured Q2 output and
+checkpoints, asks ``ModelGateway`` for source-local Q2 wire text and
 aggregates only evidence-gated proposals into ``ProductionExtractionV1``.
 
 The module is deliberately free of provider knowledge: the gateway chooses the
@@ -27,8 +27,6 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Any, Protocol, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
-
-from pydantic import BaseModel, ValidationError
 
 from cti_app.application.extraction import _html_encoding, parse_document
 from cti_app.application.model_gateway import (
@@ -54,13 +52,14 @@ from cti_app.application.production_artifact_verification import (
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
-    Q2_SCHEMA_VERSION,
+    Q2_MARKDOWN_PARSER_VERSION,
     ExtractionItem,
     IndicatorProvenance,
     IndicatorStatus,
     Q2SourceOutput,
     SemanticType,
     TechnicalExtraction,
+    parse_q2_proposals_markdown,
     project_q2_source_output,
     q2_source_output_from_json,
     q2_source_output_to_json,
@@ -73,10 +72,9 @@ from cti_app.application.production_prompts import (
 )
 from cti_app.application.production_q2_batch import (
     ArchiveQ2BatchSource,
-    Q2BatchResponse,
     archive_q2_batch_identity,
-    attribute_q2_batch_response,
     make_archive_q2_batch,
+    parse_q2_batch_response,
     partition_archive_q2_batch_sources,
 )
 from cti_app.application.production_references import (
@@ -144,15 +142,14 @@ PRODUCTION_EXTRACTION_SERVICE_VERSION = "production-extraction-service-v2"
 EXTRACTION_MODEL_POLICY_VERSION = "archive-source-extraction-v1"
 EXTRACTION_ROUTING_POLICY_VERSION = "bulk-extraction-routing-v1"
 
-#: The provider answers one structured ``Q2SourceOutput``; the gateway validates
-#: it against the schema, so the response parser is the schema itself.
-EXTRACTION_RESPONSE_PARSER_VERSION = f"q2-structured-schema-v{Q2_SCHEMA_VERSION}"
+#: The bridge answers with line-oriented Q2 text, parsed locally after receipt.
+EXTRACTION_RESPONSE_PARSER_VERSION = Q2_MARKDOWN_PARSER_VERSION
 
 #: Deterministic archived-text transform. Chunking is a pure function of the
 #: archived content, the transformers' versions, the maximum size and the
 #: overlap, so it never depends on the provider that answers.
 SOURCE_TEXT_CONTRACT_VERSION = "archived-text-v1"
-SOURCE_TEXT_CHUNKER_VERSION = "chunker-v1"
+SOURCE_TEXT_CHUNKER_VERSION = "chunker-v2"
 SOURCE_CHUNK_MAX_CHARS = 24_000
 SOURCE_CHUNK_OVERLAP_CHARS = 400
 
@@ -781,31 +778,56 @@ def _detected_mime_type(mime_type: str | None) -> DetectedMimeType:
 def archived_source_chunks(text: str) -> tuple[str, ...]:
     """Chunk one archived text deterministically, never truncating it.
 
-    Paragraphs are packed up to ``SOURCE_CHUNK_MAX_CHARS``; a single oversized
-    paragraph is cut in fixed windows overlapping by
-    ``SOURCE_CHUNK_OVERLAP_CHARS``.
+    Chunk edges prefer paragraph, line, and word boundaries. Neighboring
+    chunks share a small overlap to retain local context at each edge.
     """
 
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     if len(normalized) <= SOURCE_CHUNK_MAX_CHARS:
         return (normalized,)
-    # The overlap never exceeds a quarter of a chunk, so every window advances.
-    step = SOURCE_CHUNK_MAX_CHARS - min(SOURCE_CHUNK_OVERLAP_CHARS, SOURCE_CHUNK_MAX_CHARS // 4)
     chunks: list[str] = []
-    current = ""
-    for paragraph in normalized.split("\n\n"):
-        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
-        if len(candidate) <= SOURCE_CHUNK_MAX_CHARS:
-            current = candidate
+    max_chars = SOURCE_CHUNK_MAX_CHARS
+    overlap = min(max(0, SOURCE_CHUNK_OVERLAP_CHARS), max_chars // 4)
+    start = 0
+    while start < len(normalized):
+        limit = min(start + max_chars, len(normalized))
+        if limit == len(normalized):
+            chunks.append(normalized[start:])
+            break
+
+        boundary_floor = start + max(1, max_chars // 2)
+        boundary_ends = [
+            position + len(separator)
+            for separator in ("\n\n", "\n", " ", "\t")
+            if (position := normalized.rfind(separator, boundary_floor, limit)) >= boundary_floor
+        ]
+        if boundary_ends:
+            end = max(boundary_ends)
+        else:
+            earlier_boundaries = [
+                position + len(separator)
+                for separator in ("\n\n", "\n", " ", "\t")
+                if (position := normalized.rfind(separator, start + 1, limit)) >= start + 1
+            ]
+            end = max(earlier_boundaries, default=limit)
+        chunks.append(normalized[start:end])
+
+        chunk_length = end - start
+        if overlap == 0 or chunk_length < max_chars // 2:
+            start = end
             continue
-        if current:
-            chunks.append(current)
-        while len(paragraph) > SOURCE_CHUNK_MAX_CHARS:
-            chunks.append(paragraph[:SOURCE_CHUNK_MAX_CHARS])
-            paragraph = paragraph[step:]
-        current = paragraph
-    if current:
-        chunks.append(current)
+        chunk_overlap = min(overlap, chunk_length // 4)
+        if chunk_overlap == 0:
+            start = end
+            continue
+        overlap_target = max(start + 1, end - chunk_overlap)
+        overlap_starts = [
+            position + len(separator)
+            for separator in ("\n\n", "\n", " ", "\t")
+            if (position := normalized.rfind(separator, start + 1, overlap_target)) >= start + 1
+        ]
+        next_start = max(overlap_starts, default=overlap_target)
+        start = next_start if next_start < end else end
     return tuple(chunks)
 
 
@@ -817,11 +839,13 @@ def merge_q2_source_outputs(outputs: Sequence[Q2SourceOutput]) -> Q2SourceOutput
     artifacts = [artifact for output in outputs for artifact in output.artifacts]
     rules = [rule for output in outputs for rule in output.rules]
     return Q2SourceOutput(
-        facts=_unique(facts, lambda fact: (fact.category, fact.value.strip().casefold())),
-        events=_unique(
+        facts=_unique_preserving_evidence_quotes(
+            facts, lambda fact: (fact.category, fact.value.strip().casefold())
+        ),
+        events=_unique_preserving_evidence_quotes(
             events, lambda event: (event.event_date, event.date_text, event.text.strip().casefold())
         ),
-        artifacts=_unique(
+        artifacts=_unique_preserving_evidence_quotes(
             artifacts, lambda artifact: (artifact.artifact_type, artifact.value.strip().casefold())
         ),
         rules=_unique(rules, lambda rule: (rule.rule_type, _normalized_rule_body(rule.body))),
@@ -969,6 +993,26 @@ def _unique[T](items: Sequence[T], key: Callable[[T], Any]) -> list[T]:
             continue
         seen.add(identity)
         kept.append(item)
+    return kept
+
+
+def _unique_preserving_evidence_quotes[T](items: Sequence[T], key: Callable[[T], Any]) -> list[T]:
+    """Deduplicate proposals while retaining a quote from any matching chunk."""
+
+    positions: dict[Any, int] = {}
+    kept: list[T] = []
+    for item in items:
+        identity = key(item)
+        position = positions.get(identity)
+        if position is None:
+            positions[identity] = len(kept)
+            kept.append(item)
+            continue
+        previous = kept[position]
+        if not getattr(previous, "evidence_quote", "").strip():
+            quote = getattr(item, "evidence_quote", "").strip()
+            if quote:
+                kept[position] = cast(Any, previous).model_copy(update={"evidence_quote": quote})
     return kept
 
 
@@ -1299,11 +1343,11 @@ class ProductionExtractionService:
 
     # -- model requests -----------------------------------------------------
 
-    async def invoke(self, request: ModelRequest, output_schema: type[BaseModel]) -> ModelExecution:
-        """Ask the gateway for one structured capability, never for a provider."""
+    async def invoke(self, request: ModelRequest) -> ModelExecution:
+        """Ask the gateway for text-only extraction, never for a provider."""
 
         try:
-            execution = await self._model_gateway.extract(request, output_schema)
+            execution = await self._model_gateway.draft(request)
         except ModelSubmissionReconciliationRequiredError as exc:
             raise _ambiguity(exc.model_run_id or request.run_id, dict(exc.details)) from exc
         except ExternalModelBlockedError as exc:
@@ -1311,7 +1355,7 @@ class ProductionExtractionService:
                 ExtractionFailureCode.SOURCE_POLICY_BLOCKED, str(exc)
             ) from exc
         except StructuredOutputError as exc:
-            # A durable answer that does not match the schema.
+            # A gateway contract failure is still source-local.
             raise SourceExtractionFailure(
                 ExtractionFailureCode.SOURCE_OUTPUT_INVALID, str(exc)
             ) from exc
@@ -1337,18 +1381,7 @@ class ProductionExtractionService:
                 ExtractionFailureCode.MODEL_CALL_FAILED,
                 f"The model run reached status {model_run.status.value}",
             )
-        if isinstance(execution.structured_output, output_schema):
-            return execution
-        # Validation is deferred to this boundary: an answer outside the schema
-        # is a source-local content failure, never a submission ambiguity.
-        try:
-            structured = output_schema.model_validate_json(execution.output_text or "")
-        except ValidationError as exc:
-            raise SourceExtractionFailure(
-                ExtractionFailureCode.SOURCE_OUTPUT_INVALID,
-                "The provider answer is not a source-local structured output",
-            ) from exc
-        return replace(execution, structured_output=structured)
+        return execution
 
     def model_request(
         self,
@@ -1574,11 +1607,11 @@ class _ExtractionRun:
         batches.sort(key=lambda batch: batch[0].position)
         return singles, batches
 
-    async def _call(self, request: ModelRequest, schema: type[BaseModel]) -> ModelExecution:
+    async def _call(self, request: ModelRequest) -> ModelExecution:
         if self._before_model_call is not None:
             await self._before_model_call()
         self._model_calls += 1
-        return await self._service.invoke(request, schema)
+        return await self._service.invoke(request)
 
     async def _compute_single(self, planned: PlannedExtractionSource) -> None:
         archive = self._archives[planned.source_document_id]
@@ -1623,15 +1656,30 @@ class _ExtractionRun:
                         "chunk_count": len(chunks),
                     },
                 )
-                execution = await self._call(request, Q2SourceOutput)
-                output = cast(Q2SourceOutput, execution.structured_output)
-                outputs.append(output)
-                raw_texts.append(
-                    json.dumps(output.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
-                )
+                execution = await self._call(request)
+                raw_text = execution.output_text or ""
+                raw_texts.append(raw_text)
+                parsed = parse_q2_proposals_markdown(raw_text)
+                if not parsed.usable or parsed.value is None:
+                    self._warnings.extend(
+                        f"q2_parse_warning:{warning}" for warning in parsed.warnings
+                    )
+                    self._warnings.extend(f"q2_parse_error:{error}" for error in parsed.errors)
+                    continue
+                self._warnings.extend(f"q2_parse_warning:{warning}" for warning in parsed.warnings)
+                outputs.append(parsed.value)
                 model_run_id = execution.run.id if execution.run is not None else model_run_id
         except SourceExtractionFailure as failure:
             self._fail(planned, failure)
+            return
+        if not outputs:
+            self._fail(
+                planned,
+                SourceExtractionFailure(
+                    ExtractionFailureCode.SOURCE_OUTPUT_INVALID,
+                    "The provider answer contains no usable Q2 item",
+                ),
+            )
             return
         merged = merge_q2_source_outputs(outputs)
         checkpoint_id = await self._service._persist_checkpoint(
@@ -1684,7 +1732,7 @@ class _ExtractionRun:
             },
         )
         try:
-            execution = await self._call(request, Q2BatchResponse)
+            execution = await self._call(request)
         except SourceExtractionFailure as failure:
             # A batch failure is never attributed to one publication: every
             # capture is retried individually, where its own outcome is known.
@@ -1694,16 +1742,26 @@ class _ExtractionRun:
                 warnings=(f"extraction_batch_failed:{failure.code}",),
             )
         model_run_id = execution.run.id if execution.run is not None else None
-        attribution = attribute_q2_batch_response(
-            cast(Q2BatchResponse, execution.structured_output),
-            {entry.batch_id: entry for entry in entries},
+        parsed_batch = parse_q2_batch_response(
+            execution.output_text or "", tuple(entry.batch_id for entry in entries)
         )
+        if parsed_batch.errors:
+            return _BatchResult(
+                computations={},
+                retry_individually=sources,
+                warnings=(
+                    *parsed_batch.warnings,
+                    "extraction_batch_unrecognized_output",
+                ),
+            )
         computations: dict[UUID, _Computation] = {}
         retry: list[PlannedExtractionSource] = []
-        warnings = list(attribution.warnings)
+        warnings = list(parsed_batch.warnings)
+        results_by_id = {result.batch_id: result for result in parsed_batch.sources}
         for entry in entries:
             planned = by_id[entry.source_document_id]
-            result = attribution.result_for(entry.batch_id)
+            result = results_by_id[entry.batch_id]
+            warnings.extend(f"q2_parse_warning:{warning}" for warning in result.warnings)
             if result.output is None:
                 # Unattributable content is rejected, never redistributed.
                 warnings.append(

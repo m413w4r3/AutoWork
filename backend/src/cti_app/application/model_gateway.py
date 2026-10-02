@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
@@ -37,6 +38,14 @@ class ModelGatewayError(RuntimeError):
     attempts = 1
 
 
+# A bridge that closes an attempt as failed (DOM drift, closed tab, ...) proves no
+# result exists for it. A stateless request is then replayed as a new attempt
+# instead of waiting for a manual reconciliation of an outcome that is known.
+_BRIDGE_TERMINAL_FAILURE_RETRIES = 2
+_BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS = 5.0
+_BRIDGE_NON_REPLAYABLE_CODES = frozenset(
+    {"bridge_auth_failed", "bridge_payload_conflict", "bridge_protocol_error"}
+)
 _MODEL_SUBMISSION_RECONCILIATION_MESSAGE = (
     "La soumission du modèle doit être réconciliée avant toute nouvelle tentative."
 )
@@ -369,9 +378,9 @@ class ModelRouter:
         self._forced_backend = forced_backend
         self._routing = routing or {
             ModelRoutingHint.WEB_RESEARCH: ModelBackend.CHATGPT_BRIDGE,
-            ModelRoutingHint.BULK_EXTRACTION: ModelBackend.QWEN,
+            ModelRoutingHint.BULK_EXTRACTION: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.AMBIGUOUS_CLUSTERING: ModelBackend.CHATGPT_BRIDGE,
-            ModelRoutingHint.STANDARD_DRAFT: ModelBackend.QWEN,
+            ModelRoutingHint.STANDARD_DRAFT: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.PREMIUM_SYNTHESIS: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.EDITORIAL_ENRICHMENT: ModelBackend.CHATGPT_BRIDGE,
             ModelRoutingHint.CRITIQUE: ModelBackend.CHATGPT_BRIDGE,
@@ -950,104 +959,133 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         if request_id is None:
             raise ModelGatewayError("Model submission attempt was not allocated")
         safe_request = replace(safe_request, request_id=request_id)
-        started = time.monotonic()
-        try:
-            result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
-            async with self._uow_factory() as uow:
-                persisted = await uow.model_runs.get_for_update(run.id)
-                if persisted is None:
-                    raise ModelGatewayError(f"Model run {run.id} disappeared")
-                if result.status is AdapterResultStatus.WAITING_BACKGROUND:
-                    if not result.response_id:
-                        raise ModelGatewayError("Background adapter omitted response id")
-                    persisted.wait_for_background(
-                        response_id=result.response_id,
-                        actual_model_version=result.actual_model_version,
-                        usage=result.usage,
+        retries_left = _BRIDGE_TERMINAL_FAILURE_RETRIES
+        while True:
+            started = time.monotonic()
+            try:
+                result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
+                async with self._uow_factory() as uow:
+                    persisted = await uow.model_runs.get_for_update(run.id)
+                    if persisted is None:
+                        raise ModelGatewayError(f"Model run {run.id} disappeared")
+                    if result.status is AdapterResultStatus.WAITING_BACKGROUND:
+                        if not result.response_id:
+                            raise ModelGatewayError("Background adapter omitted response id")
+                        persisted.wait_for_background(
+                            response_id=result.response_id,
+                            actual_model_version=result.actual_model_version,
+                            usage=result.usage,
+                        )
+                        await uow.model_runs.save(persisted)
+                        await uow.commit()
+                        return ModelExecution(persisted)
+                    if result.status is AdapterResultStatus.NEEDS_REVIEW:
+                        persisted.require_review(
+                            str(result.metadata.get("reason", "no_final_answer")),
+                            "ChatGPT s'est arrêté sans produire de réponse finale.",
+                            details=result.metadata,
+                            response_id=result.response_id or persisted.response_id,
+                        )
+                        await uow.model_runs.save(persisted)
+                        await uow.commit()
+                        return ModelExecution(
+                            run=persisted,
+                            output_text=None,
+                            conversation=result.conversation,
+                            metadata=dict(result.metadata),
+                        )
+                    execution = await self._complete_run(
+                        persisted,
+                        result,
+                        duration_ms=max(0, int((time.monotonic() - started) * 1000)),
                     )
                     await uow.model_runs.save(persisted)
                     await uow.commit()
-                    return ModelExecution(persisted)
-                if result.status is AdapterResultStatus.NEEDS_REVIEW:
-                    persisted.require_review(
-                        str(result.metadata.get("reason", "no_final_answer")),
-                        "ChatGPT s'est arrêté sans produire de réponse finale.",
-                        details=result.metadata,
-                        response_id=result.response_id or persisted.response_id,
-                    )
-                    await uow.model_runs.save(persisted)
-                    await uow.commit()
-                    return ModelExecution(
-                        run=persisted,
-                        output_text=None,
-                        conversation=result.conversation,
-                        metadata=dict(result.metadata),
-                    )
-                execution = await self._complete_run(
-                    persisted,
-                    result,
+                    return execution
+            except Exception as exc:
+                self._diagnostics.record_failure(
+                    event="model.call_failed",
+                    run_id=run.id,
+                    stage=request.prompt_template_id,
+                    correlation_id=get_correlation_id(),
+                    error=exc,
+                    error_code=str(getattr(exc, "code", "model_call_failed")),
+                    provider=run.provider.value if run.provider else None,
+                    model_role=role.value,
+                    routing_hint=request.routing_hint.value,
+                    background=request.background,
+                    conversation_mode=(request.conversation.mode if request.conversation else None),
                     duration_ms=max(0, int((time.monotonic() - started) * 1000)),
                 )
-                await uow.model_runs.save(persisted)
-                await uow.commit()
-                return execution
-        except Exception as exc:
-            self._diagnostics.record_failure(
-                event="model.call_failed",
-                run_id=run.id,
-                stage=request.prompt_template_id,
-                correlation_id=get_correlation_id(),
-                error=exc,
-                error_code=str(getattr(exc, "code", "model_call_failed")),
-                provider=run.provider.value if run.provider else None,
-                model_role=role.value,
-                routing_hint=request.routing_hint.value,
-                background=request.background,
-                conversation_mode=(request.conversation.mode if request.conversation else None),
-                duration_ms=max(0, int((time.monotonic() - started) * 1000)),
-            )
-            reconciliation_error: ModelSubmissionReconciliationRequiredError | None = None
-            async with self._uow_factory() as uow:
-                persisted = await uow.model_runs.get_for_update(run.id)
-                if persisted and persisted.status in {
-                    ModelRunStatus.RUNNING,
-                    ModelRunStatus.WAITING_BACKGROUND,
-                }:
-                    if _is_certain_pre_submission_failure(exc):
-                        # Only an explicit proof that the provider was not
-                        # reached permits the FAILED/NOT_SUBMITTED state.
-                        persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
-                        persisted.fail(
-                            str(getattr(exc, "code", "model_call_failed")),
-                            _public_error(exc),
-                            details=_error_details(exc),
-                        )
-                    elif _submission_may_have_started(exc):
-                        details = _reconciliation_details(
-                            persisted,
-                            exc=exc,
-                            request_id=safe_request.request_id,
-                        )
-                        persisted.require_review(
-                            ModelSubmissionReconciliationRequiredError.code,
-                            _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
-                            details=details,
-                            response_id=getattr(exc, "bridge_run_id", None),
-                        )
-                        reconciliation_error = ModelSubmissionReconciliationRequiredError(
-                            details=details, model_run_id=persisted.id
-                        )
-                    else:
-                        persisted.fail(
-                            str(getattr(exc, "code", "model_call_failed")),
-                            _public_error(exc),
-                            details=_error_details(exc),
-                        )
-                    await uow.model_runs.save(persisted)
-                    await uow.commit()
-            if reconciliation_error is not None:
-                raise reconciliation_error from exc
-            raise
+                if retries_left > 0 and _is_confirmed_terminal_bridge_failure(exc, request):
+                    retries_left -= 1
+                    reopened = await self._reopen_after_terminal_failure(run.id, exc)
+                    if reopened is not None:
+                        run = reopened
+                        safe_request = replace(safe_request, request_id=_bridge_request_id(run))
+                        await asyncio.sleep(_BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS)
+                        continue
+                reconciliation_error: ModelSubmissionReconciliationRequiredError | None = None
+                async with self._uow_factory() as uow:
+                    persisted = await uow.model_runs.get_for_update(run.id)
+                    if persisted and persisted.status in {
+                        ModelRunStatus.RUNNING,
+                        ModelRunStatus.WAITING_BACKGROUND,
+                    }:
+                        if _is_certain_pre_submission_failure(exc):
+                            # Only an explicit proof that the provider was not
+                            # reached permits the FAILED/NOT_SUBMITTED state.
+                            persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
+                            persisted.fail(
+                                str(getattr(exc, "code", "model_call_failed")),
+                                _public_error(exc),
+                                details=_error_details(exc),
+                            )
+                        elif _submission_may_have_started(exc):
+                            details = _reconciliation_details(
+                                persisted,
+                                exc=exc,
+                                request_id=safe_request.request_id,
+                            )
+                            persisted.require_review(
+                                ModelSubmissionReconciliationRequiredError.code,
+                                _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
+                                details=details,
+                                response_id=getattr(exc, "bridge_run_id", None),
+                            )
+                            reconciliation_error = ModelSubmissionReconciliationRequiredError(
+                                details=details, model_run_id=persisted.id
+                            )
+                        else:
+                            persisted.fail(
+                                str(getattr(exc, "code", "model_call_failed")),
+                                _public_error(exc),
+                                details=_error_details(exc),
+                            )
+                        await uow.model_runs.save(persisted)
+                        await uow.commit()
+                if reconciliation_error is not None:
+                    raise reconciliation_error from exc
+                raise
+
+    async def _reopen_after_terminal_failure(self, run_id: UUID, exc: Exception) -> ModelRun | None:
+        async with self._uow_factory() as uow:
+            persisted = await uow.model_runs.get_for_update(run_id)
+            if persisted is None or persisted.status is not ModelRunStatus.RUNNING:
+                return None
+            persisted.reopen_after_confirmed_terminal_failure()
+            attempt = persisted.begin_submission_attempt()
+            await uow.model_runs.save(persisted)
+            await uow.commit()
+        self._diagnostics.record(
+            event="model.bridge_attempt_retried",
+            run_id=run_id,
+            failed_bridge_run_id=getattr(exc, "bridge_run_id", None),
+            error_code=str(getattr(exc, "code", "model_call_failed")),
+            next_attempt=attempt,
+            correlation_id=get_correlation_id(),
+        )
+        return persisted
 
     async def _persisted_execution(
         self, run: ModelRun, *, output_schema: type[BaseModel] | None
@@ -1270,6 +1308,22 @@ def _is_certain_pre_submission_failure(exc: Exception) -> bool:
         return True
     return submission_state is None and getattr(exc, "code", None) in (
         _CERTAIN_PRE_SUBMISSION_CODES
+    )
+
+
+def _is_confirmed_terminal_bridge_failure(exc: Exception, request: ModelRequest) -> bool:
+    """The bridge itself closed this stateless attempt as failed.
+
+    A stateless request is a pure function of its prompt, so replaying it after a
+    terminal failure can only cost a duplicate generation. Failures that a new
+    attempt cannot fix (credentials, idempotency conflict, broken contract) are
+    excluded.
+    """
+    return (
+        request.conversation is None
+        and getattr(exc, "bridge_status", None) == "failed"
+        and bool(getattr(exc, "bridge_run_id", None))
+        and getattr(exc, "code", None) not in _BRIDGE_NON_REPLAYABLE_CODES
     )
 
 

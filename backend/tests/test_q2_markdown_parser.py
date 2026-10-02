@@ -13,6 +13,7 @@ from cti_app.application.production_artifact_verification import (
 )
 from cti_app.application.production_parsers import (
     Q2_EXTRACTION_CONTRACT_VERSION,
+    Q2_MARKDOWN_PARSER_VERSION,
     Q2_SCHEMA_VERSION,
     DetectionRule,
     Q2ArtifactProposal,
@@ -24,9 +25,11 @@ from cti_app.application.production_parsers import (
     project_q2_source_output,
     q2_source_output_from_json,
     q2_source_output_to_json,
+    sanitize_bridge_output_text,
 )
 from cti_app.application.production_prompts import (
     CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE,
+    CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION,
     ProductionPromptTemplates,
 )
 from cti_app.domain.production import DetectionRuleType, ExtractionProfile
@@ -50,14 +53,26 @@ def test_canonical_prompts_carry_only_the_archived_capture() -> None:
 
     for prompt in (full, light):
         assert "ExampleRAT reaches evil.example." in prompt
-        assert "Do not browse the web" in prompt
+        assert "Ne naviguez pas sur le Web" in prompt
         assert "http" not in prompt.replace("evil.example", "")
-    assert "`events`" in full and "`facts`" in full
-    assert "Leave `facts` and `events`" in light
+    assert "Utilisez les groupes FACT" in full and "Utilisez EVENT" in full
+    assert "N'utilisez pas de groupes" in light
     assert CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE == {
-        ExtractionProfile.FULL: "archive-full-v1",
-        ExtractionProfile.IOC_RULES: "archive-ioc-rules-v1",
+        ExtractionProfile.FULL: "archive-full-v3",
+        ExtractionProfile.IOC_RULES: "archive-ioc-rules-v3",
     }
+    assert CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION == "archive-ioc-rules-batch-v3"
+    assert Q2_MARKDOWN_PARSER_VERSION == "q2-markdown-v9"
+    full_one_line = " ".join(full.split())
+    assert "JSON" not in full and "schema" not in full
+    assert "Chaque puce FACT ou EVENT" in full_one_line
+    assert "extrait littéral exact de la capture" in full_one_line
+    assert "Rédigez chaque description en français" in full_one_line
+    assert "formulation absolue incluant l'année" in full_one_line
+    assert "ordonnez-les chronologiquement" in full_one_line
+    assert "captures ou segments incomplets" in full_one_line
+    assert "limites de types" in full_one_line
+    assert "classement de fichiers" in full_one_line
 
 
 def test_ioc_group_parses_100_confirmed_iocs() -> None:
@@ -67,6 +82,23 @@ def test_ioc_group_parses_100_confirmed_iocs() -> None:
     assert len(output.artifacts) == 100
     assert all(item.indicator_status == "confirmed_ioc" for item in output.artifacts)
     assert all(item.context == "" and item.evidence_quote == "" for item in output.artifacts)
+
+
+def test_prompt_header_forms_are_accepted_by_the_wire_parser() -> None:
+    output = _parse(
+        "FACT malware\n- Exemple ExampleRAT :: ExampleRAT is published.\n"
+        "EVENT T2 2026\n"
+        "- Les opérateurs changent de serveur. :: In Q2 2026, operators changed servers.\n"
+        "IOC contextual domain\n- evil.example :: infrastructure connexe\n"
+        "RULE yara: Example\n```yara\nrule Example { condition: true }\n```\n"
+        "UNCERTAINTIES\n- L'attribution demeure incertaine.\n"
+    )
+
+    assert [fact.category for fact in output.facts] == ["malware"]
+    assert output.events[0].date_text == "T2 2026"
+    assert output.artifacts[0].context == "infrastructure connexe"
+    assert output.rules[0].name == "Example"
+    assert output.uncertainties == ["L'attribution demeure incertaine."]
 
 
 def test_ioc_status_is_header_data_and_optional_context_is_supported() -> None:
@@ -133,10 +165,11 @@ FACT ttps
 """
     )
 
-    assert [(fact.category, fact.value, fact.context) for fact in output.facts] == [
+    assert [(fact.category, fact.value, fact.evidence_quote) for fact in output.facts] == [
         ("malware", "ExampleRAT", "payload family"),
         ("ttps", "T1059", "shell"),
     ]
+    assert all(fact.context == "" for fact in output.facts)
     assert output.facts[1].attack_id == "T1059"
 
 
@@ -220,6 +253,42 @@ IOC confirmed domain
     assert "q2_unknown_heading" in result.warnings
 
 
+def test_partial_garbage_line_does_not_discard_later_items() -> None:
+    result = parse_q2_proposals_markdown(
+        """FACT malware
+- ExampleRAT :: The capture names ExampleRAT.
+This line is not a Q2 item.
+EVENT 2024-03-02
+- Les opérateurs déploient ExampleRAT.
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [fact.value for fact in result.value.facts] == ["ExampleRAT"]
+    assert [event.text for event in result.value.events] == ["Les opérateurs déploient ExampleRAT."]
+    assert result.warnings.count("q2_unexpected_structure") == 1
+
+
+def test_fact_and_event_quotes_split_once_and_strip_bridge_markers() -> None:
+    result = parse_q2_proposals_markdown(
+        "FACT malware\n"
+        "- Famille ExampleRAT :: The report states A :: B and names ExampleRAT "
+        ':chatgpt-content-reference{index="0"}\n'
+        "EVENT 2024-03-02\n"
+        "- Les opérateurs déploient ExampleRAT :: On 2024-03-02, A :: B "
+        "involved ExampleRAT.\n"
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.facts[0].value == "Famille ExampleRAT"
+    assert result.value.facts[0].evidence_quote == "The report states A :: B and names ExampleRAT"
+    assert result.value.facts[0].context == ""
+    assert result.value.events[0].evidence_quote == "On 2024-03-02, A :: B involved ExampleRAT."
+    assert result.value.events[0].context == ""
+
+
 @pytest.mark.parametrize(
     ("header", "warning"),
     [
@@ -244,6 +313,83 @@ IOC contextual domain
     assert [artifact.value for artifact in result.value.artifacts] == ["valid.example"]
     assert [fact.value for fact in result.value.facts] == []
     assert warning in result.warnings
+
+
+def test_malformed_item_is_dropped_and_later_items_in_group_survive() -> None:
+    result = parse_q2_proposals_markdown(
+        """FACT malware
+- :: missing value
+- ExampleRAT
+IOC confirmed unsupported_type
+- ignored.example
+IOC contextual domain
+- clearview.ai :: Reconnaissance target :chatgpt-content-reference{index="0"}
+"""
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [fact.value for fact in result.value.facts] == ["ExampleRAT"]
+    assert [(artifact.value, artifact.context) for artifact in result.value.artifacts] == [
+        ("clearview.ai", "Reconnaissance target")
+    ]
+    assert "q2_bullet_without_value" in result.warnings
+    assert "q2_unknown_ioc_type" in result.warnings
+
+
+def test_real_bridge_ui_marker_sample_is_sanitized_before_parsing() -> None:
+    bridge_json = (
+        '{"artifacts":[{"value":"clearview.ai","artifact_type":"domain",'
+        '"indicator_status":"contextual","context":"Reconnaissance target enumerated with '
+        'subfinder. :chatgpt-content-reference{index="0"}",'
+        '"evidence_quote":"clearview.ai"}], ...}'
+    )
+
+    cleaned = sanitize_bridge_output_text(bridge_json)
+    assert ':chatgpt-content-reference{index="0"}' not in cleaned
+    assert "Reconnaissance target enumerated with subfinder." in cleaned
+
+    result = parse_q2_proposals_markdown(
+        "IOC contextual domain\n"
+        "- clearview.ai :: Reconnaissance target enumerated with subfinder. "
+        ':chatgpt-content-reference{index="0"}\n'
+    )
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.artifacts[0].context == "Reconnaissance target enumerated with subfinder."
+
+
+def test_other_visible_chat_ui_markers_are_removed() -> None:
+    cleaned = sanitize_bridge_output_text(
+        'before cite[1] entity[organization] :chatgpt-image{alt="x"} '
+        "citeturn0search0 【turn3†source】 after"
+    )
+
+    for marker in (
+        "cite[1]",
+        "entity[organization]",
+        ":chatgpt-image",
+        "turn0search0",
+        "turn3",
+    ):
+        assert marker not in cleaned
+    assert "before" in cleaned and "after" in cleaned
+
+
+def test_real_unescaped_quote_sample_is_plain_text_not_a_json_error() -> None:
+    result = parse_q2_proposals_markdown(
+        "UNCERTAINTIES\n"
+        '- The value "362091310" appears only embedded in the filename '
+        '"outputIPandport362091310.txt" and is not explicitly identified '
+        "in the capture as a hash\n"
+    )
+
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert result.value.uncertainties == [
+        'The value "362091310" appears only embedded in the filename '
+        '"outputIPandport362091310.txt" and is not explicitly identified in the capture as a hash'
+    ]
 
 
 def test_unexpected_structure_ends_group_and_bullets_do_not_inherit_metadata() -> None:
@@ -334,7 +480,7 @@ def test_terminal_responses_are_case_insensitive(
 
 
 @pytest.mark.parametrize("marker", ["EMPTY", "UNAVAILABLE"])
-def test_terminal_marker_mixed_with_groups_is_rejected(marker: str) -> None:
+def test_terminal_marker_mixed_with_groups_keeps_recognized_items(marker: str) -> None:
     result = parse_q2_proposals_markdown(
         f"""{marker}
 FACT malware
@@ -342,8 +488,9 @@ FACT malware
 """
     )
 
-    assert not result.usable
-    assert result.errors == ["q2_terminal_marker_mixed"]
+    assert result.usable, result.errors
+    assert result.value is not None
+    assert [fact.value for fact in result.value.facts] == ["ExampleRAT"]
 
 
 def test_terminal_marker_inside_rule_body_is_not_a_terminal_response() -> None:
@@ -609,7 +756,8 @@ EVENT
         "Victim reported the intrusion",
         "Attribution remained unconfirmed",
     ]
-    assert output.events[0].context == "first stage"
+    assert output.events[0].evidence_quote == "first stage"
+    assert output.events[0].context == ""
 
 
 def test_event_headers_never_invent_a_date() -> None:

@@ -44,7 +44,6 @@ from cti_app.application.production_extraction import (
     extraction_input_hash,
     references_corpus_hash,
 )
-from cti_app.application.production_parsers import Q2FactProposal, Q2SourceOutput
 from cti_app.application.production_references import (
     production_reference_corpus_from_json,
     production_reference_corpus_to_json,
@@ -279,9 +278,7 @@ class _CountingRetryModelAdapter:
 
     def __init__(self) -> None:
         self.calls: list[SafeModelRequest] = []
-        self._extraction_text = Q2SourceOutput(
-            facts=[Q2FactProposal(category="actors", value="Example actor")]
-        ).model_dump_json()
+        self._extraction_text = "FACT actors\n- Example actor\n"
 
     async def invoke(
         self,

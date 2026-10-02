@@ -2,9 +2,8 @@
 
 The scenario fixture keeps PostgreSQL, the blob catalog, the real workflow,
 jobs and repositories in the loop; only the HTTP and model boundaries are
-scripted.  EXTRACTION is answered through the archive-backed structured
-capability of ``ModelGateway``: the scripted adapter replays one source-local
-``Q2SourceOutput`` per archived capture and never talks to a provider.
+scripted. EXTRACTION replays one source-local Q2 wire response per archived
+capture and never talks to a provider.
 """
 
 from __future__ import annotations
@@ -41,7 +40,6 @@ from cti_app.application.production_parsers import (
     Q2RuleProposal,
     Q2SourceOutput,
 )
-from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.production import (
@@ -61,7 +59,7 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import ProductionReferenceTier
 
-from .support import ProductionScenario
+from .support import ProductionScenario, q2_output_to_wire_text
 
 pytestmark = pytest.mark.integration
 
@@ -164,7 +162,7 @@ def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
     return tuple(blocks)
 
 
-def _adapter_result(adapter: Any, output: Q2SourceOutput | Q2BatchResponse) -> AdapterResult:
+def _adapter_result(adapter: Any, output_text: str) -> AdapterResult:
     return AdapterResult(
         status=AdapterResultStatus.COMPLETED,
         provider=adapter.provider,
@@ -172,7 +170,7 @@ def _adapter_result(adapter: Any, output: Q2SourceOutput | Q2BatchResponse) -> A
         actual_model_version=str(adapter.requested_model),
         usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
         response_id=f"canonical-{uuid4()}",
-        structured_output=output,
+        output_text=output_text,
     )
 
 
@@ -211,14 +209,12 @@ class CanonicalExtractionScript:
             if self.ambiguity is not None:
                 raise self.ambiguity
             if template == _CANONICAL_BATCH_TEMPLATE:
-                response = Q2BatchResponse(
-                    sources=[
-                        Q2BatchSourceOutput(batch_id=handle, output=self.output_for(body))
-                        for handle, body in _batch_blocks(request.text)
-                    ]
+                response = "\n\n".join(
+                    f"@@Q2:{handle}@@\n{q2_output_to_wire_text(self.output_for(body))}"
+                    for handle, body in _batch_blocks(request.text)
                 )
                 return _adapter_result(adapter, response)
-            return _adapter_result(adapter, self.output_for(request.text))
+            return _adapter_result(adapter, q2_output_to_wire_text(self.output_for(request.text)))
 
         adapter.invoke = invoke
 

@@ -336,6 +336,19 @@ class ModelRun:
         self.finished_at = None
         self.updated_at = timestamp
 
+    def reopen_after_confirmed_terminal_failure(self, *, now: datetime | None = None) -> None:
+        """Release the submission claim once the provider closed this attempt as failed.
+
+        Only a provider that stated a terminal failure for the exact attempt proves
+        that no result will ever exist for it, so a new attempt cannot double-submit.
+        """
+        if self.status is not ModelRunStatus.RUNNING:
+            raise ValueError("Only running ModelRuns can reopen a submission")
+        if self.submission_state is not ModelSubmissionState.SUBMITTED_OR_UNKNOWN:
+            raise ValueError("ModelRun has no claimed submission to close")
+        self.submission_state = ModelSubmissionState.NOT_SUBMITTED
+        self.updated_at = now or datetime.now(UTC)
+
     def begin_submission_attempt(self, *, now: datetime | None = None) -> int:
         """Claim and persist a new provider submission before contacting it."""
         if self.status is not ModelRunStatus.RUNNING:

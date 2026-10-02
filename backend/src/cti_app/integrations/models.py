@@ -65,7 +65,7 @@ class HttpResponsesTransport:
         base_url: str,
         *,
         api_key: str | None = None,
-        timeout_seconds: float = 900,
+        timeout_seconds: float | None = 900,
         connect_timeout_seconds: float = 3,
         capabilities_timeout_seconds: float = 2,
         archive_timeout_seconds: float = 60,
@@ -107,7 +107,8 @@ class HttpResponsesTransport:
         correlation_id = get_correlation_id()
         if correlation_id != "-":
             headers["X-Correlation-ID"] = correlation_id
-        timeout = httpx.Timeout(timeout_seconds or self._timeout, connect=self._connect_timeout)
+        read_timeout = timeout_seconds if timeout_seconds is not None else self._timeout
+        timeout = httpx.Timeout(read_timeout, connect=self._connect_timeout)
         try:
             if self._client is not None:
                 response = await self._client.request(

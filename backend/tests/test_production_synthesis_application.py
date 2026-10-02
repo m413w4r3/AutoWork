@@ -24,6 +24,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
 from cti_app.application.production_synthesis import (
+    MAX_SYNTHESIS_UNCERTAINTIES,
     MAX_TECHNICAL_EVIDENCE_V1,
     SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION,
     SYNTHESIS_MODEL_POLICY_VERSION,
@@ -89,6 +90,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionKind,
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
+    resolve_timeline_date_text,
 )
 from cti_app.domain.publication import ArtifactType
 
@@ -404,6 +406,104 @@ def test_timeline_deduplicates_events_and_sorts_dated_before_undated():
     assert timeline == build_synthesis_timeline(make_extraction(subject_id, (first, second)))
 
 
+def test_timeline_resolves_english_and_french_dates_and_handles_relative_wording():
+    subject_id, source_id = uuid4(), uuid4()
+    date_texts = (
+        "2026-09-17",
+        "mid-2023",
+        "mid-2025",
+        "late December 2023",
+        "early 2025",
+        "February 2025",
+        "février 2025",
+        "2013",
+        "late 2024",
+        "Q2 2026",
+        "2019",
+        "Also that year",
+        "fin 2024",
+        "début 2025",
+    )
+    source = make_source(
+        source_id,
+        events=(
+            *(
+                make_event(source_id, f"English bulletin event {index}", None, date_text=text)
+                for index, text in enumerate(date_texts)
+            ),
+            make_event(source_id, "Event without a date", None),
+        ),
+        url_suffix="timeline-language",
+    )
+    extraction = make_extraction(subject_id, (source,))
+
+    timeline = build_synthesis_timeline(extraction)
+    resolved = [
+        entry
+        for entry in timeline
+        if entry.date_text is not None and entry.date_text != "Also that year"
+    ]
+    resolved_dates = [resolve_timeline_date_text(entry.date_text) for entry in resolved]
+    assert all(resolved_date is not None for resolved_date in resolved_dates)
+    assert resolved_dates == sorted(
+        resolved_date for resolved_date in resolved_dates if resolved_date is not None
+    )
+    assert timeline[-2].date_text is None
+    assert timeline[-1].date_text == "Also that year"
+    assert {entry.date_text for entry in timeline if entry.date_text is not None} == set(date_texts)
+    assert timeline == build_synthesis_timeline(
+        make_extraction(
+            subject_id,
+            (replace(source, events=tuple(reversed(source.events))),),
+        )
+    )
+
+    warnings: list[str] = []
+    filtered_timeline = build_synthesis_timeline(extraction, warnings=warnings)
+    assert "Also that year" not in {entry.date_text for entry in filtered_timeline}
+    assert filtered_timeline[-1].date_text is None
+    assert warnings == ["Dropped 1 timeline event with unresolvable date wording."]
+
+
+def test_timeline_deduplicates_normalized_text_and_preserves_a_stable_display_value():
+    subject_id = uuid4()
+    first_id, second_id = uuid4(), uuid4()
+    event_date = date(2025, 2, 2)
+    first = make_source(
+        first_id,
+        events=(
+            make_event(
+                first_id,
+                "Operation began!",
+                event_date,
+                date_text="February 2, 2025",
+            ),
+        ),
+        url_suffix="timeline-normalized-a",
+    )
+    second = make_source(
+        second_id,
+        events=(
+            make_event(
+                second_id,
+                "operation began.",
+                event_date,
+                date_text="2 February 2025",
+            ),
+        ),
+        url_suffix="timeline-normalized-b",
+    )
+
+    timeline = build_synthesis_timeline(make_extraction(subject_id, (first, second)))
+    reversed_timeline = build_synthesis_timeline(make_extraction(subject_id, (second, first)))
+
+    assert timeline == reversed_timeline
+    assert len(timeline) == 1
+    assert timeline[0].event_date == event_date
+    assert timeline[0].date_text == "2 February 2025"
+    assert len(timeline[0].evidence_refs) == 2
+
+
 def test_uncertainties_union_provenance_and_delta_compares_exact_refs():
     subject_id = uuid4()
     first_id, second_id = uuid4(), uuid4()
@@ -457,6 +557,45 @@ def test_uncertainties_union_provenance_and_delta_compares_exact_refs():
     assert set(delta.added_evidence) == current_refs - previous_refs
     assert set(delta.removed_evidence) == previous_refs - current_refs
     assert set(delta.unchanged_evidence) == previous_refs & current_refs
+
+
+def test_uncertainties_filter_known_noise_and_merge_punctuation_variants():
+    subject_id = uuid4()
+    first_id, second_id = uuid4(), uuid4()
+    first = make_source(
+        first_id,
+        uncertainties=(
+            "Attribution remains uncertain!",
+            "No complete YARA, Sigma, Suricata, or Snort detection rule is visible "
+            "in the archived capture.",
+            'The archived capture ends with the incomplete text "Address-po" ...',
+            "...the supplied artifact schema has no blockchain-address type...",
+            "La capture tronquée se termine sur un texte incomplet.",
+        ),
+        url_suffix="uncertainty-noise-a",
+    )
+    second = make_source(
+        second_id,
+        uncertainties=("attribution-remains uncertain.",),
+        url_suffix="uncertainty-noise-b",
+    )
+
+    uncertainties = build_synthesis_uncertainties(make_extraction(subject_id, (first, second)))
+
+    assert len(uncertainties) == 1
+    assert uncertainties[0].text == "Attribution remains uncertain!"
+    assert uncertainties[0].source_document_ids == tuple(sorted((first_id, second_id), key=str))
+
+
+def test_uncertainties_are_capped_in_stable_normalized_order():
+    subject_id, source_id = uuid4(), uuid4()
+    values = tuple(f"Analytic issue {index:02d} remains unresolved" for index in range(12))
+    source = make_source(source_id, uncertainties=values, url_suffix="uncertainty-cap")
+
+    uncertainties = build_synthesis_uncertainties(make_extraction(subject_id, (source,)))
+
+    assert len(uncertainties) == MAX_SYNTHESIS_UNCERTAINTIES
+    assert tuple(item.text for item in uncertainties) == values[:MAX_SYNTHESIS_UNCERTAINTIES]
 
 
 def test_proposal_resolves_exact_handles_to_canonical_evidence_refs():
@@ -2242,3 +2381,22 @@ async def test_revision_never_merges_previous_paragraphs_into_the_new_document()
     assert texts == ["QuxLoader was observed.", "QuxLoader was observed."]
     assert "FooRAT was observed." not in texts
     assert "BarRAT was also observed." not in texts
+
+
+@pytest.mark.parametrize(
+    ("wording", "expected"),
+    [
+        ("second half of 2024", date(2024, 7, 1)),
+        ("S2 2024", date(2024, 7, 1)),
+        ("H1 2025", date(2025, 1, 1)),
+        ("premier semestre 2025", date(2025, 1, 1)),
+        ("summer 2025", date(2025, 6, 1)),
+        ("été 2025", date(2025, 6, 1)),
+        ("spring 2024", date(2024, 3, 1)),
+        ("the same year", None),
+    ],
+)
+def test_timeline_resolves_half_year_and_season_wording(
+    wording: str, expected: date | None
+) -> None:
+    assert resolve_timeline_date_text(wording) == expected

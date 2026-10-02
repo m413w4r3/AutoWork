@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import json
 import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -73,6 +74,7 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_elements,
     extraction_evidence_refs_v1,
     production_synthesis_from_json,
+    resolve_timeline_date_text,
     synthesis_evidence_refs,
     timeline_sort_key,
     validate_synthesis_lineage,
@@ -82,12 +84,14 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v1-technical-cap-128"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v2-uncertainty-cleanup-cap-10"
+SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v2-date-approximation-and-dedupe"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
 SYNTHESIS_PROPOSAL_SCHEMA_VERSION = "synthesis-proposal-v1"
 SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v1"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v1"
+MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
 MAX_TECHNICAL_EVIDENCE_V1 = 128
@@ -444,6 +448,7 @@ def synthesis_input_hash(
         "extraction_schema_version": PRODUCTION_EXTRACTION_SCHEMA_VERSION,
         "evidence_pack_schema_version": SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION,
         "evidence_pack_policy_version": evidence_pack.policy_version,
+        "timeline_policy_version": SYNTHESIS_TIMELINE_POLICY_VERSION,
         "proposal_schema_version": SYNTHESIS_PROPOSAL_SCHEMA_VERSION,
         "canonical_schema_version": PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         "prompt_version": prompt_version,
@@ -1123,18 +1128,62 @@ def validate_synthesis_proposal(
 
 def build_synthesis_timeline(
     extraction: ProductionExtractionV1,
+    *,
+    warnings: list[str] | None = None,
 ) -> tuple[SynthesisTimelineEntryV1, ...]:
-    """Normalize, deduplicate and order the canonical Extraction events."""
+    """Normalize, deduplicate and order canonical events deterministically.
+
+    If a warning channel is supplied, events whose relative date text cannot be
+    resolved are omitted and summarized there. Without one, they sort last.
+    """
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
     # Identical events published by several sources collapse into one entry
     # whose refs are the union of every publishing source's event.
-    grouped: dict[bytes, tuple[Mapping[str, Any], set[ExtractionEvidenceRefV1]]] = {}
+
+    def dedupe_identity(payload: Mapping[str, Any]) -> tuple[tuple[str, str], str]:
+        raw_event_date = payload["event_date"]
+        resolved_date = (
+            date.fromisoformat(raw_event_date)
+            if raw_event_date
+            else resolve_timeline_date_text(payload["date_text"])
+        )
+        date_identity = (
+            ("resolved", resolved_date.isoformat())
+            if resolved_date is not None
+            else (
+                "unresolved",
+                _normalized_synthesis_text(payload["date_text"] or ""),
+            )
+            if payload["date_text"] is not None
+            else ("undated", "")
+        )
+        return date_identity, _normalized_synthesis_text(payload["text"])
+
+    def representative_key(payload: Mapping[str, Any]) -> tuple[int, str, str, str]:
+        return (
+            int(payload["event_date"] is None),
+            payload["date_text"] or "",
+            payload["text"],
+            payload["event_date"] or "",
+        )
+
+    grouped: dict[
+        tuple[tuple[str, str], str],
+        tuple[Mapping[str, Any], set[ExtractionEvidenceRefV1]],
+    ] = {}
     for ref, payload in extraction_evidence_elements(extraction):
         if ref.kind is not EvidenceKind.EVENT:
             continue
-        normalized = {key: value for key, value in payload.items() if key != "source_document_ids"}
-        _payload, refs = grouped.setdefault(_canonical_json_bytes(normalized), (payload, set()))
+        identity = dedupe_identity(payload)
+        existing = grouped.get(identity)
+        if existing is None:
+            grouped[identity] = (payload, {ref})
+            continue
+        current_payload, refs = existing
+        if representative_key(payload) < representative_key(current_payload):
+            current_payload = payload
+        grouped[identity] = (current_payload, refs)
         refs.add(ref)
 
     entries = [
@@ -1148,25 +1197,87 @@ def build_synthesis_timeline(
         )
         for payload, refs in grouped.values()
     ]
+    unresolved = [
+        entry
+        for entry in entries
+        if entry.event_date is None
+        and entry.date_text is not None
+        and resolve_timeline_date_text(entry.date_text) is None
+    ]
+    if warnings is not None and unresolved:
+        entries = [entry for entry in entries if entry not in unresolved]
+        event_word = "event" if len(unresolved) == 1 else "events"
+        warning = f"Dropped {len(unresolved)} timeline {event_word} with unresolvable date wording."
+        if warning not in warnings:
+            warnings.append(warning)
     return tuple(sorted(entries, key=timeline_sort_key))
+
+
+def _normalized_synthesis_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    unaccented = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return " ".join(re.findall(r"[^\W_]+", unaccented))
+
+
+def _uncertainty_noise_search_text(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value).casefold()
+    unaccented = "".join(char for char in decomposed if not unicodedata.combining(char))
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", unaccented).split())
+
+
+def _is_noise_uncertainty(value: str) -> bool:
+    text = _uncertainty_noise_search_text(value)
+    has_missing_language = re.search(
+        r"\b(?:no|not|none|absent|missing|without|aucun|aucune|absence|manque|pas)\b",
+        text,
+    )
+    has_detection_rule = re.search(r"\b(?:yara|sigma|suricata|snort)\b", text) and re.search(
+        r"\b(?:rule|rules|regle|regles|detection|detecteur)\b", text
+    )
+    if has_missing_language and has_detection_rule:
+        return True
+    if "schema" in text and re.search(
+        r"\b(?:artifact|artefact|type|blockchain|classification)\b", text
+    ):
+        return True
+    has_partial_language = re.search(
+        r"\b(?:incomplete|truncated|partial|cut|split|ends|ended|ending|"
+        r"incomplet(?:e|s)?|tronque(?:e|es|s)?|partiel(?:le|les)?|coupe(?:e|es)?)\b",
+        text,
+    )
+    has_capture_or_chunk = re.search(r"\b(?:capture|chunk|fragment|extrait)\b", text)
+    return bool(has_partial_language and has_capture_or_chunk)
 
 
 def build_synthesis_uncertainties(
     extraction: ProductionExtractionV1,
 ) -> tuple[SynthesisUncertaintyV1, ...]:
-    """Union uncertainty text while preserving every source's provenance."""
+    """Filter boilerplate, normalize duplicates, and preserve useful provenance."""
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
-    provenance: dict[str, set[UUID]] = defaultdict(set)
+    provenance: dict[str, tuple[str, set[UUID]]] = {}
     for source in extraction.sources:
         for uncertainty in source.uncertainties:
-            provenance[uncertainty].add(source.source_document_id)
+            if _is_noise_uncertainty(uncertainty):
+                continue
+            key = _normalized_synthesis_text(uncertainty)
+            if not key:
+                continue
+            existing = provenance.get(key)
+            if existing is None:
+                provenance[key] = (uncertainty, {source.source_document_id})
+                continue
+            representative, source_ids = existing
+            if (uncertainty.casefold(), uncertainty) < (representative.casefold(), representative):
+                representative = uncertainty
+            source_ids.add(source.source_document_id)
+            provenance[key] = (representative, source_ids)
     return tuple(
         SynthesisUncertaintyV1(
-            text=text,
-            source_document_ids=tuple(sorted(source_ids, key=str)),
+            text=provenance[key][0],
+            source_document_ids=tuple(sorted(provenance[key][1], key=str)),
         )
-        for text, source_ids in sorted(provenance.items())
+        for key in sorted(provenance)[:MAX_SYNTHESIS_UNCERTAINTIES]
     )
 
 
@@ -1455,9 +1566,19 @@ class _SynthesisControlError(RuntimeError):
         )
 
 
-def _bounded_synthesis_warnings(extraction: ProductionExtractionV1) -> tuple[str, ...]:
+def _bounded_synthesis_warnings(
+    extraction: ProductionExtractionV1,
+    *,
+    additional_warnings: Iterable[str] = (),
+) -> tuple[str, ...]:
     """Project extraction warnings deterministically, with an explicit bound."""
-    warnings = sorted({warning.strip() for warning in extraction.warnings if warning.strip()})
+    warnings = sorted(
+        {
+            warning.strip()
+            for warning in (*extraction.warnings, *additional_warnings)
+            if warning.strip()
+        }
+    )
     bounded = [
         warning
         if len(warning) <= MAX_SYNTHESIS_WARNING_CHARS
@@ -2018,6 +2139,8 @@ class ProductionSynthesisService:
                 details=self._model_evidence(model_run),
             )
 
+        timeline_warnings: list[str] = []
+        timeline = build_synthesis_timeline(extraction, warnings=timeline_warnings)
         synthesis = ProductionSynthesisV1(
             schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
             subject_id=snapshot.subject_id,
@@ -2028,9 +2151,12 @@ class ProductionSynthesisService:
             title=snapshot.subject_title,
             lead=lead,
             sections=sections,
-            timeline=build_synthesis_timeline(extraction),
+            timeline=timeline,
             uncertainties=build_synthesis_uncertainties(extraction),
-            warnings=_bounded_synthesis_warnings(extraction),
+            warnings=_bounded_synthesis_warnings(
+                extraction,
+                additional_warnings=timeline_warnings,
+            ),
         )
         validate_synthesis_lineage(synthesis, snapshot, extraction_hash)
         artifact = await self._synthesis_service.store_synthesis_result(

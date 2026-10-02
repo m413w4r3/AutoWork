@@ -65,12 +65,16 @@ def test_references_prompt_separates_linked_technical_sources_without_following_
         assert linked_resource in one_line
     assert "same subject" in one_line
     assert "Do not turn every hyperlink into a SOURCE" in one_line
-    assert REFERENCES_PROMPT_VERSION == "7"
+    assert REFERENCES_PROMPT_VERSION == "8"
     assert "kind: publication|technical_resource" in one_line
     assert "reason: <short explanation of relevance to the Subject>" in one_line
     assert "editorial-title:" in one_line
     assert "## EVENT R1" in one_line
     assert "# UNCERTAINTIES" in one_line
+    assert "event text and uncertainties in French" in one_line
+    assert "strictly by date, oldest first" in one_line
+    assert "absolute wording with its year" in one_line
+    assert "at most five analytical uncertainties in French" in one_line
 
 
 def _reference_source(
@@ -346,6 +350,27 @@ text: Ignored legacy event
     assert "reference_kind_missing_defaulted_to_publication" in parsed.warnings
     assert "reference_invalid_kind" in parsed.warnings
     assert "reference_duplicate_url_ignored" in parsed.warnings
+
+
+def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
+    # The Bridge serializes ChatGPT's rendered links as `[label](href)` and the
+    # href carries ChatGPT's tracking parameter.
+    parsed = parse_production_reference_proposals(
+        "## SOURCE S1\n"
+        "title: Etherhiding\n"
+        "url: [https://example.test/blog/report/]"
+        "(https://example.test/blog/report/?utm_source=chatgpt.com)\n"
+        "role: primary\n"
+        "kind: publication\n"
+        "reason: Primary coverage\n",
+        date(2026, 8, 1),
+    )
+
+    assert parsed.value is not None
+    assert [proposal.canonical_url for proposal in parsed.value] == [
+        "https://example.test/blog/report"
+    ]
+    assert "reference_invalid_url" not in parsed.warnings
 
 
 def test_production_reference_proposal_requires_reason_and_accepts_no_new_sources() -> None:

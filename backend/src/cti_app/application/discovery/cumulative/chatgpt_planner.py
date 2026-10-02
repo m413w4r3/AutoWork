@@ -29,7 +29,6 @@ from cti_app.application.discovery.cumulative.types import (
 from cti_app.application.discovery.cumulative.validation import validate_merge_plan
 from cti_app.application.discovery.ports import BridgeCapabilitiesProvider
 from cti_app.application.model_gateway import (
-    ConversationContext,
     DraftingModel,
     ExternalModelBlockedError,
     ModelRequest,
@@ -95,21 +94,34 @@ class ChatGptMergePlanner:
         bridge_capabilities_provider: BridgeCapabilitiesProvider | None = None,
     ) -> None:
         self._model = model
-        # DELETE_ON_SUCCESS is declared on every conversation below, but the
-        # conversation only actually closes if something calls the bridge —
-        # this is that something.
         self._bridge_capabilities_provider = bridge_capabilities_provider
 
-    async def _archive_conversation_best_effort(self, conversation_id: UUID) -> None:
-        if self._bridge_capabilities_provider is None:
+    async def _release_target_best_effort(
+        self, bridge_run_id: str | None, legacy_conversation_id: UUID
+    ) -> None:
+        provider = self._bridge_capabilities_provider
+        if provider is None:
             return
+        if bridge_run_id:
+            try:
+                await provider.release_visible_recovery(bridge_run_id)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "discovery_merge_target_release_failed bridge_run_id=%s "
+                    "correlation_id=%s error_type=%s",
+                    bridge_run_id,
+                    get_correlation_id(),
+                    type(exc).__name__,
+                )
+        # Runs started before the stateless switch still own a conversation.
         try:
-            await self._bridge_capabilities_provider.archive_conversation(conversation_id)
+            await provider.archive_conversation(legacy_conversation_id)
         except Exception as exc:
             logger.warning(
                 "discovery_merge_conversation_archive_failed conversation_id=%s "
                 "correlation_id=%s error_type=%s",
-                conversation_id,
+                legacy_conversation_id,
                 get_correlation_id(),
                 type(exc).__name__,
             )
@@ -161,7 +173,6 @@ class ChatGptMergePlanner:
                     "blocking_version": DISCOVERY_BLOCKING_VERSION,
                 },
                 parameters={"temperature": 0},
-                conversation=ConversationContext(mode="fresh", id=initial_conversation_id),
                 run_id=uuid5(NAMESPACE_URL, f"discovery-merge-model-run:{merge_input_hash}"),
             ),
             DiscoveryMergePlanV1,
@@ -180,7 +191,7 @@ class ChatGptMergePlanner:
             plan, warnings = _parse_and_validate_model_plan(
                 initial.output_text, handles, parent_snapshot=parent_snapshot
             )
-            await self._archive_conversation_best_effort(initial_conversation_id)
+            await self._release_target_best_effort(initial.run.response_id, initial_conversation_id)
             return PlannedDiscoveryMerge(
                 plan,
                 merge_model_run_id=initial.run.id,
@@ -211,7 +222,6 @@ class ChatGptMergePlanner:
                     sensitivity=sensitivity,
                     metadata={"defer_validation": True, "repair_of": str(initial.run.id)},
                     parameters={"temperature": 0},
-                    conversation=ConversationContext(mode="fresh", id=repair_conversation_id),
                     run_id=uuid5(NAMESPACE_URL, f"discovery-merge-repair-run:{repair_hash}"),
                 ),
                 DiscoveryMergePlanV1,
@@ -236,11 +246,9 @@ class ChatGptMergePlanner:
                     raw_output_reference=raw_reference,
                     normalized_output_reference=repaired_reference,
                 ) from repair_error
-            # Both conversations are done once the repaired plan validates —
-            # the malformed initial one is no more useful to keep than the
-            # repair that fixed it.
-            await self._archive_conversation_best_effort(initial_conversation_id)
-            await self._archive_conversation_best_effort(repair_conversation_id)
+            # Keep both targets until a valid plan is available.
+            await self._release_target_best_effort(initial.run.response_id, initial_conversation_id)
+            await self._release_target_best_effort(repair.run.response_id, repair_conversation_id)
             return PlannedDiscoveryMerge(
                 plan,
                 merge_model_run_id=initial.run.id,

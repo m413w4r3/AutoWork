@@ -26,8 +26,8 @@ aucune mise à jour rétroactive n’est nécessaire.
 
 ## Génération et édition
 
-Qwen local est la route par défaut (`standard_draft`). OpenAI via `chatgpt-bridge` utilise la route
-`premium_synthesis` et n’est autorisé que si toutes les sources du pack permettent l’envoi externe
+`chatgpt-bridge` est la route par défaut (`standard_draft` et `premium_synthesis`) ; Qwen local reste
+configurable via `MODEL_ROUTE_STANDARD_DRAFT=qwen`. Le bridge n’est autorisé que si toutes les sources du pack permettent l’envoi externe
 et si aucune ne porte `do_not_submit`. Le modèle reçoit uniquement le JSON du pack gelé, le guide de
 style versionné et l’instruction de rédaction. Il ne reçoit ni workspace, ni document brut, ni
 conversation.

@@ -36,7 +36,6 @@ from cti_app.application.discovery_report_parser import (
 )
 from cti_app.application.jobs import JobExecutionContext
 from cti_app.application.model_gateway import (
-    ConversationContext,
     ModelExecution,
     ModelGatewayError,
     ModelRequest,
@@ -142,7 +141,6 @@ class DiscoveryService:
             },
             parameters={"reasoning": {"effort": "high"}},
             background=True,
-            conversation=ConversationContext(mode="fresh", id=fresh_conversation_id),
             run_id=research_run_id,
         )
         await context.report_progress(2, 4, "ChatGPT recherche et analyse les sources")
@@ -182,12 +180,11 @@ class DiscoveryService:
                 batch = existing
             await uow.commit()
 
-        # This discovery conversation is bounded (DELETE_ON_SUCCESS semantics):
-        # only close its live Temporary Chat browser session once the batch it
-        # produced is durably persisted as the canonical successful result.
-        # Generation error, needs_review, parser failure, or uncertain recovery
-        # never reach this line — the session stays alive for inspection/recovery.
-        await self._archive_ephemeral_conversation(fresh_conversation_id)
+        # A discovery report is a single bounded response. The bridge owns a
+        # dedicated Temporary Chat target for this stateless request; release
+        # it only after its batch is durable. Older runs used a fresh Bridge
+        # conversation, so retain their exact-id cleanup as a fallback.
+        await self._release_research_target(research.run.response_id, fresh_conversation_id)
 
         if self._after_persisted_batch is not None:
             await self._after_persisted_batch(
@@ -605,6 +602,26 @@ class DiscoveryService:
                 "snapshot_error_type": type(exc).__name__,
             }
         return {**capabilities, "snapshot_available": True}
+
+    async def _release_research_target(
+        self, bridge_run_id: str | None, legacy_conversation_id: UUID
+    ) -> None:
+        provider = self._bridge_capabilities_provider
+        if provider is None:
+            return
+        if bridge_run_id:
+            try:
+                await provider.release_visible_recovery(bridge_run_id)
+                return
+            except Exception as exc:
+                logger.warning(
+                    "discovery_research_target_release_failed bridge_run_id=%s "
+                    "correlation_id=%s error_type=%s",
+                    bridge_run_id,
+                    get_correlation_id(),
+                    type(exc).__name__,
+                )
+        await self._archive_ephemeral_conversation(legacy_conversation_id)
 
     async def _archive_ephemeral_conversation(self, conversation_id: UUID | None) -> None:
         if conversation_id is None or self._bridge_capabilities_provider is None:

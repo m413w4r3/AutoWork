@@ -10,6 +10,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
+from cti_app.application.discovery_report_parser import extract_http_urls
 from cti_app.application.production_parsers import (
     ParseResult,
     ReferenceReport,
@@ -24,7 +25,7 @@ from cti_app.application.production_parsers import (
     reference_report_from_json,
 )
 from cti_app.domain.collection import CollectionState
-from cti_app.domain.discovery import SourceRole, canonicalize_http_url
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
@@ -40,7 +41,7 @@ if TYPE_CHECKING:
 
 # AW-010 contract versions. They participate in the functional REFERENCES
 # identity: a parser or schema change invalidates the stored corpus.
-PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v1"
+PRODUCTION_REFERENCE_PARSER_VERSION = "production-reference-proposal-v2"
 PRODUCTION_REFERENCE_CORPUS_SCHEMA_VERSION = 1
 
 #: Corpus warnings that restate availability and are recomputed on each build.
@@ -391,13 +392,14 @@ def parse_production_reference_proposals(
     seen_urls: set[str] = set()
     for block in blocks:
         values = _fields(block.lines)
-        raw_url = (values.get("url") or values.get("lien") or "").strip()
-        try:
-            canonical_url = canonicalize_http_url(raw_url)
-        except (AttributeError, ValueError):
+        # The Bridge serializes ChatGPT's rendered links as `[label](href)`, so
+        # a bare `url:` value is not guaranteed to be a plain URL.
+        urls = extract_http_urls(values.get("url") or values.get("lien") or "")
+        if not urls:
             result.warnings.append("reference_invalid_url")
             result.dropped_blocks.append(block.raw())
             continue
+        canonical_url = urls[0][1]
 
         raw_kind = (values.get("kind") or "").strip()
         if not raw_kind:

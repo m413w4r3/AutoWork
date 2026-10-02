@@ -10,6 +10,7 @@ from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
     verify_q2_proposals,
 )
+from cti_app.application.production_extraction import gate_source_output
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2EventProposal,
@@ -25,6 +26,7 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
+from cti_app.domain.production import ExtractionProfile
 
 
 def _gate(text: str, source: str | SourceEvidenceDocument) -> SourceEvidenceResult:
@@ -37,9 +39,17 @@ def _gate(text: str, source: str | SourceEvidenceDocument) -> SourceEvidenceResu
 def test_fact_is_accepted_only_with_local_evidence() -> None:
     source = "The campaign deployed ExampleRAT against healthcare providers."
 
-    accepted = _gate("FACT malware\n- ExampleRAT :: payload family\n", source)
-    assert [fact.value for fact in accepted.output.facts] == ["ExampleRAT"]
-    assert accepted.output.facts[0].context == "payload family"
+    accepted = _gate(
+        "FACT malware\n"
+        "- Famille de logiciel malveillant ExampleRAT :: "
+        "The campaign deployed ExampleRAT against healthcare providers.\n",
+        source,
+    )
+    assert [fact.value for fact in accepted.output.facts] == [
+        "Famille de logiciel malveillant ExampleRAT"
+    ]
+    assert accepted.output.facts[0].context == ""
+    assert accepted.output.facts[0].evidence_quote == source
     assert accepted.rejections == ()
 
     invented = _gate("FACT malware\n- GhostRAT\n", source)
@@ -47,6 +57,45 @@ def test_fact_is_accepted_only_with_local_evidence() -> None:
     assert [rejection.proposal_kind for rejection in invented.rejections] == ["fact"]
     assert invented.rejections[0].reason_code == "source_fact_evidence_missing"
     assert invented.rejections[0].proposal_index == 1
+
+
+def test_french_fact_without_a_literal_quote_is_rejected_with_a_warning() -> None:
+    source = "The campaign deployed ExampleRAT against healthcare providers."
+    parsed = parse_q2_proposals_markdown(
+        "FACT malware\n- La campagne vise des prestataires de santé.\n"
+    )
+    assert parsed.usable, parsed.errors
+    assert parsed.value is not None
+
+    gated, warnings, rejections = gate_source_output(
+        parsed.value,
+        SourceEvidenceDocument(parsed_text=source),
+        profile=ExtractionProfile.FULL,
+    )
+
+    assert gated.facts == []
+    assert [item.reason_code for item in rejections] == ["source_fact_evidence_missing"]
+    assert warnings == ("extraction_proposal_rejected:source_fact_evidence_missing",)
+
+
+def test_french_event_with_literal_quote_is_verified_against_english_capture() -> None:
+    source = "On 2024-03-02 the actor deployed ExampleRAT."
+    parsed = parse_q2_proposals_markdown(
+        "EVENT 2024-03-02\n"
+        "- Les opérateurs déploient ExampleRAT. :: "
+        "On 2024-03-02 the actor deployed ExampleRAT.\n"
+    )
+    assert parsed.usable, parsed.errors
+    assert parsed.value is not None
+
+    verified = verify_q2_output_against_source(parsed.value, source)
+
+    assert [event.text for event in verified.output.events] == [
+        "Les opérateurs déploient ExampleRAT."
+    ]
+    assert verified.output.events[0].context == ""
+    assert verified.output.events[0].evidence_quote == source
+    assert verified.rejections == ()
 
 
 def test_indicator_is_accepted_only_with_local_evidence() -> None:

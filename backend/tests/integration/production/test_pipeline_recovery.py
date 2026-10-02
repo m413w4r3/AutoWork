@@ -23,7 +23,6 @@ from cti_app.application.production_jobs import (
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
-from cti_app.application.production_parsers import parse_q2_proposals_markdown
 from cti_app.application.production_reconciliation import ProductionReconciliationService
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.subject_production import SubjectProductionService
@@ -109,7 +108,7 @@ def _references_response(urls: tuple[str, ...]) -> str:
 def _q2_response(index: int) -> str:
     return (
         "FACT malware\n"
-        "- ExampleRAT :: The source documents the ExampleRAT family.\n\n"
+        f"- ExampleRAT :: ExampleRAT source {index}\n\n"
         "IOC confirmed domain\n"
         f"- source-{index}.security-lab.io :: Infrastructure observed in source {index}."
     )
@@ -553,12 +552,12 @@ async def test_crash_after_durable_model_response_replays_without_resubmission(
     production_scenario_factory: ScenarioFactory,
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
-    original_extract = scenario.model.extract
+    original_draft = scenario.model.draft
     failpoint_open = True
 
-    async def crash_after_response(request: Any, output_schema: Any) -> Any:
+    async def crash_after_response(request: Any, *args: Any, **kwargs: Any) -> Any:
         nonlocal failpoint_open
-        result = await original_extract(request, output_schema)
+        result = await original_draft(request, *args, **kwargs)
         if request.prompt_template_id == _EXTRACTION_TEMPLATE and failpoint_open:
             failpoint_open = False
             raise BridgeTransportError(
@@ -570,7 +569,7 @@ async def test_crash_after_durable_model_response_replays_without_resubmission(
             )
         return result
 
-    with patch.object(scenario.model, "extract", side_effect=crash_after_response):
+    with patch.object(scenario.model, "draft", side_effect=crash_after_response):
         await scenario.start()
         run = await scenario.run_until_terminal()
 
@@ -717,11 +716,9 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
 ) -> None:
     scenario, urls = _configured(production_scenario_factory, count=1)
     scenario.model.use_chatgpt_bridge_identity()
-    # The operator adopts the structured answer the provider produced; the
-    # trailing newline keeps the adopted bytes distinct in the blob catalog.
-    parsed = parse_q2_proposals_markdown(_q2_response(1))
-    assert parsed.value is not None
-    q2_response = f"{parsed.value.model_dump_json()}\n"
+    # The operator adopts the provider's line-oriented Q2 answer; a trailing
+    # newline keeps the adopted bytes distinct in the blob catalog.
+    q2_response = f"{_q2_response(1)}\n"
     scenario.model.script.q2(
         source_url=urls[0],
         response=BridgeTransportError(

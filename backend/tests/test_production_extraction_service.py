@@ -11,7 +11,6 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from pydantic import BaseModel
 
 from cti_app.application import production_extraction
 from cti_app.application.model_gateway import (
@@ -30,6 +29,7 @@ from cti_app.application.production_extraction import (
     build_extraction_plan,
     extraction_compatibility_view,
     load_reference_corpus,
+    merge_q2_source_outputs,
     project_legacy_technical_extraction,
 )
 from cti_app.application.production_parsers import (
@@ -39,7 +39,6 @@ from cti_app.application.production_parsers import (
     Q2RuleProposal,
     Q2SourceOutput,
 )
-from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
@@ -313,15 +312,50 @@ class _PreSubmissionFailure(ModelGatewayError):
     retryable = True
 
 
+def _q2_wire_output(output: Q2SourceOutput) -> str:
+    lines: list[str] = []
+
+    def add_item(value: str, context: str = "") -> None:
+        suffix = f" :: {context}" if context else ""
+        lines.append(f"- {value}{suffix}")
+
+    for fact in output.facts:
+        lines.append(f"FACT {fact.category}")
+        add_item(fact.value, fact.evidence_quote or fact.value)
+    for event in output.events:
+        event_date = event.event_date.isoformat() if event.event_date is not None else ""
+        date_text = event.date_text or ""
+        specification = event_date or date_text
+        lines.append(f"EVENT {specification}".rstrip())
+        add_item(event.text, event.evidence_quote or event.text)
+    for artifact in output.artifacts:
+        if artifact.indicator_status == "excluded":
+            continue
+        status = "confirmed" if artifact.indicator_status == "confirmed_ioc" else "contextual"
+        lines.append(f"IOC {status} {artifact.artifact_type}")
+        add_item(artifact.value, artifact.context)
+    for rule in output.rules:
+        name = f": {rule.name}" if rule.name else ""
+        lines.append(f"RULE {rule.rule_type.value}{name}")
+        fence = chr(96) * 3
+        lines.extend((f"{fence}{rule.rule_type.value}", rule.body, fence))
+    if output.uncertainties:
+        lines.append("UNCERTAINTIES")
+        for uncertainty in output.uncertainties:
+            add_item(uncertainty)
+    return "\n".join(lines) if lines else "EMPTY"
+
+
 class _StructuredGateway:
-    """Provider A: answers with the structured pydantic Q2 contract."""
+    """A fake gateway that exposes only text output to canonical extraction."""
 
     name = "provider-a-structured"
 
     def __init__(self, outputs: Mapping[str, Q2SourceOutput] | None = None) -> None:
         self.outputs = dict(outputs or {})
         self.calls: list[ModelRequest] = []
-        self.schemas: list[type[BaseModel]] = []
+        self.draft_calls: list[ModelRequest] = []
+        self.extract_calls = 0
         self.ambiguity = False
         self.fail_markers: set[str] = set()
         self.transient_markers: set[str] = set()
@@ -332,9 +366,14 @@ class _StructuredGateway:
                 return output
         return Q2SourceOutput()
 
-    async def extract(self, request: ModelRequest, output_schema: type[BaseModel]) -> object:
+    async def extract(self, request: ModelRequest, output_schema: type[Any]) -> object:
+        del request, output_schema
+        self.extract_calls += 1
+        raise AssertionError("Canonical extraction must not request structured output")
+
+    async def draft(self, request: ModelRequest) -> object:
         self.calls.append(request)
-        self.schemas.append(output_schema)
+        self.draft_calls.append(request)
         if not request.external_llm_allowed:
             raise ExternalModelBlockedError("external model use is not allowed")
         if self.ambiguity:
@@ -346,16 +385,21 @@ class _StructuredGateway:
             raise _PreSubmissionFailure("the provider was not reached")
         if any(marker in request.text for marker in self.fail_markers):
             return self._unreadable()
-        if output_schema is Q2BatchResponse:
-            return self._execution(
-                Q2BatchResponse(
-                    sources=[
-                        Q2BatchSourceOutput(batch_id=handle, output=self.output_for(body))
-                        for handle, body in _batch_blocks(request.text)
-                    ]
-                )
-            )
-        return self._execution(self.output_for(request.text))
+        text = (
+            self._batch_wire_text(request.text)
+            if request.prompt_template_id.endswith("-batch")
+            else self._single_wire_text(request)
+        )
+        return self._execution(text)
+
+    def _single_wire_text(self, request: ModelRequest) -> str:
+        return _q2_wire_output(self.output_for(request.text))
+
+    def _batch_wire_text(self, prompt: str) -> str:
+        return "\n\n".join(
+            f"@@Q2:{handle}@@\n{_q2_wire_output(self.output_for(body))}"
+            for handle, body in _batch_blocks(prompt)
+        )
 
     def _unreadable(self) -> object:
         return SimpleNamespace(
@@ -371,50 +415,7 @@ class _StructuredGateway:
             metadata={},
         )
 
-    def _execution(self, output: object) -> object:
-        return SimpleNamespace(
-            run=SimpleNamespace(
-                id=uuid4(),
-                status=ModelRunStatus.SUCCEEDED,
-                error_code=None,
-                error_message=None,
-                error_details=None,
-            ),
-            structured_output=output,
-            output_text=None,
-            metadata={},
-        )
-
-
-class _JsonTextGateway(_StructuredGateway):
-    """Provider B: answers in text; the gateway validates it against the schema."""
-
-    name = "provider-b-json-text"
-
-    def _execution(self, output: object) -> object:
-        assert isinstance(output, BaseModel)
-        text = output.model_dump_json()
-        return SimpleNamespace(
-            run=SimpleNamespace(
-                id=uuid4(),
-                status=ModelRunStatus.SUCCEEDED,
-                error_code=None,
-                error_message=None,
-                error_details=None,
-            ),
-            structured_output=type(output).model_validate_json(text),
-            output_text=text,
-            metadata={},
-        )
-
-
-class _UnreadableGateway(_StructuredGateway):
-    """Provider C: answers with nothing usable, without inventing content."""
-
-    name = "provider-c-unreadable"
-
-    def _execution(self, output: object) -> object:
-        del output
+    def _execution(self, text: str) -> object:
         return SimpleNamespace(
             run=SimpleNamespace(
                 id=uuid4(),
@@ -424,9 +425,37 @@ class _UnreadableGateway(_StructuredGateway):
                 error_details=None,
             ),
             structured_output=None,
-            output_text="",
+            output_text=text,
             metadata={},
         )
+
+
+class _JsonTextGateway(_StructuredGateway):
+    """Provider B: emits plain wire text with a bridge citation marker."""
+
+    name = "provider-b-json-text"
+
+    def _single_wire_text(self, request: ModelRequest) -> str:
+        lines = _q2_wire_output(self.output_for(request.text)).splitlines()
+        in_uncertainties = False
+        for index, line in enumerate(lines):
+            if line.strip().casefold() == "uncertainties":
+                in_uncertainties = True
+            elif in_uncertainties and line.startswith("- "):
+                lines[index] = f'{line} :chatgpt-content-reference{{index="0"}}'
+                break
+        return "\n".join(lines)
+
+
+class _UnreadableGateway(_StructuredGateway):
+    """Provider C: answers with nothing usable, without inventing content."""
+
+    name = "provider-c-unreadable"
+
+    async def draft(self, request: ModelRequest) -> object:
+        self.calls.append(request)
+        self.draft_calls.append(request)
+        return self._execution("")
 
 
 def _batch_blocks(prompt: str) -> tuple[tuple[str, str], ...]:
@@ -942,6 +971,86 @@ async def test_archived_capture_is_the_only_material_sent_to_the_model() -> None
     assert request.metadata["do_not_submit"] is False
 
 
+async def test_dirty_bridge_text_is_partial_and_raw_checkpoint_is_preserved() -> None:
+    raw_text = """FACT unknown_category
+- ignored
+FACT malware
+- ExampleRAT
+IOC confirmed domain
+- evil.security-lab.io :: C2 indicator :chatgpt-content-reference{index="0"}
+UNCERTAINTIES
+- Attribution of Actor-X remains unconfirmed.
+"""
+
+    class _DirtyBridgeGateway(_StructuredGateway):
+        def _single_wire_text(self, request: ModelRequest) -> str:
+            del request
+            return raw_text
+
+    world, snapshot, corpus = _core_world()
+    gateway = _DirtyBridgeGateway()
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.extraction is not None
+    source = execution.extraction.sources[0]
+    assert [fact.value for fact in source.facts] == ["ExampleRAT"]
+    assert [indicator.value for indicator in source.indicators] == ["evil.security-lab.io"]
+    assert any(
+        warning == "q2_parse_warning:q2_unknown_fact_category"
+        for warning in execution.extraction.warnings
+    )
+    assert raw_text in world.blobs.raws.values()
+    assert gateway.extract_calls == 0
+    assert len(gateway.draft_calls) == 1
+
+
+async def test_unrecognized_chunk_does_not_sink_a_source_with_other_usable_items(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(production_extraction, "SOURCE_CHUNK_MAX_CHARS", 120)
+
+    class _PartialChunkGateway(_StructuredGateway):
+        def _single_wire_text(self, request: ModelRequest) -> str:
+            if request.metadata["chunk_index"] == 1:
+                return "bridge prose with no recognized Q2 item"
+            return _q2_wire_output(_full_output())
+
+    world, snapshot, corpus = _core_world()
+    gateway = _PartialChunkGateway()
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=snapshot.subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.extraction is not None
+    assert execution.extraction.sources[0].facts
+    assert any(
+        warning == "q2_parse_error:q2_compact_sections_missing"
+        for warning in execution.extraction.warnings
+    )
+
+
+def test_archived_source_chunks_preserve_word_boundaries_and_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(production_extraction, "SOURCE_CHUNK_MAX_CHARS", 48)
+    monkeypatch.setattr(production_extraction, "SOURCE_CHUNK_OVERLAP_CHARS", 12)
+    source_text = "alpha beta gamma delta epsilon zeta eta theta Address-port " + "remaining " * 16
+
+    chunks = production_extraction.archived_source_chunks(source_text)
+
+    assert len(chunks) > 1
+    assert all(not chunk.endswith("Address-po") for chunk in chunks)
+    assert all(not chunk.startswith("rt ") for chunk in chunks)
+    assert any("Address-port" in chunk for chunk in chunks)
+    assert set(chunks[0].split()) & set(chunks[1].split())
+
+
 async def test_two_providers_produce_the_same_canonical_contract() -> None:
     outputs = {"ExampleRAT": _full_output()}
     first_world, first_snapshot, first_corpus = _core_world()
@@ -1263,6 +1372,52 @@ async def test_content_change_and_policy_change_never_reuse_a_checkpoint(
 # --- duplicates and batching ------------------------------------------------
 
 
+def test_chunk_merge_keeps_later_evidence_quotes_for_duplicate_proposals() -> None:
+    merged = merge_q2_source_outputs(
+        (
+            Q2SourceOutput(
+                facts=[Q2FactProposal(category="malware", value="ExampleRAT")],
+                events=[Q2EventProposal(text="Operators deployed ExampleRAT")],
+                artifacts=[
+                    Q2ArtifactProposal(
+                        value="evil.example",
+                        artifact_type="domain",
+                        indicator_status="confirmed_ioc",
+                    )
+                ],
+            ),
+            Q2SourceOutput(
+                facts=[
+                    Q2FactProposal(
+                        category="malware",
+                        value="ExampleRAT",
+                        evidence_quote="The campaign used ExampleRAT.",
+                    )
+                ],
+                events=[
+                    Q2EventProposal(
+                        text="Operators deployed ExampleRAT",
+                        evidence_quote="On 2024-03-02 operators deployed ExampleRAT.",
+                    )
+                ],
+                artifacts=[
+                    Q2ArtifactProposal(
+                        value="evil.example",
+                        artifact_type="domain",
+                        indicator_status="confirmed_ioc",
+                        evidence_quote="C2 was hosted at evil.example.",
+                    )
+                ],
+            ),
+        )
+    )
+
+    assert len(merged.facts) == len(merged.events) == len(merged.artifacts) == 1
+    assert merged.facts[0].evidence_quote == "The campaign used ExampleRAT."
+    assert merged.events[0].evidence_quote == "On 2024-03-02 operators deployed ExampleRAT."
+    assert merged.artifacts[0].evidence_quote == "C2 was hosted at evil.example."
+
+
 async def test_duplicate_content_is_computed_once_and_keeps_both_sources() -> None:
     world = _World()
     subject_id = uuid4()
@@ -1427,14 +1582,10 @@ async def test_ambiguous_batch_handle_falls_back_to_individual_readings() -> Non
     _publish(world, corpus)
 
     class _AmbiguousBatchGateway(_StructuredGateway):
-        def _execution(self, output: object) -> object:
-            if isinstance(output, Q2BatchResponse):
-                entries = list(output.sources)
-                entries[1] = Q2BatchSourceOutput(
-                    batch_id=entries[0].batch_id, output=entries[0].output
-                )
-                output = Q2BatchResponse(sources=entries)
-            return super()._execution(output)
+        def _batch_wire_text(self, prompt: str) -> str:
+            handle, body = _batch_blocks(prompt)[0]
+            output_text = _q2_wire_output(self.output_for(body))
+            return f"@@Q2:{handle}@@\n{output_text}\n@@Q2:{handle}@@\n{output_text}"
 
     gateway = _AmbiguousBatchGateway(outputs)
 
@@ -1750,7 +1901,8 @@ async def test_a_batch_never_mixes_diffusion_policies() -> None:
 
     # The restricted SUPPORTING capture is never batched with the TECHNICAL
     # one that may leave: each is sent alone, under its own policy.
-    assert all(schema is Q2SourceOutput for schema in gateway.schemas)
+    assert gateway.extract_calls == 0
+    assert len(gateway.draft_calls) == len(gateway.calls)
     restricted = [call for call in gateway.calls if "loader.security-lab.io" in call.text]
     assert [call.external_llm_allowed for call in restricted] == [False]
     assert execution.status is ExtractionExecutionStatus.SUCCEEDED

@@ -66,7 +66,6 @@ from cti_app.application.production_jobs import (
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
 from cti_app.application.production_parsers import Q2SourceOutput, parse_q2_proposals_markdown
-from cti_app.application.production_q2_batch import Q2BatchResponse, Q2BatchSourceOutput
 from cti_app.application.subject_production import ProductionBatchService
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -196,6 +195,40 @@ class _UnstructuredAnswer:
     text: str
 
 
+def q2_output_to_wire_text(output: Q2SourceOutput) -> str:
+    """Render scripted proposals using the canonical line-oriented bridge wire."""
+
+    lines: list[str] = []
+
+    def add_item(value: str, context: str = "") -> None:
+        suffix = f" :: {context}" if context else ""
+        lines.append(f"- {value}{suffix}")
+
+    for fact in output.facts:
+        lines.append(f"FACT {fact.category}")
+        add_item(fact.value, fact.evidence_quote or fact.value)
+    for event in output.events:
+        date_value = event.event_date.isoformat() if event.event_date is not None else ""
+        lines.append(f"EVENT {date_value or event.date_text or ''}".rstrip())
+        add_item(event.text, event.evidence_quote or event.text)
+    for artifact in output.artifacts:
+        if artifact.indicator_status == "excluded":
+            continue
+        status = "confirmed" if artifact.indicator_status == "confirmed_ioc" else "contextual"
+        lines.append(f"IOC {status} {artifact.artifact_type}")
+        add_item(artifact.value, artifact.context)
+    for rule in output.rules:
+        suffix = f": {rule.name}" if rule.name else ""
+        lines.append(f"RULE {rule.rule_type.value}{suffix}")
+        fence = chr(96) * 3
+        lines.extend((f"{fence}{rule.rule_type.value}", rule.body, fence))
+    if output.uncertainties:
+        lines.append("UNCERTAINTIES")
+        for uncertainty in output.uncertainties:
+            add_item(uncertainty)
+    return "\n".join(lines) if lines else "EMPTY"
+
+
 class ScriptedModelScript:
     """Functional scenario routing for the fake model boundary.
 
@@ -222,7 +255,7 @@ class ScriptedModelScript:
         self._editorial_enrichment = response
 
     def q2(self, *, source_url: str, response: str | Q2SourceOutput | Exception) -> None:
-        """Script the extraction of one source; Markdown is the readable Q2 dialect."""
+        """Script the extraction of one source using the Q2 line wire format."""
         self._q2[_canonical_url(source_url)] = response
 
     def source_url_for(self, content_sha256: object) -> str | None:
@@ -233,21 +266,21 @@ class ScriptedModelScript:
             response = self._q2_output(request.metadata.get("source_content_sha256"))
             if isinstance(response, _UnstructuredAnswer):
                 return response.text
-            return response if isinstance(response, Exception) else response.model_dump_json()
+            return response if isinstance(response, Exception) else q2_output_to_wire_text(response)
 
         if request.prompt_template_id == "production-extraction-archive-batch":
             entries = request.metadata.get("batch_sources")
             if not isinstance(entries, list):
                 raise AssertionError("Extraction batch request has no handle mapping")
-            outputs = []
+            outputs: list[str] = []
             for entry in entries:
                 output = self._q2_output(entry["source_content_sha256"])
                 if isinstance(output, _UnstructuredAnswer):
                     return output.text
                 if isinstance(output, Exception):
                     return output
-                outputs.append(Q2BatchSourceOutput(batch_id=entry["batch_id"], output=output))
-            return Q2BatchResponse(sources=outputs).model_dump_json()
+                outputs.append(f"@@Q2:{entry['batch_id']}@@\n{q2_output_to_wire_text(output)}")
+            return "\n\n".join(outputs)
 
         if request.prompt_template_id == "production-references":
             if self._references is None:

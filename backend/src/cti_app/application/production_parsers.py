@@ -1,8 +1,7 @@
-"""Q1 Markdown-tolerant parsers and Q2 structured Pydantic schemas.
+"""Q1 Markdown-tolerant parsers and Q2 extraction wire contracts.
 
-Strict JSON is a poor contract for a chat model: a single stray character makes
-the whole answer unusable. These parsers accept a forgiving Markdown dialect and
-degrade block by block — an unreadable block is dropped and reported, it never
+The Q2 line-oriented wire parser accepts a forgiving Markdown dialect and
+degrades item by item — an unreadable item is dropped and reported, it never
 sinks the rest of the answer.
 
 Everything the model says is a *proposal*. Sources are deduplicated by canonical
@@ -40,6 +39,19 @@ PARSER_VERSION = "production-markdown-v4"
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
 _BOM = "\ufeff"
+_CHATGPT_BRACE_MARKER = re.compile(r":chatgpt-[\w-]+\{[^{}\r\n]*\}", re.IGNORECASE)
+_CHATGPT_SPECIAL_MARKER = re.compile(r"[][^]*")
+_BRACKETED_UI_MARKER = re.compile(r"\b(?:cite|entity)\s*\[[^\]\r\n]*\]", re.IGNORECASE)
+_BOXED_UI_MARKER = re.compile(r"【(?:cite|entity|source|turn\d+)[^】]*】", re.IGNORECASE)
+
+
+def sanitize_bridge_output_text(text: str) -> str:
+    """Remove visible bridge/UI citation tokens without rewriting model text."""
+
+    cleaned = _CHATGPT_BRACE_MARKER.sub("", text)
+    cleaned = _CHATGPT_SPECIAL_MARKER.sub("", cleaned)
+    cleaned = _BRACKETED_UI_MARKER.sub("", cleaned)
+    return _BOXED_UI_MARKER.sub("", cleaned)
 
 
 @dataclass
@@ -382,7 +394,7 @@ Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v4"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.
-Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v7"
+Q2_MARKDOWN_PARSER_VERSION = "q2-markdown-v9"
 
 
 def q2_source_output_to_json(output: Q2SourceOutput) -> dict[str, Any]:
@@ -886,10 +898,10 @@ def _editorial_title(body: str) -> str | None:
 # --- Q2 stateless Markdown wire format -------------------------------------
 #
 # Q2 is a small, source-bound wire format. A response is already associated
-# with one source by the orchestrator, so source ids, URLs, evidence,
-# provenance and per-value status are intentionally absent from the model
-# output. This parser expands self-contained groups into the existing proposal
-# objects; the verifier assigns canonical provenance and normalization.
+# with one source by the orchestrator, so source ids, URLs, provenance and
+# per-value status are intentionally absent from model output. FACT and EVENT
+# lines carry literal evidence quotes; the verifier locates them in the source
+# and assigns canonical provenance and normalization.
 
 _Q2_FACT_CATEGORIES = frozenset(
     {
@@ -922,6 +934,7 @@ _Q2_IOC_TYPE_TO_ARTIFACT_TYPE = {
     "sha1": "hash",
     "sha256": "hash",
     "sha512": "hash",
+    "hash": "hash",
     "filename": "filename",
     "filepath": "filepath",
     "cve": "cve",
@@ -946,7 +959,6 @@ _Q2_EVENT_HEADER = re.compile(r"^EVENT(?:[:\s]+(?P<spec>.+))?$", re.IGNORECASE)
 _Q2_RULE_HEADER = re.compile(r"^RULE(?:\s+(?P<spec>.+))?$", re.IGNORECASE)
 _Q2_FENCE_OPEN = re.compile(r"^\s*```[^\n]*$")
 _Q2_RULE_FENCE_OPEN = re.compile(r"^\s*```(?P<language>[A-Za-z0-9_-]+)\s*$")
-_Q2_TERMINAL_MARKERS = frozenset({"empty", "unavailable"})
 
 _Q2_FACT_CATEGORIES_BY_CASEFOLD = {
     category.casefold(): category for category in _Q2_FACT_CATEGORIES
@@ -962,12 +974,11 @@ _Q2_RULE_TYPES_BY_CASEFOLD = {
 
 def _rule_issue(result: ParseResult[Q2SourceOutput], code: str) -> None:
     result.warnings.append(code)
-    result.uncertainties.append(code)
 
 
 def _normalize_q2_input(raw: str) -> str:
-    """Normalize only transport line endings around the Q2 wire format."""
-    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    """Remove UI tokens and normalize transport line endings around Q2 text."""
+    text = sanitize_bridge_output_text(raw).replace("\r\n", "\n").replace("\r", "\n")
     if text.startswith(_BOM):
         text = text[1:]
     return text.strip()
@@ -1063,23 +1074,6 @@ def _q2_is_markdown_heading(line: str) -> bool:
     return bool(re.match(r"^\s*#{1,6}(?:\s+|$)", line))
 
 
-def _q2_terminal_markers_outside_fences(lines: list[str]) -> tuple[str, ...]:
-    markers: list[str] = []
-    in_fence = False
-    for line in lines:
-        if in_fence:
-            if _FENCE_CLOSE.fullmatch(line):
-                in_fence = False
-            continue
-        if _Q2_FENCE_OPEN.fullmatch(line) and not _FENCE_CLOSE.fullmatch(line):
-            in_fence = True
-            continue
-        marker = line.strip().casefold()
-        if marker in _Q2_TERMINAL_MARKERS:
-            markers.append(marker)
-    return tuple(markers)
-
-
 def _q2_fence_close(lines: list[str], opening_index: int) -> int | None:
     return next(
         (
@@ -1108,12 +1102,13 @@ def _q2_undecorate_value(value: str) -> str:
     return value
 
 
-def _q2_value_and_context(raw: str) -> tuple[str, str]:
-    """Split an optional annotation, leaving IPv6 ``::`` literals intact."""
-    parts = re.split(r"\s+::\s+", raw.strip(), maxsplit=1)
-    value = _q2_undecorate_value(parts[0].strip())
-    context = parts[1].strip() if len(parts) == 2 else ""
-    return value, context
+def _q2_value_and_annotation(raw: str) -> tuple[str, str]:
+    """Split the first wire delimiter, leaving later ``::`` text intact."""
+    normalized = raw.strip()
+    if normalized.startswith(":: "):
+        return "", normalized[3:].strip()
+    value, separator, annotation = normalized.partition(" :: ")
+    return _q2_undecorate_value(value.strip()), annotation.strip() if separator else ""
 
 
 def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
@@ -1137,10 +1132,6 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
     rules: list[Q2RuleProposal] = []
     uncertainties: list[str] = []
     lines = body.split("\n")
-    if _q2_terminal_markers_outside_fences(lines):
-        result.errors.append("q2_terminal_marker_mixed")
-        return result
-
     recognized_groups = 0
     current: _Q2Header | None = None
     total_rule_content_bytes = 0
@@ -1246,6 +1237,10 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
 
         bullet = _BULLET.match(lines[i])
         if bullet is None:
+            if re.fullmatch(r"\s*[-*•]\s*", lines[i]):
+                result.warnings.append("q2_bullet_without_value")
+                i += 1
+                continue
             result.warnings.append(
                 "q2_unknown_heading"
                 if _q2_is_markdown_heading(lines[i])
@@ -1256,10 +1251,9 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
             i += 1
             continue
 
-        value, context = _q2_value_and_context(bullet.group("text"))
+        value, annotation = _q2_value_and_annotation(bullet.group("text"))
         if not value:
             result.warnings.append("q2_bullet_without_value")
-            current = None
             i += 1
             continue
 
@@ -1272,8 +1266,8 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
                     category=cast(Any, current.category),
                     value=value,
                     attack_id=attack_id,
-                    context=context,
-                    evidence_quote="",
+                    context="",
+                    evidence_quote=annotation,
                 )
             except ValidationError:
                 result.warnings.append("fact_schema_invalid")
@@ -1285,8 +1279,8 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
                     event_date=current.event_date,
                     date_text=current.date_text,
                     text=value,
-                    context=context,
-                    evidence_quote="",
+                    context="",
+                    evidence_quote=annotation,
                 )
             except ValidationError:
                 result.warnings.append("event_schema_invalid")
@@ -1298,7 +1292,7 @@ def parse_q2_proposals_markdown(text: str) -> ParseResult[Q2SourceOutput]:
                     value=value,
                     artifact_type=cast(Any, current.artifact_type),
                     indicator_status=cast(Any, current.indicator_status),
-                    context=context,
+                    context=annotation,
                     evidence_quote="",
                 )
             except ValidationError:

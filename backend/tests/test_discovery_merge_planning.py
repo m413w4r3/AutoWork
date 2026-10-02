@@ -46,14 +46,11 @@ from tests.test_discovery_cumulative import (
 
 
 class RecordingBridgeCapabilitiesProvider:
-    """Stands in for the bridge transport just to record archive calls.
-
-    DELETE_ON_SUCCESS is declared on every merge conversation; this is what
-    proves the planner actually closes them rather than only declaring it.
-    """
+    """Records release calls for bounded merge requests."""
 
     def __init__(self) -> None:
         self.archived: list[UUID] = []
+        self.released: list[str] = []
 
     async def capabilities(self) -> dict[str, object]:
         return {}
@@ -63,6 +60,10 @@ class RecordingBridgeCapabilitiesProvider:
 
     async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
         return {}
+
+    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
+        self.released.append(bridge_run_id)
+        return {"released": True}
 
 
 class RecordingDraftingModel:
@@ -87,6 +88,7 @@ class RecordingDraftingModel:
             parameters=request.parameters,
             id=request.run_id or uuid4(),
             status=ModelRunStatus.SUCCEEDED,
+            response_id=f"resp-{len(self.requests)}",
             output_references=(f"memory://output/{len(self.requests)}",),
         )
         return ModelExecution(run, output_text=output)
@@ -131,7 +133,7 @@ async def test_chatgpt_merge_uses_fresh_non_web_request_and_opaque_handles() -> 
     assert outcome.plan.groups[0].existing_subject_handles == ["X1"]
     request = model.requests[0]
     assert request.routing_hint.value == "discovery_merge"
-    assert request.conversation is not None and request.conversation.mode == "fresh"
+    assert request.conversation is None
     assert str(parent.subjects[0].subject_id) not in request.text
     assert str(delta.candidates[0].candidate_id) not in request.text
     assert "web_search" not in request.text
@@ -176,7 +178,7 @@ async def test_chatgpt_merge_repairs_structure_once_and_preserves_distinct_subje
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_merge_archives_its_conversation_on_direct_success() -> None:
+async def test_chatgpt_merge_releases_its_target_on_direct_success() -> None:
     edition_id = uuid4()
     parent = await _bootstrap(
         edition_id, [_candidate("APT42 SpearSpecter", "https://example.test/a")]
@@ -212,13 +214,13 @@ async def test_chatgpt_merge_archives_its_conversation_on_direct_success() -> No
         sensitivity="internal",
     )
 
-    conversation = model.requests[0].conversation
-    assert conversation is not None
-    assert bridge.archived == [conversation.id]
+    assert model.requests[0].conversation is None
+    assert bridge.released == ["resp-1"]
+    assert bridge.archived == []
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_merge_archives_both_conversations_after_repair() -> None:
+async def test_chatgpt_merge_releases_both_targets_after_repair() -> None:
     edition_id = uuid4()
     parent = await _bootstrap(
         edition_id, [_candidate("Screening Serpens MiniUpdate", "https://example.test/a")]
@@ -252,15 +254,13 @@ async def test_chatgpt_merge_archives_both_conversations_after_repair() -> None:
     )
 
     assert len(model.requests) == 2
-    first_conversation = model.requests[0].conversation
-    second_conversation = model.requests[1].conversation
-    assert first_conversation is not None
-    assert second_conversation is not None
-    assert bridge.archived == [first_conversation.id, second_conversation.id]
+    assert all(request.conversation is None for request in model.requests)
+    assert bridge.released == ["resp-1", "resp-2"]
+    assert bridge.archived == []
 
 
 @pytest.mark.asyncio
-async def test_chatgpt_merge_leaves_conversation_for_debugging_when_unresolved() -> None:
+async def test_chatgpt_merge_leaves_target_for_debugging_when_unresolved() -> None:
     """A failure that never reaches a valid plan keeps its transcript around —
     deleting it would remove the only way to see what went wrong."""
     edition_id = uuid4()

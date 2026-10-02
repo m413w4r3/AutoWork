@@ -43,6 +43,9 @@ structurée : un `draft()` sans schéma utilise l’adaptateur drafting textuel,
 structured qui garde `OPENAI_DRAFTING_MODEL`. Le bridge annonce
 `structured_output=prompt_and_client_validation` : le contrat JSON est injecté dans le prompt et
 validé côté AutoWork. `STRUCTURED_EXTRACTION` conserve `OPENAI_STRUCTURED_MODEL`.
+L'extraction canonique des sources (production) n'utilise pas ce rôle : elle passe par `draft` en texte
+libre (format compact `FACT`/`EVENT`/`IOC`/`RULE`/`UNCERTAINTIES`, parsé localement de façon tolérante),
+car le bridge ne produit pas de JSON fiable (voir `docs/design/extraction-wire-format-recovery.md`).
 `MODEL_FORCE_ADAPTER=chatgpt_bridge|gemini_webai|qwen|fake` permet un forçage uniquement lorsque
 `APP_ENV=development`; `openai` et `gemini` restent des alias de compatibilité. `auto` conserve
 la politique ci-dessus.

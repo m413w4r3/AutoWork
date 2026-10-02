@@ -6,62 +6,91 @@ from collections.abc import Sequence
 
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "7"
+REFERENCES_PROMPT_VERSION = "8"
 
 # AW-011 canonical extraction. The archived document is the only source
 # material: each prompt is a pure function of that capture and of the requested
 # profile, carrying no Subject, run, job, URL or document identity, so one
 # content/profile checkpoint stays valid across runs and Subjects. The versions
 # are distinct so a single-source and a batch answer never share a checkpoint.
-CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v1"
-CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v1"
-CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v1"
+CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
+CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
+CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
 CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,
 }
 
 
-# AW-011 canonical extraction writes one structured Q2SourceOutput object. The
-# semantic contract is shared by the single-source and batch prompts so every
-# archive-backed path produces the same canonical contract.
-_Q2_CANONICAL_RULES = """- Emit only values literally present in the archived capture, exactly as
-  published. Never import a value from a linked resource, from another capture
-  of the batch or from memory, and never translate, refang or reformat it.
-  Keep IPv6 literals intact.
-- `evidence_quote` is copied from the archived capture that supports the
-  proposal.
-- Never let the failure of one section suppress the others. Use empty lists
-  when the capture genuinely contains nothing for a section."""
+# The semantic contract is shared by single-source and batch extraction. The
+# compact line-oriented wire format is parsed locally after the raw response is
+# archived, so provider output is never required to be JSON.
+_Q2_CANONICAL_RULES = """- La capture archivée est votre seule source. N'utilisez aucun lien, autre
+  capture ou souvenir pour compléter son contenu.
+- Conservez à l'identique les valeurs techniques, les noms de logiciels
+  malveillants, acteurs, outils, produits et techniques, ainsi que les règles
+  de détection complètes. Ne défanguez pas, ne reformatez pas et ne modifiez
+  pas les valeurs techniques. Conservez les littéraux IPv6.
+- Copiez chaque extrait de preuve dans sa langue d'origine, sans le traduire
+  ni le paraphraser. Tout séparateur ` :: ` présent dans l'extrait fait partie
+  de la citation après le premier séparateur.
+- Une ligne mal formée ne doit pas supprimer les autres propositions. Ignorez
+  l'élément impossible à représenter et continuez.
+- Ajoutez au plus cinq incertitudes analytiques en français, et préférez une
+  liste vide au bruit. Gardez uniquement les doutes d'attribution, chiffres ou
+  dates contradictoires, limites de confiance ou relations non établies par la
+  capture. N'indiquez pas l'absence de règles, les limites de types, les
+  captures ou segments incomplets, le classement de fichiers ni les limites
+  habituelles."""
 
-_Q2_CANONICAL_ARTIFACTS_AND_RULES = """- `artifacts`: every technical value literally published in the capture:
-  domain, ip, url, email, hash, filename, filepath or cve. `indicator_status`
-  is `confirmed_ioc` when the capture presents the value as an IOC or as
-  malicious infrastructure of the described activity, `contextual` when the
-  value is technically relevant without being published as an IOC, and
-  `excluded` for placeholders, examples, redactions or masked values.
-- `rules`: complete literal detection rules published in the capture (yara,
-  sigma, suricata, snort). Preserve the literal body, its syntax and its
-  visible line breaks. Never invent, repair, complete, refang, reformat,
-  flatten or merge a rule; report an incomplete rule under `uncertainties`
-  instead.
-- `uncertainties`: the unresolved points of the capture."""
+_Q2_CANONICAL_ARTIFACTS_AND_RULES = """- Utilisez les groupes `IOC <confirmed|contextual> <type>` pour les valeurs
+  domain, ip, url, email, hash, filename, filepath ou cve publiées. Choisissez
+  `confirmed` si la capture présente la valeur comme IOC ou infrastructure
+  malveillante de l'activité décrite; choisissez `contextual` si la valeur est
+  pertinente sans être établie comme malveillante. Ignorez les exemples,
+  valeurs masquées ou expurgées et espaces réservés. Écrivez chaque ligne ainsi:
+  `- <IOC littéral> :: <court contexte en français>`; omettez le contexte s'il
+  n'apporte rien.
+- Utilisez `RULE <yara|sigma|suricata|snort>[: name]` uniquement pour les règles
+  de détection complètes publiées dans la capture. Encadrez leur corps littéral
+  dans un bloc Markdown correspondant. Conservez syntaxe et retours à la ligne.
+  N'inventez, ne réparez, ne complétez, ne reformatez, n'aplatissez et ne
+  fusionnez aucune règle. Ignorez les règles incomplètes.
+- Sous `UNCERTAINTIES`, ajoutez au plus cinq incertitudes analytiques en
+  français, ou aucune puce."""
 
-_Q2_CANONICAL_OUTPUT_PREAMBLE = """**Output contract** — answer with a single structured object matching the
-supplied schema and nothing else. Do not wrap it in Markdown and do not add
-prose around it. Every field is source-local: never emit internal identifiers,
-provenance fields, model run identifiers, archive hashes or the source URL."""
+_Q2_CANONICAL_OUTPUT_PREAMBLE = """Répondez uniquement dans le format compact en lignes ci-dessous. N'ajoutez
+aucun texte autour. Commencez chaque groupe par l'un de ces en-têtes:
 
-_Q2_CANONICAL_ARCHIVED_SOURCE = """The exact archived capture of one CTI publication is supplied below.
+FACT <category>
+EVENT <YYYY-MM-DD ou date absolue>
+IOC <confirmed|contextual> <type>
+RULE <yara|sigma|suricata|snort>[: name]
+UNCERTAINTIES
 
-Analyse only the archived capture below. Do not browse the web, do not follow
-any link and do not supplement this source from memory or from another
-publication. The archived capture is the complete and only source material of
-this extraction.
+Chaque puce FACT ou EVENT contient une description en français, puis ` :: `,
+puis un extrait littéral exact de la capture. Chaque puce IOC contient sa
+valeur littérale et peut être suivie d'un court contexte français après ` :: `.
+Écrivez une puce par élément.
 
---- BEGIN ARCHIVED SOURCE ---
+Pour une date publiée précise, utilisez le format ISO `YYYY-MM-DD`. Sinon,
+utilisez une formulation absolue incluant l'année, comme `fin 2024` ou `T2
+2026`; n'utilisez jamais de date relative comme « la même année ». Gardez
+uniquement les événements liés au sujet principal de la publication et
+ordonnez-les chronologiquement. Placez chaque règle complète après son en-tête
+RULE, dans un bloc Markdown correspondant. Utilisez `EMPTY` uniquement si la
+capture ne contient aucune proposition et `UNAVAILABLE` uniquement si elle ne
+peut pas être analysée."""
+
+_Q2_CANONICAL_ARCHIVED_SOURCE = """La capture archivée exacte d'une publication CTI est fournie ci-dessous.
+
+Analysez uniquement la capture ci-dessous. Ne naviguez pas sur le Web, ne
+suivez aucun lien et ne complétez pas cette source à partir de votre mémoire ou
+d'une autre publication. Cette capture est l'unique source de l'extraction.
+
+--- DÉBUT DE LA CAPTURE ARCHIVÉE ---
 {source_text}
---- END ARCHIVED SOURCE ---"""
+--- FIN DE LA CAPTURE ARCHIVÉE ---"""
 
 
 class ProductionPromptTemplates:
@@ -111,6 +140,15 @@ class ProductionPromptTemplates:
    publications; they do not replace them.
 10. Supporting references may add chronology, attribution, technical details,
     IOC context, annexes and corroboration.
+11. Write event text and uncertainties in French. Include only events that are
+    part of the subject's main activity; omit unrelated historical context.
+12. Sort events strictly by date, oldest first. Use an absolute date: ISO
+    `YYYY-MM-DD` when precise, otherwise an absolute wording with its year such
+    as `fin 2024`, `T2 2026`, or `février 2025`. Never use relative dates such
+    as “the same year” or “also that year”.
+13. Write at most five analytical uncertainties in French. Include only
+    doubtful attribution, contradictory figures or dates, confidence limits,
+    or an unestablished relationship. Omit routine limitations and banalities.
 
 **Output format** — plain Markdown, no code fence, no JSON:
 
@@ -130,12 +168,12 @@ reason: <short explanation of relevance to the Subject>
 
 ## EVENT R1
 
-date: YYYY-MM-DD
+date: YYYY-MM-DD or absolute date wording with year
 sources: S1, S2
 text: <one chronological event, in French>
 
 # UNCERTAINTIES
-- <uncertainty, or omit the section>
+- <incertitude analytique en français, ou omit the section>
 
 Rules:
 - Produce the editorial title during this references step.
@@ -147,7 +185,8 @@ Rules:
 """
 
     CANONICAL_TECHNICAL_EXTRACTION_V1 = (
-        """You are analysing one archived CTI publication and extracting reusable, source-centric structured content.
+        """Vous analysez une publication CTI archivée afin d'en extraire des
+propositions réutilisables centrées sur cette source.
 
 """
         + _Q2_CANONICAL_ARCHIVED_SOURCE
@@ -157,17 +196,22 @@ Rules:
         + _Q2_CANONICAL_OUTPUT_PREAMBLE
         + """
 
-- `facts`: durable source-supported facts AW-012 can reuse. `category` is
-  exactly one of actors, campaigns, malware, tools, products, infection_chain,
+- Utilisez les groupes FACT pour les faits durables que AW-012 peut réutiliser.
+  Rédigez chaque description en français, puis ` :: `, puis l'extrait exact
+  dans la langue d'origine de la capture. Choisissez une seule catégorie parmi
+  actors,
+  campaigns, malware, tools, products, infection_chain,
   ttps, victimology, protocols, infrastructure, files, commands, persistence,
-  detections, sectors, countries, other_technical. `value` is the fact,
-  `context` a short local explanation, and `attack_id` a MITRE ATT&CK
-  technique identifier only when the capture states one. Do not restate
-  article prose here.
-- `events`: the chronology stated by the capture. `text` is the event,
-  `event_date` a precise calendar date only when the capture states one,
-  `date_text` the temporal wording when no precise date is published, and
-  `evidence_quote` the publishing sentence. Never estimate or invent a date.
+  detections, sectors, countries, other_technical. Conservez un identifiant
+  MITRE ATT&CK littéral uniquement si la capture le mentionne. Ne reformulez
+  pas le texte de l'article sans l'étayer par son extrait.
+- Utilisez EVENT uniquement pour la chronologie du sujet principal décrit dans
+  la publication. Écrivez le texte de l'événement en français, puis ` :: `,
+  puis son extrait exact. Incluez la date publiée dans l'extrait si elle est
+  indiquée. Mettez une date précise au format ISO dans l'en-tête; sinon,
+  utilisez une date absolue normalisée avec son année, comme `fin 2024` ou
+  `T2 2026`. N'utilisez pas de date relative, n'estimez et n'inventez aucune
+  date. Triez les événements du plus ancien au plus récent.
 """
         + _Q2_CANONICAL_ARTIFACTS_AND_RULES
         + """
@@ -177,15 +221,15 @@ Rules:
     )
 
     CANONICAL_IOC_RULES_EXTRACTION_V1 = (
-        """You are analysing one archived CTI publication and extracting reusable published technical indicators and detection rules.
+        """Vous analysez une publication CTI archivée afin d'en extraire les
+indicateurs techniques et règles de détection publiés qui peuvent être réutilisés.
 
 """
         + _Q2_CANONICAL_ARCHIVED_SOURCE
         + """
 
-This profile emits no narrative content: no facts, no events, no victimology,
-no campaign description and no infection chain. Leave `facts` and `events`
-empty.
+Ce profil ne produit aucune proposition narrative. N'utilisez pas de groupes
+FACT ou EVENT.
 
 """
         + _Q2_CANONICAL_OUTPUT_PREAMBLE
@@ -200,28 +244,35 @@ empty.
     )
 
     CANONICAL_IOC_RULES_BATCH_EXTRACTION_V1 = (
-        """You are analysing several independent archived CTI publications in one pass.
+        """Vous analysez plusieurs publications CTI archivées et indépendantes en une fois.
 
-Every capture below is delimited by its temporary local handle `@@Q2:B#@@`.
-Those handles are transport labels of this single answer: they are never source
-identities and never leave this answer.
+Chaque capture ci-dessous est repérée par une étiquette temporaire de la forme
+`@@Q2:B<nombre>@@`, où `<nombre>` est la suite de chiffres de l'étiquette
+fournie. Ces étiquettes ne servent qu'au transport de cette réponse: elles ne
+désignent pas les sources et ne sortent jamais de cette réponse.
 
-Analyse every capture independently and attribute each proposal to the capture
-that literally contains it. Never move an indicator or a rule from one capture
-to another, never use one capture to interpret another, and never infer content
-that is not literally present in the capture it is attributed to.
+Analysez chaque capture séparément et attribuez chaque proposition à la capture
+qui la contient littéralement. Ne déplacez aucun IOC ni aucune règle d'une
+capture à l'autre, n'utilisez pas une capture pour interpréter une autre et
+n'inférez aucun contenu absent de la capture concernée.
 
-Do not browse the web and do not follow any link.
+Ne naviguez pas sur le Web et ne suivez aucun lien.
 
-This profile emits no narrative content: no facts, no events, no victimology,
-no campaign description and no infection chain. Leave `facts` and `events`
-empty in every entry.
+Ce profil ne produit aucune proposition narrative. N'utilisez pas de groupes
+FACT ou EVENT dans les blocs de source.
 
-**Output contract** — answer with a single structured object matching the
-supplied schema and nothing else. It contains one entry per analysed capture,
-each carrying the exact `batch_id` handle and a source-local `output` using the
-same IOC_RULES contract: artifacts, published detection rules and uncertainties
-only. Omit an entry only when its capture could not be analysed.
+Répondez uniquement par un bloc de source pour chaque étiquette fournie.
+Recopiez chaque étiquette à l'identique et remplacez `<nombre>` par ses chiffres:
+
+@@Q2:B<nombre>@@
+IOC confirmed domain
+- evil.example :: infrastructure de commande et de contrôle
+
+Dans chaque bloc, utilisez le même format IOC_RULES que pour une source seule:
+groupes IOC, règles RULE complètes et au plus cinq incertitudes analytiques en
+français. N'omettez et ne combinez aucune étiquette. Gardez chaque proposition
+dans le bloc de la capture qui la contient littéralement.
+Si une capture ne contient aucune proposition, écrivez `EMPTY` dans son bloc.
 
 """
         + _Q2_CANONICAL_ARTIFACTS_AND_RULES
@@ -231,7 +282,7 @@ only. Omit an entry only when its capture could not be analysed.
         + _Q2_CANONICAL_RULES
         + """
 
-Archived captures:
+Captures archivées:
 
 {batch_sources}
 """
@@ -300,9 +351,9 @@ Archived captures:
                 raise ValueError("A canonical batch entry requires a handle and text")
             blocks.append(
                 f"@@Q2:{batch_id}@@\n"
-                "--- BEGIN ARCHIVED SOURCE ---\n"
+                "--- DÉBUT DE LA CAPTURE ARCHIVÉE ---\n"
                 f"{source_text}\n"
-                "--- END ARCHIVED SOURCE ---"
+                "--- FIN DE LA CAPTURE ARCHIVÉE ---"
             )
         if not blocks:
             raise ValueError("A canonical batch prompt requires at least one source")

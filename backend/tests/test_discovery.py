@@ -10,7 +10,6 @@ from pydantic import BaseModel
 from cti_app.application.discovery.contracts import (
     DiscoverEditionParameters,
     ReprocessDiscoveryReportParameters,
-    discovery_conversation_id,
     discovery_job_idempotency_key,
     discovery_request_hash,
     discovery_request_snapshot,
@@ -82,18 +81,24 @@ class FakeBridgeCapabilities:
         del bridge_run_id
         return {}
 
+    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
+        del bridge_run_id
+        return {"released": True}
+
 
 class OrderTrackingBridgeCapabilities:
-    """Records, at the moment archive_conversation is called, whether the batch
+    """Records, at the moment target release is called, whether the batch
     was already persisted — the only way to check orchestration order through
     DiscoveryService's public surface instead of reading private implementation
-    lines. The bridge conversation itself is a live browser session with no
+    lines. The Bridge target itself is a live browser session with no
     application-side lifecycle row: only the durable batch state is checked."""
 
     def __init__(self, discovery_uow: InMemoryDiscoveryUnitOfWorkFactory) -> None:
         self._discovery_uow = discovery_uow
         self.archive_calls: list[UUID] = []
         self.archive_call_batch_persisted: list[bool] = []
+        self.release_calls: list[str] = []
+        self.release_call_batch_persisted: list[bool] = []
 
     async def capabilities(self) -> dict[str, object]:
         return {"web_search": True, "native_sources": False, "visible_citations": True}
@@ -105,6 +110,11 @@ class OrderTrackingBridgeCapabilities:
     async def preview_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
         del bridge_run_id
         return {}
+
+    async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
+        self.release_calls.append(bridge_run_id)
+        self.release_call_batch_persisted.append(bool(self._discovery_uow.state))
+        return {"released": True}
 
 
 class TransientResearchAdapter(FakeModelAdapter):
@@ -407,8 +417,7 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     )
     assert len({source.canonical_url for source in candidate.sources}) == len(candidate.sources)
     assert len(fake.calls) == 1
-    assert fake.calls[0].conversation is not None
-    assert fake.calls[0].conversation.mode == "fresh"
+    assert fake.calls[0].conversation is None
     assert all(run.model_role.value == "research" for run in model_uow.state.values())
     assert grouped_editions == [params.edition_id]
 
@@ -443,17 +452,14 @@ async def test_complete_discovery_job_with_fake_adapter_is_sourced_and_idempoten
     assert discovery_request_hash(params) == discovery_request_hash(complementary)
     assert batches[0].discovery_model_run_id != batches[1].discovery_model_run_id
     assert batches[0].id != batches[1].id
-    assert fake.calls[1].conversation is not None
-    assert fake.calls[1].conversation.mode == "fresh"
-    assert fake.calls[1].conversation.id != fake.calls[0].conversation.id
+    assert fake.calls[1].conversation is None
     assert grouped_editions == [params.edition_id, params.edition_id]
 
 
-async def test_successful_discovery_archives_conversation_once_after_batch_persisted() -> None:
+async def test_successful_discovery_releases_target_once_after_batch_persisted() -> None:
     """Orchestration boundary domain tests can't cover: the batch must be
     durably persisted as the canonical successful result before the exact live
-    Temporary Chat browser session is ever requested for closure — and closed
-    exactly once."""
+    Temporary Chat browser target is requested for closure."""
     fake = FakeModelAdapter(research_text=research_markdown_fixture())
     gateway, _, _ = gateway_for_adapter(fake)
     discovery_uow = InMemoryDiscoveryUnitOfWorkFactory()
@@ -469,7 +475,6 @@ async def test_successful_discovery_archives_conversation_once_after_batch_persi
     jobs = JobService(job_uow, registry)
     dispatcher = SynchronousJobDispatcher(JobExecutor(job_uow, registry))
     params = parameters()
-    expected_conversation_id = discovery_conversation_id(params.discovery_run_id)
 
     job = await jobs.submit(
         kind=DISCOVERY_JOB_KIND,
@@ -484,14 +489,10 @@ async def test_successful_discovery_archives_conversation_once_after_batch_persi
     completed = await jobs.get(job.id)
     assert completed.status is JobStatus.SUCCEEDED
 
-    # Same conversation id used for the model request and for the archive call.
-    assert fake.calls[0].conversation is not None
-    assert fake.calls[0].conversation.id == expected_conversation_id
-
-    # The archive request fires exactly once, and only once the batch is durably
-    # persisted as the canonical successful result.
-    assert capabilities.archive_calls == [expected_conversation_id]
-    assert capabilities.archive_call_batch_persisted == [True]
+    assert fake.calls[0].conversation is None
+    assert len(capabilities.release_calls) == 1
+    assert capabilities.release_call_batch_persisted == [True]
+    assert capabilities.archive_calls == []
 
 
 async def test_failed_research_never_deletes_conversation_or_batch() -> None:
