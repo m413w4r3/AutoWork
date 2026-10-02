@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   getReferencesArtifact,
   getExtractionArtifact,
+  getRelevanceProjectionArtifact,
   getSynthesisArtifact,
   getPublicationArtifact,
   isProductionExtractionV1,
@@ -29,13 +30,19 @@ import {
 
 interface ProductionArtifactViewProps {
   subjectId: string;
-  stage: "references" | "extraction" | "synthesis" | "publication";
+  stage:
+    | "references"
+    | "extraction"
+    | "relevance_projection"
+    | "synthesis"
+    | "publication";
   onClose?: () => void;
 }
 
 const STAGE_LABELS: Record<string, string> = {
   references: "Références",
   extraction: "Extraction CTI",
+  relevance_projection: "Périmètre des preuves",
   synthesis: "Synthèse",
   publication: "Aperçu de la publication",
 };
@@ -54,6 +61,8 @@ function getArtifactFetcher(
       return getReferencesArtifact;
     case "extraction":
       return getExtractionArtifact;
+    case "relevance_projection":
+      return getRelevanceProjectionArtifact;
     case "synthesis":
       return getSynthesisArtifact;
     case "publication":
@@ -1375,6 +1384,19 @@ export function ProductionArtifactView({
           <ExtractionPreview document={artifact.canonical_content} />
         )}
 
+      {stage === "relevance_projection" && artifact.canonical_content ? (
+        <section
+          className="artifact-content"
+          aria-label="Décisions de périmètre"
+        >
+          <p>
+            Les décisions ambiguës restent visibles ici avec leur motif et les
+            références de preuve qui les soutiennent.
+          </p>
+          <pre>{JSON.stringify(artifact.canonical_content, null, 2)}</pre>
+        </section>
+      ) : null}
+
       {referencesCorpus ? (
         <ProductionReferenceCorpusView corpus={referencesCorpus} />
       ) : null}
@@ -1396,6 +1418,7 @@ export function ProductionArtifactView({
 
       {stage !== "publication" &&
         stage !== "extraction" &&
+        stage !== "relevance_projection" &&
         !referencesCorpus &&
         !synthesisDocument &&
         renderedContent && (
@@ -1408,6 +1431,7 @@ export function ProductionArtifactView({
 
       {stage !== "publication" &&
         stage !== "extraction" &&
+        stage !== "relevance_projection" &&
         !referencesCorpus &&
         !synthesisDocument &&
         artifact.canonical_content && (

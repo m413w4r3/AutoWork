@@ -24,6 +24,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import serialize_publication_document
@@ -49,6 +50,7 @@ class PublicationAssemblyService:
         extraction: ProductionExtractionV1,
         synthesis: ProductionSynthesisV1,
         editorial_enrichment: EditorialEnrichmentV1,
+        relevance_projection: RelevanceProjectionV1 | None = None,
         metadata_extra: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         if (
@@ -78,6 +80,7 @@ class PublicationAssemblyService:
             snapshot=snapshot,
             references=references,
             extraction=extraction,
+            relevance_projection=relevance_projection,
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
         )
@@ -88,6 +91,7 @@ class PublicationAssemblyService:
             extraction=extraction,
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
+            relevance_projection=relevance_projection,
         )
         canonical_document = serialize_publication_document(document)
         canonical_bytes = ProductionArtifactStore.canonical_json_bytes(canonical_document)

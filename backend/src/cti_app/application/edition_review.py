@@ -19,6 +19,7 @@ from cti_app.application.production_repairs import (
 from cti_app.application.production_resume import resolve_retry_stage
 from cti_app.domain.editions import EditionStatus
 from cti_app.domain.production import (
+    ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionDerivedOutput,
     ProductionRepairImpact,
@@ -597,8 +598,9 @@ def _repair_articles(
         # rebuild stage can make the article true again.
         "revise_decision": 3,
         "apply_projection": 4,
-        "synthesis": 5,
-        "none": 6,
+        "relevance_projection": 5,
+        "synthesis": 6,
+        "none": 7,
     }
     # The artifact-derived debt outranks "none": an article with no current
     # deliverable always names the stage that rebuilds it, whether or not any
@@ -618,6 +620,9 @@ def _repair_articles(
                 (recommended, rebuild_stage.value),
                 key=lambda value: priority.get(value, 99),
             )
+        impacts = [_impact_from_execution_plan(item.execution_plan) for item in subject_items]
+        if rebuild_stage is not None:
+            impacts.append(_impact_from_execution_plan(_rebuild_only_execution_plan(rebuild_stage)))
         articles.append(
             (
                 min(item.position for item in subject_items),
@@ -631,9 +636,7 @@ def _repair_articles(
                         for item in subject_items
                     ),
                     recommended_stage=recommended,
-                    execution_plan=merge_repair_impacts(
-                        _impact_from_execution_plan(item.execution_plan) for item in subject_items
-                    ).execution_plan,
+                    execution_plan=merge_repair_impacts(impacts).execution_plan,
                     active_repair_count=sum(not item.resolved for item in subject_items),
                     resolved_since_last_build_count=sum(
                         item.resolved and item.rebuild_required for item in subject_items
@@ -677,6 +680,7 @@ def _rebuild_only_execution_plan(stage: ProductionStage) -> RepairExecutionPlan:
     affected_outputs = frozenset(
         ProductionDerivedOutput(artifact.value)
         for artifact in downstream_artifacts_from_pipeline_stage(stage, inclusive=True)
+        if artifact is not ProductionArtifactStage.RELEVANCE_PROJECTION
     )
     return RepairExecutionPlan(
         impact_kind=ProductionRepairImpactKind.NARRATIVE,

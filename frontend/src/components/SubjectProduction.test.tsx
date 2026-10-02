@@ -731,7 +731,7 @@ describe("SubjectProduction retry from stage", () => {
       name: "Relancer depuis une étape",
     });
     expect(select).toHaveValue("");
-    expect(screen.getAllByRole("option")).toHaveLength(7);
+    expect(screen.getAllByRole("option")).toHaveLength(8);
   });
 
   it("la synthèse n’est plus liée à une conversation", async () => {

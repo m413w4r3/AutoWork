@@ -45,7 +45,16 @@ def test_ready_run_reports_every_stage_complete() -> None:
 
     stages = build_stage_statuses(run, {})
 
-    assert completed_stage_count(stages) == 6
+    assert tuple(stages) == (
+        "sources",
+        "references",
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+        "editorial_enrichment",
+        "assembly",
+    )
+    assert completed_stage_count(stages) == 7
 
 
 def test_needs_review_surfaces_the_reason_on_the_current_stage() -> None:

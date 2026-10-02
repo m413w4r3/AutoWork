@@ -14,7 +14,7 @@ export function App() {
   );
   const subject = pathname.match(/^\/subjects\/([^/]+)$/);
   const artifact = pathname.match(
-    /^\/subjects\/([^/]+)\/production\/artifacts\/(references|extraction|synthesis|publication)$/,
+    /^\/subjects\/([^/]+)\/production\/artifacts\/(references|extraction|relevance_projection|synthesis|publication)$/,
   );
   return (
     <main>
@@ -27,7 +27,11 @@ export function App() {
           subjectId={artifact[1]!}
           stage={
             artifact[2] as
-              "references" | "extraction" | "synthesis" | "publication"
+              | "references"
+              | "extraction"
+              | "relevance_projection"
+              | "synthesis"
+              | "publication"
           }
           onClose={() => window.history.back()}
         />

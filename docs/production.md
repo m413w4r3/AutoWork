@@ -10,6 +10,7 @@ est défini dans `domain/production_pipeline.py` :
 | `SOURCES` | Aucun |
 | `REFERENCES` | `REFERENCES` |
 | `EXTRACTION` | `EXTRACTION` |
+| `RELEVANCE_PROJECTION` | `RELEVANCE_PROJECTION` |
 | `SYNTHESIS` | `SYNTHESIS` |
 | `EDITORIAL_ENRICHMENT` | `EDITORIAL_ENRICHMENT` |
 | `ASSEMBLY` | `PUBLICATION` |
@@ -18,9 +19,11 @@ est défini dans `domain/production_pipeline.py` :
 flowchart TD
   snapshot[ProductionInputSnapshot] --> references[REFERENCES: ProductionReferenceCorpusV1]
   references --> extraction[EXTRACTION: ProductionExtractionV1]
-  extraction --> synthesis[SYNTHESIS: ProductionSynthesisV1]
+  extraction --> relevance[RELEVANCE_PROJECTION: RelevanceProjectionV1]
+  relevance --> synthesis[SYNTHESIS: ProductionSynthesisV1]
   synthesis --> enrichment[EDITORIAL_ENRICHMENT: EditorialEnrichmentV1]
   enrichment --> assembly[ASSEMBLY: PublicationDocumentV4]
+  relevance --> assembly
   assembly --> preview[Subject preview: projection frontend V4]
   assembly --> render[PublicationRender] --> pdf[Typst PDF article]
 ```
@@ -134,13 +137,13 @@ réutilisé ne porte donc pas d’identité de `ProductionRun`.
 Le `Reference corpus` du domaine malware/investigation et `ProductionReferenceCorpusV1` de la
 production éditoriale sont deux contrats distincts : ils ne partagent ni module ni service.
 La projection historique `ReferenceReport` reste confinée à certaines fonctions du Repair Desk.
-Le Production State V5 transporte les quatre artefacts canoniques vérifiés avant Assembly :
+Le Production State V5 transporte les quatre artefacts portables vérifiés avant Assembly :
 `ProductionReferenceCorpusV1`, `ProductionExtractionV1`, `ProductionSynthesisV1` et
-`EditorialEnrichmentV1`. L’import restaure ces artefacts puis place le run en revue à `ASSEMBLY` ;
-son retry reconstruit `PUBLICATION` et exécute la QA sans rejouer les étapes antérieures.
-Le chemin courant REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT
-→ ASSEMBLY lit directement
-les contrats canoniques et n'utilise plus les `EVENT` Q1 comme identité de publication.
+`EditorialEnrichmentV1`. L’import restaure ces artefacts puis place le run en revue à
+`RELEVANCE_PROJECTION`, qui est recalculée depuis le snapshot et l’extraction avant la reprise
+de Synthesis. Le chemin courant REFERENCES → EXTRACTION → RELEVANCE_PROJECTION → SYNTHESIS →
+EDITORIAL_ENRICHMENT → ASSEMBLY lit directement les contrats canoniques et n'utilise plus les
+`EVENT` Q1 comme identité de publication.
 
 ### EXTRACTION et contrat canonique
 
@@ -230,19 +233,22 @@ EXTRACTION établit les faits structurés et prouvés
         ↓
 ProductionExtractionV1
         ↓
-SYNTHESIS organise et rédige exclusivement à partir de cette vérité factuelle
+RELEVANCE_PROJECTION classe l’évidence pour le sujet figé
+        ↓
+SYNTHESIS rédige à partir de l’évidence admise
         ↓
 ProductionSynthesisV1
         ↓
 EDITORIAL_ENRICHMENT produit EditorialEnrichmentV1
         ↓
-ASSEMBLY lit aussi ProductionReferenceCorpusV1
+ASSEMBLY consomme aussi ProductionReferenceCorpusV1 et RelevanceProjectionV1
         ↓
 PublicationDocumentV4 → QA canonique → READY
 ```
 
-`ProductionExtractionV1` est l’unique vérité factuelle de Synthesis. Le stage construit un pack
-d’évidence déterministe à partir de l’extraction et du contexte éditorial figé dans le snapshot ;
+`ProductionExtractionV1` est la vérité factuelle canonique ; `RelevanceProjectionV1` classe ses
+éléments pour le sujet figé. Synthesis construit un pack d’évidence déterministe à partir des
+éléments admis par cette projection et du contexte éditorial capturé dans le snapshot ;
 chaque affirmation factuelle canonique doit citer une `ExtractionEvidenceRefV1`. Synthesis
 n’effectue aucune recherche Web, ne rouvre aucun corps source pour découvrir des faits, ne prend
 pas `ReferenceReport` ni `TechnicalExtraction` comme entrées canoniques et ne consomme pas l’état
@@ -268,8 +274,8 @@ diagrammes et figures sources sans syntaxe de renderer ni média dérivé. Les c
 d’évidence appartenant à l’extraction courante. Les figures désignent un `source_document_id`
 canonique et son URL exacte. Les placements par section sont liés au hash exact de la synthèse.
 
-AW-016 consomme uniquement les artifacts canoniques `EXTRACTION` et `SYNTHESIS` ainsi que les
-métadonnées d’accès exactes des sources. Le modèle propose des tableaux indépendants du renderer et
+AW-016 consomme les artifacts canoniques `EXTRACTION`, `RELEVANCE_PROJECTION` et `SYNTHESIS`,
+ainsi que les métadonnées d’accès exactes des sources. Le modèle propose des tableaux indépendants du renderer et
 des diagrammes sémantiques via une sortie structurée stricte. Chaque ligne, nœud et arête résout
 ses handles vers des `ExtractionEvidenceRefV1` exactes. Une proposition vide reste valide lorsque
 les données ne gagnent rien à être représentées autrement. Une panne modèle ou une politique qui
@@ -413,11 +419,11 @@ sujet depuis un titre, une position ou une ressemblance visuelle.
 Chaque run traverse la pipeline statique suivante :
 
 ```text
-SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
+SOURCES → REFERENCES → EXTRACTION → RELEVANCE_PROJECTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
 ```
 
-Chaque étape produit un artifact versionné et adressé par les entrées fonctionnelles, le run et la
-génération de pipeline. Les états, erreurs, retries et progressions sont conservés dans
+Chaque étape après `SOURCES` produit un artifact versionné et adressé par les entrées fonctionnelles,
+le run et la génération de pipeline. Les états, erreurs, retries et progressions sont conservés dans
 PostgreSQL ; Redis et les workspaces ne sont pas des sources de vérité.
 
 L’annulation d’un batch actif arrête les runs non terminés, conserve les artifacts déjà produits

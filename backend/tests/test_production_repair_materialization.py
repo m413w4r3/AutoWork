@@ -300,7 +300,10 @@ async def test_canonical_rule_bundle_repair_reassembles_and_materializes_sidecar
     assert projection.calls == 1
     assert checkpoint.calls == [RUN_ID]
     assert uow.commits == 1
-    assert uow.artifacts.stale_calls == [(RUN_ID, ("publication",))]
+    assert uow.artifacts.stale_calls == [
+        (RUN_ID, ("synthesis",)),
+        (RUN_ID, ("editorial_enrichment", "publication")),
+    ]
 
 
 @pytest.mark.asyncio

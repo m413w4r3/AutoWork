@@ -41,6 +41,7 @@ EXTRACTION_PROGRESS_COMPLETED_STATUSES = frozenset({"cached", "succeeded"})
 _STAGE_MODEL_CALLS: dict[ProductionStage, int] = {
     ProductionStage.SOURCES: 0,
     ProductionStage.REFERENCES: 1,
+    ProductionStage.RELEVANCE_PROJECTION: 0,
     ProductionStage.SYNTHESIS: 1,
     ProductionStage.EDITORIAL_ENRICHMENT: 1,
     ProductionStage.ASSEMBLY: 0,

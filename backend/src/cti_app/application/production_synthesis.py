@@ -63,7 +63,14 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceProjectionV1,
+    relevance_projection_from_json,
+    validate_relevance_projection_lineage,
+)
 from cti_app.domain.production_synthesis import (
+    _MONTH_NUMBERS,
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -89,8 +96,8 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v3-multi-source-authority"
-SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v2-date-approximation-and-dedupe"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v4-subject-relevance-projection"
+SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v3-subject-relevance-projection"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v1"
@@ -799,6 +806,7 @@ def _synthesis_identity_payload(
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
         "extraction_hash": canonical_extraction_hash(extraction),
+        "relevance_projection_hash": evidence_pack.projection_hash,
         "publication_language": snapshot.publication_language,
         "extraction_schema_version": PRODUCTION_EXTRACTION_SCHEMA_VERSION,
         "evidence_pack_schema_version": SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION,
@@ -965,6 +973,7 @@ class SynthesisEvidencePackV1:
     narrative_evidence: tuple[Mapping[str, Any], ...]
     technical_evidence: tuple[Mapping[str, Any], ...]
     uncertainties: tuple[str, ...]
+    projection_hash: str | None = None
     policy_version: str = SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
         default_factory=dict, repr=False, compare=False
@@ -990,7 +999,9 @@ class SynthesisEvidencePackV1:
 
 
 def build_synthesis_evidence_pack(
-    snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    projection: RelevanceProjectionV1 | None = None,
 ) -> SynthesisEvidencePackV1:
     """Build the bounded prompt projection and its private handle resolver."""
     if not isinstance(snapshot, ProductionInputSnapshot):
@@ -999,19 +1010,36 @@ def build_synthesis_evidence_pack(
         raise ValueError("Expected a ProductionExtractionV1")
     if snapshot.subject_id != extraction.subject_id:
         raise ValueError("Synthesis snapshot and extraction subjects differ")
+    if projection is not None:
+        validate_relevance_projection_lineage(
+            projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+        )
+        if projection.production_input_hash != snapshot.input_hash:
+            raise ValueError("Synthesis relevance projection does not match its snapshot")
 
     entries = _all_evidence_entries(extraction)
     source_by_id = {source.source_document_id: source for source in extraction.sources}
+
+    def admitted(ref: ExtractionEvidenceRefV1) -> bool:
+        if projection is None:
+            return True
+        return projection.classification_for(ref).classification not in {
+            RelevanceClassification.OUT_OF_SCOPE,
+            RelevanceClassification.INDETERMINATE,
+        }
+
     narrative_refs = {
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+        and admitted(ref)
     }
     technical_candidates = [
         ref
         for ref, payload in entries.items()
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
+        and admitted(ref)
         and (str(payload["context"]).strip() or str(payload["evidence_quote"]).strip())
     ]
     technical_refs = set(
@@ -1066,7 +1094,7 @@ def build_synthesis_evidence_pack(
         for ref in catalogue_refs
         if ref in technical_refs
     )
-    uncertainties = build_synthesis_uncertainties(extraction)
+    uncertainties = build_synthesis_uncertainties(extraction, projection=projection)
 
     return SynthesisEvidencePackV1(
         subject_title=snapshot.subject_title,
@@ -1078,6 +1106,7 @@ def build_synthesis_evidence_pack(
         narrative_evidence=narrative_evidence,
         technical_evidence=technical_evidence,
         uncertainties=tuple(item.text for item in uncertainties),
+        projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
         _handle_for_ref=MappingProxyType(dict(handle_for_ref)),
     )
@@ -1099,6 +1128,7 @@ def synthesis_evidence_pack_hash(evidence_pack: SynthesisEvidencePackV1) -> str:
         "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
         "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
         "uncertainties": list(evidence_pack.uncertainties),
+        "relevance_projection_hash": evidence_pack.projection_hash,
     }
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
@@ -1682,9 +1712,25 @@ def validate_synthesis_proposal(
         raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID) from exc
 
 
+def _date_text_has_day_precision(value: str | None) -> bool:
+    if value is None:
+        return True
+    if re.search(r"\b\d{4}-\d{2}-\d{2}\b", value):
+        return True
+    if re.search(r"\b\d{4}[-/.]\d{1,2}[-/.]\d{1,2}\b", value):
+        return True
+    if re.search(r"\b\d{1,2}[-/.]\d{1,2}[-/.]\d{4}\b", value):
+        return True
+    tokens = _normalized_synthesis_text(value).split()
+    has_month = any(token in _MONTH_NUMBERS for token in tokens)
+    has_day = any(token.isdigit() and 1 <= int(token) <= 31 for token in tokens)
+    return has_month and has_day
+
+
 def build_synthesis_timeline(
     extraction: ProductionExtractionV1,
     *,
+    projection: RelevanceProjectionV1 | None = None,
     warnings: list[str] | None = None,
 ) -> tuple[SynthesisTimelineEntryV1, ...]:
     """Normalize, deduplicate and order canonical events deterministically.
@@ -1694,16 +1740,18 @@ def build_synthesis_timeline(
     """
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
+    if projection is not None:
+        validate_relevance_projection_lineage(
+            projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+        )
     # Identical events published by several sources collapse into one entry
     # whose refs are the union of every publishing source's event.
 
     def dedupe_identity(payload: Mapping[str, Any]) -> tuple[tuple[str, str], str]:
         raw_event_date = payload["event_date"]
-        resolved_date = (
-            date.fromisoformat(raw_event_date)
-            if raw_event_date
-            else resolve_timeline_date_text(payload["date_text"])
-        )
+        resolved_date = resolve_timeline_date_text(payload["date_text"] or "")
+        if resolved_date is None and raw_event_date and not payload["date_text"]:
+            resolved_date = date.fromisoformat(raw_event_date)
         date_identity = (
             ("resolved", resolved_date.isoformat())
             if resolved_date is not None
@@ -1731,6 +1779,11 @@ def build_synthesis_timeline(
     for ref, payload in extraction_evidence_elements(extraction):
         if ref.kind is not EvidenceKind.EVENT:
             continue
+        if projection is not None and projection.classification_for(ref).classification in {
+            RelevanceClassification.OUT_OF_SCOPE,
+            RelevanceClassification.INDETERMINATE,
+        }:
+            continue
         identity = dedupe_identity(payload)
         existing = grouped.get(identity)
         if existing is None:
@@ -1745,7 +1798,9 @@ def build_synthesis_timeline(
     entries = [
         SynthesisTimelineEntryV1(
             event_date=(
-                date.fromisoformat(payload["event_date"]) if payload["event_date"] else None
+                date.fromisoformat(payload["event_date"])
+                if payload["event_date"] and _date_text_has_day_precision(payload["date_text"])
+                else None
             ),
             date_text=payload["date_text"],
             text=payload["text"],
@@ -1807,14 +1862,31 @@ def _is_noise_uncertainty(value: str) -> bool:
 
 def build_synthesis_uncertainties(
     extraction: ProductionExtractionV1,
+    *,
+    projection: RelevanceProjectionV1 | None = None,
 ) -> tuple[SynthesisUncertaintyV1, ...]:
     """Filter boilerplate, normalize duplicates, and preserve useful provenance."""
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
+    if projection is not None:
+        validate_relevance_projection_lineage(
+            projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+        )
+    uncertainty_refs = {
+        (ref.source_document_id, str(payload["text"])): ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.UNCERTAINTY
+    }
     provenance: dict[str, tuple[str, set[UUID]]] = {}
     for source in extraction.sources:
         for uncertainty in source.uncertainties:
             if _is_noise_uncertainty(uncertainty):
+                continue
+            ref = uncertainty_refs[(source.source_document_id, uncertainty)]
+            if projection is not None and projection.classification_for(ref).classification in {
+                RelevanceClassification.OUT_OF_SCOPE,
+                RelevanceClassification.INDETERMINATE,
+            }:
                 continue
             key = _normalized_synthesis_text(uncertainty)
             if not key:
@@ -1828,13 +1900,32 @@ def build_synthesis_uncertainties(
                 representative = uncertainty
             source_ids.add(source.source_document_id)
             provenance[key] = (representative, source_ids)
+    ranked = sorted(
+        provenance,
+        key=lambda key: (_uncertainty_impact_rank(provenance[key][0]), key),
+    )
     return tuple(
         SynthesisUncertaintyV1(
             text=provenance[key][0],
             source_document_ids=tuple(sorted(provenance[key][1], key=str)),
         )
-        for key in sorted(provenance)[:MAX_SYNTHESIS_UNCERTAINTIES]
+        for key in ranked[:MAX_SYNTHESIS_UNCERTAINTIES]
     )
+
+
+def _uncertainty_impact_rank(value: str) -> int:
+    """Rank attribution, causality, scope and chronology gaps before other gaps."""
+    normalized = _normalized_synthesis_text(value)
+    impact_terms = (
+        ("attribution", "attributed", "actor", "responsible", "identity"),
+        ("causal", "causality", "caused", "mechanism", "because", "link"),
+        ("scope", "same campaign", "same operation", "belongs", "related"),
+        ("date", "timeline", "period", "when", "chronology", "chronological"),
+    )
+    for rank, terms in enumerate(impact_terms):
+        if any(_normalized_synthesis_text(term) in normalized for term in terms):
+            return rank
+    return len(impact_terms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -2195,14 +2286,26 @@ class ProductionSynthesisService:
         run: ProductionRun,
         snapshot: ProductionInputSnapshot,
         extraction_artifact: ProductionArtifact,
+        projection_artifact: ProductionArtifact | None = None,
     ) -> ProductionSynthesisExecution:
         """Run at most one durable drafting submission for this generation."""
         try:
             extraction, extraction_hash = await self._load_extraction(
                 run, snapshot, extraction_artifact
             )
+            projection = (
+                await self._load_projection(
+                    run,
+                    snapshot,
+                    extraction,
+                    extraction_hash,
+                    projection_artifact,
+                )
+                if projection_artifact is not None
+                else None
+            )
             policy = await self._load_access_policy(snapshot, extraction)
-            evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+            evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
             access_policy_hash = synthesis_access_policy_hash(policy)
             input_hash = synthesis_input_hash(
                 snapshot, extraction, evidence_pack, access_policy_hash
@@ -2245,6 +2348,7 @@ class ProductionSynthesisService:
             run=run,
             snapshot=snapshot,
             extraction=extraction,
+            projection=projection,
             evidence_pack=evidence_pack,
             policy=policy,
             extraction_hash=extraction_hash,
@@ -2342,6 +2446,50 @@ class ProductionSynthesisService:
                 },
             )
         return extraction, canonical_extraction_hash(extraction)
+
+    async def _load_projection(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction: ProductionExtractionV1,
+        extraction_hash: str,
+        artifact: ProductionArtifact,
+    ) -> RelevanceProjectionV1:
+        if (
+            not isinstance(artifact, ProductionArtifact)
+            or artifact.stage is not ProductionArtifactStage.RELEVANCE_PROJECTION
+            or artifact.production_run_id != run.id
+            or artifact.subject_id != snapshot.subject_id
+            or artifact.status is not ProductionArtifactStatus.VERIFIED
+            or artifact.canonical_blob_id is None
+        ):
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISSING,
+                "The verified subject relevance projection is missing",
+            )
+        try:
+            projection = relevance_projection_from_json(
+                await self._artifact_store.read_json(artifact.canonical_blob_id)
+            )
+            validate_relevance_projection_lineage(
+                projection, extraction, extraction_hash=extraction_hash
+            )
+        except (TypeError, ValueError) as exc:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISMATCH,
+                "The subject relevance projection does not match canonical extraction",
+                details={"artifact_id": str(artifact.id), "reason": str(exc)},
+            ) from exc
+        if (
+            projection.production_input_hash != snapshot.input_hash
+            or artifact.input_hash != projection.input_hash
+        ):
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.INPUTS_MISMATCH,
+                "The subject relevance projection has different functional inputs",
+                details={"artifact_id": str(artifact.id)},
+            )
+        return projection
 
     async def _load_access_policy(
         self, snapshot: ProductionInputSnapshot, extraction: ProductionExtractionV1
@@ -2691,6 +2839,7 @@ class ProductionSynthesisService:
         run: ProductionRun,
         snapshot: ProductionInputSnapshot,
         extraction: ProductionExtractionV1,
+        projection: RelevanceProjectionV1 | None,
         evidence_pack: SynthesisEvidencePackV1,
         policy: SynthesisAccessPolicyV1,
         extraction_hash: str,
@@ -2855,7 +3004,9 @@ class ProductionSynthesisService:
         await self._record_wire_parse(model_run, evidence_pack, parsed)
 
         timeline_warnings: list[str] = []
-        timeline = build_synthesis_timeline(extraction, warnings=timeline_warnings)
+        timeline = build_synthesis_timeline(
+            extraction, projection=projection, warnings=timeline_warnings
+        )
         synthesis = ProductionSynthesisV1(
             schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
             subject_id=snapshot.subject_id,
@@ -2867,7 +3018,7 @@ class ProductionSynthesisService:
             lead=lead,
             sections=sections,
             timeline=timeline,
-            uncertainties=build_synthesis_uncertainties(extraction),
+            uncertainties=build_synthesis_uncertainties(extraction, projection=projection),
             warnings=_bounded_synthesis_warnings(
                 extraction,
                 additional_warnings=timeline_warnings,
@@ -2885,6 +3036,7 @@ class ProductionSynthesisService:
             mode=mode,
             model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
             routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
+            projection_hash=projection.projection_hash if projection is not None else None,
         )
         return ProductionSynthesisExecution(
             status=SynthesisExecutionStatus.SUCCEEDED,

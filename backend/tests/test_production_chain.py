@@ -343,9 +343,9 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
 
     assert orchestrator.calls == [ProductionStage.EXTRACTION]
     assert run.pipeline_generation == 11
-    assert run.current_stage is ProductionStage.SYNTHESIS
-    assert jobs.submitted[0].kind == stage_job_kind(ProductionStage.SYNTHESIS)
-    assert jobs.submitted[0].idempotency_key == f"production-synthesis-{run.id}-g11"
+    assert run.current_stage is ProductionStage.RELEVANCE_PROJECTION
+    assert jobs.submitted[0].kind == stage_job_kind(ProductionStage.RELEVANCE_PROJECTION)
+    assert jobs.submitted[0].idempotency_key == f"production-relevance_projection-{run.id}-g11"
     assert (
         production_reconciliation_resume_idempotency_key(
             run.id,

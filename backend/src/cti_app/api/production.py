@@ -2153,6 +2153,7 @@ async def invalidate_production_reuse(
     if payload.from_stage not in {
         ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
     }:
@@ -2334,6 +2335,13 @@ async def get_references_artifact(subject_id: UUID, request: Request) -> dict[st
 @router.get("/subjects/{subject_id}/production/artifacts/extraction")
 async def get_extraction_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     return await _artifact_view(request, subject_id, "extraction")
+
+
+@router.get("/subjects/{subject_id}/production/artifacts/relevance_projection")
+async def get_relevance_projection_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
+    return await _artifact_view(
+        request, subject_id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+    )
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/synthesis")

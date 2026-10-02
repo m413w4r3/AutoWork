@@ -77,6 +77,7 @@ class PublicationEvidenceKind(StrEnum):
     EVENT = "event"
     INDICATOR = "indicator"
     RULE = "rule"
+    UNCERTAINTY = "uncertainty"
 
 
 class PublicationAssemblyErrorCode(StrEnum):

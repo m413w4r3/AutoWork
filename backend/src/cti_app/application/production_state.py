@@ -198,7 +198,7 @@ class ProductionStateImportResult(BaseModel):
 
     run_id: UUID
     status: Literal["needs_review", "running"]
-    current_stage: Literal["assembly"]
+    current_stage: Literal["relevance_projection"]
     imported_stages: tuple[
         Literal["references"],
         Literal["extraction"],
@@ -767,13 +767,14 @@ class ProductionStateService:
                 edition_id=edition_id,
                 id=run_id,
                 status=ProductionRunStatus.NEEDS_REVIEW,
-                current_stage=ProductionStage.ASSEMBLY,
+                current_stage=ProductionStage.RELEVANCE_PROJECTION,
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(
                     "État importé : références, extraction, synthèse et enrichissement éditorial "
-                    "restaurés ; l'assemblage doit être reconstruit."
+                    "restaurés ; le périmètre des preuves et les étapes suivantes doivent être "
+                    "rejoués."
                 ),
                 started_at=now,
                 finished_at=now,
@@ -834,7 +835,7 @@ class ProductionStateService:
         return ProductionStateImportResult(
             run_id=run.id,
             status="needs_review",
-            current_stage="assembly",
+            current_stage="relevance_projection",
             imported_stages=("references", "extraction", "synthesis", "editorial_enrichment"),
             schema_version=snapshot.schema_version,
             content_sha256=snapshot.content_sha256,

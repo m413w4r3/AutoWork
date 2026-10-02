@@ -314,6 +314,8 @@ class _Orchestrator:
                     self.model_calls.append(f"q2:{entry['source_id']}")
                     entry["status"] = "succeeded"
             artifacts.add(run, ProductionArtifactStage.EXTRACTION)
+        elif expected_stage is ProductionStage.RELEVANCE_PROJECTION:
+            artifacts.add(run, ProductionArtifactStage.RELEVANCE_PROJECTION)
         elif expected_stage is ProductionStage.SYNTHESIS:
             self.model_calls.append("q4")
             artifacts.add(run, ProductionArtifactStage.SYNTHESIS)
@@ -564,6 +566,7 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     assert plan.model_calls_expected == 4
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
@@ -582,7 +585,11 @@ async def test_cancel_after_extraction_never_replays_extraction(
 ) -> None:
     world = _World(
         stage=ProductionStage.SYNTHESIS,
-        produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
+        produced=(
+            ProductionArtifactStage.REFERENCES,
+            ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
+        ),
         progress=_progress(*SOURCE_IDS),
     )
     registry, jobs, orchestrator = _register(world, monkeypatch)
@@ -591,7 +598,11 @@ async def test_cancel_after_extraction_never_replays_extraction(
     resumed = await _resume_and_drain(world, registry, jobs)
 
     assert resumed.plan.resume_from_stage is ProductionStage.SYNTHESIS
-    assert resumed.plan.reused_artifacts == ("references", "extraction")
+    assert resumed.plan.reused_artifacts == (
+        "references",
+        "extraction",
+        "relevance_projection",
+    )
     assert resumed.plan.model_calls_expected == 2
     assert orchestrator.calls == [
         ProductionStage.SYNTHESIS,
@@ -610,6 +621,7 @@ async def test_cancel_after_synthesis_runs_enrichment_then_assembles(
         produced=(
             ProductionArtifactStage.REFERENCES,
             ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
             ProductionArtifactStage.SYNTHESIS,
         ),
         progress=_progress(*SOURCE_IDS),
@@ -620,7 +632,12 @@ async def test_cancel_after_synthesis_runs_enrichment_then_assembles(
     resumed = await _resume_and_drain(world, registry, jobs)
 
     assert resumed.plan.resume_from_stage is ProductionStage.EDITORIAL_ENRICHMENT
-    assert resumed.plan.reused_artifacts == ("references", "extraction", "synthesis")
+    assert resumed.plan.reused_artifacts == (
+        "references",
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+    )
     assert resumed.plan.model_calls_expected == 1
     assert orchestrator.calls == [
         ProductionStage.EDITORIAL_ENRICHMENT,
@@ -684,7 +701,13 @@ async def test_resume_keeps_one_run_one_edition_entry_and_no_orphan_artifact(
     artifacts = await world.uow.production_artifacts.list_for_run(world.run.id)
     assert len(artifacts) == len(world.uow.production_artifacts.items)
     current = [artifact.stage.value for artifact in artifacts]
-    assert sorted(current) == ["extraction", "publication", "references", "synthesis"]
+    assert sorted(current) == [
+        "extraction",
+        "publication",
+        "references",
+        "relevance_projection",
+        "synthesis",
+    ]
     # What existed before the resume is still there, untouched.
     assert kept <= world.artifact_identities()
 
@@ -815,6 +838,7 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
     assert plan.reused_artifacts == (
         "references",
         "extraction",
+        "relevance_projection",
         "synthesis",
         "editorial_enrichment",
     )
@@ -823,7 +847,11 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
 async def test_the_log_payload_names_exactly_the_documented_fields() -> None:
     world = _World(
         stage=ProductionStage.SYNTHESIS,
-        produced=(ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION),
+        produced=(
+            ProductionArtifactStage.REFERENCES,
+            ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
+        ),
         progress=_progress(*SOURCE_IDS),
     )
     await world.service().cancel_run_with_result(world.run.id)
@@ -833,7 +861,7 @@ async def test_the_log_payload_names_exactly_the_documented_fields() -> None:
     assert resumed.plan.as_log_fields() == {
         "previous_status": "cancelled",
         "resume_from_stage": "synthesis",
-        "reused_artifacts": ["references", "extraction"],
+        "reused_artifacts": ["references", "extraction", "relevance_projection"],
         "model_calls_expected": 2,
     }
 

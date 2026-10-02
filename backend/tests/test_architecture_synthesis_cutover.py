@@ -47,6 +47,46 @@ def _assert_symbol_absent(path: Path, source: str, symbol: str) -> None:
     assert symbol not in source, f"{path}: forbidden symbol {symbol}"
 
 
+def _current_artifact_reads(method_name: str) -> set[str]:
+    module = ast.parse(WORKFLOW.read_text())
+    orchestrator = next(
+        node
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "ProductionWorkflowOrchestrator"
+    )
+    method = next(
+        node
+        for node in orchestrator.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == method_name
+    )
+    stages: set[str] = set()
+    for node in ast.walk(method):
+        if not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if not (
+            isinstance(function, ast.Attribute)
+            and function.attr == "get_current"
+            and isinstance(function.value, ast.Attribute)
+            and function.value.attr == "production_artifacts"
+        ):
+            continue
+        assert len(node.args) == 2
+        stage = node.args[1]
+        if isinstance(stage, ast.Constant) and isinstance(stage.value, str):
+            stages.add(stage.value)
+            continue
+        if (
+            isinstance(stage, ast.Attribute)
+            and stage.attr == "value"
+            and isinstance(stage.value, ast.Attribute)
+        ):
+            stages.add(stage.value.attr.lower())
+            continue
+        raise AssertionError(f"{method_name} reads an unrecognized artifact stage")
+    return stages
+
+
 def test_canonical_synthesis_has_no_legacy_evidence_or_conversation_path() -> None:
     synthesis_source = SYNTHESIS.read_text()
     workflow_branch = _canonical_workflow_branch()
@@ -75,6 +115,18 @@ def test_canonical_synthesis_uses_gateway_text_blocks_without_source_fetch() -> 
         "requests.",
     ):
         assert forbidden not in source
+
+
+def test_synthesis_and_enrichment_read_only_the_projection_artifact_in_addition() -> None:
+    assert _current_artifact_reads("_execute_synthesis_stage") == {
+        "extraction",
+        "relevance_projection",
+    }
+    assert _current_artifact_reads("_execute_editorial_enrichment_stage") == {
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+    }
 
 
 def test_backend_runtime_and_schema_have_no_synthesis_conversation_identity() -> None:

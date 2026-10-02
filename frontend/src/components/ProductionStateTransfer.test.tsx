@@ -92,7 +92,7 @@ function responseFor(input: RequestInfo | URL, init?: RequestInit): Response {
     return Response.json({
       run_id: "run-imported",
       status: "needs_review",
-      current_stage: "assembly",
+      current_stage: "relevance_projection",
       imported_stages: [
         "references",
         "extraction",

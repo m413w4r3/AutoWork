@@ -28,6 +28,7 @@ from cti_app.domain.production_synthesis import production_synthesis_from_json
 _COSTLY_STAGES = (
     ProductionArtifactStage.REFERENCES,
     ProductionArtifactStage.EXTRACTION,
+    ProductionArtifactStage.RELEVANCE_PROJECTION,
     ProductionArtifactStage.SYNTHESIS,
     ProductionArtifactStage.EDITORIAL_ENRICHMENT,
 )

@@ -42,6 +42,7 @@ interface SubjectProductionProps {
 const STAGE_ARTIFACT_LABELS: Record<string, string> = {
   references: "les références",
   extraction: "l’extraction",
+  relevance_projection: "le périmètre des preuves",
   synthesis: "la synthèse",
   editorial_enrichment: "l’enrichissement éditorial",
   publication: "l’assemblage",
@@ -55,6 +56,8 @@ const RETRY_DESCRIPTIONS: Record<RetryStage, string> = {
     "Les références et toutes les étapes suivantes seront recalculées. Les sources existantes seront conservées.",
   extraction:
     "L’extraction et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
+  relevance_projection:
+    "Le périmètre des preuves et toutes les étapes suivantes seront recalculés. Les références et l’extraction existantes seront conservées.",
   synthesis:
     "La synthèse et toutes les étapes suivantes seront recalculées. Les références existantes seront conservées.",
   editorial_enrichment:
@@ -438,6 +441,11 @@ export function SubjectProduction({
         </a>
         <a href={`/subjects/${subjectId}/production/artifacts/extraction`}>
           Voir l’extraction
+        </a>
+        <a
+          href={`/subjects/${subjectId}/production/artifacts/relevance_projection`}
+        >
+          Voir le périmètre des preuves
         </a>
         <a href={`/subjects/${subjectId}/production/artifacts/synthesis`}>
           Voir la synthèse

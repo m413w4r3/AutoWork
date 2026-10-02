@@ -31,6 +31,7 @@ class EvidenceKind(StrEnum):
     EVENT = "event"
     INDICATOR = "indicator"
     RULE = "rule"
+    UNCERTAINTY = "uncertainty"
 
 
 class SynthesisSectionKind(StrEnum):
@@ -475,12 +476,25 @@ def extraction_evidence_elements(
     if not isinstance(extraction, ProductionExtractionV1):
         raise ValueError("Expected a ProductionExtractionV1")
     payload = production_extraction_to_json(extraction)
-    return tuple(
+    elements = [
         (extraction_evidence_ref(source.source_document_id, kind, element), element)
         for source, source_payload in zip(extraction.sources, payload["sources"], strict=True)
         for kind, list_key in _EVIDENCE_PAYLOAD_KEYS
         for element in source_payload[list_key]
+    ]
+    elements.extend(
+        (
+            extraction_evidence_ref(
+                source.source_document_id,
+                EvidenceKind.UNCERTAINTY,
+                {"text": uncertainty},
+            ),
+            {"text": uncertainty},
+        )
+        for source in extraction.sources
+        for uncertainty in source.uncertainties
     )
+    return tuple(elements)
 
 
 def _ref_to_json(ref: ExtractionEvidenceRefV1) -> dict[str, str]:

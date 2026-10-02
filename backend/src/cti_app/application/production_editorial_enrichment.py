@@ -106,6 +106,12 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceProjectionV1,
+    relevance_projection_from_json,
+    validate_relevance_projection_lineage,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -125,7 +131,7 @@ if TYPE_CHECKING:
 EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v1"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 1
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v2-multi-source-authority"
+    "editorial-enrichment-evidence-pack-v3-subject-relevance-projection"
 )
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v2"
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
@@ -1018,6 +1024,7 @@ class EditorialEnrichmentEvidencePackV1:
     current_synthesis: Mapping[str, Any]
     narrative_evidence: tuple[Mapping[str, Any], ...]
     technical_evidence: tuple[Mapping[str, Any], ...]
+    projection_hash: str | None = None
     policy_version: str = EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
         default_factory=dict, repr=False, compare=False
@@ -1210,6 +1217,7 @@ def build_editorial_enrichment_evidence_pack(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    projection: RelevanceProjectionV1 | None = None,
 ) -> EditorialEnrichmentEvidencePackV1:
     """Build a stable source-free model projection and exact handle resolver."""
     if not isinstance(snapshot, ProductionInputSnapshot):
@@ -1227,20 +1235,37 @@ def build_editorial_enrichment_evidence_pack(
         and synthesis.publication_language == snapshot.publication_language
     ):
         raise ValueError("Editorial enrichment evidence inputs have mismatched lineage")
+    if projection is not None:
+        validate_relevance_projection_lineage(
+            projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+        )
+        if projection.production_input_hash != snapshot.input_hash:
+            raise ValueError("Editorial relevance projection does not match its snapshot")
 
     entries = _all_evidence_entries(extraction)
     source_by_id = {source.source_document_id: source for source in extraction.sources}
+
+    def admitted(ref: ExtractionEvidenceRefV1) -> bool:
+        if projection is None:
+            return True
+        return projection.classification_for(ref).classification not in {
+            RelevanceClassification.OUT_OF_SCOPE,
+            RelevanceClassification.INDETERMINATE,
+        }
+
     narrative_refs = {
         ref
         for ref in entries
         if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
         and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+        and admitted(ref)
     }
     technical_candidates = sorted(
         (
             ref
             for ref, payload in entries.items()
             if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
+            and admitted(ref)
             and (
                 str(payload.get("context") or "").strip()
                 or str(payload.get("evidence_quote") or "").strip()
@@ -1249,7 +1274,9 @@ def build_editorial_enrichment_evidence_pack(
         key=evidence_ref_sort_key,
     )[:MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE]
     included_refs = (
-        narrative_refs | set(technical_candidates) | set(synthesis_evidence_refs(synthesis))
+        narrative_refs
+        | set(technical_candidates)
+        | {ref for ref in synthesis_evidence_refs(synthesis) if admitted(ref)}
     )
 
     def authority_key(ref: ExtractionEvidenceRefV1) -> tuple[int, int, str, str]:
@@ -1302,6 +1329,7 @@ def build_editorial_enrichment_evidence_pack(
         current_synthesis=MappingProxyType(_synthesis_prompt_projection(synthesis, handle_for_ref)),
         narrative_evidence=tuple(MappingProxyType(record) for record in narrative_evidence),
         technical_evidence=tuple(MappingProxyType(record) for record in technical_evidence),
+        projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
     )
 
@@ -1320,6 +1348,7 @@ def editorial_enrichment_evidence_pack_hash(
                 "current_synthesis": dict(pack.current_synthesis),
                 "narrative_evidence": [dict(item) for item in pack.narrative_evidence],
                 "technical_evidence": [dict(item) for item in pack.technical_evidence],
+                "relevance_projection_hash": pack.projection_hash,
             }
         )
     ).hexdigest()
@@ -1441,6 +1470,7 @@ def build_editorial_enrichment_model_request(
         evidence_pack_hash=pack_hash,
         access_policy_hash=access_hash,
         source_figure_inventory_hash=source_figure_inventory_hash,
+        projection_hash=evidence_pack.projection_hash,
     )
     invocation_hash = compute_editorial_enrichment_invocation_hash(
         extraction=extraction,
@@ -1448,6 +1478,7 @@ def build_editorial_enrichment_model_request(
         evidence_pack_hash=pack_hash,
         access_policy_hash=access_hash,
         source_figure_inventory_hash=source_figure_inventory_hash,
+        projection_hash=evidence_pack.projection_hash,
     )
     prompt_payload = {
         "instructions": (
@@ -1470,6 +1501,7 @@ def build_editorial_enrichment_model_request(
         "current_evidence_pack": {
             "schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
             "policy_version": evidence_pack.policy_version,
+            "relevance_projection_hash": evidence_pack.projection_hash,
             "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
             "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
         },
@@ -1831,9 +1863,15 @@ class ProductionEditorialEnrichmentService:
         snapshot: ProductionInputSnapshot,
         extraction_artifact: ProductionArtifact,
         synthesis_artifact: ProductionArtifact,
+        projection_artifact: ProductionArtifact | None = None,
     ) -> ProductionEditorialEnrichmentExecution:
         try:
             extraction = await self._load_extraction(run, snapshot, extraction_artifact)
+            projection = (
+                await self._load_projection(run, snapshot, extraction, projection_artifact)
+                if projection_artifact is not None
+                else None
+            )
             synthesis = await self._load_synthesis(run, snapshot, synthesis_artifact, extraction)
             async with self._uow_factory() as uow:
                 try:
@@ -1857,7 +1895,7 @@ class ProductionEditorialEnrichmentService:
                 )
             await self._ingest_source_figures(source_figure_inventory)
             evidence_pack = build_editorial_enrichment_evidence_pack(
-                snapshot, extraction, synthesis
+                snapshot, extraction, synthesis, projection
             )
             evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
             access_policy_hash = synthesis_access_policy_hash(access_policy)
@@ -1866,6 +1904,7 @@ class ProductionEditorialEnrichmentService:
                 synthesis=synthesis,
                 evidence_pack_hash=evidence_pack_hash,
                 access_policy_hash=access_policy_hash,
+                projection_hash=projection.projection_hash if projection is not None else None,
                 source_figure_inventory_hash=source_figure_inventory.functional_hash(),
             )
         except _EditorialEnrichmentInputControl as control:
@@ -2075,6 +2114,7 @@ class ProductionEditorialEnrichmentService:
             model_run_id=model_run.id,
             evidence_pack_hash=evidence_pack_hash,
             access_policy_hash=access_policy_hash,
+            projection_hash=projection.projection_hash if projection is not None else None,
             model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
             routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
@@ -2309,6 +2349,49 @@ class ProductionEditorialEnrichmentService:
             )
         return synthesis
 
+    async def _load_projection(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        extraction: ProductionExtractionV1,
+        artifact: ProductionArtifact,
+    ) -> RelevanceProjectionV1:
+        if (
+            not isinstance(artifact, ProductionArtifact)
+            or artifact.stage is not ProductionArtifactStage.RELEVANCE_PROJECTION
+            or artifact.production_run_id != run.id
+            or artifact.subject_id != snapshot.subject_id
+            or artifact.status is not ProductionArtifactStatus.VERIFIED
+            or artifact.canonical_blob_id is None
+        ):
+            raise _EditorialEnrichmentInputControl(
+                EditorialEnrichmentStageErrorCode.INPUTS_MISSING,
+                "The verified subject relevance projection is missing",
+            )
+        try:
+            projection = relevance_projection_from_json(
+                await self._artifact_store.read_json(artifact.canonical_blob_id)
+            )
+            validate_relevance_projection_lineage(
+                projection, extraction, extraction_hash=canonical_extraction_hash(extraction)
+            )
+        except ProductionReuseStorageUnavailableError:
+            raise
+        except Exception as exc:
+            raise _EditorialEnrichmentInputControl(
+                EditorialEnrichmentStageErrorCode.INPUTS_MISMATCH,
+                "The subject relevance projection does not match canonical extraction",
+            ) from exc
+        if (
+            projection.production_input_hash != snapshot.input_hash
+            or artifact.input_hash != projection.input_hash
+        ):
+            raise _EditorialEnrichmentInputControl(
+                EditorialEnrichmentStageErrorCode.INPUTS_MISMATCH,
+                "The subject relevance projection has different functional inputs",
+            )
+        return projection
+
     async def _reuse_exact(
         self,
         *,
@@ -2431,6 +2514,7 @@ def _editorial_enrichment_identity_payload(
     synthesis: ProductionSynthesisV1,
     evidence_pack_hash: str,
     access_policy_hash: str,
+    projection_hash: str | None = None,
     source_figure_inventory_hash: str | None = None,
     prompt_version: str | None = None,
     contract_version: str | None = None,
@@ -2444,6 +2528,8 @@ def _editorial_enrichment_identity_payload(
         and _SHA256_RE.fullmatch(source_figure_inventory_hash) is None
     ):
         raise ValueError("Source figure inventory hash must be lowercase SHA-256")
+    if projection_hash is not None and _SHA256_RE.fullmatch(projection_hash) is None:
+        raise ValueError("Relevance projection hash must be lowercase SHA-256")
     payload = {
         "stage": "editorial_enrichment",
         "production_input_hash": synthesis.production_input_hash,
@@ -2455,6 +2541,7 @@ def _editorial_enrichment_identity_payload(
         "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
         "evidence_pack_policy_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION,
         "evidence_pack_hash": evidence_pack_hash,
+        "relevance_projection_hash": projection_hash,
         "access_policy_hash": access_policy_hash,
         "prompt_version": prompt_version or EDITORIAL_ENRICHMENT_PROMPT_VERSION,
         "contract_version": contract_version or EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
@@ -2473,6 +2560,7 @@ def compute_editorial_enrichment_invocation_hash(
     synthesis: ProductionSynthesisV1,
     evidence_pack_hash: str,
     access_policy_hash: str,
+    projection_hash: str | None = None,
     source_figure_inventory_hash: str | None = None,
     prompt_version: str | None = None,
     contract_version: str | None = None,
@@ -2483,6 +2571,7 @@ def compute_editorial_enrichment_invocation_hash(
         synthesis=synthesis,
         evidence_pack_hash=evidence_pack_hash,
         access_policy_hash=access_policy_hash,
+        projection_hash=projection_hash,
         source_figure_inventory_hash=source_figure_inventory_hash,
         prompt_version=prompt_version,
         contract_version=contract_version,
@@ -2496,6 +2585,7 @@ def compute_editorial_enrichment_input_hash(
     synthesis: ProductionSynthesisV1,
     evidence_pack_hash: str,
     access_policy_hash: str,
+    projection_hash: str | None = None,
     source_figure_inventory_hash: str | None = None,
     prompt_version: str | None = None,
     contract_version: str | None = None,
@@ -2507,6 +2597,7 @@ def compute_editorial_enrichment_input_hash(
         synthesis=synthesis,
         evidence_pack_hash=evidence_pack_hash,
         access_policy_hash=access_policy_hash,
+        projection_hash=projection_hash,
         source_figure_inventory_hash=source_figure_inventory_hash,
         prompt_version=prompt_version,
         contract_version=contract_version,

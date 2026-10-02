@@ -397,6 +397,7 @@ async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() ->
         subject_id=subject_id, edition_id=edition_id, payload=payload
     )
 
+    assert result.current_stage == "relevance_projection"
     assert item.production_run_id == result.run_id
     assert item.auto_recovery_count == 0
     uow.edition_production_batch_items.save.assert_awaited_once_with(item)

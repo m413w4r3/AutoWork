@@ -37,10 +37,18 @@ from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
     ProductionReferenceSourceV1,
 )
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceProjectionV1,
+    RelevanceReasonCode,
+    validate_relevance_projection_lineage,
+)
 from cti_app.domain.production_synthesis import (
+    EvidenceKind,
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
+    extraction_evidence_elements,
     extraction_evidence_refs_v1,
     synthesis_evidence_refs,
 )
@@ -162,9 +170,23 @@ def _project_synthesis_publication(
 
 
 def _project_publication_iocs(
-    *, extraction: ProductionExtractionV1, narrative: _PublicationNarrativeProjection
+    *,
+    extraction: ProductionExtractionV1,
+    narrative: _PublicationNarrativeProjection,
+    relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> _PublicationContentProjection:
     """Add confirmed canonical IOCs to the narrative projection."""
+    indicator_ref_by_identity = {
+        (
+            ref.source_document_id,
+            str(payload["value"]),
+            str(payload["artifact_type"]),
+            str(payload["context"]),
+            str(payload["evidence_quote"]),
+        ): ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.INDICATOR
+    }
     occurrences: dict[tuple[ArtifactType, str], tuple[set[str], set[UUID]]] = {}
     for source in extraction.sources:
         for item in source.indicators:
@@ -173,6 +195,25 @@ def _project_publication_iocs(
                 or item.artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES
             ):
                 continue
+            if relevance_projection is not None:
+                ref = indicator_ref_by_identity[
+                    (
+                        source.source_document_id,
+                        item.value,
+                        item.artifact_type.value,
+                        item.context,
+                        item.evidence_quote,
+                    )
+                ]
+                decision = relevance_projection.classification_for(ref)
+                if decision.classification not in {
+                    RelevanceClassification.DIRECT,
+                    RelevanceClassification.CORROBORATION,
+                } or decision.reason_code not in {
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                    RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
+                }:
+                    continue
             try:
                 normalized_value = normalize_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
@@ -223,6 +264,7 @@ def _validate_publication_lineage(
     references: ProductionReferenceCorpusV1,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> None:
     """Require all canonical artifacts to belong to the same frozen inputs."""
     if (
@@ -260,9 +302,26 @@ def _validate_publication_lineage(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
             "Synthesis does not match the canonical extraction",
         )
+    if relevance_projection is not None:
+        try:
+            validate_relevance_projection_lineage(
+                relevance_projection,
+                extraction,
+                extraction_hash=canonical_extraction_hash(extraction),
+            )
+        except ValueError as exc:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                "Relevance projection does not match canonical extraction",
+            ) from exc
+        if relevance_projection.production_input_hash != snapshot.input_hash:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.INPUTS_MISMATCH,
+                "Relevance projection does not match the production input snapshot",
+            )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "2"
+ASSEMBLY_POLICY_VERSION: Final[str] = "3-subject-relevance-projection"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -276,6 +335,7 @@ def compute_assembly_input_hash(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1,
+    relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> str:
     """Return the deterministic functional identity of canonical Assembly inputs."""
     payload = {
@@ -284,6 +344,9 @@ def compute_assembly_input_hash(
         "extraction_hash": canonical_extraction_hash(extraction),
         "synthesis_hash": canonical_synthesis_hash(synthesis),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(editorial_enrichment),
+        "relevance_projection_hash": (
+            relevance_projection.projection_hash if relevance_projection is not None else None
+        ),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
     }
@@ -489,6 +552,7 @@ def build_publication_document_v4(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1,
+    relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> PublicationDocumentV4:
     """Build the renderer-independent V4 publication from canonical inputs."""
     _validate_publication_lineage(
@@ -496,6 +560,7 @@ def build_publication_document_v4(
         references=references,
         extraction=extraction,
         synthesis=synthesis,
+        relevance_projection=relevance_projection,
     )
     _validate_publication_enrichment(
         editorial_enrichment=editorial_enrichment,
@@ -504,7 +569,11 @@ def build_publication_document_v4(
     )
 
     narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
-    projection = _project_publication_iocs(extraction=extraction, narrative=narrative)
+    projection = _project_publication_iocs(
+        extraction=extraction,
+        narrative=narrative,
+        relevance_projection=relevance_projection,
+    )
     tables = _project_publication_tables(editorial_enrichment.tables)
     diagrams = _project_publication_diagrams(editorial_enrichment.diagrams)
     figures = _project_publication_figures(editorial_enrichment.source_figures)

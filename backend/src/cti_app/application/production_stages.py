@@ -374,6 +374,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         access_policy_hash: str,
         model_policy_version: str,
         routing_policy_version: str,
+        projection_hash: str | None = None,
         source_figure_inventory_hash: str | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
@@ -386,6 +387,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             synthesis=synthesis,
             evidence_pack_hash=evidence_pack_hash,
             access_policy_hash=access_policy_hash,
+            projection_hash=projection_hash,
             source_figure_inventory_hash=source_figure_inventory_hash,
         ):
             raise ValueError("editorial_enrichment_lineage_mismatch")
@@ -416,6 +418,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 "routing_policy_version": routing_policy_version,
                 "evidence_pack_hash": evidence_pack_hash,
                 "access_policy_hash": access_policy_hash,
+                "relevance_projection_hash": projection_hash,
                 "table_count": len(enrichment.tables),
                 "diagram_count": len(enrichment.diagrams),
                 "source_figure_count": len(enrichment.source_figures),
@@ -467,6 +470,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         mode: SynthesisMode = SynthesisMode.FRESH,
         model_policy_version: str = "",
         routing_policy_version: str = "",
+        projection_hash: str | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
@@ -499,6 +503,7 @@ class SynthesisService(_ArtifactPayloadMixin):
             "word_count": sum(len(value.split()) for value in narrative),
             "model_policy_version": model_policy_version,
             "routing_policy_version": routing_policy_version,
+            "relevance_projection_hash": projection_hash,
             "synthesis_policy_version": synthesis.synthesis_policy_version,
         }
         async with self._uow_factory() as uow:

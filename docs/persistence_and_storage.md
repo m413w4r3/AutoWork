@@ -63,16 +63,17 @@ d’idempotence associe la clé à l’empreinte canonique du payload : le même
 le même batch ; une autre empreinte ou une nouvelle clé incompatible avec un batch actif est
 refusée. Le board de production peut être vide et retourne alors `200` avec zéro sujet.
 
-La pipeline d’un run est fixe : `SOURCES`, `REFERENCES`, `EXTRACTION`, `SYNTHESIS`,
-`EDITORIAL_ENRICHMENT`, `ASSEMBLY`,
+La pipeline d’un run est fixe : `SOURCES`, `REFERENCES`, `EXTRACTION`,
+`RELEVANCE_PROJECTION`, `SYNTHESIS`, `EDITORIAL_ENRICHMENT`, `ASSEMBLY`,
 puis `READY`. Les états asynchrones vivent en PostgreSQL ; Redis ne transporte que les identifiants
 de jobs. L’annulation conserve l’historique, arrête les travaux non terminés et ne ferme pas
 l’édition.
 
 Production State V5 exporte les quatre blobs canoniques vérifiés de `REFERENCES`, `EXTRACTION`,
 `SYNTHESIS` et `EDITORIAL_ENRICHMENT`, avec leurs hashes et leur lineage. Son import les restaure
-en nouveaux artifacts et reprend à `ASSEMBLY` après revue. `PUBLICATION` est reconstruite par
-Assembly et ne fait pas partie du snapshot portable.
+en nouveaux artifacts et reprend à `RELEVANCE_PROJECTION` après revue. Cette étape recalcule la
+projection depuis l’extraction portable et le snapshot sujet avant la reprise de Synthesis.
+`PUBLICATION` est reconstruite par Assembly et ne fait pas partie du snapshot portable.
 
 `ASSEMBLY` produit l'artifact canonique `PUBLICATION` sans rendu. `READY` valide la production
 canonique et sa QA, indépendamment du rendu PDF d'un article ou d'un bulletin.

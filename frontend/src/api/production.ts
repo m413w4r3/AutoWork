@@ -7,6 +7,7 @@ export type ProductionStage =
   | "sources"
   | "references"
   | "extraction"
+  | "relevance_projection"
   | "synthesis"
   | "editorial_enrichment"
   | "assembly";
@@ -886,7 +887,7 @@ export type ProductionStateSnapshot = ProductionStateSnapshotV5;
 export interface ProductionStateImportResult {
   run_id: string;
   status: "needs_review";
-  current_stage: "assembly";
+  current_stage: "relevance_projection";
   imported_stages: [
     "references",
     "extraction",
@@ -1207,6 +1208,14 @@ export async function getExtractionArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/extraction`);
+}
+
+export async function getRelevanceProjectionArtifact(
+  subjectId: string,
+): Promise<ArtifactResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/relevance_projection`,
+  );
 }
 
 export async function getSynthesisArtifact(

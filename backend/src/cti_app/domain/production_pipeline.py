@@ -17,6 +17,10 @@ PRODUCTION_PIPELINE: tuple[ProductionStageSpec, ...] = (
     ProductionStageSpec(ProductionStage.SOURCES, None),
     ProductionStageSpec(ProductionStage.REFERENCES, ProductionArtifactStage.REFERENCES),
     ProductionStageSpec(ProductionStage.EXTRACTION, ProductionArtifactStage.EXTRACTION),
+    ProductionStageSpec(
+        ProductionStage.RELEVANCE_PROJECTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
+    ),
     ProductionStageSpec(ProductionStage.SYNTHESIS, ProductionArtifactStage.SYNTHESIS),
     ProductionStageSpec(
         ProductionStage.EDITORIAL_ENRICHMENT,

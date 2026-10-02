@@ -66,6 +66,9 @@ class TestProductionRunStates:
         assert run.current_stage is ProductionStage.EXTRACTION
 
         run.advance_stage(now=datetime.now(UTC))
+        assert run.current_stage is ProductionStage.RELEVANCE_PROJECTION
+
+        run.advance_stage(now=datetime.now(UTC))
         assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage(now=datetime.now(UTC))
@@ -335,6 +338,7 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
         for stage in (
             ProductionArtifactStage.REFERENCES,
             ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
             ProductionArtifactStage.SYNTHESIS,
             ProductionArtifactStage.PUBLICATION,
         )
@@ -401,6 +405,7 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
 
     assert result.staled_artifacts == [
         "extraction",
+        "relevance_projection",
         "synthesis",
         "editorial_enrichment",
         "publication",
@@ -415,6 +420,7 @@ async def test_retry_from_extraction_stales_downstream_artifacts_only() -> None:
         if artifact.status is ProductionArtifactStatus.STALE
     } == {
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.PUBLICATION,
     }

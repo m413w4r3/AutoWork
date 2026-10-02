@@ -23,6 +23,7 @@ def test_production_stage_order_and_stage_artifact_mapping() -> None:
         ProductionStage.SOURCES,
         ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
@@ -31,6 +32,7 @@ def test_production_stage_order_and_stage_artifact_mapping() -> None:
         None,
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
@@ -38,6 +40,7 @@ def test_production_stage_order_and_stage_artifact_mapping() -> None:
     assert production_artifact_stages() == (
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
@@ -50,6 +53,10 @@ def test_production_stage_order_and_stage_artifact_mapping() -> None:
     [
         (ProductionArtifactStage.REFERENCES, ProductionStage.REFERENCES),
         (ProductionArtifactStage.EXTRACTION, ProductionStage.EXTRACTION),
+        (
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
+            ProductionStage.RELEVANCE_PROJECTION,
+        ),
         (ProductionArtifactStage.SYNTHESIS, ProductionStage.SYNTHESIS),
         (ProductionArtifactStage.EDITORIAL_ENRICHMENT, ProductionStage.EDITORIAL_ENRICHMENT),
         (ProductionArtifactStage.PUBLICATION, ProductionStage.ASSEMBLY),
@@ -67,6 +74,7 @@ def test_prerequisite_artifacts_follow_the_pipeline() -> None:
         None,
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
     )
@@ -77,7 +85,8 @@ def test_prerequisite_artifacts_follow_the_pipeline() -> None:
     [
         (ProductionStage.SOURCES, ProductionStage.REFERENCES),
         (ProductionStage.REFERENCES, ProductionStage.EXTRACTION),
-        (ProductionStage.EXTRACTION, ProductionStage.SYNTHESIS),
+        (ProductionStage.EXTRACTION, ProductionStage.RELEVANCE_PROJECTION),
+        (ProductionStage.RELEVANCE_PROJECTION, ProductionStage.SYNTHESIS),
         (ProductionStage.SYNTHESIS, ProductionStage.EDITORIAL_ENRICHMENT),
         (ProductionStage.EDITORIAL_ENRICHMENT, ProductionStage.ASSEMBLY),
         (ProductionStage.ASSEMBLY, None),
@@ -95,6 +104,7 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
             (
                 ProductionArtifactStage.REFERENCES,
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -102,6 +112,7 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
             (
                 ProductionArtifactStage.REFERENCES,
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -111,6 +122,7 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
             ProductionStage.REFERENCES,
             (
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -118,6 +130,7 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
             (
                 ProductionArtifactStage.REFERENCES,
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -126,12 +139,14 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
         (
             ProductionStage.EXTRACTION,
             (
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
             ),
             (
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -141,6 +156,20 @@ def test_next_stage(stage: ProductionStage, successor: ProductionStage | None) -
             ProductionStage.SYNTHESIS,
             (ProductionArtifactStage.EDITORIAL_ENRICHMENT, ProductionArtifactStage.PUBLICATION),
             (
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                ProductionArtifactStage.PUBLICATION,
+            ),
+        ),
+        (
+            ProductionStage.RELEVANCE_PROJECTION,
+            (
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                ProductionArtifactStage.PUBLICATION,
+            ),
+            (
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -174,6 +203,7 @@ def test_downstream_artifacts_from_pipeline_stage(
             ProductionArtifactStage.REFERENCES,
             (
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -181,6 +211,7 @@ def test_downstream_artifacts_from_pipeline_stage(
             (
                 ProductionArtifactStage.REFERENCES,
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
@@ -189,12 +220,28 @@ def test_downstream_artifacts_from_pipeline_stage(
         (
             ProductionArtifactStage.EXTRACTION,
             (
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,
             ),
             (
                 ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                ProductionArtifactStage.PUBLICATION,
+            ),
+        ),
+        (
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
+            (
+                ProductionArtifactStage.SYNTHESIS,
+                ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+                ProductionArtifactStage.PUBLICATION,
+            ),
+            (
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
                 ProductionArtifactStage.SYNTHESIS,
                 ProductionArtifactStage.EDITORIAL_ENRICHMENT,
                 ProductionArtifactStage.PUBLICATION,

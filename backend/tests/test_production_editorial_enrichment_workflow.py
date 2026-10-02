@@ -83,6 +83,15 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
         )
         upstream[stage] = artifact
         await uow.production_artifacts.append(artifact)
+    projection_artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="c" * 64,
+    )
+    upstream[ProductionArtifactStage.RELEVANCE_PROJECTION] = projection_artifact
+    await uow.production_artifacts.append(projection_artifact)
 
     run = ProductionRun(
         id=run_id,
@@ -130,6 +139,7 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
             snapshot,
             upstream[ProductionArtifactStage.EXTRACTION],
             upstream[ProductionArtifactStage.SYNTHESIS],
+            upstream[ProductionArtifactStage.RELEVANCE_PROJECTION],
         )
     ]
     assert result == {

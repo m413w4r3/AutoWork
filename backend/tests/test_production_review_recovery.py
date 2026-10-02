@@ -431,6 +431,7 @@ async def test_review_retry_reopens_the_finished_batch_and_reaches_assembly(
 
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,
@@ -629,6 +630,7 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
 
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
         ProductionStage.EDITORIAL_ENRICHMENT,
         ProductionStage.ASSEMBLY,

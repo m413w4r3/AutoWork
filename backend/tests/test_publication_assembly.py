@@ -602,8 +602,8 @@ async def test_ioc_only_repair_reuses_narrative_and_reassembles_canonical_public
         value="ioc.example",
         artifact_type=ArtifactType.DOMAIN,
         indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
-        context="",
-        evidence_quote="The source identifies the domain.",
+        context="Example actor used the malicious domain for command and control.",
+        evidence_quote=("Example actor used the malicious domain for command and control."),
         evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
         source_document_ids=(source.source_document_id,),
     )

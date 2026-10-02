@@ -30,6 +30,7 @@ class ProductionStage(StrEnum):
     SOURCES = "sources"
     REFERENCES = "references"
     EXTRACTION = "extraction"
+    RELEVANCE_PROJECTION = "relevance_projection"
     SYNTHESIS = "synthesis"
     EDITORIAL_ENRICHMENT = "editorial_enrichment"
     ASSEMBLY = "assembly"
@@ -673,6 +674,7 @@ class ProductionInputSnapshot:
 class ProductionArtifactStage(StrEnum):
     REFERENCES = "references"
     EXTRACTION = "extraction"
+    RELEVANCE_PROJECTION = "relevance_projection"
     SYNTHESIS = "synthesis"
     EDITORIAL_ENRICHMENT = "editorial_enrichment"
     PUBLICATION = "publication"
@@ -999,6 +1001,7 @@ class ProductionRun:
                 ProductionStage.SOURCES: ProductionStage.REFERENCES,
                 ProductionStage.REFERENCES: ProductionStage.REFERENCES,
                 ProductionStage.EXTRACTION: ProductionStage.EXTRACTION,
+                ProductionStage.RELEVANCE_PROJECTION: ProductionStage.RELEVANCE_PROJECTION,
                 ProductionStage.SYNTHESIS: ProductionStage.SYNTHESIS,
                 ProductionStage.EDITORIAL_ENRICHMENT: ProductionStage.EDITORIAL_ENRICHMENT,
                 ProductionStage.ASSEMBLY: None,
@@ -1289,6 +1292,7 @@ class ProductionReuseInvalidation:
         if self.from_stage not in {
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
+            ProductionStage.RELEVANCE_PROJECTION,
             ProductionStage.SYNTHESIS,
             ProductionStage.EDITORIAL_ENRICHMENT,
         }:

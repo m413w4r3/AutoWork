@@ -74,11 +74,13 @@ modifie jamais ce snapshot ni le run historique.
 Chaque run suit une pipeline statique et ordonnée :
 
 ```text
-SOURCES → REFERENCES → EXTRACTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
+SOURCES → REFERENCES → EXTRACTION → RELEVANCE_PROJECTION → SYNTHESIS → EDITORIAL_ENRICHMENT → ASSEMBLY → READY
 ```
 
-`EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et déterministe en
-AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
+`RELEVANCE_PROJECTION` ajoute une classification déterministe propre au sujet sur l’extraction
+canonique, sans modifier ses checkpoints source. `SYNTHESIS` et `EDITORIAL_ENRICHMENT` consomment
+cette projection. `EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et
+déterministe en AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
 fonctionnelle de `PUBLICATION`, dont le corps est `PublicationDocumentV4`. `READY` signifie
 que les artifacts canoniques sont valides et que la QA canonique a réussi ; le rendu PDF constitue
 un pipeline distinct.
@@ -97,12 +99,13 @@ Le stage n’a pas de conversation canonique; le RAW conserve temporairement le 
 les champs legacy nécessaires aux anciens consommateurs.
 
 Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` et ne partage
-avec lui ni module ni service. Extraction consomme le corpus directement. Synthesis lit
-`ProductionExtractionV1`, puis Editorial Enrichment lie un contrat vide à l’extraction et à la
-synthèse. Assembly construit `PublicationDocumentV4` depuis le snapshot, le corpus, l’extraction,
-la synthèse et cet enrichment, sans compiler de média ni rendre de document. Le format portable
-Production State V5 conserve les quatre
-artefacts canoniques avant Assembly, enrichissement éditorial compris.
+avec lui ni module ni service. Extraction consomme le corpus directement. `RELEVANCE_PROJECTION`
+classe les éléments de `ProductionExtractionV1` pour le sujet figé. Synthesis et Editorial
+Enrichment ne consomment que les éléments admis par cette projection. Assembly construit
+`PublicationDocumentV4` depuis le snapshot, le corpus, l’extraction, la projection, la synthèse et
+cet enrichment, sans compiler de média ni rendre de document. Production State V5 conserve les
+quatre artefacts portables de `REFERENCES`, `EXTRACTION`, `SYNTHESIS` et `EDITORIAL_ENRICHMENT`;
+l’import reprend à `RELEVANCE_PROJECTION` pour la reconstruire avant Synthesis.
 
 La surface Production ne déclenche ni `GET` ni `POST` Selection. Elle ne dépend d’aucune projection
 de regroupement éditorial et n’ajoute aucun statut de production à l’édition.

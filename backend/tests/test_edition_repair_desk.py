@@ -30,6 +30,7 @@ from cti_app.domain.production import (
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
+    ProductionDerivedOutput,
     ProductionRepairAction,
     ProductionRepairIssueKind,
     ProductionRun,
@@ -328,9 +329,9 @@ async def test_an_article_with_no_repair_issue_still_appears_when_it_owes_a_rebu
     assert page.summary.articles_needing_rebuild == 1
     article = next(item for item in page.articles if item.subject_id == SUBJECT_B)
     # The stage named here is the one the retry endpoint will accept.
-    assert article.recommended_stage == "synthesis"
+    assert article.recommended_stage == "relevance_projection"
     assert article.active_repair_count == 0
-    assert article.execution_plan.model_call_required is True
+    assert article.execution_plan.model_call_required is False
 
 
 @pytest.mark.asyncio
@@ -343,7 +344,14 @@ async def test_the_rebuild_debt_outranks_a_repair_plan_that_asks_for_nothing() -
     ).list(EDITION_ID, status="all", limit=20)
 
     assert page.summary.articles_needing_rebuild == 1
-    assert page.articles[0].recommended_stage == "synthesis"
+    assert page.articles[0].recommended_stage == "relevance_projection"
+    assert page.articles[0].execution_plan.affected_outputs == frozenset(
+        {
+            ProductionDerivedOutput.SYNTHESIS,
+            ProductionDerivedOutput.EDITORIAL_ENRICHMENT,
+            ProductionDerivedOutput.PUBLICATION,
+        }
+    )
 
 
 @pytest.mark.asyncio

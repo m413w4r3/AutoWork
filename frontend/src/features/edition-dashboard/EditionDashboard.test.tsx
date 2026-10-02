@@ -275,7 +275,7 @@ describe("EditionDashboard", () => {
 
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(screen.getAllByText("Chargement…", { selector: "td" })).toHaveLength(
-      5,
+      6,
     );
     expect(
       screen.queryAllByText("Non démarrée", { selector: "td" }),
@@ -291,7 +291,7 @@ describe("EditionDashboard", () => {
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(
       screen.getAllByText("Indisponible", { selector: "td" }),
-    ).toHaveLength(5);
+    ).toHaveLength(6);
     expect(
       screen.queryAllByText("Non démarrée", { selector: "td" }),
     ).toHaveLength(0);
@@ -306,7 +306,7 @@ describe("EditionDashboard", () => {
     expect(await screen.findByText("Sujet non démarré")).toBeInTheDocument();
     expect(
       screen.getAllByText("Non démarrée", { selector: "td" }),
-    ).toHaveLength(6);
+    ).toHaveLength(7);
   });
 
   it("signale un payload Subjects non conforme sans afficher l'état vide", async () => {
@@ -432,6 +432,7 @@ describe("EditionDashboard", () => {
     for (const stage of [
       "Références",
       "Extraction",
+      "Périmètre des preuves",
       "Synthèse",
       "Enrichissement",
       "Assemblage",
@@ -443,10 +444,11 @@ describe("EditionDashboard", () => {
     const cells = screen
       .getAllByRole("cell")
       .map((cell) => cell.textContent)
-      .slice(-5);
+      .slice(-6);
     expect(cells).toEqual([
       "Terminée",
       "Attention",
+      NON_DEMARREE,
       "En cours",
       NON_DEMARREE,
       NON_DEMARREE,

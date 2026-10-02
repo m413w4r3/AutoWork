@@ -27,6 +27,7 @@ from cti_app.application.production_extraction import extraction_input_hash
 from cti_app.application.production_references import (
     production_reference_corpus_from_json,
 )
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_stages import ReferenceResearchService
 from cti_app.application.production_synthesis import (
     ProductionSynthesisExecution,
@@ -73,6 +74,7 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_relevance import relevance_projection_to_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_production_synthesis_storage import canonical_pair
@@ -1265,9 +1267,11 @@ async def test_references_retry_reuses_the_same_model_run_identity(
 
 
 class _SynthesisArtifacts:
-    """Artifact repository double: the REFERENCES stage is never readable."""
+    """Synthesis may read extraction plus its exact relevance projection."""
 
-    _READABLE_STAGES: ClassVar[frozenset[str]] = frozenset({"extraction", "synthesis"})
+    _READABLE_STAGES: ClassVar[frozenset[str]] = frozenset(
+        {"extraction", "relevance_projection", "synthesis"}
+    )
 
     def __init__(self, items: list[ProductionArtifact] | None = None) -> None:
         self.items = list(items or [])
@@ -1597,14 +1601,26 @@ def _synthesis_world() -> SimpleNamespace:
         input_hash="c" * 64,
         canonical_blob_id=extraction_blob_id,
     )
-    artifacts = _SynthesisArtifacts([extraction_artifact])
+    projection = build_relevance_projection(snapshot, extraction)
+    projection_blob_id = store.put(
+        ProductionArtifactStore.canonical_json_bytes(relevance_projection_to_json(projection))
+    )
+    projection_artifact = ProductionArtifact(
+        production_run_id=run.id,
+        subject_id=run.subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        canonical_blob_id=projection_blob_id,
+    )
+    artifacts = _SynthesisArtifacts([extraction_artifact, projection_artifact])
     uow = _SynthesisUow(
         runs={run.id: run},
         snapshots={run.id: snapshot},
         artifacts=artifacts,
         documents=[document],
     )
-    pack = build_synthesis_evidence_pack(snapshot, extraction)
+    pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
     handles = {str(entry["kind"]): str(entry["handle"]) for entry in pack.narrative_evidence}
     gateway = _SynthesisGateway(_synthesis_proposal(handles))
     orchestrator = ProductionWorkflowOrchestrator(
@@ -1620,6 +1636,8 @@ def _synthesis_world() -> SimpleNamespace:
         document=document,
         extraction_blob_id=extraction_blob_id,
         extraction_artifact=extraction_artifact,
+        projection=projection,
+        projection_artifact=projection_artifact,
         artifacts=artifacts,
         uow=uow,
         store=store,
@@ -1630,7 +1648,7 @@ def _synthesis_world() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact() -> None:
+async def test_synthesis_stage_uses_extraction_and_only_its_relevance_projection() -> None:
     world = _synthesis_world()
     for legacy_input in (
         "load_reference_projection",
@@ -1643,7 +1661,11 @@ async def test_synthesis_stage_uses_only_the_canonical_extraction_artifact() -> 
 
     assert result["status"] == "success"
     assert result["mode"] == "fresh"
-    assert {stage for _, stage in world.artifacts.requested} == {"extraction", "synthesis"}
+    assert {stage for _, stage in world.artifacts.requested} == {
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+    }
     assert not hasattr(world.run, "synthesis_conversation_id")
     assert len(world.gateway.requests) == 1
     request = world.gateway.requests[0]
@@ -1680,7 +1702,13 @@ async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None
         input_hash="d" * 64,
         canonical_blob_id=first.extraction_blob_id,
     )
-    artifacts_b = _SynthesisArtifacts([extraction_artifact_b, source_artifact])
+    projection_artifact_b = replace(
+        first.projection_artifact,
+        production_run_id=run_b.id,
+    )
+    artifacts_b = _SynthesisArtifacts(
+        [extraction_artifact_b, projection_artifact_b, source_artifact]
+    )
     uow_b = _SynthesisUow(
         runs={run_b.id: run_b},
         snapshots={run_b.id: snapshot_b},

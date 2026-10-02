@@ -164,7 +164,12 @@ function stubProductionFetch(payloads: {
 }
 
 function renderArtifact(
-  stage: "references" | "extraction" | "synthesis" | "publication",
+  stage:
+    | "references"
+    | "extraction"
+    | "relevance_projection"
+    | "synthesis"
+    | "publication",
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -175,6 +180,41 @@ function renderArtifact(
     </QueryClientProvider>,
   );
 }
+
+it("keeps ambiguous relevance decisions visible with their reasons", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "projection-1",
+        stage: "relevance_projection",
+        version: 1,
+        status: "verified",
+        metadata: {},
+        canonical_content: {
+          classifications: [
+            {
+              classification: "indeterminate",
+              reason_code: "relation_not_established",
+              evidence_ref: { kind: "fact", evidence_key: "a".repeat(64) },
+              supporting_evidence_refs: [],
+              provenance: "deterministic_policy",
+            },
+          ],
+        },
+      }),
+    ),
+  );
+
+  renderArtifact("relevance_projection");
+
+  expect(
+    await screen.findByText(/"classification": "indeterminate"/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/"reason_code": "relation_not_established"/),
+  ).toBeInTheDocument();
+});
 
 it("ne rend pas une publication dont le schema n'est pas V4", async () => {
   vi.stubGlobal(

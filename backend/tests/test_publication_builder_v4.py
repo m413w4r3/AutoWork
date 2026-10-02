@@ -651,6 +651,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
             ProductionArtifactStore.canonical_json_bytes(production_synthesis_to_json(synthesis))
         ).hexdigest(),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(enrichment),
+        "relevance_projection_hash": None,
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
     }
@@ -816,6 +817,7 @@ def test_assembly_input_hash_api_excludes_runtime_and_renderer_inputs() -> None:
         "extraction",
         "synthesis",
         "editorial_enrichment",
+        "relevance_projection",
     )
     assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 

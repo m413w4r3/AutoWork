@@ -1628,7 +1628,7 @@ async def _seed_exportable_run(
     return run
 
 
-async def test_imported_v5_state_is_directly_assemblable(
+async def test_imported_v5_state_rebuilds_relevance_before_assembly(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
@@ -1665,7 +1665,7 @@ async def test_imported_v5_state_is_directly_assemblable(
     imported = await api.post(f"/api/subjects/{subject_id}/production/state/import", json=snapshot)
     assert imported.status_code == 200, imported.text
     assert imported.json()["status"] == "needs_review"
-    assert imported.json()["current_stage"] == "assembly"
+    assert imported.json()["current_stage"] == "relevance_projection"
     assert imported.json()["imported_stages"] == [
         "references",
         "extraction",
@@ -1678,12 +1678,13 @@ async def test_imported_v5_state_is_directly_assemblable(
 
     production = await api.get(f"/api/subjects/{subject_id}/production")
     assert production.json()["status"] == "needs_review"
-    assert production.json()["current_stage"] == "assembly"
+    assert production.json()["current_stage"] == "relevance_projection"
     assert production.json()["stages"]["references"]["status"] == "succeeded"
     assert production.json()["stages"]["extraction"]["status"] == "succeeded"
-    assert production.json()["stages"]["synthesis"]["status"] == "succeeded"
-    assert production.json()["stages"]["editorial_enrichment"]["status"] == "succeeded"
-    assert production.json()["stages"]["assembly"]["status"] == "needs_review"
+    assert production.json()["stages"]["relevance_projection"]["status"] == "needs_review"
+    assert production.json()["stages"]["synthesis"]["status"] == "pending"
+    assert production.json()["stages"]["editorial_enrichment"]["status"] == "pending"
+    assert production.json()["stages"]["assembly"]["status"] == "pending"
     imported_artifacts: dict[str, dict[str, Any]] = {}
     for stage in ("references", "extraction", "synthesis", "editorial_enrichment"):
         artifact = await api.get(f"/api/subjects/{subject_id}/production/artifacts/{stage}")
@@ -1859,17 +1860,37 @@ async def test_production_state_import_maps_validation_errors(
         (
             ProductionRunStatus.READY,
             ProductionStage.SOURCES,
-            ["references", "extraction", "synthesis", "editorial_enrichment", "publication"],
+            [
+                "references",
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            ],
         ),
         (
             ProductionRunStatus.READY,
             ProductionStage.REFERENCES,
-            ["references", "extraction", "synthesis", "editorial_enrichment", "publication"],
+            [
+                "references",
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            ],
         ),
         (
             ProductionRunStatus.READY,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "editorial_enrichment", "publication"],
+            [
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            ],
         ),
         (
             ProductionRunStatus.READY,
@@ -1885,12 +1906,24 @@ async def test_production_state_import_maps_validation_errors(
         (
             ProductionRunStatus.FAILED,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "editorial_enrichment", "publication"],
+            [
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            ],
         ),
         (
             ProductionRunStatus.NEEDS_REVIEW,
             ProductionStage.EXTRACTION,
-            ["extraction", "synthesis", "editorial_enrichment", "publication"],
+            [
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            ],
         ),
     ),
 )
@@ -2078,6 +2111,9 @@ async def test_a_refused_retry_names_the_stage_that_would_run(
     # Everything downstream of EXTRACTION was invalidated by the repair.
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.REFERENCES))
     await uow.production_artifacts.append(_artifact(run, ProductionArtifactStage.EXTRACTION))
+    await uow.production_artifacts.append(
+        _artifact(run, ProductionArtifactStage.RELEVANCE_PROJECTION)
+    )
 
     response = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": "assembly"})
 
@@ -2104,6 +2140,7 @@ async def test_retry_assembly_without_enrichment_points_to_enrichment(
     for stage in (
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
     ):
         await uow.production_artifacts.append(_artifact(run, stage))
@@ -2134,7 +2171,7 @@ async def test_the_named_retry_stage_is_the_one_that_succeeds(
     accepted = await api.post(f"/api/production/runs/{run.id}/retry", json={"stage": stage})
 
     assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["requested_stage"] == "synthesis"
+    assert accepted.json()["requested_stage"] == "relevance_projection"
     assert uow.production_runs.items[run.id].pipeline_generation == 1
 
 

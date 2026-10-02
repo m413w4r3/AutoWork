@@ -42,6 +42,7 @@ SUBJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
 
 _REFERENCES = ProductionArtifactStage.REFERENCES.value
 _EXTRACTION = ProductionArtifactStage.EXTRACTION.value
+_RELEVANCE_PROJECTION = ProductionArtifactStage.RELEVANCE_PROJECTION.value
 _SYNTHESIS = ProductionArtifactStage.SYNTHESIS.value
 _ENRICHMENT = ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
 _PUBLICATION = ProductionArtifactStage.PUBLICATION.value
@@ -165,19 +166,28 @@ async def test_a_cancelled_run_is_never_moved() -> None:
 @pytest.mark.parametrize(
     ("live", "expected"),
     [
-        # The IOC repair case: synthesis and publication staled together.
+        # The IOC repair case: projection remains current while synthesis and publication stale.
         (
-            {_REFERENCES, _EXTRACTION},
+            {_REFERENCES, _EXTRACTION, _RELEVANCE_PROJECTION},
             ProductionStage.SYNTHESIS,
         ),
         # A references reconciliation stales everything downstream of it.
         ({_REFERENCES}, ProductionStage.EXTRACTION),
-        ({_REFERENCES, _EXTRACTION, _SYNTHESIS}, ProductionStage.EDITORIAL_ENRICHMENT),
+        (
+            {_REFERENCES, _EXTRACTION, _RELEVANCE_PROJECTION, _SYNTHESIS},
+            ProductionStage.EDITORIAL_ENRICHMENT,
+        ),
         # Nothing survived at all.
         (set(), ProductionStage.REFERENCES),
         # Publication alone was staled, ready for a deterministic reassembly.
         (
-            {_REFERENCES, _EXTRACTION, _SYNTHESIS, _ENRICHMENT},
+            {
+                _REFERENCES,
+                _EXTRACTION,
+                _RELEVANCE_PROJECTION,
+                _SYNTHESIS,
+                _ENRICHMENT,
+            },
             ProductionStage.ASSEMBLY,
         ),
     ],
@@ -190,7 +200,14 @@ def test_retry_stage_is_the_first_missing_artifact(
 
 def test_a_complete_run_replays_its_last_stage() -> None:
     """Every artifact is current: there is no gap to aim at."""
-    live = {_REFERENCES, _EXTRACTION, _SYNTHESIS, _ENRICHMENT, _PUBLICATION}
+    live = {
+        _REFERENCES,
+        _EXTRACTION,
+        _RELEVANCE_PROJECTION,
+        _SYNTHESIS,
+        _ENRICHMENT,
+        _PUBLICATION,
+    }
 
     assert (
         resolve_retry_stage(live, current_stage=ProductionStage.ASSEMBLY)
@@ -220,7 +237,8 @@ def test_a_ready_run_without_a_publication_owes_a_rebuild() -> None:
     row = _row(live_stages=frozenset({_REFERENCES, _EXTRACTION}), document=False)
 
     assert row.rebuild_required is True
-    assert row.rebuild_stage is ProductionStage.SYNTHESIS
+    assert row.rebuild_stage is ProductionStage.RELEVANCE_PROJECTION
+    assert row.rebuild_stage is not ProductionStage.SYNTHESIS
 
 
 def test_a_ready_run_with_its_publication_owes_nothing() -> None:
@@ -322,7 +340,7 @@ def test_the_invariant_actually_catches_the_regression() -> None:
     ]
 
     assert len(offenders) == 1
-    assert offenders[0].rebuild_stage is ProductionStage.SYNTHESIS
+    assert offenders[0].rebuild_stage is ProductionStage.RELEVANCE_PROJECTION
 
 
 # --------------------------------------------------------------------------
@@ -339,7 +357,7 @@ async def test_ioc_added_after_publication_leaves_a_named_debt() -> None:
     await _require_publication_rebuild(uow, run, retry_stage=ProductionStage.SYNTHESIS.value)
     row = _row(
         run_status=run.status,
-        live_stages=frozenset({_REFERENCES, _EXTRACTION}),
+        live_stages=frozenset({_REFERENCES, _EXTRACTION, _RELEVANCE_PROJECTION}),
         document=False,
     )
 

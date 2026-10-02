@@ -1191,6 +1191,7 @@ async def rebuild_edition_review_item(
 
         references = current.get(ProductionArtifactStage.REFERENCES.value)
         extraction = current.get(ProductionArtifactStage.EXTRACTION.value)
+        relevance_projection = current.get(ProductionArtifactStage.RELEVANCE_PROJECTION.value)
         synthesis = current.get(ProductionArtifactStage.SYNTHESIS.value)
         publication = current.get(ProductionArtifactStage.PUBLICATION.value)
         archived_source_urls: set[str] = set()
@@ -1276,6 +1277,8 @@ async def rebuild_edition_review_item(
             if references is None
             else ProductionStage.EXTRACTION
             if extraction is None
+            else ProductionStage.RELEVANCE_PROJECTION
+            if relevance_projection is None
             else ProductionStage.SYNTHESIS
             if synthesis is None
             else ProductionStage.ASSEMBLY

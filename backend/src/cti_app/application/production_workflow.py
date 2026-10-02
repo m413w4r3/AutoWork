@@ -67,6 +67,11 @@ from cti_app.application.production_references import (
     production_reference_corpus_from_json,
     production_reference_corpus_metadata,
 )
+from cti_app.application.production_relevance import (
+    ProductionRelevanceProjectionService,
+    RelevanceProjectionExecution,
+    RelevanceProjectionExecutionStatus,
+)
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
     build_repair_evidence_pack,
@@ -112,6 +117,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_relevance import relevance_projection_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.publication_document import parse_publication_document
@@ -492,6 +498,11 @@ class ProductionWorkflowOrchestrator:
             else None
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
+        self._relevance_projection = (
+            ProductionRelevanceProjectionService(production_uow_factory, artifact_store)
+            if artifact_store is not None
+            else None
+        )
         self._editorial_enrichment = EditorialEnrichmentService(
             production_uow_factory, artifact_store
         )
@@ -611,6 +622,8 @@ class ProductionWorkflowOrchestrator:
                 result = await self._execute_references_stage(run, context, snapshot)
             elif expected_stage == ProductionStage.EXTRACTION:
                 result = await self._execute_extraction_stage(run, context, snapshot)
+            elif expected_stage == ProductionStage.RELEVANCE_PROJECTION:
+                result = await self._execute_relevance_projection_stage(run, context, snapshot)
             elif expected_stage == ProductionStage.SYNTHESIS:
                 result = await self._execute_synthesis_stage(run, context, snapshot)
             elif expected_stage == ProductionStage.EDITORIAL_ENRICHMENT:
@@ -1333,17 +1346,34 @@ class ProductionWorkflowOrchestrator:
                 "error": "Canonical synthesis service is not configured",
             }
         async with self._uow_factory() as uow:
-            # Only the current EXTRACTION artifact is read: REFERENCES is no
-            # longer loaded, hashed or projected by the canonical branch.
+            # Synthesis consumes only the current EXTRACTION and its one
+            # subject-scoped relevance projection. REFERENCES is not reloaded.
             extraction_artifact = await uow.production_artifacts.get_current(run.id, "extraction")
-        if extraction_artifact is None:
+            projection_artifact = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+            )
+        if (
+            extraction_artifact is None
+            or extraction_artifact.status is not ProductionArtifactStatus.VERIFIED
+            or extraction_artifact.canonical_blob_id is None
+        ):
             return {
                 "stage": "synthesis",
-                "status": "error",
-                "error": "Extraction artifact not found",
+                "status": "terminal_error",
+                "error_code": "synthesis_inputs_missing",
+                "error": "Verified extraction artifact not found",
+            }
+        if projection_artifact is None:
+            return {
+                "stage": "synthesis",
+                "status": "terminal_error",
+                "error_code": "synthesis_inputs_missing",
+                "error": "Relevance projection artifact not found",
             }
         try:
-            execution = await service.execute(run, snapshot, extraction_artifact)
+            execution = await service.execute(
+                run, snapshot, extraction_artifact, projection_artifact
+            )
         except JobCancelledError:
             raise
         except Exception as exc:
@@ -1351,6 +1381,59 @@ class ProductionWorkflowOrchestrator:
             return self._handle_stage_exception(run, "synthesis", exc)
         await self._check_cancellation(run.id, context)
         return self._synthesis_execution_result(execution)
+
+    async def _execute_relevance_projection_stage(
+        self,
+        run: ProductionRun,
+        context: JobExecutionContext | None = None,
+        snapshot: ProductionInputSnapshot | None = None,
+    ) -> dict[str, Any]:
+        await self._check_cancellation(run.id, context)
+        service = self._relevance_projection
+        if snapshot is None or service is None:
+            return {
+                "stage": ProductionStage.RELEVANCE_PROJECTION.value,
+                "status": "terminal_error",
+                "error_code": "relevance_projection_inputs_missing",
+            }
+        async with self._uow_factory() as uow:
+            extraction_artifact = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.EXTRACTION.value
+            )
+        if extraction_artifact is None:
+            return {
+                "stage": ProductionStage.RELEVANCE_PROJECTION.value,
+                "status": "terminal_error",
+                "error_code": "relevance_projection_inputs_missing",
+            }
+        try:
+            execution = await service.execute(run, snapshot, extraction_artifact)
+        except JobCancelledError:
+            raise
+        except Exception as exc:
+            await self._check_cancellation(run.id, context)
+            return self._handle_stage_exception(
+                run, ProductionStage.RELEVANCE_PROJECTION.value, exc
+            )
+        await self._check_cancellation(run.id, context)
+        return self._relevance_projection_execution_result(execution)
+
+    @staticmethod
+    def _relevance_projection_execution_result(
+        execution: RelevanceProjectionExecution,
+    ) -> dict[str, Any]:
+        return {
+            "stage": ProductionStage.RELEVANCE_PROJECTION.value,
+            "status": (
+                "reused"
+                if execution.status is RelevanceProjectionExecutionStatus.REUSED
+                else "success"
+            ),
+            "artifact_id": str(execution.artifact.id),
+            "input_hash": execution.projection.input_hash,
+            "projection_hash": execution.projection.projection_hash,
+            "classification_count": len(execution.projection.classifications),
+        }
 
     @staticmethod
     def _synthesis_execution_result(
@@ -1436,10 +1519,13 @@ class ProductionWorkflowOrchestrator:
             extraction_artifact = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.EXTRACTION.value
             )
+            projection_artifact = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+            )
             synthesis_artifact = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.SYNTHESIS.value
             )
-        if extraction_artifact is None or synthesis_artifact is None:
+        if extraction_artifact is None or projection_artifact is None or synthesis_artifact is None:
             return {
                 "stage": "editorial_enrichment",
                 "status": "terminal_error",
@@ -1447,7 +1533,7 @@ class ProductionWorkflowOrchestrator:
             }
         try:
             execution = await service.execute(
-                run, snapshot, extraction_artifact, synthesis_artifact
+                run, snapshot, extraction_artifact, synthesis_artifact, projection_artifact
             )
         except JobCancelledError:
             raise
@@ -1513,12 +1599,21 @@ class ProductionWorkflowOrchestrator:
         async with self._uow_factory() as uow:
             references = await uow.production_artifacts.get_current(run.id, "references")
             extraction = await uow.production_artifacts.get_current(run.id, "extraction")
+            relevance_projection = await uow.production_artifacts.get_current(
+                run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+            )
             synthesis = await uow.production_artifacts.get_current(run.id, "synthesis")
             enrichment = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
             )
 
-            if references is None or extraction is None or synthesis is None or enrichment is None:
+            if (
+                references is None
+                or extraction is None
+                or relevance_projection is None
+                or synthesis is None
+                or enrichment is None
+            ):
                 return {
                     "stage": "assembly",
                     "status": "error",
@@ -1540,7 +1635,13 @@ class ProductionWorkflowOrchestrator:
                 return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
             if any(
                 artifact.canonical_blob_id is None
-                for artifact in (references, extraction, synthesis, enrichment)
+                for artifact in (
+                    references,
+                    extraction,
+                    relevance_projection,
+                    synthesis,
+                    enrichment,
+                )
             ):
                 return {"stage": "assembly", "status": "error", "error": "assembly_inputs_missing"}
             try:
@@ -1550,6 +1651,19 @@ class ProductionWorkflowOrchestrator:
                 canonical_extraction = production_extraction_from_json(
                     await self._artifact_store.read_json(cast(UUID, extraction.canonical_blob_id))
                 )
+                canonical_relevance_projection = relevance_projection_from_json(
+                    await self._artifact_store.read_json(
+                        cast(UUID, relevance_projection.canonical_blob_id)
+                    )
+                )
+                if (
+                    relevance_projection.input_hash != canonical_relevance_projection.input_hash
+                    or synthesis.metadata.get("relevance_projection_hash")
+                    != canonical_relevance_projection.projection_hash
+                    or enrichment.metadata.get("relevance_projection_hash")
+                    != canonical_relevance_projection.projection_hash
+                ):
+                    raise ValueError("assembly_relevance_projection_lineage_mismatch")
                 canonical_synthesis = production_synthesis_from_json(
                     await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
                 )
@@ -1568,12 +1682,14 @@ class ProductionWorkflowOrchestrator:
                     snapshot=snapshot,
                     references=canonical_references,
                     extraction=canonical_extraction,
+                    relevance_projection=canonical_relevance_projection,
                     synthesis=canonical_synthesis,
                     editorial_enrichment=canonical_enrichment,
                     metadata_extra={
                         "input_artifacts": {
                             "references_artifact_id": str(references.id),
                             "extraction_artifact_id": str(extraction.id),
+                            "relevance_projection_artifact_id": str(relevance_projection.id),
                             "synthesis_artifact_id": str(synthesis.id),
                             "editorial_enrichment_artifact_id": str(enrichment.id),
                         },
@@ -1593,6 +1709,7 @@ class ProductionWorkflowOrchestrator:
                     snapshot=snapshot,
                     references=canonical_references,
                     extraction=canonical_extraction,
+                    relevance_projection=canonical_relevance_projection,
                     synthesis=canonical_synthesis,
                     editorial_enrichment=canonical_enrichment,
                     publication=document,

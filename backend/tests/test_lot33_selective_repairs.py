@@ -247,11 +247,12 @@ def _canonical_extraction(
     events: tuple[ExtractionEventV1, ...],
     *,
     indicators: tuple[ExtractionIndicatorV1, ...] = (),
+    production_input_hash: str = "a" * 64,
 ) -> ProductionExtractionV1:
     return ProductionExtractionV1(
         schema_version=1,
         subject_id=SUBJECT_ID,
-        production_input_hash="a" * 64,
+        production_input_hash=production_input_hash,
         references_corpus_hash="b" * 64,
         profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
         sources=(
@@ -291,8 +292,12 @@ def _event(day: int, text: str) -> ExtractionEventV1:
 
 def test_canonical_evidence_classifies_narrative_and_publication_repairs_selectively() -> None:
     snapshot = _snapshot()
-    previous = _canonical_extraction((_event(2, "Initial access"),))
-    updated_event = _canonical_extraction((_event(2, "Changed initial access"),))
+    previous = _canonical_extraction(
+        (_event(2, "Initial access"),), production_input_hash=snapshot.input_hash
+    )
+    updated_event = _canonical_extraction(
+        (_event(2, "Changed initial access"),), production_input_hash=snapshot.input_hash
+    )
     publication_indicator = ExtractionIndicatorV1(
         value="evil.example",
         artifact_type=ArtifactType.DOMAIN,
@@ -305,6 +310,7 @@ def test_canonical_evidence_classifies_narrative_and_publication_repairs_selecti
     publication_extraction = _canonical_extraction(
         previous.sources[0].events,
         indicators=(publication_indicator,),
+        production_input_hash=snapshot.input_hash,
     )
     previous_hash = _synthesis_evidence_hash(_synthesis_evidence_refs(snapshot, previous))
     event_hash = _synthesis_evidence_hash(_synthesis_evidence_refs(snapshot, updated_event))

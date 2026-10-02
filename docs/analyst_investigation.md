@@ -7,6 +7,6 @@ The state machine starts `queued -> running`; a running investigation can await 
 
 `LoopBudget` has `max_cycles=3` and caller-supplied maxima for pivot runs, acquired hits, new samples, and VT read units. `LoopBudgetCategory` types every consumed category; each increment is persisted and rejected before it exceeds its maximum.
 
-Publication production progression is a single pipeline: `SOURCES -> REFERENCES -> EXTRACTION -> SYNTHESIS -> EDITORIAL_ENRICHMENT -> ASSEMBLY`. Analyst investigations remain an independent, explicitly launched subsystem and are not production stages.
+Publication production progression is a single pipeline: `SOURCES -> REFERENCES -> EXTRACTION -> RELEVANCE_PROJECTION -> SYNTHESIS -> EDITORIAL_ENRICHMENT -> ASSEMBLY`. Analyst investigations remain an independent, explicitly launched subsystem and are not production stages.
 
 `AnalystDecision` is append-only and investigation-scoped. It records a typed decision and target, target id, actor, reason, correlation id, and occurrence timestamp; it does not extend editorial `HumanDecision`.

@@ -60,6 +60,10 @@ from cti_app.application.production_references import (
     production_reference_corpus_to_json,
     report_source_labels,
 )
+from cti_app.application.production_relevance import (
+    build_relevance_projection,
+    persist_relevance_projection_in_uow,
+)
 from cti_app.application.production_repair_payloads import (
     ProductionRepairPayloadResolver,
     RepairPayloadOrigin,
@@ -131,6 +135,10 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
+)
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceProjectionV1,
 )
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
@@ -2445,7 +2453,8 @@ def _synthesis_evidence_refs(
     extraction: ProductionExtractionV1,
 ) -> frozenset[ExtractionEvidenceRefV1]:
     """Return canonical refs actually admitted to the deterministic synthesis pack."""
-    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    relevance_projection = build_relevance_projection(snapshot, extraction)
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, relevance_projection)
     canonical_refs = set(extraction_evidence_refs_v1(extraction))
     handles = (
         record["handle"]
@@ -4102,31 +4111,57 @@ class ProductionRepairMaterializationService:
             canonical_extraction = production_extraction_from_json(
                 await store.read_json(extraction.canonical_blob_id)
             )
+            relevance_projection = build_relevance_projection(snapshot, canonical_extraction)
+            projection_execution = await persist_relevance_projection_in_uow(
+                uow,
+                run,
+                snapshot,
+                relevance_projection,
+                store,
+                mark_downstream_stale=False,
+            )
+            relevance_projection = projection_execution.projection
+            relevance_projection_artifact = projection_execution.artifact
             synthesis = production_synthesis_from_json(
                 await store.read_json(synthesis_artifact.canonical_blob_id)
             )
             extraction_hash = canonical_extraction_hash(canonical_extraction)
-            if synthesis.extraction_hash != extraction_hash:
-                current_refs = set(extraction_evidence_refs_v1(canonical_extraction))
-                if not synthesis_evidence_refs(synthesis) <= current_refs:
-                    raise ProductionRepairProjectionError("assembly_evidence_missing")
-                prior_extractions = [
-                    artifact
-                    for artifact in await uow.production_artifacts.list_for_run(run.id)
-                    if artifact.stage is ProductionArtifactStage.EXTRACTION
-                    and artifact.version < extraction.version
-                    and artifact.canonical_blob_id is not None
-                ]
-                lineage_found = False
-                for prior in prior_extractions:
-                    previous = production_extraction_from_json(
-                        await store.read_json(cast(UUID, prior.canonical_blob_id))
-                    )
-                    if canonical_extraction_hash(previous) == synthesis.extraction_hash:
-                        lineage_found = True
-                        break
-                if not lineage_found:
-                    raise ProductionRepairProjectionError("assembly_inputs_mismatch")
+            synthesis_refs = synthesis_evidence_refs(synthesis)
+            current_refs = set(extraction_evidence_refs_v1(canonical_extraction))
+            if not synthesis_refs <= current_refs:
+                raise ProductionRepairProjectionError("assembly_evidence_missing")
+            if any(
+                relevance_projection.classification_for(ref).classification
+                in {
+                    RelevanceClassification.OUT_OF_SCOPE,
+                    RelevanceClassification.INDETERMINATE,
+                }
+                for ref in synthesis_refs
+            ):
+                raise ProductionRepairProjectionError("synthesis_relevance_projection_changed")
+            if (
+                synthesis.extraction_hash != extraction_hash
+                or synthesis_artifact.metadata.get("relevance_projection_hash")
+                != relevance_projection.projection_hash
+            ):
+                if synthesis.extraction_hash != extraction_hash:
+                    prior_extractions = [
+                        artifact
+                        for artifact in await uow.production_artifacts.list_for_run(run.id)
+                        if artifact.stage is ProductionArtifactStage.EXTRACTION
+                        and artifact.version < extraction.version
+                        and artifact.canonical_blob_id is not None
+                    ]
+                    lineage_found = False
+                    for prior in prior_extractions:
+                        previous = production_extraction_from_json(
+                            await store.read_json(cast(UUID, prior.canonical_blob_id))
+                        )
+                        if canonical_extraction_hash(previous) == synthesis.extraction_hash:
+                            lineage_found = True
+                            break
+                    if not lineage_found:
+                        raise ProductionRepairProjectionError("assembly_inputs_mismatch")
                 synthesis = replace(synthesis, extraction_hash=extraction_hash)
                 _, synthesis_blob_id, _ = await store.store_stage_payloads(
                     canonical=production_synthesis_to_json(synthesis)
@@ -4151,6 +4186,7 @@ class ProductionRepairMaterializationService:
                             "policy": "synthesis-lineage-rebase-v1",
                             "source_input_hash": synthesis_artifact.input_hash,
                             "extraction_hash": extraction_hash,
+                            "relevance_projection_hash": relevance_projection.projection_hash,
                         }
                     ),
                     canonical_blob_id=synthesis_blob_id,
@@ -4162,6 +4198,7 @@ class ProductionRepairMaterializationService:
                         "reused_from_artifact_id": str(synthesis_artifact.id),
                         "reused_from_created_at": synthesis_artifact.created_at.isoformat(),
                         "lineage_rebased": True,
+                        "relevance_projection_hash": relevance_projection.projection_hash,
                     },
                 )
                 await uow.production_artifacts.append(rebased)
@@ -4177,6 +4214,8 @@ class ProductionRepairMaterializationService:
                 extraction=canonical_extraction,
                 synthesis_artifact=synthesis_artifact,
                 synthesis=synthesis,
+                relevance_projection=relevance_projection,
+                relevance_projection_artifact=relevance_projection_artifact,
             )
             publication = await uow.production_artifacts.get_current(
                 run.id, ProductionArtifactStage.PUBLICATION.value
@@ -4189,6 +4228,7 @@ class ProductionRepairMaterializationService:
                 "input_artifacts": {
                     "references_artifact_id": str(references_artifact.id),
                     "extraction_artifact_id": str(extraction.id),
+                    "relevance_projection_artifact_id": str(relevance_projection_artifact.id),
                     "synthesis_artifact_id": str(synthesis_artifact.id),
                     "editorial_enrichment_artifact_id": str(editorial_enrichment_artifact.id),
                 }
@@ -4202,6 +4242,7 @@ class ProductionRepairMaterializationService:
                 snapshot=snapshot,
                 references=references,
                 extraction=canonical_extraction,
+                relevance_projection=relevance_projection,
                 synthesis=synthesis,
                 editorial_enrichment=editorial_enrichment,
                 metadata_extra=metadata,
@@ -4215,6 +4256,7 @@ class ProductionRepairMaterializationService:
                 snapshot=snapshot,
                 references=references,
                 extraction=canonical_extraction,
+                relevance_projection=relevance_projection,
                 synthesis=synthesis,
                 editorial_enrichment=editorial_enrichment,
                 publication=document,
@@ -4237,6 +4279,8 @@ class ProductionRepairMaterializationService:
         extraction: ProductionExtractionV1,
         synthesis_artifact: ProductionArtifact,
         synthesis: ProductionSynthesisV1,
+        relevance_projection: RelevanceProjectionV1,
+        relevance_projection_artifact: ProductionArtifact,
     ) -> tuple[EditorialEnrichmentV1, ProductionArtifact]:
         """Rebase the current model-generated enrichment onto the repaired lineage.
 
@@ -4276,6 +4320,8 @@ class ProductionRepairMaterializationService:
         if (
             previous.extraction_hash == extraction_hash
             and previous.synthesis_hash == synthesis_hash
+            and current.metadata.get("relevance_projection_hash")
+            == relevance_projection.projection_hash
         ):
             try:
                 validate_editorial_enrichment(previous, extraction=extraction, synthesis=synthesis)
@@ -4285,10 +4331,20 @@ class ProductionRepairMaterializationService:
                 ) from exc
             return previous, current
 
-        if not editorial_enrichment_evidence_refs(previous) <= set(
-            extraction_evidence_refs_v1(extraction)
-        ):
+        enrichment_refs = editorial_enrichment_evidence_refs(previous)
+        if not enrichment_refs <= set(extraction_evidence_refs_v1(extraction)):
             raise _EditorialEnrichmentRebuildRequired("editorial_enrichment_evidence_missing")
+        if any(
+            relevance_projection.classification_for(ref).classification
+            in {
+                RelevanceClassification.OUT_OF_SCOPE,
+                RelevanceClassification.INDETERMINATE,
+            }
+            for ref in enrichment_refs
+        ):
+            raise _EditorialEnrichmentRebuildRequired(
+                "editorial_enrichment_relevance_projection_changed"
+            )
         enrichment = replace(
             previous,
             production_input_hash=synthesis.production_input_hash,
@@ -4331,6 +4387,7 @@ class ProductionRepairMaterializationService:
                     "source_input_hash": current.input_hash,
                     "extraction_hash": extraction_hash,
                     "synthesis_hash": synthesis_hash,
+                    "relevance_projection_hash": relevance_projection.projection_hash,
                 }
             ),
             status=ProductionArtifactStatus.VERIFIED,
@@ -4344,8 +4401,10 @@ class ProductionRepairMaterializationService:
                 "reused_from_artifact_id": str(current.id),
                 "reused_from_created_at": current.created_at.isoformat(),
                 "lineage_rebased": True,
+                "relevance_projection_hash": relevance_projection.projection_hash,
                 "input_artifacts": {
                     "extraction_artifact_id": str(extraction_artifact.id),
+                    "relevance_projection_artifact_id": str(relevance_projection_artifact.id),
                     "synthesis_artifact_id": str(synthesis_artifact.id),
                 },
             },

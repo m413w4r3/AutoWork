@@ -10,6 +10,7 @@ from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
@@ -24,6 +25,7 @@ def qa_publication_v4(
     snapshot: ProductionInputSnapshot,
     references: ProductionReferenceCorpusV1,
     extraction: ProductionExtractionV1,
+    relevance_projection: RelevanceProjectionV1 | None = None,
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1,
     publication: PublicationDocumentV4,
@@ -44,6 +46,7 @@ def qa_publication_v4(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
+            relevance_projection=relevance_projection,
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
         )
@@ -110,6 +113,7 @@ class ProductionQAService:
         snapshot: ProductionInputSnapshot,
         references: ProductionReferenceCorpusV1,
         extraction: ProductionExtractionV1,
+        relevance_projection: RelevanceProjectionV1 | None = None,
         synthesis: ProductionSynthesisV1,
         editorial_enrichment: EditorialEnrichmentV1,
         publication: PublicationDocumentV4,
@@ -118,6 +122,7 @@ class ProductionQAService:
             snapshot=snapshot,
             references=references,
             extraction=extraction,
+            relevance_projection=relevance_projection,
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
             publication=publication,

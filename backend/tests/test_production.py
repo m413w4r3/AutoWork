@@ -90,6 +90,9 @@ class TestProductionRun:
         assert run.current_stage is ProductionStage.EXTRACTION  # type: ignore[comparison-overlap]
 
         run.advance_stage()
+        assert run.current_stage is ProductionStage.RELEVANCE_PROJECTION
+
+        run.advance_stage()
         assert run.current_stage is ProductionStage.SYNTHESIS
 
         run.advance_stage()
@@ -305,6 +308,7 @@ class TestProductionWorkflow:
             ProductionStage.SOURCES,
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
+            ProductionStage.RELEVANCE_PROJECTION,
             ProductionStage.SYNTHESIS,
             ProductionStage.EDITORIAL_ENRICHMENT,
             ProductionStage.ASSEMBLY,
