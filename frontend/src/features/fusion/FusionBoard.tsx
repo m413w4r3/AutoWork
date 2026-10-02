@@ -115,6 +115,7 @@ const historyLabels: Record<string, string> = {
 };
 
 const COMPARISON_ROWS: ComparisonRow[] = [
+  ["Activité / périmètre", (candidate) => candidate.summary],
   ["Date", (candidate) => candidate.event_date ?? "—"],
   ["Acteurs", (candidate) => formatList(candidate.actors)],
   ["Campagnes", (candidate) => formatList(candidate.campaigns)],
@@ -494,6 +495,9 @@ function ReviewGroupCard({
   return (
     <section className="fusion-review-group">
       <h4>{proposalText(group, targets)}</h4>
+      <p className="fusion-review-rationale">
+        <strong>Motif proposé :</strong> {group.rationale}
+      </p>
       <dl className="fusion-facts">
         <Fact label="Dates" value={candidateDates(members)} />
         <Fact label="Acteur / campagne" value={actorsAndCampaigns(members)} />

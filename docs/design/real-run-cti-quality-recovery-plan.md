@@ -228,6 +228,8 @@ Comparer explicitement les cas Chainalysis/Bitquery ; ne pas identifier leurs mo
 
 Remplacer le bootstrap « une candidate = un sujet » par un contrôle de collisions au sein de l'intake. Exploiter URL canonique/identité de document, campagne, acteur, malware, période et mécanisme, sans fusion automatique sur URL partagée ou similarité du titre seule. Proposer les collisions ambiguës en Fusion avec justification et périmètres comparés.
 
+**Règle appliquée.** La confiance est élevée uniquement si deux candidates partagent une URL canonique, au moins une ancre acteur/campagne normalisée à l'identique et la même date d'événement non nulle, sans valeurs acteur ou campagne explicitement contradictoires. Une ancre partagée accompagnée d'au moins un autre signal (document, date d'événement, malware ou expression de mécanisme commune) produit une proposition de confiance moyenne. Le mécanisme est un n-gramme exact de deux ou trois termes du résumé, de la nouveauté ou de la raison technique ; il ne suffit jamais seul. Les dates d'événement sont le signal de période disponible dans le contrat Discovery. Toute collision reste en `REVIEW` jusqu'à une décision humaine dans Fusion ; une URL ou un titre similaire seuls ne produisent aucune proposition.
+
 Préserver les décisions de fusion manuelle, leurs identités et leur historique. Tester la re-découverte après fusion : ne pas recréer les trois sujets absorbés ni déplacer leurs contributions sans décision.
 
 **Modules.** [Prompt Discovery](../../backend/src/cti_app/application/discovery/prompts.py), [planners cumulatifs](../../backend/src/cti_app/application/discovery/cumulative/planners.py), validation de fusion et UI de revue.

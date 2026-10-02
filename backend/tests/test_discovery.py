@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -19,7 +20,11 @@ from cti_app.application.discovery.jobs import (
     DISCOVERY_JOB_KIND,
     REPROCESS_DISCOVERY_REPORT_JOB_KIND,
 )
-from cti_app.application.discovery.prompts import _research_prompt
+from cti_app.application.discovery.prompts import (
+    PROMPT_TEMPLATE_ID,
+    PROMPT_TEMPLATE_VERSION,
+    _research_prompt,
+)
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.jobs import (
     DuplicateJobError,
@@ -33,8 +38,11 @@ from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
     ModelGateway,
+    ModelRequest,
     ModelRouter,
+    ModelRoutingHint,
     SafeModelRequest,
+    sanitize_model_request,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
@@ -1107,6 +1115,31 @@ def test_research_prompt_is_the_documented_markdown_contract() -> None:
     assert "visible-iocs: <jusqu’à 10 valeurs exactes" in prompt  # noqa: RUF001
     assert "period: <" not in prompt
     assert "N’échappe pas les tirets des noms de champs." in prompt  # noqa: RUF001
+    normalized_prompt = " ".join(prompt.split())
+    assert "une recherche cohérente" in normalized_prompt
+    assert "une même publication peut donc soutenir" in normalized_prompt
+    assert "justifier pourquoi il s’agit d’une activité autonome" in normalized_prompt  # noqa: RUF001
+
+
+def test_discovery_prompt_version_invalidates_the_model_checkpoint_identity() -> None:
+    params = parameters()
+    request = ModelRequest(
+        text=_research_prompt(params),
+        prompt_template_id=PROMPT_TEMPLATE_ID,
+        prompt_template_version=PROMPT_TEMPLATE_VERSION,
+        evidence_pack_hash=discovery_request_hash(params),
+        external_llm_allowed=params.external_llm_allowed,
+        routing_hint=ModelRoutingHint.WEB_RESEARCH,
+        sensitivity=params.sensitivity,
+        background=True,
+    )
+    previous_version_request = replace(request, prompt_template_version="4.1")
+
+    assert PROMPT_TEMPLATE_VERSION == "4.2"
+    assert (
+        sanitize_model_request(request).authorized_input_hash
+        != sanitize_model_request(previous_version_request).authorized_input_hash
+    )
 
 
 def _import_service() -> tuple[DiscoveryService, InMemoryDiscoveryUnitOfWorkFactory, list[UUID]]:

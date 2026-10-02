@@ -20,7 +20,10 @@ from cti_app.application.discovery.cumulative.errors import (
     MergePlanInvalidError,
 )
 from cti_app.application.discovery.cumulative.merge_runs import make_merge_run
-from cti_app.application.discovery.cumulative.planners import HeuristicMergePlanner
+from cti_app.application.discovery.cumulative.planners import (
+    DeterministicBootstrapPlanner,
+    HeuristicMergePlanner,
+)
 from cti_app.application.discovery.cumulative.types import (
     DiscoveryMergePlanner,
     MergeHandleLabel,
@@ -39,6 +42,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoveryMergePlanV1,
     DiscoveryMergeRun,
+    DiscoveryPlannerKind,
     DiscoverySnapshot,
     MergeValidationStatus,
     canonical_sha256,
@@ -46,6 +50,12 @@ from cti_app.domain.discovery_cumulative import (
 from cti_app.logging import get_correlation_id
 
 logger = logging.getLogger(__name__)
+
+
+def _applied_diagnostic_event(planner_kind: DiscoveryPlannerKind, *, merge_event_count: int) -> str:
+    if planner_kind is DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP and merge_event_count == 0:
+        return "discovery.bootstrap_applied"
+    return "merge.applied"
 
 
 def _handle_label(handle: str, candidate: CandidateTopic) -> MergeHandleLabel:
@@ -211,7 +221,9 @@ class CumulativeDiscoveryService:
             )
             handles = build_merge_handles(parent, delta, included_subjects=included)
             planner: DiscoveryMergePlanner = (
-                HeuristicMergePlanner() if parent is None else (planner_override or self._planner)
+                DeterministicBootstrapPlanner()
+                if parent is None
+                else (planner_override or self._planner)
             )
             excluded_subject_count = len(parent.subjects) - len(handles.existing) if parent else 0
             cache_key_run = make_merge_run(
@@ -413,7 +425,9 @@ class CumulativeDiscoveryService:
             await uow.subject_contributions.append_many(applied.contributions)
             await uow.commit()
             self._diagnostics.record(
-                event="merge.applied",
+                event=_applied_diagnostic_event(
+                    run.planner_kind, merge_event_count=len(applied.merge_events)
+                ),
                 run_id=run.id,
                 stage="discovery_merge",
                 correlation_id=get_correlation_id(),

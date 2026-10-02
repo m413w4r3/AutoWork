@@ -9,6 +9,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from itertools import combinations
 from uuid import UUID
 
 from cti_app.application.discovery.cumulative.context import _handle_number
@@ -18,7 +19,8 @@ from cti_app.application.discovery.cumulative.types import (
     ResolvedMergeHandles,
 )
 from cti_app.application.discovery.cumulative.validation import validate_merge_plan
-from cti_app.application.discovery_identity import candidates_match_strongly
+from cti_app.application.discovery_identity import candidates_match_strongly, normalize
+from cti_app.domain.discovery import CandidateTopic, canonicalize_http_url
 from cti_app.domain.discovery_cumulative import (
     DiscoveryMergeGroup,
     DiscoveryMergePlanV1,
@@ -30,6 +32,253 @@ from cti_app.domain.discovery_cumulative import (
 )
 
 HEURISTIC_POLICY_VERSION = "heuristic-v2"
+BOOTSTRAP_COLLISION_POLICY_VERSION = "bootstrap-collision-v1"
+
+_MECHANISM_STOPWORDS = frozenset(
+    {
+        "activity",
+        "against",
+        "attack",
+        "campaign",
+        "discovered",
+        "during",
+        "from",
+        "group",
+        "malware",
+        "new",
+        "operation",
+        "report",
+        "same",
+        "shows",
+        "that",
+        "their",
+        "this",
+        "through",
+        "used",
+        "using",
+        "with",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _IntakeCollision:
+    confidence: MergeConfidence
+    evidence: MergeEvidence
+    motive: str
+
+
+def bootstrap_intake_collision(
+    left: CandidateTopic, right: CandidateTopic
+) -> _IntakeCollision | None:
+    """Find conservative, review-only collisions between incoming candidates.
+
+    A canonical document or similar wording is never enough by itself. A pair
+    needs a shared actor or campaign and compatible explicit scopes. A shared
+    canonical document plus a matching event date is the high-confidence rule;
+    other anchored combinations remain lower-confidence review proposals.
+    """
+    shared_actors = _shared_values(left.actors, right.actors)
+    shared_campaigns = _shared_values(left.campaigns, right.campaigns)
+    if not shared_actors and not shared_campaigns:
+        return None
+
+    left_actors = {_identity(value) for value in left.actors if _identity(value)}
+    right_actors = {_identity(value) for value in right.actors if _identity(value)}
+    left_campaigns = {_identity(value) for value in left.campaigns if _identity(value)}
+    right_campaigns = {_identity(value) for value in right.campaigns if _identity(value)}
+    if left_actors and right_actors and not left_actors & right_actors:
+        return None
+    if left_campaigns and right_campaigns and not left_campaigns & right_campaigns:
+        return None
+
+    shared_documents = _canonical_document_urls(left) & _canonical_document_urls(right)
+    shared_malware = _shared_values(left.malware, right.malware)
+    shared_cves = _shared_values(left.cves, right.cves)
+    shared_mechanisms = _mechanism_phrases(left) & _mechanism_phrases(right)
+    overlapping_event_date = left.event_date is not None and left.event_date == right.event_date
+
+    high_confidence = bool(shared_documents and overlapping_event_date)
+    if not high_confidence and not (
+        shared_documents or overlapping_event_date or shared_malware or shared_mechanisms
+    ):
+        return None
+
+    semantic_basis = [
+        *(f"shared actor: {value}" for value in shared_actors),
+        *(f"shared campaign: {value}" for value in shared_campaigns),
+        *(f"shared mechanism: {value}" for value in sorted(shared_mechanisms)),
+    ]
+    if overlapping_event_date:
+        assert left.event_date is not None
+        semantic_basis.append(f"same event date: {left.event_date.isoformat()}")
+    if high_confidence:
+        semantic_basis.append("same canonical document, scope anchor, and event date")
+
+    evidence = MergeEvidence(
+        shared_publication_urls=sorted(shared_documents),
+        shared_campaigns=sorted(shared_campaigns),
+        shared_malware=sorted(shared_malware),
+        shared_explicit_identifiers=sorted(shared_cves),
+        semantic_basis=semantic_basis,
+    )
+    confidence = MergeConfidence.HIGH if high_confidence else MergeConfidence.MEDIUM
+    motive = (
+        "the same canonical document, an exact actor/campaign anchor, and the same event date"
+        if high_confidence
+        else (
+            "an exact actor/campaign anchor plus corroborating document, period, malware, "
+            "or mechanism evidence"
+        )
+    )
+    return _IntakeCollision(confidence=confidence, evidence=evidence, motive=motive)
+
+
+def _bootstrap_collision_plan(handles: ResolvedMergeHandles) -> DiscoveryMergePlanV1:
+    ordered_handles = sorted(handles.incoming, key=_handle_number)
+    collisions = {
+        frozenset((left_handle, right_handle)): collision
+        for left_handle, right_handle in combinations(ordered_handles, 2)
+        if (
+            collision := bootstrap_intake_collision(
+                handles.incoming[left_handle].candidate,
+                handles.incoming[right_handle].candidate,
+            )
+        )
+        is not None
+    }
+
+    # Build complete-link groups: every pair in a proposal must have its own
+    # collision evidence. This avoids merging a transitive chain of unrelated
+    # activities into one all-or-nothing Fusion decision.
+    clusters: list[list[str]] = []
+    for handle in ordered_handles:
+        matching_cluster = next(
+            (
+                cluster
+                for cluster in clusters
+                if all(frozenset((handle, member)) in collisions for member in cluster)
+            ),
+            None,
+        )
+        if matching_cluster is None:
+            clusters.append([handle])
+        else:
+            matching_cluster.append(handle)
+
+    groups: list[DiscoveryMergeGroup] = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            groups.append(
+                DiscoveryMergeGroup(
+                    existing_subject_handles=[],
+                    incoming_candidate_handles=cluster,
+                    confidence=MergeConfidence.HIGH,
+                    disposition=MergeDisposition.APPLY,
+                    rationale="No anchored intake collision; create a distinct subject.",
+                    evidence=MergeEvidence(semantic_basis=["deterministic intake collision check"]),
+                )
+            )
+            continue
+
+        pair_matches = [
+            collisions[frozenset((left, right))] for left, right in combinations(cluster, 2)
+        ]
+        confidence = (
+            MergeConfidence.HIGH
+            if all(item.confidence is MergeConfidence.HIGH for item in pair_matches)
+            else MergeConfidence.MEDIUM
+        )
+        evidence = MergeEvidence(
+            shared_publication_urls=sorted(
+                {url for item in pair_matches for url in item.evidence.shared_publication_urls}
+            ),
+            shared_campaigns=sorted(
+                {value for item in pair_matches for value in item.evidence.shared_campaigns}
+            ),
+            shared_malware=sorted(
+                {value for item in pair_matches for value in item.evidence.shared_malware}
+            ),
+            shared_explicit_identifiers=sorted(
+                {
+                    value
+                    for item in pair_matches
+                    for value in item.evidence.shared_explicit_identifiers
+                }
+            ),
+            semantic_basis=list(
+                dict.fromkeys(
+                    ["deterministic first-intake collision check"]
+                    + [basis for item in pair_matches for basis in item.evidence.semantic_basis]
+                )
+            ),
+        )
+        scope_comparison = " || ".join(
+            _candidate_scope_comparison(handles.incoming[handle].candidate) for handle in cluster
+        )
+        motives = "; ".join(dict.fromkeys(item.motive for item in pair_matches))
+        groups.append(
+            DiscoveryMergeGroup(
+                existing_subject_handles=[],
+                incoming_candidate_handles=cluster,
+                confidence=confidence,
+                disposition=MergeDisposition.REVIEW,
+                rationale=(
+                    f"First-intake collision proposal: {motives}. Side-by-side scope comparison: "
+                    f"{scope_comparison}. Analyst decision required."
+                ),
+                evidence=evidence,
+                flags=["intake_collision"],
+            )
+        )
+    return DiscoveryMergePlanV1(groups=groups)
+
+
+def _identity(value: str) -> str:
+    return normalize(value)
+
+
+def _shared_values(left: Sequence[str], right: Sequence[str]) -> list[str]:
+    left_keys = {_identity(value) for value in left if _identity(value)}
+    right_keys = {_identity(value) for value in right if _identity(value)}
+    shared_keys = left_keys & right_keys
+    labels: dict[str, str] = {}
+    for value in (*left, *right):
+        key = _identity(value)
+        if key and key in shared_keys and key not in labels:
+            labels[key] = value.strip()
+    return [labels[key] for key in sorted(labels)]
+
+
+def _canonical_document_urls(candidate: CandidateTopic) -> set[str]:
+    urls = [source.canonical_url or source.url for source in candidate.sources] + [
+        source.raw_url for source in candidate.incomplete_sources if source.raw_url
+    ]
+    return {canonical for url in urls if (canonical := canonicalize_http_url(url)) is not None}
+
+
+def _mechanism_phrases(candidate: CandidateTopic) -> set[str]:
+    phrases: set[str] = set()
+    for text in (candidate.summary, candidate.novelty, candidate.technical_potential_reason):
+        words = normalize(text).split()
+        for width in (2, 3):
+            for start in range(len(words) - width + 1):
+                phrase = words[start : start + width]
+                if all(len(word) >= 4 and word not in _MECHANISM_STOPWORDS for word in phrase):
+                    phrases.add(" ".join(phrase))
+    return phrases
+
+
+def _candidate_scope_comparison(candidate: CandidateTopic) -> str:
+    actors = ", ".join(candidate.actors) or "unknown"
+    campaigns = ", ".join(candidate.campaigns) or "unknown"
+    malware = ", ".join(candidate.malware) or "unknown"
+    period = candidate.event_date.isoformat() if candidate.event_date else "unknown"
+    mechanisms = ", ".join(sorted(_mechanism_phrases(candidate))[:3]) or "unknown"
+    return (
+        f"{candidate.title!r} [actor={actors}; campaign={campaigns}; malware={malware}; "
+        f"event_date={period}; mechanism={mechanisms}]"
+    )
 
 
 class HeuristicMergePlanner:
@@ -50,21 +299,8 @@ class HeuristicMergePlanner:
     ) -> PlannedDiscoveryMerge:
         del delta, edition_id, external_llm_allowed, sensitivity
         if parent_snapshot is None:
-            return PlannedDiscoveryMerge(
-                DiscoveryMergePlanV1(
-                    groups=[
-                        DiscoveryMergeGroup(
-                            existing_subject_handles=[],
-                            incoming_candidate_handles=[handle],
-                            confidence=MergeConfidence.HIGH,
-                            disposition=MergeDisposition.APPLY,
-                            rationale="deterministic bootstrap",
-                            evidence=MergeEvidence(semantic_basis=["first intake"]),
-                        )
-                        for handle in sorted(handles.incoming, key=_handle_number)
-                    ]
-                )
-            )
+            plan, warnings = validate_merge_plan(_bootstrap_collision_plan(handles), handles)
+            return PlannedDiscoveryMerge(plan, warnings=warnings)
 
         subject_handles = {subject_id: handle for handle, subject_id in handles.existing.items()}
         by_target: dict[str, list[str]] = defaultdict(list)
@@ -106,6 +342,29 @@ class HeuristicMergePlanner:
             for handle in create_new
         )
         return PlannedDiscoveryMerge(DiscoveryMergePlanV1(groups=groups))
+
+
+class DeterministicBootstrapPlanner(HeuristicMergePlanner):
+    """Review-only collision check used for an edition's first intake."""
+
+    kind = DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP
+    policy_version = BOOTSTRAP_COLLISION_POLICY_VERSION
+
+    async def plan(
+        self,
+        parent_snapshot: DiscoverySnapshot | None,
+        delta: DiscoveryDelta,
+        handles: ResolvedMergeHandles,
+        *,
+        edition_id: UUID,
+        external_llm_allowed: bool,
+        sensitivity: str,
+    ) -> PlannedDiscoveryMerge:
+        del delta, edition_id, external_llm_allowed, sensitivity
+        if parent_snapshot is not None:
+            raise ValueError("DeterministicBootstrapPlanner requires an empty snapshot")
+        plan, warnings = validate_merge_plan(_bootstrap_collision_plan(handles), handles)
+        return PlannedDiscoveryMerge(plan, warnings=warnings)
 
 
 @dataclass(frozen=True, slots=True)

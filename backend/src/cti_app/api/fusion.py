@@ -92,6 +92,7 @@ class FusionReviewGroupView(BaseModel):
     candidates: list[FusionCandidateView]
     proposed_discovery_subject_ids: list[UUID]
     confidence: str
+    rationale: str
     requires_decision: bool
     deterministic_signals: list[FusionSignalView]
     model_suggestion: FusionSuggestionView | None
@@ -311,6 +312,7 @@ def _board_view(board: FusionBoard) -> FusionBoardView:
                         candidates=[_candidate_view(item) for item in group.candidates],
                         proposed_discovery_subject_ids=list(group.proposed_discovery_subject_ids),
                         confidence=group.confidence,
+                        rationale=group.rationale,
                         requires_decision=group.requires_decision,
                         deterministic_signals=_signal_views(group.deterministic_signals),
                         model_suggestion=_suggestion_view(group.model_suggestion),

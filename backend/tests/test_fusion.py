@@ -25,6 +25,7 @@ from cti_app.application.discovery.fusion import (
     FusionService,
     _coalesce_existing_targets,
     _model_suggestion,
+    _pending_review,
     _signals,
 )
 from cti_app.domain.discovery import DiscoveryCandidate
@@ -416,3 +417,86 @@ def test_human_successor_keeps_the_persisted_model_suggestion_visible() -> None:
     assert suggestion is not None
     assert suggestion.recommendation == "merge"
     assert suggestion.summary == group.rationale
+
+
+def test_pending_fusion_review_exposes_rationale_and_candidate_scopes() -> None:
+    edition_id = uuid4()
+    batch = _batch(
+        edition_id,
+        [
+            _candidate(
+                "Research part one",
+                "https://example.test/research",
+                summary="The first stage of one intrusion research.",
+                actors=("Example Group",),
+                campaigns=("Operation Cedar",),
+                event_date=datetime(2026, 6, 10, tzinfo=UTC).date(),
+            ),
+            _candidate(
+                "Research part two",
+                "https://example.test/research",
+                summary="The second stage of the same intrusion research.",
+                actors=("Example Group",),
+                campaigns=("Operation Cedar",),
+                event_date=datetime(2026, 6, 10, tzinfo=UTC).date(),
+            ),
+        ],
+    )
+    candidates = tuple(
+        DiscoveryCandidate.from_candidate_topic(
+            item,
+            discovery_run_id=batch.discovery_run_id,
+            discovery_batch_id=batch.id,
+            position=index,
+        )
+        for index, item in enumerate(batch.candidates)
+    )
+    rationale = (
+        "Both candidates cover Operation Cedar by Example Group on 2026-06-10; "
+        "the summaries describe sequential parts of one research."
+    )
+    plan = DiscoveryMergePlanV1(
+        groups=[
+            DiscoveryMergeGroup(
+                existing_subject_handles=[],
+                incoming_candidate_handles=["C1", "C2"],
+                confidence=MergeConfidence.HIGH,
+                disposition=MergeDisposition.REVIEW,
+                rationale=rationale,
+            )
+        ]
+    )
+    run = DiscoveryMergeRun(
+        edition_id=edition_id,
+        parent_snapshot_id=None,
+        intake_id=uuid4(),
+        planner_kind=DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+        prompt_version="none",
+        policy_version="bootstrap-collision-v1",
+        blocking_version="all-v1",
+        merge_input_hash="a" * 64,
+        handle_map={f"C{index + 1}": str(item.id) for index, item in enumerate(candidates)},
+        included_subject_ids=(),
+        excluded_subject_count=0,
+        validation_status=MergeValidationStatus.NEEDS_REVIEW,
+        plan_payload=plan.model_dump(mode="json"),
+    )
+
+    review = _pending_review(
+        run,
+        {item.id: item for item in candidates},
+        {item.id: item for item in candidates},
+        {},
+        {run.id: run},
+        stale=False,
+    )
+
+    assert review.groups[0].rationale == rationale
+    assert [item.summary for item in review.groups[0].candidates] == [
+        "The first stage of one intrusion research.",
+        "The second stage of the same intrusion research.",
+    ]
+    assert [item.campaigns for item in review.groups[0].candidates] == [
+        ("Operation Cedar",),
+        ("Operation Cedar",),
+    ]

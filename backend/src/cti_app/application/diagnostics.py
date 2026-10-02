@@ -68,6 +68,8 @@ class DiagnosticsLog:
                     "  `merge.plan_invalid` s'arrêtent avant d'appliquer ;\n"
                     "  `merge.resolve_*` couvre la décision humaine (`_applied`,\n"
                     "  `_deferred`, `_stale`, `_already_applied`, `_failed`)\n"
+                    "- `discovery.bootstrap_applied` : placement initial des candidats\n"
+                    "  après le contrôle de collisions, sans fusion de sujets\n"
                     "- `http.request_failed` : toute erreur non rattrapée d'une requête,\n"
                     "  avec sa trace — le message rendu au navigateur est volontairement\n"
                     "  vague, c'est ici que se trouve la cause\n",

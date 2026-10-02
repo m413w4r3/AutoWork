@@ -116,6 +116,8 @@ const board: FusionBoardModel = {
           candidates: [candidate("candidate-d", "Candidate D")],
           proposed_discovery_subject_ids: ["subject-a"],
           confidence: "medium",
+          rationale:
+            "Le même acteur relie cette candidate au périmètre proposé.",
           requires_decision: true,
           deterministic_signals: [
             {
@@ -209,6 +211,14 @@ describe("FusionBoard", () => {
     expect(
       screen.getByText("Rattachement proposé à « Campagne A »"),
     ).toBeInTheDocument();
+    expect(screen.getByText("Motif proposé :")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Le même acteur relie cette candidate au périmètre proposé.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Activité / périmètre")).toHaveLength(2);
+    expect(screen.getByText("Candidate D résumé")).toBeInTheDocument();
     expect(
       screen.queryByText(/Article|Ignorer|Lancer la production/),
     ).not.toBeInTheDocument();

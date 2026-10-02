@@ -153,6 +153,7 @@ class FusionReviewGroup:
     candidates: tuple[FusionCandidate, ...]
     proposed_discovery_subject_ids: tuple[UUID, ...]
     confidence: str
+    rationale: str
     requires_decision: bool
     deterministic_signals: tuple[FusionDeterministicSignal, ...]
     model_suggestion: FusionModelSuggestion | None
@@ -977,6 +978,7 @@ def _pending_review(
                 candidates=tuple(_candidate_view(item) for item in incoming),
                 proposed_discovery_subject_ids=subject_ids,
                 confidence=group.confidence.value,
+                rationale=group.rationale,
                 requires_decision=_needs_decision(group),
                 deterministic_signals=signals,
                 model_suggestion=_model_suggestion(run, group, runs_by_id),

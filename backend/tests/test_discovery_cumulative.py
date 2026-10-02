@@ -10,14 +10,23 @@ import pytest
 from cti_app.application.discovery.cumulative.apply import (
     apply_discovery_merge_plan as _apply_discovery_merge_plan,
 )
+from cti_app.application.discovery.cumulative.apply import apply_structural_subject_merge
 from cti_app.application.discovery.cumulative.context import (
     build_discovery_delta as _build_discovery_delta,
 )
 from cti_app.application.discovery.cumulative.context import build_merge_handles
 from cti_app.application.discovery.cumulative.merge_runs import make_merge_run
-from cti_app.application.discovery.cumulative.planners import HeuristicMergePlanner
+from cti_app.application.discovery.cumulative.planners import (
+    DeterministicBootstrapPlanner,
+    HeuristicMergePlanner,
+    bootstrap_intake_collision,
+)
+from cti_app.application.discovery.cumulative.service import _applied_diagnostic_event
 from cti_app.application.discovery.cumulative.types import AppliedDiscoveryMerge, DiscoveryDelta
-from cti_app.application.discovery.cumulative.validation import validate_merge_plan
+from cti_app.application.discovery.cumulative.validation import (
+    merge_plan_review_reasons,
+    validate_merge_plan,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import (
     CandidateTopic,
@@ -33,6 +42,7 @@ from cti_app.domain.discovery_cumulative import (
     DiscoveryIntake,
     DiscoveryMergeGroup,
     DiscoveryMergePlanV1,
+    DiscoveryPlannerKind,
     DiscoverySnapshot,
     MergeConfidence,
     MergeDisposition,
@@ -136,6 +146,311 @@ async def test_bootstrap_uses_same_applier_and_local_stable_ids() -> None:
     assert applied.snapshot.subjects[0].subject_id == applied.identities[0].id
     assert applied.contributions[0].subject_id == applied.identities[0].id
     assert applied.contributions[0].candidate_id == batch.candidates[0].id
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_proposes_coherent_research_parts_for_fusion_review() -> None:
+    edition_id = uuid4()
+    candidates = [
+        _candidate(
+            f"Operation Kite research part {index}",
+            "https://example.test/research?utm_source=monthly-report",
+            summary=f"Part {index} describes credential theft through a fake browser update.",
+            actors=("Example APT",),
+            campaigns=("Operation Kite",),
+            malware=("KiteLoader",),
+            event_date=date(2026, 7, 10),
+            novelty="credential theft via fake browser updates",
+        )
+        for index in range(1, 4)
+    ]
+    batch = _batch(edition_id, candidates)
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(None, delta)
+    planner = DeterministicBootstrapPlanner()
+
+    outcome = await planner.plan(
+        None,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=False,
+        sensitivity="internal",
+    )
+
+    assert len(outcome.plan.groups) == 1
+    proposal = outcome.plan.groups[0]
+    assert proposal.incoming_candidate_handles == ["C1", "C2", "C3"]
+    assert proposal.disposition is MergeDisposition.REVIEW
+    assert proposal.confidence is MergeConfidence.HIGH
+    assert proposal.flags == ["intake_collision"]
+    assert proposal.evidence.shared_campaigns == ["Operation Kite"]
+    assert proposal.evidence.shared_malware == ["KiteLoader"]
+    assert proposal.evidence.shared_publication_urls
+    assert all(candidate.title in proposal.rationale for candidate in candidates)
+    assert "actor=Example APT" in proposal.rationale
+    assert "campaign=Operation Kite" in proposal.rationale
+    assert "event_date=2026-07-10" in proposal.rationale
+    assert "mechanism=" in proposal.rationale
+    assert "Analyst decision required" in proposal.rationale
+    assert merge_plan_review_reasons(outcome.plan)
+
+
+@pytest.mark.asyncio
+async def test_monthly_report_keeps_independent_campaigns_as_three_subjects() -> None:
+    edition_id = uuid4()
+    candidates = [
+        _candidate(
+            f"Campaign {index}",
+            "https://example.test/monthly-report",
+            actors=("Example APT",),
+            campaigns=(f"Independent campaign {index}",),
+            malware=(f"Family {index}",),
+            event_date=date(2026, 7, 10),
+        )
+        for index in range(1, 4)
+    ]
+    batch = _batch(edition_id, candidates)
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    handles = build_merge_handles(None, delta)
+    planner = DeterministicBootstrapPlanner()
+    outcome = await planner.plan(
+        None,
+        delta,
+        handles,
+        edition_id=edition_id,
+        external_llm_allowed=True,
+        sensitivity="internal",
+    )
+    run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=None,
+        intake=intake,
+        delta=delta,
+        planner=planner,
+        handles=handles,
+        outcome=outcome,
+    )
+
+    applied = apply_discovery_merge_plan(
+        None,
+        delta,
+        outcome.plan,
+        resolved_handles=handles,
+        planner_kind=run.planner_kind,
+        edition_id=edition_id,
+        intake_id=intake.id,
+        merge_run_id=run.id,
+    )
+
+    assert len(applied.snapshot.subjects) == 3
+    assert all(len(group.incoming_candidate_handles) == 1 for group in outcome.plan.groups)
+    assert all(group.disposition is MergeDisposition.APPLY for group in outcome.plan.groups)
+    assert not applied.merge_events
+
+
+def test_bootstrap_collision_rule_requires_anchors_and_uses_period_and_mechanism() -> None:
+    left = _candidate(
+        "Research section A",
+        "https://example.test/report",
+        summary="Credential theft via fake browser updates",
+        actors=("Example APT",),
+        campaigns=("Operation Kite",),
+        event_date=date(2026, 7, 10),
+    )
+    same_scope = _candidate(
+        "Research section B",
+        "https://example.test/report?utm_medium=share",
+        summary="Credential theft via fake browser updates",
+        actors=("Example APT",),
+        campaigns=("Operation Kite",),
+        event_date=date(2026, 7, 10),
+    )
+
+    strong = bootstrap_intake_collision(left, same_scope)
+    assert strong is not None
+    assert strong.confidence is MergeConfidence.HIGH
+
+    no_period = _candidate(
+        "Research section B",
+        "https://example.test/report",
+        actors=("Example APT",),
+        campaigns=("Operation Kite",),
+    )
+    ambiguous_document = bootstrap_intake_collision(left, no_period)
+    assert ambiguous_document is not None
+    assert ambiguous_document.confidence is MergeConfidence.MEDIUM
+
+    url_only = _candidate("Another subject", "https://example.test/report")
+    assert bootstrap_intake_collision(left, url_only) is None
+
+    title_only = _candidate("Research section A update", "https://example.test/other")
+    assert bootstrap_intake_collision(left, title_only) is None
+
+    different_campaign = _candidate(
+        "Another activity",
+        "https://example.test/report",
+        actors=("Example APT",),
+        campaigns=("Independent Operation",),
+        event_date=date(2026, 7, 10),
+    )
+    assert bootstrap_intake_collision(left, different_campaign) is None
+
+    mechanism_support = _candidate(
+        "A separate publication",
+        "https://different.example.test/article",
+        summary="Credential theft via fake browser updates",
+        actors=("Example APT",),
+        campaigns=("Operation Kite",),
+    )
+    ambiguous_mechanism = bootstrap_intake_collision(left, mechanism_support)
+    assert ambiguous_mechanism is not None
+    assert ambiguous_mechanism.confidence is MergeConfidence.MEDIUM
+
+
+def test_bootstrap_audit_uses_a_non_merge_event_when_no_merge_event_exists() -> None:
+    assert (
+        _applied_diagnostic_event(
+            DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            merge_event_count=0,
+        )
+        == "discovery.bootstrap_applied"
+    )
+    assert (
+        _applied_diagnostic_event(DiscoveryPlannerKind.HEURISTIC, merge_event_count=0)
+        == "merge.applied"
+    )
+    assert (
+        _applied_diagnostic_event(
+            DiscoveryPlannerKind.DETERMINISTIC_BOOTSTRAP,
+            merge_event_count=1,
+        )
+        == "merge.applied"
+    )
+
+
+@pytest.mark.asyncio
+async def test_rediscovery_after_manual_merge_keeps_absorbed_identity_and_history() -> None:
+    edition_id = uuid4()
+    candidates = [
+        _candidate(
+            "Campaign A",
+            "https://example.test/a",
+            actors=("Example APT",),
+            campaigns=("Operation A",),
+            malware=("Family A",),
+        ),
+        _candidate(
+            "Campaign B",
+            "https://example.test/b",
+            actors=("Example APT",),
+            campaigns=("Operation B",),
+            malware=("Family B",),
+        ),
+    ]
+    first_batch = _batch(edition_id, candidates)
+    first_intake = _intake(first_batch)
+    first_delta = build_discovery_delta(first_intake, first_batch)
+    first_handles = build_merge_handles(None, first_delta)
+    bootstrap = DeterministicBootstrapPlanner()
+    first_outcome = await bootstrap.plan(
+        None,
+        first_delta,
+        first_handles,
+        edition_id=edition_id,
+        external_llm_allowed=True,
+        sensitivity="internal",
+    )
+    first_run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=None,
+        intake=first_intake,
+        delta=first_delta,
+        planner=bootstrap,
+        handles=first_handles,
+        outcome=first_outcome,
+    )
+    first_applied = apply_discovery_merge_plan(
+        None,
+        first_delta,
+        first_outcome.plan,
+        resolved_handles=first_handles,
+        planner_kind=first_run.planner_kind,
+        edition_id=edition_id,
+        intake_id=first_intake.id,
+        merge_run_id=first_run.id,
+    )
+    original_subject_ids = {subject.subject_id for subject in first_applied.snapshot.subjects}
+    original_contributions = tuple(first_applied.contributions)
+    canonical_candidates = _canonical_candidates(first_batch)
+
+    manual_merge = apply_structural_subject_merge(
+        first_applied.snapshot,
+        canonical_candidates,
+        edition_id=edition_id,
+        subject_ids=tuple(original_subject_ids),
+        merge_run_id=uuid4(),
+        actor_id="analyst",
+    )
+    survivor_id = manual_merge.snapshot.subjects[0].subject_id
+    absorbed_ids = original_subject_ids - {survivor_id}
+    assert len(absorbed_ids) == 1
+    assert manual_merge.merge_events[0].from_subject_id in absorbed_ids
+    assert manual_merge.merge_events[0].into_subject_id == survivor_id
+    assert not manual_merge.contributions
+
+    rediscovery_candidates = [
+        _candidate(
+            candidate.title,
+            candidate.sources[0].url,
+            actors=candidate.actors,
+            campaigns=candidate.campaigns,
+            malware=candidate.malware,
+        )
+        for candidate in candidates
+    ]
+    second_batch = _batch(edition_id, rediscovery_candidates)
+    second_intake = _intake(second_batch)
+    second_delta = build_discovery_delta(second_intake, second_batch)
+    second_handles = build_merge_handles(manual_merge.snapshot, second_delta)
+    heuristic = HeuristicMergePlanner()
+    second_outcome = await heuristic.plan(
+        manual_merge.snapshot,
+        second_delta,
+        second_handles,
+        edition_id=edition_id,
+        external_llm_allowed=True,
+        sensitivity="internal",
+    )
+    second_run = make_merge_run(
+        edition_id=edition_id,
+        parent_snapshot=manual_merge.snapshot,
+        intake=second_intake,
+        delta=second_delta,
+        planner=heuristic,
+        handles=second_handles,
+        outcome=second_outcome,
+    )
+    rediscovered = apply_discovery_merge_plan(
+        manual_merge.snapshot,
+        second_delta,
+        second_outcome.plan,
+        resolved_handles=second_handles,
+        planner_kind=second_run.planner_kind,
+        edition_id=edition_id,
+        intake_id=second_intake.id,
+        merge_run_id=second_run.id,
+    )
+
+    assert {subject.subject_id for subject in rediscovered.snapshot.subjects} == {survivor_id}
+    assert not (absorbed_ids & {subject.subject_id for subject in rediscovered.snapshot.subjects})
+    assert not rediscovered.identities
+    assert not rediscovered.merge_events
+    assert all(item.subject_id == survivor_id for item in rediscovered.contributions)
+    assert tuple(first_applied.contributions) == original_contributions
+    assert {item.subject_id for item in original_contributions} == original_subject_ids
 
 
 @pytest.mark.asyncio
@@ -543,17 +858,27 @@ def test_plan_validation_rejects_missing_duplicate_and_unknown_handles() -> None
             validate_merge_plan(plan, handles)
 
 
-def _candidate(title: str, url: str, *, summary: str = "Summary") -> CandidateTopic:
+def _candidate(
+    title: str,
+    url: str,
+    *,
+    summary: str = "Summary",
+    novelty: str = "Novelty",
+    actors: tuple[str, ...] = (),
+    campaigns: tuple[str, ...] = (),
+    malware: tuple[str, ...] = (),
+    event_date: date | None = None,
+) -> CandidateTopic:
     return CandidateTopic(
         title=title,
         summary=summary,
-        novelty="Novelty",
+        novelty=novelty,
         technical_potential=3,
         uncertainties=(),
         relevance_reasons=("Relevant",),
-        actors=(),
-        campaigns=(),
-        malware=(),
+        actors=actors,
+        campaigns=campaigns,
+        malware=malware,
         cves=(),
         victims=(),
         sectors=(),
@@ -574,6 +899,7 @@ def _candidate(title: str, url: str, *, summary: str = "Summary") -> CandidateTo
         tlp=TLP.AMBER,
         sensitivity="internal",
         external_llm_allowed=True,
+        event_date=event_date,
         local_ref="S1",
     )
 

@@ -5,7 +5,7 @@ from cti_app.application.discovery.contracts import DiscoverEditionParameters
 # ruff: noqa: RUF001 - The exact French business prompt intentionally uses typographic apostrophes.
 
 PROMPT_TEMPLATE_ID = "monthly-cti-discovery"
-PROMPT_TEMPLATE_VERSION = "4.1"
+PROMPT_TEMPLATE_VERSION = "4.2"
 
 
 def _research_prompt(parameters: DiscoverEditionParameters) -> str:
@@ -58,12 +58,20 @@ Propose tous les sujets significatifs retrouvés. Il n’existe aucune limite ni
 quota de sujets, de brèves ou d’articles approfondis. La sélection finale sera
 effectuée par un analyste humain.
 
-Regroupe dans un même SUBJECT les publications décrivant manifestement la même
-campagne, le même incident ou la même recherche.
+L’unité éditoriale d’un SUBJECT est une campagne, un incident ou une recherche
+cohérente. Regroupe dans un même SUBJECT les sous-parties d’une même recherche
+lorsqu’elles ne décrivent pas des activités autonomes.
 
 Une synthèse mensuelle ou trimestrielle peut être liée à plusieurs SUBJECT.
 Ne fusionne pas des campagnes différentes uniquement parce qu’elles sont
-mentionnées dans la même synthèse.
+mentionnées dans la même synthèse, et une même publication peut donc soutenir
+plusieurs SUBJECT.
+
+Si tu sépares plusieurs sous-parties d’une même publication ou recherche,
+`presentation` de chaque SUBJECT doit préciser son périmètre distinct et
+justifier pourquoi il s’agit d’une activité autonome. Des phases ou éléments
+techniques d’une même activité ne constituent pas à eux seuls des SUBJECT
+distincts.
 
 Chaque SUBJECT doit normalement comporter au moins une publication dans la
 période observable. Les publications antérieures peuvent être ajoutées comme

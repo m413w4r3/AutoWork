@@ -74,6 +74,7 @@ export interface FusionReviewGroup {
   candidates: FusionCandidate[];
   proposed_discovery_subject_ids: string[];
   confidence: string;
+  rationale: string;
   requires_decision: boolean;
   deterministic_signals: FusionSignal[];
   model_suggestion: FusionModelSuggestion | null;
