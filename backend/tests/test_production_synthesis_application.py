@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -13,6 +12,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel
 
+import cti_app.application.production_synthesis as synthesis_module
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
@@ -20,7 +20,6 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
-    StructuredOutputError,
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
 from cti_app.application.production_synthesis import (
@@ -46,9 +45,11 @@ from cti_app.application.production_synthesis import (
     build_synthesis_uncertainties,
     canonical_extraction_hash,
     draft_synthesis_proposal,
+    parse_synthesis_proposal_wire,
     synthesis_access_policy_hash,
     synthesis_evidence_pack_hash,
     synthesis_input_hash,
+    synthesis_invocation_hash,
     synthesis_model_run_id,
     validate_synthesis_proposal,
 )
@@ -967,9 +968,12 @@ async def test_synthesis_hash_request_and_model_identity_are_functional_and_stat
     assert request.evidence_pack_hash == synthesis_evidence_pack_hash(evidence_pack)
     assert all(str(source_id) not in request.text for source_id in (source_id, document.blob_id))
     assert all(record["handle"] in request.text for record in evidence_pack.narrative_evidence)
+    assert "@@EVIDENCE E001@@" in request.text
+    assert "@@CLAIM L001@@" in request.text
+    assert "Do not return JSON" in request.text
     assert request.run_id == synthesis_model_run_id(
         run,
-        synthesis_input_hash(
+        synthesis_invocation_hash(
             snapshot,
             extraction,
             evidence_pack,
@@ -978,11 +982,12 @@ async def test_synthesis_hash_request_and_model_identity_are_functional_and_stat
         SynthesisMode.FRESH,
     )
     assert request.run_id == synthesis_model_run_id(
-        run, request.metadata["synthesis_input_hash"], SynthesisMode.FRESH
+        run, request.metadata["synthesis_invocation_hash"], SynthesisMode.FRESH
     )
+    assert request.metadata["synthesis_input_hash"] != request.metadata["synthesis_invocation_hash"]
     changed_generation = replace(run, pipeline_generation=5)
     assert request.run_id != synthesis_model_run_id(
-        changed_generation, request.metadata["synthesis_input_hash"], SynthesisMode.FRESH
+        changed_generation, request.metadata["synthesis_invocation_hash"], SynthesisMode.FRESH
     )
 
 
@@ -1029,7 +1034,7 @@ async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_
 
 
 @pytest.mark.asyncio
-async def test_model_gateway_receives_synthesis_proposal_as_structured_schema():
+async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = make_extraction(
@@ -1050,7 +1055,7 @@ async def test_model_gateway_receives_synthesis_proposal_as_structured_schema():
         request_seen: object | None = None
         schema_seen: object | None = None
 
-        async def draft(self, model_request: object, output_schema: object) -> str:
+        async def draft(self, model_request: object, output_schema: object | None = None) -> str:
             self.request_seen = model_request
             self.schema_seen = output_schema
             return "drafted"
@@ -1059,7 +1064,8 @@ async def test_model_gateway_receives_synthesis_proposal_as_structured_schema():
     result = await draft_synthesis_proposal(gateway, request)  # type: ignore[arg-type]
     assert result == "drafted"
     assert gateway.request_seen is request
-    assert gateway.schema_seen is SynthesisProposalV1
+    assert gateway.schema_seen is None
+    assert "Do not return JSON" in request.text
 
 
 # --- canonical synthesis application service --------------------------------
@@ -1134,17 +1140,53 @@ class _MemoryInvalidations:
 
 
 class _RecordingGateway:
-    """One programmed ModelGateway.draft outcome; every call is recorded."""
+    """A small archived-output ModelGateway double; provider submissions are recorded."""
 
     def __init__(self, responder: Callable[[ModelRequest], ModelExecution] | Exception) -> None:
         self._responder = responder
-        self.calls: list[tuple[ModelRequest, object]] = []
+        self.calls: list[tuple[ModelRequest, object | None]] = []
+        self.runs: dict[UUID, ModelRun] = {}
+        self.outputs: dict[str, bytes] = {}
+        self.diagnostics: list[dict[str, object]] = []
+        self._normalized_count = 0
 
-    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+    async def draft(
+        self, request: ModelRequest, output_schema: object | None = None
+    ) -> ModelExecution:
         self.calls.append((request, output_schema))
         if isinstance(self._responder, Exception):
             raise self._responder
-        return self._responder(request)
+        execution = self._responder(request)
+        if execution.run.raw_output_reference and execution.output_text is not None:
+            self.outputs[execution.run.raw_output_reference] = execution.output_text.encode("utf-8")
+        self.runs[execution.run.id] = execution.run
+        return execution
+
+    async def get_run(self, run_id: UUID) -> ModelRun | None:
+        return self.runs.get(run_id)
+
+    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000) -> bytes:
+        content = self.outputs[reference]
+        if len(content) > max_bytes:
+            raise ValueError("output too large")
+        return content
+
+    async def archive_output(self, content: bytes, *, mime_type: str) -> str:
+        del mime_type
+        self._normalized_count += 1
+        reference = f"model-normalized://{self._normalized_count}"
+        self.outputs[reference] = content
+        return reference
+
+    async def record_output_diagnostics(self, run_id: UUID, **values: object) -> None:
+        self.diagnostics.append({"run_id": run_id, **values})
+        run = self.runs[run_id]
+        run.normalized_output_reference = values["normalized_reference"]  # type: ignore[assignment]
+        run.normalized_output_sha256 = values["normalized_sha256"]  # type: ignore[assignment]
+        run.parser_stage = values["parser_stage"]  # type: ignore[assignment]
+        run.normalization_version = values["normalization_version"]  # type: ignore[assignment]
+        run.transformations = values["transformations"]  # type: ignore[assignment]
+        run.validation_errors = values["validation_errors"]  # type: ignore[assignment]
 
 
 class _RecordingSynthesisWriter:
@@ -1181,9 +1223,44 @@ class _PreSubmissionFailure(ModelGatewayError):
     retryable = True
 
 
+def _proposal_wire(proposal: SynthesisProposalV1) -> str:
+    lines = ["@@LEAD@@"]
+    for index, claim in enumerate(proposal.lead, start=1):
+        lines.extend(
+            (
+                f"@@CLAIM L{index:03d}@@",
+                f"EVIDENCE: {', '.join(claim.evidence_handles)}",
+                f"TEXT: {claim.text}",
+            )
+        )
+    for section_index, section in enumerate(proposal.sections, start=1):
+        lines.extend(
+            (
+                f"@@SECTION {section.kind.value} S{section_index:03d}@@",
+                f"HEADING: {section.heading}",
+            )
+        )
+        for claim_index, claim in enumerate(section.claims, start=1):
+            lines.extend(
+                (
+                    f"@@CLAIM S{section_index:03d}C{claim_index:03d}@@",
+                    f"EVIDENCE: {', '.join(claim.evidence_handles)}",
+                    f"TEXT: {claim.text}",
+                )
+            )
+        lines.append("@@END SECTION@@")
+    return "\n".join(lines)
+
+
 def _succeeded(
-    request: ModelRequest, proposal: BaseModel | None, *, text: str | None = "raw answer"
+    request: ModelRequest, proposal: BaseModel | None, *, text: str | None = None
 ) -> ModelExecution:
+    if text is None:
+        text = (
+            _proposal_wire(proposal)
+            if isinstance(proposal, SynthesisProposalV1)
+            else "This response has no synthesis blocks."
+        )
     run = ModelRun(
         provider=ModelProvider.OPENAI,
         model_role=ModelRole.DRAFTING,
@@ -1196,11 +1273,16 @@ def _succeeded(
         # The durable ModelRun identity is the one the request already carries.
         id=request.run_id or uuid4(),
     )
+    raw_bytes = text.encode("utf-8")
+    raw_reference = f"model-output://{run.id}"
+    run.raw_output_reference = raw_reference
+    run.raw_output_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    run.raw_output_chars = len(text)
     run.succeed(
         actual_model_version="gpt-5",
         duration_ms=3,
         usage=ModelUsage(total_tokens=7),
-        output_references=("model-output://1",),
+        output_references=(raw_reference,),
         response_id=None,
     )
     return ModelExecution(run=run, output_text=text, structured_output=proposal)
@@ -1378,7 +1460,7 @@ async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     assert result.extraction_hash == canonical_extraction_hash(world.extraction)
     assert len(world.gateway.calls) == 1
     request, schema = world.gateway.calls[0]
-    assert schema is SynthesisProposalV1
+    assert schema is None
     assert request.web_search is False
     assert request.conversation is None
     assert request.allow_failed_resubmit is True
@@ -1401,7 +1483,11 @@ async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     assert stored["input_hash"] == result.input_hash
     # The canonical extraction is the deserialized artifact blob, never a raw input.
     assert stored["extraction"] == world.extraction
-    assert stored["raw_result"] == "raw answer"
+    assert result.model_run_id is not None
+    stored_run = world.gateway.runs[result.model_run_id]
+    assert stored_run.raw_output_reference is not None
+    archived = world.gateway.outputs[stored_run.raw_output_reference]
+    assert stored["raw_result"] == archived.decode("utf-8")
     assert stored["model_run_id"] == result.model_run_id
     assert stored["mode"] is SynthesisMode.FRESH
     assert stored["model_policy_version"] == SYNTHESIS_MODEL_POLICY_VERSION
@@ -1484,39 +1570,217 @@ async def test_external_model_block_from_gateway_is_needs_review():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["absent", "wrong_schema", "gateway_error"])
-async def test_invalid_structured_output_needs_review_without_repair_call(failure: str):
+async def test_unintelligible_synthesis_text_needs_review_without_empty_success():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = _matched_extraction(
         snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
     )
-    pack = build_synthesis_evidence_pack(snapshot, extraction)
-    handle = str(pack.narrative_evidence[0]["handle"])
-    proposal = SynthesisProposalV1.model_validate(make_proposal("FooRAT was identified.", handle))
-    responder: Callable[[ModelRequest], ModelExecution] | Exception
-    if failure == "absent":
-        # Valid JSON text is present, but no validated structured output is.
-        responder = lambda request: _succeeded(  # noqa: E731
-            request, None, text=proposal.model_dump_json()
-        )
-    elif failure == "wrong_schema":
-        responder = lambda request: _succeeded(  # noqa: E731
-            request,
-            SynthesisClaimProposalV1(text="FooRAT was identified.", evidence_handles=(handle,)),
-        )
-    else:
-        responder = StructuredOutputError("schema mismatch")
-    gateway = _RecordingGateway(responder)
+    raw = "This response has no recognizable synthesis blocks."
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=raw))
     world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
 
     result = await world.service.execute(world.run, snapshot, world.artifact)
 
     assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
     assert result.error_code == SynthesisProposalErrorCode.OUTPUT_INVALID.value
+    assert result.details["parse_error"] == "synthesis_unintelligible_response"
     assert result.model_calls == 1
     assert len(gateway.calls) == 1
     assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_dirty_synthesis_wire_keeps_valid_blocks_and_archives_raw_response():
+    world = _fresh_setup()
+    raw = f"""```text
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: Le rapport nomme "FooRAT" :chatgpt-content-reference{{index="0"}} dans cette activité.
+@@CLAIM BROKEN@@
+EVIDENCE: {world.handle}
+@@CLAIM L002@@
+Evidence {world.handle}
+Text: L'analyse cite aussi "FooRAT" comme élément du dossier.
+@@SECTION overview S001@@
+HEADING: Constat principal
+@@CLAIM C001@@
+EVIDENCE: {world.handle}
+TEXT: Le texte associe "FooRAT" à cette campagne.
+@@END SECTION@@
+```"""
+    parsed = parse_synthesis_proposal_wire(raw)
+
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.lead) == 2
+    assert len(parsed.proposal.sections) == 1
+    assert [(item.block_id, item.reason_code) for item in parsed.rejections] == [
+        ("BROKEN", "synthesis_claim_missing_text")
+    ]
+    assert parsed.transformations == ("bridge_ui_markers_removed",)
+
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 1
+    assert result.details["parse_rejections"] == [
+        {"block_id": "BROKEN", "reason_code": "synthesis_claim_missing_text"}
+    ]
+    assert result.model_run_id is not None
+    model_run = world.gateway.runs[result.model_run_id]
+    assert model_run.raw_output_reference is not None
+    assert world.gateway.outputs[model_run.raw_output_reference] == raw.encode("utf-8")
+    stored = world.writer.calls[0]
+    assert stored["raw_result"] == raw
+    synthesis = stored["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert [paragraph.text for paragraph in synthesis.lead] == [
+        'Le rapport nomme "FooRAT"  dans cette activité.',
+        'L\'analyse cite aussi "FooRAT" comme élément du dossier.',
+    ]
+    assert len(synthesis.sections) == 1
+    assert synthesis.sections[0].paragraphs[0].evidence_refs == (
+        world.pack.resolve_handle(world.handle),
+    )
+    assert ":chatgpt-content-reference" not in str(production_synthesis_to_json(synthesis))
+    assert model_run.normalized_output_reference is not None
+    normalized = SynthesisProposalV1.model_validate_json(
+        world.gateway.outputs[model_run.normalized_output_reference]
+    )
+    assert len(normalized.lead) == 2
+    assert normalized.lead[0].evidence_handles == (world.handle,)
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_synthesis_marker_is_a_valid_empty_proposal():
+    world = _fresh_setup()
+    raw = "```text\n@@EMPTY@@\n```"
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.error_code is None
+    assert result.model_calls == 1
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    assert synthesis.lead == ()
+    assert synthesis.sections == ()
+    assert result.details["paragraph_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_parser_version_change_reparses_verified_raw_without_draft_call(monkeypatch):
+    first_world = _fresh_setup()
+    first = await first_world.service.execute(
+        first_world.run, first_world.snapshot, first_world.artifact
+    )
+    first_synthesis = first_world.writer.calls[0]["synthesis"]
+    assert isinstance(first_synthesis, ProductionSynthesisV1)
+
+    monkeypatch.setattr(
+        synthesis_module, "SYNTHESIS_WIRE_PARSER_VERSION", "synthesis-text-parser-v2-test"
+    )
+    resumed_world = _service_world(
+        first_world.snapshot,
+        first_world.extraction,
+        (make_document(first_world.snapshot.subject_id, first_world.source_id),),
+        first_world.gateway,
+    )
+    old_synthesis_blob = uuid4()
+    resumed_world.store.payloads[old_synthesis_blob] = production_synthesis_to_json(first_synthesis)
+    resumed_world.artifacts.artifacts.extend(
+        (
+            ProductionArtifact(
+                production_run_id=resumed_world.run.id,
+                subject_id=resumed_world.run.subject_id,
+                stage=ProductionArtifactStage.SYNTHESIS,
+                version=1,
+                input_hash=first.input_hash,
+                canonical_blob_id=old_synthesis_blob,
+                model_run_id=first.model_run_id,
+            ),
+            ProductionArtifact(
+                production_run_id=resumed_world.run.id,
+                subject_id=resumed_world.run.subject_id,
+                stage=ProductionArtifactStage.EXTRACTION,
+                version=1,
+                input_hash=EXTRACTION_ARTIFACT_HASH,
+                canonical_blob_id=resumed_world.artifact.canonical_blob_id,
+            ),
+        )
+    )
+    resumed = await resumed_world.service.execute(
+        resumed_world.run, first_world.snapshot, resumed_world.artifact
+    )
+
+    assert first.status is SynthesisExecutionStatus.SUCCEEDED
+    assert resumed.status is SynthesisExecutionStatus.SUCCEEDED
+    assert resumed.model_calls == 0
+    assert first.input_hash != resumed.input_hash
+    assert first.model_run_id == resumed.model_run_id
+    assert len(first_world.gateway.calls) == 1
+    assert resumed.details["parse_identity"] != first.details["parse_identity"]
+    resumed_synthesis = resumed_world.writer.calls[0]["synthesis"]
+    assert resumed_synthesis == first_synthesis
+
+
+@pytest.mark.asyncio
+async def test_prompt_version_change_requires_a_new_model_call(monkeypatch):
+    first_world = _fresh_setup()
+    first = await first_world.service.execute(
+        first_world.run, first_world.snapshot, first_world.artifact
+    )
+
+    monkeypatch.setattr(synthesis_module, "SYNTHESIS_PROMPT_VERSION", "synthesis-draft-v3-test")
+    next_world = _service_world(
+        first_world.snapshot,
+        first_world.extraction,
+        (make_document(first_world.snapshot.subject_id, first_world.source_id),),
+        first_world.gateway,
+    )
+    next_result = await next_world.service.execute(
+        next_world.run, first_world.snapshot, next_world.artifact
+    )
+
+    assert first.status is SynthesisExecutionStatus.SUCCEEDED
+    assert next_result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert next_result.model_calls == 1
+    assert next_result.input_hash != first.input_hash
+    assert next_result.model_run_id != first.model_run_id
+    assert len(first_world.gateway.calls) == 2
+    assert first_world.gateway.calls[1][0].prompt_template_version == "synthesis-draft-v3-test"
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_same_archived_response_and_result():
+    first_world = _fresh_setup()
+    first = await first_world.service.execute(
+        first_world.run, first_world.snapshot, first_world.artifact
+    )
+    first_synthesis = first_world.writer.calls[0]["synthesis"]
+    assert isinstance(first_synthesis, ProductionSynthesisV1)
+    resumed_world = _service_world(
+        first_world.snapshot,
+        first_world.extraction,
+        (make_document(first_world.snapshot.subject_id, first_world.source_id),),
+        first_world.gateway,
+    )
+
+    resumed = await resumed_world.service.execute(
+        resumed_world.run, first_world.snapshot, resumed_world.artifact
+    )
+
+    assert resumed.status is SynthesisExecutionStatus.SUCCEEDED
+    assert resumed.model_calls == 0
+    assert resumed.input_hash == first.input_hash
+    assert resumed.model_run_id == first.model_run_id
+    assert resumed.details["parse_identity"] == first.details["parse_identity"]
+    assert len(first_world.gateway.calls) == 1
+    assert resumed_world.writer.calls[0]["raw_result"] == first_world.writer.calls[0]["raw_result"]
+    assert resumed_world.writer.calls[0]["synthesis"] == first_synthesis
 
 
 @pytest.mark.asyncio
@@ -2061,38 +2325,21 @@ async def test_revision_sends_previous_document_and_exact_delta_without_leaking_
     assert request.metadata["synthesis_mode"] == SynthesisMode.REVISE_PREVIOUS.value
     assert request.metadata["synthesis_input_hash"] == expected_input_hash
     assert request.run_id == synthesis_model_run_id(
-        world.run, expected_input_hash, SynthesisMode.REVISE_PREVIOUS
+        world.run,
+        request.metadata["synthesis_invocation_hash"],
+        SynthesisMode.REVISE_PREVIOUS,
     )
-    payload = json.loads(request.text)
-    previous_payload = payload["previous_synthesis_non_authoritative"]
-    assert previous_payload["non_authoritative"] is True
-    assert [claim["text"] for claim in previous_payload["lead"]] == [
-        "FooRAT was observed.",
-        "BarRAT was also observed.",
-    ]
-    assert sorted(previous_payload["lead"][0]["evidence_handles"]) == sorted(
-        (
-            current_pack.handle_for(_pack_ref(current_pack, value=value_a)),
-            current_pack.handle_for(_pack_ref(current_pack, value=value_c)),
-        )
-    )
-    assert previous_payload["lead"][1]["evidence_handles"] == []
-    assert previous_payload["lead"][1]["unsupported_evidence_count"] == 1
-    delta = payload["evidence_delta"]
-    assert delta["added"] == {
-        "count": 1,
-        "handles": [current_pack.handle_for(_pack_ref(current_pack, value=value_d))],
-    }
-    assert delta["unchanged"] == {
-        "count": 2,
-        "handles": sorted(
-            (
-                current_pack.handle_for(_pack_ref(current_pack, value=value_a)),
-                current_pack.handle_for(_pack_ref(current_pack, value=value_c)),
-            )
-        ),
-    }
-    assert delta["removed"] == {"count": 1, "kinds": ["fact"]}
+    assert "@@PREVIOUS SYNTHESIS: NON-AUTHORITATIVE@@" in request.text
+    assert "FooRAT was observed." in request.text
+    assert "BarRAT was also observed." in request.text
+    assert "CURRENT HANDLES:" in request.text
+    assert "UNSUPPORTED EVIDENCE COUNT: 1" in request.text
+    assert "ADDED COUNT: 1" in request.text
+    assert "UNCHANGED COUNT: 2" in request.text
+    assert "REMOVED COUNT: 1" in request.text
+    assert "REMOVED KINDS: fact" in request.text
+    assert current_pack.handle_for(_pack_ref(current_pack, value=value_d)) in request.text
+    assert current_pack.handle_for(_pack_ref(current_pack, value=value_a)) in request.text
     assert str(source_id) not in request.text
     assert str(previous_run_id) not in request.text
 
@@ -2307,7 +2554,9 @@ async def test_revision_retry_reuses_the_same_model_run_identity():
     assert first_request.metadata["synthesis_mode"] == SynthesisMode.REVISE_PREVIOUS.value
     assert first_request.run_id == second_request.run_id
     assert first_request.run_id == synthesis_model_run_id(
-        world.run, first_request.metadata["synthesis_input_hash"], SynthesisMode.REVISE_PREVIOUS
+        world.run,
+        first_request.metadata["synthesis_invocation_hash"],
+        SynthesisMode.REVISE_PREVIOUS,
     )
     assert world.writer.calls == []
 

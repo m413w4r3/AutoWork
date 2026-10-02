@@ -27,7 +27,6 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelRoutingHint,
     ModelSubmissionReconciliationRequiredError,
-    StructuredOutputError,
 )
 from cti_app.application.persistence import (
     ProductionUnitOfWork,
@@ -37,6 +36,12 @@ from cti_app.application.persistence import (
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
+)
+from cti_app.application.production_parsers import sanitize_bridge_output_text
+from cti_app.application.production_prompts import (
+    SYNTHESIS_PROMPT_VERSION,
+    SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
+    SYNTHESIS_WIRE_PARSER_VERSION,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.model_runs import ModelRun, ModelRunStatus
@@ -88,8 +93,6 @@ SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v2-uncertainty
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v2-date-approximation-and-dedupe"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 1
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
-SYNTHESIS_PROPOSAL_SCHEMA_VERSION = "synthesis-proposal-v1"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v1"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v1"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
@@ -158,19 +161,371 @@ class SynthesisSectionProposalV1(_StrictProposalModel):
 
 
 class SynthesisProposalV1(_StrictProposalModel):
-    """Structured output schema returned directly by ModelGateway.draft."""
+    """Strict internal proposal created from the tolerant text wire format."""
 
     lead: tuple[SynthesisClaimProposalV1, ...]
     sections: tuple[SynthesisSectionProposalV1, ...]
 
-    @field_validator("lead")
-    @classmethod
-    def _nonempty_lead(
-        cls, value: tuple[SynthesisClaimProposalV1, ...]
-    ) -> tuple[SynthesisClaimProposalV1, ...]:
-        if not value:
-            raise ValueError("Proposal lead must be a non-empty tuple")
-        return value
+
+@dataclass(frozen=True, slots=True)
+class SynthesisWireRejection:
+    block_id: str
+    reason_code: str
+    raw_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisWireParseResult:
+    proposal: SynthesisProposalV1 | None
+    rejections: tuple[SynthesisWireRejection, ...] = ()
+    error_code: str | None = None
+    explicit_empty: bool = False
+    transformations: tuple[str, ...] = ()
+
+
+@dataclass(slots=True)
+class _WireSection:
+    block_id: str
+    kind: SynthesisSectionKind | None
+    heading: list[str] = field(default_factory=list)
+    claims: list[SynthesisClaimProposalV1] = field(default_factory=list)
+    raw_lines: list[str] = field(default_factory=list)
+    error_code: str | None = None
+
+
+@dataclass(slots=True)
+class _WireClaim:
+    block_id: str
+    group: str
+    section: _WireSection | None
+    evidence_handles: tuple[str, ...] | None = None
+    text_lines: list[str] = field(default_factory=list)
+    raw_lines: list[str] = field(default_factory=list)
+    text_started: bool = False
+    error_code: str | None = None
+
+
+_SYNTHESIS_FENCE = re.compile(r"^\s*```(?:[A-Za-z0-9_-]+)?\s*$")
+_SYNTHESIS_BLOCK_WRAPPERS = re.compile(r"^@@\s*(.*?)\s*@@$")
+_SYNTHESIS_SECTION_HEADER = re.compile(
+    r"^SECTION\s*:?\s+([A-Za-z][A-Za-z0-9_-]*)(?:\s+([A-Za-z0-9._-]+))?\s*:?$",
+    re.IGNORECASE,
+)
+_SYNTHESIS_CLAIM_HEADER = re.compile(r"^CLAIM(?:\s+([A-Za-z0-9._-]+))?\s*:?$", re.IGNORECASE)
+_SYNTHESIS_FIELD = re.compile(
+    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+_SYNTHESIS_FIELD_BARE = re.compile(
+    r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s+(.+)$",
+    re.IGNORECASE,
+)
+_SYNTHESIS_HANDLE = re.compile(r"\bE\d{3,}\b")
+
+
+def _wire_line(line: str) -> str:
+    value = line.strip()
+    if value.startswith("#"):
+        value = re.sub(r"^#{1,6}\s*", "", value)
+    value = re.sub(r"^[-*+]\s+", "", value).strip()
+    if len(value) >= 4 and value.startswith("**") and value.endswith("**"):
+        value = value[2:-2].strip()
+    if len(value) >= 2 and value.startswith("`") and value.endswith("`"):
+        value = value[1:-1].strip()
+    wrapped = _SYNTHESIS_BLOCK_WRAPPERS.fullmatch(value)
+    if wrapped is not None:
+        value = wrapped.group(1).strip()
+    return value
+
+
+def _wire_rejection(
+    block_id: str, reason_code: str, raw_lines: Iterable[str]
+) -> SynthesisWireRejection:
+    raw = "\n".join(raw_lines).encode("utf-8")
+    return SynthesisWireRejection(
+        block_id=block_id,
+        reason_code=reason_code,
+        raw_sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
+def _wire_evidence_handles(value: str) -> tuple[str, ...] | None:
+    raw = value.strip()
+    handles = tuple(_SYNTHESIS_HANDLE.findall(raw))
+    residue = _SYNTHESIS_HANDLE.sub("", raw)
+    residue = re.sub(r"\band\b", "", residue, flags=re.IGNORECASE)
+    residue = re.sub(r"[\[\](){}\s,;./&|]+", "", residue)
+    return handles if handles and not residue else None
+
+
+def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
+    """Parse independent synthesis blocks without relaxing claim validation."""
+    if not isinstance(raw_text, str):
+        return SynthesisWireParseResult(None, error_code="synthesis_unintelligible_response")
+    sanitized = sanitize_bridge_output_text(raw_text).replace("\r\n", "\n").replace("\r", "\n")
+    if sanitized.startswith("\ufeff"):
+        sanitized = sanitized[1:]
+    normalized_endings = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+    transformations = ("bridge_ui_markers_removed",) if sanitized != normalized_endings else ()
+    lines = sanitized.splitlines()
+    rejected: list[SynthesisWireRejection] = []
+    lead: list[SynthesisClaimProposalV1] = []
+    sections: list[SynthesisSectionProposalV1] = []
+    current_group: str | None = None
+    current_section: _WireSection | None = None
+    current_claim: _WireClaim | None = None
+    explicit_empty = False
+    recognized = False
+    sequence = 0
+    seen_ids: set[str] = set()
+
+    def reject(block_id: str, code: str, raw_lines: Iterable[str]) -> None:
+        rejected.append(_wire_rejection(block_id, code, raw_lines))
+
+    def finish_claim() -> None:
+        nonlocal current_claim
+        claim = current_claim
+        current_claim = None
+        if claim is None:
+            return
+        if claim.error_code is not None:
+            reject(claim.block_id, claim.error_code, claim.raw_lines)
+            return
+        if claim.group == "section" and (
+            claim.section is None or claim.section.error_code is not None
+        ):
+            reject(claim.block_id, "synthesis_claim_in_invalid_section", claim.raw_lines)
+            return
+        if claim.evidence_handles is None:
+            reject(claim.block_id, "synthesis_claim_missing_evidence_handles", claim.raw_lines)
+            return
+        if not claim.text_started or not "\n".join(claim.text_lines).strip():
+            reject(claim.block_id, "synthesis_claim_missing_text", claim.raw_lines)
+            return
+        if len(set(claim.evidence_handles)) != len(claim.evidence_handles):
+            reject(claim.block_id, "synthesis_claim_duplicate_evidence_handle", claim.raw_lines)
+            return
+        try:
+            parsed = SynthesisClaimProposalV1(
+                text="\n".join(claim.text_lines).strip(),
+                evidence_handles=claim.evidence_handles,
+            )
+        except ValueError:
+            reject(claim.block_id, "synthesis_claim_schema_invalid", claim.raw_lines)
+            return
+        if claim.group == "lead":
+            lead.append(parsed)
+        elif claim.section is not None:
+            claim.section.claims.append(parsed)
+
+    def finish_section() -> None:
+        nonlocal current_section
+        section = current_section
+        current_section = None
+        if section is None:
+            return
+        if section.error_code is not None:
+            reject(section.block_id, section.error_code, section.raw_lines)
+            return
+        if not any(part.strip() for part in section.heading):
+            reject(section.block_id, "synthesis_section_missing_heading", section.raw_lines)
+            return
+        if not section.claims:
+            reject(section.block_id, "synthesis_section_missing_valid_claims", section.raw_lines)
+            return
+        try:
+            sections.append(
+                SynthesisSectionProposalV1(
+                    kind=section.kind,
+                    heading="\n".join(section.heading).strip(),
+                    claims=tuple(section.claims),
+                )
+            )
+        except ValueError:
+            reject(section.block_id, "synthesis_section_schema_invalid", section.raw_lines)
+
+    for index, raw_line in enumerate(lines, start=1):
+        if _SYNTHESIS_FENCE.fullmatch(raw_line):
+            continue
+        line = _wire_line(raw_line)
+        if not line or line in {"---", "***"}:
+            continue
+
+        if line.casefold() in {"empty", "no claims", "no supported claims"}:
+            finish_claim()
+            finish_section()
+            recognized = True
+            if explicit_empty or lead or sections or current_group is not None:
+                reject(f"EMPTY-{index}", "synthesis_empty_marker_conflict", (raw_line,))
+            else:
+                explicit_empty = True
+            current_group = None
+            continue
+        if explicit_empty:
+            reject(f"EMPTY-{index}", "synthesis_empty_marker_conflict", (raw_line,))
+            explicit_empty = False
+
+        header_value = line.rstrip(":").strip()
+        if header_value.casefold() in {"lead", "synthesis lead", "synthesis output"}:
+            finish_claim()
+            finish_section()
+            current_group = "lead" if header_value.casefold() != "synthesis output" else None
+            recognized = True
+            continue
+
+        section_match = _SYNTHESIS_SECTION_HEADER.fullmatch(header_value)
+        if section_match is not None:
+            finish_claim()
+            finish_section()
+            kind_text, local_id = section_match.groups()
+            sequence += 1
+            section_id = local_id or f"S{sequence:03d}"
+            kind = next(
+                (
+                    item
+                    for item in SynthesisSectionKind
+                    if item.value.casefold() == kind_text.casefold()
+                ),
+                None,
+            )
+            current_section = _WireSection(
+                block_id=section_id,
+                kind=kind,
+                raw_lines=[raw_line],
+                error_code=None if kind is not None else "synthesis_unknown_section_kind",
+            )
+            current_group = "section"
+            recognized = True
+            continue
+
+        if header_value.casefold() in {"end claim", "end item"}:
+            if current_claim is not None:
+                current_claim.raw_lines.append(raw_line)
+            finish_claim()
+            recognized = True
+            continue
+        if header_value.casefold() == "end section":
+            finish_claim()
+            if current_section is not None:
+                current_section.raw_lines.append(raw_line)
+            finish_section()
+            current_group = None
+            recognized = True
+            continue
+
+        claim_match = _SYNTHESIS_CLAIM_HEADER.fullmatch(header_value)
+        if claim_match is not None:
+            finish_claim()
+            sequence += 1
+            block_id = claim_match.group(1) or f"C{sequence:03d}"
+            raw_claim = [raw_line]
+            if block_id in seen_ids:
+                error_code = "synthesis_duplicate_local_block_id"
+            else:
+                error_code = None
+                seen_ids.add(block_id)
+            claim_group = current_group or "orphan"
+            current_claim = _WireClaim(
+                block_id=block_id,
+                group=claim_group,
+                section=current_section if claim_group == "section" else None,
+                raw_lines=raw_claim,
+                error_code=error_code,
+            )
+            if current_group is None:
+                current_claim.error_code = "synthesis_claim_outside_group"
+            recognized = True
+            continue
+
+        field_match = _SYNTHESIS_FIELD.fullmatch(line) or _SYNTHESIS_FIELD_BARE.fullmatch(line)
+        if field_match is not None:
+            field_name = re.sub(r"\s+", " ", field_match.group(1).casefold()).strip()
+            value = field_match.group(2)
+            if current_claim is not None:
+                current_claim.raw_lines.append(raw_line)
+                if field_name.startswith("evidence") or field_name == "handles":
+                    if current_claim.evidence_handles is not None:
+                        current_claim.error_code = "synthesis_claim_duplicate_evidence_field"
+                    else:
+                        current_claim.evidence_handles = _wire_evidence_handles(value)
+                        if current_claim.evidence_handles is None:
+                            current_claim.error_code = "synthesis_claim_invalid_evidence_handles"
+                elif field_name == "text":
+                    if current_claim.text_started:
+                        current_claim.error_code = "synthesis_claim_duplicate_text_field"
+                    else:
+                        current_claim.text_started = True
+                        current_claim.text_lines.append(value)
+                else:
+                    current_claim.error_code = "synthesis_claim_unknown_field"
+                recognized = True
+                continue
+            if current_section is not None and field_name == "heading":
+                current_section.raw_lines.append(raw_line)
+                if current_section.heading:
+                    current_section.error_code = (
+                        current_section.error_code or "synthesis_section_duplicate_heading"
+                    )
+                else:
+                    current_section.heading.append(value)
+                recognized = True
+                continue
+            if current_section is not None:
+                current_section.raw_lines.append(raw_line)
+            recognized = True
+            continue
+
+        if current_claim is not None:
+            current_claim.raw_lines.append(raw_line)
+            if current_claim.text_started:
+                current_claim.text_lines.append(raw_line.strip())
+            else:
+                current_claim.error_code = (
+                    current_claim.error_code or "synthesis_claim_unknown_field"
+                )
+        elif current_section is not None:
+            current_section.raw_lines.append(raw_line)
+            if current_section.heading:
+                current_section.heading.append(raw_line.strip())
+
+    finish_claim()
+    finish_section()
+
+    if explicit_empty and not lead and not sections and not rejected:
+        return SynthesisWireParseResult(
+            proposal=SynthesisProposalV1(lead=(), sections=()),
+            explicit_empty=True,
+            transformations=transformations,
+        )
+    if not recognized:
+        return SynthesisWireParseResult(
+            None,
+            tuple(rejected),
+            error_code="synthesis_unintelligible_response",
+            transformations=transformations,
+        )
+    if not lead:
+        rejected.append(_wire_rejection("LEAD", "synthesis_lead_missing", lines))
+        return SynthesisWireParseResult(
+            None,
+            tuple(rejected),
+            error_code="synthesis_lead_missing",
+            transformations=transformations,
+        )
+    try:
+        proposal = SynthesisProposalV1(lead=tuple(lead), sections=tuple(sections))
+    except ValueError:
+        return SynthesisWireParseResult(
+            None,
+            tuple(rejected),
+            error_code="synthesis_proposal_schema_invalid",
+            transformations=transformations,
+        )
+    return SynthesisWireParseResult(
+        proposal,
+        tuple(rejected),
+        transformations=transformations,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -423,18 +778,18 @@ async def build_synthesis_access_policy(
     )
 
 
-def synthesis_input_hash(
+def _synthesis_identity_payload(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     evidence_pack: SynthesisEvidencePackV1,
     access_policy_hash: str,
     *,
-    prompt_version: str = SYNTHESIS_PROMPT_VERSION,
-    validator_version: str = SYNTHESIS_VALIDATOR_VERSION,
-    model_policy_version: str = SYNTHESIS_MODEL_POLICY_VERSION,
-    routing_policy_version: str = SYNTHESIS_ROUTING_POLICY_VERSION,
-) -> str:
-    """Hash all functional Synthesis inputs and policy/contract versions."""
+    prompt_version: str | None = None,
+    validator_version: str | None = None,
+    model_policy_version: str | None = None,
+    routing_policy_version: str | None = None,
+) -> dict[str, Any]:
+    """Return stable request inputs, excluding parser-only implementation state."""
     if not re.fullmatch(r"[0-9a-f]{64}", access_policy_hash):
         raise ValueError("Synthesis access policy hash must be a lowercase SHA-256")
     if snapshot.subject_id != extraction.subject_id:
@@ -447,35 +802,86 @@ def synthesis_input_hash(
         "publication_language": snapshot.publication_language,
         "extraction_schema_version": PRODUCTION_EXTRACTION_SCHEMA_VERSION,
         "evidence_pack_schema_version": SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION,
+        "evidence_pack_hash": synthesis_evidence_pack_hash(evidence_pack),
         "evidence_pack_policy_version": evidence_pack.policy_version,
         "timeline_policy_version": SYNTHESIS_TIMELINE_POLICY_VERSION,
-        "proposal_schema_version": SYNTHESIS_PROPOSAL_SCHEMA_VERSION,
+        "proposal_contract_version": SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
         "canonical_schema_version": PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
-        "prompt_version": prompt_version,
-        "validator_version": validator_version,
+        "prompt_version": prompt_version or SYNTHESIS_PROMPT_VERSION,
+        "validator_version": validator_version or SYNTHESIS_VALIDATOR_VERSION,
         "evidence_ref_algorithm_version": SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION,
         "synthesis_policy_version": SYNTHESIS_POLICY_VERSION,
         "access_policy_hash": access_policy_hash,
-        "model_policy_version": model_policy_version,
-        "routing_policy_version": routing_policy_version,
+        "model_policy_version": model_policy_version or SYNTHESIS_MODEL_POLICY_VERSION,
+        "routing_policy_version": routing_policy_version or SYNTHESIS_ROUTING_POLICY_VERSION,
     }
+    return payload
+
+
+def synthesis_invocation_hash(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    evidence_pack: SynthesisEvidencePackV1,
+    access_policy_hash: str,
+    *,
+    prompt_version: str | None = None,
+    validator_version: str | None = None,
+    model_policy_version: str | None = None,
+    routing_policy_version: str | None = None,
+) -> str:
+    """Identity of the request that may cause a provider submission."""
+    payload = _synthesis_identity_payload(
+        snapshot,
+        extraction,
+        evidence_pack,
+        access_policy_hash,
+        prompt_version=prompt_version,
+        validator_version=validator_version,
+        model_policy_version=model_policy_version,
+        routing_policy_version=routing_policy_version,
+    )
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
-def synthesis_model_run_id(
-    run: ProductionRun, synthesis_input_hash: str, mode: SynthesisMode
-) -> UUID:
+def synthesis_input_hash(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+    evidence_pack: SynthesisEvidencePackV1,
+    access_policy_hash: str,
+    *,
+    prompt_version: str | None = None,
+    validator_version: str | None = None,
+    model_policy_version: str | None = None,
+    routing_policy_version: str | None = None,
+    parser_version: str | None = None,
+) -> str:
+    """Identity of a parsed canonical synthesis, including parser behavior."""
+    payload = _synthesis_identity_payload(
+        snapshot,
+        extraction,
+        evidence_pack,
+        access_policy_hash,
+        prompt_version=prompt_version,
+        validator_version=validator_version,
+        model_policy_version=model_policy_version,
+        routing_policy_version=routing_policy_version,
+    )
+    payload["parser_version"] = parser_version or SYNTHESIS_WIRE_PARSER_VERSION
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def synthesis_model_run_id(run: ProductionRun, invocation_hash: str, mode: SynthesisMode) -> UUID:
     """Derive a stable provider ModelRun identity for one run generation/mode."""
     if not isinstance(run, ProductionRun) or not isinstance(mode, SynthesisMode):
         raise ValueError("Synthesis ModelRun identity inputs are invalid")
-    if not re.fullmatch(r"[0-9a-f]{64}", synthesis_input_hash):
-        raise ValueError("Synthesis input hash must be a lowercase SHA-256")
+    if not re.fullmatch(r"[0-9a-f]{64}", invocation_hash):
+        raise ValueError("Synthesis invocation hash must be a lowercase SHA-256")
     identity = ":".join(
         (
             "production-synthesis-model-run-v1",
             str(run.id),
             str(run.pipeline_generation),
-            synthesis_input_hash,
+            invocation_hash,
             mode.value,
         )
     )
@@ -652,6 +1058,110 @@ def synthesis_evidence_pack_hash(evidence_pack: SynthesisEvidencePackV1) -> str:
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
+def synthesis_parse_identity(
+    raw_output_sha256: str,
+    evidence_pack: SynthesisEvidencePackV1,
+    *,
+    prompt_version: str | None = None,
+    contract_version: str | None = None,
+    parser_version: str | None = None,
+) -> str:
+    """Bind a parse to verified bytes, the contract, and exact request handles."""
+    if not re.fullmatch(r"[0-9a-f]{64}", raw_output_sha256):
+        raise ValueError("Raw synthesis output hash must be a lowercase SHA-256")
+    handle_mapping = [
+        {"handle": handle, "evidence_ref": repr(ref)}
+        for handle, ref in sorted(evidence_pack._handle_to_ref.items())
+    ]
+    payload = {
+        "raw_output_sha256": raw_output_sha256,
+        "parser_version": parser_version or SYNTHESIS_WIRE_PARSER_VERSION,
+        "contract_version": contract_version or SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
+        "prompt_version": prompt_version or SYNTHESIS_PROMPT_VERSION,
+        "request_handle_mapping": handle_mapping,
+    }
+    return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
+
+
+def _render_evidence_record(record: Mapping[str, Any]) -> list[str]:
+    handle = str(record["handle"])
+    lines = [f"@@EVIDENCE {handle}@@"]
+    for key, value in record.items():
+        if key == "handle" or value is None:
+            continue
+        lines.extend((f"{key.upper()}:", str(value)))
+    lines.append("@@END EVIDENCE@@")
+    return lines
+
+
+def _render_revision_context(
+    revision: SynthesisRevisionContextV1, evidence_pack: SynthesisEvidencePackV1
+) -> list[str]:
+    payload = build_synthesis_revision_payload(revision, evidence_pack)
+    previous = payload["previous_synthesis_non_authoritative"]
+    lines = ["@@PREVIOUS SYNTHESIS: NON-AUTHORITATIVE@@"]
+    if not isinstance(previous, Mapping):
+        return lines
+    for key in ("non_authoritative", "publication_language", "title"):
+        lines.extend((f"{key.upper()}:", str(previous.get(key, ""))))
+    for group in ("lead", "sections"):
+        values = previous.get(group, [])
+        if not isinstance(values, list):
+            continue
+        lines.append(f"{group.upper()}:")
+        for index, item in enumerate(values, start=1):
+            if not isinstance(item, Mapping):
+                continue
+            lines.append(f"@@PREVIOUS {group.upper()} P{index:03d}@@")
+            if group == "sections":
+                lines.extend(
+                    (
+                        f"KIND: {item.get('kind', '')}",
+                        f"HEADING: {item.get('heading', '')}",
+                    )
+                )
+            claims = item.get("claims", []) if group == "sections" else [item]
+            if isinstance(claims, list):
+                for claim_index, claim in enumerate(claims, start=1):
+                    if not isinstance(claim, Mapping):
+                        continue
+                    lines.append(f"PREVIOUS CLAIM P{index:03d}.{claim_index:03d}:")
+                    lines.append(f"TEXT: {claim.get('text', '')}")
+                    handles = claim.get("evidence_handles", [])
+                    if isinstance(handles, list):
+                        lines.append(f"CURRENT HANDLES: {', '.join(str(item) for item in handles)}")
+                    lines.append(
+                        f"UNSUPPORTED EVIDENCE COUNT: {claim.get('unsupported_evidence_count', 0)}"
+                    )
+    timeline = previous.get("timeline", [])
+    if isinstance(timeline, list) and timeline:
+        lines.append("PREVIOUS TIMELINE:")
+        for index, event in enumerate(timeline, start=1):
+            if not isinstance(event, Mapping):
+                continue
+            lines.append(f"@@PREVIOUS EVENT T{index:03d}@@")
+            for key in ("event_date", "date_text", "text"):
+                value = event.get(key)
+                if value is not None:
+                    lines.extend((f"{key.upper()}:", str(value)))
+    uncertainties = previous.get("uncertainties", [])
+    if isinstance(uncertainties, list) and uncertainties:
+        lines.append("PREVIOUS UNCERTAINTIES:")
+        lines.extend(str(value) for value in uncertainties)
+    delta = payload.get("evidence_delta")
+    if isinstance(delta, Mapping):
+        lines.append("CURRENT EVIDENCE DELTA:")
+        for key, value in delta.items():
+            if isinstance(value, Mapping):
+                for field_name, field_value in value.items():
+                    if isinstance(field_value, list):
+                        rendered = ", ".join(str(item) for item in field_value)
+                    else:
+                        rendered = str(field_value)
+                    lines.append(f"{key.upper()} {field_name.upper()}: {rendered}")
+    return lines
+
+
 def build_synthesis_model_request(
     run: ProductionRun,
     snapshot: ProductionInputSnapshot,
@@ -699,57 +1209,57 @@ def build_synthesis_model_request(
 
     policy_hash = synthesis_access_policy_hash(access_policy)
     functional_hash = synthesis_input_hash(snapshot, extraction, evidence_pack, policy_hash)
+    invocation_hash = synthesis_invocation_hash(snapshot, extraction, evidence_pack, policy_hash)
     pack_hash = synthesis_evidence_pack_hash(evidence_pack)
-    instructions = (
-        "Write in the requested publication language. Paraphrase and organize "
-        "only the supplied "
-        "evidence; invent no facts, dates, identifiers, causal links, or source details. Omit "
-        "unsupported information. Cite every factual claim using one or more exact evidence "
-        "handles from this pack. Handles are temporary references; never output handles in "
-        "claim text. Keep claims atomic, use plain text without Markdown or HTML, and return "
-        "only the requested structured proposal."
-    )
+    prompt_lines = [
+        "SYNTHESIS DRAFT REQUEST",
+        f"Prompt version: {SYNTHESIS_PROMPT_VERSION}",
+        f"Contract version: {SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",
+        f"Publication language: {snapshot.publication_language}",
+        f"Subject title: {snapshot.subject_title}",
+        f"TLP: {snapshot.subject_tlp.value}",
+        f"Discovery summary: {snapshot.discovery_summary}",
+        f"Actor or campaign: {snapshot.actor_or_campaign}",
+        f"Period: {snapshot.period_start.isoformat()} to {snapshot.period_end.isoformat()}",
+        "",
+        "Use only the evidence blocks below. Do not add facts, dates, identifiers, causal links,",
+        "or source details that the evidence does not support. Omit unsupported information.",
+        "Write every factual claim in the publication language. Keep one factual claim per block.",
+        "Put exact evidence handles on the EVIDENCE line, never in claim text. Do not invent or",
+        "modify handles. Preserve technical literals exactly as written in the evidence.",
+        "Use narrative evidence for the lead and ordinary sections. Technical handles are allowed",
+        "only in sections whose kind is technical, infrastructure, or detection.",
+        "If no narrative claim can be supported, return only @@EMPTY@@.",
+        "Do not return JSON, a Markdown table, HTML, or explanatory text outside the blocks.",
+        "",
+        "OUTPUT FORMAT",
+        "@@LEAD@@",
+        "@@CLAIM L001@@",
+        "EVIDENCE: E001, E002",
+        "TEXT: one plain-text paragraph in the publication language",
+        "@@SECTION overview S001@@",
+        "HEADING: a short plain-text heading",
+        "@@CLAIM C001@@",
+        "EVIDENCE: E001",
+        "TEXT: one plain-text paragraph in the publication language",
+        "@@END SECTION@@",
+        f"Allowed section kinds: {', '.join(kind.value for kind in SynthesisSectionKind)}",
+        "Repeat CLAIM blocks as needed.",
+        "Every non-empty response must have at least one lead claim.",
+        "A section needs a kind, heading, and at least one supported claim.",
+        "",
+        "CURRENT EVIDENCE PACK",
+    ]
+    for record in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence):
+        prompt_lines.extend(_render_evidence_record(record))
+        prompt_lines.append("")
+    if evidence_pack.uncertainties:
+        prompt_lines.append("@@ANALYTICAL UNCERTAINTIES@@")
+        prompt_lines.extend(evidence_pack.uncertainties)
+        prompt_lines.append("@@END UNCERTAINTIES@@")
     if revision is not None:
-        instructions += (
-            " A previous synthesis is supplied as non-authoritative context only: the current "
-            "evidence pack is the sole factual authority. Reuse a previous claim only when the "
-            "current pack still supports it, cite it with current handles, and drop or rewrite "
-            "every claim whose evidence was removed."
-        )
-    prompt_payload = {
-        "instructions": instructions,
-        "publication_language": snapshot.publication_language,
-        "frozen_subject_context": {
-            "title": snapshot.subject_title,
-            "tlp": snapshot.subject_tlp.value,
-            "discovery_summary": snapshot.discovery_summary,
-            "actor_or_campaign": snapshot.actor_or_campaign,
-            "period_start": snapshot.period_start.isoformat(),
-            "period_end": snapshot.period_end.isoformat(),
-        },
-        "current_evidence_pack": {
-            "schema_version": SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION,
-            "policy_version": evidence_pack.policy_version,
-            "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
-            "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
-            "uncertainties": list(evidence_pack.uncertainties),
-        },
-        "output_contract": {
-            "schema_version": SYNTHESIS_PROPOSAL_SCHEMA_VERSION,
-            "lead": [{"text": "claim text", "evidence_handles": ["E001"]}],
-            "sections": [
-                {
-                    "kind": "overview",
-                    "heading": "Human readable heading",
-                    "claims": [{"text": "claim text", "evidence_handles": ["E001"]}],
-                }
-            ],
-            "allowed_section_kinds": [kind.value for kind in SynthesisSectionKind],
-        },
-    }
-    if revision is not None:
-        prompt_payload.update(build_synthesis_revision_payload(revision, evidence_pack))
-    prompt = json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        prompt_lines.extend(("", *_render_revision_context(revision, evidence_pack)))
+    prompt = "\n".join(prompt_lines).strip()
     if any(str(record.source_document_id) in prompt for record in access_policy.sources):
         raise ValueError("Source document identities cannot appear in the Synthesis prompt")
 
@@ -765,6 +1275,7 @@ def build_synthesis_model_request(
         sensitivity=access_policy.effective_tlp.value,
         metadata={
             "synthesis_input_hash": functional_hash,
+            "synthesis_invocation_hash": invocation_hash,
             "synthesis_mode": mode.value,
             "synthesis_access_policy_hash": policy_hash,
             "effective_tlp": access_policy.effective_tlp.value,
@@ -777,7 +1288,7 @@ def build_synthesis_model_request(
         web_search=False,
         background=False,
         conversation=None,
-        run_id=synthesis_model_run_id(run, functional_hash, mode),
+        run_id=synthesis_model_run_id(run, invocation_hash, mode),
         # The gateway only resubmits a FAILED run whose submission state
         # proves the provider was never reached.
         allow_failed_resubmit=True,
@@ -787,8 +1298,8 @@ def build_synthesis_model_request(
 async def draft_synthesis_proposal(
     model_gateway: ModelGateway, request: ModelRequest
 ) -> ModelExecution:
-    """Submit one stateless structured draft through the provider-agnostic gateway."""
-    return await model_gateway.draft(request, SynthesisProposalV1)
+    """Submit one stateless text draft through the provider-agnostic gateway."""
+    return await model_gateway.draft(request)
 
 
 def _invalid_proposal() -> None:
@@ -1647,8 +2158,12 @@ class ProductionSynthesisService:
             )
             policy = await self._load_access_policy(snapshot, extraction)
             evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+            access_policy_hash = synthesis_access_policy_hash(policy)
             input_hash = synthesis_input_hash(
-                snapshot, extraction, evidence_pack, synthesis_access_policy_hash(policy)
+                snapshot, extraction, evidence_pack, access_policy_hash
+            )
+            invocation_hash = synthesis_invocation_hash(
+                snapshot, extraction, evidence_pack, access_policy_hash
             )
             reused = await self._reuse_exact(
                 run=run,
@@ -1678,7 +2193,9 @@ class ProductionSynthesisService:
                     "synthesis_access_policy_hash": synthesis_access_policy_hash(policy),
                 },
             )
-        revision = await self._find_revision_context(run, snapshot, extraction, input_hash)
+        revision = await self._find_revision_context(
+            run, snapshot, extraction, input_hash, invocation_hash
+        )
         return await self._draft(
             run=run,
             snapshot=snapshot,
@@ -1869,6 +2386,7 @@ class ProductionSynthesisService:
         snapshot: ProductionInputSnapshot,
         extraction: ProductionExtractionV1,
         input_hash: str,
+        invocation_hash: str,
     ) -> SynthesisRevisionContextV1 | None:
         """Locate the most recent eligible prior canonical synthesis, if any.
 
@@ -1878,7 +2396,13 @@ class ProductionSynthesisService:
         """
         async with self._uow_factory() as uow:
             candidates = await self._revision_candidates(uow, run, snapshot)
+            current_invocation_runs = {
+                synthesis_model_run_id(run, invocation_hash, mode)
+                for mode in (SynthesisMode.FRESH, SynthesisMode.REVISE_PREVIOUS)
+            }
             for artifact in candidates:
+                if artifact.model_run_id in current_invocation_runs:
+                    continue
                 context = await self._decode_revision_candidate(
                     uow, artifact, extraction, input_hash
                 )
@@ -2007,6 +2531,115 @@ class ProductionSynthesisService:
                 return candidate
         return None
 
+    async def _verified_existing_execution(
+        self, request: ModelRequest
+    ) -> tuple[ModelExecution | None, dict[str, Any] | None]:
+        """Read a completed invocation's exact archived bytes without submitting."""
+        if request.run_id is None:
+            return None, {"error_code": "synthesis_invocation_identity_missing"}
+        run = await self._model_gateway.get_run(request.run_id)
+        if run is None or run.status is not ModelRunStatus.SUCCEEDED:
+            return None, None
+        if (
+            run.id != request.run_id
+            or run.prompt_template_id != request.prompt_template_id
+            or run.prompt_template_version != request.prompt_template_version
+            or run.evidence_pack_hash != request.evidence_pack_hash
+        ):
+            return None, {"error_code": "synthesis_invocation_identity_mismatch"}
+        text, error = await self._verified_raw_text(run)
+        if error is not None:
+            return None, error
+        assert text is not None
+        return (
+            ModelExecution(
+                run=run,
+                output_text=text,
+                structured_output=None,
+                metadata={"checkpoint": "verified_raw_output_reparse"},
+            ),
+            None,
+        )
+
+    async def _verified_raw_text(
+        self, run: ModelRun, *, expected_text: str | None = None
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """Verify archived bytes against the immutable response digest before parsing."""
+        reference = run.raw_output_reference or (
+            run.output_references[0] if run.output_references else None
+        )
+        if not reference or not run.raw_output_sha256:
+            return None, {"error_code": "synthesis_raw_output_archive_missing"}
+        try:
+            raw_bytes = await self._model_gateway.read_output(reference)
+        except Exception:
+            return None, {"error_code": "synthesis_raw_output_archive_unreadable"}
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        if digest != run.raw_output_sha256:
+            return None, {"error_code": "synthesis_raw_output_hash_mismatch"}
+        if expected_text is not None and raw_bytes != expected_text.encode("utf-8"):
+            return None, {"error_code": "synthesis_raw_output_response_mismatch"}
+        try:
+            return raw_bytes.decode("utf-8"), None
+        except UnicodeDecodeError:
+            return None, {"error_code": "synthesis_raw_output_encoding_invalid"}
+
+    async def _record_wire_parse(
+        self,
+        run: ModelRun,
+        evidence_pack: SynthesisEvidencePackV1,
+        parsed: SynthesisWireParseResult,
+        *,
+        validation_error: str | None = None,
+    ) -> str:
+        """Persist parser identity and normalized strict proposal beside raw output."""
+        assert run.raw_output_sha256 is not None
+        identity = synthesis_parse_identity(run.raw_output_sha256, evidence_pack)
+        normalization_version = identity
+        if run.parser_stage == "synthesis" and run.normalization_version == normalization_version:
+            return identity
+        validation_errors: list[dict[str, Any]] = [
+            {
+                "path": ["blocks", item.block_id],
+                "code": item.reason_code,
+                "value_sha256": item.raw_sha256,
+            }
+            for item in parsed.rejections
+        ]
+        if validation_error is not None:
+            validation_errors.append(
+                {
+                    "path": ["proposal"],
+                    "code": validation_error,
+                    "value_sha256": run.raw_output_sha256,
+                }
+            )
+        normalized_reference: str | None = None
+        normalized_sha256: str | None = None
+        transformations = [
+            *parsed.transformations,
+            f"synthesis_parser:{SYNTHESIS_WIRE_PARSER_VERSION}",
+            f"synthesis_contract:{SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",
+            f"synthesis_prompt:{SYNTHESIS_PROMPT_VERSION}",
+        ]
+        if parsed.proposal is not None:
+            normalized = parsed.proposal.model_dump_json().encode("utf-8")
+            normalized_sha256 = hashlib.sha256(normalized).hexdigest()
+            normalized_reference = await self._model_gateway.archive_output(
+                normalized, mime_type="application/json; charset=utf-8"
+            )
+            transformations.append("synthesis_text_blocks_to_strict_proposal")
+        await self._model_gateway.record_output_diagnostics(
+            run.id,
+            normalized_reference=normalized_reference,
+            normalized_sha256=normalized_sha256,
+            parser_stage="synthesis",
+            normalization_version=normalization_version,
+            transformations=tuple(transformations),
+            validation_errors=tuple(validation_errors),
+        )
+        return identity
+
     async def _draft(
         self,
         *,
@@ -2027,6 +2660,7 @@ class ProductionSynthesisService:
         if request.metadata.get("synthesis_input_hash") != input_hash:
             raise ValueError("Synthesis request identity is inconsistent with its inputs")
         model_run_id = request.run_id
+        model_calls = 0
 
         def reviewed(
             error_code: str,
@@ -2035,6 +2669,7 @@ class ProductionSynthesisService:
             run_id: UUID | None,
             details: Mapping[str, Any],
             reconciliation: bool = False,
+            model_call_count: int | None = None,
         ) -> ProductionSynthesisExecution:
             """A terminal outcome of the single submission, never a retry."""
             payload = dict(details)
@@ -2049,14 +2684,25 @@ class ProductionSynthesisService:
                 model_run_id=run_id,
                 input_hash=input_hash,
                 extraction_hash=extraction_hash,
-                model_calls=1,
+                model_calls=model_calls if model_call_count is None else model_call_count,
                 error_code=error_code,
                 error=error,
                 details=payload,
             )
 
         try:
-            execution = await draft_synthesis_proposal(self._model_gateway, request)
+            execution, archive_error = await self._verified_existing_execution(request)
+            if archive_error is not None:
+                return reviewed(
+                    SynthesisProposalErrorCode.OUTPUT_INVALID.value,
+                    "The archived synthesis response could not be verified for re-parsing.",
+                    run_id=model_run_id,
+                    details=archive_error,
+                    model_call_count=0,
+                )
+            if execution is None:
+                model_calls = 1
+                execution = await draft_synthesis_proposal(self._model_gateway, request)
         except ModelSubmissionReconciliationRequiredError as exc:
             return reviewed(
                 SynthesisStageErrorCode.RECONCILIATION_REQUIRED.value,
@@ -2069,13 +2715,6 @@ class ProductionSynthesisService:
             return reviewed(
                 SynthesisStageErrorCode.POLICY_BLOCKED.value,
                 "The source access policy blocked the selected model route.",
-                run_id=model_run_id,
-                details={"error_code": exc.code},
-            )
-        except StructuredOutputError as exc:
-            return reviewed(
-                SynthesisProposalErrorCode.OUTPUT_INVALID.value,
-                "The provider answer is not a structured synthesis proposal.",
                 run_id=model_run_id,
                 details={"error_code": exc.code},
             )
@@ -2115,29 +2754,60 @@ class ProductionSynthesisService:
                 details=self._model_evidence(model_run),
             )
 
-        proposal = execution.structured_output
-        if not isinstance(proposal, SynthesisProposalV1):
-            # A malformed answer is never re-asked and never parsed loosely.
+        raw_text, raw_error = await self._verified_raw_text(
+            model_run, expected_text=execution.output_text
+        )
+        if raw_error is not None or raw_text is None:
             return reviewed(
                 SynthesisProposalErrorCode.OUTPUT_INVALID.value,
-                "The provider answer lacks a validated synthesis proposal.",
+                "The synthesis response is not backed by verified archived bytes.",
                 run_id=model_run.id,
-                details=self._model_evidence(model_run),
+                details={**self._model_evidence(model_run), **(raw_error or {})},
+            )
+        parsed = parse_synthesis_proposal_wire(raw_text)
+        parse_identity = synthesis_parse_identity(model_run.raw_output_sha256 or "", evidence_pack)
+        rejection_details = [
+            {"block_id": item.block_id, "reason_code": item.reason_code}
+            for item in parsed.rejections
+        ]
+        if parsed.proposal is None:
+            await self._record_wire_parse(model_run, evidence_pack, parsed)
+            return reviewed(
+                SynthesisProposalErrorCode.OUTPUT_INVALID.value,
+                "The synthesis response contains no usable proposal blocks.",
+                run_id=model_run.id,
+                details={
+                    **self._model_evidence(model_run),
+                    "parse_identity": parse_identity,
+                    "parse_error": parsed.error_code,
+                    "rejections": rejection_details,
+                },
             )
         try:
             lead, sections = validate_synthesis_proposal(
-                proposal,
+                parsed.proposal,
                 evidence_pack,
                 extraction,
                 removed_evidence=() if revision is None else revision.delta.removed_evidence,
             )
         except SynthesisProposalControlError as exc:
+            await self._record_wire_parse(
+                model_run,
+                evidence_pack,
+                parsed,
+                validation_error=exc.code.value,
+            )
             return reviewed(
                 exc.code.value,
                 f"The synthesis proposal failed {exc.code.value}.",
                 run_id=model_run.id,
-                details=self._model_evidence(model_run),
+                details={
+                    **self._model_evidence(model_run),
+                    "parse_identity": parse_identity,
+                    "rejections": rejection_details,
+                },
             )
+        await self._record_wire_parse(model_run, evidence_pack, parsed)
 
         timeline_warnings: list[str] = []
         timeline = build_synthesis_timeline(extraction, warnings=timeline_warnings)
@@ -2165,7 +2835,7 @@ class ProductionSynthesisService:
             input_hash=input_hash,
             synthesis=synthesis,
             extraction=extraction,
-            raw_result=execution.output_text,
+            raw_result=raw_text,
             model_run_id=model_run.id,
             mode=mode,
             model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
@@ -2178,9 +2848,11 @@ class ProductionSynthesisService:
             model_run_id=model_run.id,
             input_hash=input_hash,
             extraction_hash=extraction_hash,
-            model_calls=1,
+            model_calls=model_calls,
             details={
                 **_synthesis_counts(synthesis),
+                "parse_identity": parse_identity,
+                "parse_rejections": rejection_details,
                 **({} if revision is None else _revision_details(revision)),
             },
         )
