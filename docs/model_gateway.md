@@ -29,7 +29,7 @@ implémentation expose toutes les capacités OpenAI.
 | Structuration de la découverte | Qwen |
 | Regroupement ambigu | OpenAI via `chatgpt-bridge` |
 | Synthèse premium et critique | OpenAI via `chatgpt-bridge` |
-| Editorial enrichment structuré | OpenAI via `chatgpt-bridge` |
+| Enrichissement éditorial en blocs textuels | OpenAI via `chatgpt-bridge` |
 | Extraction volumique | Qwen |
 | Brouillon standard ou contenu sensible | Qwen |
 
@@ -39,8 +39,9 @@ il accepte `chatgpt_bridge`, `qwen` ou `fake` (Gemini WebAI n’a pas encore de 
 
 Sur `chatgpt_bridge`, le routeur choisit l’adaptateur selon le rôle **et** l’exigence de sortie
 structurée : un `draft()` sans schéma utilise l’adaptateur drafting textuel, un `draft()` avec
-`output_schema` (Synthesis, Editorial Enrichment, fusion Discovery) utilise un adaptateur
-structured qui garde `OPENAI_DRAFTING_MODEL`. Le bridge annonce
+`output_schema` utilise l’adaptateur structured qui garde `OPENAI_DRAFTING_MODEL`. SYNTHESIS et
+EDITORIAL_ENRICHMENT utilisent le drafting textuel ; leurs blocs sont parsés puis validés
+localement. Le bridge annonce
 `structured_output=prompt_and_client_validation` : le contrat JSON est injecté dans le prompt et
 validé côté AutoWork. `STRUCTURED_EXTRACTION` conserve `OPENAI_STRUCTURED_MODEL`.
 L'extraction canonique des sources (production) n'utilise pas ce rôle : elle passe par `draft` en texte

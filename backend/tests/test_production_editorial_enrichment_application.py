@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import pytest
 from pydantic import BaseModel
 
+import cti_app.application.production_editorial_enrichment as enrichment_module
 from cti_app.application.diagram_compilation import CompiledDiagram
 from cti_app.application.model_gateway import (
     ModelExecution,
@@ -24,6 +25,7 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+    EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
     EditorialEnrichmentExecutionStatus,
     EditorialEnrichmentProposalControlError,
     EditorialEnrichmentProposalV1,
@@ -37,6 +39,7 @@ from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
     build_editorial_enrichment_model_request,
     compute_editorial_enrichment_input_hash,
+    compute_editorial_enrichment_invocation_hash,
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_model_run_id,
     editorial_enrichment_output_contract_example,
@@ -356,17 +359,14 @@ def test_invalid_diagram_groups_are_output_invalid_not_a_raw_domain_error(
 
 
 def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> None:
-    example = editorial_enrichment_output_contract_example()
+    contract = editorial_enrichment_output_contract_example()
 
-    parsed = EditorialEnrichmentProposalV1.model_validate(example)
-
-    for diagram in example["diagrams"]:
-        node_ids = {node["node_id"] for node in diagram["nodes"]}
-        for edge in diagram["edges"]:
-            assert edge["source_node_id"] in node_ids
-            assert edge["target_node_id"] in node_ids
-    keys = [item.key for item in (*parsed.tables, *parsed.diagrams)]
-    assert len(keys) == len(set(keys))
+    assert isinstance(contract, str)
+    assert "COLUMN C001" in contract and "ROW R001" in contract
+    assert "NODE N001" in contract and "RELATION L001" in contract
+    assert "GROUP G001" in contract and "NO USEFUL ENRICHMENT" in contract
+    assert "EVIDENCE: E001" in contract
+    assert "D2" in contract
 
 
 def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
@@ -499,38 +499,62 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert request.routing_hint.value == "editorial_enrichment"
     assert request.prompt_template_version == EDITORIAL_ENRICHMENT_PROMPT_VERSION
     assert request.run_id == editorial_enrichment_model_run_id(
-        run, request.metadata["editorial_enrichment_input_hash"]
+        run, request.metadata["editorial_enrichment_invocation_hash"]
     )
     assert str(source.id) not in request.text
     assert "blob_id" not in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-structured-v1"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v1"
+    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
+        "editorial-enrichment-block-contract-v1"
+    )
 
 
 def test_functional_hash_and_model_run_identity_bind_policy_generation_and_pack() -> None:
     run = ProductionRun(subject_id=_SUBJECT_ID, edition_id=uuid4())
     extraction = _extraction()
     synthesis = _synthesis(extraction)
-    left = compute_editorial_enrichment_input_hash(
+    invocation_left = compute_editorial_enrichment_invocation_hash(
         extraction=extraction,
         synthesis=synthesis,
         evidence_pack_hash="1" * 64,
         access_policy_hash="2" * 64,
     )
-    right = compute_editorial_enrichment_input_hash(
+    invocation_right = compute_editorial_enrichment_invocation_hash(
         extraction=extraction,
         synthesis=synthesis,
         evidence_pack_hash="3" * 64,
         access_policy_hash="2" * 64,
     )
 
-    assert left != right
-    assert editorial_enrichment_model_run_id(run, left) != editorial_enrichment_model_run_id(
-        run, right
-    )
-    assert editorial_enrichment_model_run_id(run, left) == editorial_enrichment_model_run_id(
-        run, left
-    )
+    assert invocation_left != invocation_right
+    assert editorial_enrichment_model_run_id(
+        run, invocation_left
+    ) != editorial_enrichment_model_run_id(run, invocation_right)
+    assert editorial_enrichment_model_run_id(
+        run, invocation_left
+    ) == editorial_enrichment_model_run_id(run, invocation_left)
     assert EditorialEnrichmentExecutionStatus.NEEDS_REVIEW.value == "needs_review"
+
+
+def test_parser_version_changes_artifact_identity_but_not_invocation_identity() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    common = {
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "evidence_pack_hash": "1" * 64,
+        "access_policy_hash": "2" * 64,
+    }
+
+    invocation_v1 = compute_editorial_enrichment_invocation_hash(**common)
+    invocation_v2 = compute_editorial_enrichment_invocation_hash(
+        **common, prompt_version=EDITORIAL_ENRICHMENT_PROMPT_VERSION
+    )
+    artifact_v1 = compute_editorial_enrichment_input_hash(**common, parser_version="wire-v1")
+    artifact_v2 = compute_editorial_enrichment_input_hash(**common, parser_version="wire-v2")
+
+    assert invocation_v1 == invocation_v2
+    assert artifact_v1 != artifact_v2
 
 
 @pytest.mark.parametrize(
@@ -622,12 +646,69 @@ class _RecordingGateway:
     def __init__(self, responder: Callable[[ModelRequest], ModelExecution] | Exception) -> None:
         self._responder = responder
         self.calls: list[tuple[ModelRequest, object]] = []
+        self.runs: dict[UUID, ModelRun] = {}
+        self.outputs: dict[str, bytes] = {}
+        self.diagnostics: list[dict[str, object]] = []
 
-    async def draft(self, request: ModelRequest, output_schema: object) -> ModelExecution:
+    async def draft(
+        self, request: ModelRequest, output_schema: object | None = None
+    ) -> ModelExecution:
         self.calls.append((request, output_schema))
         if isinstance(self._responder, Exception):
             raise self._responder
-        return self._responder(request)
+        execution = self._responder(request)
+        if execution.output_text is None:
+            return execution
+        raw = execution.output_text.encode("utf-8")
+        reference = f"model-output://{execution.run.id}"
+        execution.run.raw_output_reference = reference
+        execution.run.raw_output_sha256 = hashlib.sha256(raw).hexdigest()
+        execution.run.raw_output_chars = len(execution.output_text)
+        execution.run.output_references = (reference,)
+        self.outputs[reference] = raw
+        self.runs[execution.run.id] = execution.run
+        return execution
+
+    async def get_run(self, run_id: UUID) -> ModelRun | None:
+        return self.runs.get(run_id)
+
+    async def read_output(self, reference: str, *, max_bytes: int = 10_000_000) -> bytes:
+        del max_bytes
+        return self.outputs[reference]
+
+    async def archive_output(self, content: bytes, *, mime_type: str) -> str:
+        del mime_type
+        reference = f"model-normalized://{uuid4()}"
+        self.outputs[reference] = content
+        return reference
+
+    async def record_output_diagnostics(
+        self,
+        run_id: UUID,
+        *,
+        normalized_reference: str | None,
+        normalized_sha256: str | None,
+        parser_stage: str | None,
+        normalization_version: str | None,
+        transformations: tuple[str, ...],
+        validation_errors: tuple[dict[str, object], ...],
+    ) -> None:
+        run = self.runs[run_id]
+        run.normalized_output_reference = normalized_reference
+        run.normalized_output_sha256 = normalized_sha256
+        run.parser_stage = parser_stage
+        run.normalization_version = normalization_version
+        run.transformations = transformations
+        run.validation_errors = validation_errors  # type: ignore[assignment]
+        self.diagnostics.append(
+            {
+                "run_id": run_id,
+                "parser_stage": parser_stage,
+                "normalization_version": normalization_version,
+                "transformations": transformations,
+                "validation_errors": validation_errors,
+            }
+        )
 
 
 class _RecordingWriter:
@@ -685,7 +766,96 @@ def _succeeded(request: ModelRequest, proposal: BaseModel | None) -> ModelExecut
         output_references=("model-output://1",),
         response_id=None,
     )
-    return ModelExecution(run=run, output_text="raw answer", structured_output=proposal)
+    output_text = (
+        _proposal_to_wire(proposal)
+        if isinstance(proposal, EditorialEnrichmentProposalV1)
+        else "raw answer"
+    )
+    return ModelExecution(run=run, output_text=output_text, structured_output=None)
+
+
+def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
+    payload = proposal.model_dump(mode="json")
+    lines: list[str] = []
+    for index, table in enumerate(payload["tables"], start=1):
+        lines.extend(
+            [
+                f"TABLE T{index:03d}",
+                f"KEY: {table['key']}",
+                f"KIND: {table['kind']}",
+                f"TITLE: {table['title']}",
+            ]
+        )
+        if table.get("caption") is not None:
+            lines.append(f"CAPTION: {table['caption']}")
+        placement = table["placement"]
+        lines.append(f"PLACEMENT: {placement['kind']}")
+        if placement.get("section_index") is not None:
+            lines.append(f"SECTION_INDEX: {placement['section_index']}")
+        for column_index, column in enumerate(table["columns"], start=1):
+            lines.extend(
+                [
+                    f"COLUMN C{index:03d}_{column_index:03d}",
+                    f"KEY: {column['key']}",
+                    f"LABEL: {column['label']}",
+                    "END COLUMN",
+                ]
+            )
+        for row_index, row in enumerate(table["rows"], start=1):
+            lines.append(f"ROW R{index:03d}_{row_index:03d}")
+            lines.extend(f"CELL: {cell}" for cell in row["cells"])
+            lines.append(f"EVIDENCE: {', '.join(row['evidence_handles'])}")
+            lines.append("END ROW")
+        lines.append("END TABLE")
+    for index, diagram in enumerate(payload["diagrams"], start=1):
+        lines.extend(
+            [
+                f"DIAGRAM D{index:03d}",
+                f"KEY: {diagram['key']}",
+                f"KIND: {diagram['kind']}",
+                f"TITLE: {diagram['title']}",
+            ]
+        )
+        if diagram.get("caption") is not None:
+            lines.append(f"CAPTION: {diagram['caption']}")
+        lines.append(f"DIRECTION: {diagram['direction']}")
+        placement = diagram["placement"]
+        lines.append(f"PLACEMENT: {placement['kind']}")
+        if placement.get("section_index") is not None:
+            lines.append(f"SECTION_INDEX: {placement['section_index']}")
+        for node_index, node in enumerate(diagram["nodes"], start=1):
+            lines.extend(
+                [
+                    f"NODE N{index:03d}_{node_index:03d}",
+                    f"ID: {node['node_id']}",
+                    f"LABEL: {node['label']}",
+                    f"EVIDENCE: {', '.join(node['evidence_handles'])}",
+                    "END NODE",
+                ]
+            )
+        for edge_index, edge in enumerate(diagram["edges"], start=1):
+            lines.extend(
+                [
+                    f"RELATION L{index:03d}_{edge_index:03d}",
+                    f"FROM: {edge['source_node_id']}",
+                    f"TO: {edge['target_node_id']}",
+                ]
+            )
+            if edge.get("label") is not None:
+                lines.append(f"LABEL: {edge['label']}")
+            lines.extend([f"EVIDENCE: {', '.join(edge['evidence_handles'])}", "END RELATION"])
+        for group_index, group in enumerate(diagram["groups"], start=1):
+            lines.extend(
+                [
+                    f"GROUP G{index:03d}_{group_index:03d}",
+                    f"ID: {group['group_id']}",
+                    f"LABEL: {group['label']}",
+                    f"NODES: {', '.join(group['node_ids'])}",
+                    "END GROUP",
+                ]
+            )
+        lines.append("END DIAGRAM")
+    return "\n".join(lines) if lines else "NO USEFUL ENRICHMENT"
 
 
 def _document(*, do_not_submit: bool = False) -> SourceDocument:
@@ -778,15 +948,17 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
     assert (result.model_calls, result.table_count, result.diagram_count) == (1, 1, 1)
     assert result.source_figure_count == 0
     request, schema = world.gateway.calls[0]
-    assert schema is EditorialEnrichmentProposalV1
+    assert schema is None
     assert request.routing_hint is ModelRoutingHint.EDITORIAL_ENRICHMENT
     assert (
         request.run_id
         == result.model_run_id
-        == editorial_enrichment_model_run_id(world.run, result.input_hash)
+        == editorial_enrichment_model_run_id(
+            world.run, request.metadata["editorial_enrichment_invocation_hash"]
+        )
     )
     stored = world.writer.calls[0]
-    assert stored["raw_result"] == "raw answer"
+    assert stored["raw_result"] == _proposal_to_wire(_proposal("E001"))
     assert stored["model_run_id"] == result.model_run_id
     assert stored["input_hash"] == result.input_hash
     enrichment = stored["enrichment"]
@@ -804,6 +976,169 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 1)
     assert len(world.writer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() -> None:
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace(
+        "END TABLE",
+        "ROW R_BAD\nCELL: malformed row\nEVIDENCE: E001\nEND ROW\nEND TABLE",
+        1,
+    )
+    wire = wire.replace(
+        "END DIAGRAM",
+        "GROUP G_VALID\nID: stage\nLABEL: Execution stage\nNODES: malware, execution\n"
+        "END GROUP\nRELATION L_UNKNOWN\nFROM: malware\nTO: missing\nLABEL: leads to\n"
+        "EVIDENCE: E001\nEND RELATION\nEND DIAGRAM",
+        1,
+    )
+    wire = wire.replace("CELL: ExampleRAT", 'CELL: "ExampleRAT"', 1)
+    wire = wire.replace("EVIDENCE: E001", "EVIDENCE: E001【cite:turn2】", 1)
+    polluted = f"```text\n{wire}\n```"
+    world = _world(
+        _RecordingGateway(
+            lambda request: replace(_succeeded(request, _proposal("E001")), output_text=polluted)
+        )
+    )
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.table_count == result.diagram_count == 1
+    assert result.details is not None
+    rejections = result.details["rejections"]
+    assert {item["reason_code"] for item in rejections} == {
+        "editorial_enrichment_table_row_column_count_mismatch",
+        "editorial_enrichment_diagram_relation_unknown_node",
+    }
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert len(enrichment.tables[0].rows) == 1  # type: ignore[attr-defined]
+    assert enrichment.tables[0].rows[0].cells[0] == '"ExampleRAT"'  # type: ignore[attr-defined]
+    assert len(enrichment.diagrams[0].edges) == 1  # type: ignore[attr-defined]
+    assert len(enrichment.diagrams[0].groups) == 1  # type: ignore[attr-defined]
+    assert enrichment.tables[0].placement.kind is EnrichmentPlacementKind.AFTER_LEAD  # type: ignore[attr-defined]
+    assert enrichment.diagrams[0].placement.section_index == 0  # type: ignore[attr-defined]
+    assert world.writer.calls[0]["raw_result"] == polluted
+    run = world.gateway.runs[result.model_run_id]
+    assert "bridge_ui_markers_removed" in run.transformations
+    assert "markdown_fences_removed" in run.transformations
+    assert {item["code"] for item in run.validation_errors} == {
+        "editorial_enrichment_table_row_column_count_mismatch",
+        "editorial_enrichment_diagram_relation_unknown_node",
+    }
+
+
+@pytest.mark.asyncio
+async def test_unintelligible_nonempty_response_needs_review() -> None:
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, None)))
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value
+    assert result.details is not None
+    assert result.details["wire_error_code"] == "editorial_enrichment_unintelligible_response"
+    assert result.model_calls == 1
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_parser_version_bump_reparses_archived_output_without_model_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
+    first = await _execute(world)
+    first_enrichment = world.writer.calls[0]["enrichment"]
+    original_identity = world.gateway.runs[first.model_run_id].normalization_version
+    original_normalized_sha256 = world.gateway.runs[first.model_run_id].normalized_output_sha256
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION",
+        "editorial-enrichment-wire-v2",
+    )
+    second = await _execute(world)
+
+    assert first.status is second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert second.model_calls == 0
+    assert len(world.gateway.calls) == 1
+    assert second.model_run_id == first.model_run_id
+    assert second.input_hash != first.input_hash
+    reparsed = world.writer.calls[1]["enrichment"]
+    assert reparsed.tables == first_enrichment.tables  # type: ignore[attr-defined]
+    assert tuple(
+        replace(item, compiled_asset_id=None)
+        for item in reparsed.diagrams  # type: ignore[attr-defined]
+    ) == tuple(
+        replace(item, compiled_asset_id=None)
+        for item in first_enrichment.diagrams  # type: ignore[attr-defined]
+    )
+    assert world.gateway.runs[second.model_run_id].normalization_version != original_identity
+    assert (
+        world.gateway.runs[second.model_run_id].normalized_output_sha256
+        == original_normalized_sha256
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("version_name", "version_value"),
+    (
+        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v4"),
+        (
+            "EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION",
+            "editorial-enrichment-block-contract-v2",
+        ),
+    ),
+)
+async def test_prompt_or_contract_version_bump_uses_a_new_model_invocation(
+    monkeypatch: pytest.MonkeyPatch, version_name: str, version_value: str
+) -> None:
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
+    first = await _execute(world)
+    monkeypatch.setattr(enrichment_module, version_name, version_value)
+
+    second = await _execute(world)
+
+    assert second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert len(world.gateway.calls) == 2
+    assert second.model_calls == 1
+    assert second.input_hash != first.input_hash
+    assert second.model_run_id != first.model_run_id
+
+
+@pytest.mark.asyncio
+async def test_restart_resumes_from_verified_raw_output_with_identical_result() -> None:
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
+    first = await _execute(world)
+    first_enrichment = world.writer.calls[0]["enrichment"]
+    world.service = ProductionEditorialEnrichmentService(
+        uow_factory=world.service._uow_factory,  # type: ignore[attr-defined,arg-type]
+        artifact_store=world.store,  # type: ignore[arg-type]
+        model_gateway=world.gateway,  # type: ignore[arg-type]
+        editorial_enrichment_service=world.writer,  # type: ignore[arg-type]
+        artifact_reuse=world.service._artifact_reuse,  # type: ignore[attr-defined,arg-type]
+        media_asset_store=world.service._media_asset_store,  # type: ignore[attr-defined,arg-type]
+        diagram_compiler=world.service._diagram_compiler,  # type: ignore[attr-defined,arg-type]
+    )
+
+    resumed = await _execute(world)
+
+    assert resumed.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert resumed.model_calls == 0
+    assert len(world.gateway.calls) == 1
+    assert resumed.model_run_id == first.model_run_id
+    resumed_enrichment = world.writer.calls[1]["enrichment"]
+    assert resumed_enrichment.tables == first_enrichment.tables  # type: ignore[attr-defined]
+    assert tuple(
+        replace(item, compiled_asset_id=None)
+        for item in resumed_enrichment.diagrams  # type: ignore[attr-defined]
+    ) == tuple(
+        replace(item, compiled_asset_id=None)
+        for item in first_enrichment.diagrams  # type: ignore[attr-defined]
+    )
+    assert world.writer.calls[1]["raw_result"] == world.writer.calls[0]["raw_result"]
 
 
 @pytest.mark.asyncio
@@ -917,11 +1252,17 @@ async def test_invalid_structured_output_needs_review_without_artifact(failure: 
     }
     assert result.model_calls == 1
     assert world.writer.calls == []
+    if failure == "unknown_handle":
+        assert result.details is not None
+        assert any(
+            item["reason_code"] == "editorial_enrichment_unknown_evidence_handle"
+            for item in result.details["rejections"]
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("collision", ["duplicate_table_keys", "table_key_equals_diagram_key"])
-async def test_key_collision_in_structured_proposal_needs_review_without_artifact(
+async def test_key_collision_rejects_only_the_conflicting_wire_block(
     collision: str,
 ) -> None:
     proposal = EditorialEnrichmentProposalV1.model_validate(_colliding_proposal(collision))
@@ -929,10 +1270,14 @@ async def test_key_collision_in_structured_proposal_needs_review_without_artifac
 
     result = await _execute(world)
 
-    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
-    assert result.error_code == "editorial_enrichment_output_invalid"
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.details is not None
+    assert any(
+        item["reason_code"] == "editorial_enrichment_duplicate_key"
+        for item in result.details["rejections"]
+    )
     assert result.model_calls == 1
-    assert world.writer.calls == []
+    assert len(world.writer.calls) == 1
 
 
 @pytest.mark.asyncio
