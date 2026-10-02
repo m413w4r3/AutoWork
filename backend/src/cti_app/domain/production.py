@@ -316,6 +316,7 @@ class ProductionSubmissionReconciliation:
     model_run_id: UUID
     stage: ProductionStage
     bridge_response_id: str | None
+    bridge_request_id: str | None = None
     submission_state: ModelSubmissionState
     phase: str
     output_sha256: str | None = None
@@ -1045,7 +1046,13 @@ class ProductionRun:
         self.updated_at = self._timestamp(now, "updated_at")
         self.version += 1
 
-    def adopt_reconciliation_output(self, *, output_sha256: str, provenance: str) -> None:
+    def adopt_reconciliation_output(
+        self,
+        *,
+        output_sha256: str,
+        provenance: str,
+        bridge_response_id: str | None = None,
+    ) -> None:
         """Record the exact adopted bytes without changing pipeline generation."""
         if self.reconciliation is None:
             raise ValueError("production_reconciliation_missing")
@@ -1053,7 +1060,8 @@ class ProductionRun:
             production_run_id=self.reconciliation.production_run_id,
             model_run_id=self.reconciliation.model_run_id,
             stage=self.reconciliation.stage,
-            bridge_response_id=self.reconciliation.bridge_response_id,
+            bridge_response_id=bridge_response_id or self.reconciliation.bridge_response_id,
+            bridge_request_id=self.reconciliation.bridge_request_id,
             submission_state=self.reconciliation.submission_state,
             phase=self.reconciliation.phase,
             output_sha256=output_sha256,

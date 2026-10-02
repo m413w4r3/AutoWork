@@ -2579,7 +2579,7 @@ def _reconciliation_run(
             model_run_id=uuid4(),
             stage=stage,
             bridge_response_id="bridge-1",
-            submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+            submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
             phase="reconciliation",
         ),
     )

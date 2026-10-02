@@ -23,6 +23,7 @@ from cti_app.application.model_gateway import (
     ModelCapabilityError,
     ModelGateway,
     ModelGatewayError,
+    ModelProviderNotConfiguredError,
     ModelRequest,
     ModelRouter,
     ModelRoutingHint,
@@ -102,11 +103,17 @@ class TerminalFailureThenSuccessTransport:
     """The bridge closes the first `failures` attempts as failed, then answers."""
 
     def __init__(
-        self, *, failures: int, retryable: bool = True, bridge_status: str | None = "failed"
+        self,
+        *,
+        failures: int,
+        retryable: bool = True,
+        bridge_status: str | None = "failed",
+        verified_no_answer: bool = False,
     ) -> None:
         self.failures = failures
         self.retryable = retryable
         self.bridge_status = bridge_status
+        self.verified_no_answer = verified_no_answer
         self.idempotency_keys: list[str | None] = []
 
     async def create(
@@ -123,6 +130,7 @@ class TerminalFailureThenSuccessTransport:
                 submission_state="post_submission",
                 bridge_run_id=f"resp_failed_{len(self.idempotency_keys)}",
                 bridge_status=self.bridge_status,
+                verified_no_answer=self.verified_no_answer,
             )
         return {
             "id": "resp_ok",
@@ -324,6 +332,7 @@ async def test_typed_bridge_error_details_are_persisted_safely() -> None:
     assert run.error_details == {
         "provider": "openai_chatgpt_bridge",
         "phase": "generation",
+        "diagnostic_code": "bridge_auth_failed",
         "retryable": False,
         "attempts": 1,
     }
@@ -369,11 +378,13 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
     assert caught.value.phase == "reconciliation"
     assert run.status is ModelRunStatus.NEEDS_REVIEW
     assert run.error_code == "model_submission_reconciliation_required"
-    assert run.submission_state.value == "submitted_or_unknown"
+    assert run.submission_state.value == "external_state_unknown"
     assert run.submission_attempt == 1
+    assert run.bridge_request_id == f"{run.id}:a1"
     assert run.error_details == {
         "provider": "openai_chatgpt_bridge",
         "phase": "submission_confirmation",
+        "diagnostic_code": "bridge_ui_timeout",
         "retryable": True,
         "attempts": 1,
         "submission_state": "submission_attempted",
@@ -381,6 +392,26 @@ async def test_attempted_bridge_failure_is_reconciliation_only_and_keeps_diagnos
         "reconciliation_phase": "reconciliation",
         "bridge_diagnostics": {"user_turns_before": 1},
     }
+
+
+async def test_restart_keeps_exact_bridge_request_identity_for_reconciliation() -> None:
+    transport = SubmissionAwareResponsesTransport(submission_state="submission_attempted")
+    gateway, model_uow, output_store = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    assert model_request.run_id is not None
+    restarted_gateway = ModelGateway(gateway._router, model_uow, output_store)
+    persisted = await restarted_gateway.get_run(model_request.run_id)
+
+    assert persisted is not None
+    assert persisted.bridge_request_id == f"{persisted.id}:a1"
+    assert persisted.submission_state.value == "external_state_unknown"
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await restarted_gateway.research(model_request)
+    assert transport.calls == 1
 
 
 @pytest.fixture
@@ -395,7 +426,9 @@ def no_bridge_retry_delay(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_bridge_confirmed_terminal_failure_is_replayed_as_a_new_attempt(
     retryable: bool,
 ) -> None:
-    transport = TerminalFailureThenSuccessTransport(failures=2, retryable=retryable)
+    transport = TerminalFailureThenSuccessTransport(
+        failures=2, retryable=retryable, verified_no_answer=True
+    )
     gateway, model_uow, _ = gateway_with_transport(transport)
     model_request = request(external_llm_allowed=True, run_id=uuid4())
 
@@ -409,17 +442,19 @@ async def test_bridge_confirmed_terminal_failure_is_replayed_as_a_new_attempt(
 
 
 @pytest.mark.usefixtures("no_bridge_retry_delay")
-async def test_bridge_terminal_failure_retries_are_bounded_then_reconciled() -> None:
-    transport = TerminalFailureThenSuccessTransport(failures=99)
+async def test_verified_terminal_failure_retries_are_bounded() -> None:
+    transport = TerminalFailureThenSuccessTransport(failures=99, verified_no_answer=True)
     gateway, model_uow, _ = gateway_with_transport(transport)
     model_request = request(external_llm_allowed=True, run_id=uuid4())
 
-    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+    with pytest.raises(BridgeTransportError):
         await gateway.research(model_request)
 
     run = model_uow.state[model_request.run_id]
     assert len(transport.idempotency_keys) == 3
-    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.status is ModelRunStatus.FAILED
+    assert run.error_code == "bridge_server_error"
+    assert run.submission_state.value == "verified_terminal_failure"
     assert run.submission_attempt == 3
 
 
@@ -442,6 +477,62 @@ async def test_unconfirmed_bridge_failure_is_never_replayed(
 
     assert len(transport.idempotency_keys) == 1
     assert model_uow.state[model_request.run_id].status is ModelRunStatus.NEEDS_REVIEW
+
+
+@pytest.mark.usefixtures("no_bridge_retry_delay")
+async def test_failed_without_verified_no_answer_reconciles_without_retry() -> None:
+    transport = TerminalFailureThenSuccessTransport(
+        failures=1, bridge_status="failed", verified_no_answer=False
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert len(transport.idempotency_keys) == 1
+    assert run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.submission_state.value == "external_state_unknown"
+    assert run.error_details["diagnostic_code"] == "bridge_server_error"
+
+
+@pytest.mark.parametrize(
+    "diagnostic_code",
+    [
+        "bridge_ambiguous_response_roots",
+        "bridge_tab_closed",
+        "bridge_extension_disconnected",
+    ],
+)
+async def test_bridge_cause_code_is_persisted_on_reconciliation(
+    diagnostic_code: str,
+) -> None:
+    class FailureTransport:
+        async def create(
+            self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        ) -> dict[str, Any]:
+            del payload, idempotency_key
+            raise BridgeTransportError(
+                diagnostic_code,
+                "bridge cause",
+                retryable=False,
+                submission_state="post_submission",
+            )
+
+        async def retrieve(self, response_id: str) -> dict[str, Any]:
+            del response_id
+            raise AssertionError("not used")
+
+    gateway, model_uow, _ = gateway_with_transport(FailureTransport())
+    model_request = request(external_llm_allowed=True, run_id=uuid4())
+
+    with pytest.raises(ModelSubmissionReconciliationRequiredError):
+        await gateway.research(model_request)
+
+    run = model_uow.state[model_request.run_id]
+    assert run.error_details["diagnostic_code"] == diagnostic_code
+    assert run.submission_state.value == "external_state_unknown"
 
 
 async def test_proven_pre_submission_bridge_failure_can_be_explicitly_retried() -> None:
@@ -703,7 +794,7 @@ async def test_running_not_submitted_run_is_claimed_exactly_once() -> None:
     assert len(fake.calls) == 1
 
 
-async def test_running_submitted_or_unknown_run_is_never_resubmitted() -> None:
+async def test_running_external_state_unknown_run_is_never_resubmitted() -> None:
     """A run that made it past the initial-submission claim is a possible
     duplicate-in-flight and must never be reposted."""
     fake = FakeModelAdapter()
@@ -727,7 +818,7 @@ async def test_running_submitted_or_unknown_run_is_never_resubmitted() -> None:
     assert model_request.run_id is not None
     pre_persisted = gateway.build_run(model_request, ModelRole.DRAFTING)
     pre_persisted.begin_submission_attempt()
-    assert pre_persisted.submission_state.value == "submitted_or_unknown"
+    assert pre_persisted.submission_state.value == "external_state_unknown"
     model_uow.state[pre_persisted.id] = pre_persisted
 
     with pytest.raises(ModelSubmissionReconciliationRequiredError):
@@ -767,7 +858,7 @@ async def test_qwen_unknown_failure_is_not_resubmitted() -> None:
     run = model_uow.state[model_request.run_id]
     assert run.status is ModelRunStatus.NEEDS_REVIEW
     assert run.error_code == "model_submission_reconciliation_required"
-    assert run.submission_state.value == "submitted_or_unknown"
+    assert run.submission_state.value == "external_state_unknown"
     assert run.submission_attempt == 1
     assert transport.calls == 1
 
@@ -817,6 +908,7 @@ async def test_background_openai_response_is_resumed_by_job_polling() -> None:
     gateway, model_uow, output_store = gateway_with_transport(transport)
     execution = await gateway.research(request(external_llm_allowed=True, background=True))
     assert execution.run.status is ModelRunStatus.WAITING_BACKGROUND
+    assert execution.run.submission_state.value == "submission_in_progress"
 
     job_uow = InMemoryJobUnitOfWorkFactory()
     registry = create_job_registry(gateway)
@@ -839,9 +931,31 @@ async def test_background_openai_response_is_resumed_by_job_polling() -> None:
     assert completed_job.status is JobStatus.SUCCEEDED
     assert completed_job.attempt == 2
     assert completed_run.status is ModelRunStatus.SUCCEEDED
+    assert completed_run.submission_state.value == "result_obtained"
     assert completed_run.response_id == "resp_background"
     assert completed_run.output_references[0].startswith("memory://model-outputs/")
     assert list(output_store.objects.values()) == [b"Recherche termin\xc3\xa9e"]
+
+
+async def test_background_wait_budget_becomes_reconciliation_without_another_poll() -> None:
+    transport = SequencedResponsesTransport(
+        [{"id": "resp_budget", "status": "queued", "model": "chatgpt-web"}]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    gateway._background_wait_timeout_seconds = 0
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+
+    recovered = await gateway.resume(execution.run.id)
+    run = model_uow.state[execution.run.id]
+
+    assert recovered.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert run.error_code == "model_background_wait_budget_exceeded"
+    assert run.error_details["diagnostic_code"] == "model_background_wait_budget_exceeded"
+    assert run.submission_state.value == "external_state_unknown"
+    assert run.response_id == "resp_budget"
+    assert transport.retrieve_calls == 0
 
 
 class _CountingChatTransport:
@@ -928,20 +1042,50 @@ async def test_production_factory_builds_gemini_fail_closed_for_structured_outpu
         )
 
 
-async def test_bridge_generation_has_no_client_read_timeout() -> None:
+async def test_bridge_generation_read_timeout_uses_configured_wait_budget() -> None:
     from typing import cast
 
     from cti_app.application.persistence import UnitOfWorkFactory
     from cti_app.config import Settings
     from cti_app.integrations.model_factory import create_model_gateway
 
-    # The bridge owns the generation deadline; a client read timeout would
-    # abandon a live run and send it to manual reconciliation.
-    gateway = create_model_gateway(Settings(_env_file=None), cast(UnitOfWorkFactory, lambda: None))
+    gateway = create_model_gateway(
+        Settings(_env_file=None, openai_bridge_wait_timeout_seconds=321),
+        cast(UnitOfWorkFactory, lambda: None),
+    )
     bridge = gateway._router.by_backend(ModelBackend.CHATGPT_BRIDGE, ModelRole.RESEARCH)
 
     transport = bridge._transport  # type: ignore[attr-defined]
-    assert transport._timeout is None
+    assert transport._timeout == 321
+
+
+async def test_preflight_reports_missing_provider_without_submission() -> None:
+    from cti_app.integrations.models import FakeModelAdapter
+
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=FakeModelAdapter(),
+            routing={ModelRoutingHint.BULK_EXTRACTION: ModelBackend.GEMINI_WEBAI},
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+
+    with pytest.raises(ModelProviderNotConfiguredError) as caught:
+        await gateway.preflight(
+            request(
+                external_llm_allowed=True,
+                routing_hint=ModelRoutingHint.BULK_EXTRACTION,
+            ),
+            ModelRole.DRAFTING,
+        )
+
+    assert caught.value.code == "model_provider_not_configured"
+    assert model_uow.state == {}
 
 
 async def test_production_factory_routes_editorial_enrichment_independently() -> None:
@@ -1009,6 +1153,37 @@ async def test_bridge_detail_pre_submission_fails_without_reconciliation() -> No
     assert run.error_details["submission_state"] == "pre_submission"
 
 
+async def test_bridge_authentication_preflight_fails_terminally_before_post() -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        return httpx.Response(
+            401,
+            json={
+                "detail": {
+                    "code": "bridge_auth_failed",
+                    "submission_state": "pre_submission",
+                }
+            },
+        )
+
+    run_id = uuid4()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        gateway, model_uow, _ = gateway_with_transport(
+            ChatGPTBridgeClient("http://bridge.test/v1", client=client)
+        )
+        with pytest.raises(BridgeTransportError) as caught:
+            await gateway.research(request(external_llm_allowed=True, run_id=run_id))
+
+    run = model_uow.state[run_id]
+    assert caught.value.code == "bridge_auth_failed"
+    assert paths == ["/v1/bridge/capabilities"]
+    assert run.status is ModelRunStatus.FAILED
+    assert run.error_code == "bridge_auth_failed"
+    assert run.submission_state.value == "not_submitted"
+
+
 async def test_gemini_http_refusals_are_typed_and_only_proven_ones_skip_reconciliation() -> None:
     statuses = iter([401, 400])
     calls: list[int] = []
@@ -1049,7 +1224,7 @@ async def test_gemini_http_refusals_are_typed_and_only_proven_ones_skip_reconcil
     assert auth_run.submission_state.value == "not_submitted"
     bad_request_run = model_uow.state[bad_request_run_id]
     assert bad_request_run.status is ModelRunStatus.NEEDS_REVIEW
-    assert bad_request_run.submission_state.value == "submitted_or_unknown"
+    assert bad_request_run.submission_state.value == "external_state_unknown"
     diagnostics = bad_request_run.error_details["bridge_diagnostics"]
     assert diagnostics["error_code"] == "provider_bad_request"
     assert diagnostics["http_status"] == 400

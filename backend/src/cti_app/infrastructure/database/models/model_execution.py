@@ -49,7 +49,8 @@ class ModelRunRow(Base):
         CheckConstraint(f"model_role IN ({MODEL_ROLE_VALUES_SQL})", name="ck_model_runs_role"),
         CheckConstraint(f"status IN ({MODEL_RUN_STATUS_VALUES_SQL})", name="ck_model_runs_status"),
         CheckConstraint(
-            "submission_state IN ('not_submitted', 'submitted_or_unknown')",
+            "submission_state IN ('not_submitted', 'external_state_unknown', "
+            "'submission_in_progress', 'result_obtained', 'verified_terminal_failure')",
             name="ck_model_runs_submission_state",
         ),
         CheckConstraint("submission_attempt >= 0", name="ck_model_runs_submission_attempt"),
@@ -95,6 +96,7 @@ class ModelRunRow(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     submission_state: Mapped[str] = mapped_column(String(32), nullable=False)
     submission_attempt: Mapped[int] = mapped_column(BigInteger, nullable=False, server_default="0")
+    bridge_request_id: Mapped[str | None] = mapped_column(String(255))
     response_id: Mapped[str | None] = mapped_column(String(255), unique=True)
     output_references: Mapped[list[str]] = mapped_column(JSONB, nullable=False)
     error_code: Mapped[str | None] = mapped_column(String(64))

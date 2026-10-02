@@ -13,6 +13,7 @@ from cti_app.application.model_gateway import (
     ModelGateway,
     ModelGatewayError,
 )
+from cti_app.domain.model_runs import ModelRunStatus
 
 
 class ModelBackgroundPollParameters(JobParameters):
@@ -46,6 +47,12 @@ def register_model_jobs(registry: JobRegistry, gateway: ModelGateway) -> None:
                 str(exc),
                 transient=bool(getattr(exc, "retryable", False)),
             ) from exc
+        if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
+            raise JobHandlerError(
+                execution.run.error_code or "model_response_needs_review",
+                execution.run.error_message or "La réponse du modèle requiert une réconciliation.",
+                transient=False,
+            )
         return execution.run.output_references[0]
 
     registry.register(

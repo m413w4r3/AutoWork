@@ -229,6 +229,9 @@ class SqlAlchemyProductionRunRepository:
             reconciliation_bridge_response_id=(
                 run.reconciliation.bridge_response_id if run.reconciliation is not None else None
             ),
+            reconciliation_bridge_request_id=(
+                run.reconciliation.bridge_request_id if run.reconciliation is not None else None
+            ),
             reconciliation_submission_state=(
                 run.reconciliation.submission_state.value
                 if run.reconciliation is not None
@@ -299,6 +302,9 @@ class SqlAlchemyProductionRunRepository:
                     run.reconciliation.bridge_response_id
                     if run.reconciliation is not None
                     else None
+                ),
+                reconciliation_bridge_request_id=(
+                    run.reconciliation.bridge_request_id if run.reconciliation is not None else None
                 ),
                 reconciliation_submission_state=(
                     run.reconciliation.submission_state.value
@@ -1084,6 +1090,9 @@ class SqlAlchemyBatchStatusReadRepository:
                 ProductionRunRow.reconciliation_bridge_response_id.label(
                     "reconciliation_bridge_response_id"
                 ),
+                ProductionRunRow.reconciliation_bridge_request_id.label(
+                    "reconciliation_bridge_request_id"
+                ),
                 ProductionRunRow.reconciliation_submission_state.label(
                     "reconciliation_submission_state"
                 ),
@@ -1123,6 +1132,7 @@ class SqlAlchemyBatchStatusReadRepository:
                     production_run_id=row["run_id"],
                     model_run_id=row.get("reconciliation_model_run_id"),
                     bridge_response_id=row.get("reconciliation_bridge_response_id"),
+                    bridge_request_id=row.get("reconciliation_bridge_request_id"),
                     submission_state=row.get("reconciliation_submission_state"),
                     phase=row.get("reconciliation_phase"),
                     stage=row.get("reconciliation_stage"),
@@ -1156,6 +1166,7 @@ def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
             production_run_id=row.id,
             model_run_id=row.reconciliation_model_run_id,
             bridge_response_id=row.reconciliation_bridge_response_id,
+            bridge_request_id=row.reconciliation_bridge_request_id,
             submission_state=row.reconciliation_submission_state,
             phase=row.reconciliation_phase,
             stage=row.reconciliation_stage,
@@ -1176,6 +1187,7 @@ def _reconciliation_from_values(
     production_run_id: UUID,
     model_run_id: UUID | None,
     bridge_response_id: str | None,
+    bridge_request_id: str | None,
     submission_state: str | None,
     phase: str | None,
     stage: str | None,
@@ -1198,6 +1210,7 @@ def _reconciliation_from_values(
         model_run_id=model_run_id,
         stage=ProductionStage(stage),
         bridge_response_id=bridge_response_id,
+        bridge_request_id=bridge_request_id,
         submission_state=ModelSubmissionState(submission_state),
         phase=phase,
         output_sha256=output_sha256,

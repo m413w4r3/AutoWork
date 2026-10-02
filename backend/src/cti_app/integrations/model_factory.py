@@ -32,9 +32,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     bridge_transport = ChatGPTBridgeClient(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
-        # No client-side read timeout: the bridge owns the generation deadline
-        # (BRIDGE_TOTAL_TIMEOUT) and answers with a typed error when it expires.
-        timeout_seconds=None,
+        timeout_seconds=settings.openai_bridge_wait_timeout_seconds,
         connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
         capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
     )
@@ -120,6 +118,7 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         cast(ModelRunUnitOfWorkFactory, uow_factory),
         output_store,
         diagnostics=DiagnosticsLog.from_env(settings.diagnostics_log_root),
+        background_wait_timeout_seconds=settings.model_background_wait_timeout_seconds,
     )
 
 

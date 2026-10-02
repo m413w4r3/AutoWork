@@ -183,6 +183,7 @@ async def _reconciliation_identity(
         model_run_id=model_run.id,
         stage=stage,
         bridge_response_id=model_run.response_id,
+        bridge_request_id=getattr(model_run, "bridge_request_id", None),
         submission_state=model_run.submission_state,
         phase="reconciliation",
     )

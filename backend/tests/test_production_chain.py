@@ -319,7 +319,7 @@ async def test_reconciliation_resume_consumes_exact_archived_run_and_same_genera
         model_run_id=model_run_id,
         stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-response-1",
-        submission_state="submitted_or_unknown",
+        submission_state="external_state_unknown",
         phase="reconciliation",
         output_sha256=output_sha256,
         provenance="visible_recovery",
@@ -852,7 +852,7 @@ async def test_stalled_references_run_parks_for_reconciliation_and_fences_retry(
         # The ModelRun keeps the real bridge reason, not the state machine's code.
         error_code="active_signal_stalled",
         response_id="resp_65a707c50a5549a582b2fc3f",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         status=ModelRunStatus.NEEDS_REVIEW,
     )
 

@@ -269,6 +269,7 @@ class ProductionReconciliationView(BaseModel):
     production_run_id: str
     model_run_id: str
     bridge_response_id: str | None
+    bridge_request_id: str | None
     submission_state: str
     phase: str
     stage: ProductionStage
@@ -700,6 +701,7 @@ def reconciliation_view(
         production_run_id=str(run_id),
         model_run_id=str(reconciliation.model_run_id),
         bridge_response_id=reconciliation.bridge_response_id,
+        bridge_request_id=reconciliation.bridge_request_id,
         submission_state=reconciliation.submission_state.value,
         phase=reconciliation.phase,
         stage=reconciliation.stage,

@@ -186,7 +186,7 @@ def test_a_run_awaiting_reconciliation_is_never_automatic_whatever_its_code() ->
         model_run_id=uuid4(),
         stage=ProductionStage.EXTRACTION,
         bridge_response_id=None,
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
 

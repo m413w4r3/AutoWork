@@ -44,10 +44,13 @@ class ModelRunStatus(StrEnum):
 
 
 class ModelSubmissionState(StrEnum):
-    """What is known about delivery of the logical request to its provider."""
+    """What is known about the external submission, separately from run status."""
 
     NOT_SUBMITTED = "not_submitted"
-    SUBMITTED_OR_UNKNOWN = "submitted_or_unknown"
+    EXTERNAL_STATE_UNKNOWN = "external_state_unknown"
+    SUBMISSION_IN_PROGRESS = "submission_in_progress"
+    RESULT_OBTAINED = "result_obtained"
+    VERIFIED_TERMINAL_FAILURE = "verified_terminal_failure"
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +96,7 @@ class ModelRun:
     status: ModelRunStatus = ModelRunStatus.RUNNING
     submission_state: ModelSubmissionState = ModelSubmissionState.NOT_SUBMITTED
     submission_attempt: int = 0
+    bridge_request_id: str | None = None
     response_id: str | None = None
     output_references: tuple[str, ...] = ()
     error_code: str | None = None
@@ -179,6 +183,7 @@ class ModelRun:
         if not response_id:
             raise ValueError("A background response id is required")
         self.status = ModelRunStatus.WAITING_BACKGROUND
+        self.submission_state = ModelSubmissionState.SUBMISSION_IN_PROGRESS
         self.response_id = response_id
         self.actual_model_version = actual_model_version
         self.usage = usage
@@ -199,6 +204,7 @@ class ModelRun:
             raise ValueError("A completed run requires duration and stored output")
         timestamp = now or datetime.now(UTC)
         self.status = ModelRunStatus.SUCCEEDED
+        self.submission_state = ModelSubmissionState.RESULT_OBTAINED
         self.actual_model_version = actual_model_version
         self.duration_ms = duration_ms
         self.usage = usage
@@ -256,6 +262,7 @@ class ModelRun:
         output_chars: int,
         provenance: str,
         actor_id: str,
+        bridge_response_id: str | None = None,
         source_model_run_id: UUID | None = None,
         now: datetime | None = None,
     ) -> None:
@@ -267,6 +274,8 @@ class ModelRun:
             }
         if self.status not in allowed:
             raise ValueError("Model run is not eligible for this recovery")
+        if bridge_response_id and self.response_id and self.response_id != bridge_response_id:
+            raise ValueError("Recovered response identity does not match the ModelRun")
         timestamp = now or datetime.now(UTC)
         previous = dict(self.error_details or {})
         previous["recovery"] = {
@@ -276,6 +285,8 @@ class ModelRun:
             "source_model_run_id": str(source_model_run_id) if source_model_run_id else None,
         }
         self.status = ModelRunStatus.SUCCEEDED
+        self.submission_state = ModelSubmissionState.RESULT_OBTAINED
+        self.response_id = bridge_response_id or self.response_id
         self.output_references = (*self.output_references, output_reference)
         self.raw_output_reference = output_reference
         self.raw_output_sha256 = output_sha256
@@ -336,6 +347,26 @@ class ModelRun:
         self.finished_at = None
         self.updated_at = timestamp
 
+    def mark_verified_terminal_failure(
+        self, *, response_id: str | None = None, now: datetime | None = None
+    ) -> None:
+        """Record an explicit provider guarantee that this attempt has no answer."""
+        if self.status is not ModelRunStatus.RUNNING:
+            raise ValueError("Only running ModelRuns can record a terminal provider failure")
+        if self.submission_state is not ModelSubmissionState.EXTERNAL_STATE_UNKNOWN:
+            raise ValueError("ModelRun has no unresolved provider submission")
+        self.submission_state = ModelSubmissionState.VERIFIED_TERMINAL_FAILURE
+        self.response_id = response_id or self.response_id
+        self.updated_at = now or datetime.now(UTC)
+
+    def mark_external_state_unknown(self, *, now: datetime | None = None) -> None:
+        if self.submission_state in {
+            ModelSubmissionState.SUBMISSION_IN_PROGRESS,
+            ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        }:
+            self.submission_state = ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+            self.updated_at = now or datetime.now(UTC)
+
     def reopen_after_confirmed_terminal_failure(self, *, now: datetime | None = None) -> None:
         """Release the submission claim once the provider closed this attempt as failed.
 
@@ -344,19 +375,22 @@ class ModelRun:
         """
         if self.status is not ModelRunStatus.RUNNING:
             raise ValueError("Only running ModelRuns can reopen a submission")
-        if self.submission_state is not ModelSubmissionState.SUBMITTED_OR_UNKNOWN:
-            raise ValueError("ModelRun has no claimed submission to close")
+        if self.submission_state is not ModelSubmissionState.VERIFIED_TERMINAL_FAILURE:
+            raise ValueError("ModelRun terminal failure was not verified")
         self.submission_state = ModelSubmissionState.NOT_SUBMITTED
         self.updated_at = now or datetime.now(UTC)
 
-    def begin_submission_attempt(self, *, now: datetime | None = None) -> int:
+    def begin_submission_attempt(
+        self, *, bridge_request_id: str | None = None, now: datetime | None = None
+    ) -> int:
         """Claim and persist a new provider submission before contacting it."""
         if self.status is not ModelRunStatus.RUNNING:
             raise ValueError("Only running ModelRuns can be submitted")
         if self.submission_state is not ModelSubmissionState.NOT_SUBMITTED:
             raise ValueError("ModelRun submission is already claimed")
         self.submission_attempt += 1
-        self.submission_state = ModelSubmissionState.SUBMITTED_OR_UNKNOWN
+        self.submission_state = ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+        self.bridge_request_id = bridge_request_id
         self.updated_at = now or datetime.now(UTC)
         return self.submission_attempt
 

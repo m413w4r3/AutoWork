@@ -38,9 +38,15 @@ class ModelGatewayError(RuntimeError):
     attempts = 1
 
 
-# A bridge that closes an attempt as failed (DOM drift, closed tab, ...) proves no
-# result exists for it. A stateless request is then replayed as a new attempt
-# instead of waiting for a manual reconciliation of an outcome that is known.
+class ModelProviderNotConfiguredError(ModelGatewayError):
+    code = "model_provider_not_configured"
+    retryable = False
+    phase = "preflight"
+    submission_state = "pre_submission"
+
+
+# The retry budget applies only when the bridge explicitly guarantees that its
+# exact failed run cannot later yield an answer.
 _BRIDGE_TERMINAL_FAILURE_RETRIES = 2
 _BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS = 5.0
 _BRIDGE_NON_REPLAYABLE_CODES = frozenset(
@@ -446,6 +452,22 @@ class ModelRouter:
         except KeyError as exc:
             raise ModelGatewayError(f"Model provider is not configured: {provider.value}") from exc
 
+    def routing_snapshot(self) -> dict[str, Any]:
+        active = {
+            hint.value: (
+                self._forced_backend.value if self._forced_backend is not None else backend.value
+            )
+            for hint, backend in self._routing.items()
+        }
+        return {
+            "active_routing": active,
+            "forced_backend": self._forced_backend.value if self._forced_backend else None,
+            "configured_backends": {
+                backend.value: bool(getattr(adapter, "is_configured", True))
+                for backend, adapter in self._adapters.items()
+            },
+        }
+
 
 class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, CriticModel):
     def __init__(
@@ -454,10 +476,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         uow_factory: ModelRunUnitOfWorkFactory,
         output_store: ModelOutputStore,
         diagnostics: DiagnosticsLog | None = None,
+        background_wait_timeout_seconds: float = 900.0,
     ) -> None:
         self._router = router
         self._uow_factory = uow_factory
         self._output_store = output_store
+        self._background_wait_timeout_seconds = background_wait_timeout_seconds
         # Research, merge, extraction and drafting all funnel through _execute,
         # so a bridge or Qwen failure is recorded once here for every caller.
         self._diagnostics = diagnostics or DiagnosticsLog(None)
@@ -483,6 +507,32 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
     async def execute(self, request: ModelRequest, role: ModelRole) -> ModelExecution:
         return await self._execute(request, role)
 
+    async def preflight(
+        self,
+        request: ModelRequest,
+        role: ModelRole,
+        *,
+        structured_output: bool = False,
+    ) -> dict[str, str]:
+        """Check route configuration and cheap provider readiness without submitting a prompt."""
+        try:
+            adapter = self._router.select(request, role, structured_output=structured_output)
+        except ModelGatewayError as exc:
+            raise ModelProviderNotConfiguredError(str(exc)) from exc
+        if not bool(getattr(adapter, "is_configured", True)):
+            raise ModelProviderNotConfiguredError(
+                f"Model provider is not configured: {adapter.provider.value}"
+            )
+        if request.external_llm_allowed or not adapter.is_external:
+            check = getattr(adapter, "preflight", None)
+            if callable(check):
+                await check()
+        return {"provider": adapter.provider.value, "backend": adapter.backend.value}
+
+    def routing_status(self) -> dict[str, Any]:
+        """Credential-free snapshot for operational status surfaces."""
+        return self._router.routing_snapshot()
+
     async def get_run(self, run_id: UUID) -> ModelRun | None:
         async with self._uow_factory() as uow:
             return await uow.model_runs.get(run_id)
@@ -502,6 +552,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         actor_id: str,
         source_model_run_id: UUID | None = None,
         external_turn_id: str | None = None,
+        bridge_response_id: str | None = None,
     ) -> ModelRun:
         """Adopt an out-of-band output for an exact ModelRun.
 
@@ -517,6 +568,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             existing = await uow.model_runs.get(run_id)
             if existing is None:
                 raise ModelGatewayError(f"Model run {run_id} does not exist")
+            if (
+                bridge_response_id
+                and existing.response_id
+                and existing.response_id != bridge_response_id
+            ):
+                raise ModelGatewayError("Recovered response identity does not match")
             recovery = (existing.error_details or {}).get("recovery")
             if (
                 existing.status is ModelRunStatus.SUCCEEDED
@@ -526,6 +583,12 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 and recovery.get("source_model_run_id")
                 == (str(source_model_run_id) if source_model_run_id else None)
             ):
+                if bridge_response_id and existing.response_id != bridge_response_id:
+                    if existing.response_id is not None:
+                        raise ModelGatewayError("Recovered response identity does not match")
+                    existing.response_id = bridge_response_id
+                    await uow.model_runs.save(existing)
+                    await uow.commit()
                 return existing
             allowed = {ModelRunStatus.NEEDS_REVIEW}
             if provenance in {"manual_import", "visible_recovery"}:
@@ -548,6 +611,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 output_chars=len(content.decode(errors="replace")),
                 provenance=provenance,
                 actor_id=actor_id,
+                bridge_response_id=bridge_response_id,
                 source_model_run_id=source_model_run_id,
             )
             await uow.model_runs.save(run)
@@ -759,6 +823,22 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 0,
                 int((datetime.now(UTC) - run.started_at).total_seconds() * 1000),
             )
+            if elapsed_ms >= self._background_wait_timeout_seconds * 1000:
+                details = {
+                    "diagnostic_code": "model_background_wait_budget_exceeded",
+                    "bridge_response_id": run.response_id,
+                    "wait_budget_seconds": self._background_wait_timeout_seconds,
+                }
+                run.mark_external_state_unknown()
+                run.require_review(
+                    "model_background_wait_budget_exceeded",
+                    "La réponse du modèle dépasse le budget d'attente configuré.",
+                    details=details,
+                    response_id=run.response_id,
+                )
+                await uow.model_runs.save(run)
+                await uow.commit()
+                return ModelExecution(run, metadata=details)
             try:
                 result = await adapter.resume(
                     run.response_id, role=run.model_role, output_schema=output_schema
@@ -782,6 +862,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         ),
                     )
                 if result.status is AdapterResultStatus.NEEDS_REVIEW:
+                    run.mark_external_state_unknown()
                     run.require_review(
                         str(result.metadata.get("reason", "no_final_answer")),
                         "ChatGPT s'est arrêté sans produire de réponse finale.",
@@ -803,13 +884,30 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             except BackgroundResponsePendingError:
                 raise
             except Exception as exc:
-                run.fail(
-                    str(getattr(exc, "code", "model_resume_failed")),
-                    _public_error(exc),
-                    details=_error_details(exc),
-                )
+                details = _error_details(exc)
+                requires_reconciliation = _submission_may_have_started(exc)
+                if requires_reconciliation:
+                    run.mark_external_state_unknown()
+                    run.require_review(
+                        ModelSubmissionReconciliationRequiredError.code,
+                        _MODEL_SUBMISSION_RECONCILIATION_MESSAGE,
+                        details=_reconciliation_details(
+                            run,
+                            exc=exc,
+                            request_id=run.bridge_request_id,
+                        ),
+                        response_id=getattr(exc, "bridge_run_id", None) or run.response_id,
+                    )
+                else:
+                    run.fail(
+                        str(getattr(exc, "code", "model_resume_failed")),
+                        _public_error(exc),
+                        details=details,
+                    )
                 await uow.model_runs.save(run)
                 await uow.commit()
+                if requires_reconciliation:
+                    return ModelExecution(run, metadata=run.error_details or {})
                 raise
 
     async def _execute(
@@ -857,7 +955,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         )
                 elif run.status is ModelRunStatus.RUNNING:
                     # RUNNING covers two very different situations:
-                    # - SUBMITTED_OR_UNKNOWN: the prompt may already be in flight at
+                    # - EXTERNAL_STATE_UNKNOWN: the prompt may already be in flight at
                     #   the provider. Posting again could double-submit, so this is
                     #   never resubmitted — it is immediately sealed for
                     #   reconciliation.
@@ -944,7 +1042,9 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 await uow.commit()
                 raise ExternalModelBlockedError(run.error_message)
             if persisted_success is None and resume_run_id is None:
-                run.begin_submission_attempt()
+                run.begin_submission_attempt(
+                    bridge_request_id=_next_bridge_request_id(run, adapter)
+                )
                 await uow.model_runs.save(run)
             await uow.commit()
 
@@ -955,14 +1055,18 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
 
         # A new submission gets a new bridge identity. Transport retries reuse
         # this exact key because the adapter receives it as request_id.
-        request_id = _bridge_request_id(run)
-        if request_id is None:
+        request_id = run.bridge_request_id
+        if adapter.backend is ModelBackend.CHATGPT_BRIDGE and request_id is None:
             raise ModelGatewayError("Model submission attempt was not allocated")
         safe_request = replace(safe_request, request_id=request_id)
         retries_left = _BRIDGE_TERMINAL_FAILURE_RETRIES
         while True:
             started = time.monotonic()
             try:
+                # The durable request identity is already committed, but no
+                # generation POST has happened. A cheap capability probe can
+                # fail here without losing the identity or resubmitting.
+                await self.preflight(request, role, structured_output=requires_structured_output)
                 result = await adapter.invoke(safe_request, role=role, output_schema=output_schema)
                 async with self._uow_factory() as uow:
                     persisted = await uow.model_runs.get_for_update(run.id)
@@ -980,6 +1084,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         await uow.commit()
                         return ModelExecution(persisted)
                     if result.status is AdapterResultStatus.NEEDS_REVIEW:
+                        persisted.mark_external_state_unknown()
                         persisted.require_review(
                             str(result.metadata.get("reason", "no_final_answer")),
                             "ChatGPT s'est arrêté sans produire de réponse finale.",
@@ -1022,7 +1127,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     reopened = await self._reopen_after_terminal_failure(run.id, exc)
                     if reopened is not None:
                         run = reopened
-                        safe_request = replace(safe_request, request_id=_bridge_request_id(run))
+                        safe_request = replace(safe_request, request_id=run.bridge_request_id)
                         await asyncio.sleep(_BRIDGE_TERMINAL_FAILURE_RETRY_DELAY_SECONDS)
                         continue
                 reconciliation_error: ModelSubmissionReconciliationRequiredError | None = None
@@ -1032,7 +1137,16 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         ModelRunStatus.RUNNING,
                         ModelRunStatus.WAITING_BACKGROUND,
                     }:
-                        if _is_certain_pre_submission_failure(exc):
+                        if _is_confirmed_terminal_bridge_failure(exc, request):
+                            persisted.mark_verified_terminal_failure(
+                                response_id=getattr(exc, "bridge_run_id", None)
+                            )
+                            persisted.fail(
+                                str(getattr(exc, "code", "model_call_failed")),
+                                _public_error(exc),
+                                details=_error_details(exc),
+                            )
+                        elif _is_certain_pre_submission_failure(exc):
                             # Only an explicit proof that the provider was not
                             # reached permits the FAILED/NOT_SUBMITTED state.
                             persisted.submission_state = ModelSubmissionState.NOT_SUBMITTED
@@ -1073,8 +1187,17 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
             persisted = await uow.model_runs.get_for_update(run_id)
             if persisted is None or persisted.status is not ModelRunStatus.RUNNING:
                 return None
+            persisted.mark_verified_terminal_failure(
+                response_id=getattr(exc, "bridge_run_id", None)
+            )
             persisted.reopen_after_confirmed_terminal_failure()
-            attempt = persisted.begin_submission_attempt()
+            attempt = persisted.begin_submission_attempt(
+                bridge_request_id=(
+                    f"{persisted.id}:a{persisted.submission_attempt + 1}"
+                    if persisted.backend is ModelBackend.CHATGPT_BRIDGE
+                    else None
+                )
+            )
             await uow.model_runs.save(persisted)
             await uow.commit()
         self._diagnostics.record(
@@ -1323,6 +1446,7 @@ def _is_confirmed_terminal_bridge_failure(exc: Exception, request: ModelRequest)
         request.conversation is None
         and getattr(exc, "bridge_status", None) == "failed"
         and bool(getattr(exc, "bridge_run_id", None))
+        and getattr(exc, "verified_no_answer", False) is True
         and getattr(exc, "code", None) not in _BRIDGE_NON_REPLAYABLE_CODES
     )
 
@@ -1332,16 +1456,26 @@ def _submission_may_have_started(exc: Exception) -> bool:
     if submission_state in {
         "submission_attempted",
         "post_submission",
-        "submitted_or_unknown",
+        "external_state_unknown",
     }:
         return True
     return not _is_certain_pre_submission_failure(exc)
 
 
 def _bridge_request_id(run: ModelRun) -> str | None:
+    if run.bridge_request_id:
+        return run.bridge_request_id
+    if run.backend is not ModelBackend.CHATGPT_BRIDGE:
+        return None
     if run.submission_attempt < 1:
         return None
     return f"{run.id}:a{run.submission_attempt}"
+
+
+def _next_bridge_request_id(run: ModelRun, adapter: ModelAdapter) -> str | None:
+    if adapter.backend is not ModelBackend.CHATGPT_BRIDGE:
+        return None
+    return f"{run.id}:a{run.submission_attempt + 1}"
 
 
 def _reconciliation_details(
@@ -1382,6 +1516,7 @@ def _error_details(
     details: dict[str, Any] = {
         "provider": str(getattr(exc, "provider", "unknown"))[:64],
         "phase": str(phase or getattr(exc, "phase", "model_call"))[:64],
+        "diagnostic_code": str(getattr(exc, "code", "model_call_failed"))[:64],
         "retryable": bool(getattr(exc, "retryable", False)),
         "attempts": max(1, int(getattr(exc, "attempts", 1))),
     }
@@ -1389,6 +1524,8 @@ def _error_details(
         value = getattr(exc, key, None)
         if isinstance(value, str) and value:
             details[key] = value[:128]
+    if getattr(exc, "verified_no_answer", False) is True:
+        details["verified_no_answer"] = True
     source_submission_state = submission_state or getattr(exc, "submission_state", None)
     if isinstance(source_submission_state, str) and source_submission_state:
         details["submission_state"] = source_submission_state[:32]

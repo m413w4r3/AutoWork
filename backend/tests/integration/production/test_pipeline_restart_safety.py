@@ -491,7 +491,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     assert model_run.backend is ModelBackend.CHATGPT_BRIDGE
     assert model_run.transport is ModelTransport.OPENAI_RESPONSES
     assert model_run.status is ModelRunStatus.NEEDS_REVIEW
-    assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
+    assert model_run.submission_state is ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
 
     # The operator adopts the line-oriented answer the provider produced.
     visible_text = _q2(1).replace(

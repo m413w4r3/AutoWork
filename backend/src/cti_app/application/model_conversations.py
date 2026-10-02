@@ -703,7 +703,7 @@ class ModelConversationService:
                 # RUNNING/NOT_SUBMITTED, meaning the gateway failed before ever
                 # claiming it for submission. Left alone that run would stay RUNNING
                 # forever. Any run the gateway did touch (SUCCEEDED, NEEDS_REVIEW,
-                # FAILED, or SUBMITTED_OR_UNKNOWN) is left untouched.
+                # FAILED, or EXTERNAL_STATE_UNKNOWN) is left untouched.
                 persisted_run = await uow.model_runs.get_for_update(run.id)
                 if (
                     persisted_run is not None

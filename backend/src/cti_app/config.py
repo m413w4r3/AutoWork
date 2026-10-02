@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     openai_bridge_api_key: SecretStr | None = None
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_bridge_capabilities_timeout_seconds: float = Field(default=2.0, gt=0, le=2)
+    openai_bridge_wait_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
     # Fermer un onglet exige un aller-retour WebSocket vers l'extension Chrome.
     # Le budget doit couvrir BRIDGE_UI_TIMEOUT (30 s) plus la fenêtre de
     # reconnexion BRIDGE_RECONNECT_GRACE (20 s) du service worker MV3.
@@ -98,6 +99,9 @@ class Settings(BaseSettings):
         "chatgpt_bridge"
     )
     model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    model_background_wait_timeout_seconds: float = Field(default=900.0, gt=0, le=86400)
+    code_version: str = "0.1.0"
+    worker_code_version: str | None = None
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
     discovery_chatgpt_structuring_fallback: bool = False
     collection_max_redirects: int = Field(default=5, ge=0, le=10)

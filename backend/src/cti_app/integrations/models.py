@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -78,6 +79,11 @@ class HttpResponsesTransport:
         self._capabilities_timeout = min(capabilities_timeout_seconds, 2)
         self._archive_timeout = archive_timeout_seconds
         self._client = client
+        self._last_capabilities_check = 0.0
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._base_url)
 
     async def create(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
@@ -129,13 +135,30 @@ class HttpResponsesTransport:
                 "Le bridge ChatGPT est inaccessible.",
                 retryable=True,
                 phase=phase,
+                submission_state=("pre_submission" if phase == "preflight" else None),
             ) from exc
-        except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+        except httpx.ReadTimeout as exc:
+            timed_out_generation = phase == "generation"
+            raise BridgeTransportError(
+                ("bridge_wait_budget_exceeded" if timed_out_generation else "bridge_timeout"),
+                (
+                    "Le bridge ChatGPT a dépassé le budget d'attente AutoWork."
+                    if timed_out_generation
+                    else "Le bridge ChatGPT n'a pas répondu à temps."
+                ),
+                retryable=not timed_out_generation,
+                phase=phase,
+                submission_state=(
+                    "pre_submission" if phase == "preflight" else "submission_attempted"
+                ),
+            ) from exc
+        except httpx.ConnectTimeout as exc:
             raise BridgeTransportError(
                 "bridge_timeout",
                 "Le bridge ChatGPT n'a pas répondu à temps.",
                 retryable=True,
                 phase=phase,
+                submission_state=("pre_submission" if phase == "preflight" else None),
             ) from exc
         if response.is_error:
             raise _bridge_http_error(response, 1, default_phase=phase)
@@ -147,6 +170,7 @@ class HttpResponsesTransport:
                 "Le bridge a renvoyé une réponse JSON invalide.",
                 retryable=False,
                 phase=phase,
+                submission_state=("pre_submission" if phase == "preflight" else None),
             ) from exc
         if not isinstance(value, dict):
             raise BridgeTransportError(
@@ -154,6 +178,7 @@ class HttpResponsesTransport:
                 "Le bridge a renvoyé un contrat invalide.",
                 retryable=False,
                 phase=phase,
+                submission_state=("pre_submission" if phase == "preflight" else None),
             )
         return value
 
@@ -177,6 +202,7 @@ class BridgeTransportError(ModelGatewayError):
         diagnostics: dict[str, Any] | None = None,
         conversation_id: str | None = None,
         reason: str | None = None,
+        verified_no_answer: bool = False,
     ) -> None:
         super().__init__(safe_description)
         self.code = code
@@ -191,6 +217,7 @@ class BridgeTransportError(ModelGatewayError):
         self.diagnostics = diagnostics or {}
         self.conversation_id = conversation_id
         self.reason = reason
+        self.verified_no_answer = verified_no_answer
 
 
 def _retry_after_seconds(value: str | None) -> float | None:
@@ -208,6 +235,12 @@ def _retry_after_seconds(value: str | None) -> float | None:
 
 # Submission boundary values a provider contract may state explicitly.
 _SUBMISSION_STATES = frozenset({"pre_submission", "submission_attempted", "post_submission"})
+_BRIDGE_DIAGNOSTIC_CODE_ALIASES = {
+    "ambiguous_response_roots": "bridge_ambiguous_response_roots",
+    "tab_closed": "bridge_tab_closed",
+    "bridge_tab_closed": "bridge_tab_closed",
+    "wait_budget_exceeded": "bridge_wait_budget_exceeded",
+}
 
 
 def _bridge_http_error(
@@ -224,13 +257,18 @@ def _bridge_http_error(
     server_message: str | None = None
     reason: str | None = None
     conversation_id: str | None = None
+    verified_no_answer = False
     try:
         body = response.json()
         detail = body.get("detail") if isinstance(body, dict) else None
         source = detail if isinstance(detail, dict) else body
         error = source.get("error") if isinstance(source, dict) else None
         if isinstance(source, dict):
-            bridge_run_id = source.get("id") if isinstance(source.get("id"), str) else None
+            for identity_key in ("id", "bridge_run_id", "response_id"):
+                identity = source.get(identity_key)
+                if isinstance(identity, str) and identity.strip():
+                    bridge_run_id = identity.strip()
+                    break
             bridge_status = source.get("status") if isinstance(source.get("status"), str) else None
             if isinstance(source.get("code"), str):
                 server_code = source["code"]
@@ -238,6 +276,8 @@ def _bridge_http_error(
                 server_message = source["message"]
             if isinstance(source.get("reason"), str):
                 reason = source["reason"]
+            if source.get("verified_no_answer") is True:
+                verified_no_answer = True
             if isinstance(source.get("conversation_id"), str):
                 conversation_id = source["conversation_id"]
             if isinstance(source.get("phase"), str):
@@ -257,12 +297,16 @@ def _bridge_http_error(
                 if isinstance(value, (bool, int, str)):
                     diagnostics[field] = value
         if isinstance(error, dict):
+            if isinstance(error.get("id"), str) and not bridge_run_id:
+                bridge_run_id = error["id"]
             if isinstance(error.get("code"), str):
                 server_code = error["code"]
             if isinstance(error.get("message"), str):
                 server_message = error["message"]
             if isinstance(error.get("reason"), str):
                 reason = error["reason"]
+            if error.get("verified_no_answer") is True:
+                verified_no_answer = True
             if isinstance(error.get("phase"), str):
                 phase = error["phase"][:64]
             if error.get("submission_state") in _SUBMISSION_STATES:
@@ -279,16 +323,21 @@ def _bridge_http_error(
                     diagnostics[field] = value
     except ValueError:
         pass
+    if default_phase == "preflight":
+        submission_state = "pre_submission"
     if (
         server_code
         in {
             "bridge_auth_failed",
             "bridge_rate_limited",
             "bridge_extension_disconnected",
+            "bridge_ambiguous_response_roots",
+            "bridge_tab_closed",
             "bridge_ui_timeout",
             "bridge_idle_timeout",
             "bridge_total_timeout",
             "bridge_timeout",
+            "bridge_wait_budget_exceeded",
             "bridge_unreachable",
             "bridge_payload_conflict",
             "bridge_protocol_error",
@@ -300,6 +349,8 @@ def _bridge_http_error(
         | _ARCHIVE_ERROR_CODES
     ):
         code = server_code
+    elif server_code in _BRIDGE_DIAGNOSTIC_CODE_ALIASES:
+        code = _BRIDGE_DIAGNOSTIC_CODE_ALIASES[server_code]
     elif status in {401, 403}:
         code = "bridge_auth_failed"
     elif status == 409:
@@ -321,6 +372,7 @@ def _bridge_http_error(
         "bridge_auth_failed",
         "bridge_payload_conflict",
         "bridge_protocol_error",
+        "bridge_wait_budget_exceeded",
         "conversation_busy",
         "conversation_unavailable",
         "conversation_profile_mismatch",
@@ -331,6 +383,9 @@ def _bridge_http_error(
         "bridge_auth_failed": "L'authentification auprès du bridge a échoué.",
         "bridge_rate_limited": "Le bridge limite temporairement les requêtes.",
         "bridge_extension_disconnected": "L'extension ChatGPT est déconnectée.",
+        "bridge_ambiguous_response_roots": "Le bridge a trouvé plusieurs racines de réponse.",
+        "bridge_tab_closed": "L'onglet ChatGPT a été fermé pendant la génération.",
+        "bridge_wait_budget_exceeded": "Le bridge ChatGPT a dépassé le budget d'attente AutoWork.",
         "bridge_ui_timeout": "L'inspection de l'interface ChatGPT a expiré.",
         "bridge_idle_timeout": (
             "L'extension ChatGPT n'a envoyé aucun heartbeat pendant la fenêtre autorisée."
@@ -368,6 +423,7 @@ def _bridge_http_error(
         diagnostics=diagnostics,
         conversation_id=conversation_id,
         reason=reason,
+        verified_no_answer=verified_no_answer,
     )
 
 
@@ -447,8 +503,26 @@ class ChatGPTBridgeClient(HttpResponsesTransport):
 
     async def capabilities(self) -> dict[str, Any]:
         return await self._request(
-            "GET", "/bridge/capabilities", timeout_seconds=self._capabilities_timeout
+            "GET",
+            "/bridge/capabilities",
+            timeout_seconds=self._capabilities_timeout,
+            phase="preflight",
         )
+
+    async def preflight(self) -> None:
+        if not self.is_configured:
+            raise BridgeTransportError(
+                "model_provider_not_configured",
+                "Le fournisseur ChatGPT Bridge n'est pas configuré.",
+                retryable=False,
+                phase="preflight",
+                submission_state="pre_submission",
+            )
+        now = time.monotonic()
+        if now - self._last_capabilities_check < 15:
+            return
+        await self.capabilities()
+        self._last_capabilities_check = time.monotonic()
 
     async def archive_conversation(self, conversation_id: UUID) -> None:
         response = await self._request(
@@ -507,6 +581,10 @@ class HttpChatCompletionsTransport:
         self._timeout = timeout_seconds
         self._provider = provider
         self._client = client
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._base_url)
 
     async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
@@ -714,6 +792,15 @@ class OpenAIResearchAdapter:
         self._transport = transport
         self.requested_model = model
 
+    @property
+    def is_configured(self) -> bool:
+        return bool(getattr(self._transport, "is_configured", True))
+
+    async def preflight(self) -> None:
+        check = getattr(self._transport, "preflight", None)
+        if callable(check):
+            await check()
+
     async def invoke(
         self,
         request: SafeModelRequest,
@@ -764,6 +851,15 @@ class OpenAIStructuredAdapter:
     def __init__(self, transport: ResponsesTransport, *, model: str) -> None:
         self._transport = transport
         self.requested_model = model
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(getattr(self._transport, "is_configured", True))
+
+    async def preflight(self) -> None:
+        check = getattr(self._transport, "preflight", None)
+        if callable(check):
+            await check()
 
     async def invoke(
         self,
@@ -840,6 +936,15 @@ class OpenAICompatibleChatAdapter:
         self.requested_model = model
         self.is_external = is_external
         self.capabilities = capabilities or ModelCapabilities()
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(getattr(self._transport, "is_configured", True))
+
+    async def preflight(self) -> None:
+        check = getattr(self._transport, "preflight", None)
+        if callable(check):
+            await check()
 
     async def invoke(
         self,
@@ -958,6 +1063,7 @@ class FakeModelAdapter:
     )
     requested_model = "fake-deterministic-v1"
     is_external = False
+    is_configured = True
 
     def __init__(
         self,
@@ -1174,6 +1280,7 @@ def _failed_response_error(raw: dict[str, Any], *, response_id: str | None) -> B
     diagnostics = _safe_bridge_diagnostics(raw_details if isinstance(raw_details, dict) else {})
     raw_code = error.get("code") or raw.get("code")
     code = raw_code if isinstance(raw_code, str) and raw_code.strip() else "bridge_response_failed"
+    code = _BRIDGE_DIAGNOSTIC_CODE_ALIASES.get(code, code)
     raw_message = error.get("message") or raw.get("message")
     message = (
         " ".join(raw_message.split())[:512]
@@ -1200,6 +1307,9 @@ def _failed_response_error(raw: dict[str, Any], *, response_id: str | None) -> B
     )
     raw_reason = error.get("reason") or raw.get("reason")
     reason = raw_reason if isinstance(raw_reason, str) and raw_reason else None
+    verified_no_answer = (
+        error.get("verified_no_answer") is True or raw.get("verified_no_answer") is True
+    )
     status_code = raw.get("status_code")
     return BridgeTransportError(
         code,
@@ -1214,6 +1324,7 @@ def _failed_response_error(raw: dict[str, Any], *, response_id: str | None) -> B
         diagnostics=diagnostics,
         conversation_id=conversation_id,
         reason=reason,
+        verified_no_answer=verified_no_answer,
     )
 
 

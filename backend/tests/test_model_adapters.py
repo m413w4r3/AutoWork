@@ -708,6 +708,44 @@ def test_bridge_detail_submission_state_accepts_only_known_values() -> None:
     assert parsed("probably_not_sent") is None
 
 
+@pytest.mark.parametrize(
+    ("bridge_code", "diagnostic_code"),
+    [
+        ("ambiguous_response_roots", "bridge_ambiguous_response_roots"),
+        ("tab_closed", "bridge_tab_closed"),
+        ("bridge_extension_disconnected", "bridge_extension_disconnected"),
+    ],
+)
+def test_bridge_dom_failures_keep_distinct_diagnostic_codes(
+    bridge_code: str, diagnostic_code: str
+) -> None:
+    response = httpx.Response(
+        502,
+        request=httpx.Request("POST", "https://bridge.test/v1/responses"),
+        json={"detail": {"code": bridge_code, "submission_state": "post_submission"}},
+    )
+
+    error = _bridge_http_error(response, attempts=1)
+
+    assert error.code == diagnostic_code
+    assert error.submission_state == "post_submission"
+
+
+def test_failed_response_requires_explicit_verified_no_answer_signal() -> None:
+    from cti_app.integrations.models import _responses_result
+
+    base = {
+        "id": "resp_terminal",
+        "status": "failed",
+        "error": {"code": "bridge_response_failed"},
+    }
+    for verified, expected in [(False, False), (True, True)]:
+        response = {**base, "verified_no_answer": verified}
+        with pytest.raises(BridgeTransportError) as caught:
+            _responses_result(response, ModelProvider.OPENAI)
+        assert caught.value.verified_no_answer is expected
+
+
 def _chat_payload(prompt: str = "Texte autorisé") -> dict[str, Any]:
     return {"model": "gemini-3-flash", "messages": [{"role": "user", "content": prompt}]}
 

@@ -15,6 +15,15 @@ class FakeReadinessChecker:
         return self._statuses
 
 
+class FakeModelGatewayStatus:
+    def routing_status(self) -> dict[str, object]:
+        return {
+            "active_routing": {"premium_synthesis": "chatgpt_bridge"},
+            "forced_backend": None,
+            "configured_backends": {"chatgpt_bridge": True, "qwen": True},
+        }
+
+
 @pytest.mark.asyncio
 async def test_live_has_no_dependency(client: AsyncClient, app: FastAPI) -> None:
     checker = FakeReadinessChecker({})
@@ -73,3 +82,21 @@ async def test_correlation_id_is_preserved(client: AsyncClient) -> None:
     )
 
     assert response.headers["X-Correlation-ID"] == "test-correlation"
+
+
+@pytest.mark.asyncio
+async def test_model_status_exposes_routes_and_versions_without_credentials(
+    client: AsyncClient, app: FastAPI
+) -> None:
+    app.state.model_gateway = FakeModelGatewayStatus()
+
+    response = await client.get("/api/health/models")
+    payload = response.json()
+
+    assert response.status_code == 200
+    assert payload["active_routing"] == {"premium_synthesis": "chatgpt_bridge"}
+    assert payload["configured_backends"]["chatgpt_bridge"] is True
+    assert payload["code_version"]
+    assert payload["worker_code_version"]
+    assert "api_key" not in response.text.casefold()
+    assert "credential" not in response.text.casefold()

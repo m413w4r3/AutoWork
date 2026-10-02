@@ -916,7 +916,7 @@ async def test_native_needs_review_is_not_collapsed_into_a_generic_error(
     assert error.bridge_response_id == "resp_65a707c50a5549a582b2fc3f"
     assert error.recovery_available is True
     assert error.details["output_chars"] == len("Réponse visible mais jamais conclue")
-    assert error.details["submission_state"] == "submitted_or_unknown"
+    assert error.details["submission_state"] == "external_state_unknown"
     assert "n'a pas produit de réponse finale" not in str(error)
     # Le ModelRun garde le vrai motif du bridge : c'est le diagnostic.
     assert model_run.status is ModelRunStatus.NEEDS_REVIEW

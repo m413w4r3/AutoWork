@@ -775,7 +775,7 @@ async def test_post_submission_ambiguity_reconciles_exact_model_run_without_resu
     assert model_run.backend is ModelBackend.CHATGPT_BRIDGE
     assert model_run.transport is ModelTransport.OPENAI_RESPONSES
     assert model_run.status is ModelRunStatus.SUCCEEDED
-    assert model_run.submission_state is ModelSubmissionState.SUBMITTED_OR_UNKNOWN
+    assert model_run.submission_state is ModelSubmissionState.RESULT_OBTAINED
     assert model_run.submission_attempt == 1
     assert len(resume_jobs) == 1
     assert (

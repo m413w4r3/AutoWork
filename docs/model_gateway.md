@@ -84,6 +84,13 @@ Les requêtes n'acceptent que du texte et des métadonnées JSON. `bytes`, `byte
 `memoryview` sont rejetés. Les secrets usuels, Bearer tokens, chemins internes et clés de
 métadonnées sensibles sont retirés avant calcul du hash et avant appel.
 
+Chaque appel de modèle effectue un préflight sans prompt : AutoWork valide le provider et la
+route sélectionnés, puis sonde `/v1/bridge/capabilities` pour le Bridge (résultat positif mis en
+cache 15 secondes). Un provider ou une route absents échouent avec
+`model_provider_not_configured`. La sonde ne transmet aucun texte métier. `GET /api/health/models`
+expose les routes actives, les backends configurés et les versions de code API/worker sans clé
+ni credential.
+
 ### Recherche REFERENCES de Production
 
 Dans AW-010, la recherche de références de Production passe directement par `ModelGateway` avec
@@ -194,8 +201,11 @@ dans le DOM, et refuse le run quand la vérification échoue. Côté AutoWork, s
 
 Les appels longs utilisent `background: true`. L'identifiant `resp_*` est conservé dans le
 `ModelRun`; un job `model.openai.background.poll` appelle ensuite `GET /v1/responses/{id}`.
-Il retry seulement tant que le statut est `queued` ou `in_progress`, conformément à la
-[documentation Background mode](https://developers.openai.com/api/docs/guides/background).
+Il poll seulement tant que le statut est `queued` ou `in_progress`, conformément à la
+[documentation Background mode](https://developers.openai.com/api/docs/guides/background). Le
+budget d'attente `MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS` et l'intervalle
+`DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS` sont configurables. À expiration, le run passe en
+réconciliation avec `model_background_wait_budget_exceeded` ; aucun nouveau POST n'est émis.
 Un futur transport direct vers OpenAI devra en plus tenir compte du fait que ce mode n'est pas
 compatible Zero Data Retention, avant de l'autoriser pour une classification sensible.
 
@@ -233,6 +243,24 @@ Il traduit ensuite la requête vers l'interface ChatGPT :
 - les contrôles de récupération du Bridge possèdent un registre SQLite durable et dédupliquent
   sur l'UUID du `ModelRun`. Une exécution terminée survit au redémarrage ; une exécution
   interrompue échoue sans resoumission implicite. Le data plane reste la façade Responses.
+
+AutoWork persiste avant le POST la clé d'idempotence exacte `bridge_request_id`, puis conserve
+également l'identifiant de réponse quand le Bridge le retourne. La reprise peut sonder
+`GET /v1/responses/{bridge_request_id}` si aucune réponse HTTP n'a livré d'identifiant ; elle ne
+cherche jamais une conversation par titre, ordre, index DOM ou ressemblance visuelle. La clé de
+requête seule n'autorise pas la récupération DOM visible, qui exige un identifiant de réponse
+persisté.
+
+Le statut `failed` n'est pas à lui seul une preuve que la réponse ne peut plus être récupérée.
+Une relance automatique est permise uniquement pour un run Bridge stateless qui fournit
+l'identifiant exact et `verified_no_answer: true`. Sans ce signal explicite, AutoWork conserve
+l'état externe inconnu et passe en réconciliation. Le protocole Bridge actuel ne documente pas
+encore cette garantie ; voir
+[`cti-recovery-l2-bridge-findings.md`](design/cti-recovery-l2-bridge-findings.md).
+
+Les états `ModelSubmissionState` distinguent `not_submitted`, `external_state_unknown`,
+`submission_in_progress`, `result_obtained` et `verified_terminal_failure`. `ModelRunStatus`
+reste le cycle de vie applicatif (`running`, `waiting_background`, `needs_review`, etc.).
 
 L'intégration est donc remplaçable par le service Responses officiel sans modifier les ports
 métier.
@@ -276,7 +304,8 @@ phase, le caractère retryable et le nombre de tentatives. La description publiq
 | Prompt versionné | `prompt_template_id`, `prompt_template_version` |
 | Preuves d'entrée | `authorized_input_hash`, `evidence_pack_hash` |
 | Observabilité | `parameters`, `duration_ms`, `usage`, `status`, dates |
-| Reprise | `response_id` unique |
+| Reprise | `bridge_request_id` exact ; `response_id` unique quand le Bridge l'a retourné |
+| État externe | `submission_state` typé, distinct de `status` |
 | Sorties | `output_references`, références/hashes/tailles brut et normalisé |
 | Parse | phase, versions sérialiseur/normalisation, transformations, ligne/colonne JSON |
 | Validation | chemins/codes Pydantic, compteurs de citations et URLs |
@@ -327,8 +356,11 @@ reste publié sur loopback côté hôte ; `OPENAI_BRIDGE_API_KEY` doit égaler l
 de la stack. Configuration effective :
 `docker compose -f compose.yaml -f compose.models.yaml config`.
 
-Chaque appel au Bridge est une seule tentative HTTP : une relance éventuelle relève du
-`ModelGateway`, à partir de l'erreur typée et de son `submission_state`.
+Chaque POST au Bridge est une seule tentative HTTP : une relance éventuelle relève du
+`ModelGateway`, à partir de l'erreur typée, de l'identifiant exact et du signal explicite
+`verified_no_answer`. `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP AutoWork ; une
+expiration après le POST signifie « état externe inconnu » et ne prétend pas annuler la génération
+côté Bridge.
 
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance

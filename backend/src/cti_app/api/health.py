@@ -22,6 +22,14 @@ class ReadyResponse(BaseModel):
     dependencies: dict[str, DependencyResponse]
 
 
+class ModelRoutingStatusResponse(BaseModel):
+    active_routing: dict[str, str]
+    forced_backend: str | None
+    configured_backends: dict[str, bool]
+    code_version: str
+    worker_code_version: str
+
+
 @router.get("/live", response_model=LiveResponse)
 async def live() -> LiveResponse:
     return LiveResponse(status="ok")
@@ -39,4 +47,18 @@ async def ready(request: Request, response: Response) -> ReadyResponse:
             name: DependencyResponse(status=result.status, detail=result.detail)
             for name, result in checks.items()
         },
+    )
+
+
+@router.get("/models", response_model=ModelRoutingStatusResponse)
+async def model_routing_status(request: Request) -> ModelRoutingStatusResponse:
+    from cti_app.config import get_settings
+
+    settings = get_settings()
+    gateway = request.app.state.model_gateway
+    routing = gateway.routing_status()
+    return ModelRoutingStatusResponse(
+        **routing,
+        code_version=settings.code_version,
+        worker_code_version=settings.worker_code_version or settings.code_version,
     )

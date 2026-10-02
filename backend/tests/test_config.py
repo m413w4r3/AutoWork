@@ -58,6 +58,19 @@ def test_discovery_bridge_poll_interval_is_configurable_and_bounded(
         Settings(_env_file=None)
 
 
+def test_model_wait_budgets_are_configurable_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "1200")
+    monkeypatch.setenv("MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS", "3600")
+    settings = Settings(_env_file=None)
+
+    assert settings.openai_bridge_wait_timeout_seconds == 1200
+    assert settings.model_background_wait_timeout_seconds == 3600
+
+    monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "3601")
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
 def test_job_actor_time_limit_outlives_the_dramatiq_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

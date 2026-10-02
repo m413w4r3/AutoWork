@@ -54,6 +54,7 @@ from cti_app.domain.model_runs import (
     ModelRole,
     ModelRun,
     ModelRunStatus,
+    ModelSubmissionState,
     ModelUsage,
 )
 from cti_app.integrations.models import (
@@ -845,7 +846,7 @@ async def test_controlled_completion_is_idempotent_and_keeps_exact_conversation(
     assert details["recovery_child_model_run_id"] == str(first)
 
 
-async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
+async def test_unverified_bridge_disconnect_reconciles_discovery_without_resubmitting() -> None:
     params = parameters()
     adapter = DeferredResearchAdapter(
         terminal_error=BridgeTransportError(
@@ -874,10 +875,13 @@ async def test_terminal_bridge_error_fails_discovery_without_parsing() -> None:
 
     await dispatcher.dispatch(job.id)
 
-    failed = await jobs.get(job.id)
-    assert failed.status is JobStatus.FAILED
-    assert failed.error_code == "bridge_extension_disconnected"
-    assert model_uow.state[waiting.id].status is ModelRunStatus.FAILED
+    reconciled = await jobs.get(job.id)
+    assert reconciled.status is JobStatus.WAITING_HUMAN
+    stored_run = model_uow.state[waiting.id]
+    assert stored_run.status is ModelRunStatus.NEEDS_REVIEW
+    assert stored_run.submission_state is ModelSubmissionState.EXTERNAL_STATE_UNKNOWN
+    assert stored_run.error_details is not None
+    assert stored_run.error_details["diagnostic_code"] == "bridge_extension_disconnected"
     assert adapter.calls == []
     assert adapter.resume_calls == 1
 

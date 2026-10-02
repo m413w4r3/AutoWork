@@ -130,6 +130,7 @@ class _Gateway:
         provenance: str,
         actor_id: str,
         external_turn_id: str | None = None,
+        bridge_response_id: str | None = None,
     ) -> ModelRun:
         if run_id != self.model.id:
             raise ModelGatewayError("wrong model run")
@@ -138,9 +139,11 @@ class _Gateway:
                 "provenance": provenance,
                 "actor_id": actor_id,
                 "external_turn_id": external_turn_id,
+                "bridge_response_id": bridge_response_id,
             }
         )
         self.model.status = ModelRunStatus.SUCCEEDED
+        self.model.response_id = bridge_response_id or self.model.response_id
         self.model.raw_output_sha256 = hashlib.sha256(content).hexdigest()
         self.model.raw_output_reference = "blob://automatic-recovery"
         return self.model
@@ -171,7 +174,8 @@ def _fixture(
         evidence_pack_hash="b" * 64,
         parameters={},
         status=ModelRunStatus.NEEDS_REVIEW,
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        bridge_request_id="bridge-request:a1",
         error_code="active_signal_stalled",
     )
     run = ProductionRun(
@@ -181,13 +185,14 @@ def _fixture(
         status=ProductionRunStatus.NEEDS_REVIEW,
         current_stage=ProductionStage.REFERENCES,
         error_code=PRODUCTION_RECONCILIATION_ERROR_CODE,
-        error_details={"bridge_request_id": "bridge-request:a1"},
+        error_details={},
         reconciliation=ProductionSubmissionReconciliation(
             production_run_id=uuid4(),
             model_run_id=model_id,
             stage=ProductionStage.REFERENCES,
             bridge_response_id=None,
-            submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+            bridge_request_id="bridge-request:a1",
+            submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
             phase="reconciliation",
         ),
     )
@@ -196,7 +201,8 @@ def _fixture(
         model_run_id=model_id,
         stage=ProductionStage.REFERENCES,
         bridge_response_id=None,
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        bridge_request_id="bridge-request:a1",
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
     uow = _Uow(
@@ -262,7 +268,9 @@ async def test_terminal_success_adopts_non_empty_output_and_resumes() -> None:
     assert run.reconciliation is not None
     assert run.reconciliation.output_sha256 == hashlib.sha256(b"# answer").hexdigest()
     assert run.reconciliation.provenance == "automatic_bridge_retrieval"
+    assert run.reconciliation.bridge_response_id == "resp_123"
     assert model.status is ModelRunStatus.SUCCEEDED
+    assert model.response_id == "resp_123"
     assert gateway.calls[0]["provenance"] == "automatic_bridge_retrieval"
     assert not hasattr(run, "synthesis_conversation_id")
 
@@ -402,7 +410,8 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
         model_run_id=run.reconciliation.model_run_id,
         stage=ProductionStage.SOURCES,
         bridge_response_id=None,
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        bridge_request_id="bridge-request:a1",
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
     jobs = _Jobs()

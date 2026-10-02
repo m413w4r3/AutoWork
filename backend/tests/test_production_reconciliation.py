@@ -256,7 +256,7 @@ def _build_fixture(
         evidence_pack_hash="b" * 64,
         parameters={},
         status=ModelRunStatus.NEEDS_REVIEW,
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         submission_attempt=1,
         response_id="bridge-1",
         error_code="model_submission_reconciliation_required",
@@ -277,7 +277,7 @@ def _build_fixture(
         model_run_id=model_id,
         stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
     uow = _Uow(run, model, edition_state=edition_state, batch_status=batch_status)
@@ -538,6 +538,7 @@ async def test_visible_adoption_forwards_the_verified_external_turn_id(
             "provenance": "visible_recovery",
             "actor_id": "analyst",
             "external_turn_id": "dom-turn-77",
+            "bridge_response_id": "bridge-1",
         }
     ]
     assert gateway.adoptions[0]["external_turn_id"] != gateway.model.response_id
@@ -603,7 +604,7 @@ async def test_bridge_reason_model_run_is_reconcilable_and_resumes_same_generati
         model_run_id=gateway.model.id,
         stage=ProductionStage.REFERENCES,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
     gateway.model.error_code = "active_signal_stalled"
@@ -644,7 +645,7 @@ async def test_external_turn_identity_unavailable_is_reconcilable_never_retried(
         model_run_id=gateway.model.id,
         stage=ProductionStage.REFERENCES,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
     gateway.model.error_code = "external_turn_identity_unavailable"

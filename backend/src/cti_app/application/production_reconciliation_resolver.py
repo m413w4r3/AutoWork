@@ -124,6 +124,7 @@ class ProductionReconciliationResolver:
             provenance="automatic_bridge_retrieval",
             actor_id="system:production-reconciliation",
             external_turn_id=_verified_external_turn_id(payload),
+            bridge_response_id=_verified_bridge_response_id(payload),
         )
         expected_sha256 = hashlib.sha256(text.encode("utf-8")).hexdigest()
         if (
@@ -151,6 +152,7 @@ class ProductionReconciliationResolver:
                 run.adopt_reconciliation_output(
                     output_sha256=expected_sha256,
                     provenance="automatic_bridge_retrieval",
+                    bridge_response_id=model.response_id,
                 )
                 run.resume_reconciled(expected_stage=current.stage)
                 await uow.production_runs.save(run)
@@ -282,6 +284,9 @@ def _bridge_run_id(run: ProductionRun) -> str | None:
         return anchored
     if reconciliation.bridge_response_id:
         return reconciliation.bridge_response_id[:255]
+    if reconciliation.bridge_request_id:
+        # The bridge supports its idempotency key as an exact GET lookup alias.
+        return reconciliation.bridge_request_id[:255]
     return None
 
 
@@ -311,6 +316,14 @@ def _verified_external_turn_id(payload: dict[str, Any]) -> str | None:
             value = candidate.strip()
             if value and len(value) <= 512:
                 return value
+    return None
+
+
+def _verified_bridge_response_id(payload: dict[str, Any]) -> str | None:
+    for key in ("id", "response_id"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:255]
     return None
 
 

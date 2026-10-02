@@ -31,6 +31,7 @@ from cti_app.domain.model_runs import (
     ModelRole,
     ModelRun,
     ModelRunStatus,
+    ModelSubmissionState,
 )
 from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.infrastructure.database.models.core import ProvenanceEventRow, SubjectRow
@@ -357,7 +358,7 @@ async def test_model_run_round_trip_never_persists_prompt_content(
             persisted = await uow.model_runs.get_for_update(run.id)
             assert persisted is not None
             assert persisted.submission_attempt == 0
-            assert persisted.begin_submission_attempt() == 1
+            assert persisted.begin_submission_attempt(bridge_request_id="run-request:a1") == 1
             persisted.wait_for_background(
                 response_id="resp_integration",
                 actual_model_version="chatgpt-web",
@@ -389,6 +390,8 @@ async def test_model_run_round_trip_never_persists_prompt_content(
         assert persisted.status is ModelRunStatus.WAITING_BACKGROUND
         assert persisted.submission_attempt == 1
         assert persisted.response_id == "resp_integration"
+        assert persisted.bridge_request_id == "run-request:a1"
+        assert persisted.submission_state is ModelSubmissionState.SUBMISSION_IN_PROGRESS
         assert persisted.raw_output_sha256 == "c" * 64
         assert persisted.validation_errors[0]["code"] == "value_error"
         async with SqlAlchemyUnitOfWork(session_factory) as uow:

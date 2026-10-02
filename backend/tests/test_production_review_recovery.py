@@ -594,7 +594,7 @@ async def test_reconciliation_resume_job_chains_to_assembly_on_a_reopened_batch(
         model_run_id=model_run_id,
         stage=ProductionStage.EXTRACTION,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
         output_sha256=output_sha256,
         provenance="visible_recovery",
@@ -647,7 +647,7 @@ def _reconciliation_identity(
         model_run_id=uuid4(),
         stage=stage,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
 

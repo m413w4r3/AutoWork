@@ -116,6 +116,7 @@ class ProductionRunRow(Base):
         Uuid(as_uuid=True), ForeignKey("model_runs.id", ondelete="RESTRICT")
     )
     reconciliation_bridge_response_id: Mapped[str | None] = mapped_column(String(255))
+    reconciliation_bridge_request_id: Mapped[str | None] = mapped_column(String(255))
     reconciliation_submission_state: Mapped[str | None] = mapped_column(String(32))
     reconciliation_phase: Mapped[str | None] = mapped_column(String(64))
     reconciliation_stage: Mapped[str | None] = mapped_column(String(32))

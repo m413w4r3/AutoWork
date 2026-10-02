@@ -126,7 +126,7 @@ def _reconciliation() -> ProductionSubmissionReconciliation:
         model_run_id=MODEL_RUN_ID,
         stage=ProductionStage.SYNTHESIS,
         bridge_response_id="bridge-1",
-        submission_state=ModelSubmissionState.SUBMITTED_OR_UNKNOWN,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
         phase="reconciliation",
     )
 

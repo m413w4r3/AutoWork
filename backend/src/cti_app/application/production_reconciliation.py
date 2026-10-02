@@ -79,6 +79,7 @@ class ProductionRecoveryPreview:
     stage: str
     pipeline_generation: int
     bridge_response_id: str | None
+    bridge_request_id: str | None
     submission_state: str
     phase: str
     text: str
@@ -99,6 +100,7 @@ class ProductionRecoveryPreview:
             "stage": self.stage,
             "pipeline_generation": self.pipeline_generation,
             "bridge_response_id": self.bridge_response_id,
+            "bridge_request_id": self.bridge_request_id,
             "submission_state": self.submission_state,
             "phase": self.phase,
             "text": self.text,
@@ -133,12 +135,16 @@ class ProductionReconciliationService:
                 "production_reconciliation_backend_unsupported",
                 "La récupération visible est réservée au backend chatgpt_bridge.",
             )
-        if not reconciliation.bridge_response_id:
+        recovery_identity = _visible_recovery_identity(reconciliation)
+        if recovery_identity is None:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",
                 "La cible ChatGPT exacte n'est plus disponible ; utilisez l'import Markdown.",
             )
-        if model.response_id != reconciliation.bridge_response_id:
+        if (
+            model.response_id != reconciliation.bridge_response_id
+            or model.bridge_request_id != reconciliation.bridge_request_id
+        ):
             raise ProductionReconciliationError(
                 "production_reconciliation_identity_mismatch",
                 "La réponse du bridge ne correspond pas au ModelRun persistant.",
@@ -149,13 +155,13 @@ class ProductionReconciliationService:
                 "Le bridge ChatGPT n'est pas disponible ; utilisez l'import Markdown.",
             )
         try:
-            payload = await self._bridge.preview_visible_recovery(reconciliation.bridge_response_id)
+            payload = await self._bridge.preview_visible_recovery(recovery_identity)
         except Exception as exc:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",
                 "La cible ChatGPT exacte n'est pas récupérable ; utilisez l'import Markdown.",
             ) from exc
-        if payload.get("bridge_run_id") != reconciliation.bridge_response_id:
+        if payload.get("bridge_run_id") != recovery_identity:
             raise ProductionReconciliationError(
                 "production_reconciliation_identity_mismatch",
                 "Le bridge a renvoyé une autre réponse que celle du ModelRun.",
@@ -188,7 +194,7 @@ class ProductionReconciliationService:
             run,
             reconciliation,
             markdown,
-            visible_available=bool(reconciliation.bridge_response_id),
+            visible_available=_visible_recovery_identity(reconciliation) is not None,
             metadata={"source": "manual_import"},
         )
 
@@ -213,6 +219,7 @@ class ProductionReconciliationService:
                     provenance="visible_recovery",
                     actor_id=actor_id,
                     external_turn_id=preview.external_turn_id,
+                    bridge_response_id=preview.bridge_response_id,
                 )
             except ModelGatewayError as exc:
                 raise ProductionReconciliationError(
@@ -273,12 +280,13 @@ class ProductionReconciliationService:
                 "production_reconciliation_backend_unsupported",
                 "La libération visible est réservée au backend chatgpt_bridge.",
             )
-        if not reconciliation.bridge_response_id:
+        recovery_identity = _visible_recovery_identity(reconciliation)
+        if recovery_identity is None:
             raise ProductionReconciliationError(
                 "production_reconciliation_visible_unavailable",
                 "La cible ChatGPT exacte n'est plus disponible.",
             )
-        await self._release(reconciliation.bridge_response_id)
+        await self._release(recovery_identity)
         return {"action": "production_reconciliation_abandoned", "run_id": str(run_id)}
 
     async def _adopt_and_resume(
@@ -302,8 +310,9 @@ class ProductionReconciliationService:
             run_id, reconciliation, expected_sha256, provenance
         )
         released = False
-        if release_visible and reconciliation.bridge_response_id:
-            released = await self._release(reconciliation.bridge_response_id)
+        recovery_identity = _visible_recovery_identity(reconciliation)
+        if release_visible and recovery_identity is not None:
+            released = await self._release(recovery_identity)
         return {
             "action": "production_reconciliation_adopted",
             "run_id": str(run_id),
@@ -382,7 +391,9 @@ class ProductionReconciliationService:
                 )
             if current.output_sha256 is None:
                 run.adopt_reconciliation_output(
-                    output_sha256=expected_sha256, provenance=provenance
+                    output_sha256=expected_sha256,
+                    provenance=provenance,
+                    bridge_response_id=adopted.response_id,
                 )
             elif current.provenance != provenance:
                 raise ProductionReconciliationError(
@@ -624,6 +635,7 @@ class ProductionReconciliationService:
             stage=reconciliation.stage.value,
             pipeline_generation=run.pipeline_generation,
             bridge_response_id=reconciliation.bridge_response_id,
+            bridge_request_id=reconciliation.bridge_request_id,
             submission_state=reconciliation.submission_state.value,
             phase=reconciliation.phase,
             text=text,
@@ -633,6 +645,13 @@ class ProductionReconciliationService:
             visible_available=visible_available,
             external_turn_id=external_turn_id,
         )
+
+
+def _visible_recovery_identity(
+    reconciliation: ProductionSubmissionReconciliation,
+) -> str | None:
+    """Visible DOM recovery requires a response identity; request keys are probe-only."""
+    return reconciliation.bridge_response_id
 
 
 def _verified_external_turn_id(value: object) -> str | None:

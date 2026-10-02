@@ -242,6 +242,9 @@ class SqlAlchemyEditionReviewReadRepository:
                 ProductionRunRow.reconciliation_bridge_response_id.label(
                     "reconciliation_bridge_response_id"
                 ),
+                ProductionRunRow.reconciliation_bridge_request_id.label(
+                    "reconciliation_bridge_request_id"
+                ),
                 ProductionRunRow.reconciliation_submission_state.label(
                     "reconciliation_submission_state"
                 ),
@@ -353,6 +356,7 @@ def _reconciliation_from_row(row: Any, run_id: UUID) -> ProductionSubmissionReco
         model_run_id=model_run_id,
         stage=ProductionStage(stage),
         bridge_response_id=row["reconciliation_bridge_response_id"],
+        bridge_request_id=row["reconciliation_bridge_request_id"],
         submission_state=ModelSubmissionState(submission_state),
         phase=phase,
         output_sha256=row["reconciliation_output_sha256"],
