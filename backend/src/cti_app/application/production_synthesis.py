@@ -39,6 +39,7 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
+    SYNTHESIS_EDITORIAL_CONTRACT_V4,
     SYNTHESIS_PROMPT_VERSION,
     SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
     SYNTHESIS_WIRE_PARSER_VERSION,
@@ -100,11 +101,11 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v5-reserves-contradictions"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v6-ranked-uncertainty-handles"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v3-subject-relevance-projection"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v1"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v2-headingless-reserve-handles"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
@@ -151,15 +152,8 @@ class SynthesisClaimProposalV1(_StrictProposalModel):
 
 class SynthesisSectionProposalV1(_StrictProposalModel):
     kind: SynthesisSectionKind
-    heading: StrictStr
+    heading: StrictStr = ""
     claims: tuple[SynthesisClaimProposalV1, ...]
-
-    @field_validator("heading")
-    @classmethod
-    def _nonempty_heading(cls, value: str) -> str:
-        if not value.strip():
-            raise ValueError("Section heading must be non-empty text")
-        return value
 
     @field_validator("claims")
     @classmethod
@@ -186,19 +180,27 @@ class SynthesisWireRejection:
 
 
 @dataclass(frozen=True, slots=True)
+class SynthesisWireWarning:
+    block_id: str
+    warning_code: str
+
+
+@dataclass(frozen=True, slots=True)
 class SynthesisWireParseResult:
     proposal: SynthesisProposalV1 | None
     rejections: tuple[SynthesisWireRejection, ...] = ()
     error_code: str | None = None
     explicit_empty: bool = False
     transformations: tuple[str, ...] = ()
+    warnings: tuple[SynthesisWireWarning, ...] = ()
+    diagnostics: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
 class _WireSection:
     block_id: str
     kind: SynthesisSectionKind | None
-    heading: list[str] = field(default_factory=list)
+    heading_present: bool = False
     claims: list[SynthesisClaimProposalV1] = field(default_factory=list)
     raw_lines: list[str] = field(default_factory=list)
     error_code: str | None = None
@@ -231,7 +233,7 @@ _SYNTHESIS_FIELD_BARE = re.compile(
     r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s+(.+)$",
     re.IGNORECASE,
 )
-_SYNTHESIS_HANDLE = re.compile(r"\bE\d{3,}\b")
+_SYNTHESIS_HANDLE = re.compile(r"\b[ER]\d{3,}\b")
 
 
 def _wire_line(line: str) -> str:
@@ -280,6 +282,8 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
     transformations = ("bridge_ui_markers_removed",) if sanitized != normalized_endings else ()
     lines = sanitized.splitlines()
     rejected: list[SynthesisWireRejection] = []
+    warnings: list[SynthesisWireWarning] = []
+    diagnostics: list[str] = []
     lead: list[SynthesisClaimProposalV1] = []
     sections: list[SynthesisSectionProposalV1] = []
     current_group: str | None = None
@@ -338,9 +342,13 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if section.error_code is not None:
             reject(section.block_id, section.error_code, section.raw_lines)
             return
-        if not any(part.strip() for part in section.heading):
-            reject(section.block_id, "synthesis_section_missing_heading", section.raw_lines)
-            return
+        if section.heading_present:
+            warnings.append(
+                SynthesisWireWarning(
+                    block_id=section.block_id,
+                    warning_code="synthesis_section_heading_dropped",
+                )
+            )
         if not section.claims:
             reject(section.block_id, "synthesis_section_missing_valid_claims", section.raw_lines)
             return
@@ -348,7 +356,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             sections.append(
                 SynthesisSectionProposalV1(
                     kind=section.kind,
-                    heading="\n".join(section.heading).strip(),
+                    heading="",
                     claims=tuple(section.claims),
                 )
             )
@@ -381,6 +389,20 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             finish_claim()
             finish_section()
             current_group = "lead" if header_value.casefold() != "synthesis output" else None
+            recognized = True
+            continue
+
+        if header_value.casefold() in {"diagnostics", "synthesis diagnostics"}:
+            finish_claim()
+            finish_section()
+            current_group = "diagnostics"
+            recognized = True
+            continue
+
+        if header_value.casefold() in {"end diagnostics", "end synthesis diagnostics"}:
+            finish_claim()
+            finish_section()
+            current_group = None
             recognized = True
             continue
 
@@ -473,12 +495,19 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                 continue
             if current_section is not None and field_name == "heading":
                 current_section.raw_lines.append(raw_line)
-                if current_section.heading:
-                    current_section.error_code = (
-                        current_section.error_code or "synthesis_section_duplicate_heading"
-                    )
-                else:
-                    current_section.heading.append(value)
+                current_section.heading_present = True
+                recognized = True
+                continue
+            if current_group == "diagnostics":
+                diagnostic = re.fullmatch(
+                    r"(?:MISSING\s+COVERAGE|DIAGNOSTIC)\s*:\s*(.+)",
+                    line,
+                    re.IGNORECASE,
+                )
+                if diagnostic is not None:
+                    text = diagnostic.group(1).strip()
+                    if text:
+                        diagnostics.append(text)
                 recognized = True
                 continue
             if current_section is not None:
@@ -496,8 +525,17 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                 )
         elif current_section is not None:
             current_section.raw_lines.append(raw_line)
-            if current_section.heading:
-                current_section.heading.append(raw_line.strip())
+        elif current_group == "diagnostics":
+            diagnostic = re.fullmatch(
+                r"(?:MISSING\s+COVERAGE|DIAGNOSTIC)\s*:\s*(.+)",
+                line,
+                re.IGNORECASE,
+            )
+            if diagnostic is not None:
+                text = diagnostic.group(1).strip()
+                if text:
+                    diagnostics.append(text)
+            recognized = True
 
     finish_claim()
     finish_section()
@@ -507,6 +545,8 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             proposal=SynthesisProposalV1(lead=(), sections=()),
             explicit_empty=True,
             transformations=transformations,
+            warnings=tuple(warnings),
+            diagnostics=tuple(diagnostics),
         )
     if not recognized:
         return SynthesisWireParseResult(
@@ -514,6 +554,8 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             tuple(rejected),
             error_code="synthesis_unintelligible_response",
             transformations=transformations,
+            warnings=tuple(warnings),
+            diagnostics=tuple(diagnostics),
         )
     if not lead:
         rejected.append(_wire_rejection("LEAD", "synthesis_lead_missing", lines))
@@ -522,6 +564,8 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             tuple(rejected),
             error_code="synthesis_lead_missing",
             transformations=transformations,
+            warnings=tuple(warnings),
+            diagnostics=tuple(diagnostics),
         )
     try:
         proposal = SynthesisProposalV1(lead=tuple(lead), sections=tuple(sections))
@@ -531,11 +575,15 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             tuple(rejected),
             error_code="synthesis_proposal_schema_invalid",
             transformations=transformations,
+            warnings=tuple(warnings),
+            diagnostics=tuple(diagnostics),
         )
     return SynthesisWireParseResult(
         proposal,
         tuple(rejected),
         transformations=transformations,
+        warnings=tuple(warnings),
+        diagnostics=tuple(diagnostics),
     )
 
 
@@ -635,8 +683,8 @@ _MARKDOWN_TABLE_SEPARATOR = re.compile(
 )
 _MARKDOWN_TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
 _SOURCE_MARKER = re.compile(
-    r"(?i)(?:\[(?:s\d+|e\d+|\d+|source\s*\d+|ref(?:erence)?\s*\d+)\]|"
-    r"\((?:s\d+|source\s*\d+)\)|\bE\d{3,}\b)"
+    r"(?i)(?:\[(?:s\d+|[er]\d+|\d+|source\s*\d+|ref(?:erence)?\s*\d+)\]|"
+    r"\((?:s\d+|source\s*\d+)\)|\b[ER]\d{3,}\b)"
 )
 
 _CVE = re.compile(r"\bCVE-\d{4}-\d{4,}\b", re.IGNORECASE)
@@ -712,6 +760,7 @@ SYNTHESIS_METADATA_KEYS = frozenset(
         "model_policy_version",
         "routing_policy_version",
         "synthesis_policy_version",
+        "diagnostics",
     }
 )
 
@@ -1033,6 +1082,19 @@ def build_synthesis_evidence_pack(
 
     entries = _all_evidence_entries(extraction)
     source_by_id = {source.source_document_id: source for source in extraction.sources}
+    uncertainties = build_synthesis_uncertainties(extraction, projection=projection)
+    ranked_uncertainty_keys = {
+        (source_id, _normalized_synthesis_text(item.text))
+        for item in uncertainties
+        for source_id in item.source_document_ids
+    }
+    uncertainty_refs = {
+        ref
+        for ref, payload in entries.items()
+        if ref.kind is EvidenceKind.UNCERTAINTY
+        and (ref.source_document_id, _normalized_synthesis_text(str(payload["text"])))
+        in ranked_uncertainty_keys
+    }
 
     def admitted(ref: ExtractionEvidenceRefV1) -> bool:
         if projection is None:
@@ -1062,10 +1124,15 @@ def build_synthesis_evidence_pack(
     narrative_refs = {
         ref
         for ref in entries
-        if ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
-        and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
-        and admitted(ref)
-        and ref not in counter_refs
+        if (
+            (
+                ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
+                and source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+                and admitted(ref)
+                and ref not in counter_refs
+            )
+            or ref in uncertainty_refs
+        )
     }
     technical_candidates = [
         ref
@@ -1113,6 +1180,7 @@ def build_synthesis_evidence_pack(
     reserve_handle_for_ref = {
         ref: f"R{index:03d}" for index, ref in enumerate(reserve_catalogue_refs, start=1)
     }
+    handle_to_ref.update({handle: ref for ref, handle in reserve_handle_for_ref.items()})
 
     narrative_evidence = tuple(
         _prompt_evidence_record(
@@ -1158,8 +1226,6 @@ def build_synthesis_evidence_pack(
         )
         for relation in (projection.source_pair_relations if projection is not None else ())
     )
-    uncertainties = build_synthesis_uncertainties(extraction, projection=projection)
-
     return SynthesisEvidencePackV1(
         subject_title=snapshot.subject_title,
         publication_language=snapshot.publication_language,
@@ -1365,35 +1431,15 @@ def build_synthesis_model_request(
         f"Actor or campaign: {snapshot.actor_or_campaign}",
         f"Period: {snapshot.period_start.isoformat()} to {snapshot.period_end.isoformat()}",
         "",
-        "Use only the evidence blocks below. Do not add facts, dates, identifiers, causal links,",
-        "or source details that the evidence does not support. Omit unsupported information.",
-        "Write every factual claim in the publication language. Keep one factual claim per block.",
-        "Put exact evidence handles on the EVIDENCE line, never in claim text. Do not invent or",
-        "modify handles. Preserve technical literals exactly as written in the evidence.",
-        "Use narrative evidence for the lead and ordinary sections. Technical handles are allowed",
-        "only in sections whose kind is technical, infrastructure, or detection.",
-        "If no narrative claim can be supported, return only @@EMPTY@@.",
-        "Do not return JSON, a Markdown table, HTML, or explanatory text outside the blocks.",
-        "",
-        "OUTPUT FORMAT",
-        "@@LEAD@@",
-        "@@CLAIM L001@@",
-        "EVIDENCE: E001, E002",
-        "TEXT: one plain-text paragraph in the publication language",
-        "@@SECTION overview S001@@",
-        "HEADING: a short plain-text heading",
-        "@@CLAIM C001@@",
-        "EVIDENCE: E001",
-        "TEXT: one plain-text paragraph in the publication language",
-        "@@END SECTION@@",
+        *SYNTHESIS_EDITORIAL_CONTRACT_V4.strip().splitlines(),
         f"Allowed section kinds: {', '.join(kind.value for kind in SynthesisSectionKind)}",
-        "Repeat CLAIM blocks as needed.",
-        "Every non-empty response must have at least one lead claim.",
-        "A section needs a kind, heading, and at least one supported claim.",
+        "If no narrative claim can be supported, return only @@EMPTY@@.",
         "",
         "CURRENT EVIDENCE PACK",
     ]
     for record in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence):
+        if record.get("kind") == EvidenceKind.UNCERTAINTY.value:
+            continue
         prompt_lines.extend(_render_evidence_record(record))
         prompt_lines.append("")
     if evidence_pack.reserve_evidence or evidence_pack.source_pair_relations:
@@ -1414,10 +1460,28 @@ def build_synthesis_model_request(
                 f"(handles: {', '.join(relation['supporting_handles'])})"
             )
         prompt_lines.append("@@END RESERVES / CONTRADICTIONS@@")
-    if evidence_pack.uncertainties:
-        prompt_lines.append("@@ANALYTICAL UNCERTAINTIES@@")
-        prompt_lines.extend(evidence_pack.uncertainties)
-        prompt_lines.append("@@END UNCERTAINTIES@@")
+    uncertainty_records = tuple(
+        record
+        for uncertainty in evidence_pack.uncertainties
+        for record in evidence_pack.narrative_evidence
+        if record.get("kind") == EvidenceKind.UNCERTAINTY.value
+        and _normalized_synthesis_text(str(record.get("text", "")))
+        == _normalized_synthesis_text(uncertainty)
+    )
+    if uncertainty_records:
+        prompt_lines.extend(
+            (
+                "@@PROJECTED / RANKED ANALYTICAL UNCERTAINTIES — CONTEXT FOR CLOSING PROSE@@",
+                "Use these source-grounded, projected items to shape the final analytic "
+                "paragraphs.",
+                "Cite their exact E handles when the paragraph relies on them; do not reproduce",
+                "this context as a list in the synthesis.",
+            )
+        )
+        for record in uncertainty_records:
+            prompt_lines.extend(_render_evidence_record(record))
+            prompt_lines.append("")
+        prompt_lines.append("@@END PROJECTED / RANKED UNCERTAINTIES@@")
     if revision is not None:
         prompt_lines.extend(("", *_render_revision_context(revision, evidence_pack)))
     prompt = "\n".join(prompt_lines).strip()
@@ -1485,7 +1549,11 @@ def _claim_proposal_from_payload(value: Any) -> SynthesisClaimProposalV1:
 
 
 def _section_proposal_from_payload(value: Any) -> SynthesisSectionProposalV1:
-    payload = _strict_mapping(value, _SECTION_PROPOSAL_KEYS, "Section proposal")
+    if not isinstance(value, Mapping) or not {"kind", "claims"} <= set(value):
+        raise ValueError("Section proposal fields do not match the strict schema")
+    if set(value) - _SECTION_PROPOSAL_KEYS:
+        raise ValueError("Section proposal fields do not match the strict schema")
+    payload = value
     claims = payload["claims"]
     if not isinstance(claims, list):
         raise ValueError("Section claims must be an array")
@@ -1494,7 +1562,7 @@ def _section_proposal_from_payload(value: Any) -> SynthesisSectionProposalV1:
         raise ValueError("Section kind must be text")
     return SynthesisSectionProposalV1(
         kind=SynthesisSectionKind(kind_value),
-        heading=payload["heading"],
+        heading=payload.get("heading", ""),
         claims=tuple(_claim_proposal_from_payload(claim) for claim in claims),
     )
 
@@ -1733,8 +1801,29 @@ def validate_synthesis_proposal(
 
         narrative_handles = {str(record["handle"]) for record in evidence_pack.narrative_evidence}
         technical_handles = {str(record["handle"]) for record in evidence_pack.technical_evidence}
+        reserve_narrative_handles = {
+            str(record["handle"])
+            for record in evidence_pack.reserve_evidence
+            if record.get("kind")
+            in {
+                EvidenceKind.FACT.value,
+                EvidenceKind.EVENT.value,
+                EvidenceKind.UNCERTAINTY.value,
+            }
+        }
+        reserve_technical_handles = {
+            str(record["handle"])
+            for record in evidence_pack.reserve_evidence
+            if record.get("kind") in {EvidenceKind.INDICATOR.value, EvidenceKind.RULE.value}
+        }
         narrative_refs = {evidence_pack.resolve_handle(handle) for handle in narrative_handles}
+        narrative_refs.update(
+            evidence_pack.resolve_handle(handle) for handle in reserve_narrative_handles
+        )
         technical_refs = {evidence_pack.resolve_handle(handle) for handle in technical_handles}
+        technical_refs.update(
+            evidence_pack.resolve_handle(handle) for handle in reserve_technical_handles
+        )
 
         known_technical: set[tuple[str, str]] = set()
         technical_support_mutable: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = (
@@ -1771,23 +1860,14 @@ def validate_synthesis_proposal(
         lead = tuple(convert_claim(claim, allow_technical=False) for claim in parsed.lead)
         sections: list[SynthesisSectionV1] = []
         for section in parsed.sections:
-            _validate_plain_text(section.heading)
             allow_technical = section.kind in _TECHNICAL_SECTION_KINDS
             paragraphs = tuple(
                 convert_claim(claim, allow_technical=allow_technical) for claim in section.claims
             )
-            section_refs = tuple(ref for paragraph in paragraphs for ref in paragraph.evidence_refs)
-            _validate_grounded_text(
-                section.heading,
-                section_refs,
-                entries,
-                known_technical,
-                technical_support_mutable,
-            )
             sections.append(
                 SynthesisSectionV1(
                     kind=section.kind,
-                    heading=section.heading,
+                    heading="",
                     paragraphs=paragraphs,
                 )
             )
@@ -2188,7 +2268,6 @@ def render_synthesis_markdown(
     for paragraph in synthesis.lead:
         lines.extend((paragraph.text, sources(paragraph.evidence_refs), ""))
     for section in synthesis.sections:
-        lines.extend((f"## {section.heading}", ""))
         for paragraph in section.paragraphs:
             lines.extend((paragraph.text, sources(paragraph.evidence_refs), ""))
     if synthesis.timeline:
@@ -2199,16 +2278,6 @@ def render_synthesis_markdown(
             )
             lines.extend((f"- {label}: {entry.text}", f"  {sources(entry.evidence_refs)}"))
         lines.append("")
-    if synthesis.uncertainties:
-        lines.extend(("## Uncertainties", ""))
-        for item in synthesis.uncertainties:
-            urls = sorted(source_urls[document_id] for document_id in item.source_document_ids)
-            lines.extend((f"- {item.text}", f"  Sources: {', '.join(urls)}"))
-        lines.append("")
-    if synthesis.warnings:
-        lines.extend(("## Warnings", ""))
-        lines.extend(f"- {warning}" for warning in synthesis.warnings)
-        lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2218,6 +2287,7 @@ def render_synthesis_markdown(
 # keep the canonical warning projection small and deterministic.
 MAX_SYNTHESIS_WARNINGS = 16
 MAX_SYNTHESIS_WARNING_CHARS = 500
+MAX_SYNTHESIS_DIAGNOSTICS = 16
 
 
 class SynthesisExecutionStatus(StrEnum):
@@ -2322,6 +2392,14 @@ def _bounded_synthesis_warnings(
     if omitted > 0:
         bounded.append(f"{omitted} extraction warning(s) omitted from this synthesis projection")
     return tuple(bounded)
+
+
+def _bounded_synthesis_diagnostics(values: Iterable[str]) -> tuple[str, ...]:
+    normalized = sorted({value.strip() for value in values if value.strip()})
+    return tuple(
+        value if len(value) <= MAX_SYNTHESIS_WARNING_CHARS else value[:499] + "…"
+        for value in normalized[:MAX_SYNTHESIS_DIAGNOSTICS]
+    )
 
 
 def _synthesis_counts(synthesis: ProductionSynthesisV1) -> dict[str, Any]:
@@ -2880,6 +2958,8 @@ class ProductionSynthesisService:
             )
         transformations = [
             *parsed.transformations,
+            *(("synthesis_section_heading_dropped",) if parsed.warnings else ()),
+            *(("synthesis_missing_coverage_diagnostics",) if parsed.diagnostics else ()),
             f"synthesis_parser:{SYNTHESIS_WIRE_PARSER_VERSION}",
             f"synthesis_contract:{SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",
             f"synthesis_prompt:{SYNTHESIS_PROMPT_VERSION}",
@@ -3029,6 +3109,14 @@ class ProductionSynthesisService:
             {"block_id": item.block_id, "reason_code": item.reason_code}
             for item in parsed.rejections
         ]
+        wire_diagnostics: dict[str, Any] = {
+            "parse_warnings": [
+                {"block_id": item.block_id, "warning_code": item.warning_code}
+                for item in parsed.warnings
+            ],
+            "rejected_blocks": rejection_details,
+            "missing_coverage": list(_bounded_synthesis_diagnostics(parsed.diagnostics)),
+        }
         if parsed.proposal is None:
             await self._record_wire_parse(model_run, evidence_pack, parsed)
             return reviewed(
@@ -3040,6 +3128,7 @@ class ProductionSynthesisService:
                     "parse_identity": parse_identity,
                     "parse_error": parsed.error_code,
                     "rejections": rejection_details,
+                    "diagnostics": wire_diagnostics,
                 },
             )
         try:
@@ -3064,6 +3153,7 @@ class ProductionSynthesisService:
                     **self._model_evidence(model_run),
                     "parse_identity": parse_identity,
                     "rejections": rejection_details,
+                    "diagnostics": wire_diagnostics,
                 },
             )
         await self._record_wire_parse(model_run, evidence_pack, parsed)
@@ -3086,10 +3176,17 @@ class ProductionSynthesisService:
             uncertainties=build_synthesis_uncertainties(extraction, projection=projection),
             warnings=_bounded_synthesis_warnings(
                 extraction,
-                additional_warnings=timeline_warnings,
+                additional_warnings=(
+                    *timeline_warnings,
+                    *(f"{item.warning_code}:{item.block_id}" for item in parsed.warnings),
+                ),
             ),
         )
         validate_synthesis_lineage(synthesis, snapshot, extraction_hash)
+        diagnostics = {
+            **wire_diagnostics,
+            "warnings": list(synthesis.warnings),
+        }
         artifact = await self._synthesis_service.store_synthesis_result(
             run_id=run.id,
             subject_id=snapshot.subject_id,
@@ -3102,6 +3199,7 @@ class ProductionSynthesisService:
             model_policy_version=SYNTHESIS_MODEL_POLICY_VERSION,
             routing_policy_version=SYNTHESIS_ROUTING_POLICY_VERSION,
             projection_hash=projection.projection_hash if projection is not None else None,
+            diagnostics=diagnostics,
         )
         return ProductionSynthesisExecution(
             status=SynthesisExecutionStatus.SUCCEEDED,
@@ -3115,6 +3213,7 @@ class ProductionSynthesisService:
                 **_synthesis_counts(synthesis),
                 "parse_identity": parse_identity,
                 "parse_rejections": rejection_details,
+                "diagnostics": diagnostics,
                 **({} if revision is None else _revision_details(revision)),
             },
         )

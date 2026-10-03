@@ -16,7 +16,6 @@ import {
   type ProductionSynthesisEvidenceKindV1,
   type ProductionSynthesisEvidenceRefV1,
   type ProductionSynthesisParagraphV1,
-  type ProductionSynthesisSectionKindV1,
   type ProductionSynthesisTimelineEntryV1,
   type ProductionSynthesisV1,
   type PublicationDocumentV4,
@@ -761,21 +760,6 @@ const SYNTHESIS_MODE_LABELS: Record<string, string> = {
   reuse_exact: "Réutilisation d’une synthèse identique",
 };
 
-const SYNTHESIS_SECTION_KIND_LABELS: Record<
-  ProductionSynthesisSectionKindV1,
-  string
-> = {
-  overview: "Vue d’ensemble",
-  campaign: "Campagne",
-  infection_chain: "Chaîne d’infection",
-  technical: "Technique",
-  victimology: "Victimologie",
-  infrastructure: "Infrastructure",
-  detection: "Détection",
-  impact: "Impact",
-  other: "Autre",
-};
-
 const SYNTHESIS_EVIDENCE_KIND_LABELS: Record<
   ProductionSynthesisEvidenceKindV1,
   string
@@ -959,12 +943,6 @@ function ProductionSynthesisView({
 
       {document.sections.map((section, index) => (
         <section className="synthesis-section" key={`${section.kind}-${index}`}>
-          <h4>
-            {section.heading}{" "}
-            <small className="synthesis-section__kind">
-              {SYNTHESIS_SECTION_KIND_LABELS[section.kind]}
-            </small>
-          </h4>
           {section.paragraphs.map((paragraph, paragraphIndex) => (
             <SynthesisParagraph
               key={`${section.kind}-${index}-${paragraphIndex}`}
@@ -1071,7 +1049,7 @@ export function PublicationDocumentView({
       {document.lead.map((item, index) => paragraph(item, `lead-${index}`))}
       {document.sections.map((section, index) => (
         <section key={`${section.kind}-${index}`}>
-          <h4>{section.heading}</h4>
+          {section.heading.trim() ? <h4>{section.heading}</h4> : null}
           {section.paragraphs.map((item, paragraphIndex) =>
             paragraph(item, `${index}-${paragraphIndex}`),
           )}

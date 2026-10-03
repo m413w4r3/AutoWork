@@ -46,6 +46,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
     draft_synthesis_proposal,
     parse_synthesis_proposal_wire,
+    render_synthesis_markdown,
     synthesis_access_policy_hash,
     synthesis_evidence_pack_hash,
     synthesis_input_hash,
@@ -686,7 +687,44 @@ def test_proposal_resolves_exact_handles_to_canonical_evidence_refs():
     assert lead[0].text == "FooRAT was identified in the report."
     assert lead[0].evidence_refs == (pack.resolve_handle(handle),)
     assert sections[0].kind is SynthesisSectionKind.OVERVIEW
+    assert sections[0].heading == ""
     assert not hasattr(lead[0], "evidence_handles")
+
+
+def test_one_paragraph_can_cite_multiple_supporting_handles():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (
+            make_source(
+                source_id,
+                facts=(make_fact(source_id, "FooRAT"), make_fact(source_id, "BarRAT")),
+            ),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handles_by_value = {
+        str(record["value"]): str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    }
+    proposal = {
+        "lead": [
+            {
+                "text": "FooRAT and BarRAT are both named in the report.",
+                "evidence_handles": [handles_by_value["FooRAT"], handles_by_value["BarRAT"]],
+            }
+        ],
+        "sections": [],
+    }
+
+    lead, sections = validate_synthesis_proposal(proposal, pack, extraction)
+
+    assert sections == ()
+    assert set(lead[0].evidence_refs) == {
+        pack.resolve_handle(handles_by_value["FooRAT"]),
+        pack.resolve_handle(handles_by_value["BarRAT"]),
+    }
 
 
 def test_proposal_rejects_unknown_handle_and_malformed_schema():
@@ -742,7 +780,7 @@ def test_proposal_rejects_markdown_html_and_source_markers(text: str):
     )
 
 
-def test_proposal_rejects_markup_in_section_heading():
+def test_proposal_drops_model_section_heading_without_rejecting_claims():
     subject_id, source_id = uuid4(), uuid4()
     extraction = make_extraction(
         subject_id,
@@ -751,14 +789,12 @@ def test_proposal_rejects_markup_in_section_heading():
     pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
     handle = str(pack.narrative_evidence[0]["handle"])
 
-    assert_proposal_error(
-        lambda: validate_synthesis_proposal(
-            make_proposal("FooRAT was identified.", handle, heading="# Overview"),
-            pack,
-            extraction,
-        ),
-        "synthesis_output_invalid",
+    _, sections = validate_synthesis_proposal(
+        make_proposal("FooRAT was identified.", handle, heading="# Overview"),
+        pack,
+        extraction,
     )
+    assert sections[0].heading == ""
 
 
 def test_proposal_rejects_technical_literals_missing_from_extraction():
@@ -1107,7 +1143,14 @@ async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = make_extraction(
-        subject_id, (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),)
+        subject_id,
+        (
+            make_source(
+                source_id,
+                facts=(make_fact(source_id, "FooRAT"),),
+                uncertainties=("Scope remains unknown.", "Attribution remains uncertain."),
+            ),
+        ),
     )
     pack = build_synthesis_evidence_pack(snapshot, extraction)
     policy = await build_synthesis_access_policy(
@@ -1135,6 +1178,26 @@ async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     assert gateway.request_seen is request
     assert gateway.schema_seen is None
     assert "Do not return JSON" in request.text
+    assert "dense, coherent CTI prose" in request.text
+    for marker in (
+        "campaign, victimology",
+        "infection/execution chain",
+        "persistence",
+        "C2 protocol",
+        "concrete observable",
+        "confidence level",
+        "HANDLE_A, HANDLE_B",
+        "@@DIAGNOSTICS@@",
+        "PROJECTED / RANKED ANALYTICAL UNCERTAINTIES",
+        "Attribution remains uncertain.",
+        "Scope remains unknown.",
+    ):
+        assert marker.casefold() in request.text.casefold()
+    assert request.text.index("Attribution remains uncertain.") < request.text.index(
+        "Scope remains unknown."
+    )
+    assert "HEADING: a short" not in request.text
+    assert "Return JSON" not in request.text
 
 
 # --- canonical synthesis application service --------------------------------
@@ -1687,6 +1750,9 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
     assert [(item.block_id, item.reason_code) for item in parsed.rejections] == [
         ("BROKEN", "synthesis_claim_missing_text")
     ]
+    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
+        ("S001", "synthesis_section_heading_dropped")
+    ]
     assert parsed.transformations == ("bridge_ui_markers_removed",)
 
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
@@ -1710,6 +1776,7 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
         'L\'analyse cite aussi "FooRAT" comme élément du dossier.',
     ]
     assert len(synthesis.sections) == 1
+    assert synthesis.sections[0].heading == ""
     assert synthesis.sections[0].paragraphs[0].evidence_refs == (
         world.pack.resolve_handle(world.handle),
     )
@@ -1720,6 +1787,79 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
     )
     assert len(normalized.lead) == 2
     assert normalized.lead[0].evidence_handles == (world.handle,)
+
+
+def test_wire_parser_accepts_headingless_sections_and_drops_present_heading_with_warning():
+    world = _fresh_setup()
+
+    def wire(heading: str) -> str:
+        optional_heading = f"HEADING: {heading}\n" if heading else ""
+        return (
+            "@@LEAD@@\n"
+            "@@CLAIM L001@@\n"
+            f"EVIDENCE: {world.handle}\n"
+            "TEXT: FooRAT was identified in the report.\n"
+            "@@SECTION technical S001@@\n"
+            f"{optional_heading}"
+            "@@CLAIM C001@@\n"
+            f"EVIDENCE: {world.handle}\n"
+            "TEXT: FooRAT was identified in the technical section.\n"
+            "@@END SECTION@@"
+        )
+
+    headingless = parse_synthesis_proposal_wire(wire(""))
+    headed = parse_synthesis_proposal_wire(wire("Internal heading"))
+
+    assert headingless.proposal is not None
+    assert headingless.proposal.sections[0].heading == ""
+    assert headingless.warnings == ()
+    assert headed.proposal is not None
+    assert headed.proposal.sections[0].heading == ""
+    assert [(item.block_id, item.warning_code) for item in headed.warnings] == [
+        ("S001", "synthesis_section_heading_dropped")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_synthesis_diagnostics_are_persisted_separately_from_body():
+    world = _fresh_setup()
+    raw = f"""@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: FooRAT was identified in the report.
+@@SECTION overview S001@@
+HEADING: Drafted title that must be dropped
+@@CLAIM BROKEN@@
+EVIDENCE: {world.handle}
+@@CLAIM C001@@
+EVIDENCE: {world.handle}
+TEXT: FooRAT was also examined technically.
+@@END SECTION@@
+@@DIAGNOSTICS@@
+MISSING COVERAGE: the delivery chain is absent from the supplied extraction
+@@END DIAGNOSTICS@@"""
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.details["diagnostics"]["missing_coverage"] == [
+        "the delivery chain is absent from the supplied extraction"
+    ]
+    assert result.details["diagnostics"]["rejected_blocks"] == [
+        {"block_id": "BROKEN", "reason_code": "synthesis_claim_missing_text"}
+    ]
+    assert result.details["diagnostics"]["parse_warnings"] == [
+        {"block_id": "S001", "warning_code": "synthesis_section_heading_dropped"}
+    ]
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert isinstance(synthesis, ProductionSynthesisV1)
+    body = render_synthesis_markdown(synthesis, world.extraction)
+    assert "Drafted title that must be dropped" not in body
+    assert "delivery chain is absent" not in body
+    assert "synthesis_section_heading_dropped" not in body
+    assert "Attribution remains uncertain." not in body
+    assert world.writer.calls[0]["diagnostics"] == result.details["diagnostics"]
 
 
 @pytest.mark.asyncio
@@ -1821,6 +1961,37 @@ async def test_prompt_version_change_requires_a_new_model_call(monkeypatch):
     assert next_result.model_run_id != first.model_run_id
     assert len(first_world.gateway.calls) == 2
     assert first_world.gateway.calls[1][0].prompt_template_version == "synthesis-draft-v3-test"
+
+
+@pytest.mark.asyncio
+async def test_contract_version_change_requires_a_new_model_call(monkeypatch):
+    first_world = _fresh_setup()
+    first = await first_world.service.execute(
+        first_world.run, first_world.snapshot, first_world.artifact
+    )
+
+    monkeypatch.setattr(
+        synthesis_module,
+        "SYNTHESIS_PROPOSAL_CONTRACT_VERSION",
+        "synthesis-text-blocks-v2-test",
+    )
+    next_world = _service_world(
+        first_world.snapshot,
+        first_world.extraction,
+        (make_document(first_world.snapshot.subject_id, first_world.source_id),),
+        first_world.gateway,
+    )
+    next_result = await next_world.service.execute(
+        next_world.run, first_world.snapshot, next_world.artifact
+    )
+
+    assert first.status is SynthesisExecutionStatus.SUCCEEDED
+    assert next_result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert next_result.model_calls == 1
+    assert next_result.input_hash != first.input_hash
+    assert next_result.model_run_id != first.model_run_id
+    assert len(first_world.gateway.calls) == 2
+    assert "Contract version: synthesis-text-blocks-v2-test" in first_world.gateway.calls[1][0].text
 
 
 @pytest.mark.asyncio

@@ -732,7 +732,7 @@ function isSynthesisSection(
     hasExactKeys(value, ["kind", "heading", "paragraphs"]) &&
     typeof value.kind === "string" &&
     SYNTHESIS_SECTION_KINDS.has(value.kind) &&
-    isNonEmptyString(value.heading) &&
+    typeof value.heading === "string" &&
     Array.isArray(value.paragraphs) &&
     value.paragraphs.length > 0 &&
     value.paragraphs.every(isSynthesisParagraph)

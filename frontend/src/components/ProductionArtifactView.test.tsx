@@ -95,7 +95,7 @@ function synthesisArtifact(
       sections: [
         {
           kind: "infection_chain",
-          heading: "Progression de l’attaque",
+          heading: "",
           paragraphs: [
             {
               text: "Le leurre déclenche une chaîne PowerShell.",
@@ -105,7 +105,7 @@ function synthesisArtifact(
         },
         {
           kind: "campaign",
-          heading: "Contexte de la campagne",
+          heading: "",
           paragraphs: [
             {
               text: "La campagne vise des organisations exposées.",
@@ -277,7 +277,7 @@ it("affiche la publication V4 et ses enrichissements", async () => {
             sections: [
               {
                 kind: "overview",
-                heading: "Contexte",
+                heading: "",
                 paragraphs: [
                   {
                     text: "Paragraphe sourcé.",
@@ -329,12 +329,7 @@ it("affiche la publication V4 et ses enrichissements", async () => {
                 role: "primary",
               },
             ],
-            uncertainties: [
-              {
-                text: "Attribution incertaine.",
-                source_document_ids: [VENDOR_DOCUMENT_ID],
-              },
-            ],
+            uncertainties: [],
             tables: [
               {
                 key: "commands",
@@ -418,11 +413,13 @@ it("affiche la publication V4 et ses enrichissements", async () => {
     await screen.findByRole("heading", { name: "Article canonique" }),
   ).toBeInTheDocument();
   expect(screen.getByText("Lead sourcé.")).toBeInTheDocument();
-  expect(screen.getByRole("heading", { name: "Contexte" })).toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "Contexte" }),
+  ).not.toBeInTheDocument();
   expect(screen.getByText("Paragraphe sourcé.")).toBeInTheDocument();
   expect(screen.getByText("Événement.")).toBeInTheDocument();
   expect(screen.getByText("evil.example")).toBeInTheDocument();
-  expect(screen.getByText("Attribution incertaine.")).toBeInTheDocument();
+  expect(screen.queryByText("Attribution incertaine.")).not.toBeInTheDocument();
   expect(
     screen.getByRole("heading", { name: "Commandes observées" }),
   ).toBeInTheDocument();
@@ -899,12 +896,11 @@ it("rend la synthèse canonique V1 et la provenance exacte de ses évidences", a
     within(leadParagraph as HTMLElement).getByRole("link", { name: IOC_URL }),
   ).toBeInTheDocument();
   expect(
-    screen.getByRole("heading", { name: /Progression de l’attaque/ }),
-  ).toBeInTheDocument();
+    screen.queryByRole("heading", { name: /Progression de l’attaque/ }),
+  ).not.toBeInTheDocument();
   expect(
-    screen.getByRole("heading", { name: /Contexte de la campagne/ }),
-  ).toBeInTheDocument();
-  expect(screen.getByText("Chaîne d’infection")).toBeInTheDocument();
+    screen.queryByRole("heading", { name: /Contexte de la campagne/ }),
+  ).not.toBeInTheDocument();
   expect(screen.getByText(/20 août 2026/)).toBeInTheDocument();
   expect(
     screen.getByText("Début de la campagne observée."),

@@ -97,7 +97,6 @@ from cti_app.domain.publication import (
     PublicationSectionV1,
     PublicationSourceV1,
     PublicationTimelineEntryV1,
-    PublicationUncertaintyV1,
 )
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
@@ -948,12 +947,12 @@ def test_synthesis_publication_projection_preserves_narrative_and_order() -> Non
         sections=(
             SynthesisSectionV1(
                 kind=SynthesisSectionKind.OVERVIEW,
-                heading="Overview heading",
+                heading="",
                 paragraphs=(SynthesisParagraphV1("Overview text.", (evidence[0],)),),
             ),
             SynthesisSectionV1(
                 kind=SynthesisSectionKind.TECHNICAL,
-                heading="Technical heading",
+                heading="",
                 paragraphs=(
                     SynthesisParagraphV1("Technical first.", (evidence[1],)),
                     SynthesisParagraphV1("Technical second.", (evidence[0],)),
@@ -996,12 +995,12 @@ def test_synthesis_publication_projection_preserves_narrative_and_order() -> Non
     assert projection.sections == (
         PublicationSectionV1(
             PublicationSectionKind.OVERVIEW,
-            "Overview heading",
+            "",
             (PublicationParagraphV1("Overview text.", (publication_ref(evidence[0]),)),),
         ),
         PublicationSectionV1(
             PublicationSectionKind.TECHNICAL,
-            "Technical heading",
+            "",
             (
                 PublicationParagraphV1("Technical first.", (publication_ref(evidence[1]),)),
                 PublicationParagraphV1("Technical second.", (publication_ref(evidence[0]),)),
@@ -1022,10 +1021,7 @@ def test_synthesis_publication_projection_preserves_narrative_and_order() -> Non
             (publication_ref(evidence[0]),),
         ),
     )
-    assert projection.uncertainties == tuple(
-        PublicationUncertaintyV1(item.text, item.source_document_ids)
-        for item in synthesis.uncertainties
-    )
+    assert projection.uncertainties == ()
     assert projection.used_source_document_ids == frozenset({source_document_id})
 
     reversed_synthesis = replace(
@@ -1318,12 +1314,12 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
         sections=(
             SynthesisSectionV1(
                 SynthesisSectionKind.OVERVIEW,
-                "Overview",
+                "",
                 (SynthesisParagraphV1("Overview text.", (fact_a, fact_b)),),
             ),
             SynthesisSectionV1(
                 SynthesisSectionKind.TECHNICAL,
-                "Technical details",
+                "",
                 (SynthesisParagraphV1("Technical text.", (fact_b,)),),
             ),
         ),
@@ -1366,12 +1362,12 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
         sections=(
             PublicationSectionV1(
                 PublicationSectionKind.OVERVIEW,
-                "Overview",
+                "",
                 (PublicationParagraphV1("Overview text.", (ref_a, ref_b)),),
             ),
             PublicationSectionV1(
                 PublicationSectionKind.TECHNICAL,
-                "Technical details",
+                "",
                 (PublicationParagraphV1("Technical text.", (ref_b,)),),
             ),
         ),
@@ -1414,9 +1410,7 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
                 role=reference_b.role,
             ),
         ),
-        uncertainties=(
-            PublicationUncertaintyV1("Attribution remains uncertain.", (source_a_id, source_b_id)),
-        ),
+        uncertainties=(),
         tables=(),
         diagrams=(),
         figures=(),

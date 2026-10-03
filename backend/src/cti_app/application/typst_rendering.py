@@ -204,7 +204,8 @@ def project_publication_to_typst_model(
     body_blocks.extend({"type": "paragraph", "text": item.text} for item in document.lead)
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
     for section_index, section in enumerate(document.sections):
-        body_blocks.append({"type": "section_heading", "text": section.heading})
+        if section.heading.strip():
+            body_blocks.append({"type": "section_heading", "text": section.heading})
         body_blocks.extend(
             {"type": "paragraph", "text": paragraph.text} for paragraph in section.paragraphs
         )

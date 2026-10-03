@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
@@ -471,6 +472,7 @@ class SynthesisService(_ArtifactPayloadMixin):
         model_policy_version: str = "",
         routing_policy_version: str = "",
         projection_hash: str | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
@@ -505,6 +507,7 @@ class SynthesisService(_ArtifactPayloadMixin):
             "routing_policy_version": routing_policy_version,
             "relevance_projection_hash": projection_hash,
             "synthesis_policy_version": synthesis.synthesis_policy_version,
+            "diagnostics": dict(diagnostics or {}),
         }
         async with self._uow_factory() as uow:
             # Not get_current: a synthesis retry stales every prior synthesis

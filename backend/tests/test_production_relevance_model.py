@@ -67,6 +67,7 @@ from cti_app.domain.production_synthesis import (
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
     ProductionSynthesisV1,
+    extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication import ArtifactType
 from tests.test_production_relevance_domain import (
@@ -688,14 +689,21 @@ def test_reserve_and_contradiction_context_is_handle_addressed_and_leak_guard_cl
     assert synthesis_pack.reserve_evidence
     assert synthesis_pack.source_pair_relations[0]["relation"] == "contradiction"
     assert "NON-AUTHORITATIVE CONTEXT" in synthesis_request.text
+    reserve_handles = tuple(str(item["handle"]) for item in synthesis_pack.reserve_evidence)
+    assert reserve_handles
+    assert all(f"@@EVIDENCE {handle}@@" in synthesis_request.text for handle in reserve_handles)
+    assert "R handles are citeable" in synthesis_request.text
+    assert "only for passages" in synthesis_request.text
     assert all(str(source_id) not in synthesis_request.text for source_id in source_ids)
     assert "reserves_and_contradictions_non_authoritative" in enrichment_request.text
     assert all(str(source_id) not in enrichment_request.text for source_id in source_ids)
     assert enrichment_pack.reserve_evidence
     assert synthesis_evidence_pack_hash(synthesis_pack) != ""
     assert editorial_enrichment_evidence_pack_hash(enrichment_pack) != ""
-    with pytest.raises(ValueError, match="synthesis_unknown_evidence"):
-        synthesis_pack.resolve_handle(str(synthesis_pack.reserve_evidence[0]["handle"]))
+    assert all(
+        synthesis_pack.resolve_handle(handle) in set(extraction_evidence_refs_v1(extraction))
+        for handle in reserve_handles
+    )
 
 
 def test_model_relevance_context_and_projection_are_subject_specific_for_shared_capture() -> None:

@@ -148,18 +148,10 @@ def _project_synthesis_publication(
         )
         for entry in synthesis.timeline
     )
-    uncertainties = tuple(
-        PublicationUncertaintyV1(
-            text=uncertainty.text,
-            source_document_ids=uncertainty.source_document_ids,
-        )
-        for uncertainty in synthesis.uncertainties
-    )
-    used_source_document_ids.update(
-        source_document_id
-        for uncertainty in uncertainties
-        for source_document_id in uncertainty.source_document_ids
-    )
+    # Projected uncertainties inform the synthesis conclusion and review
+    # diagnostics; publishing their source list separately would duplicate the
+    # analysis instead of presenting it in prose.
+    uncertainties: tuple[PublicationUncertaintyV1, ...] = ()
     return _PublicationNarrativeProjection(
         lead=lead,
         sections=sections,

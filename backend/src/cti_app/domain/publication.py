@@ -181,8 +181,8 @@ class PublicationSectionV1:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, PublicationSectionKind):
             raise ValueError("Publication section kind is invalid")
-        if not isinstance(self.heading, str) or not self.heading.strip():
-            raise ValueError("Publication section heading must be non-empty text")
+        if not isinstance(self.heading, str):
+            raise ValueError("Publication section heading must be text")
         if not isinstance(self.paragraphs, tuple) or not self.paragraphs:
             raise ValueError("Publication section paragraphs must be a non-empty tuple")
         if any(not isinstance(paragraph, PublicationParagraphV1) for paragraph in self.paragraphs):

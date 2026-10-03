@@ -300,6 +300,20 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
 
 
+def test_empty_internal_section_heading_is_not_rendered(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    document = _full_document()
+    document = replace(
+        document,
+        sections=(replace(document.sections[0], heading=""),),
+    )
+
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+
+    assert {"type": "paragraph", "text": "Section body"} in data["body_blocks"]
+    assert all(block["type"] != "section_heading" for block in data["body_blocks"])
+
+
 def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Path) -> None:
     renderer, bundle = _renderer(tmp_path)
     placement_specs = (

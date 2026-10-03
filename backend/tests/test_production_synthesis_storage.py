@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from typing import Any, cast
 from uuid import UUID, uuid4
 
@@ -192,6 +193,11 @@ async def test_canonical_storage_preview_metadata_versions_and_stale():
     uow, store = MemoryUow(), MemoryStore()
     run_id, subject_id, model_run_id = uuid4(), uuid4(), uuid4()
     synthesis, extraction = canonical_pair(subject_id)
+    synthesis = replace(synthesis, warnings=("Dropped an unresolved timeline event.",))
+    diagnostics = {
+        "warnings": ["Dropped an unresolved timeline event."],
+        "missing_coverage": ["No execution-chain detail was extracted."],
+    }
     service = SynthesisService(uow_factory(uow), store)
     for version in (1, 2):
         artifact = await service.store_synthesis_result(
@@ -204,6 +210,7 @@ async def test_canonical_storage_preview_metadata_versions_and_stale():
             model_run_id=model_run_id,
             mode=SynthesisMode.FRESH,
             model_policy_version="model-v1",
+            diagnostics=diagnostics,
         )
         assert artifact.version == version
         assert artifact.canonical_blob_id is not None
@@ -214,6 +221,10 @@ async def test_canonical_storage_preview_metadata_versions_and_stale():
         assert store.blobs[artifact.rendered_blob_id].decode() == render_synthesis_markdown(
             synthesis, extraction
         )
+        rendered = store.blobs[artifact.rendered_blob_id].decode()
+        assert "Dropped an unresolved timeline event." not in rendered
+        assert "Technical" not in rendered
+        assert artifact.metadata["diagnostics"] == diagnostics
         assert artifact.metadata["paragraph_count"] == 2
         assert artifact.metadata["evidence_ref_count"] == 1
         assert artifact.metadata["model_policy_version"] == "model-v1"

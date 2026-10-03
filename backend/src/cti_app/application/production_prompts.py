@@ -16,9 +16,103 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v3-reserve-context"
-SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v1"
-SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v1"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v4-editorial-prose"
+SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v2-headingless"
+SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v2-headingless-diagnostics"
+
+SYNTHESIS_EDITORIAL_CONTRACT_V4 = """EDITORIAL CONTRACT
+
+Write dense, coherent CTI prose in the publication language. For French
+publications, write in French except for source names, quotations and exact
+technical literals. Preserve names, commands, paths, keys, fields, ports and
+formats exactly as documented. Explain what each mechanism does and how the
+steps connect; do not replace documented detail with generic phrases. Use only
+the supplied evidence blocks; add no facts, dates, identifiers, causal links,
+or source details from memory or outside research.
+
+Return the lead first. It is the first synthesis paragraph and must not repeat
+the article title or add a second introduction. Continue the narrative in this
+progression, combining related observations into substantial paragraphs:
+1. context and carefully qualified attribution;
+2. campaign, victimology, and infection/execution chain;
+3. TTPs and distinctive mechanisms, including persistence, privilege,
+   evasion, and anti-analysis when documented;
+4. tools and components;
+5. C2 protocol, communication structure, and infrastructure when documented;
+6. final paragraphs with confidence limits and CTI analyst observations in
+   prose, stating the confidence level and its basis where supported, informed
+   by the projected, ranked uncertainty observations below.
+
+Do not write section titles, subtitles, lists of uncertainties, or filler.
+Section kinds are internal placement anchors only. A paragraph may cite several
+evidence handles when they all support its full account. Keep lineage fine
+grained: cite every supporting handle and no unrelated handle. State the
+epistemic status explicitly in the prose: distinguish a vendor observation,
+an adverse claim, independent corroboration, a hypothesis, and an analytical
+inference. A reserve that qualifies attribution or causality must qualify the
+same passage it concerns, not only the conclusion.
+
+Use reserve and source-pair context to qualify claims. R handles are citeable
+only for passages that state the relevant qualification or contradiction; do
+not present reserved material as an unqualified established fact. When
+composing a cross-source account, cite each handle that supports the combined
+paragraph and state what each source does and does not establish.
+
+For every detection pivot, explain the concrete observable, the telemetry
+needed to see it, its link to the described mechanism, and its limits. Never
+present an invented rule as a published rule. Do not turn a technical value
+into an IOC attribution unless the evidence supports that relation. If the
+pack lacks detail on a theme, do not invent it or pad the prose; report the
+coverage gap only in the optional diagnostics block.
+
+Do not duplicate recommendations or add vague defensive advice. Do not repeat
+the reference timeline merely to restate it. Mention dates in the synthesis
+only when they explain technical evolution, scope, attribution, or a material
+analytical limit. Preserve the source's exact date precision.
+
+Neutral precision examples (generic placeholders only; never reuse their facts
+or handles in the subject's synthesis):
+
+@@CLAIM EXAMPLE-1@@
+EVIDENCE: HANDLE_A, HANDLE_B
+TEXT: L'éditeur A observe `outil-exemple.exe` lancé avec `/mode-exemple` ; la
+source B confirme le processus, sans documenter cet argument.
+
+@@CLAIM EXAMPLE-2@@
+EVIDENCE: HANDLE_C, RESERVE_A
+TEXT: L'éditeur A attribue l'activité à un opérateur ; la réserve RESERVE_A ne relie
+pas l'observation indépendante au même événement, donc cette attribution reste
+hypothétique.
+
+@@CLAIM EXAMPLE-3@@
+EVIDENCE: HANDLE_D
+TEXT: La création de `cle-exemple` par `outil-exemple.exe` constitue un pivot
+si la télémétrie conserve le nom du processus et l'opération registre ; ce
+signal établit le comportement observé, pas l'identité de l'opérateur.
+
+OUTPUT FORMAT
+Use only the text-block wire format below. Do not return JSON. Do not write any
+text outside these blocks. Do not emit a HEADING field. Sections are optional;
+their kind is only a stable internal placement anchor.
+
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: E001, E002
+TEXT: one plain-text synthesis paragraph in the publication language
+
+@@SECTION technical S001@@
+@@CLAIM C001@@
+EVIDENCE: E003
+TEXT: one plain-text synthesis paragraph in the publication language
+@@END SECTION@@
+
+An optional diagnostic block may appear after all synthesis blocks. Use it
+only for concrete missing-coverage observations, never for publication prose:
+
+@@DIAGNOSTICS@@
+MISSING COVERAGE: <theme absent from the supplied evidence>
+@@END DIAGNOSTICS@@
+"""
 EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v4-reserve-context"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = "editorial-enrichment-block-contract-v1"
 EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v1"

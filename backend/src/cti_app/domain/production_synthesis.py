@@ -105,7 +105,8 @@ class SynthesisSectionV1:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, SynthesisSectionKind):
             raise ValueError("Synthesis section kind is invalid")
-        _require_semantic_text(self.heading, "Synthesis section heading")
+        if not isinstance(self.heading, str):
+            raise ValueError("Synthesis section heading must be text")
         if not isinstance(self.paragraphs, tuple) or not self.paragraphs:
             raise ValueError("Synthesis section paragraphs must be a non-empty tuple")
         if any(not isinstance(paragraph, SynthesisParagraphV1) for paragraph in self.paragraphs):
@@ -658,7 +659,7 @@ def _section_from_json(raw: Any) -> SynthesisSectionV1:
     )
     return SynthesisSectionV1(
         kind=kind,
-        heading=_text(payload["heading"], "Section heading", semantic=True),
+        heading=_text(payload["heading"], "Section heading"),
         paragraphs=paragraphs,
     )
 
