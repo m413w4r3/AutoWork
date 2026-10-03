@@ -88,7 +88,7 @@ def chp_parity_document() -> PublicationDocumentV4:
         sections=(
             replace(
                 document.sections[0],
-                heading="Technical analysis",
+                heading="synthesis_internal_heading",
                 paragraphs=(
                     replace(
                         document.sections[0].paragraphs[0],
@@ -100,7 +100,11 @@ def chp_parity_document() -> PublicationDocumentV4:
         uncertainties=(
             replace(
                 document.uncertainties[0],
-                text="Attribution remains unresolved in this fixture.",
+                text="extraction_source_skipped:fixture",
+            ),
+            replace(
+                document.uncertainties[0],
+                text="synthesis_output_invalid:fixture",
             ),
         ),
     )
@@ -302,10 +306,14 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
 
     expected_text = (
         "CHP visual parity fixture",
+        "RÉFÉRENCES",
         "Chronologie",
         "No display date",
         "One source event",
         "Several source event",
+        "Sources complémentaires",
+        "Primary source",
+        "SYNTHÈSE",
         "Synthesis lead paragraph for parity coverage.",
         "A second lead paragraph.",
         "Observed command table",
@@ -313,7 +321,6 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Purpose",
         "-enc",
         "Execution",
-        "Technical analysis",
         "Section paragraph describing the observed activity.",
         "Diagram asset title",
         "Diagram asset caption.",
@@ -324,15 +331,16 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Display url",
         "Display email",
         "Display hash",
-        "Incertitudes et limites",
-        "Attribution remains unresolved in this fixture.",
-        "Sources",
-        "Primary source",
+        "ANNEXE TECHNIQUE — INDICATEURS",
         "Example Lab",
         "Duplicate URL source",
     )
     for expected in expected_text:
         assert expected in text
+    assert "synthesis_internal_heading" not in text
+    assert "extraction_source_skipped" not in text
+    assert "synthesis_output_invalid" not in text
+    assert "Attribution remains unresolved" not in text
 
     for url in (
         "https://example.test/one",
@@ -342,20 +350,23 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert "2025-01-02" in text
     ordered_markers = (
         "CHP visual parity fixture",
+        "RÉFÉRENCES",
         "Chronologie",
         "No display date",
+        "Sources complémentaires",
+        "SYNTHÈSE",
         "Synthesis lead paragraph for parity coverage.",
         "Observed command table",
-        "Technical analysis",
         "Diagram asset title",
         "Source figure caption.",
+        "ANNEXE TECHNIQUE — INDICATEURS",
         "Display ip",
-        "Attribution remains unresolved in this fixture.",
-        "Sources",
-        "Primary source",
     )
     marker_positions = tuple(text.index(marker) for marker in ordered_markers)
     assert marker_positions == tuple(sorted(marker_positions))
+    assert text.count("Primary source") == 1
+    assert text.count("Synthesis lead paragraph for parity coverage.") == 1
+    assert text.count("A second lead paragraph.") == 1
 
     assert {media_ref.expected_mime_type for media_ref in render_source.media_refs} == {
         "image/svg+xml",

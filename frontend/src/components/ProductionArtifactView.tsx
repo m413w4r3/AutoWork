@@ -1043,37 +1043,90 @@ export function PublicationDocumentView({
       {provenance(item.evidence_refs.map((ref) => ref.source_document_id))}
     </p>
   );
+  const enrichmentsAt = (kind: string, sectionIndex: number | null) => (
+    <>
+      <PublicationTablesView
+        tables={document.tables.filter(
+          (item) =>
+            item.placement.kind === kind &&
+            item.placement.section_index === sectionIndex,
+        )}
+      />
+      <PublicationDiagramsView
+        diagrams={document.diagrams.filter(
+          (item) =>
+            item.placement.kind === kind &&
+            item.placement.section_index === sectionIndex,
+        )}
+      />
+      <PublicationFiguresView
+        figures={document.figures.filter(
+          (item) =>
+            item.placement.kind === kind &&
+            item.placement.section_index === sectionIndex,
+        )}
+      />
+    </>
+  );
   return (
     <article className="publication-preview">
       <h3>{document.title}</h3>
-      {document.lead.map((item, index) => paragraph(item, `lead-${index}`))}
-      {document.sections.map((section, index) => (
-        <section key={`${section.kind}-${index}`}>
-          {section.heading.trim() ? <h4>{section.heading}</h4> : null}
-          {section.paragraphs.map((item, paragraphIndex) =>
-            paragraph(item, `${index}-${paragraphIndex}`),
-          )}
-        </section>
-      ))}
-      {document.timeline.length > 0 && (
-        <section>
-          <h4>Chronologie</h4>
-          {document.timeline.map((item, index) => (
-            <p key={index}>
-              {item.event_date || item.date_text ? (
-                <strong>{item.date_text || item.event_date} : </strong>
-              ) : null}
-              {item.text}
-              {provenance(
-                item.evidence_refs.map((ref) => ref.source_document_id),
-              )}
-            </p>
-          ))}
-        </section>
-      )}
+      <section aria-label="RÉFÉRENCES">
+        <h4>RÉFÉRENCES</h4>
+        {document.timeline.length > 0 ? (
+          <div>
+            <h5>Chronologie</h5>
+            {document.timeline.map((item, index) => (
+              <p key={`timeline-${index}`}>
+                {item.event_date || item.date_text ? (
+                  <strong>{item.date_text || item.event_date} : </strong>
+                ) : null}
+                {item.text}
+                {provenance(
+                  item.evidence_refs.map((ref) => ref.source_document_id),
+                )}
+              </p>
+            ))}
+          </div>
+        ) : null}
+        {enrichmentsAt("after_timeline", null)}
+        {document.sources.length > 0 ? (
+          <section>
+            <h5>Sources complémentaires</h5>
+            <ul>
+              {document.sources.map((source) => (
+                <li key={source.source_document_id}>
+                  <a
+                    href={source.canonical_url}
+                    rel="noreferrer"
+                    target="_blank"
+                  >
+                    {source.title || source.canonical_url}
+                  </a>
+                  {source.publisher ? ` — ${source.publisher}` : ""}
+                </li>
+              ))}
+            </ul>
+          </section>
+        ) : null}
+      </section>
+      <section aria-label="SYNTHÈSE">
+        <h4>SYNTHÈSE</h4>
+        {document.lead.map((item, index) => paragraph(item, `lead-${index}`))}
+        {enrichmentsAt("after_lead", null)}
+        {document.sections.map((section, index) => (
+          <div key={`${section.kind}-${index}`}>
+            {section.paragraphs.map((item, paragraphIndex) =>
+              paragraph(item, `${index}-${paragraphIndex}`),
+            )}
+            {enrichmentsAt("after_section", index)}
+          </div>
+        ))}
+        {enrichmentsAt("end", null)}
+      </section>
       {document.indicators.length > 0 && (
-        <section>
-          <h4>IOC</h4>
+        <section aria-label="ANNEXE TECHNIQUE — INDICATEURS">
+          <h4>ANNEXE TECHNIQUE — INDICATEURS</h4>
           {document.indicators.map((group) => (
             <div key={group.artifact_type}>
               <h5>{IOC_LABELS[group.artifact_type] || group.artifact_type}</h5>
@@ -1089,36 +1142,28 @@ export function PublicationDocumentView({
           ))}
         </section>
       )}
-      {document.sources.length > 0 && (
-        <section>
-          <h4>Sources</h4>
-          <ul>
-            {document.sources.map((source) => (
-              <li key={source.source_document_id}>
-                <a href={source.canonical_url} rel="noreferrer" target="_blank">
-                  {source.title || source.canonical_url}
-                </a>
-                {source.publisher ? ` — ${source.publisher}` : ""}
-              </li>
-            ))}
-          </ul>
-        </section>
-      )}
-      {document.uncertainties.length > 0 && (
-        <section>
-          <h4>Incertitudes</h4>
-          {document.uncertainties.map((item, index) => (
-            <p key={index}>
-              {item.text}
-              {provenance(item.source_document_ids)}
-            </p>
-          ))}
-        </section>
-      )}
-      <PublicationTablesView tables={document.tables} />
-      <PublicationDiagramsView diagrams={document.diagrams} />
-      <PublicationFiguresView figures={document.figures} />
     </article>
+  );
+}
+
+function PublicationDiagnosticsPanel({
+  diagnostics,
+}: {
+  diagnostics: unknown;
+}) {
+  const serialized = JSON.stringify(diagnostics ?? {}, null, 2);
+  return (
+    <section
+      className="publication-diagnostics"
+      aria-label="Diagnostics de publication"
+    >
+      <h3>Diagnostics techniques</h3>
+      {serialized === "{}" ? (
+        <p>Aucun diagnostic technique.</p>
+      ) : (
+        <pre>{serialized}</pre>
+      )}
+    </section>
   );
 }
 
@@ -1348,7 +1393,12 @@ export function ProductionArtifactView({
 
       {stage === "publication" &&
         isPublicationDocument(artifact.canonical_content) && (
-          <PublicationDocumentView document={artifact.canonical_content} />
+          <>
+            <PublicationDiagnosticsPanel
+              diagnostics={artifact.metadata.diagnostics}
+            />
+            <PublicationDocumentView document={artifact.canonical_content} />
+          </>
         )}
 
       {stage === "extraction" &&

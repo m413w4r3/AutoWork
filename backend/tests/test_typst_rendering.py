@@ -216,18 +216,12 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v1"
-    assert data["timeline"] == []
-    assert data["body_blocks"] == [{"type": "paragraph", "text": "Initial assessment"}]
-    assert data["indicators"] == {
-        "ips": [],
-        "domains": [],
-        "urls": [],
-        "emails": [],
-        "hashes": [],
-    }
-    assert data["uncertainties"] == []
-    assert data["sources"] == [
+    assert data["schema_version"] == "typst-publication-model-v2"
+    references, synthesis = data["content_sections"]
+    assert references["type"] == "references"
+    assert references["timeline"] == []
+    assert references["blocks"] == []
+    assert references["sources"] == [
         {
             "title": "Source article",
             "publisher": "Example",
@@ -235,6 +229,10 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
             "url": "https://example.test/1",
         }
     ]
+    assert synthesis == {
+        "type": "synthesis",
+        "blocks": [{"type": "paragraph", "text": "Initial assessment"}],
+    }
 
 
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
@@ -246,7 +244,9 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
 
     assert data["language"] == "fr"
     assert data["title"] == "Intrusion report"
-    assert data["timeline"] == [
+    references, synthesis, technical_annex = data["content_sections"]
+    assert references["type"] == "references"
+    assert references["timeline"] == [
         {
             "display_date": "",
             "text": "No display date",
@@ -263,15 +263,16 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
             "source_urls": ["https://example.test/one", "https://example.test/two"],
         },
     ]
-    assert data["indicators"] == {
+    assert technical_annex["type"] == "technical_annex"
+    assert technical_annex["indicators"] == {
         "ips": ["Display ip"],
         "domains": ["Display domain"],
         "urls": ["Display url"],
         "emails": ["Display email"],
         "hashes": ["Display hash"],
     }
-    assert data["uncertainties"] == ["Attribution remains uncertain"]
-    assert data["sources"] == [
+    assert "uncertainties" not in data
+    assert references["sources"] == [
         {
             "title": "Primary source",
             "publisher": "Example Lab",
@@ -291,27 +292,69 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
             "url": "https://example.test/one",
         },
     ]
-    assert data["body_blocks"][:2] == [
+    assert synthesis["blocks"][:2] == [
         {"type": "paragraph", "text": _INJECTION_TEXT},
         {"type": "paragraph", "text": "Second lead paragraph"},
     ]
-    assert data["body_blocks"][2] == {"type": "section_heading", "text": _INJECTION_TEXT}
-    assert data["body_blocks"][3] == {"type": "paragraph", "text": "Section body"}
+    assert synthesis["blocks"][2] == {"type": "paragraph", "text": "Section body"}
+    assert all(
+        block["type"] != "section_heading"
+        for section in data["content_sections"]
+        for block in section.get("blocks", [])
+    )
     assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
 
 
-def test_empty_internal_section_heading_is_not_rendered(tmp_path: Path) -> None:
+def test_internal_section_heading_is_not_projected(tmp_path: Path) -> None:
     renderer, bundle = _renderer(tmp_path)
     document = _full_document()
     document = replace(
         document,
-        sections=(replace(document.sections[0], heading=""),),
+        sections=(replace(document.sections[0], heading="Internal title"),),
     )
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
 
-    assert {"type": "paragraph", "text": "Section body"} in data["body_blocks"]
-    assert all(block["type"] != "section_heading" for block in data["body_blocks"])
+    synthesis = data["content_sections"][1]
+    assert {"type": "paragraph", "text": "Section body"} in synthesis["blocks"]
+    assert all(block["type"] != "section_heading" for block in synthesis["blocks"])
+
+
+def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    document = _full_document()
+    document = replace(
+        document,
+        lead=(replace(document.lead[0], text="Opening assessment."), document.lead[1]),
+        sections=(
+            replace(
+                document.sections[0],
+                paragraphs=(
+                    replace(
+                        document.sections[0].paragraphs[0],
+                        text="  OPENING   ASSESSMENT.  ",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    references, synthesis, _annex = data["content_sections"]
+    paragraphs = [block["text"] for block in synthesis["blocks"] if block["type"] == "paragraph"]
+
+    assert [section["type"] for section in data["content_sections"]] == [
+        "references",
+        "synthesis",
+        "technical_annex",
+    ]
+    assert paragraphs[0] == "Opening assessment."
+    assert (
+        sum(" ".join(text.casefold().split()) == "opening assessment." for text in paragraphs) == 1
+    )
+    assert references["type"] == "references"
 
 
 def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Path) -> None:
@@ -351,7 +394,8 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     )
     document = _full_document(tables=tables, diagrams=diagrams, figures=figures)
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
-    blocks = data["body_blocks"]
+    reference_blocks = data["content_sections"][0]["blocks"]
+    blocks = data["content_sections"][1]["blocks"]
 
     expected_by_placement = {
         name: [
@@ -361,10 +405,9 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
         ]
         for name, _, _ in placement_specs
     }
-    observed_after_timeline = [block["key"] for block in blocks[:6]]
-    lead_start = 6
-    observed_after_lead = [block["key"] for block in blocks[lead_start + 2 : lead_start + 8]]
-    section_rich_start = lead_start + 8 + 2
+    observed_after_timeline = [block["key"] for block in reference_blocks]
+    observed_after_lead = [block["key"] for block in blocks[2:8]]
+    section_rich_start = 9
     observed_after_section = [
         block["key"] for block in blocks[section_rich_start : section_rich_start + 6]
     ]
@@ -374,7 +417,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     assert observed_after_lead == expected_by_placement["after_lead"]
     assert observed_after_section == expected_by_placement["after_section"]
     assert observed_end == expected_by_placement["end"]
-    assert [block["type"] for block in blocks[:6]] == [
+    assert [block["type"] for block in reference_blocks] == [
         "table",
         "table",
         "diagram",
@@ -383,7 +426,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
         "figure",
     ]
     caption_block = next(
-        block for block in blocks if block.get("key") == "table_after_timeline_z_first"
+        block for block in reference_blocks if block.get("key") == "table_after_timeline_z_first"
     )
     assert caption_block["caption"] == _INJECTION_TEXT
     assert caption_block["columns"] == ["Command", "Purpose"]
@@ -430,7 +473,9 @@ def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
     document = _full_document(figures=(first, second))
     rendered = renderer.render(document, bundle)
     data = json.loads(rendered.render_data_bytes)
-    figure_blocks = [block for block in data["body_blocks"] if block["type"] == "figure"]
+    figure_blocks = [
+        block for block in data["content_sections"][1]["blocks"] if block["type"] == "figure"
+    ]
 
     assert len(rendered.media_refs) == 1
     assert rendered.media_refs[0].asset_id == shared_asset_id

@@ -26,7 +26,7 @@ from cti_app.domain.publication_document import (
     PublicationTableV1,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v1"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v2"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _MEDIA_EXTENSIONS = {
     "image/svg+xml": ".svg",
@@ -66,13 +66,9 @@ class TypstRenderSource:
 
 
 @dataclass(frozen=True, slots=True)
-class TypstPublicationModelV1:
+class TypstPublicationModelV2:
     title: str
-    timeline: list[dict[str, Any]]
-    body_blocks: list[dict[str, Any]]
-    indicators: dict[str, list[str]]
-    uncertainties: list[str]
-    sources: list[dict[str, Any]]
+    content_sections: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
 
 
@@ -114,11 +110,7 @@ class TypstRenderer:
             "schema_version": _RENDER_DATA_SCHEMA_VERSION,
             "language": document.publication_language,
             "title": model.title,
-            "timeline": model.timeline,
-            "body_blocks": model.body_blocks,
-            "indicators": model.indicators,
-            "uncertainties": model.uncertainties,
-            "sources": model.sources,
+            "content_sections": model.content_sections,
         }
         render_data_bytes = json.dumps(
             render_data,
@@ -137,7 +129,7 @@ class TypstRenderer:
 
 def project_publication_to_typst_model(
     document: PublicationDocumentV4,
-) -> TypstPublicationModelV1:
+) -> TypstPublicationModelV2:
     """Project one canonical V4 publication into shared Typst article data."""
     media_refs_by_id: dict[UUID, TypstMediaRef] = {}
     rich_by_placement: dict[tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]] = {}
@@ -199,15 +191,18 @@ def project_publication_to_typst_model(
             _figure_block(figure, media_ref),
         )
 
+    reference_blocks = list(
+        rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
+    )
     body_blocks: list[dict[str, Any]] = []
-    body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ()))
     body_blocks.extend({"type": "paragraph", "text": item.text} for item in document.lead)
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
+    lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
     for section_index, section in enumerate(document.sections):
-        if section.heading.strip():
-            body_blocks.append({"type": "section_heading", "text": section.heading})
         body_blocks.extend(
-            {"type": "paragraph", "text": paragraph.text} for paragraph in section.paragraphs
+            {"type": "paragraph", "text": paragraph.text}
+            for paragraph in section.paragraphs
+            if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         )
         body_blocks.extend(
             rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
@@ -223,6 +218,15 @@ def project_publication_to_typst_model(
         }
         for entry in document.timeline
     ]
+    sources = [
+        {
+            "title": source.title,
+            "publisher": source.publisher,
+            "date": source.published_at.isoformat() if source.published_at is not None else None,
+            "url": source.canonical_url,
+        }
+        for source in document.sources
+    ]
 
     indicators: dict[str, list[str]] = {
         key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
@@ -230,23 +234,21 @@ def project_publication_to_typst_model(
     for group in document.indicators:
         indicators[_INDICATOR_KEYS[group.artifact_type]] = [item.value for item in group.indicators]
 
-    return TypstPublicationModelV1(
+    content_sections: list[dict[str, Any]] = [
+        {
+            "type": "references",
+            "timeline": timeline,
+            "blocks": reference_blocks,
+            "sources": sources,
+        },
+        {"type": "synthesis", "blocks": body_blocks},
+    ]
+    if any(indicators.values()):
+        content_sections.append({"type": "technical_annex", "indicators": indicators})
+
+    return TypstPublicationModelV2(
         title=document.title,
-        timeline=timeline,
-        body_blocks=body_blocks,
-        indicators=indicators,
-        uncertainties=[item.text for item in document.uncertainties],
-        sources=[
-            {
-                "title": source.title,
-                "publisher": source.publisher,
-                "date": source.published_at.isoformat()
-                if source.published_at is not None
-                else None,
-                "url": source.canonical_url,
-            }
-            for source in document.sources
-        ],
+        content_sections=content_sections,
         media_refs=tuple(media_refs_by_id.values()),
     )
 

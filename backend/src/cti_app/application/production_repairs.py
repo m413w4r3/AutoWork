@@ -4235,6 +4235,16 @@ class ProductionRepairMaterializationService:
                     "editorial_enrichment_artifact_id": str(editorial_enrichment_artifact.id),
                 }
             }
+            metadata["diagnostics"] = {
+                stage_name: artifact.metadata.get("diagnostics", {})
+                for stage_name, artifact in (
+                    ("references", references_artifact),
+                    ("extraction", extraction),
+                    ("relevance_projection", relevance_projection_artifact),
+                    ("synthesis", synthesis_artifact),
+                    ("editorial_enrichment", editorial_enrichment_artifact),
+                )
+            }
             if repair_materialization is not None:
                 metadata["repair_materialization"] = dict(repair_materialization)
             new_publication = await CanonicalAssemblyService(

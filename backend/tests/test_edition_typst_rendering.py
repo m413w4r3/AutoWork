@@ -121,7 +121,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v1"
+    assert data["schema_version"] == "typst-edition-model-v2"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "France",
@@ -168,26 +168,29 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     source, data = _render_data(tmp_path, edition)
     publication = data["publications"][0]
     projected = project_publication_to_typst_model(document)
-    body_types = [block["type"] for block in publication["body_blocks"]]
+    references, synthesis, technical_annex = publication["content_sections"]
+    body_types = [block["type"] for block in synthesis["blocks"]]
 
     assert publication["title"] == "Intrusion report"
-    assert publication["timeline"][0]["text"] == "No display date"
-    assert publication["body_blocks"][0]["text"] == _INJECTION_TEXT
-    assert "section_heading" in body_types
+    assert references["timeline"][0]["text"] == "No display date"
+    assert synthesis["blocks"][0]["text"] == _INJECTION_TEXT
+    assert "section_heading" not in body_types
     assert "table" in body_types
     assert "diagram" in body_types
     assert "figure" in body_types
-    assert publication["indicators"]["ips"] == ["Display ip"]
-    assert publication["uncertainties"] == ["Attribution remains uncertain"]
-    assert publication["sources"][0]["url"] == "https://example.test/one"
+    assert technical_annex["indicators"]["ips"] == ["Display ip"]
+    assert "uncertainties" not in publication
+    assert references["sources"][0]["url"] == "https://example.test/one"
     assert len(source.media_refs) == 2
-    assert json.loads(source.render_data_bytes)["publications"][0]["body_blocks"][0]["text"] == (
-        _INJECTION_TEXT
+    assert (
+        json.loads(source.render_data_bytes)["publications"][0]["content_sections"][1]["blocks"][0][
+            "text"
+        ]
+        == _INJECTION_TEXT
     )
     assert source.source_bytes == b'#let edition = json("edition-render-data.json")\n'
     assert source.source_bytes != _INJECTION_TEXT.encode()
-    assert publication["body_blocks"] == projected.body_blocks
-    assert publication["timeline"] == projected.timeline
+    assert publication["content_sections"] == projected.content_sections
 
 
 def test_shared_and_distinct_media_are_deduplicated_in_first_use_order(
@@ -424,11 +427,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
     render_data = json.loads(rendered.render_data_bytes)
 
     assert model.title == render_data["title"]
-    assert model.timeline == render_data["timeline"]
-    assert model.body_blocks == render_data["body_blocks"]
-    assert model.indicators == render_data["indicators"]
-    assert model.uncertainties == render_data["uncertainties"]
-    assert model.sources == render_data["sources"]
+    assert model.content_sections == render_data["content_sections"]
     assert model.media_refs == rendered.media_refs
 
 

@@ -7,8 +7,8 @@
   if url in result { result } else { result + (url,) }
 })
 
-#let publication-timeline-events(publication) = {
-  publication.timeline.map(event => (
+#let publication-timeline-events(events) = {
+  events.map(event => (
     event.display_date,
     event.text,
     unique-urls(event.source_urls),
@@ -16,8 +16,7 @@
 }
 
 #let render-publication-timeline(events) = {
-  section-title[Chronologie]
-  timeline(events)
+  timeline(publication-timeline-events(events))
 }
 
 #let render-table(item) = {
@@ -68,8 +67,6 @@
 #let render-body-block(item) = {
   if item.type == "paragraph" {
     [#item.text #parbreak()]
-  } else if item.type == "section_heading" {
-    section-title(item.text)
   } else if item.type == "table" {
     render-table(item)
   } else if item.type == "diagram" {
@@ -82,36 +79,42 @@
 }
 
 #let render-publication-body(publication) = {
-  for item in publication.body_blocks {
-    render-body-block(item)
-  }
-
-  ioc-list(
-    title: [Indicateurs],
-    ips: publication.indicators.ips,
-    domains: publication.indicators.domains,
-    urls: publication.indicators.urls,
-    emails: publication.indicators.emails,
-    hashes: publication.indicators.hashes,
-  )
-
-  if publication.uncertainties.len() > 0 [
-    #section-title[Incertitudes et limites]
-    #for uncertainty in publication.uncertainties {
-      [#uncertainty #parbreak()]
+  for content_section in publication.content_sections {
+    if content_section.type == "references" [
+      #section-title[RÉFÉRENCES]
+      #if content_section.timeline.len() > 0 [
+        #section-title[Chronologie]
+        #render-publication-timeline(content_section.timeline)
+      ]
+      #for item in content_section.blocks {
+        render-body-block(item)
+      }
+      #if content_section.sources.len() > 0 [
+        #section-title[Sources complémentaires]
+        #source-list(content_section.sources)
+      ]
+    ] else if content_section.type == "synthesis" [
+      #section-title[SYNTHÈSE]
+      #for item in content_section.blocks {
+        render-body-block(item)
+      }
+    ] else if content_section.type == "technical_annex" [
+      #section-title[ANNEXE TECHNIQUE — INDICATEURS]
+      #ioc-list(
+        title: [Indicateurs],
+        ips: content_section.indicators.ips,
+        domains: content_section.indicators.domains,
+        urls: content_section.indicators.urls,
+        emails: content_section.indicators.emails,
+        hashes: content_section.indicators.hashes,
+      )
+    ] else {
+      panic("unsupported publication content section type: " + content_section.type)
     }
-  ]
-
-  if publication.sources.len() > 0 [
-    #section-title[Sources]
-    #source-list(publication.sources)
-  ]
+  }
 }
 
 #let render-publication(publication) = {
   heading(level: 1)[#publication.title]
-
-  render-publication-timeline(publication-timeline-events(publication))
-
   render-publication-body(publication)
 }

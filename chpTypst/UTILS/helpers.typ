@@ -224,10 +224,12 @@
     ],
   )
 
-  // Chronologie
-  section-title[Chronologie]
-  timeline(events)
-  v(10pt)
+  if events != none [
+    // Chronologie
+    #section-title[Chronologie]
+    #timeline(events)
+    #v(10pt)
+  ]
 
   if overview != () [
     #block(
@@ -240,10 +242,11 @@
   ]
   
   
-  // Synthèse
-  section-title[Synthèse]
-
-  set par(spacing: 2em)
+  if events != none [
+    // Synthèse
+    #section-title[Synthèse]
+    #set par(spacing: 2em)
+  ]
   body
 }
 

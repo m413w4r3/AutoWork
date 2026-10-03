@@ -113,10 +113,13 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
         "Edition diagram",
         "Edition figure",
         "Display ip",
-        "Attribution remains uncertain",
         "Primary source",
     ):
         assert expected in text
+    # L5: the uncertainty list is no longer published inside the article body.
+    assert "Attribution remains uncertain" not in text
+    assert text.count("RÉFÉRENCES") >= 1
+    assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
     assert text.index("Alpha first article") < text.index("Zulu second article")
     assert "France — 2026-08-01 / 2026-08-31" in text
     page_count = len(reader.pages)

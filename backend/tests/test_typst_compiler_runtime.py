@@ -68,74 +68,76 @@ def typst_binary() -> str:
 
 def _runtime_render_data() -> dict[str, Any]:
     return {
-        "schema_version": "typst-publication-model-v1",
+        "schema_version": "typst-publication-model-v2",
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
-        "timeline": [
+        "content_sections": [
             {
-                "display_date": "2026-09-30",
-                "text": "First observed event in the fixture timeline.",
-                "source_urls": ["https://example.test/timeline"],
+                "type": "references",
+                "timeline": [
+                    {
+                        "display_date": "2026-09-30",
+                        "text": "First observed event in the fixture timeline.",
+                        "source_urls": ["https://example.test/timeline"],
+                    },
+                    {
+                        "display_date": "2026-10-01",
+                        "text": "A second timeline event.",
+                        "source_urls": [],
+                    },
+                ],
+                "blocks": [],
+                "sources": [
+                    {
+                        "title": "Example runtime source",
+                        "publisher": "AutoWork fixture",
+                        "date": "2026-10-01",
+                        "url": "https://example.test/source",
+                    }
+                ],
             },
             {
-                "display_date": "2026-10-01",
-                "text": "A second timeline event.",
-                "source_urls": [],
+                "type": "synthesis",
+                "blocks": [
+                    {"type": "paragraph", "text": "This paragraph exercises the publication lead."},
+                    {
+                        "type": "table",
+                        "key": "lead-table",
+                        "title": "Table after the lead",
+                        "caption": "A compact local table.",
+                        "columns": ["Indicator", "Value"],
+                        "rows": [["IP", "192.0.2.10"], ["Domain", "example.test"]],
+                    },
+                    {"type": "paragraph", "text": "First section content."},
+                    {
+                        "type": "figure",
+                        "key": "runtime-figure",
+                        "caption": "Vendored CHP image used as a figure.",
+                        "provenance": "AW-019 runtime fixture",
+                        "locator": "page 1, figure A",
+                        "media_path": "media/figure.png",
+                    },
+                    {"type": "paragraph", "text": "Second section content."},
+                    {
+                        "type": "table",
+                        "key": "end-table",
+                        "title": "End placement table",
+                        "caption": "A rich block after the final section.",
+                        "columns": ["Check", "Result"],
+                        "rows": [["PDF", "valid"]],
+                    },
+                ],
             },
-        ],
-        "body_blocks": [
             {
-                "type": "diagram",
-                "key": "runtime-diagram",
-                "title": "Local SVG diagram",
-                "caption": "Diagram fixture caption.",
-                "media_path": "media/diagram.svg",
+                "type": "technical_annex",
+                "indicators": {
+                    "ips": ["192.0.2.10"],
+                    "domains": ["example.test"],
+                    "urls": ["https://example.test/path"],
+                    "emails": ["analyst@example.test"],
+                    "hashes": ["0123456789abcdef0123456789abcdef"],
+                },
             },
-            {"type": "paragraph", "text": "This paragraph exercises the publication lead."},
-            {
-                "type": "table",
-                "key": "lead-table",
-                "title": "Table after the lead",
-                "caption": "A compact local table.",
-                "columns": ["Indicator", "Value"],
-                "rows": [["IP", "192.0.2.10"], ["Domain", "example.test"]],
-            },
-            {"type": "section_heading", "text": "First section"},
-            {"type": "paragraph", "text": "First section content."},
-            {
-                "type": "figure",
-                "key": "runtime-figure",
-                "caption": "Vendored CHP image used as a figure.",
-                "provenance": "AW-019 runtime fixture",
-                "locator": "page 1, figure A",
-                "media_path": "media/figure.png",
-            },
-            {"type": "section_heading", "text": "Second section"},
-            {"type": "paragraph", "text": "Second section content."},
-            {
-                "type": "table",
-                "key": "end-table",
-                "title": "End placement table",
-                "caption": "A rich block after the final section.",
-                "columns": ["Check", "Result"],
-                "rows": [["PDF", "valid"]],
-            },
-        ],
-        "indicators": {
-            "ips": ["192.0.2.10"],
-            "domains": ["example.test"],
-            "urls": ["https://example.test/path"],
-            "emails": ["analyst@example.test"],
-            "hashes": ["0123456789abcdef0123456789abcdef"],
-        },
-        "uncertainties": ["The sample includes a deliberately bounded uncertainty."],
-        "sources": [
-            {
-                "title": "Example runtime source",
-                "publisher": "AutoWork fixture",
-                "date": "2026-10-01",
-                "url": "https://example.test/source",
-            }
         ],
     }
 

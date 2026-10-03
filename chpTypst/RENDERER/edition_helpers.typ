@@ -1,6 +1,6 @@
 #import "../UTILS/colors.typ": light-grey, purple
 #import "../UTILS/helpers.typ": article, article-indexing
-#import "publication_helpers.typ": publication-timeline-events, render-publication-body
+#import "publication_helpers.typ": render-publication-body
 
 #let has-text(value) = value != none and value != ""
 
@@ -54,7 +54,7 @@
       category: "Article",
       number: article-number(publication.position),
       title: publication.title,
-      events: publication-timeline-events(publication),
+      events: none,
       body: render-publication-body(publication),
     )
   }

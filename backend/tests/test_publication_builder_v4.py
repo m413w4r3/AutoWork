@@ -795,7 +795,11 @@ def test_assembly_input_hash_changes_with_each_functional_component(
         != original
     )
 
-    monkeypatch.setattr(publication_builder, "ASSEMBLY_POLICY_VERSION", "3")
+    monkeypatch.setattr(
+        publication_builder,
+        "ASSEMBLY_POLICY_VERSION",
+        "3-subject-relevance-projection",
+    )
     assert (
         compute_assembly_input_hash(
             snapshot=snapshot,
@@ -1439,7 +1443,6 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
         )
         == canonical_json
     )
-
     missing_references = replace(
         references,
         sources=tuple(
@@ -1467,3 +1470,34 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
             synthesis=missing_synthesis,
             editorial_enrichment=missing_enrichment,
         )
+
+
+def test_publication_builder_removes_internal_headings_but_keeps_section_anchors() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    synthesis = replace(
+        synthesis,
+        lead=(SynthesisParagraphV1("Lead first paragraph.", (evidence,)),),
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.TECHNICAL,
+                "Internal technical title",
+                (SynthesisParagraphV1("Technical continuation.", (evidence,)),),
+            ),
+        ),
+    )
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert len(document.sections) == 1
+    assert document.sections[0].kind is PublicationSectionKind.TECHNICAL
+    assert document.sections[0].heading == ""
+    assert document.lead[0].text == "Lead first paragraph."
+    assert document.sections[0].paragraphs[0].text == "Technical continuation."

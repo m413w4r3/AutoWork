@@ -95,6 +95,19 @@ class PublicationAssemblyService:
         )
         canonical_document = serialize_publication_document(document)
         canonical_bytes = ProductionArtifactStore.canonical_json_bytes(canonical_document)
+        metadata = dict(metadata_extra or {})
+        upstream_diagnostics = metadata.pop("diagnostics", {})
+        metadata["diagnostics"] = {
+            "warnings_by_stage": {
+                "references": list(references.warnings),
+                "extraction": list(extraction.warnings),
+                "synthesis": list(synthesis.warnings),
+                "editorial_enrichment": list(editorial_enrichment.warnings),
+            },
+            "upstream": (
+                dict(upstream_diagnostics) if isinstance(upstream_diagnostics, Mapping) else {}
+            ),
+        }
         stage = ProductionArtifactStage.PUBLICATION
         current = await self._production_artifacts.get_current(run.id, stage.value)
         if (
@@ -106,6 +119,7 @@ class PublicationAssemblyService:
                 metadata_extra is None
                 or current.metadata.get("input_artifacts") == metadata_extra.get("input_artifacts")
             )
+            and current.metadata.get("diagnostics") == metadata.get("diagnostics")
         ):
             try:
                 stored = await self._artifact_store.read_bytes(current.canonical_blob_id)
@@ -123,8 +137,8 @@ class PublicationAssemblyService:
 
         candidate = await self._reusable_candidate(run, input_hash, canonical_bytes)
         if candidate is not None:
-            metadata = dict(metadata_extra or {})
-            metadata.update(
+            reused_metadata = dict(metadata)
+            reused_metadata.update(
                 {
                     "reused": True,
                     "reused_from_artifact_id": str(candidate.id),
@@ -139,7 +153,7 @@ class PublicationAssemblyService:
                 input_hash=input_hash,
                 canonical_blob_id=candidate.canonical_blob_id,
                 reused_from_artifact_id=candidate.id,
-                metadata=metadata,
+                metadata=reused_metadata,
             )
             self._set_repair_result_id(artifact)
             await self._production_artifacts.append(artifact)
@@ -158,7 +172,7 @@ class PublicationAssemblyService:
             version=version,
             input_hash=input_hash,
             canonical_blob_id=canonical_blob_id,
-            metadata=dict(metadata_extra or {}),
+            metadata=metadata,
         )
         self._set_repair_result_id(artifact)
         await self._production_artifacts.append(artifact)

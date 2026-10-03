@@ -6,11 +6,15 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application import publication_qa
 from cti_app.application.publication_builder import build_publication_document_v4
 from cti_app.application.publication_qa import qa_publication_v4
+from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
+from cti_app.domain.publication import PublicationSectionKind, PublicationSectionV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
+    PublicationUncertaintyV1,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -114,6 +118,58 @@ def test_figure_provenance_and_manual_figure_addition_fail() -> None:
 
     added = replace(publication.figures[0], key="source_figure_02")
     _assert_failed(inputs, replace(publication, figures=(*publication.figures, added)))
+
+
+def test_publication_format_checks_reject_headings_uncertainties_language_and_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inputs, publication = _rich_inputs()
+
+    headed = replace(
+        publication,
+        sections=(
+            PublicationSectionV1(
+                PublicationSectionKind.TECHNICAL,
+                "Internal technical heading",
+                (publication.lead[0],),
+            ),
+        ),
+    )
+    result = _assert_failed(inputs, headed)
+    assert result["checks"]["no_internal_synthesis_headings"] is False
+
+    uncertain = replace(
+        publication,
+        uncertainties=(
+            PublicationUncertaintyV1(
+                "Unresolved attribution",
+                (publication.sources[0].source_document_id,),
+            ),
+        ),
+    )
+    result = _assert_failed(inputs, uncertain)
+    assert result["checks"]["no_uncertainty_list"] is False
+
+    wrong_language = replace(publication, publication_language="fr")
+    result = _assert_failed(inputs, wrong_language)
+    assert result["checks"]["publication_language"] is False
+
+    leaked = replace(publication, title="synthesis_output_invalid")
+    result = _assert_failed(inputs, leaked)
+    assert result["checks"]["no_diagnostic_code_leaks"] is False
+
+    original_projector = project_publication_to_typst_model
+    monkeypatch.setattr(
+        publication_qa,
+        "project_publication_to_typst_model",
+        lambda document: replace(
+            original_projector(document),
+            content_sections=list(reversed(original_projector(document).content_sections)),
+        ),
+    )
+    result = qa_publication_v4(publication=publication, **inputs)
+    assert result["checks"]["references_then_synthesis"] is False
+    assert result["passed"] is False
 
 
 def test_source_removal_is_rejected_by_the_v4_document_boundary() -> None:

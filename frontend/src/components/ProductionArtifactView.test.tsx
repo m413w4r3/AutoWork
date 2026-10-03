@@ -262,7 +262,13 @@ it("affiche la publication V4 et ses enrichissements", async () => {
           stage: "publication",
           version: 1,
           status: "verified",
-          metadata: {},
+          metadata: {
+            diagnostics: {
+              warnings_by_stage: {
+                synthesis: ["synthesis_output_invalid"],
+              },
+            },
+          },
           canonical_content: {
             schema_version: "4",
             subject_id: SYNTHESIS_SUBJECT_ID,
@@ -412,6 +418,31 @@ it("affiche la publication V4 et ses enrichissements", async () => {
   expect(
     await screen.findByRole("heading", { name: "Article canonique" }),
   ).toBeInTheDocument();
+  const referencesHeading = screen.getByRole("heading", {
+    name: "RÉFÉRENCES",
+  });
+  const synthesisHeading = screen.getByRole("heading", {
+    name: "SYNTHÈSE",
+  });
+  const annexHeading = screen.getByRole("heading", {
+    name: "ANNEXE TECHNIQUE — INDICATEURS",
+  });
+  expect(
+    referencesHeading.compareDocumentPosition(synthesisHeading) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  expect(
+    synthesisHeading.compareDocumentPosition(annexHeading) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
+  const diagnosticsPanel = screen.getByRole("region", {
+    name: "Diagnostics de publication",
+  });
+  expect(diagnosticsPanel).toHaveTextContent("synthesis_output_invalid");
+  expect(
+    diagnosticsPanel.compareDocumentPosition(referencesHeading) &
+      Node.DOCUMENT_POSITION_FOLLOWING,
+  ).toBeTruthy();
   expect(screen.getByText("Lead sourcé.")).toBeInTheDocument();
   expect(
     screen.queryByRole("heading", { name: "Contexte" }),

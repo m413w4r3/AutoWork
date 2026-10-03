@@ -17,7 +17,7 @@ from cti_app.application.typst_rendering import (
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.publication_document import PublicationDocumentV4
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v1"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v2"
 
 
 class EditionTypstRendererError(ValueError):
@@ -82,11 +82,7 @@ class EditionTypstRenderer:
                     "position": publication.position,
                     "subject_id": str(publication.subject_id),
                     "title": model.title,
-                    "timeline": model.timeline,
-                    "body_blocks": model.body_blocks,
-                    "indicators": model.indicators,
-                    "uncertainties": model.uncertainties,
-                    "sources": model.sources,
+                    "content_sections": model.content_sections,
                 }
             )
 

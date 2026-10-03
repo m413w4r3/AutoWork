@@ -269,6 +269,23 @@ def _run(snapshot: ProductionInputSnapshot) -> ProductionRun:
     )
 
 
+def _expected_diagnostics(
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    enrichment: EditorialEnrichmentV1,
+) -> dict[str, object]:
+    return {
+        "warnings_by_stage": {
+            "references": list(references.warnings),
+            "extraction": list(extraction.warnings),
+            "synthesis": list(synthesis.warnings),
+            "editorial_enrichment": list(enrichment.warnings),
+        },
+        "upstream": {},
+    }
+
+
 def test_assembly_constructor_has_no_renderer_dependency() -> None:
     parameters = tuple(signature(PublicationAssemblyService).parameters)
     assert parameters == ("artifact_store", "production_artifacts")
@@ -319,7 +336,9 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
     assert artifact.canonical_blob_id == UUID(int=50)
     assert artifact.raw_blob_id is None
     assert artifact.rendered_blob_id is None
-    assert artifact.metadata == {}
+    assert artifact.metadata == {
+        "diagnostics": _expected_diagnostics(references, extraction, synthesis, enrichment)
+    }
     document_json = serialize_publication_document(document)
     assert document_json["schema_version"] == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
     assert set(document_json) == {
@@ -391,15 +410,14 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     snapshot, references, extraction, synthesis = _canonical_inputs()
     service, catalog, artifacts = _service()
     source_run = _run(snapshot)
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     source = await service.assemble_publication(
         run=source_run,
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
-        editorial_enrichment=build_empty_editorial_enrichment(
-            extraction=extraction, synthesis=synthesis
-        ),
+        editorial_enrichment=enrichment,
     )
     artifacts.terminal_runs[source_run.id] = source_run.edition_id
     target_snapshot = replace(snapshot, production_run_id=UUID(int=30))
@@ -411,9 +429,7 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
         references=references,
         extraction=extraction,
         synthesis=synthesis,
-        editorial_enrichment=build_empty_editorial_enrichment(
-            extraction=extraction, synthesis=synthesis
-        ),
+        editorial_enrichment=enrichment,
     )
 
     assert len(catalog.writes) == 1
@@ -426,10 +442,49 @@ async def test_identical_inputs_reuse_a_finished_run_publication_with_provenance
     assert reused.rendered_blob_id is None
     assert reused.reused_from_artifact_id == source.id
     assert reused.metadata == {
+        "diagnostics": _expected_diagnostics(references, extraction, synthesis, enrichment),
         "reused": True,
         "reused_from_artifact_id": str(source.id),
         "reused_from_created_at": source.created_at.isoformat(),
     }
+
+
+@pytest.mark.asyncio
+async def test_publication_warnings_are_artifact_diagnostics_not_document_content() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    references = replace(references, warnings=("reference_invalid_url",))
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        warnings=("extraction_source_skipped:https://example.test:unavailable",),
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        warnings=("synthesis_output_invalid",),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        warnings=("editorial_enrichment_invalid",),
+    )
+    service, catalog, _artifacts = _service()
+    store = ProductionArtifactStore(catalog)
+
+    artifact = await service.assemble_publication(
+        run=_run(snapshot),
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    document_json = await store.read_json(artifact.canonical_blob_id)
+
+    assert artifact.metadata["diagnostics"] == _expected_diagnostics(
+        references, extraction, synthesis, enrichment
+    )
+    assert "extraction_source_skipped" not in str(document_json)
+    assert "synthesis_output_invalid" not in str(document_json)
 
 
 @pytest.mark.asyncio

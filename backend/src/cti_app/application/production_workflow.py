@@ -1721,6 +1721,16 @@ class ProductionWorkflowOrchestrator:
                             "synthesis_artifact_id": str(synthesis.id),
                             "editorial_enrichment_artifact_id": str(enrichment.id),
                         },
+                        "diagnostics": {
+                            stage_name: artifact.metadata.get("diagnostics", {})
+                            for stage_name, artifact in (
+                                ("references", references),
+                                ("extraction", extraction),
+                                ("relevance_projection", relevance_projection),
+                                ("synthesis", synthesis),
+                                ("editorial_enrichment", enrichment),
+                            )
+                        },
                         **(
                             {"repair_materialization": repair_marker}
                             if repair_marker is not None
