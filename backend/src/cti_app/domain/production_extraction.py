@@ -364,11 +364,7 @@ class ProductionSourceExtractionV1:
                 kind=self.kind,
                 editorial_role=editorial_role,
             )
-            reason_code = (
-                expected_reason
-                if self.profile is ExtractionProfile.FULL
-                else ExtractionProfileReasonCode.TECHNICAL_ANNEX
-            )
+            reason_code = expected_reason
             object.__setattr__(self, "profile_reason_code", reason_code)
         elif not isinstance(reason_code, ExtractionProfileReasonCode):
             raise ValueError("Extraction source profile reason code is invalid")
@@ -454,12 +450,27 @@ class ProductionExtractionV1:
             value = getattr(self, field_name)
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"Production extraction {field_name} must be a lowercase SHA-256")
-        if self.profile_policy_version != EXTRACTION_PROFILE_POLICY_VERSION:
-            raise ValueError("Production extraction profile policy version is incompatible")
+        if (
+            not isinstance(self.profile_policy_version, str)
+            or not self.profile_policy_version.strip()
+        ):
+            raise ValueError("Production extraction profile policy version must be non-empty text")
         if not isinstance(self.sources, tuple) or any(
             not isinstance(source, ProductionSourceExtractionV1) for source in self.sources
         ):
             raise ValueError("Production extraction sources must be a tuple of V1 sources")
+        if self.profile_policy_version == EXTRACTION_PROFILE_POLICY_VERSION:
+            for source in self.sources:
+                assert source.editorial_role is not None
+                expected_profile, _ = extraction_profile_decision(
+                    tier=source.tier,
+                    kind=source.kind,
+                    editorial_role=source.editorial_role,
+                )
+                if source.profile is not expected_profile:
+                    raise ValueError(
+                        "Production extraction profile does not match its reference tier"
+                    )
         if not self.sources:
             raise ValueError("Production extraction requires at least one extracted source")
         if not isinstance(self.omitted_sources, tuple) or any(

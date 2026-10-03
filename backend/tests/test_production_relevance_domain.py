@@ -165,7 +165,11 @@ def _source(
         tier=tier,
         kind=ProductionReferenceKind.PUBLICATION,
         role=role,
-        profile=ExtractionProfile.FULL,
+        profile=(
+            ExtractionProfile.FULL
+            if tier is ProductionReferenceTier.CORE
+            else ExtractionProfile.IOC_RULES
+        ),
         checkpoint_id=None,
         reuse_state=ExtractionReuseState.FRESH,
         facts=tuple(facts),

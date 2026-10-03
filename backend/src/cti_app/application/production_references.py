@@ -425,6 +425,21 @@ def parse_production_reference_proposals(
 
     body = normalize_text(text)
     blocks, _ = _split_blocks(body, _SOURCE_BLOCKS)
+    if (
+        not blocks
+        and body.strip()
+        and not re.fullmatch(
+            r"(?is)\s*(?:#\s*REFERENCES\s*)?(?:NO\s+(?:NEW|ADDITIONAL)\s+SOURCES?|"
+            r"NO\s+NEW\s+SOURCE\s+FOUND|AUCUNE\s+NOUVELLE\s+SOURCE(?:\s+IDENTIFI[ÉE]E?S?)?)"
+            r"[.!]?\s*",
+            body,
+        )
+    ):
+        result.errors.append("reference_unintelligible_response")
+        return result
+    if not blocks and text.strip() and not body.strip():
+        result.errors.append("reference_unintelligible_response")
+        return result
     proposals: list[ProductionReferenceProposal] = []
     seen_urls: set[str] = set()
     for block in blocks:

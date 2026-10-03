@@ -28,6 +28,7 @@ from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
 from cti_app.domain.production import (
+    PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -561,37 +562,46 @@ class ProductionRelevanceProjectionService:
         )
         if extraction.subject_id != snapshot.subject_id:
             raise ValueError("Projection extraction subject differs from its snapshot")
-        classifier = self._model_classifier or self._classifier
-        projection = build_relevance_projection(snapshot, extraction, classifier=classifier)
-        reused = await self._reuse_exact(run, projection)
+        baseline_projection = build_relevance_projection(
+            snapshot, extraction, classifier=self._classifier
+        )
+        requested_projection = (
+            build_relevance_projection(snapshot, extraction, classifier=self._model_classifier)
+            if self._model_classifier is not None
+            else baseline_projection
+        )
+        reused = await self._reuse_exact(run, requested_projection)
         if reused is not None:
             return reused
+        projection = requested_projection
         proposal: ModelRelevanceProposalExecution | None = None
         artifact_metadata: dict[str, Any] = {}
         if self._model_classifier is not None:
             try:
                 async with self._uow_factory() as policy_uow:
                     access_policy = await build_synthesis_access_policy(
-                        snapshot, extraction, policy_uow.source_documents
+                        snapshot,
+                        extraction,
+                        policy_uow.source_documents,
+                        policy_uow.source_collections,
                     )
             except (AttributeError, TypeError, ValueError) as exc:
-                return RelevanceProjectionExecution(
-                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
-                    artifact=None,
-                    projection=projection,
+                return await self._persist_classifier_fallback(
+                    run,
+                    snapshot,
+                    baseline_projection,
                     error_code="relevance_classifier_access_policy_unavailable",
-                    error="The model access policy for the exact extraction is unavailable.",
-                    details={"reason": str(exc)},
+                    reason=str(exc),
                 )
-            if access_policy.do_not_submit:
-                return RelevanceProjectionExecution(
-                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
-                    artifact=None,
-                    projection=projection,
+            if access_policy.do_not_submit or not access_policy.external_llm_allowed:
+                return await self._persist_classifier_fallback(
+                    run,
+                    snapshot,
+                    baseline_projection,
                     error_code="relevance_classifier_policy_blocked",
-                    error="The source access policy forbids a model submission.",
+                    reason="The source access policy forbids a model submission.",
                     details={
-                        "do_not_submit": True,
+                        "do_not_submit": access_policy.do_not_submit,
                         "external_llm_allowed": access_policy.external_llm_allowed,
                     },
                 )
@@ -599,17 +609,33 @@ class ProductionRelevanceProjectionService:
                 run, snapshot, extraction, access_policy
             )
             if proposal.status is RelevanceProposalStatus.NEEDS_REVIEW:
-                return RelevanceProjectionExecution(
-                    status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
-                    artifact=None,
-                    projection=projection,
+                if (
+                    proposal.reconciliation_required
+                    or proposal.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
+                ):
+                    return RelevanceProjectionExecution(
+                        status=RelevanceProjectionExecutionStatus.NEEDS_REVIEW,
+                        artifact=None,
+                        projection=requested_projection,
+                        model_calls=proposal.model_calls,
+                        model_run_id=proposal.model_run_id,
+                        invocation_hash=proposal.invocation_hash,
+                        parse_identity=proposal.parse_identity,
+                        error_code=proposal.error_code,
+                        error=proposal.error,
+                        details=proposal.details,
+                    )
+                return await self._persist_classifier_fallback(
+                    run,
+                    snapshot,
+                    baseline_projection,
+                    error_code=proposal.error_code or "relevance_classifier_model_call_failed",
+                    reason=proposal.error or "The relevance classifier proposal is unavailable.",
+                    details=proposal.details,
                     model_calls=proposal.model_calls,
                     model_run_id=proposal.model_run_id,
                     invocation_hash=proposal.invocation_hash,
                     parse_identity=proposal.parse_identity,
-                    error_code=proposal.error_code,
-                    error=proposal.error,
-                    details=proposal.details,
                 )
             projection = self._merge_model_proposals(projection, extraction, proposal)
             artifact_metadata = {
@@ -646,6 +672,50 @@ class ProductionRelevanceProjectionService:
                     "source_pair_relation_count": len(projection.source_pair_relations),
                 },
             )
+
+    async def _persist_classifier_fallback(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        baseline: RelevanceProjectionV1,
+        *,
+        error_code: str,
+        reason: str,
+        details: Mapping[str, Any] | None = None,
+        model_calls: int = 0,
+        model_run_id: UUID | None = None,
+        invocation_hash: str | None = None,
+        parse_identity: str | None = None,
+    ) -> RelevanceProjectionExecution:
+        fallback = {"error_code": error_code, "reason": reason}
+        async with self._uow_factory() as uow:
+            execution = await persist_relevance_projection_in_uow(
+                uow,
+                run,
+                snapshot,
+                baseline,
+                self._artifact_store,
+                artifact_metadata={"model_classifier_fallback": fallback},
+            )
+            if execution.artifact is not None:
+                execution.artifact.metadata = {
+                    **execution.artifact.metadata,
+                    "model_classifier_fallback": fallback,
+                }
+                if execution.status is RelevanceProjectionExecutionStatus.REUSED:
+                    execution = replace(
+                        execution, status=RelevanceProjectionExecutionStatus.SUCCEEDED
+                    )
+            if execution.status is RelevanceProjectionExecutionStatus.SUCCEEDED:
+                await uow.commit()
+        return replace(
+            execution,
+            model_calls=model_calls,
+            model_run_id=model_run_id,
+            invocation_hash=invocation_hash,
+            parse_identity=parse_identity,
+            details={**dict(details or {}), "model_classifier_fallback": fallback},
+        )
 
     async def _reuse_exact(
         self, run: ProductionRun, projection: RelevanceProjectionV1
@@ -718,6 +788,7 @@ class ProductionRelevanceProjectionService:
                         )
                     )
                     continue
+            baseline_decision = decisions[item.evidence_ref]
             supporting = tuple(
                 sorted(
                     {item.evidence_ref, *item.supporting_evidence_refs},
@@ -728,7 +799,22 @@ class ProductionRelevanceProjectionService:
                 item.evidence_ref.kind is EvidenceKind.INDICATOR
                 and item.classification
                 in {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
-                and len(supporting) < 2
+                and (
+                    len(supporting) < 2
+                    or (
+                        baseline_decision.classification is not RelevanceClassification.DIRECT
+                        and not any(
+                            ref != item.evidence_ref
+                            and ref.source_document_id == item.evidence_ref.source_document_id
+                            and decisions[ref].classification
+                            in {
+                                RelevanceClassification.DIRECT,
+                                RelevanceClassification.CORROBORATION,
+                            }
+                            for ref in item.supporting_evidence_refs
+                        )
+                    )
+                )
             ):
                 rejections.append(
                     RelevanceProposalRejectionV1(
@@ -737,12 +823,26 @@ class ProductionRelevanceProjectionService:
                         item.raw_sha256,
                     )
                 )
-                decisions[item.evidence_ref] = RelevanceClassificationItemV1(
-                    evidence_ref=item.evidence_ref,
-                    classification=RelevanceClassification.INDETERMINATE,
-                    reason_code=RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
-                    supporting_evidence_refs=supporting,
-                    provenance=RelevanceDecisionProvenance.MODEL_PROPOSAL,
+                if baseline_decision.classification is not RelevanceClassification.DIRECT:
+                    decisions[item.evidence_ref] = RelevanceClassificationItemV1(
+                        evidence_ref=item.evidence_ref,
+                        classification=RelevanceClassification.INDETERMINATE,
+                        reason_code=RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+                        supporting_evidence_refs=supporting,
+                        provenance=RelevanceDecisionProvenance.MODEL_PROPOSAL,
+                    )
+                continue
+            if (
+                item.evidence_ref.kind is EvidenceKind.INDICATOR
+                and baseline_decision.classification is RelevanceClassification.DIRECT
+                and item.classification is RelevanceClassification.INDETERMINATE
+            ):
+                rejections.append(
+                    RelevanceProposalRejectionV1(
+                        item.block_id,
+                        RelevanceProposalRejectionReason.CORE_PRIMARY_DEFAULT_GUARD,
+                        item.raw_sha256,
+                    )
                 )
                 continue
             decisions[item.evidence_ref] = RelevanceClassificationItemV1(

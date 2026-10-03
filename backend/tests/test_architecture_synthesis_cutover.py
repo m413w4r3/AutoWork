@@ -110,7 +110,6 @@ def test_canonical_synthesis_uses_gateway_text_blocks_without_source_fetch() -> 
         "parse_document(",
         "decoded_blob_id",
         "fetch_source(",
-        "source_collections",
         "httpx.",
         "requests.",
     ):

@@ -22,6 +22,9 @@ from cti_app.application.model_gateway import (
     ModelSubmissionReconciliationRequiredError,
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
+from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
+)
 from cti_app.application.production_synthesis import (
     MAX_SYNTHESIS_UNCERTAINTIES,
     MAX_TECHNICAL_EVIDENCE_V1,
@@ -37,6 +40,7 @@ from cti_app.application.production_synthesis import (
     SynthesisProposalV1,
     SynthesisSectionProposalV1,
     SynthesisStageErrorCode,
+    _date_supported_by_payload,
     build_synthesis_access_policy,
     build_synthesis_delta,
     build_synthesis_evidence_pack,
@@ -45,6 +49,7 @@ from cti_app.application.production_synthesis import (
     build_synthesis_uncertainties,
     canonical_extraction_hash,
     draft_synthesis_proposal,
+    extraction_evidence_elements,
     parse_synthesis_proposal_wire,
     render_synthesis_markdown,
     synthesis_access_policy_hash,
@@ -55,6 +60,7 @@ from cti_app.application.production_synthesis import (
     validate_synthesis_proposal,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
@@ -155,6 +161,14 @@ class MemorySourceDocuments:
     async def get(self, document_id: UUID) -> SourceDocument | None:
         self.requested.append(document_id)
         return self.documents.get(document_id)
+
+
+class MemorySourceCollections:
+    def __init__(self, collections: tuple[SourceCollection, ...] = ()) -> None:
+        self.collections = {collection.id: collection for collection in collections}
+
+    async def get(self, collection_id: UUID) -> SourceCollection | None:
+        return self.collections.get(collection_id)
 
 
 def make_fact(source_id: UUID, value: str, *, context: str = "") -> ExtractionFactV1:
@@ -319,7 +333,7 @@ def test_refs_hash_and_prompt_handles_are_stable_across_source_load_order():
         raise AssertionError("unknown handles must not be approximated")
 
 
-def test_supporting_full_facts_and_events_follow_core_narrative_evidence():
+def test_core_full_facts_and_events_follow_core_narrative_evidence():
     subject_id = uuid4()
     core_id, supporting_id = uuid4(), uuid4()
     core = make_source(
@@ -330,7 +344,7 @@ def test_supporting_full_facts_and_events_follow_core_narrative_evidence():
     )
     supporting = make_source(
         supporting_id,
-        tier=ProductionReferenceTier.SUPPORTING,
+        tier=ProductionReferenceTier.CORE,
         profile=ExtractionProfile.FULL,
         role=SourceRole.INDEPENDENT,
         editorial_role=ProductionEditorialRole.CORROBORATION,
@@ -342,7 +356,7 @@ def test_supporting_full_facts_and_events_follow_core_narrative_evidence():
                 date(2026, 1, 4),
             ),
         ),
-        url_suffix="supporting-independent",
+        url_suffix="core-independent",
     )
     extraction = make_extraction(subject_id, (supporting, core))
 
@@ -389,6 +403,22 @@ def test_changed_fact_payload_changes_its_evidence_key():
     )
     assert original_ref.source_document_id == changed_ref.source_document_id
     assert original_ref.evidence_key != changed_ref.evidence_key
+
+
+def test_date_grounding_preserves_approximate_precision_and_checks_quotes():
+    approximate_event = {
+        "event_date": date(2024, 6, 15),
+        "date_text": "mid-2024",
+    }
+    assert not _date_supported_by_payload(approximate_event, "date:2024-06-15")
+
+    quoted_fact = {
+        "category": "timeline",
+        "value": "Deployment was reported.",
+        "context": "",
+        "evidence_quote": "The report dates deployment to 2025-04-06.",
+    }
+    assert _date_supported_by_payload(quoted_fact, "date:2025-04-06")
 
 
 def test_technical_pack_is_contextual_body_free_deterministic_and_bounded():
@@ -618,7 +648,7 @@ def test_uncertainties_union_provenance_and_delta_compares_exact_refs():
 
     uncertainties = build_synthesis_uncertainties(previous)
     shared_uncertainty = next(item for item in uncertainties if item.text == shared)
-    assert shared_uncertainty.source_document_ids == tuple(sorted((first_id, second_id), key=str))
+    assert shared_uncertainty.source_document_ids == (first_id,)
     assert tuple(item.text for item in uncertainties) == (
         "Attribution remains uncertain.",
         "Scope is unknown.",
@@ -630,6 +660,69 @@ def test_uncertainties_union_provenance_and_delta_compares_exact_refs():
     assert set(delta.added_evidence) == current_refs - previous_refs
     assert set(delta.removed_evidence) == previous_refs - current_refs
     assert set(delta.unchanged_evidence) == previous_refs & current_refs
+
+
+def test_ioc_rules_uncertainty_is_excluded_from_synthesis_and_enrichment_packs():
+    subject_id = uuid4()
+    core_id, supporting_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    support_uncertainty = "The supporting source does not verify attribution."
+    extraction = replace(
+        make_extraction(
+            subject_id,
+            (
+                make_source(
+                    core_id,
+                    facts=(make_fact(core_id, "CoreReport"),),
+                    uncertainties=("The campaign operator is not identified.",),
+                    url_suffix="core-uncertainty",
+                ),
+                make_source(
+                    supporting_id,
+                    tier=ProductionReferenceTier.SUPPORTING,
+                    uncertainties=(support_uncertainty,),
+                    url_suffix="supporting-uncertainty",
+                ),
+            ),
+        ),
+        production_input_hash=snapshot.input_hash,
+    )
+    synthesis_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    core_uncertainty = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.UNCERTAINTY
+        and ref.source_document_id == core_id
+        and payload.get("text") == "The campaign operator is not identified."
+    )
+    supporting_uncertainty = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.UNCERTAINTY
+        and ref.source_document_id == supporting_id
+        and payload.get("text") == support_uncertainty
+    )
+
+    assert support_uncertainty in extraction.sources[1].uncertainties
+    assert synthesis_pack.handle_for(core_uncertainty) is not None
+    assert synthesis_pack.handle_for(supporting_uncertainty) is None
+    uncertainties = build_synthesis_uncertainties(extraction)
+    assert {source_id for item in uncertainties for source_id in item.source_document_ids} == {
+        core_id
+    }
+
+    synthesis = _canonical_synthesis(snapshot, extraction)
+    synthesis = replace(
+        synthesis,
+        lead=(SynthesisParagraphV1(support_uncertainty, (supporting_uncertainty,)),),
+    )
+    enrichment_pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    assert supporting_uncertainty not in enrichment_pack._handle_to_ref.values()
+    assert supporting_uncertainty not in enrichment_pack._reserve_handle_to_ref.values()
+    assert support_uncertainty not in str(enrichment_pack.narrative_evidence)
+    assert support_uncertainty not in str(enrichment_pack.current_synthesis)
+    assert support_uncertainty not in str(enrichment_pack.reserve_evidence)
+    assert not enrichment_pack.current_synthesis["lead"]
 
 
 def test_uncertainties_filter_known_noise_and_merge_punctuation_variants():
@@ -1229,8 +1322,10 @@ class _Uow:
         documents: MemorySourceDocuments,
         artifacts: _MemoryArtifacts | None = None,
         invalidations: _MemoryInvalidations | None = None,
+        collections: tuple[SourceCollection, ...] = (),
     ) -> None:
         self.source_documents = documents
+        self.source_collections = MemorySourceCollections(collections)
         self.production_artifacts = artifacts or _MemoryArtifacts()
         self.production_reuse_invalidations = invalidations or _MemoryInvalidations()
 
@@ -1439,6 +1534,7 @@ def _service_world(
     extraction_blob_id: UUID | None = None,
     extra_payloads: Mapping[UUID, dict[str, object]] | None = None,
     artifacts: tuple[ProductionArtifact, ...] = (),
+    collections: tuple[SourceCollection, ...] = (),
 ) -> SimpleNamespace:
     blob_id = extraction_blob_id or uuid4()
     payloads = dict(extra_payloads or {})
@@ -1449,7 +1545,7 @@ def _service_world(
     artifact_repository = _MemoryArtifacts(artifacts)
     service = ProductionSynthesisService(
         uow_factory=lambda: _Uow(  # type: ignore[arg-type]
-            document_repository, artifact_repository
+            document_repository, artifact_repository, collections=collections
         ),
         artifact_store=store,  # type: ignore[arg-type]
         model_gateway=gateway,  # type: ignore[arg-type]
@@ -1688,7 +1784,7 @@ async def test_external_model_block_from_gateway_is_needs_review():
     world = _service_world(
         snapshot,
         extraction,
-        (make_document(subject_id, source_id, external_llm_allowed=False),),
+        (make_document(subject_id, source_id),),
         gateway,
     )
 
@@ -1699,6 +1795,38 @@ async def test_external_model_block_from_gateway_is_needs_review():
     assert result.model_calls == 1
     assert len(gateway.calls) == 1
     assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_collection_access_policy_blocks_synthesis_before_gateway() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot, make_source(source_id, facts=(make_fact(source_id, "FooRAT"),))
+    )
+    collection = SourceCollection(
+        subject_id=subject_id,
+        edition_id=snapshot.edition_id,
+        requested_url="https://restricted.example/report",
+        proposed_role=SourceRole.PRIMARY,
+        external_llm_allowed=False,
+    )
+    document = replace(make_document(subject_id, source_id), source_collection_id=collection.id)
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    world = _service_world(
+        snapshot,
+        extraction,
+        (document,),
+        gateway,
+        collections=(collection,),
+    )
+
+    result = await world.service.execute(world.run, snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisStageErrorCode.POLICY_BLOCKED.value
+    assert result.model_calls == 0
+    assert gateway.calls == []
 
 
 @pytest.mark.asyncio

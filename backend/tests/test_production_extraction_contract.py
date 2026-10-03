@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from datetime import date
 from uuid import UUID, uuid4
 
@@ -71,7 +72,12 @@ def _source(
         tier=tier,
         kind=ProductionReferenceKind.PUBLICATION,
         role=SourceRole.PRIMARY,
-        profile=profile or ExtractionProfile.FULL,
+        profile=profile
+        or (
+            ExtractionProfile.FULL
+            if tier is ProductionReferenceTier.CORE
+            else ExtractionProfile.IOC_RULES
+        ),
         checkpoint_id=_CHECKPOINT_ID,
         reuse_state=reuse_state,
         facts=(
@@ -112,13 +118,16 @@ def _source(
     )
 
 
-def _extraction(*sources: ProductionSourceExtractionV1) -> ProductionExtractionV1:
+def _extraction(
+    *sources: ProductionSourceExtractionV1,
+    profile_policy_version: str = EXTRACTION_PROFILE_POLICY_VERSION,
+) -> ProductionExtractionV1:
     return ProductionExtractionV1(
         schema_version=1,
         subject_id=_SUBJECT_ID,
         production_input_hash=_SHA,
         references_corpus_hash="b" * 64,
-        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        profile_policy_version=profile_policy_version,
         sources=sources or (_source(),),
         omitted_sources=(),
         warnings=(),
@@ -226,7 +235,7 @@ def test_duplicate_source_url_is_rejected() -> None:
         _extraction(first, second)
 
 
-def test_supporting_full_profile_reason_is_persisted() -> None:
+def test_legacy_supporting_full_profile_reason_still_loads() -> None:
     source = ProductionSourceExtractionV1(
         source_document_id=_DOCUMENT_ID,
         canonical_url="https://example.test/independent-analysis",
@@ -246,7 +255,8 @@ def test_supporting_full_profile_reason_is_persisted() -> None:
         uncertainties=(),
     )
 
-    payload = production_extraction_to_json(_extraction(source))["sources"][0]
+    legacy = _extraction(source, profile_policy_version="production-reference-tier-v2")
+    payload = production_extraction_to_json(legacy)["sources"][0]
 
     assert payload["tier"] == ProductionReferenceTier.SUPPORTING.value
     assert payload["profile"] == ExtractionProfile.FULL.value
@@ -254,6 +264,39 @@ def test_supporting_full_profile_reason_is_persisted() -> None:
     assert (
         payload["profile_reason_code"]
         == ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION.value
+    )
+    assert production_extraction_from_json(production_extraction_to_json(legacy)) == legacy
+
+
+def test_current_policy_rejects_supporting_full_profile_and_defaults_support_reason() -> None:
+    supporting_full = ProductionSourceExtractionV1(
+        source_document_id=_DOCUMENT_ID,
+        canonical_url="https://example.test/supporting-full",
+        content_sha256=_SHA,
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        profile=ExtractionProfile.FULL,
+        checkpoint_id=_CHECKPOINT_ID,
+        reuse_state=ExtractionReuseState.FRESH,
+        facts=(),
+        events=(),
+        indicators=(),
+        rules=(),
+        uncertainties=(),
+    )
+    with pytest.raises(ValueError, match="profile does not match its reference tier"):
+        _extraction(supporting_full)
+
+    supporting_ioc_rules = replace(
+        supporting_full,
+        canonical_url="https://example.test/supporting-ioc-rules",
+        profile=ExtractionProfile.IOC_RULES,
+        profile_reason_code=None,
+    )
+    assert (
+        supporting_ioc_rules.profile_reason_code is ExtractionProfileReasonCode.SUPPORTING_CONTEXT
     )
 
 
@@ -451,18 +494,10 @@ def test_empty_extraction_is_rejected() -> None:
         )
 
 
-def test_wrong_profile_policy_version_is_rejected() -> None:
-    with pytest.raises(ValueError, match="profile policy version"):
-        ProductionExtractionV1(
-            schema_version=1,
-            subject_id=_SUBJECT_ID,
-            production_input_hash=_SHA,
-            references_corpus_hash="b" * 64,
-            profile_policy_version="production-reference-tier-v2",
-            sources=(_source(),),
-            omitted_sources=(),
-            warnings=(),
-        )
+def test_old_profile_policy_version_still_loads() -> None:
+    legacy = _extraction(profile_policy_version="production-reference-tier-v2")
+
+    assert production_extraction_from_json(production_extraction_to_json(legacy)) == legacy
 
 
 def test_canonical_fact_categories_cover_full_extraction() -> None:

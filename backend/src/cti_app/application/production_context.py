@@ -13,6 +13,8 @@ from datetime import date
 from uuid import UUID
 
 from cti_app.application.persistence import UnitOfWork
+from cti_app.application.production_access_policy import resolve_source_policy
+from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceOriginKind
 from cti_app.domain.production import ProductionInputSnapshot
 
@@ -34,6 +36,7 @@ class SubjectProductionContext:
     period_start: str
     period_end: str
     research_date: date
+    effective_tlp: TLP
     core_sources_text: str
     supporting_sources_text: str
     external_llm_allowed: bool
@@ -75,6 +78,13 @@ async def build_subject_production_context(
     relevant_urls = frozenset(relevant_source_urls or ())
 
     collections = list(await uow.source_collections.list_for_subject(subject_id))
+    documents_repository = getattr(uow, "source_documents", None)
+    documents = (
+        list(await documents_repository.list_for_subject(subject_id))
+        if documents_repository is not None
+        else []
+    )
+    documents_by_id = {document.id: document for document in documents}
     core_source_urls = frozenset(source.canonical_url for source in snapshot.core_sources)
     allowed_urls = core_source_urls | relevant_urls
     core_sources_text = "\n".join(_describe(source) for source in snapshot.core_sources)
@@ -87,23 +97,29 @@ async def build_subject_production_context(
 
     # The diffusion policy decides whether this subject may reach an external
     # model at all; it is never a hardcoded True.
-    blocking = tuple(
-        dict.fromkeys(
-            (
-                *(
-                    item.canonical_url
-                    for item in collections
-                    if item.canonical_url in allowed_urls
-                    and (item.do_not_submit or not item.external_llm_allowed)
-                ),
-                *(
-                    source.canonical_url
-                    for source in snapshot.core_sources
-                    if not source.external_llm_allowed
-                ),
-            )
-        )
-    )
+    blocking_urls: list[str] = []
+    effective_tlps = [snapshot.subject_tlp, *(source.tlp for source in snapshot.core_sources)]
+    for item in collections:
+        if item.canonical_url not in allowed_urls:
+            continue
+        document_id = getattr(item, "source_document_id", None)
+        document = documents_by_id.get(document_id)
+        if document is not None:
+            if getattr(document, "source_collection_id", item.id) != item.id:
+                blocking_urls.append(item.canonical_url)
+                continue
+            policy = resolve_source_policy(document, item)
+            effective_tlps.append(policy.tlp)
+            if policy.do_not_submit or not policy.external_llm_allowed:
+                blocking_urls.append(item.canonical_url)
+        else:
+            effective_tlps.append(item.source_tlp)
+            if item.do_not_submit or not item.external_llm_allowed:
+                blocking_urls.append(item.canonical_url)
+    for source in snapshot.core_sources:
+        if not source.external_llm_allowed:
+            blocking_urls.append(source.canonical_url)
+    blocking = tuple(dict.fromkeys(blocking_urls))
 
     archived = [
         item
@@ -127,5 +143,6 @@ async def build_subject_production_context(
         core_sources_text=core_sources_text,
         supporting_sources_text=supporting_sources_text,
         external_llm_allowed=not blocking,
+        effective_tlp=max(effective_tlps, key=lambda item: tuple(TLP).index(item)),
         blocking_sources=blocking,
     )

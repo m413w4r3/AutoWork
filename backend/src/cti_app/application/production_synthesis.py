@@ -31,8 +31,10 @@ from cti_app.application.model_gateway import (
 from cti_app.application.persistence import (
     ProductionUnitOfWork,
     ProductionUnitOfWorkFactory,
+    SourceCollectionRepository,
     SourceDocumentRepository,
 )
+from cti_app.application.production_access_policy import resolve_source_policy
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
@@ -104,7 +106,7 @@ if TYPE_CHECKING:
 SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v6-ranked-uncertainty-handles"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v3-subject-relevance-projection"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
-SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v1"
+SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v2-headingless-reserve-handles"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
@@ -794,6 +796,7 @@ async def build_synthesis_access_policy(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     source_documents: SourceDocumentRepository,
+    source_collections: SourceCollectionRepository | None = None,
 ) -> SynthesisAccessPolicyV1:
     """Load exact source metadata and conservatively fold its model access policy."""
     if snapshot.subject_id != extraction.subject_id:
@@ -809,25 +812,38 @@ async def build_synthesis_access_policy(
         try:
             document_id = document.id
             subject_id = document.subject_id
-            tlp = document.tlp
-            external_llm_allowed = document.external_llm_allowed
-            do_not_submit = document.do_not_submit
+            collection_id = document.source_collection_id
         except AttributeError as exc:
             raise ValueError("synthesis_access_policy_unavailable") from exc
+        if document_id != source_id or subject_id != snapshot.subject_id:
+            raise ValueError("synthesis_access_policy_unavailable")
+        collection = None
+        if collection_id is not None:
+            if source_collections is None:
+                raise ValueError("synthesis_access_policy_unavailable")
+            collection = await source_collections.get(collection_id)
+            if (
+                collection is None
+                or collection.id != collection_id
+                or collection.subject_id != snapshot.subject_id
+            ):
+                raise ValueError("synthesis_access_policy_unavailable")
+        try:
+            policy = resolve_source_policy(document, collection)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("synthesis_access_policy_unavailable") from exc
         if (
-            document_id != source_id
-            or subject_id != snapshot.subject_id
-            or not isinstance(tlp, TLP)
-            or type(external_llm_allowed) is not bool
-            or type(do_not_submit) is not bool
+            not isinstance(policy.tlp, TLP)
+            or type(policy.external_llm_allowed) is not bool
+            or type(policy.do_not_submit) is not bool
         ):
             raise ValueError("synthesis_access_policy_unavailable")
         records.append(
             SynthesisAccessSourceV1(
                 source_document_id=source_id,
-                tlp=tlp,
-                external_llm_allowed=external_llm_allowed,
-                do_not_submit=do_not_submit,
+                tlp=policy.tlp,
+                external_llm_allowed=policy.external_llm_allowed,
+                do_not_submit=policy.do_not_submit,
             )
         )
 
@@ -1111,6 +1127,10 @@ def build_synthesis_evidence_pack(
         ref
         for ref in entries
         if projection is not None
+        and (
+            ref.kind is not EvidenceKind.UNCERTAINTY
+            or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+        )
         and projection.classification_for(ref).classification
         is RelevanceClassification.COUNTER_INDICATION
     }
@@ -1119,6 +1139,10 @@ def build_synthesis_evidence_pack(
             ref
             for relation in projection.source_pair_relations
             for ref in relation.supporting_evidence_refs
+            if (
+                ref.kind is not EvidenceKind.UNCERTAINTY
+                or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+            )
         }
         if projection is not None
         else set()
@@ -1743,8 +1767,12 @@ def _resolve_claim_refs(
 
 def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> bool:
     if "event_date" in payload:
-        event_date = payload["event_date"]
         date_text = payload["date_text"]
+        # event_date is a sort key; date_text preserves the precision asserted
+        # by the source, including approximate wording such as "mid-2024".
+        if isinstance(date_text, str) and date_text.strip():
+            return date_key in _date_literals(date_text)
+        event_date = payload["event_date"]
         return any(
             date_key in _date_literals(value)
             for value in (event_date or "", date_text or "")
@@ -1752,8 +1780,11 @@ def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> boo
         )
     if "category" not in payload:
         return False
-    fact_value = payload.get("value")
-    return isinstance(fact_value, str) and date_key in _date_literals(fact_value)
+    return any(
+        date_key in _date_literals(value)
+        for value in (payload.get("value"), payload.get("context"), payload.get("evidence_quote"))
+        if isinstance(value, str)
+    )
 
 
 def _validate_grounded_text(
@@ -2048,6 +2079,8 @@ def build_synthesis_uncertainties(
     }
     provenance: dict[str, tuple[str, set[UUID]]] = {}
     for source in extraction.sources:
+        if source.profile is not ExtractionProfile.FULL:
+            continue
         for uncertainty in source.uncertainties:
             if _is_noise_uncertainty(uncertainty):
                 continue
@@ -2490,7 +2523,7 @@ class ProductionSynthesisService:
             return control.result()
         if reused is not None:
             return reused
-        if policy.do_not_submit:
+        if policy.do_not_submit or not policy.external_llm_allowed:
             # A do_not_submit source forbids every model submission; only the
             # model gateway route could turn this evidence into a draft.
             return ProductionSynthesisExecution(
@@ -2502,7 +2535,7 @@ class ProductionSynthesisService:
                 error_code=SynthesisStageErrorCode.POLICY_BLOCKED.value,
                 error="The source access policy forbids any model submission.",
                 details={
-                    "do_not_submit": True,
+                    "do_not_submit": policy.do_not_submit,
                     "external_llm_allowed": policy.external_llm_allowed,
                     "effective_tlp": policy.effective_tlp.value,
                     "synthesis_access_policy_hash": synthesis_access_policy_hash(policy),
@@ -2665,7 +2698,7 @@ class ProductionSynthesisService:
         async with self._uow_factory() as uow:
             try:
                 return await build_synthesis_access_policy(
-                    snapshot, extraction, uow.source_documents
+                    snapshot, extraction, uow.source_documents, uow.source_collections
                 )
             except ProductionReuseStorageUnavailableError:
                 raise

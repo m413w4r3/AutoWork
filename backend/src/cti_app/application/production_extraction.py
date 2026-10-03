@@ -40,6 +40,7 @@ from cti_app.application.model_gateway import (
     StructuredOutputError,
 )
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_access_policy import SourceAccessPolicy, resolve_source_policy
 from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
@@ -90,7 +91,6 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
-from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, DetectedMimeType, SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
@@ -621,20 +621,6 @@ async def load_reference_corpus(
 
 
 @dataclass(frozen=True, slots=True)
-class SourceAccessPolicy:
-    """The diffusion policy governing one exact archived document."""
-
-    tlp: TLP
-    sensitivity: str
-    external_llm_allowed: bool
-    do_not_submit: bool
-
-    @property
-    def submission_allowed(self) -> bool:
-        return self.external_llm_allowed and not self.do_not_submit
-
-
-@dataclass(frozen=True, slots=True)
 class SourceArchive:
     """One planned source resolved to its exact archived bytes."""
 
@@ -643,29 +629,6 @@ class SourceArchive:
     collection: SourceCollection | None
     policy: SourceAccessPolicy
     content: bytes
-
-
-def resolve_source_policy(
-    document: SourceDocument, collection: SourceCollection | None
-) -> SourceAccessPolicy:
-    """Combine the document and collection policies without ever loosening one."""
-
-    tlp = document.tlp
-    external_llm_allowed = document.external_llm_allowed
-    do_not_submit = document.do_not_submit
-    sensitivity = "internal"
-    if collection is not None:
-        ranks = list(TLP)
-        tlp = max((document.tlp, collection.source_tlp), key=ranks.index)
-        external_llm_allowed = external_llm_allowed and collection.external_llm_allowed
-        do_not_submit = do_not_submit or collection.do_not_submit
-        sensitivity = collection.sensitivity or sensitivity
-    return SourceAccessPolicy(
-        tlp=tlp,
-        sensitivity=sensitivity,
-        external_llm_allowed=external_llm_allowed,
-        do_not_submit=do_not_submit,
-    )
 
 
 async def load_source_archive(

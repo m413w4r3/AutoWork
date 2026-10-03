@@ -871,7 +871,9 @@ async def _store_canonical_first_pass(
     # extraction and the exact source access policy; no legacy report hash
     # participates any more.
     async with uow_factory() as uow:
-        policy = await build_synthesis_access_policy(snapshot, extraction, uow.source_documents)
+        policy = await build_synthesis_access_policy(
+            snapshot, extraction, uow.source_documents, uow.source_collections
+        )
     # The production orchestrator classifies with the model classifier enabled by
     # default; its projection identity is part of every later stage identity.
     projection = build_relevance_projection(
@@ -915,7 +917,7 @@ async def _store_empty_enrichment(
     validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     async with uow_factory() as uow:
         access_policy = await build_synthesis_access_policy(
-            snapshot, extraction, uow.source_documents
+            snapshot, extraction, uow.source_documents, uow.source_collections
         )
     evidence_pack_hash = editorial_enrichment_evidence_pack_hash(
         build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)

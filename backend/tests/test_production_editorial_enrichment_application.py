@@ -58,6 +58,7 @@ from cti_app.application.production_enrichment_revision import (
     EditorialEnrichmentRevisionValidationError,
     ProductionEditorialEnrichmentRevisionService,
 )
+from cti_app.application.production_prompts import EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
@@ -69,6 +70,7 @@ from cti_app.application.source_figure_inventory import (
     SourceFigureInventoryResult,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
@@ -140,6 +142,14 @@ class _MemorySourceDocuments:
         return tuple(
             document for document in self.documents.values() if document.subject_id == subject_id
         )
+
+
+class _MemorySourceCollections:
+    def __init__(self, collections: tuple[SourceCollection, ...] = ()) -> None:
+        self.collections = {collection.id: collection for collection in collections}
+
+    async def get(self, collection_id: UUID) -> SourceCollection | None:
+        return self.collections.get(collection_id)
 
 
 def _snapshot(
@@ -383,7 +393,7 @@ def test_evidence_pack_is_stable_private_and_resolves_exact_refs() -> None:
     assert all("body" not in record for record in first.technical_evidence)
 
 
-def test_supporting_full_narrative_evidence_is_available_after_core():
+def test_core_full_narrative_evidence_is_available_after_primary_core():
     snapshot = _snapshot()
     core_id, supporting_id, annex_id = uuid4(), uuid4(), uuid4()
     core = _source(
@@ -414,7 +424,7 @@ def test_supporting_full_narrative_evidence_is_available_after_core():
     )
     supporting = _source(
         supporting_id,
-        tier=ProductionReferenceTier.SUPPORTING,
+        tier=ProductionReferenceTier.CORE,
         profile=ExtractionProfile.FULL,
         role=SourceRole.INDEPENDENT,
         editorial_role=ProductionEditorialRole.CORROBORATION,
@@ -440,7 +450,7 @@ def test_supporting_full_narrative_evidence_is_available_after_core():
                 source_document_ids=(supporting_id,),
             ),
         ),
-        url_suffix="supporting",
+        url_suffix="corroborating-core",
     )
     annex = _source(
         annex_id,
@@ -1285,6 +1295,8 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     )
     assert str(source.id) not in request.text
     assert str(extraction.sources[0].source_document_id) not in request.text
+    assert "https://cdn.example.test/example-rat.png" not in request.text
+    assert extraction.sources[0].canonical_url not in request.text
     assert "F001" in request.text
     assert "ExampleRAT execution architecture" in request.text
     assert "640" in request.text and "400" in request.text
@@ -1293,6 +1305,32 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
         "editorial-enrichment-block-contract-v4-analytic-purpose"
     )
+
+    revision_request = ProductionEditorialEnrichmentRevisionService._model_request(
+        request_identity="c" * 64,
+        request_identity_payload={"base_input_hash": "d" * 64},
+        action=EditorialEnrichmentRevisionAction.CHOOSE_ANOTHER_FIGURE,
+        instruction="Choose a clearer figure.",
+        element_kind=EditorialEnrichmentElementKind.FIGURE,
+        element_key="F001",
+        base_element={
+            "key": "F001",
+            "source_document_id": str(source.id),
+            "source_url": extraction.sources[0].canonical_url,
+            "caption": "Evidence from https://cdn.example.test/example-rat.png",
+            "locator": {"original_asset_url": "https://cdn.example.test/example-rat.png"},
+            "resolved_figure": {"figure_id": str(figure_catalog[0].figure.figure_id)},
+        },
+        element_evidence_handles=[],
+        evidence_pack=pack,
+        evidence_pack_hash=editorial_enrichment_evidence_pack_hash(pack),
+        figure_catalog=figure_catalog,
+        access_policy=access_policy,
+    )
+    assert revision_request.prompt_template_version == EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+    assert str(source.id) not in revision_request.text
+    assert extraction.sources[0].canonical_url not in revision_request.text
+    assert "https://cdn.example.test/example-rat.png" not in revision_request.text
 
 
 def test_functional_hash_and_model_run_identity_bind_policy_generation_and_pack() -> None:
@@ -1460,8 +1498,13 @@ class _MemoryDiagramCompiler:
 
 
 class _Uow:
-    def __init__(self, documents: _MemorySourceDocuments) -> None:
+    def __init__(
+        self,
+        documents: _MemorySourceDocuments,
+        collections: tuple[SourceCollection, ...] = (),
+    ) -> None:
         self.source_documents = documents
+        self.source_collections = _MemorySourceCollections(collections)
         self.blobs = _MemoryBlobs()
 
     async def __aenter__(self) -> _Uow:
@@ -1750,6 +1793,7 @@ def _world(
     *,
     documents: tuple[SourceDocument, ...] | None = None,
     reuse: _ReuseStub | None = None,
+    collections: tuple[SourceCollection, ...] = (),
 ) -> SimpleNamespace:
     snapshot = _snapshot()
     run = ProductionRun(
@@ -1766,7 +1810,7 @@ def _world(
         documents if documents is not None else (_document(),)
     )
     service = ProductionEditorialEnrichmentService(
-        uow_factory=lambda: _Uow(source_documents),  # type: ignore[arg-type,return-value]
+        uow_factory=lambda: _Uow(source_documents, collections),  # type: ignore[arg-type,return-value]
         artifact_store=store,  # type: ignore[arg-type]
         model_gateway=gateway,  # type: ignore[arg-type]
         editorial_enrichment_service=writer,  # type: ignore[arg-type]
@@ -1943,7 +1987,7 @@ async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_
 
 
 @pytest.mark.asyncio
-async def test_resource_search_is_blocked_by_external_access_policy_even_when_enabled() -> None:
+async def test_document_access_policy_blocks_enrichment_before_gateway() -> None:
     needs_wire = (
         "NEEDS N001\nKIND: MEDIA\nREASON: Missing figure.\n"
         "QUERY_HINT: Example incident source media\nEND NEEDS"
@@ -1956,11 +2000,31 @@ async def test_resource_search_is_blocked_by_external_access_policy_even_when_en
 
     result = await _execute(world)
 
-    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert len(world.gateway.calls) == 1
-    assert result.details["resource_proposal_search"]["status"] == (  # type: ignore[index]
-        "blocked_by_access_policy"
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == EditorialEnrichmentStageErrorCode.POLICY_BLOCKED
+    assert result.model_calls == 0
+    assert world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_collection_access_policy_blocks_enrichment_before_gateway() -> None:
+    collection = SourceCollection(
+        subject_id=_SUBJECT_ID,
+        edition_id=uuid4(),
+        requested_url="https://restricted.example/report",
+        proposed_role=SourceRole.PRIMARY,
+        external_llm_allowed=False,
     )
+    document = replace(_document(), source_collection_id=collection.id)
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    world = _world(gateway, documents=(document,), collections=(collection,))
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == EditorialEnrichmentStageErrorCode.POLICY_BLOCKED
+    assert result.model_calls == 0
+    assert world.gateway.calls == []
 
 
 @pytest.mark.asyncio
@@ -2341,10 +2405,12 @@ class _RevisionUow:
         snapshot: ProductionInputSnapshot,
         source_documents: _MemorySourceDocuments,
         artifacts: _RevisionArtifactRepository,
+        source_collections: _MemorySourceCollections,
     ) -> None:
         self.production_runs = SimpleNamespace(get_current_for_subject=self._current_run)
         self.production_input_snapshots = SimpleNamespace(get_by_run=self._snapshot_for_run)
         self.source_documents = source_documents
+        self.source_collections = source_collections
         self.blobs = _MemoryBlobs()
         self.production_artifacts = artifacts
         self._run = run
@@ -2369,6 +2435,8 @@ class _RevisionUow:
 async def _revision_harness(
     monkeypatch: pytest.MonkeyPatch,
     gateway: _RecordingGateway,
+    *,
+    collection: SourceCollection | None = None,
 ) -> SimpleNamespace:
     from cti_app.application.publication_assembly import PublicationAssemblyService
 
@@ -2385,8 +2453,14 @@ async def _revision_harness(
         lambda _payload: SimpleNamespace(),
     )
 
-    source_documents = _MemorySourceDocuments((_document(),))
-    policy = await build_synthesis_access_policy(world.snapshot, world.extraction, source_documents)
+    document = _document()
+    if collection is not None:
+        document = replace(document, source_collection_id=collection.id)
+    source_documents = _MemorySourceDocuments((document,))
+    source_collections = _MemorySourceCollections((collection,) if collection is not None else ())
+    policy = await build_synthesis_access_policy(
+        world.snapshot, world.extraction, source_documents, source_collections
+    )
     evidence_pack = build_editorial_enrichment_evidence_pack(
         world.snapshot, world.extraction, world.synthesis
     )
@@ -2455,6 +2529,7 @@ async def _revision_harness(
             snapshot=world.snapshot,
             source_documents=source_documents,
             artifacts=artifacts,
+            source_collections=source_collections,
         )
 
     world.service._uow_factory = uow_factory  # type: ignore[assignment]
@@ -2554,6 +2629,24 @@ async def test_element_revision_appends_one_version_carries_other_elements_and_i
     assert len(world.world.gateway.calls) == 1
     request = world.world.gateway.calls[0][0]
     assert request.prompt_template_id == "production-editorial-enrichment"
+    assert request.prompt_template_version == EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+    assert request.parameters["contract_version"].startswith(
+        "editorial-enrichment-revision-contract-"
+    )
+    revision_identity_payload = request.metadata["revision_request"]
+    assert revision_identity_payload["revision_prompt_version"] == (
+        EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+    )
+    assert (
+        revision_identity_payload["revision_contract_version"]
+        == (request.parameters["contract_version"])
+    )
+    assert (
+        request.metadata["editorial_revision_request_identity"]
+        == hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(revision_identity_payload)
+        ).hexdigest()
+    )
     assert request.web_search is False
     assert len(world.assembled) == len(world.rendered) == 1
     assert result.revision["element_before"] != result.revision["element_after"]
@@ -2565,6 +2658,29 @@ async def test_element_revision_appends_one_version_carries_other_elements_and_i
         result.artifact.metadata["evidence_pack_hash"] == world.base.metadata["evidence_pack_hash"]
     )
     assert result.previous_publication_artifact_id is not None
+
+
+@pytest.mark.asyncio
+async def test_collection_access_policy_blocks_revision_before_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    collection = SourceCollection(
+        subject_id=_SUBJECT_ID,
+        edition_id=uuid4(),
+        requested_url="https://restricted.example/report",
+        proposed_role=SourceRole.PRIMARY,
+        external_llm_allowed=False,
+    )
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        collection=collection,
+    )
+
+    with pytest.raises(ValueError, match="editorial_enrichment_revision_policy_blocked"):
+        await world.service.revise(**_revision_args(world))
+
+    assert world.world.gateway.calls == []
 
 
 @pytest.mark.asyncio

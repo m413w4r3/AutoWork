@@ -47,7 +47,10 @@ from cti_app.domain.edition_render import (
     EditionRender,
     compute_edition_render_input_hash,
 )
-from cti_app.domain.publication_document import PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
+from cti_app.domain.publication_document import (
+    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+)
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 EDITION_RENDERER_MANIFEST = "edition-renderer-manifest.json"
@@ -281,12 +284,12 @@ def _ensure_edition_publications_are_v4(payload: dict[str, Any]) -> None:
         if not isinstance(item, dict):
             continue
         document = item.get("document")
-        if (
-            isinstance(document, dict)
-            and document.get("schema_version") != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
-        ):
+        if isinstance(document, dict) and document.get("schema_version") not in {
+            PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+        }:
             raise EditionRenderPublicationSchemaUnsupportedError(
-                "Edition rendering requires every publication to use schema version 4"
+                "Edition rendering requires every publication to use schema version 4 or 5"
             )
 
 

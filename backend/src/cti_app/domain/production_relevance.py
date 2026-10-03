@@ -20,7 +20,7 @@ from cti_app.domain.production_synthesis import (
 )
 
 RELEVANCE_PROJECTION_SCHEMA_VERSION = 2
-RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-model-proposal-v2"
+RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-model-proposal-v3"
 DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v3-core-default"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -76,6 +76,7 @@ class RelevanceProposalRejectionReason(StrEnum):
     GENERIC_FILENAME_GUARD = "generic_filename_guard"
     FOOTER_CONTACT_GUARD = "footer_contact_guard"
     RELATION_REQUIRES_TWO_FULL_SOURCES = "relation_requires_two_full_sources"
+    CORE_PRIMARY_DEFAULT_GUARD = "core_primary_default_guard"
     RELATION_MISSING_REASON = "relation_missing_reason"
     RELATION_DUPLICATE_SOURCE_PAIR = "relation_duplicate_source_pair"
 

@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application import production_context as production_context_module
 from cti_app.application import production_extraction, production_workflow
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.model_gateway import ModelExecution, ModelGatewayError, ModelRequest
@@ -898,6 +899,7 @@ def _corpus_orchestrator(
     gateway: Any | None = None,
     collection_service: Any | None = None,
     external_llm_allowed: bool = True,
+    use_actual_context: bool = False,
 ) -> ProductionWorkflowOrchestrator:
     async def production_context(*args: object, **kwargs: object) -> Any:
         del args, kwargs
@@ -911,9 +913,19 @@ def _corpus_orchestrator(
             core_sources_text="",
             supporting_sources_text="",
             external_llm_allowed=external_llm_allowed,
+            effective_tlp=TLP.CLEAR,
         )
 
-    monkeypatch.setattr(production_workflow, "build_subject_production_context", production_context)
+    if use_actual_context:
+        monkeypatch.setattr(
+            production_workflow,
+            "build_subject_production_context",
+            production_context_module.build_subject_production_context,
+        )
+    else:
+        monkeypatch.setattr(
+            production_workflow, "build_subject_production_context", production_context
+        )
     orchestrator = ProductionWorkflowOrchestrator.__new__(ProductionWorkflowOrchestrator)
     factory = cast(Any, lambda: uow)
     orchestrator._uow_factory = factory
@@ -1177,6 +1189,47 @@ async def test_external_policy_blocks_references_without_a_model_call(
 
 
 @pytest.mark.asyncio
+async def test_document_access_policy_blocks_references_before_gateway(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://core.example/report"
+    snapshot = _core_snapshot(uuid4(), url)
+    collection, archived = _archived_collection(snapshot.subject_id, url)
+    document = SourceDocument(
+        id=archived.id,
+        subject_id=snapshot.subject_id,
+        blob_id=uuid4(),
+        original_name="source.pdf",
+        origin="test",
+        acquired_at=datetime.now(UTC),
+        license_restriction=None,
+        tlp=TLP.CLEAR,
+        do_not_submit=False,
+        external_llm_allowed=False,
+        source_collection_id=collection.id,
+    )
+    artifacts = _Artifacts([])
+    uow = _CorpusUow(artifacts, collections=[collection], documents=[document])
+    gateway = _ResearchGateway(_RAW_REFERENCES)
+    orchestrator = _corpus_orchestrator(
+        monkeypatch,
+        uow=uow,
+        store=_BlobStore(),
+        gateway=gateway,
+        use_actual_context=True,
+    )
+
+    result = await orchestrator._execute_references_stage(
+        _run_for(snapshot, status=ProductionRunStatus.RUNNING), None, snapshot
+    )
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "external_llm_blocked"
+    assert gateway.requests == []
+    assert artifacts.items == []
+
+
+@pytest.mark.asyncio
 async def test_references_rebuild_never_upgrades_a_legacy_imported_artifact(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1352,6 +1405,11 @@ class _SynthesisDocuments:
         return self.documents.get(document_id)
 
 
+class _SynthesisCollections:
+    async def get(self, _collection_id: UUID) -> SourceCollection | None:
+        return None
+
+
 class _SynthesisUow:
     """Only the frozen snapshot, the extraction and its documents are reachable."""
 
@@ -1368,6 +1426,7 @@ class _SynthesisUow:
         self.production_artifacts = artifacts
         self.production_reuse_invalidations = _Invalidations()
         self.source_documents = _SynthesisDocuments(list(documents or []))
+        self.source_collections = _SynthesisCollections()
         self.commits = 0
 
     async def __aenter__(self) -> _SynthesisUow:

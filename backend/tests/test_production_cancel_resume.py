@@ -563,7 +563,7 @@ async def test_cancel_during_extraction_resumes_extraction_without_losing_source
     assert plan.resume_from_stage is ProductionStage.EXTRACTION
     assert plan.reused_artifacts == ("references",)
     # Two sources still owe Q2, Q4 owes synthesis, and enrichment may draft once.
-    assert plan.model_calls_expected == 4
+    assert plan.model_calls_expected == 5
     assert orchestrator.calls == [
         ProductionStage.EXTRACTION,
         ProductionStage.RELEVANCE_PROJECTION,
@@ -659,7 +659,7 @@ async def test_cancel_before_references_resumes_the_first_model_stage(
     assert resumed.plan.resume_from_stage is ProductionStage.REFERENCES
     assert resumed.plan.reused_artifacts == ()
     # Q1, Q2 per archived source, Q4 synthesis, then one enrichment draft.
-    assert resumed.plan.model_calls_expected == 1 + len(SOURCE_IDS) + 2
+    assert resumed.plan.model_calls_expected == 1 + len(SOURCE_IDS) + 3
     assert orchestrator.calls[0] is ProductionStage.REFERENCES
     assert world.run.status is ProductionRunStatus.READY
 
@@ -842,6 +842,39 @@ async def test_a_fully_produced_run_replays_only_the_free_assembly() -> None:
         "synthesis",
         "editorial_enrichment",
     )
+
+
+@pytest.mark.parametrize(("enabled", "expected"), ((True, 3), (False, 2)))
+async def test_resume_cost_counts_the_optional_relevance_classifier(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool, expected: int
+) -> None:
+    from cti_app import config
+
+    monkeypatch.setattr(
+        config,
+        "get_settings",
+        lambda: SimpleNamespace(production_relevance_classifier_enabled=enabled),
+    )
+    run = ProductionRun(
+        subject_id=uuid4(),
+        edition_id=uuid4(),
+        status=ProductionRunStatus.CANCELLED,
+    )
+    artifacts = {
+        stage.value: ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=stage,
+            version=1,
+            input_hash="a" * 64,
+        )
+        for stage in (ProductionArtifactStage.REFERENCES, ProductionArtifactStage.EXTRACTION)
+    }
+
+    plan = plan_production_resume(run, artifacts=artifacts, archived_source_count=1)
+
+    assert plan.resume_from_stage is ProductionStage.RELEVANCE_PROJECTION
+    assert plan.model_calls_expected == expected
 
 
 async def test_the_log_payload_names_exactly_the_documented_fields() -> None:

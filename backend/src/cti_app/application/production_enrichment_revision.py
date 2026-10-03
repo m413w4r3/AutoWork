@@ -28,8 +28,8 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment_proposal,
 )
 from cti_app.application.production_prompts import (
-    EDITORIAL_ENRICHMENT_PROMPT_VERSION,
-    EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+    EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
+    EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
 from cti_app.application.production_stages import EditorialEnrichmentService
@@ -125,6 +125,8 @@ class ProductionEditorialEnrichmentRevisionService:
             "element_key": element_key,
             "action": action.value,
             "instruction": normalized_instruction,
+            "revision_prompt_version": EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
+            "revision_contract_version": EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
         }
         request_identity = hashlib.sha256(
             ProductionArtifactStore.canonical_json_bytes(request_identity_payload)
@@ -191,7 +193,10 @@ class ProductionEditorialEnrichmentRevisionService:
 
         async with self._enrichment._uow_factory() as uow:
             access_policy = await build_synthesis_access_policy(
-                snapshot, extraction, uow.source_documents
+                snapshot,
+                extraction,
+                uow.source_documents,
+                uow.source_collections,
             )
             inventory = await load_archived_source_figure_inventory(
                 subject_id=subject_id,
@@ -655,6 +660,36 @@ class ProductionEditorialEnrichmentRevisionService:
     ) -> Any:
         from cti_app.application.model_gateway import ModelRequest, ModelRoutingHint
 
+        target_base_element = base_element
+        if element_kind is EditorialEnrichmentElementKind.FIGURE:
+            resolved = base_element.get("resolved_figure")
+            resolved_id = resolved.get("figure_id") if isinstance(resolved, dict) else None
+            catalog_record: dict[str, Any] = next(
+                (
+                    entry.prompt_record()
+                    for entry in figure_catalog
+                    if str(entry.figure.figure_id) == resolved_id
+                ),
+                {},
+            )
+            from cti_app.application.production_editorial_enrichment import (
+                _safe_figure_prompt_text,
+            )
+
+            target_base_element = {
+                "key": element_key,
+                "caption": _safe_figure_prompt_text(base_element.get("caption")),
+                "figure_handle": catalog_record.get("handle"),
+                "anchor": catalog_record.get("anchor")
+                or catalog_record.get("figure_label")
+                or catalog_record.get("nearby_heading"),
+                "page": catalog_record.get("page"),
+                "dimensions": catalog_record.get("dimensions", {"width": None, "height": None}),
+                "provenance_summary": catalog_record.get(
+                    "provenance_summary", "Archived source media"
+                ),
+            }
+
         prompt_payload = {
             "instructions": (
                 "Révise uniquement l'élément ciblé. Utilise exclusivement les handles du "
@@ -671,7 +706,7 @@ class ProductionEditorialEnrichmentRevisionService:
             "target": {
                 "kind": element_kind.value,
                 "key": element_key,
-                "base_element": base_element,
+                "base_element": target_base_element,
                 "base_element_evidence_handles": element_evidence_handles,
             },
             "admitted_evidence_pack": {
@@ -689,14 +724,14 @@ class ProductionEditorialEnrichmentRevisionService:
             },
             "figure_catalog": [value.prompt_record() for value in figure_catalog],
             "output_contract": editorial_enrichment_output_contract_example(),
-            "output_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+            "output_contract_version": (EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION),
         }
         return ModelRequest(
             text=json.dumps(
                 prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
             ),
             prompt_template_id="production-editorial-enrichment",
-            prompt_template_version=EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+            prompt_template_version=EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
             evidence_pack_hash=evidence_pack_hash,
             external_llm_allowed=access_policy.external_llm_allowed
             and not access_policy.do_not_submit,
@@ -720,7 +755,7 @@ class ProductionEditorialEnrichmentRevisionService:
                 "revision_request": request_identity_payload,
             },
             parameters={
-                "contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+                "contract_version": EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION,
                 "revision": True,
             },
         )

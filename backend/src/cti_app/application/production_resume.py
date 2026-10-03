@@ -184,6 +184,10 @@ def plan_production_resume(
         if stage is ProductionStage.EXTRACTION:
             pending = pending_extraction_sources(run.extraction_progress)
             model_calls += pending if pending is not None else archived_source_count
+        elif stage is ProductionStage.RELEVANCE_PROJECTION:
+            from cti_app.config import get_settings
+
+            model_calls += int(get_settings().production_relevance_classifier_enabled)
         else:
             model_calls += _STAGE_MODEL_CALLS[stage]
 

@@ -42,6 +42,8 @@ from cti_app.application.production_synthesis import (
     synthesis_evidence_pack_hash,
 )
 from cti_app.domain.classification import TLP
+from cti_app.domain.collection import CollectionState, SourceCollection
+from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
     ProductionArtifact,
@@ -55,8 +57,9 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionEditorialRole
+from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
 from cti_app.domain.production_relevance import (
+    DEFAULT_RELEVANCE_CLASSIFIER_VERSION,
     RelevanceClassification,
     RelevanceDecisionProvenance,
     RelevanceProposalRejectionReason,
@@ -281,8 +284,14 @@ class _MemoryStore:
 
 
 class _MemoryUow:
-    def __init__(self, documents: dict[UUID, object], artifacts: _MemoryArtifacts) -> None:
+    def __init__(
+        self,
+        documents: dict[UUID, object],
+        artifacts: _MemoryArtifacts,
+        collections: tuple[SourceCollection, ...] = (),
+    ) -> None:
         self.source_documents = _MemorySourceDocuments(documents)
+        self.source_collections = _MemorySourceCollections(collections)
         self.production_artifacts = artifacts
         self.commits = 0
 
@@ -304,6 +313,14 @@ class _MemorySourceDocuments:
         return self.documents.get(source_id)
 
 
+class _MemorySourceCollections:
+    def __init__(self, collections: tuple[SourceCollection, ...]) -> None:
+        self.collections = {item.id: item for item in collections}
+
+    async def get(self, collection_id: UUID):
+        return self.collections.get(collection_id)
+
+
 class _MemoryUowFactory:
     def __init__(self, uow: _MemoryUow) -> None:
         self.uow = uow
@@ -317,6 +334,8 @@ def _service_world(
     extraction: ProductionExtractionV1,
     source_ids: tuple[UUID, ...],
     gateway: _FakeGateway,
+    *,
+    collections: tuple[SourceCollection, ...] = (),
 ) -> Any:
     documents = {
         source_id: SimpleNamespace(
@@ -325,11 +344,12 @@ def _service_world(
             tlp=TLP.CLEAR,
             external_llm_allowed=True,
             do_not_submit=False,
+            source_collection_id=None,
         )
         for source_id in source_ids
     }
     artifacts = _MemoryArtifacts()
-    uow = _MemoryUow(documents, artifacts)
+    uow = _MemoryUow(documents, artifacts, collections)
     extraction_blob_id = uuid4()
     store = _MemoryStore(
         {
@@ -460,7 +480,7 @@ def test_explicit_none_marker_is_a_valid_empty_proposal() -> None:
     assert unintelligible.error_code == "relevance_classifier_unintelligible_response"
 
 
-def test_model_direct_ioc_without_documented_relation_is_downgraded() -> None:
+def test_model_direct_core_ioc_without_documented_relation_keeps_baseline() -> None:
     snapshot, extraction, _ = _world()
     pack = build_relevance_model_evidence_pack(snapshot, extraction)
     ioc_ref = _ref_for(extraction, EvidenceKind.INDICATOR, "198.51.100.27")
@@ -484,8 +504,60 @@ def test_model_direct_ioc_without_documented_relation_is_downgraded() -> None:
     )
 
     decision = merged.classification_for(ioc_ref)
-    assert decision.classification is RelevanceClassification.INDETERMINATE
-    assert decision.provenance is RelevanceDecisionProvenance.MODEL_PROPOSAL
+    assert decision.classification is RelevanceClassification.DIRECT
+    assert decision.provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+    assert any(
+        item.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
+        for item in merged.model_proposal_rejections
+    )
+
+
+def test_model_cannot_promote_supporting_ioc_from_unrelated_core_fact() -> None:
+    snapshot, extraction, _ = _world()
+    support_id = uuid4()
+    supporting = _source(
+        support_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        indicators=(
+            _indicator(
+                support_id,
+                "203.0.113.90",
+                ArtifactType.IP,
+                context="A supporting IOC with no relation to the primary report.",
+            ),
+        ),
+    )
+    extraction = _extraction(snapshot, (*extraction.sources, supporting))
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    ioc_ref = _ref_for(extraction, EvidenceKind.INDICATOR, "203.0.113.90")
+    unrelated_core_fact = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    parsed = parse_relevance_classifier_wire(
+        _wire_classification(
+            pack._handle_for_ref[ioc_ref],
+            "DIRECT",
+            "malicious_subject_relation",
+            supporting=pack._handle_for_ref[unrelated_core_fact],
+        ),
+        pack,
+        extraction,
+    )
+    baseline = build_relevance_projection(snapshot, extraction)
+    from cti_app.application.production_relevance_model import ModelRelevanceProposalExecution
+
+    merged = ProductionRelevanceProjectionService._merge_model_proposals(
+        baseline,
+        extraction,
+        ModelRelevanceProposalExecution(
+            status=RelevanceProposalStatus.SUCCEEDED,
+            classifications=parsed.classifications,
+            rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+        ),
+    )
+
+    assert (
+        merged.classification_for(ioc_ref).classification is RelevanceClassification.INDETERMINATE
+    )
     assert any(
         item.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
         for item in merged.model_proposal_rejections
@@ -588,6 +660,139 @@ async def test_unintelligible_and_ambiguous_model_results_require_review_without
     assert result.artifact is None
     assert world.artifacts.items == []
     assert len(ambiguous_gateway.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_code", "expected_calls"),
+    [
+        ("unintelligible", "relevance_classifier_unintelligible_response", 1),
+        ("no_valid_blocks", "relevance_classifier_no_valid_blocks", 1),
+        ("policy", "relevance_classifier_policy_blocked", 0),
+        ("do_not_submit", "relevance_classifier_policy_blocked", 0),
+        ("auth", "relevance_classifier_model_call_failed", 1),
+        ("access_policy", "relevance_classifier_access_policy_unavailable", 0),
+    ],
+)
+async def test_nonambiguous_classifier_failures_persist_deterministic_fallback(
+    failure: str, expected_code: str, expected_calls: int
+) -> None:
+    snapshot, extraction, source_ids = _world()
+    responses: list[str] | Exception
+    if failure == "unintelligible":
+        responses = ["I cannot classify this evidence."]
+    elif failure == "no_valid_blocks":
+        responses = ["@@ CLASSIFICATION BAD @@\nclassification: MYSTERY\nEND CLASSIFICATION"]
+    elif failure == "auth":
+        responses = ModelGatewayError("provider authentication failed")
+    else:
+        responses = ["unused"]
+    gateway = _FakeGateway(responses)
+    world = _service_world(snapshot, extraction, source_ids, gateway)
+    if failure == "policy":
+        world.uow.source_documents.documents[source_ids[0]].external_llm_allowed = False
+    elif failure == "do_not_submit":
+        world.uow.source_documents.documents[source_ids[0]].do_not_submit = True
+    elif failure == "access_policy":
+        world.uow.source_documents.documents.pop(source_ids[0])
+
+    result = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert result.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert result.projection.classifier_version == DEFAULT_RELEVANCE_CLASSIFIER_VERSION
+    assert result.model_calls == expected_calls
+    assert len(gateway.calls) == expected_calls
+    assert result.details is not None
+    assert result.details["model_classifier_fallback"]["error_code"] == expected_code
+    assert world.artifacts.items[0].metadata["model_classifier_fallback"]["error_code"] == (
+        expected_code
+    )
+
+
+@pytest.mark.asyncio
+async def test_collection_policy_blocks_classifier_before_gateway_call() -> None:
+    snapshot, extraction, source_ids = _world()
+    collection = SourceCollection(
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+        requested_url="https://core.example/report",
+        proposed_role=SourceRole.PRIMARY,
+        state=CollectionState.ARCHIVED,
+        source_tlp=TLP.AMBER_STRICT,
+        external_llm_allowed=False,
+    )
+    gateway = _FakeGateway(["unused"])
+    world = _service_world(snapshot, extraction, source_ids, gateway, collections=(collection,))
+    world.uow.source_documents.documents[source_ids[0]].source_collection_id = collection.id
+
+    result = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert result.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert result.details is not None
+    assert result.details["model_classifier_fallback"]["error_code"] == (
+        "relevance_classifier_policy_blocked"
+    )
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_on_existing_baseline_still_succeeds_and_records_metadata() -> None:
+    snapshot, extraction, source_ids = _world()
+    gateway = _FakeGateway(["unused"])
+    world = _service_world(snapshot, extraction, source_ids, gateway)
+    world.service = ProductionRelevanceProjectionService(
+        _MemoryUowFactory(world.uow),
+        world.store,  # type: ignore[arg-type]
+        model_gateway=gateway,
+        model_enabled=False,
+    )
+    baseline = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+    world.uow.source_documents.documents[source_ids[0]].external_llm_allowed = False
+    world.service = ProductionRelevanceProjectionService(
+        _MemoryUowFactory(world.uow),
+        world.store,  # type: ignore[arg-type]
+        model_gateway=gateway,
+    )
+
+    fallback = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert baseline.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert fallback.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert fallback.artifact is not None
+    assert fallback.artifact.metadata["model_classifier_fallback"]["error_code"] == (
+        "relevance_classifier_policy_blocked"
+    )
+    assert fallback.details["model_classifier_fallback"]["error_code"] == (
+        "relevance_classifier_policy_blocked"
+    )
+    assert gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_classifier_retries_after_fallback_with_model_classifier_identity() -> None:
+    snapshot, extraction, source_ids = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    target = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    gateway = _FakeGateway(
+        [
+            "I cannot classify this evidence.",
+            _wire_classification(
+                pack._handle_for_ref[target], "CONTEXT", "context_source_without_relation"
+            ),
+        ]
+    )
+    world = _service_world(snapshot, extraction, source_ids, gateway)
+
+    first = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+    next_run = replace(world.run, id=uuid4())
+    next_extraction_artifact = replace(world.extraction_artifact, production_run_id=next_run.id)
+    second = await world.service.execute(next_run, snapshot, next_extraction_artifact)
+
+    assert first.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert second.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert first.projection.classifier_version == DEFAULT_RELEVANCE_CLASSIFIER_VERSION
+    assert second.projection.classifier_version.startswith("model-subject-scope-v2:")
+    assert len(gateway.calls) == 2
 
 
 @pytest.mark.asyncio

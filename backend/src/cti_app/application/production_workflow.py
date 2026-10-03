@@ -999,6 +999,7 @@ class ProductionWorkflowOrchestrator:
             evidence_pack_hash=hashlib.sha256(prompt.encode()).hexdigest(),
             external_llm_allowed=ctx.external_llm_allowed,
             routing_hint=ModelRoutingHint.WEB_RESEARCH,
+            sensitivity=ctx.effective_tlp.value,
             web_search=True,
             conversation=None,
             run_id=model_run_id,
@@ -1042,6 +1043,13 @@ class ProductionWorkflowOrchestrator:
         # here and re-projected later for the stages that still need them.
         parsed = parse_production_reference_proposals(raw, research_date)
         self._log_parse(run, "references", parsed)
+        if parsed.errors:
+            return {
+                "stage": "references",
+                "status": "needs_review",
+                "error_code": parsed.errors[0],
+                "error": "Reference reply is uninterpretable and has no usable source blocks.",
+            }
         await self._check_cancellation(run.id, context)
         collection = await self._collect_reference_proposals(
             run, parsed.value or (), context, snapshot

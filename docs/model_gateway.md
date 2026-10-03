@@ -36,6 +36,7 @@ implémentation expose toutes les capacités OpenAI.
 Les variables `MODEL_ROUTE_<HINT>` configurent le mapping `ModelRoutingHint -> ModelBackend`.
 `MODEL_ROUTE_EDITORIAL_ENRICHMENT` configure séparément le backend de l’enrichissement éditorial ;
 il accepte `chatgpt_bridge`, `qwen` ou `fake` (Gemini WebAI n’a pas encore de contrat structured).
+`PRODUCTION_RELEVANCE_CLASSIFIER_ENABLED` active les propositions de classement assistées par modèle (par défaut `true`), tandis que `PRODUCTION_EDITORIAL_RESOURCE_SEARCH_ENABLED` active la recherche web bornée de ressources manquantes dans l’enrichissement (par défaut `false`).
 
 Sur `chatgpt_bridge`, le routeur choisit l’adaptateur selon le rôle **et** l’exigence de sortie
 structurée : un `draft()` sans schéma utilise l’adaptateur drafting textuel, un `draft()` avec

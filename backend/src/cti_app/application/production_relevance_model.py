@@ -759,7 +759,7 @@ class ModelRelevanceClassifier:
     def version(self) -> str:
         return ":".join(
             (
-                "model-subject-scope-v1",
+                "model-subject-scope-v2",
                 self._contract_version,
                 self._prompt_version,
                 self._parser_version,

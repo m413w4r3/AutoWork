@@ -429,13 +429,28 @@ def test_production_reference_proposal_requires_reason_and_accepts_no_new_source
         date(2026, 8, 1),
     )
     empty = parse_production_reference_proposals(
-        "# REFERENCES\neditorial-title: legacy\n## EVENT R1\ntext: ignored",
+        "NO NEW SOURCES",
         date(2026, 8, 1),
     )
 
     assert missing_reason.usable and missing_reason.value == ()
     assert "reference_missing_reason" in missing_reason.warnings
     assert empty.usable and empty.value == ()
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "I cannot help with that request.",
+        "```text\nI cannot help with that request.\n```",
+        "<!-- BRIDGE:response-start -->\n<!-- BRIDGE:response-end -->",
+    ),
+)
+def test_unintelligible_nonempty_reference_response_is_invalid(raw: str) -> None:
+    parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
+
+    assert not parsed.usable
+    assert parsed.errors == ["reference_unintelligible_response"]
 
 
 def test_legacy_reference_projection_filters_to_eligible_corpus_sources_and_handles_v4() -> None:

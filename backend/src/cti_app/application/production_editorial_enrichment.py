@@ -496,30 +496,28 @@ class EditorialFigureCatalogEntry:
         )
 
     def prompt_record(self) -> dict[str, Any]:
-        locator = self.figure.locator.figure_label or self.figure.locator.section or "unspecified"
         return {
             "handle": self.handle,
             "source_role": self.source_role,
             "editorial_role": self.editorial_role,
-            "caption": _bounded_catalog_text(self.metadata.caption_text),
-            "alt": _bounded_catalog_text(self.metadata.alt_text),
-            "nearby_heading": _bounded_catalog_text(
+            "caption": _safe_figure_prompt_text(self.metadata.caption_text),
+            "alt": _safe_figure_prompt_text(self.metadata.alt_text),
+            "nearby_heading": _safe_figure_prompt_text(
                 self.metadata.nearby_heading_text or self.figure.locator.section
             ),
-            "figure_label": _bounded_catalog_text(self.figure.locator.figure_label),
+            "figure_label": _safe_figure_prompt_text(self.figure.locator.figure_label),
             "page": self.figure.locator.page,
-            "anchor": _bounded_catalog_text(self.metadata.anchor),
+            "anchor": _safe_figure_prompt_text(self.metadata.anchor),
             "dimensions": {
                 "width": self.metadata.width,
                 "height": self.metadata.height,
             },
             "mime_type": self.figure.mime_type,
             "provenance_summary": _bounded_catalog_text(
-                f"Archived source media; role={self.source_role}; locator={locator}"
+                f"Archived source media; role={self.source_role}"
             ),
-            "original_asset_url": _bounded_catalog_text(self.figure.locator.original_asset_url),
             "decision": self.figure.decision.value,
-            "decision_reason": self.figure.decision_reason,
+            "decision_reason": _safe_figure_prompt_text(self.figure.decision_reason),
         }
 
 
@@ -528,6 +526,19 @@ def _bounded_catalog_text(value: str | None, limit: int = 400) -> str | None:
         return None
     text = " ".join(value.split())
     return text[:limit] if text else None
+
+
+def _safe_figure_prompt_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = re.sub(r"https?://\S+", "[redacted URL]", value, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+        "[redacted ID]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _bounded_catalog_text(text)
 
 
 def _proposal_annotation_to_domain(
@@ -2328,32 +2339,46 @@ def _synthesis_prompt_projection(
     synthesis: ProductionSynthesisV1,
     handle_for_ref: Mapping[ExtractionEvidenceRefV1, str],
 ) -> dict[str, Any]:
-    def paragraph(item: Any, anchor: str) -> dict[str, Any]:
+    def paragraph(item: Any, anchor: str) -> dict[str, Any] | None:
+        if any(
+            ref.kind is EvidenceKind.UNCERTAINTY and ref not in handle_for_ref
+            for ref in item.evidence_refs
+        ):
+            return None
         return {
             "anchor": anchor,
             "text": item.text,
             "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
         }
 
+    lead = [
+        projected
+        for index, item in enumerate(synthesis.lead, start=1)
+        if (projected := paragraph(item, lead_paragraph_anchor(index))) is not None
+    ]
+    sections: list[dict[str, Any]] = []
+    for index, section in enumerate(synthesis.sections):
+        paragraphs = [
+            projected
+            for paragraph_index, item in enumerate(section.paragraphs, start=1)
+            if (projected := paragraph(item, section_paragraph_anchor(index, paragraph_index)))
+            is not None
+        ]
+        if paragraphs:
+            sections.append(
+                {
+                    "section_index": index,
+                    "kind": section.kind.value,
+                    "heading": section.heading,
+                    "paragraphs": paragraphs,
+                }
+            )
+
     return {
         "language": synthesis.publication_language,
         "title": synthesis.title,
-        "lead": [
-            paragraph(item, lead_paragraph_anchor(index))
-            for index, item in enumerate(synthesis.lead, start=1)
-        ],
-        "sections": [
-            {
-                "section_index": index,
-                "kind": section.kind.value,
-                "heading": section.heading,
-                "paragraphs": [
-                    paragraph(item, section_paragraph_anchor(index, paragraph_index))
-                    for paragraph_index, item in enumerate(section.paragraphs, start=1)
-                ],
-            }
-            for index, section in enumerate(synthesis.sections)
-        ],
+        "lead": lead,
+        "sections": sections,
         "timeline": [
             {
                 "event_date": item.event_date.isoformat() if item.event_date else None,
@@ -2362,6 +2387,10 @@ def _synthesis_prompt_projection(
                 "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
             }
             for item in synthesis.timeline
+            if not any(
+                ref.kind is EvidenceKind.UNCERTAINTY and ref not in handle_for_ref
+                for ref in item.evidence_refs
+            )
         ],
     }
 
@@ -2399,6 +2428,11 @@ def build_editorial_enrichment_evidence_pack(
     source_by_id = {source.source_document_id: source for source in extraction.sources}
 
     def admitted(ref: ExtractionEvidenceRefV1) -> bool:
+        if (
+            ref.kind is EvidenceKind.UNCERTAINTY
+            and source_by_id[ref.source_document_id].profile is not ExtractionProfile.FULL
+        ):
+            return False
         if projection is None:
             return True
         return projection.classification_for(ref).classification not in {
@@ -2410,6 +2444,10 @@ def build_editorial_enrichment_evidence_pack(
         ref
         for ref in entries
         if projection is not None
+        and (
+            ref.kind is not EvidenceKind.UNCERTAINTY
+            or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+        )
         and projection.classification_for(ref).classification
         is RelevanceClassification.COUNTER_INDICATION
     }
@@ -2418,6 +2456,10 @@ def build_editorial_enrichment_evidence_pack(
             ref
             for relation in projection.source_pair_relations
             for ref in relation.supporting_evidence_refs
+            if (
+                ref.kind is not EvidenceKind.UNCERTAINTY
+                or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
+            )
         }
         if projection is not None
         else set()
@@ -3487,7 +3529,10 @@ class ProductionEditorialEnrichmentService:
             async with self._uow_factory() as uow:
                 try:
                     access_policy = await build_synthesis_access_policy(
-                        snapshot, extraction, uow.source_documents
+                        snapshot,
+                        extraction,
+                        uow.source_documents,
+                        uow.source_collections,
                     )
                 except ProductionReuseStorageUnavailableError:
                     raise
@@ -3542,7 +3587,7 @@ class ProductionEditorialEnrichmentService:
         )
         if reused is not None:
             return reused
-        if access_policy.do_not_submit:
+        if access_policy.do_not_submit or not access_policy.external_llm_allowed:
             return self._needs_review(
                 input_hash=input_hash,
                 model_run_id=None,
@@ -3550,7 +3595,7 @@ class ProductionEditorialEnrichmentService:
                 error_code=EditorialEnrichmentStageErrorCode.POLICY_BLOCKED,
                 error_message="The source access policy forbids any model submission.",
                 details={
-                    "do_not_submit": True,
+                    "do_not_submit": access_policy.do_not_submit,
                     "external_llm_allowed": access_policy.external_llm_allowed,
                     "access_policy_hash": access_policy_hash,
                 },
