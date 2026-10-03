@@ -71,6 +71,7 @@ from cti_app.application.source_figure_inventory import (
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
 )
+from cti_app.application.source_media_collection import SourceMediaArchiveService
 from cti_app.domain.model_runs import ModelRun, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -2080,6 +2081,7 @@ class ProductionEditorialEnrichmentService:
         artifact_reuse: ProductionArtifactReuseService | None = None,
         media_asset_store: MediaAssetStore | None = None,
         diagram_compiler: DiagramCompiler | None = None,
+        source_media_archiver: SourceMediaArchiveService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
@@ -2091,6 +2093,7 @@ class ProductionEditorialEnrichmentService:
             SourceFigureIngestor(media_asset_store) if media_asset_store is not None else None
         )
         self._diagram_compiler = diagram_compiler
+        self._source_media_archiver = source_media_archiver
 
     async def execute(
         self,
@@ -2127,6 +2130,7 @@ class ProductionEditorialEnrichmentService:
                     source_document_repository=uow.source_documents,
                     blob_repository=uow.blobs,
                     artifact_store=self._artifact_store,
+                    media_archiver=self._source_media_archiver,
                 )
             await self._ingest_source_figures(source_figure_inventory)
             evidence_pack = build_editorial_enrichment_evidence_pack(

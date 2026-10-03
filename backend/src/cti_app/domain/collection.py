@@ -71,6 +71,11 @@ class DetectedMimeType(StrEnum):
     PDF = "application/pdf"
     TEXT = "text/plain"
     JSON = "application/json"
+    PNG = "image/png"
+    JPEG = "image/jpeg"
+    GIF = "image/gif"
+    WEBP = "image/webp"
+    SVG = "image/svg+xml"
 
 
 class ClaimKind(StrEnum):

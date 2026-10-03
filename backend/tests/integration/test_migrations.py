@@ -69,6 +69,7 @@ from cti_app.infrastructure.database.models import (  # noqa: F401
     publication_render,
     publication_review,
     selection,
+    source_media,
 )
 from cti_app.infrastructure.database.models.base import Base
 from tests.integration.conftest import _alembic_config

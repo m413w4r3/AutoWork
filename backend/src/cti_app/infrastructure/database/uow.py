@@ -61,6 +61,7 @@ from cti_app.application.persistence import (
     SourceCollectionRepository,
     SourceDocumentRepository,
     SourceExtractionRepository,
+    SourceMediaRepository,
     SubjectContributionRepository,
     SubjectDiscoveryOriginRepository,
     SubjectMergeEventRepository,
@@ -166,6 +167,9 @@ from cti_app.infrastructure.database.repositories.selection import (
     SqlAlchemySelectionIdempotencyRepository,
     SqlAlchemySubjectDiscoveryOriginRepository,
 )
+from cti_app.infrastructure.database.repositories.source_media import (
+    SqlAlchemySourceMediaRepository,
+)
 
 
 class SqlAlchemyUnitOfWork:
@@ -184,6 +188,7 @@ class SqlAlchemyUnitOfWork:
     selection_idempotency: SelectionIdempotencyRepository
     subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
+    source_media_candidates: SourceMediaRepository
     samples: SampleRepository
     sample_feature_sets: SampleFeatureSetRepository
     sample_acquisition_attempts: SampleAcquisitionAttemptRepository
@@ -259,6 +264,7 @@ class SqlAlchemyUnitOfWork:
         self.selection_idempotency = SqlAlchemySelectionIdempotencyRepository(self._session)
         self.subject_discovery_origins = SqlAlchemySubjectDiscoveryOriginRepository(self._session)
         self.source_documents = SqlAlchemySourceDocumentRepository(self._session)
+        self.source_media_candidates = SqlAlchemySourceMediaRepository(self._session)
         self.samples = SqlAlchemySampleRepository(self._session)
         self.sample_feature_sets = SqlAlchemySampleFeatureSetRepository(self._session)
         self.sample_acquisition_attempts = SqlAlchemySampleAcquisitionAttemptRepository(

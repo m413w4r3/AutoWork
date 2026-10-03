@@ -88,6 +88,7 @@ from cti_app.domain.selection import (
     SelectionIdempotencyRecord,
     SubjectDiscoveryOrigin,
 )
+from cti_app.domain.source_media import SourceMediaRecord
 from cti_app.domain.typst_render import TypstRenderAcquisition
 from cti_app.domain.virustotal import VirusTotalFileView, VirusTotalObservation
 
@@ -402,6 +403,16 @@ class SourceDocumentRepository(Protocol):
     async def save(self, document: SourceDocument) -> None: ...
 
     async def list_for_subject(self, subject_id: UUID) -> Sequence[SourceDocument]: ...
+
+
+class SourceMediaRepository(Protocol):
+    async def get(self, candidate_id: UUID) -> SourceMediaRecord | None: ...
+
+    async def list_for_subject_policy(
+        self, subject_id: UUID, policy_sha256: str
+    ) -> Sequence[SourceMediaRecord]: ...
+
+    async def add_if_absent(self, record: SourceMediaRecord) -> SourceMediaRecord: ...
 
 
 class SampleRepository(Protocol):
@@ -774,6 +785,7 @@ class UnitOfWork(Protocol):
     selection_idempotency: SelectionIdempotencyRepository
     subject_discovery_origins: SubjectDiscoveryOriginRepository
     source_documents: SourceDocumentRepository
+    source_media_candidates: SourceMediaRepository
     samples: SampleRepository
     sample_feature_sets: SampleFeatureSetRepository
     sample_acquisition_attempts: SampleAcquisitionAttemptRepository
@@ -1161,6 +1173,7 @@ class ProductionUnitOfWork(Protocol):
     # A repair reads the archived source back to verify a corrected value,
     # so the archived document and its blob are part of this contract.
     source_documents: SourceDocumentRepository
+    source_media_candidates: SourceMediaRepository
     blobs: BlobRepository
 
     async def __aenter__(self) -> Self: ...

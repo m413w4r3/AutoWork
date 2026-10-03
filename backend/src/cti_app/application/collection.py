@@ -37,6 +37,7 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.persistence import UnitOfWork, UnitOfWorkFactory
 from cti_app.application.source_filenames import analyst_filename
+from cti_app.application.source_media_collection import SourceMediaArchiveService
 from cti_app.application.subject_lineage import resolve_subject_discovery_lineage
 from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.domain.collection import (
@@ -250,6 +251,11 @@ class SubjectCollectionService:
         self._collector = collector
         self._blob_store = blob_store
         self._catalog = BlobCatalogService(blob_store, uow_factory)
+        self._source_media_archiver = SourceMediaArchiveService(
+            uow_factory,
+            collector,
+            blob_store,
+        )
         self._policy = self._collector.policy
         self._workspace_materializer = workspace_materializer
         self._workspace_root = workspace_root
@@ -462,6 +468,10 @@ class SubjectCollectionService:
     @property
     def policy_snapshot(self) -> CollectionPolicySnapshot:
         return self._policy_snapshot
+
+    @property
+    def source_media_archiver(self) -> SourceMediaArchiveService:
+        return self._source_media_archiver
 
     async def attempts(self, collection_id: UUID) -> list[CollectionAttempt]:
         async with self._uow_factory() as uow:

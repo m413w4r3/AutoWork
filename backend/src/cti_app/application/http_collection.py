@@ -228,6 +228,7 @@ class SafeHttpCollector:
         requested_url: str,
         *,
         cancellation_check: CancellationCheck | None = None,
+        allow_images: bool = False,
     ) -> CollectedResponse:
         current = requested_url.strip()
         redirects: list[str] = []
@@ -366,7 +367,7 @@ class SafeHttpCollector:
                 decoded_body, content_encoding = _decode_body(
                     response.encoded_body, response.headers, self.policy
                 )
-                detected = _detect_mime(decoded_body)
+                detected = _detect_mime(decoded_body, allow_images=allow_images)
             except CollectionError as exc:
                 exc.with_context(
                     final_url=current,
@@ -524,7 +525,11 @@ def _bounded_decompress(body: bytes, limit: int, window_bits: int) -> bytes:
     return expanded
 
 
-def _detect_mime(body: bytes) -> DetectedMimeType:
+def _detect_mime(body: bytes, *, allow_images: bool = False) -> DetectedMimeType:
+    if allow_images:
+        image_mime = _sniff_image_mime(body)
+        if image_mime is not None:
+            return image_mime
     prefix = body[:1024]
     if prefix.startswith(b"\xef\xbb\xbf"):
         prefix = prefix[3:]
@@ -546,6 +551,21 @@ def _detect_mime(body: bytes) -> DetectedMimeType:
     if "\x00" not in decoded:
         return DetectedMimeType.TEXT
     raise UnsupportedContentError("Detected content type is not supported")
+
+
+def _sniff_image_mime(body: bytes) -> DetectedMimeType | None:
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return DetectedMimeType.PNG
+    if body.startswith(b"\xff\xd8\xff"):
+        return DetectedMimeType.JPEG
+    if body.startswith((b"GIF87a", b"GIF89a")):
+        return DetectedMimeType.GIF
+    if len(body) >= 12 and body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return DetectedMimeType.WEBP
+    prefix = body[:1024].lstrip(b"\xef\xbb\xbf\x00\t\r\n ")
+    if re.match(rb"(?:<\?xml[^>]*\?>\s*)?<svg(?:\s|>)", prefix, re.IGNORECASE):
+        return DetectedMimeType.SVG
+    return None
 
 
 def _content_type(value: str | None) -> str | None:

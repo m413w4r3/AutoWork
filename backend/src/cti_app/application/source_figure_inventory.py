@@ -1,4 +1,4 @@
-"""Deterministic, network-free inventory of figures in archived source blobs."""
+"""Deterministic source-figure inventory backed by archived media blobs."""
 
 from __future__ import annotations
 
@@ -9,12 +9,16 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from html.parser import HTMLParser
-from io import BytesIO
-from urllib.parse import unquote_to_bytes, urljoin, urlsplit
+from typing import Protocol
+from urllib.parse import unquote_to_bytes
 from uuid import UUID
 
 from cti_app.application.persistence import BlobRepository, SourceDocumentRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.source_media_extraction import (
+    SourceMediaObservation,
+    extract_source_media_observations,
+)
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.discovery import canonicalize_http_url
 from cti_app.domain.entities import SourceDocument
@@ -27,6 +31,7 @@ from cti_app.domain.production_editorial_enrichment import (
     source_figure_id,
 )
 from cti_app.domain.production_extraction import ProductionSourceExtractionV1
+from cti_app.domain.source_media import SourceMediaRecord, SourceMediaStatus
 
 MAX_SOURCE_FIGURES = 64
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
@@ -62,6 +67,7 @@ class SourceFigureInventoryResult:
     figures: tuple[ResolvedSourceFigureV1, ...]
     truncated: bool = False
     warnings: tuple[str, ...] = ()
+    policy_sha256: str | None = None
 
     @property
     def accepted(self) -> tuple[ResolvedSourceFigureV1, ...]:
@@ -73,6 +79,7 @@ class SourceFigureInventoryResult:
         payload = {
             "truncated": self.truncated,
             "warnings": list(self.warnings),
+            "policy_sha256": self.policy_sha256,
             "figures": [
                 {
                     "figure_id": str(figure.figure_id),
@@ -120,7 +127,7 @@ class _ImageElementParser(HTMLParser):
 
 
 class SourceFigureInventory:
-    """Find source images without fetching URLs or creating media blobs."""
+    """Resolve source observations against locally archived media blobs."""
 
     def __init__(
         self,
@@ -147,6 +154,9 @@ class SourceFigureInventory:
         self,
         sources: tuple[ArchivedFigureSource, ...],
         assets: tuple[ArchivedFigureAsset, ...],
+        *,
+        media_candidates: tuple[SourceMediaRecord, ...] = (),
+        policy_sha256: str | None = None,
     ) -> SourceFigureInventoryResult:
         source_by_id = {source.source_document_id: source for source in sources}
         if len(source_by_id) != len(sources):
@@ -266,6 +276,17 @@ class SourceFigureInventory:
                 found.append(figure)
             return True
 
+        observations_by_source: dict[UUID, list[SourceMediaObservation]] = {}
+        for observation in extract_source_media_observations(tuple(ordered_sources)):
+            observations_by_source.setdefault(observation.source_document_id, []).append(
+                observation
+            )
+        media_by_location = {
+            (record.source_document_id, record.dom_locator): record
+            for record in media_candidates
+            if record.dom_locator is not None
+        }
+
         for source in ordered_sources:
             if (
                 len(source.content) > self._max_source_bytes
@@ -274,162 +295,136 @@ class SourceFigureInventory:
                 warnings.add("source_figure_source_exceeds_byte_limit")
                 continue
             mime_type = _normalized_mime(source.mime_type)
-            if mime_type in {"text/html", "application/xhtml+xml"}:
-                try:
-                    parser = _ImageElementParser()
-                    parser.feed(source.content.decode("utf-8", errors="replace"))
-                    parser.close()
-                except Exception:
-                    warnings.add("source_figure_html_parse_failed")
+            if mime_type == "application/pdf":
+                _pdf_extractions, pdf_warning = _pdf_images(source)
+                if pdf_warning is not None:
+                    warnings.add(pdf_warning)
+            for index, observation in enumerate(
+                observations_by_source.get(source.source_document_id, ()), start=1
+            ):
+                if observation.is_page_excerpt:
+                    warnings.add("source_figure_pdf_page_excerpt_needed")
                     continue
-                for index, (src, label) in enumerate(parser.images, start=1):
-                    asset_url: str | None = None
-                    locator = SourceFigureLocatorV1(
-                        figure_label=(label or f"HTML image {index}").strip(),
+                label = observation.alt_text or (
+                    observation.dom_locator.rsplit(":", 1)[-1]
+                    if mime_type == "application/pdf"
+                    else f"HTML image {index}"
+                )
+                asset_url = observation.requested_url
+                if asset_url and asset_url.casefold().startswith("data:"):
+                    embedded = observation.image_bytes
+                    digest = hashlib.sha256(embedded).hexdigest() if embedded is not None else None
+                    image_mime = _sniff_mime(embedded) if embedded is not None else None
+                    safe_asset_url = (
+                        f"data:{image_mime or 'image/unknown'};sha256={digest}"
+                        if digest is not None
+                        else "data:image/unknown;sha256=unavailable"
                     )
-                    if src is None or not src.strip():
-                        if not add(
-                            source=source,
-                            locator=locator,
-                            asset_url=None,
-                            provenance=(
-                                f"img element in archived document {source.source_document_id}"
-                            ),
-                            decision=SourceFigureDecision.REJECTED,
-                            reason="image_source_missing",
-                        ):
-                            break
-                        continue
-                    if src.lstrip().casefold().startswith("data:"):
-                        observation = _data_uri(src.strip(), self._max_figure_bytes)
-                        if observation.error is not None:
-                            if not add(
-                                source=source,
-                                locator=locator,
-                                asset_url=None,
-                                provenance=(
-                                    f"data URI in archived document {source.source_document_id}"
-                                ),
-                                decision=SourceFigureDecision.REJECTED,
-                                reason=observation.error,
-                                sha256=observation.sha256,
-                                mime_type=observation.mime_type,
-                                byte_size=observation.byte_size,
-                            ):
-                                break
-                            continue
-                        assert observation.sha256 is not None
-                        data_locator = SourceFigureLocatorV1(
-                            figure_label=locator.figure_label,
-                            original_asset_url=(
-                                f"data:{observation.mime_type or 'image/unknown'};"
-                                f"sha256={observation.sha256}"
-                            ),
-                        )
-                        local_asset = assets_by_hash.get(observation.sha256)
-                        decision, reason = _resolve_observed_bytes(observation, local_asset)
-                        if not add(
-                            source=source,
-                            locator=data_locator,
-                            asset_url=data_locator.original_asset_url,
-                            provenance=f"data URI in archived document {source.source_document_id}",
-                            decision=decision,
-                            reason=reason,
-                            blob=local_asset if decision is SourceFigureDecision.ACCEPTED else None,
-                            sha256=observation.sha256,
-                            mime_type=observation.mime_type,
-                            byte_size=observation.byte_size,
-                        ):
-                            break
-                        continue
-                    parsed = urlsplit(src.strip())
-                    if parsed.scheme and parsed.scheme.casefold() not in {"http", "https"}:
-                        if not add(
-                            source=source,
-                            locator=locator,
-                            asset_url=None,
-                            provenance=(
-                                f"image reference in archived document {source.source_document_id}"
-                            ),
-                            decision=SourceFigureDecision.REJECTED,
-                            reason="unsupported_image_source_scheme",
-                        ):
-                            break
-                        continue
-                    asset_url = _canonical_http_url(urljoin(source.source_url, src.strip()))
-                    if asset_url is None:
-                        if not add(
-                            source=source,
-                            locator=locator,
-                            asset_url=None,
-                            provenance=(
-                                f"image reference in archived document {source.source_document_id}"
-                            ),
-                            decision=SourceFigureDecision.REJECTED,
-                            reason="invalid_image_source_url",
-                        ):
-                            break
-                        continue
-                    matched_asset = assets_by_url.get(asset_url)
-                    decision, reason = _resolve_archived_asset(
-                        matched_asset, self._max_figure_bytes
-                    )
+                    asset_url = safe_asset_url
+                locator = SourceFigureLocatorV1(
+                    page=observation.page,
+                    section=observation.nearby_heading_text,
+                    figure_label=label.strip() if label else f"HTML image {index}",
+                    original_asset_url=asset_url,
+                )
+                media_record = media_by_location.get(
+                    (source.source_document_id, observation.dom_locator)
+                )
+                provenance = _media_provenance(source, observation)
+                if observation.pre_exclusion_reason is not None:
                     if not add(
                         source=source,
                         locator=locator,
                         asset_url=asset_url,
-                        provenance=(
-                            f"image URL in archived document {source.source_document_id}; "
-                            f"local archive match {matched_asset.source_document_id}"
-                            if matched_asset is not None
-                            else f"image URL in archived document {source.source_document_id}"
-                        ),
-                        decision=decision,
-                        reason=reason,
-                        blob=matched_asset if decision is SourceFigureDecision.ACCEPTED else None,
-                        sha256=matched_asset.sha256 if matched_asset is not None else None,
-                        mime_type=matched_asset.mime_type if matched_asset is not None else None,
-                        byte_size=matched_asset.byte_size if matched_asset is not None else None,
+                        provenance=provenance,
+                        decision=SourceFigureDecision.REJECTED,
+                        reason=observation.pre_exclusion_reason.value,
                     ):
                         break
-            elif mime_type == "application/pdf":
-                pdf_images, pdf_warning = _pdf_images(source)
-                if pdf_warning is not None:
-                    warnings.add(pdf_warning)
-                for page, name, content, extraction_error in pdf_images:
-                    locator = SourceFigureLocatorV1(
-                        page=page,
-                        figure_label=name or f"PDF page {page} image",
-                    )
-                    digest = hashlib.sha256(content).hexdigest() if content is not None else None
-                    image_mime = _sniff_mime(content) if content is not None else None
-                    matched_pdf_asset = assets_by_hash.get(digest) if digest is not None else None
-                    decision, reason = _resolve_observed_bytes(
-                        _ObservedImage(
-                            digest,
-                            image_mime,
-                            len(content) if content is not None else None,
-                            extraction_error,
-                        ),
-                        matched_pdf_asset,
-                    )
+                    continue
+                if media_record is not None and media_record.status in {
+                    SourceMediaStatus.EXCLUDED_BY_RULE,
+                    SourceMediaStatus.COLLECTION_FAILED,
+                }:
+                    if not add(
+                        source=source,
+                        locator=locator,
+                        asset_url=asset_url,
+                        provenance=provenance,
+                        decision=SourceFigureDecision.REJECTED,
+                        reason=media_record.reason_code.value,
+                        sha256=media_record.sha256,
+                        mime_type=media_record.mime_type,
+                        byte_size=media_record.byte_size,
+                    ):
+                        break
+                    continue
+                if observation.image_bytes is not None:
+                    content = observation.image_bytes
+                    digest = hashlib.sha256(content).hexdigest()
+                    image_mime = _sniff_mime(content)
+                    observed = _ObservedImage(digest, image_mime, len(content), None)
+                    matched = assets_by_hash.get(digest)
+                    decision, reason = _resolve_observed_bytes(observed, matched)
+                    if (
+                        media_record is not None
+                        and media_record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
+                    ):
+                        reason = "accepted_for_review"
+                    if not add(
+                        source=source,
+                        locator=locator,
+                        asset_url=asset_url,
+                        provenance=provenance,
+                        decision=decision,
+                        reason=reason,
+                        blob=matched if decision is SourceFigureDecision.ACCEPTED else None,
+                        sha256=digest,
+                        mime_type=image_mime,
+                        byte_size=len(content),
+                    ):
+                        break
+                    continue
+                if asset_url is None:
                     if not add(
                         source=source,
                         locator=locator,
                         asset_url=None,
-                        provenance=(
-                            f"embedded image on PDF page {page} of {source.source_document_id}"
-                        ),
-                        decision=decision,
-                        reason=reason,
-                        blob=matched_pdf_asset
-                        if decision is SourceFigureDecision.ACCEPTED
-                        else None,
-                        sha256=digest,
-                        mime_type=image_mime,
-                        byte_size=len(content) if content is not None else None,
+                        provenance=provenance,
+                        decision=SourceFigureDecision.REJECTED,
+                        reason="invalid_image_source_url",
                     ):
                         break
+                    continue
+                matched_asset = assets_by_url.get(_canonical_http_url(asset_url) or "")
+                decision, reason = _resolve_archived_asset(matched_asset, self._max_figure_bytes)
+                if (
+                    media_record is not None
+                    and media_record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
+                ):
+                    reason = (
+                        "accepted_for_review"
+                        if matched_asset is not None
+                        else "image_bytes_not_in_blob_store"
+                    )
+                    decision = (
+                        SourceFigureDecision.ACCEPTED
+                        if matched_asset is not None
+                        else SourceFigureDecision.PENDING
+                    )
+                if not add(
+                    source=source,
+                    locator=locator,
+                    asset_url=asset_url,
+                    provenance=provenance,
+                    decision=decision,
+                    reason=reason,
+                    blob=matched_asset if decision is SourceFigureDecision.ACCEPTED else None,
+                    sha256=matched_asset.sha256 if matched_asset is not None else None,
+                    mime_type=matched_asset.mime_type if matched_asset is not None else None,
+                    byte_size=matched_asset.byte_size if matched_asset is not None else None,
+                ):
+                    break
             if truncated:
                 break
 
@@ -449,6 +444,7 @@ class SourceFigureInventory:
             figures=ordered,
             truncated=truncated,
             warnings=tuple(sorted(warnings)),
+            policy_sha256=policy_sha256,
         )
 
 
@@ -529,21 +525,20 @@ def _resolve_archived_asset(
 def _pdf_images(
     source: ArchivedFigureSource,
 ) -> tuple[tuple[tuple[int, str | None, bytes | None, str | None], ...], str | None]:
-    try:
-        from pypdf import PdfReader
-    except ImportError:
-        return (), "source_figure_pdf_extraction_unavailable"
-    images: list[tuple[int, str | None, bytes | None, str | None]] = []
-    try:
-        reader = PdfReader(BytesIO(source.content), strict=False)
-        for page_number, page in enumerate(reader.pages, start=1):
-            for image in page.images:
-                content = image.data
-                name = str(getattr(image, "name", "") or "") or None
-                images.append((page_number, name, content, None))
-    except Exception:
-        return tuple(images), "source_figure_pdf_parse_failed"
-    return tuple(images), None
+    observations = extract_source_media_observations((source,))
+    return (
+        tuple(
+            (
+                observation.page or 1,
+                observation.dom_locator.rsplit(":", 1)[-1],
+                observation.image_bytes,
+                observation.extraction_error,
+            )
+            for observation in observations
+            if not observation.is_page_excerpt
+        ),
+        None,
+    )
 
 
 def _sniff_mime(content: bytes) -> str | None:
@@ -559,6 +554,22 @@ def _sniff_mime(content: bytes) -> str | None:
     if re.match(rb"(?:<\?xml[^>]*\?>\s*)?<svg(?:\s|>)", sample):
         return "image/svg+xml"
     return None
+
+
+def _media_provenance(source: ArchivedFigureSource, observation: SourceMediaObservation) -> str:
+    details = [
+        f"archived source document {source.source_document_id}",
+        observation.dom_locator,
+    ]
+    for label, value in (
+        ("alt", observation.alt_text),
+        ("caption", observation.caption_text),
+        ("heading", observation.nearby_heading_text),
+        ("anchor", observation.anchor),
+    ):
+        if value:
+            details.append(f"{label}: {value}")
+    return "; ".join(details)
 
 
 def _normalized_mime(value: str) -> str:
@@ -581,6 +592,17 @@ def _canonical_http_url(value: str | None) -> str | None:
         return None
 
 
+class SourceMediaArchiver(Protocol):
+    @property
+    def policy_sha256(self) -> str: ...
+
+    async def collect(
+        self,
+        subject_id: UUID,
+        sources: tuple[ArchivedFigureSource, ...],
+    ) -> tuple[SourceMediaRecord, ...]: ...
+
+
 async def load_archived_source_figure_inventory(
     *,
     subject_id: UUID,
@@ -589,8 +611,9 @@ async def load_archived_source_figure_inventory(
     blob_repository: BlobRepository,
     artifact_store: ProductionArtifactStore,
     inventory: SourceFigureInventory | None = None,
+    media_archiver: SourceMediaArchiver | None = None,
 ) -> SourceFigureInventoryResult:
-    """Read only source and image blobs already catalogued for this subject."""
+    """Build a figure inventory and collect unresolved local-source media."""
     scanner = inventory or SourceFigureInventory()
     documents = await source_document_repository.list_for_subject(subject_id)
     documents_by_id = {document.id: document for document in documents}
@@ -650,7 +673,7 @@ async def load_archived_source_figure_inventory(
         archived_sources.append(
             ArchivedFigureSource(
                 source_document_id=source_document_id,
-                source_url=source.canonical_url,
+                source_url=source_document.final_url or source.canonical_url,
                 mime_type=mime_type,
                 blob_id=blob_id,
                 sha256=descriptor.sha256,
@@ -659,7 +682,36 @@ async def load_archived_source_figure_inventory(
             )
         )
 
-    result = scanner.inventory(tuple(archived_sources), tuple(archived_assets))
+    media_candidates: tuple[SourceMediaRecord, ...] = ()
+    policy_sha256: str | None = None
+    if media_archiver is not None and archived_sources:
+        media_candidates = await media_archiver.collect(subject_id, tuple(archived_sources))
+        policy_sha256 = media_archiver.policy_sha256
+        for candidate in media_candidates:
+            if (
+                candidate.blob_id is None
+                or candidate.sha256 is None
+                or candidate.mime_type is None
+                or candidate.byte_size is None
+            ):
+                continue
+            archived_assets.append(
+                ArchivedFigureAsset(
+                    source_document_id=candidate.source_document_id,
+                    source_url=candidate.requested_url,
+                    blob_id=candidate.blob_id,
+                    sha256=candidate.sha256,
+                    mime_type=candidate.mime_type,
+                    byte_size=candidate.byte_size,
+                )
+            )
+
+    result = scanner.inventory(
+        tuple(archived_sources),
+        tuple(archived_assets),
+        media_candidates=media_candidates,
+        policy_sha256=policy_sha256,
+    )
     if not loader_warnings:
         return result
     return replace(result, warnings=tuple(sorted(set(result.warnings) | loader_warnings)))

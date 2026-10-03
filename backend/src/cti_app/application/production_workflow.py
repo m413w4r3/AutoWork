@@ -540,6 +540,11 @@ class ProductionWorkflowOrchestrator:
                 artifact_reuse=self._artifact_reuse,
                 media_asset_store=media_asset_store,
                 diagram_compiler=diagram_compiler,
+                source_media_archiver=(
+                    getattr(collection_service, "source_media_archiver", None)
+                    if collection_service is not None
+                    else None
+                ),
             )
             if self._model_gateway is not None and artifact_store is not None
             else None
