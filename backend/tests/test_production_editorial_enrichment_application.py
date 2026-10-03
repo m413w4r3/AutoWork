@@ -16,7 +16,10 @@ from pydantic import BaseModel
 import cti_app.api.production as production_api
 import cti_app.application.production_editorial_enrichment as enrichment_module
 import cti_app.application.production_enrichment_revision as revision_module
-from cti_app.application.diagram_compilation import CompiledDiagram
+from cti_app.application.diagram_compilation import (
+    CompiledDiagram,
+    DiagramCompilerProcessError,
+)
 from cti_app.application.model_gateway import (
     ModelExecution,
     ModelGatewayError,
@@ -1914,6 +1917,80 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
     enrichment = stored["enrichment"]
     assert enrichment.source_figures == ()  # type: ignore[attr-defined]
     assert enrichment.diagrams[0].compiled_asset_id is not None  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_failed_diagram_is_reviewed_while_valid_sibling_and_artifact_are_stored() -> None:
+    proposal = _proposal("E001")
+    sibling_purpose = proposal.diagrams[0].purpose.model_copy(
+        update={"question": "Which second documented action follows the initial step?"}
+    )
+    sibling = proposal.diagrams[0].model_copy(
+        update={"key": "sibling_chain", "purpose": sibling_purpose}
+    )
+    proposal = proposal.model_copy(update={"diagrams": (proposal.diagrams[0], sibling)})
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, proposal)))
+    successful_compiler = _MemoryDiagramCompiler()
+
+    class Compiler:
+        async def compile(self, diagram: object) -> CompiledDiagram:
+            if diagram.key == "infection_chain":  # type: ignore[attr-defined]
+                raise DiagramCompilerProcessError("D2 rejected this diagram")
+            return await successful_compiler.compile(diagram)
+
+    world.service._diagram_compiler = Compiler()
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.diagram_count == 1
+    assert len(world.writer.calls) == 1
+    stored = world.writer.calls[0]["enrichment"]
+    assert [item.key for item in stored.diagrams] == ["sibling_chain"]  # type: ignore[attr-defined]
+    assert len(stored.tables) == 1  # type: ignore[attr-defined]
+    assert (
+        "editorial_enrichment_diagram_render_failed:infection_chain:"
+        "diagram_compiler_process_failure"
+    ) in stored.warnings  # type: ignore[attr-defined]
+    assert result.details is not None
+    assert result.details["diagram_rejections"] == [
+        {
+            "diagram_key": "infection_chain",
+            "reason_code": "editorial_enrichment_diagram_render_failed",
+            "compiler_error_code": "diagram_compiler_process_failure",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_all_failed_diagrams_degrade_to_stored_tables_with_review_rejections() -> None:
+    proposal = _proposal("E001")
+    sibling_purpose = proposal.diagrams[0].purpose.model_copy(
+        update={"question": "Which second documented action follows the initial step?"}
+    )
+    sibling = proposal.diagrams[0].model_copy(
+        update={"key": "sibling_chain", "purpose": sibling_purpose}
+    )
+    proposal = proposal.model_copy(update={"diagrams": (proposal.diagrams[0], sibling)})
+    world = _world(_RecordingGateway(lambda request: _succeeded(request, proposal)))
+
+    class Compiler:
+        async def compile(self, diagram: object) -> CompiledDiagram:
+            raise DiagramCompilerProcessError(
+                f"D2 rejected {diagram.key}"  # type: ignore[attr-defined]
+            )
+
+    world.service._diagram_compiler = Compiler()
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.diagram_count == 0
+    assert len(world.writer.calls) == 1
+    stored = world.writer.calls[0]["enrichment"]
+    assert stored.diagrams == ()  # type: ignore[attr-defined]
+    assert len(stored.tables) == 1  # type: ignore[attr-defined]
+    assert len(result.details["diagram_rejections"]) == 2  # type: ignore[index]
 
 
 @pytest.mark.asyncio

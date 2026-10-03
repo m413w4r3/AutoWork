@@ -182,7 +182,9 @@ def _header_footer_labels(source: str) -> set[str]:
 
 
 def _normalized_pdf_text(reader: PdfReader) -> tuple[str, str]:
-    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    # Zero-width spaces are display-only break opportunities inserted in long
+    # IOC/path/command spans; they are not part of the canonical text.
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages).replace("\u200b", "")
     normalized = " ".join(extracted.split())
     return normalized, re.sub(r"\s+", "", extracted)
 

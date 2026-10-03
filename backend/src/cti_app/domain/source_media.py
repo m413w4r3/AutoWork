@@ -24,6 +24,7 @@ class SourceMediaReasonCode(StrEnum):
     BELOW_MINIMUM_DIMENSIONS = "below_minimum_dimensions"
     BELOW_MINIMUM_BYTES = "below_minimum_bytes"
     EXCEEDS_MAXIMUM_BYTES = "exceeds_maximum_bytes"
+    IMAGE_TOO_LARGE_DIMENSIONS = "image_too_large_dimensions"
     UNSUPPORTED_IMAGE_TYPE = "unsupported_image_type"
     MISSING_SOURCE_URL = "missing_source_url"
     INVALID_SOURCE_URL = "invalid_source_url"

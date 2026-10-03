@@ -81,7 +81,8 @@ SOURCES → REFERENCES → EXTRACTION → RELEVANCE_PROJECTION → SYNTHESIS →
 canonique, sans modifier ses checkpoints source. `SYNTHESIS` et `EDITORIAL_ENRICHMENT` consomment
 cette projection. `EDITORIAL_ENRICHMENT` produit un `EditorialEnrichmentV1` canonique vide et
 déterministe en AW-015, sans appel modèle. `ASSEMBLY` exige cet artifact et inclut son hash dans l’identité
-fonctionnelle de `PUBLICATION`, dont le corps est `PublicationDocumentV4`. `READY` signifie
+fonctionnelle de `PUBLICATION`, dont le corps courant est `PublicationDocumentV5`
+(`schema_version: "5"`), wrapper sur le document V4 avec `rich_text` sémantique. `READY` signifie
 que les artifacts canoniques sont valides et que la QA canonique a réussi ; le rendu PDF constitue
 un pipeline distinct.
 
@@ -102,7 +103,7 @@ Le corpus malware/investigation reste distinct de `ProductionReferenceCorpusV1` 
 avec lui ni module ni service. Extraction consomme le corpus directement. `RELEVANCE_PROJECTION`
 classe les éléments de `ProductionExtractionV1` pour le sujet figé. Synthesis et Editorial
 Enrichment ne consomment que les éléments admis par cette projection. Assembly construit
-`PublicationDocumentV4` depuis le snapshot, le corpus, l’extraction, la projection, la synthèse et
+`PublicationDocumentV5` (`schema_version: "5"`) depuis le snapshot, le corpus, l’extraction, la projection, la synthèse et
 cet enrichment, sans compiler de média ni rendre de document. Production State V5 conserve les
 quatre artefacts portables de `REFERENCES`, `EXTRACTION`, `SYNTHESIS` et `EDITORIAL_ENRICHMENT`;
 l’import reprend à `RELEVANCE_PROJECTION` pour la reconstruire avant Synthesis.
@@ -117,9 +118,10 @@ l’artifact de document et son hash d’entrée. L’acceptation crée un manif
 append-only qui fige l’ordre et les références exactes. L’assemblage lit uniquement ce manifeste
 et crée les JSON canoniques `EditionDocumentV2` et `EditionRelease`.
 
-La frontière d'article est `PublicationDocumentV4 → PublicationRender → Typst PDF`. Le preview
-Subject est une projection frontend directe du V4 ; `GET /api/subjects/{id}/publication/pdf` sert
-le PDF AW-019. Pour l'édition, `PublicationManifestV1 → EditionDocumentV2 → EditionRelease →
+La frontière d'article est `PublicationDocumentV5 → PublicationRender → Typst PDF`. Le preview
+Subject projette le V5 côté frontend ; le wrapper V5 conserve les champs V4 et ajoute `rich_text`.
+`GET /api/subjects/{id}/publication/pdf` sert le PDF AW-019. Le rendu d'édition accepte les
+documents de schéma `4` et `5`. Pour l'édition, `PublicationManifestV1 → EditionDocumentV2 → EditionRelease →
 EditionRender → Typst PDF` rend un seul document Typst à partir des articles ordonnés du manifeste.
 `EditionRelease` reste JSON uniquement et ne contient pas le PDF.
 

@@ -1604,6 +1604,10 @@ class ProductionWorkflowOrchestrator:
         artifact = execution.artifact
         if execution.status is EditorialEnrichmentExecutionStatus.SUCCEEDED and artifact:
             result.update({"status": "success", "artifact_id": str(artifact.id), "reused": False})
+            if execution.warnings:
+                result["warnings"] = list(execution.warnings)
+            if execution.details:
+                result["details"] = dict(execution.details)
         elif execution.status is EditorialEnrichmentExecutionStatus.REUSED and artifact:
             reused_from = artifact.reused_from_artifact_id
             result.update(

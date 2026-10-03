@@ -31,8 +31,10 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-SOURCE_MEDIA_POLICY_VERSION = "source-media-exclusion-v1"
+SOURCE_MEDIA_POLICY_VERSION = "source-media-exclusion-v2"
 SOURCE_MEDIA_MAX_BYTES = 5 * 1024 * 1024
+SOURCE_MEDIA_MAX_PIXELS = 40_000_000
+SOURCE_MEDIA_MAX_SIDE_LENGTH = 10_000
 SOURCE_MEDIA_BUCKET = "source-media-candidates"
 
 
@@ -54,6 +56,8 @@ class SourceMediaPolicy:
     minimum_height: int = 100
     minimum_bytes: int = 2 * 1024
     maximum_bytes: int = SOURCE_MEDIA_MAX_BYTES
+    maximum_pixels: int = SOURCE_MEDIA_MAX_PIXELS
+    maximum_side_length: int = SOURCE_MEDIA_MAX_SIDE_LENGTH
     perceptual_hamming_distance: int = 4
     boilerplate_pattern: str = (
         r"(?:logo|favicon|brand|avatar|social|menu|navbar|navigation|breadcrumb|"
@@ -70,6 +74,8 @@ class SourceMediaPolicy:
             "minimum_height",
             "minimum_bytes",
             "maximum_bytes",
+            "maximum_pixels",
+            "maximum_side_length",
         ):
             value = getattr(self, name)
             if type(value) is not int or value < 1:
@@ -285,6 +291,23 @@ class SourceMediaArchiveService:
                         reason=SourceMediaReasonCode.NOT_AN_IMAGE
                         if mime_type is None
                         else SourceMediaReasonCode.UNSUPPORTED_IMAGE_TYPE,
+                        **shared_fields,
+                    )
+                )
+                continue
+            if image_dimensions_exceed_limits(
+                width,
+                height,
+                maximum_pixels=self.policy.maximum_pixels,
+                maximum_side_length=self.policy.maximum_side_length,
+            ):
+                resolved.append(
+                    self._base_record(
+                        subject_id,
+                        observation,
+                        candidate_id,
+                        status=SourceMediaStatus.EXCLUDED_BY_RULE,
+                        reason=SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS,
                         **shared_fields,
                     )
                 )
@@ -525,7 +548,7 @@ def _sniff_image_mime(content: bytes) -> str | None:
 
 def image_dimensions(content: bytes, mime_type: str | None) -> tuple[int | None, int | None]:
     try:
-        if mime_type == "image/png" and len(content) >= 24:
+        if mime_type == "image/png" and len(content) >= 24 and content[12:16] == b"IHDR":
             return struct.unpack(">II", content[16:24])
         if mime_type == "image/gif" and len(content) >= 10:
             return struct.unpack("<HH", content[6:10])
@@ -538,6 +561,20 @@ def image_dimensions(content: bytes, mime_type: str | None) -> tuple[int | None,
     except (ValueError, IndexError, struct.error):
         return None, None
     return None, None
+
+
+def image_dimensions_exceed_limits(
+    width: int | None,
+    height: int | None,
+    *,
+    maximum_pixels: int = SOURCE_MEDIA_MAX_PIXELS,
+    maximum_side_length: int = SOURCE_MEDIA_MAX_SIDE_LENGTH,
+) -> bool:
+    return (
+        (width is not None and width > maximum_side_length)
+        or (height is not None and height > maximum_side_length)
+        or (width is not None and height is not None and width * height > maximum_pixels)
+    )
 
 
 def _jpeg_dimensions(content: bytes) -> tuple[int | None, int | None]:

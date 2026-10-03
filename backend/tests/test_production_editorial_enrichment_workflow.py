@@ -117,7 +117,16 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
         table_count=2,
         diagram_count=1,
         source_figure_count=0,
-        details={},
+        warnings=("editorial_enrichment_diagram_render_failed:flow:diagram_compiler_timeout",),
+        details={
+            "diagram_rejections": [
+                {
+                    "diagram_key": "flow",
+                    "reason_code": "editorial_enrichment_diagram_render_failed",
+                    "compiler_error_code": "diagram_compiler_timeout",
+                }
+            ]
+        },
     )
     calls = []
 
@@ -153,6 +162,16 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
         "status": "success",
         "artifact_id": str(artifact.id),
         "reused": False,
+        "warnings": ["editorial_enrichment_diagram_render_failed:flow:diagram_compiler_timeout"],
+        "details": {
+            "diagram_rejections": [
+                {
+                    "diagram_key": "flow",
+                    "reason_code": "editorial_enrichment_diagram_render_failed",
+                    "compiler_error_code": "diagram_compiler_timeout",
+                }
+            ]
+        },
     }
 
 
@@ -176,6 +195,7 @@ def test_editorial_enrichment_cross_run_reuse_is_exposed_as_success() -> None:
         table_count=1,
         diagram_count=2,
         source_figure_count=0,
+        warnings=(),
         details={"reused": True},
     )
 

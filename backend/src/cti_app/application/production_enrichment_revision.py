@@ -849,13 +849,24 @@ class ProductionEditorialEnrichmentRevisionService:
                 or self._enrichment._media_asset_store is None
             ):
                 raise ValueError("editorial_enrichment_diagram_compilation_unavailable")
-            compiled = await compile_and_store_diagrams(
+            compilation = await compile_and_store_diagrams(
                 (diagram_replacement,),
                 compiler=self._enrichment._diagram_compiler,
                 media_asset_store=self._enrichment._media_asset_store,
                 production_run_id=run_id,
             )
-            diagram_replacement = compiled[0]
+            if compilation.rejections:
+                rejection = compilation.rejections[0]
+                raise EditorialEnrichmentRevisionValidationError(
+                    [
+                        {
+                            "block_id": rejection.diagram_key,
+                            "reason_code": rejection.warning_code,
+                            "compiler_error_code": rejection.reason_code,
+                        }
+                    ]
+                )
+            diagram_replacement = compilation.diagrams[0]
             return replace(
                 base,
                 diagrams=tuple(

@@ -15,6 +15,12 @@ from uuid import UUID
 
 from cti_app.application.persistence import BlobRepository, SourceDocumentRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.source_media_collection import (
+    SOURCE_MEDIA_MAX_PIXELS,
+    SOURCE_MEDIA_MAX_SIDE_LENGTH,
+    image_dimensions,
+    image_dimensions_exceed_limits,
+)
 from cti_app.application.source_media_extraction import (
     SourceMediaObservation,
     extract_source_media_observations,
@@ -31,12 +37,18 @@ from cti_app.domain.production_editorial_enrichment import (
     source_figure_id,
 )
 from cti_app.domain.production_extraction import ProductionSourceExtractionV1
-from cti_app.domain.source_media import SourceMediaRecord, SourceMediaStatus
+from cti_app.domain.source_media import (
+    SourceMediaReasonCode,
+    SourceMediaRecord,
+    SourceMediaStatus,
+)
 
 MAX_SOURCE_FIGURES = 64
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
 MAX_SOURCE_FIGURE_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_SOURCE_FIGURE_PIXELS = SOURCE_MEDIA_MAX_PIXELS
+MAX_SOURCE_FIGURE_SIDE_LENGTH = SOURCE_MEDIA_MAX_SIDE_LENGTH
 
 _DATA_URI_PREFIX = re.compile(r"^data:([^,]*?),(.*)$", re.IGNORECASE | re.DOTALL)
 
@@ -60,6 +72,8 @@ class ArchivedFigureAsset:
     sha256: str
     mime_type: str
     byte_size: int
+    width: int | None = None
+    height: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,12 +175,16 @@ class SourceFigureInventory:
         max_source_bytes: int = MAX_SOURCE_DOCUMENT_BYTES,
         max_figure_bytes: int = MAX_SOURCE_FIGURE_BYTES,
         max_total_figure_bytes: int = MAX_SOURCE_FIGURE_TOTAL_BYTES,
+        max_figure_pixels: int = MAX_SOURCE_FIGURE_PIXELS,
+        max_figure_side_length: int = MAX_SOURCE_FIGURE_SIDE_LENGTH,
     ) -> None:
         for name, value in (
             ("max_figures", max_figures),
             ("max_source_bytes", max_source_bytes),
             ("max_figure_bytes", max_figure_bytes),
             ("max_total_figure_bytes", max_total_figure_bytes),
+            ("max_figure_pixels", max_figure_pixels),
+            ("max_figure_side_length", max_figure_side_length),
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -174,6 +192,8 @@ class SourceFigureInventory:
         self._max_source_bytes = max_source_bytes
         self._max_figure_bytes = max_figure_bytes
         self._max_total_figure_bytes = max_total_figure_bytes
+        self._max_figure_pixels = max_figure_pixels
+        self._max_figure_side_length = max_figure_side_length
 
     def inventory(
         self,
@@ -226,12 +246,30 @@ class SourceFigureInventory:
             mime_type: str | None = None,
             byte_size: int | None = None,
             media_record: SourceMediaRecord | None = None,
+            width: int | None = None,
+            height: int | None = None,
             alt_text: str | None = None,
             caption_text: str | None = None,
             nearby_heading_text: str | None = None,
             anchor: str | None = None,
         ) -> bool:
             nonlocal total_figure_bytes, truncated
+            observed_width = width
+            observed_height = height
+            if media_record is not None:
+                if observed_width is None:
+                    observed_width = media_record.width
+                if observed_height is None:
+                    observed_height = media_record.height
+            if image_dimensions_exceed_limits(
+                observed_width,
+                observed_height,
+                maximum_pixels=self._max_figure_pixels,
+                maximum_side_length=self._max_figure_side_length,
+            ):
+                decision = SourceFigureDecision.REJECTED
+                reason = SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
+                blob = None
             if sha256 is not None:
                 duplicate_index = indices_by_hash.get(sha256)
                 if duplicate_index is not None:
@@ -242,6 +280,7 @@ class SourceFigureInventory:
                         and previous.decision_reason
                         not in {
                             "figure_exceeds_byte_limit",
+                            SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value,
                             "inventory_exceeds_total_byte_limit",
                         }
                     ):
@@ -303,8 +342,8 @@ class SourceFigureInventory:
                 )
                 or nearby_heading_text,
                 anchor=(media_record.anchor if media_record is not None else None) or anchor,
-                width=media_record.width if media_record is not None else None,
-                height=media_record.height if media_record is not None else None,
+                width=observed_width,
+                height=observed_height,
             )
             if sha256 is not None:
                 if duplicate:
@@ -416,11 +455,19 @@ class SourceFigureInventory:
                     content = observation.image_bytes
                     digest = hashlib.sha256(content).hexdigest()
                     image_mime = _sniff_mime(content)
-                    observed = _ObservedImage(digest, image_mime, len(content), None)
+                    width, height = image_dimensions(content, image_mime)
+                    observed = _ObservedImage(digest, image_mime, len(content), None, width, height)
                     matched = assets_by_hash.get(digest)
-                    decision, reason = _resolve_observed_bytes(observed, matched)
+                    decision, reason = _resolve_observed_bytes(
+                        observed,
+                        matched,
+                        self._max_figure_bytes,
+                        self._max_figure_pixels,
+                        self._max_figure_side_length,
+                    )
                     if (
-                        media_record is not None
+                        decision is SourceFigureDecision.ACCEPTED
+                        and media_record is not None
                         and media_record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
                     ):
                         reason = "accepted_for_review"
@@ -435,6 +482,8 @@ class SourceFigureInventory:
                         sha256=digest,
                         mime_type=image_mime,
                         byte_size=len(content),
+                        width=width,
+                        height=height,
                         media_record=media_record,
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
@@ -460,9 +509,15 @@ class SourceFigureInventory:
                         break
                     continue
                 matched_asset = assets_by_url.get(_canonical_http_url(asset_url) or "")
-                decision, reason = _resolve_archived_asset(matched_asset, self._max_figure_bytes)
+                decision, reason = _resolve_archived_asset(
+                    matched_asset,
+                    self._max_figure_bytes,
+                    self._max_figure_pixels,
+                    self._max_figure_side_length,
+                )
                 if (
-                    media_record is not None
+                    decision is SourceFigureDecision.ACCEPTED
+                    and media_record is not None
                     and media_record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
                 ):
                     reason = (
@@ -523,6 +578,8 @@ class _ObservedImage:
     mime_type: str | None
     byte_size: int | None
     error: str | None
+    width: int | None = None
+    height: int | None = None
 
 
 def _data_uri(value: str, max_bytes: int) -> _ObservedImage:
@@ -549,17 +606,44 @@ def _data_uri(value: str, max_bytes: int) -> _ObservedImage:
         )
     if actual_mime is None or actual_mime not in SUPPORTED_MEDIA_MIME_TYPES:
         return _ObservedImage(digest, None, len(content), "unsupported_image_mime_type")
+    width, height = image_dimensions(content, actual_mime)
+    if image_dimensions_exceed_limits(
+        width,
+        height,
+        maximum_pixels=MAX_SOURCE_FIGURE_PIXELS,
+        maximum_side_length=MAX_SOURCE_FIGURE_SIDE_LENGTH,
+    ):
+        return _ObservedImage(
+            digest,
+            actual_mime,
+            len(content),
+            SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value,
+            width,
+            height,
+        )
     if declared_mime != actual_mime:
-        return _ObservedImage(digest, actual_mime, len(content), "data_uri_mime_mismatch")
-    return _ObservedImage(digest, actual_mime, len(content), None)
+        return _ObservedImage(
+            digest, actual_mime, len(content), "data_uri_mime_mismatch", width, height
+        )
+    return _ObservedImage(digest, actual_mime, len(content), None, width, height)
 
 
 def _resolve_observed_bytes(
     observed: _ObservedImage,
     asset: ArchivedFigureAsset | None,
+    max_figure_bytes: int = MAX_SOURCE_FIGURE_BYTES,
+    max_figure_pixels: int = MAX_SOURCE_FIGURE_PIXELS,
+    max_figure_side_length: int = MAX_SOURCE_FIGURE_SIDE_LENGTH,
 ) -> tuple[SourceFigureDecision, str]:
     if observed.error is not None:
         return SourceFigureDecision.REJECTED, observed.error
+    if image_dimensions_exceed_limits(
+        observed.width if observed.width is not None else (asset.width if asset else None),
+        observed.height if observed.height is not None else (asset.height if asset else None),
+        maximum_pixels=max_figure_pixels,
+        maximum_side_length=max_figure_side_length,
+    ):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
     if observed.mime_type not in SUPPORTED_MEDIA_MIME_TYPES:
         return SourceFigureDecision.REJECTED, "unsupported_image_mime_type"
     if asset is None:
@@ -570,7 +654,12 @@ def _resolve_observed_bytes(
         or asset.byte_size != observed.byte_size
     ):
         return SourceFigureDecision.REJECTED, "archived_blob_metadata_mismatch"
-    return _resolve_archived_asset(asset, MAX_SOURCE_FIGURE_BYTES)
+    return _resolve_archived_asset(
+        asset,
+        max_figure_bytes,
+        max_figure_pixels,
+        max_figure_side_length,
+    )
 
 
 def _total_limit_exceeded(
@@ -580,7 +669,10 @@ def _total_limit_exceeded(
 
 
 def _resolve_archived_asset(
-    asset: ArchivedFigureAsset | None, max_figure_bytes: int
+    asset: ArchivedFigureAsset | None,
+    max_figure_bytes: int,
+    max_figure_pixels: int = MAX_SOURCE_FIGURE_PIXELS,
+    max_figure_side_length: int = MAX_SOURCE_FIGURE_SIDE_LENGTH,
 ) -> tuple[SourceFigureDecision, str]:
     if asset is None:
         return SourceFigureDecision.PENDING, "image_not_in_local_archive"
@@ -588,6 +680,13 @@ def _resolve_archived_asset(
         return SourceFigureDecision.REJECTED, "unsupported_image_mime_type"
     if asset.byte_size > max_figure_bytes:
         return SourceFigureDecision.REJECTED, "figure_exceeds_byte_limit"
+    if image_dimensions_exceed_limits(
+        asset.width,
+        asset.height,
+        maximum_pixels=max_figure_pixels,
+        maximum_side_length=max_figure_side_length,
+    ):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
     return SourceFigureDecision.ACCEPTED, "matched_archived_blob"
 
 
@@ -706,6 +805,11 @@ async def load_archived_source_figure_inventory(
         mime_type = _normalized_mime(document.detected_mime_type or descriptor.mime_type)
         if not mime_type.startswith("image/"):
             continue
+        width: int | None = None
+        height: int | None = None
+        if descriptor.size <= MAX_SOURCE_FIGURE_BYTES:
+            content = await artifact_store.read_bytes(blob_id, max_bytes=MAX_SOURCE_FIGURE_BYTES)
+            width, height = image_dimensions(content, mime_type)
         archived_assets.append(
             ArchivedFigureAsset(
                 source_document_id=document.id,
@@ -714,6 +818,8 @@ async def load_archived_source_figure_inventory(
                 sha256=descriptor.sha256,
                 mime_type=mime_type,
                 byte_size=descriptor.size,
+                width=width,
+                height=height,
             )
         )
 
@@ -772,6 +878,8 @@ async def load_archived_source_figure_inventory(
                     sha256=candidate.sha256,
                     mime_type=candidate.mime_type,
                     byte_size=candidate.byte_size,
+                    width=candidate.width,
+                    height=candidate.height,
                 )
             )
 

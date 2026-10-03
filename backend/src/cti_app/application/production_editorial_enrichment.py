@@ -3830,13 +3830,32 @@ class ProductionEditorialEnrichmentService:
         if enrichment.diagrams:
             if self._diagram_compiler is None or self._media_asset_store is None:
                 raise RuntimeError("Diagram compilation requires a compiler and media asset store")
-            compiled_diagrams = await compile_and_store_diagrams(
+            compilation = await compile_and_store_diagrams(
                 enrichment.diagrams,
                 compiler=self._diagram_compiler,
                 media_asset_store=self._media_asset_store,
                 production_run_id=run.id,
             )
-            enrichment = replace(enrichment, diagrams=compiled_diagrams)
+            enrichment = replace(
+                enrichment,
+                diagrams=compilation.diagrams,
+                warnings=(
+                    *enrichment.warnings,
+                    *(
+                        f"{item.warning_code}:{item.diagram_key}:{item.reason_code}"
+                        for item in compilation.rejections
+                    ),
+                ),
+            )
+            if compilation.rejections:
+                wire_details["diagram_rejections"] = [
+                    {
+                        "diagram_key": item.diagram_key,
+                        "reason_code": item.warning_code,
+                        "compiler_error_code": item.reason_code,
+                    }
+                    for item in compilation.rejections
+                ]
             validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
         artifact = await self._editorial_enrichment_service.store_editorial_enrichment_result(
             run_id=run.id,
@@ -3864,7 +3883,13 @@ class ProductionEditorialEnrichmentService:
             diagram_count=len(enrichment.diagrams),
             source_figure_count=len(enrichment.source_figures),
             warnings=enrichment.warnings,
-            details=wire_details if parsed.rejections or parsed.proposal.resource_needs else None,
+            details=(
+                wire_details
+                if parsed.rejections
+                or parsed.proposal.resource_needs
+                or wire_details.get("diagram_rejections")
+                else None
+            ),
         )
 
     async def _verified_existing_execution(

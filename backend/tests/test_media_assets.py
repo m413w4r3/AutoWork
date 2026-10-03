@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import struct
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.diagram_compilation import CompiledDiagram
+from cti_app.application.diagram_compilation import (
+    CompiledDiagram,
+    DiagramCompilerProcessError,
+)
 from cti_app.application.media_assets import (
     MAX_SOURCE_FIGURE_BYTES,
     MediaAssetStore,
@@ -32,6 +37,15 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 
 _PNG = b"\x89PNG\r\n\x1a\n" + uuid4().bytes
+
+
+def _png_header(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    )
 
 
 class _MemoryBlobStore:
@@ -296,6 +310,17 @@ async def test_source_figure_ingestor_rejects_oversized_content() -> None:
 
 
 @pytest.mark.asyncio
+async def test_source_figure_ingestor_rechecks_pixel_dimensions_before_persisting() -> None:
+    class Store:
+        async def put(self, *_: Any, **__: Any) -> None:
+            pytest.fail("Oversized dimensions must be rejected before persistence")
+
+    content = _png_header(8_000, 6_000)
+    with pytest.raises(ValueError, match="dimension limit"):
+        await SourceFigureIngestor(Store()).ingest(_figure(content=content), content)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
 async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() -> None:
     blob_store = _MemoryBlobStore()
     media_assets = _MemoryMediaAssets()
@@ -303,7 +328,7 @@ async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() 
     compiler = _DiagramCompiler(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>")
     run_id = uuid4()
 
-    diagrams = await compile_and_store_diagrams(
+    compilation = await compile_and_store_diagrams(
         (_diagram(),),
         compiler=compiler,
         media_asset_store=asset_store,
@@ -311,10 +336,11 @@ async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() 
     )
 
     assert len(compiler.seen) == 1
-    assert diagrams[0].compiled_asset_id == media_asset_id(
+    assert compilation.rejections == ()
+    assert compilation.diagrams[0].compiled_asset_id == media_asset_id(
         hashlib.sha256(compiler.svg).hexdigest(), "image/svg+xml"
     )
-    manifest = await asset_store.get(diagrams[0].compiled_asset_id)
+    manifest = await asset_store.get(compilation.diagrams[0].compiled_asset_id)
     assert manifest is not None
     assert manifest.kind is MediaAssetKind.DIAGRAM_SVG
     assert manifest.compiler_name == "d2"
@@ -322,3 +348,60 @@ async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() 
     assert manifest.policy_version == "diagram-d2-svg-v3-relation-semantics"
     assert manifest.source == f"production_run:{run_id}:diagram:network_flow"
     assert await asset_store.read(manifest.asset_id) == compiler.svg
+
+
+@pytest.mark.asyncio
+async def test_diagram_compilation_drops_failed_diagram_and_keeps_valid_sibling() -> None:
+    blob_store = _MemoryBlobStore()
+    media_assets = _MemoryMediaAssets()
+    asset_store = MediaAssetStore(blob_store, lambda: _MemoryUow(media_assets))  # type: ignore[arg-type]
+    valid_diagram = replace(_diagram(), key="valid_flow")
+
+    class Compiler:
+        async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+            if diagram.key == "network_flow":
+                raise DiagramCompilerProcessError("D2 rejected this diagram")
+            return await _DiagramCompiler(b"<svg></svg>").compile(diagram)
+
+    result = await compile_and_store_diagrams(
+        (_diagram(), valid_diagram),
+        compiler=Compiler(),  # type: ignore[arg-type]
+        media_asset_store=asset_store,
+        production_run_id=uuid4(),
+    )
+
+    assert [diagram.key for diagram in result.diagrams] == ["valid_flow"]
+    assert result.diagrams[0].compiled_asset_id is not None
+    assert len(result.rejections) == 1
+    assert result.rejections[0].diagram_key == "network_flow"
+    assert result.rejections[0].reason_code == "diagram_compiler_process_failure"
+    assert result.rejections[0].warning_code == "editorial_enrichment_diagram_render_failed"
+
+
+@pytest.mark.asyncio
+async def test_diagram_compilation_returns_rejections_when_every_diagram_fails() -> None:
+    blob_store = _MemoryBlobStore()
+    media_assets = _MemoryMediaAssets()
+    asset_store = MediaAssetStore(blob_store, lambda: _MemoryUow(media_assets))  # type: ignore[arg-type]
+    diagrams = (
+        _diagram(),
+        replace(_diagram(), key="second_flow"),
+    )
+
+    class Compiler:
+        async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+            raise DiagramCompilerProcessError(f"D2 rejected {diagram.key}")
+
+    result = await compile_and_store_diagrams(
+        diagrams,
+        compiler=Compiler(),  # type: ignore[arg-type]
+        media_asset_store=asset_store,
+        production_run_id=uuid4(),
+    )
+
+    assert result.diagrams == ()
+    assert {item.diagram_key for item in result.rejections} == {
+        "network_flow",
+        "second_flow",
+    }
+    assert not media_assets.by_id

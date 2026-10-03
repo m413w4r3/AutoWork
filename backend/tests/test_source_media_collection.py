@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID, uuid4
 
+import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject, NumberObject
 
@@ -61,6 +62,15 @@ def _png(width: int, height: int, *, compression: int = 6, seed: int = 0) -> byt
         + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
         + chunk(b"IDAT", zlib.compress(bytes(rows), compression))
         + chunk(b"IEND", b"")
+    )
+
+
+def _png_header(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     )
 
 
@@ -385,6 +395,26 @@ async def test_unreachable_unsafe_and_over_limit_images_have_explicit_outcomes()
     assert by_alt["Unavailable chart"].collection_diagnostics["http_status"] == 404
 
 
+@pytest.mark.parametrize(("width", "height"), [(10_001, 200), (8_000, 6_000)])
+async def test_images_with_excessive_dimensions_are_excluded_before_archiving(
+    width: int, height: int
+) -> None:
+    service, factory, store, _transport = _service(
+        {"https://site.example/large-dimensions.png": _response(_png_header(width, height))}
+    )
+
+    (record,) = await service.collect(
+        SUBJECT_ID,
+        (_source('<img alt="Oversized chart" src="/large-dimensions.png">'),),
+    )
+
+    assert record.status is SourceMediaStatus.EXCLUDED_BY_RULE
+    assert record.reason_code is SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS
+    assert (record.width, record.height) == (width, height)
+    assert not factory.state.blobs
+    assert not store.objects
+
+
 async def test_collector_wire_size_limit_is_recorded_as_collection_diagnostic() -> None:
     image = _png(400, 260)
     service, _factory, _store, _transport = _service(
@@ -441,14 +471,14 @@ async def test_policy_version_change_changes_candidate_identity_and_decision_has
     service_v2, _, _, _ = _service(
         responses,
         factory=factory,
-        policy=SourceMediaPolicy(version="source-media-exclusion-v2"),
+        policy=SourceMediaPolicy(version="source-media-exclusion-v3"),
     )
 
     second = await service_v2.collect(SUBJECT_ID, (source,))
 
     assert first[0].id != second[0].id
     assert first[0].policy_sha256 != second[0].policy_sha256
-    assert second[0].policy_version == "source-media-exclusion-v2"
+    assert second[0].policy_version == "source-media-exclusion-v3"
     inventories = []
     for service, records in ((service_v1, first), (service_v2, second)):
         assets = tuple(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import struct
 from typing import Any
 from uuid import UUID
 
@@ -65,6 +66,15 @@ def _html(*images: str) -> bytes:
 
 def _data_uri(content: bytes = _PNG) -> str:
     return "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+
+
+def _png_header(width: int, height: int) -> bytes:
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + struct.pack(">I", 13)
+        + b"IHDR"
+        + struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    )
 
 
 def test_data_uri_is_parsed_but_pending_without_an_existing_blob() -> None:
@@ -150,6 +160,20 @@ def test_inventory_applies_figure_count_and_size_limits() -> None:
     assert len(limited.figures) == 1
     assert oversized.figures[0].decision is SourceFigureDecision.REJECTED
     assert oversized.figures[0].decision_reason == "figure_exceeds_byte_limit"
+
+
+@pytest.mark.parametrize(("width", "height"), [(10_001, 200), (8_000, 6_000)])
+def test_inventory_rejects_header_only_pngs_with_excessive_dimensions(
+    width: int, height: int
+) -> None:
+    content = _png_header(width, height)
+    source = _source(_html(f'<img src="{_data_uri(content)}" alt="Oversized chart">'))
+
+    result = SourceFigureInventory().inventory((source,), ())
+
+    assert len(result.figures) == 1
+    assert result.figures[0].decision is SourceFigureDecision.REJECTED
+    assert result.figures[0].decision_reason == "image_too_large_dimensions"
 
 
 def test_inventory_applies_its_total_byte_limit() -> None:

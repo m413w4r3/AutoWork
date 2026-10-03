@@ -22,15 +22,17 @@ flowchart TD
   extraction --> relevance[RELEVANCE_PROJECTION: RelevanceProjectionV1]
   relevance --> synthesis[SYNTHESIS: ProductionSynthesisV1]
   synthesis --> enrichment[EDITORIAL_ENRICHMENT: EditorialEnrichmentV1]
-  enrichment --> assembly[ASSEMBLY: PublicationDocumentV4]
+  enrichment --> assembly[ASSEMBLY: PublicationDocumentV5, schema 5]
   relevance --> assembly
-  assembly --> preview[Subject preview: projection frontend V4]
+  assembly --> preview[Subject preview: projection frontend V5]
   assembly --> render[PublicationRender] --> pdf[Typst PDF article]
 ```
 
-`ASSEMBLY` écrit `PublicationDocumentV4` dans l'artifact `PUBLICATION`. Il ne compile aucun média
-et ne rend aucun document. Le preview Subject projette directement le V4 côté frontend ; son PDF
-est produit par le rendu AW-019 `PublicationRender`, sans relire Synthesis ni Editorial Enrichment.
+`ASSEMBLY` écrit `PublicationDocumentV5` (`schema_version: "5"`) dans l'artifact
+`PUBLICATION`. Ce wrapper conserve le document V4 et ajoute `rich_text`, le texte sémantique
+typé. Il ne compile aucun média et ne rend aucun document. Le preview Subject projette directement
+le V5 côté frontend ; son PDF est produit par le rendu AW-019 `PublicationRender`, sans relire
+Synthesis ni Editorial Enrichment.
 La QA canonique passée, le run devient `READY`, indépendamment du rendu.
 
 ## Rendu de publication et de bulletin
@@ -39,7 +41,7 @@ La publication d'un Subject et le bulletin d'édition ont des rendus séparés :
 
 ```mermaid
 flowchart TD
-  publication[PublicationDocumentV4] --> publication_render[PublicationRender] --> article_pdf[Typst PDF]
+  publication[PublicationDocumentV5 (schema 5)] --> publication_render[PublicationRender] --> article_pdf[Typst PDF]
   manifest[PublicationManifestV1] --> document[EditionDocumentV2]
   document --> release[EditionRelease: JSON uniquement]
   release --> render[EditionRender: ligne identifiée par input_hash]
@@ -243,7 +245,7 @@ EDITORIAL_ENRICHMENT produit EditorialEnrichmentV1
         ↓
 ASSEMBLY consomme aussi ProductionReferenceCorpusV1 et RelevanceProjectionV1
         ↓
-PublicationDocumentV4 → QA canonique → READY
+PublicationDocumentV5 (schema 5) → QA canonique → READY
 ```
 
 `ProductionExtractionV1` est la vérité factuelle canonique ; `RelevanceProjectionV1` classe ses
@@ -327,20 +329,22 @@ du binaire et évolue avec tout changement volontaire des bytes produits.
 Le stage `EDITORIAL_ENRICHMENT` compile les diagrammes et persiste les SVG avec les médias gérés par
 `MediaAssetStore`. `SourceFigureInventory` inventorie les figures locales ; `SourceFigureIngestor`
 valide et archive celles retenues. Assembly projette les tables, les diagrammes déjà compilés
-(`compiled_asset_id` → `asset_id`) et les figures `INCLUDED` résolues dans `PublicationDocumentV4`.
+(`compiled_asset_id` → `asset_id`) et les figures `INCLUDED` résolues dans `PublicationDocumentV5`.
 Les figures `PROPOSED` ou `EXCLUDED` n’y figurent jamais : Assembly ne décide rien éditorialement,
 ne compile aucun diagramme, ne télécharge aucune image et n’appelle aucun modèle. La compilation D2
 ne remplace pas le renderer documentaire actuel.
 
 Assembly vérifie le lineage du snapshot, des références, de l’extraction, de la synthèse et de
-l’enrichissement avant de construire `PublicationDocumentV4`. Le titre, le lead, les sections, la
+l’enrichissement avant de construire `PublicationDocumentV5`. Le titre, le lead, les sections, la
 chronologie et les incertitudes viennent de Synthesis ; les IOC confirmés viennent d’Extraction.
 Les sources sont résolues par `source_document_id`. Le hash d’Assembly dépend des cinq entrées canoniques, de
-la version de document (`4`) et de la policy (`2`), sans version de renderer, D2 ni Typst :
+la version de document (`5`) et de la policy (`2`), sans version de renderer, D2 ni Typst :
 les mêmes entrées ne réutilisent donc jamais un ancien artifact d’une autre version. Le hash de l’enrichissement
 fait partie de l’identité d’Assembly depuis AW-015.
-`PublicationDocumentV4.sources` couvre exactement les sources utilisées, enrichissement compris.
-QA recalcule la projection V4 depuis les cinq entrées canoniques et compare le document exact.
+`PublicationDocumentV5` enveloppe les champs du V4 et ajoute `rich_text` avec les rôles sémantiques.
+`PublicationDocumentV5.sources` couvre exactement les sources utilisées, enrichissement compris.
+QA recalcule la projection V5 depuis les cinq entrées canoniques et compare le document exact.
+Le rendu d'édition accepte les publications historiques de schéma `4` et les documents V5 de schéma `5`.
 L'artifact `PUBLICATION` conserve le document canonique, sans rendu, sans source D2, sans SVG
 en ligne et sans Typst.
 
@@ -348,7 +352,7 @@ Pandoc est l'ancien renderer supprimé en AW-020.
 
 AW-016 produit des propositions structurées. AW-017a, AW-017b et AW-017c fournissent la compilation
 des diagrammes, l’inventaire des figures et la persistance des médias. AW-018 projette
-l’enrichissement et les médias dans `PublicationDocumentV4`.
+l’enrichissement et les médias dans `PublicationDocumentV5`.
 
 ## ProductionBoard
 

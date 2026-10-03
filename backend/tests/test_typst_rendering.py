@@ -384,12 +384,90 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
-    assert "".join(span["text"] for span in paragraph["semantic_spans"]) == lead_text
+    assert (
+        "".join(span["text"] for span in paragraph["semantic_spans"]).replace("\u200b", "")
+        == lead_text
+    )
     assert {"semantic-actor", "semantic-command", "semantic-technical-literal"} <= styles
     assert len(semantic_cells) == sum(len(row) for row in table["rows"])
     assert all(isinstance(cell_spans, list) for cell_spans in semantic_cells)
     assert "semantic-command" in {span["style"] for span in semantic_cells[0]}
     assert "semantic-actor" in {span["style"] for span in table["semantic_caption"]}
+
+
+def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    long_hash = "a" * 128
+    long_path = "/opt/very-long-installation/path/to/a/critical/binary"
+    long_command = "powershell.exe -ExecutionPolicy Bypass -EncodedCommand " + "B" * 48
+    lead_text = f"Hash {long_hash}; path {long_path}; command {long_command}."
+    base = _full_document()
+    base = replace(
+        base,
+        lead=(replace(base.lead[0], text=lead_text), *base.lead[1:]),
+        indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.HASH,
+                (
+                    PublicationIndicatorV1(
+                        value=long_hash,
+                        normalized_value=long_hash,
+                        artifact_type=ArtifactType.HASH,
+                        source_document_ids=(_SOURCE_ID,),
+                    ),
+                ),
+            ),
+        ),
+    )
+    proposals = tuple(
+        SemanticAnnotationProposalV1(
+            paragraph_anchor="lead:0001",
+            role=role,
+            text=value,
+        )
+        for role, value in (
+            (SemanticRole.IOC, long_hash),
+            (SemanticRole.PATH, long_path),
+            (SemanticRole.COMMAND, long_command),
+        )
+    )
+    annotator = SemanticAnnotator(EnglishTermDetector(()))
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            annotator.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=(),
+                proposals=proposals,
+            )
+            for anchor, text in publication_document_text_anchors(base).items()
+        ),
+    )
+    document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
+
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    synthesis = data["content_sections"][1]
+    lead = next(
+        block
+        for block in synthesis["blocks"]
+        if block.get("type") == "paragraph" and block.get("text") == lead_text
+    )
+    spans = {span["style"]: span["text"] for span in lead["semantic_spans"]}
+
+    def break_text(value: str) -> str:
+        return "\u200b".join(value[index : index + 16] for index in range(0, len(value), 16))
+
+    assert data["content_sections"][2]["indicators"]["hashes"] == [break_text(long_hash)]
+    assert spans["semantic-ioc"] == break_text(long_hash)
+    assert spans["semantic-path"] == break_text(long_path)
+    assert spans["semantic-command"] == break_text(long_command)
+    assert document.document.lead[0].text == lead_text
+    assert document.document.indicators[0].indicators[0].value == long_hash
+    assert "\u200b" not in lead_text
 
 
 def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(

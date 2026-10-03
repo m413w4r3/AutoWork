@@ -27,7 +27,7 @@ adressés par SHA-256. Un workspace ou une conversation ne peut jamais être une
 | `publication_manifests` | Ordre et artifacts exacts retenus pour une publication, append-only. |
 | `edition_releases` | Snapshot JSON du manifest et de l'`EditionDocumentV2`, sans bytes de rendu. |
 | `edition_renders` | Rendus PDF d'un release, identifiés par `input_hash` et référencés au blob store. |
-| `publication_renders` | Rendus PDF d'un artifact `PublicationDocumentV4`, référencés au blob store. |
+| `publication_renders` | Rendus PDF d'un artifact `PublicationDocumentV5` (schéma `5`) ou historique V4, référencés au blob store. |
 | `blobs` | Catalogue des objets MinIO, unicité par bucket logique et SHA-256. |
 
 La baseline finale ne contient aucune table `editorial_groups`. Elle ne contient pas non plus de
@@ -80,9 +80,10 @@ canonique et sa QA, indépendamment du rendu PDF d'un article ou d'un bulletin.
 
 ## Documents publiés et rendus
 
-La chaîne Subject est `PublicationDocumentV4 → PublicationRender → Typst PDF`. Le preview Subject
-est la projection frontend directe du V4 ; `GET /api/subjects/{id}/publication/pdf` demande ou
-retourne le rendu AW-019.
+La chaîne Subject est `PublicationDocumentV5 → PublicationRender → Typst PDF`. Le schéma `5`
+enveloppe le document V4 et ajoute `rich_text`, le texte sémantique. Le preview Subject projette
+directement le V5 côté frontend ; `GET /api/subjects/{id}/publication/pdf` demande ou retourne le
+rendu AW-019. Le rendu d'édition accepte les documents de schéma `4` et `5`.
 
 La chaîne édition est `PublicationManifestV1 → EditionDocumentV2 → EditionRelease → EditionRender
 → Typst PDF`. `EditionRelease` conserve seulement le snapshot JSON du manifest et du document

@@ -429,7 +429,7 @@ it("keeps ambiguous relevance decisions visible with their reasons", async () =>
   ).toBeInTheDocument();
 });
 
-it("ne rend pas une publication dont le schema n'est pas V4", async () => {
+it("ne rend pas une publication dont le schema n'est ni V4 ni V5", async () => {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockResolvedValue(
@@ -463,6 +463,73 @@ it("ne rend pas une publication dont le schema n'est pas V4", async () => {
       name: "Publication legacy à ne pas afficher",
     }),
   ).not.toBeInTheDocument();
+});
+
+it("ne répète pas dans les sections un paragraphe déjà affiché dans le lead", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "publication-duplicate-lead",
+        stage: "publication",
+        version: 1,
+        status: "verified",
+        metadata: {},
+        canonical_content: {
+          schema_version: "4",
+          subject_id: SYNTHESIS_SUBJECT_ID,
+          publication_language: "fr",
+          title: "Publication avec lead répété",
+          lead: [
+            {
+              text: "Straße assessment.",
+              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+            },
+          ],
+          sections: [
+            {
+              kind: "overview",
+              heading: "",
+              paragraphs: [
+                {
+                  text: "  STRASSE   ASSESSMENT.  ",
+                  evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                },
+                {
+                  text: "Unique section detail.",
+                  evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+                },
+              ],
+            },
+          ],
+          timeline: [],
+          indicators: [],
+          sources: [
+            {
+              source_document_id: VENDOR_DOCUMENT_ID,
+              canonical_url: VENDOR_URL,
+              title: "Rapport",
+              publisher: "Vendor",
+              published_at: null,
+              tier: "core",
+              kind: "publication",
+              role: "primary",
+            },
+          ],
+          uncertainties: [],
+          tables: [],
+          diagrams: [],
+          figures: [],
+        },
+      }),
+    ),
+  );
+
+  renderArtifact("publication");
+
+  expect(await screen.findByText("Straße assessment.")).toBeInTheDocument();
+  expect(screen.getAllByText("Straße assessment.")).toHaveLength(1);
+  expect(screen.getByText("Unique section detail.")).toBeInTheDocument();
 });
 
 it("affiche la publication V4 et ses enrichissements", async () => {

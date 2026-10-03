@@ -50,6 +50,18 @@ _INDICATOR_KEYS = {
     ArtifactType.EMAIL: "emails",
     ArtifactType.HASH: "hashes",
 }
+_BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command"})
+_TYPOGRAPHIC_BREAK_INTERVAL = 16
+
+
+def _breakable_typst_display_text(value: str) -> str:
+    """Add line-break opportunities to render data without changing canonical text."""
+    if len(value) <= _TYPOGRAPHIC_BREAK_INTERVAL:
+        return value
+    return "\u200b".join(
+        value[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
+        for index in range(0, len(value), _TYPOGRAPHIC_BREAK_INTERVAL)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,7 +170,14 @@ def project_publication_to_typst_model(
         if paragraph.text != text:
             raise ValueError(f"Semantic text differs from publication content at {anchor}")
         return [
-            {"style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[span.role], "text": span.text}
+            {
+                "style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[span.role],
+                "text": (
+                    _breakable_typst_display_text(span.text)
+                    if span.role.value in _BREAKABLE_SEMANTIC_ROLES
+                    else span.text
+                ),
+            }
             for span in paragraph.spans
         ]
 
@@ -327,7 +346,9 @@ def project_publication_to_typst_model(
         key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
     }
     for group in document.indicators:
-        indicators[_INDICATOR_KEYS[group.artifact_type]] = [item.value for item in group.indicators]
+        indicators[_INDICATOR_KEYS[group.artifact_type]] = [
+            _breakable_typst_display_text(item.value) for item in group.indicators
+        ]
 
     content_sections: list[dict[str, Any]] = [
         {

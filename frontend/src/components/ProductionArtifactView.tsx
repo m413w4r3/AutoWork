@@ -213,6 +213,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function publicationParagraphFingerprint(text: string): string {
+  const folded = Array.from(text, (character) =>
+    character === "ı" ? character : character.toUpperCase().toLowerCase(),
+  )
+    .join("")
+    .replace(/ß/g, "ss");
+  return folded.trim().split(/\s+/u).filter(Boolean).join(" ");
+}
+
 function isProductionReferenceSource(
   value: unknown,
 ): value is ProductionReferenceSource {
@@ -1154,6 +1163,9 @@ export function PublicationDocumentView({
   const sources = new Map(
     document.sources.map((source) => [source.source_document_id, source]),
   );
+  const leadFingerprints = new Set(
+    document.lead.map((item) => publicationParagraphFingerprint(item.text)),
+  );
   const provenance = (sourceIds: string[]) => (
     <span className="publication-preview__provenance">
       {Array.from(new Set(sourceIds)).map((sourceId, index) => {
@@ -1299,11 +1311,13 @@ export function PublicationDocumentView({
           {document.sections.map((section, index) => (
             <div key={`${section.kind}-${index}`}>
               {section.paragraphs.map((item, paragraphIndex) =>
-                paragraph(
-                  item,
-                  `${index}-${paragraphIndex}`,
-                  `section:${index}:paragraph:${String(paragraphIndex + 1).padStart(4, "0")}`,
-                ),
+                leadFingerprints.has(publicationParagraphFingerprint(item.text))
+                  ? null
+                  : paragraph(
+                      item,
+                      `${index}-${paragraphIndex}`,
+                      `section:${index}:paragraph:${String(paragraphIndex + 1).padStart(4, "0")}`,
+                    ),
               )}
               {enrichmentsAt("after_section", index)}
             </div>
