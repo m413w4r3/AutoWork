@@ -260,6 +260,7 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         assert await uow.production_artifacts.mark_from_stage_stale(run.id, "references") == [
             "references",
             "extraction",
+            "relevance_projection",
             "synthesis",
             "editorial_enrichment",
             "publication",
@@ -272,6 +273,7 @@ async def test_stale_artifacts_are_replaced_with_monotonic_versions_in_postgres(
         assert await uow.production_artifacts.mark_from_stage_stale(run.id, "references") == [
             "references",
             "extraction",
+            "relevance_projection",
             "synthesis",
             "editorial_enrichment",
             "publication",
@@ -341,6 +343,7 @@ async def test_mark_stages_stale_updates_only_requested_non_stale_stages(
         ("extraction", "verified"),
         ("publication", "stale"),
         ("references", "verified"),
+        ("relevance_projection", "verified"),
         ("synthesis", "stale"),
     ]
 

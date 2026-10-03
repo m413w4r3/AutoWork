@@ -21,7 +21,7 @@ from cti_app.domain.production_synthesis import (
 
 RELEVANCE_PROJECTION_SCHEMA_VERSION = 2
 RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-model-proposal-v2"
-DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v2"
+DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v3-core-default"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 

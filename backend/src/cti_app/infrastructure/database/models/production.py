@@ -22,13 +22,15 @@ from .base import Base
 
 PRODUCTION_STATUS_VALUES_SQL = "'queued', 'running', 'ready', 'needs_review', 'failed', 'cancelled'"
 PRODUCTION_STAGE_VALUES_SQL = (
-    "'sources', 'references', 'extraction', 'synthesis', 'editorial_enrichment', 'assembly'"
+    "'sources', 'references', 'extraction', 'relevance_projection', 'synthesis', "
+    "'editorial_enrichment', 'assembly'"
 )
 PRODUCTION_ARTIFACT_STAGE_VALUES_SQL = (
-    "'references', 'extraction', 'synthesis', 'editorial_enrichment', 'publication'"
+    "'references', 'extraction', 'relevance_projection', 'synthesis', "
+    "'editorial_enrichment', 'publication'"
 )
 PRODUCTION_REUSE_STAGE_VALUES_SQL = (
-    "'references', 'extraction', 'synthesis', 'editorial_enrichment'"
+    "'references', 'extraction', 'relevance_projection', 'synthesis', 'editorial_enrichment'"
 )
 PRODUCTION_ARTIFACT_STATUS_VALUES_SQL = "'verified', 'stale', 'needs_review'"
 SOURCE_EXTRACTION_STATUS_VALUES_SQL = "'running', 'verified', 'needs_review', 'failed'"

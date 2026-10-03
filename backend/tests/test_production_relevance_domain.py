@@ -403,6 +403,59 @@ def test_unrelated_muddywater_hashes_generic_filename_and_footer_email_are_not_i
     assert published.indicators == ()
 
 
+def test_core_confirmed_iocs_are_direct_by_default_and_published() -> None:
+    snapshot = _snapshot(actor_or_campaign="MOIS")
+    core_id, support_id = uuid4(), uuid4()
+    core = _source(
+        core_id,
+        indicators=(
+            # Neutral wording: the CORE source is about this subject and presents
+            # the value as a confirmed IOC.
+            _indicator(core_id, "c2.example.test", ArtifactType.DOMAIN, context="Command server"),
+            # Another actor named without any subject anchor stays out of scope.
+            _indicator(
+                core_id,
+                "b" * 64,
+                ArtifactType.HASH,
+                context="MuddyWater sample hash for ArenaC2",
+            ),
+        ),
+    )
+    support = _source(
+        support_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        role=SourceRole.INDEPENDENT,
+        indicators=(
+            _indicator(
+                support_id, "other.example.test", ArtifactType.DOMAIN, context="Command server"
+            ),
+        ),
+    )
+    extraction = _extraction(snapshot, (core, support))
+    projection = build_relevance_projection(snapshot, extraction)
+    by_value = {
+        payload["value"]: projection.classification_for(ref)
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.INDICATOR
+    }
+
+    domain = by_value["c2.example.test"]
+    assert domain.classification is RelevanceClassification.DIRECT
+    assert domain.reason_code is RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION
+    assert by_value["b" * 64].classification is RelevanceClassification.OUT_OF_SCOPE
+    # A complementary source without a demonstrated subject relation stays unpublished.
+    assert by_value["other.example.test"].classification is RelevanceClassification.INDETERMINATE
+
+    narrative = _PublicationNarrativeProjection((), (), (), (), frozenset())
+    published = _project_publication_iocs(
+        extraction=extraction, narrative=narrative, relevance_projection=projection
+    )
+    assert [
+        item.normalized_value for group in published.indicators for item in group.indicators
+    ] == ["c2.example.test"]
+
+
 def test_indeterminate_stays_in_projection_and_is_omitted_from_synthesis() -> None:
     snapshot = _snapshot()
     primary_id, support_id = uuid4(), uuid4()

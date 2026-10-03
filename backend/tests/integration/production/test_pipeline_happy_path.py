@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from typing import Any
@@ -20,9 +19,6 @@ from cti_app.application.model_gateway import (
 from cti_app.application.production_recovery import ProductionRecoveryPolicyV1
 from cti_app.application.production_repairs import ProductionRepairMaterializationService
 from cti_app.application.production_synthesis import (
-    SynthesisClaimProposalV1,
-    SynthesisProposalV1,
-    SynthesisSectionProposalV1,
     canonical_extraction_hash,
     production_synthesis_from_json,
 )
@@ -42,11 +38,15 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_to_json,
 )
-from cti_app.domain.production_synthesis import SynthesisSectionKind
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import parse_publication_document
 
-from .support import ProductionScenario, grounded_editorial_proposal
+from .support import (
+    ProductionScenario,
+    grounded_editorial_proposal,
+    synthesis_prompt_records,
+    synthesis_proposal_wire,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -64,6 +64,7 @@ url: https://example.test/core
 publisher: Core Labs
 published-at: 2026-08-10
 role: primary
+editorial-role: primary
 kind: publication
 reason: Primary reporting on the campaign
 
@@ -74,6 +75,7 @@ url: https://example.test/secondary
 publisher: Secondary Labs
 published-at: 2026-08-11
 role: independent
+editorial-role: corroboration
 kind: publication
 reason: Independent corroboration of the campaign
 
@@ -129,33 +131,22 @@ async def _configured_scenario(
     return scenario
 
 
-def _canonical_proposal(request_text: str) -> SynthesisProposalV1:
-    """Answer the canonical structured draft with grounded, atomic claims."""
-    payload = json.loads(request_text)
-    pack = payload["current_evidence_pack"]
-    facts = [record for record in pack["narrative_evidence"] if record["kind"] == "fact"]
+def _canonical_proposal(request_text: str) -> str:
+    """Answer the canonical text-block draft with grounded, atomic claims."""
+    records = synthesis_prompt_records(request_text)
+    facts = [record for record in records if record.get("kind") == "fact"]
     assert facts, "The canonical evidence pack must expose the narrative fact"
     fact = facts[0]
-    lead = SynthesisClaimProposalV1(
-        text=f"{fact['value']} is documented by the selected publications.",
-        evidence_handles=(fact["handle"],),
-    )
-    domains = tuple(
-        SynthesisClaimProposalV1(
-            text=f"The publications list the infrastructure domain {record['value']}.",
-            evidence_handles=(record["handle"],),
+    lead = (f"{fact['value']} is documented by the selected publications.", (fact["handle"],))
+    domains = [
+        (
+            f"The publications list the infrastructure domain {record['value']}.",
+            (record["handle"],),
         )
-        for record in pack["technical_evidence"]
-        if record["kind"] == "indicator"
-    )
-    sections = (
-        SynthesisSectionProposalV1(
-            kind=SynthesisSectionKind.INFRASTRUCTURE,
-            heading="Infrastructure",
-            claims=domains or (lead,),
-        ),
-    )
-    return SynthesisProposalV1(lead=(lead,), sections=sections)
+        for record in records
+        if record.get("kind") == "indicator"
+    ]
+    return synthesis_proposal_wire([lead], [("infrastructure", domains or [lead])])
 
 
 def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModelRequest]:
@@ -178,7 +169,7 @@ def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModel
             raise AssertionError("Canonical Synthesis must be stateless")
         requests.append(request)
         scenario.model.provider_calls.append(request)
-        proposal = _canonical_proposal(request.text)
+        output_text = _canonical_proposal(request.text)
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
             provider=adapter.provider,
@@ -188,8 +179,7 @@ def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModel
             # model_runs.response_id is globally unique: derive it from the
             # gateway's per-attempt request id, never from a per-test counter.
             response_id=f"canonical-synthesis-{request.request_id}",
-            output_text=proposal.model_dump_json(),
-            structured_output=proposal,
+            output_text=output_text,
         )
 
     adapter.invoke = invoke  # type: ignore[method-assign]
@@ -259,12 +249,13 @@ async def test_complete_production_pipeline_reaches_ready(
     assert set(by_stage) == {
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
     }
     assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
-    assert [by_stage[stage].version for stage in by_stage] == [1, 1, 1, 1, 1]
+    assert [by_stage[stage].version for stage in by_stage] == [1, 1, 1, 1, 1, 1]
     assert all(len(artifact.input_hash) == 64 for artifact in artifacts)
     assert by_stage[ProductionArtifactStage.REFERENCES].metadata["warnings"] == []
     assert by_stage[ProductionArtifactStage.EXTRACTION].metadata["warnings"] == []
@@ -317,7 +308,8 @@ async def test_complete_production_pipeline_reaches_ready(
     ]
     assert model_calls[0].stage == "references"
     assert model_calls[-1].stage == "editorial_enrichment"
-    assert all(call.stage == "extraction" for call in model_calls[1:-2])
+    assert all(call.stage == "extraction" for call in model_calls[1:-3])
+    assert model_calls[-3].stage == "relevance_projection"
     assert model_calls[-2].stage == "synthesis"
     # Canonical Synthesis is one stateless structured draft through the gateway.
     assert len(synthesis_requests) == 1
@@ -329,7 +321,8 @@ async def test_complete_production_pipeline_reaches_ready(
     covered_q2_urls = tuple(url for call in q2_calls for url in call.source_urls)
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
-    assert len(model_calls) == 3 + len(q2_calls)
+    # references, relevance projection, synthesis and editorial enrichment
+    assert len(model_calls) == 4 + len(q2_calls)
     # Only the References stage searches the web; extraction and synthesis are
     # stateless and offline.
     assert all(call.web_search is (call.stage == "references") for call in model_calls)
@@ -407,7 +400,7 @@ async def test_complete_production_pipeline_reaches_ready(
     assert "secondary-c2.security-lab.io" in synthesis_text
     assert "core-c2.security-lab.io" in str(publication_payload)
     assert "secondary-c2.security-lab.io" in str(publication_payload)
-    assert publication_payload["schema_version"] == "4"
+    assert publication_payload["schema_version"] == "5"
     assert publication_payload["title"] == synthesis_payload["title"]
     assert publication_payload["lead"] == synthesis_payload["lead"]
     assert publication_payload["sections"] == synthesis_payload["sections"]

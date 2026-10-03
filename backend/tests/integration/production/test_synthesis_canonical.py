@@ -49,9 +49,6 @@ from cti_app.application.production_parsers import (
 )
 from cti_app.application.production_synthesis import (
     SYNTHESIS_PROMPT_VERSION,
-    SynthesisClaimProposalV1,
-    SynthesisProposalV1,
-    SynthesisSectionProposalV1,
     build_synthesis_delta,
     canonical_extraction_hash,
     production_synthesis_from_json,
@@ -80,11 +77,10 @@ from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
-    SynthesisSectionKind,
     extraction_evidence_refs_v1,
 )
 
-from .support import ProductionScenario
+from .support import ProductionScenario, synthesis_prompt_records, synthesis_proposal_wire
 
 pytestmark = pytest.mark.integration
 
@@ -117,6 +113,7 @@ url: https://canonical.test/core-one
 publisher: Canonical Labs
 published-at: 2026-08-03
 role: primary
+editorial-role: primary
 kind: publication
 reason: Primary reporting on the campaign
 
@@ -127,6 +124,7 @@ url: https://canonical.test/core-two
 publisher: Canonical Labs
 published-at: 2026-08-06
 role: independent
+editorial-role: corroboration
 kind: publication
 reason: Independent corroboration of the campaign
 
@@ -212,61 +210,37 @@ def _configure(scenario: ProductionScenario) -> ProductionScenario:
     return scenario
 
 
-def _proposal_from_prompt(prompt_text: str) -> SynthesisProposalV1:
-    """Answer the canonical prompt with a grounded, deterministic proposal."""
-    payload = json.loads(prompt_text)
-    pack = payload["current_evidence_pack"]
-    narrative = list(pack["narrative_evidence"])
-    technical = list(pack["technical_evidence"])
-    facts = [record for record in narrative if record["kind"] == "fact"]
+def _proposal_from_prompt(prompt_text: str) -> str:
+    """Answer the canonical prompt with a grounded, deterministic text-block proposal."""
+    records = synthesis_prompt_records(prompt_text)
+    facts = [record for record in records if record.get("kind") == "fact"]
     assert facts, "The canonical evidence pack exposes the narrative fact"
     fact = facts[0]
-    lead = SynthesisClaimProposalV1(
-        text=f"{fact['value']} is documented by the selected publications.",
-        evidence_handles=(fact["handle"],),
-    )
-    domains = tuple(
-        SynthesisClaimProposalV1(
-            text=f"The publications list the infrastructure domain {record['value']}.",
-            evidence_handles=(record["handle"],),
+    lead = (f"{fact['value']} is documented by the selected publications.", (fact["handle"],))
+    domains = [
+        (
+            f"The publications list the infrastructure domain {record['value']}.",
+            (record["handle"],),
         )
-        for record in technical
-        if record["kind"] == "indicator"
-    )
-    rules = tuple(
-        SynthesisClaimProposalV1(
-            text=f"The publication provides the detection rule {record['name']}.",
-            evidence_handles=(record["handle"],),
+        for record in records
+        if record.get("kind") == "indicator"
+    ]
+    rules = [
+        (
+            f"The publication provides the detection rule {record['name']}.",
+            (record["handle"],),
         )
-        for record in technical
-        if record["kind"] == "rule" and record["name"]
-    )
-    sections: list[SynthesisSectionProposalV1] = []
+        for record in records
+        if record.get("kind") == "rule" and record.get("name")
+    ]
+    sections: list[tuple[str, list[tuple[str, tuple[str, ...]]]]] = []
     if domains:
-        sections.append(
-            SynthesisSectionProposalV1(
-                kind=SynthesisSectionKind.INFRASTRUCTURE,
-                heading="Infrastructure",
-                claims=domains,
-            )
-        )
+        sections.append(("infrastructure", domains))
     if rules:
-        sections.append(
-            SynthesisSectionProposalV1(
-                kind=SynthesisSectionKind.DETECTION,
-                heading="Detection",
-                claims=rules,
-            )
-        )
+        sections.append(("detection", rules))
     if not sections:
-        sections.append(
-            SynthesisSectionProposalV1(
-                kind=SynthesisSectionKind.OVERVIEW,
-                heading="Overview",
-                claims=(lead,),
-            )
-        )
-    return SynthesisProposalV1(lead=(lead,), sections=tuple(sections))
+        sections.append(("overview", [lead]))
+    return synthesis_proposal_wire([lead], sections)
 
 
 def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModelRequest]:
@@ -289,7 +263,7 @@ def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModel
             raise AssertionError("Canonical Synthesis must be stateless")
         requests.append(request)
         scenario.model.provider_calls.append(request)
-        proposal = _proposal_from_prompt(request.text)
+        output_text = _proposal_from_prompt(request.text)
         return AdapterResult(
             status=AdapterResultStatus.COMPLETED,
             provider=adapter.provider,
@@ -299,8 +273,7 @@ def _install_canonical_synthesis(scenario: ProductionScenario) -> list[SafeModel
             # model_runs.response_id is globally unique: derive it from the
             # gateway's per-attempt request id, never from a per-test counter.
             response_id=f"canonical-synthesis-{request.request_id}",
-            output_text=proposal.model_dump_json(),
-            structured_output=proposal,
+            output_text=output_text,
         )
 
     adapter.invoke = invoke  # type: ignore[method-assign]
@@ -429,18 +402,22 @@ async def _drain(scenario: ProductionScenario, run_id: UUID) -> ProductionRun:
     return run
 
 
+async def _park_run(scenario: ProductionScenario, run_id: UUID, stage: ProductionStage) -> None:
+    async with scenario.uow_factory() as uow:
+        persisted = await uow.production_runs.get_for_update(run_id)
+        assert persisted is not None
+        persisted.current_stage = stage
+        await uow.production_runs.save(persisted)
+        await uow.commit()
+
+
 async def _prepare_synthesis_run(scenario: ProductionScenario) -> ProductionRun:
     """Create a run parked on SYNTHESIS with a fresh frozen snapshot."""
     production = SubjectProductionService(scenario.uow_factory)
     run, created = await production.create_run(scenario.subject.id, scenario.edition.id)
     assert created
     run = await production.start_run(run.id)
-    async with scenario.uow_factory() as uow:
-        persisted = await uow.production_runs.get_for_update(run.id)
-        assert persisted is not None
-        persisted.current_stage = ProductionStage.SYNTHESIS
-        await uow.production_runs.save(persisted)
-        await uow.commit()
+    await _park_run(scenario, run.id, ProductionStage.SYNTHESIS)
     return run
 
 
@@ -583,7 +560,7 @@ async def test_canonical_synthesis_pipeline_persists_reloads_and_assembles(
     publication_payload = await scenario.artifact_store.read_json(
         publication_artifact.canonical_blob_id
     )
-    assert publication_payload["schema_version"] == "4"
+    assert publication_payload["schema_version"] == "5"
     publication_text = json.dumps(publication_payload)
     assert publication_payload["title"] == synthesis.title
     assert [item["text"] for item in publication_payload["lead"]] == [
@@ -605,6 +582,7 @@ async def test_canonical_synthesis_exact_reuse_skips_drafting(
     first_run = await scenario.run_until_terminal()
     assert first_run.status is ProductionRunStatus.READY, (
         first_run.error_code,
+        first_run.error_message,
         first_run.error_details,
     )
     assert len(drafts) == 1
@@ -620,6 +598,7 @@ async def test_canonical_synthesis_exact_reuse_skips_drafting(
 
     assert terminal.status is ProductionRunStatus.READY, (
         terminal.error_code,
+        terminal.error_message,
         terminal.error_details,
     )
     # Exact reuse: not a single provider submission, drafting included.
@@ -652,6 +631,7 @@ async def test_canonical_synthesis_revision_drops_removed_evidence(
     first_run = await scenario.run_until_terminal()
     assert first_run.status is ProductionRunStatus.READY, (
         first_run.error_code,
+        first_run.error_message,
         first_run.error_details,
     )
     assert tripwire == []
@@ -695,6 +675,13 @@ async def test_canonical_synthesis_revision_drops_removed_evidence(
         artifact_store=scenario.artifact_store,
     )
     drafts_before = len(drafts)
+    # The revised extraction needs its own relevance projection first.
+    await _park_run(scenario, second_run.id, ProductionStage.RELEVANCE_PROJECTION)
+    projected = await orchestrator.execute_stage(
+        second_run.id, ProductionStage.RELEVANCE_PROJECTION
+    )
+    assert projected["status"] == "success", projected
+    await _park_run(scenario, second_run.id, ProductionStage.SYNTHESIS)
     result = await orchestrator.execute_stage(second_run.id, ProductionStage.SYNTHESIS)
 
     assert result["status"] == "success", result

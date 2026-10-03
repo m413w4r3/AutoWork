@@ -13,6 +13,10 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
+from cti_app.application.production_artifact_reuse import (
+    ProductionArtifactReuseService,
+    cross_run_reuse_allowed,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_relevance_model import (
     ModelRelevanceClassifier,
@@ -31,6 +35,7 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
     ProductionExtractionV1,
     production_extraction_from_json,
 )
@@ -239,7 +244,13 @@ def _classify_item(
 
     if kind is EvidenceKind.INDICATOR:
         value = str(payload.get("value") or "").strip().casefold()
-        malicious_role = _contains_marker(text, _MALICIOUS_ROLE_MARKERS)
+        # The extractor's "confirmed IOC" status already records that the source
+        # presents the value as malicious; markers cover contextual wording.
+        malicious_role = str(
+            payload.get("indicator_status") or ""
+        ) == ExtractionIndicatorStatus.CONFIRMED_IOC or _contains_marker(
+            text, _MALICIOUS_ROLE_MARKERS
+        )
         if value in _GENERIC_FILENAMES:
             return decision(RelevanceClassification.CONTEXT, RelevanceReasonCode.GENERIC_FILENAME)
         if _EMAIL.search(value):
@@ -254,15 +265,17 @@ def _classify_item(
                 RelevanceClassification.CONTEXT,
                 RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
             )
+        if primary_core:
+            # The primary CORE publication is about this subject: a value it
+            # presents as malicious belongs to it unless another actor is named.
+            return decision(
+                RelevanceClassification.DIRECT,
+                RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+            )
         if not scope_match:
             return decision(
                 RelevanceClassification.INDETERMINATE,
                 RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
-            )
-        if primary_core:
-            return decision(
-                RelevanceClassification.DIRECT,
-                RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
             )
         if source.editorial_role is ProductionEditorialRole.CORROBORATION:
             return decision(
@@ -516,9 +529,11 @@ class ProductionRelevanceProjectionService:
         model_gateway: Any | None = None,
         model_enabled: bool = True,
         model_classifier: ModelRelevanceClassifier | None = None,
+        artifact_reuse: ProductionArtifactReuseService | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
+        self._artifact_reuse = artifact_reuse
         self._classifier = classifier or DeterministicRelevanceClassifier()
         self._model_classifier = None
         if model_enabled:
@@ -548,6 +563,9 @@ class ProductionRelevanceProjectionService:
             raise ValueError("Projection extraction subject differs from its snapshot")
         classifier = self._model_classifier or self._classifier
         projection = build_relevance_projection(snapshot, extraction, classifier=classifier)
+        reused = await self._reuse_exact(run, projection)
+        if reused is not None:
+            return reused
         proposal: ModelRelevanceProposalExecution | None = None
         artifact_metadata: dict[str, Any] = {}
         if self._model_classifier is not None:
@@ -628,6 +646,35 @@ class ProductionRelevanceProjectionService:
                     "source_pair_relation_count": len(projection.source_pair_relations),
                 },
             )
+
+    async def _reuse_exact(
+        self, run: ProductionRun, projection: RelevanceProjectionV1
+    ) -> RelevanceProjectionExecution | None:
+        """Reuse an identical verified projection before any model submission.
+
+        The projection input hash covers the frozen subject input, the exact
+        extraction and the classifier identity (prompt, contract and parser
+        versions), so a hit never changes the lineage of later stages.
+        """
+        if self._artifact_reuse is None:
+            return None
+        stage = ProductionArtifactStage.RELEVANCE_PROJECTION
+        reuse = await self._artifact_reuse.find_or_reuse(
+            run=run,
+            stage=stage,
+            input_hash=projection.input_hash,
+            allow_cross_run=cross_run_reuse_allowed(run, stage),
+        )
+        if reuse is None or reuse.artifact.canonical_blob_id is None:
+            return None
+        stored = relevance_projection_from_json(
+            await self._artifact_store.read_json(reuse.artifact.canonical_blob_id)
+        )
+        if stored.input_hash != projection.input_hash:
+            return None
+        return RelevanceProjectionExecution(
+            RelevanceProjectionExecutionStatus.REUSED, reuse.artifact, stored
+        )
 
     @staticmethod
     def _merge_model_proposals(

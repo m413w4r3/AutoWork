@@ -454,9 +454,14 @@ async def test_repair_materialization_is_one_commit_with_the_new_publication(
         uow_factory, fixture.run.id, ProductionArtifactStage.EDITORIAL_ENRICHMENT
     )
     assert enrichment is not None
+    projection = await _current(
+        uow_factory, fixture.run.id, ProductionArtifactStage.RELEVANCE_PROJECTION
+    )
+    assert projection is not None
     assert publication.metadata["input_artifacts"] == {
         "references_artifact_id": str(fixture.references.id),
         "extraction_artifact_id": str(extraction.id),
+        "relevance_projection_artifact_id": str(projection.id),
         "synthesis_artifact_id": str(synthesis.id),
         "editorial_enrichment_artifact_id": str(enrichment.id),
     }

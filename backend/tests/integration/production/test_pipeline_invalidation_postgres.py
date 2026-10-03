@@ -40,12 +40,18 @@ async def test_postgres_artifact_invalidation_uses_pipeline_dependencies(
         (
             "artifact",
             ProductionArtifactStage.REFERENCES.value,
-            {"extraction", "synthesis", "editorial_enrichment", "publication"},
+            {
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            },
         ),
         (
             "artifact",
             ProductionArtifactStage.EXTRACTION.value,
-            {"synthesis", "editorial_enrichment", "publication"},
+            {"relevance_projection", "synthesis", "editorial_enrichment", "publication"},
         ),
         (
             "artifact",
@@ -61,7 +67,13 @@ async def test_postgres_artifact_invalidation_uses_pipeline_dependencies(
         (
             "pipeline",
             ProductionStage.EXTRACTION.value,
-            {"extraction", "synthesis", "editorial_enrichment", "publication"},
+            {
+                "extraction",
+                "relevance_projection",
+                "synthesis",
+                "editorial_enrichment",
+                "publication",
+            },
         ),
         ("pipeline", ProductionStage.ASSEMBLY.value, {"publication"}),
     )

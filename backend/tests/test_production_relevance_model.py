@@ -445,6 +445,21 @@ async def test_model_proposals_merge_with_deterministic_fallback_and_guards() ->
     assert world.artifacts.items[0].metadata["model_calls"] == 1
 
 
+def test_explicit_none_marker_is_a_valid_empty_proposal() -> None:
+    snapshot, extraction, _ = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+
+    parsed = parse_relevance_classifier_wire("```\n@@NONE@@\n```", pack, extraction)
+
+    assert parsed.error_code is None
+    assert parsed.explicit_none is True
+    assert parsed.classifications == ()
+    assert parsed.source_pair_relations == ()
+    assert parsed.rejections == ()
+    unintelligible = parse_relevance_classifier_wire("I cannot help with that.", pack, extraction)
+    assert unintelligible.error_code == "relevance_classifier_unintelligible_response"
+
+
 def test_model_direct_ioc_without_documented_relation_is_downgraded() -> None:
     snapshot, extraction, _ = _world()
     pack = build_relevance_model_evidence_pack(snapshot, extraction)
@@ -526,10 +541,10 @@ async def test_model_classifier_replays_parser_changes_and_invokes_on_prompt_cha
 
     first = await ModelRelevanceClassifier(gateway).propose(run, snapshot, extraction, access)
     parser_bump = await ModelRelevanceClassifier(
-        gateway, parser_version="subject-relevance-wire-v2"
+        gateway, parser_version="subject-relevance-wire-v3"
     ).propose(run, snapshot, extraction, access)
     prompt_bump = await ModelRelevanceClassifier(
-        gateway, prompt_version="subject-relevance-classifier-v2"
+        gateway, prompt_version="subject-relevance-classifier-v3"
     ).propose(run, snapshot, extraction, access)
 
     assert first.status is RelevanceProposalStatus.SUCCEEDED

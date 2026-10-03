@@ -171,6 +171,8 @@ class RelevanceWireParseResult:
     rejections: tuple[RelevanceWireRejection, ...]
     error_code: str | None = None
     transformations: tuple[str, ...] = ()
+    #: The model explicitly proposed no change (``@@NONE@@``): a valid empty answer.
+    explicit_none: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +393,7 @@ def build_relevance_classifier_model_request(
             "two FULL sources, and give a concise reason."
         ),
         "Allowed source-pair relations: " + relations,
+        "If you propose no classification and no relation, return only @@NONE@@.",
         "Output text blocks only; do not output JSON.",
         "",
         "FROZEN SUBJECT CONTEXT",
@@ -475,6 +478,9 @@ def _block_digest(block: _WireBlock) -> str:
     return hashlib.sha256("\n".join(block.raw_lines).encode("utf-8")).hexdigest()
 
 
+_NONE_MARKERS = frozenset({"@@none@@", "@@ none @@", "none", "no proposals"})
+
+
 def parse_relevance_classifier_wire(
     raw_text: str,
     pack: RelevanceModelEvidencePack,
@@ -493,12 +499,17 @@ def parse_relevance_classifier_wire(
     blocks: list[_WireBlock] = []
     current: _WireBlock | None = None
     recognized = False
+    explicit_none = False
     sequence = 0
     for raw_line in sanitized.splitlines():
         if _FENCE.fullmatch(raw_line):
             continue
         line = _clean_wire_line(raw_line)
         if not line or line in {"---", "***"}:
+            continue
+        if line.casefold() in _NONE_MARKERS:
+            recognized = True
+            explicit_none = True
             continue
         end = _END.fullmatch(line)
         if end is not None:
@@ -678,7 +689,11 @@ def parse_relevance_classifier_wire(
         )
 
     return RelevanceWireParseResult(
-        tuple(classifications), tuple(relations), tuple(rejections), transformations=transformations
+        tuple(classifications),
+        tuple(relations),
+        tuple(rejections),
+        transformations=transformations,
+        explicit_none=explicit_none,
     )
 
 
@@ -929,7 +944,9 @@ class ModelRelevanceClassifier:
             normalized_output=normalized_output,
         )
         if parsed.error_code is not None or not (
-            parsed.classifications or parsed.source_pair_relations
+            parsed.classifications
+            or parsed.source_pair_relations
+            or (parsed.explicit_none and not parsed.rejections)
         ):
             error_code = parsed.error_code or "relevance_classifier_no_valid_blocks"
             return ModelRelevanceProposalExecution(

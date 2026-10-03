@@ -318,7 +318,11 @@ class _ImportUow:
             get_active=AsyncMock(return_value=self.discovery_snapshot)
         )
         self.discovery_candidates = SimpleNamespace(list_for_edition=AsyncMock(return_value=[]))
-        self.production_artifacts = SimpleNamespace(append=AsyncMock())
+        self.production_artifacts = SimpleNamespace(
+            append=AsyncMock(),
+            get_current=AsyncMock(return_value=None),
+            list_for_run=AsyncMock(return_value=[]),
+        )
         self.production_input_snapshots = SimpleNamespace(add=AsyncMock())
         self.commit = AsyncMock()
 
@@ -407,7 +411,7 @@ async def test_import_repoints_existing_batch_item_and_resets_auto_recovery() ->
         subject_id=subject_id, edition_id=edition_id, payload=payload
     )
 
-    assert result.current_stage == "relevance_projection"
+    assert result.current_stage == "assembly"
     assert item.production_run_id == result.run_id
     assert item.auto_recovery_count == 0
     uow.edition_production_batch_items.save.assert_awaited_once_with(item)
@@ -599,12 +603,18 @@ async def test_v5_export_preserves_the_four_canonical_artifacts() -> None:
     imported_artifacts = [
         call.args[0] for call in import_uow.production_artifacts.append.await_args_list
     ]
+    # The four exported artifacts are restored; the relevance projection is rebuilt
+    # deterministically from the imported extraction (no model call).
     assert [artifact.stage.value for artifact in imported_artifacts] == [
         "references",
         "extraction",
         "synthesis",
         "editorial_enrichment",
+        "relevance_projection",
     ]
+    projection_hash = imported_artifacts[-1].metadata["projection_hash"]
+    assert imported_artifacts[2].metadata["relevance_projection_hash"] == projection_hash
+    assert imported_artifacts[3].metadata["relevance_projection_hash"] == projection_hash
     assert all(
         artifact.status is ProductionArtifactStatus.VERIFIED for artifact in imported_artifacts
     )

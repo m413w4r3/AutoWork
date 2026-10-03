@@ -8,6 +8,7 @@ workflow objects below are the application implementations.
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -238,7 +239,7 @@ class ScriptedModelScript:
 
     def __init__(self) -> None:
         self._references: str | None = None
-        self._editorial_enrichment: str | Callable[[str], str] = '{"tables": [], "diagrams": []}'
+        self._editorial_enrichment: str | Callable[[str], str] = "NO USEFUL ENRICHMENT"
         self._q2: dict[str, str | Q2SourceOutput | Exception] = {}
         self._url_by_sha256: dict[str, str] = {}
 
@@ -286,6 +287,10 @@ class ScriptedModelScript:
             if self._references is None:
                 raise AssertionError("No scripted references response")
             return self._references
+
+        if request.prompt_template_id == "production-relevance-classifier":
+            # The deterministic L3b-1 baseline stays authoritative in these scenarios.
+            return "@@NONE@@"
 
         if request.prompt_template_id == "production-synthesis":
             return _grounded_synthesis_proposal(request.text)
@@ -454,6 +459,8 @@ class ScriptedModelGateway(ModelGateway):
             stage = "extraction"
         elif request.routing_hint is ModelRoutingHint.WEB_RESEARCH:
             stage = "references"
+        elif request.prompt_template_id == "production-relevance-classifier":
+            stage = "relevance_projection"
         elif request.prompt_template_id == "production-synthesis":
             stage = "synthesis"
         elif request.prompt_template_id == "production-editorial-enrichment":
@@ -902,29 +909,66 @@ class ProductionScenario:
         return restarted
 
 
+_EVIDENCE_BLOCK = re.compile(
+    r"^@@EVIDENCE (E\d+)@@\n(.*?)^@@END EVIDENCE@@$", re.MULTILINE | re.DOTALL
+)
+_EVIDENCE_FIELD = re.compile(r"^([A-Z_]+):\n(.*?)(?=^[A-Z_]+:\n|\Z)", re.MULTILINE | re.DOTALL)
+
+
+def synthesis_prompt_records(prompt_text: str) -> list[dict[str, str]]:
+    """The evidence records (handle, kind and lower-cased fields) of a Synthesis prompt."""
+    records: list[dict[str, str]] = []
+    for block in _EVIDENCE_BLOCK.finditer(prompt_text):
+        record = {"handle": block.group(1)}
+        for match in _EVIDENCE_FIELD.finditer(block.group(2)):
+            record[match.group(1).lower()] = match.group(2).strip()
+        records.append(record)
+    return records
+
+
+def synthesis_proposal_wire(
+    lead: Sequence[tuple[str, Sequence[str]]],
+    sections: Sequence[tuple[str, Sequence[tuple[str, Sequence[str]]]]] = (),
+) -> str:
+    """Render ``(text, handles)`` claims as the text-block Synthesis wire format."""
+    lines = ["@@LEAD@@"]
+    for index, (text, handles) in enumerate(lead, start=1):
+        lines.extend(
+            (f"@@CLAIM L{index:03d}@@", f"EVIDENCE: {', '.join(handles)}", f"TEXT: {text}")
+        )
+    for section_index, (kind, claims) in enumerate(sections, start=1):
+        lines.append(f"@@SECTION {kind} S{section_index:03d}@@")
+        for claim_index, (text, handles) in enumerate(claims, start=1):
+            lines.extend(
+                (
+                    f"@@CLAIM S{section_index:03d}C{claim_index:03d}@@",
+                    f"EVIDENCE: {', '.join(handles)}",
+                    f"TEXT: {text}",
+                )
+            )
+        lines.append("@@END SECTION@@")
+    return "\n".join(lines)
+
+
 def _grounded_synthesis_proposal(prompt_text: str) -> str:
     """Answer a canonical Synthesis draft with one claim grounded in the pack.
 
     The claim carries no technical literal or date, so it is valid for any
     evidence pack that exposes at least one narrative element.
     """
-    narrative = json.loads(prompt_text)["current_evidence_pack"]["narrative_evidence"]
+    narrative = [
+        record["handle"]
+        for record in synthesis_prompt_records(prompt_text)
+        if record.get("kind") in {"fact", "event"}
+    ]
     if not narrative:
         raise AssertionError("The canonical evidence pack exposes no narrative evidence")
-    claim = {
-        "text": "The selected publications document this activity.",
-        "evidence_handles": [narrative[0]["handle"]],
-    }
-    return json.dumps(
-        {
-            "lead": [claim],
-            "sections": [{"kind": "overview", "heading": "Overview", "claims": [claim]}],
-        }
-    )
+    claim = ("The selected publications document this activity.", (narrative[0],))
+    return synthesis_proposal_wire([claim], [("overview", [claim])])
 
 
 def grounded_editorial_proposal(prompt_text: str) -> str:
-    """Return a structured table and diagram using exact pack handles."""
+    """Return a table and a diagram as Editorial Enrichment text blocks."""
     pack = json.loads(prompt_text)["current_evidence_pack"]
     evidence = pack["technical_evidence"] or pack["narrative_evidence"]
     if not evidence:
@@ -934,47 +978,72 @@ def grounded_editorial_proposal(prompt_text: str) -> str:
     value = first.get("value") or first.get("text")
     if not isinstance(value, str) or not value:
         raise AssertionError("Editorial evidence has no readable value")
-    placement = {"kind": "after_lead", "section_index": None}
-    return json.dumps(
-        {
-            "tables": [
-                {
-                    "key": "observations",
-                    "kind": "custom",
-                    "title": "Observations rapportées",
-                    "caption": None,
-                    "columns": [
-                        {"key": "type", "label": "Type"},
-                        {"key": "value", "label": "Valeur"},
-                    ],
-                    "rows": [{"cells": ["Élément", value], "evidence_handles": [handle]}],
-                    "placement": placement,
-                }
-            ],
-            "diagrams": [
-                {
-                    "key": "reported_activity",
-                    "kind": "custom",
-                    "title": "Éléments documentés",
-                    "caption": None,
-                    "direction": "left_to_right",
-                    "nodes": [
-                        {"node_id": "report", "label": "Rapport", "evidence_handles": [handle]},
-                        {"node_id": "observation", "label": value, "evidence_handles": [handle]},
-                    ],
-                    "edges": [
-                        {
-                            "source_node_id": "report",
-                            "target_node_id": "observation",
-                            "label": "documente",
-                            "evidence_handles": [handle],
-                        }
-                    ],
-                    "groups": [],
-                    "placement": placement,
-                }
-            ],
-        }
+
+    def purpose(question: str, gain: str) -> tuple[str, ...]:
+        return (
+            f"PURPOSE: {question}",
+            "DATA: La source rapporte cet élément.",
+            f"GAIN: {gain}",
+            "SCOPE: Un seul élément de preuve.",
+            f"PURPOSE_EVIDENCE: {handle}",
+            "LIMITS: Aucun contexte supplémentaire n'est documenté.",
+            "PLACEMENT_REASON: Placé après le paragraphe d'introduction.",
+        )
+
+    return "\n".join(
+        (
+            "TABLE T001",
+            "KEY: observations",
+            "KIND: custom",
+            "TITLE: Observations rapportées",
+            *purpose(
+                "Quelle valeur la source rapporte-t-elle ?",
+                "Un tableau isole la valeur rapportée sans la répéter dans le texte.",
+            ),
+            "PLACEMENT: after_lead",
+            "COLUMN C001_001",
+            "KEY: type",
+            "LABEL: Type",
+            "END COLUMN",
+            "COLUMN C001_002",
+            "KEY: value",
+            "LABEL: Valeur",
+            "END COLUMN",
+            "ROW R001_001",
+            "CELL: Élément",
+            f"CELL: {value}",
+            f"EVIDENCE: {handle}",
+            "END ROW",
+            "END TABLE",
+            "DIAGRAM D001",
+            "KEY: reported_activity",
+            "KIND: custom",
+            "TITLE: Éléments documentés",
+            *purpose(
+                "Comment la valeur se rattache-t-elle à son type documenté ?",
+                "Un schéma relie le type à la valeur pour situer l'élément.",
+            ),
+            "DIRECTION: left_to_right",
+            "PLACEMENT: after_lead",
+            "NODE N001_001",
+            "ID: report",
+            f"LABEL: {first['kind']}",
+            f"EVIDENCE: {handle}",
+            "END NODE",
+            "NODE N001_002",
+            "ID: observation",
+            f"LABEL: {value}",
+            f"EVIDENCE: {handle}",
+            "END NODE",
+            "RELATION L001_001",
+            "FROM: report",
+            "TO: observation",
+            "RELATION_TYPE: inference",
+            "LABEL: documente",
+            f"EVIDENCE: {handle}",
+            "END RELATION",
+            "END DIAGRAM",
+        )
     )
 
 
@@ -992,4 +1061,6 @@ __all__ = [
     "ScriptedModelGateway",
     "grounded_editorial_proposal",
     "reserve_edition_code",
+    "synthesis_prompt_records",
+    "synthesis_proposal_wire",
 ]

@@ -1635,7 +1635,7 @@ async def _seed_exportable_run(
     return run
 
 
-async def test_imported_v5_state_rebuilds_relevance_before_assembly(
+async def test_imported_v5_state_is_directly_assemblable(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     edition_id, subject_id = uuid4(), uuid4()
@@ -1672,7 +1672,7 @@ async def test_imported_v5_state_rebuilds_relevance_before_assembly(
     imported = await api.post(f"/api/subjects/{subject_id}/production/state/import", json=snapshot)
     assert imported.status_code == 200, imported.text
     assert imported.json()["status"] == "needs_review"
-    assert imported.json()["current_stage"] == "relevance_projection"
+    assert imported.json()["current_stage"] == "assembly"
     assert imported.json()["imported_stages"] == [
         "references",
         "extraction",
@@ -1685,13 +1685,14 @@ async def test_imported_v5_state_rebuilds_relevance_before_assembly(
 
     production = await api.get(f"/api/subjects/{subject_id}/production")
     assert production.json()["status"] == "needs_review"
-    assert production.json()["current_stage"] == "relevance_projection"
+    assert production.json()["current_stage"] == "assembly"
     assert production.json()["stages"]["references"]["status"] == "succeeded"
     assert production.json()["stages"]["extraction"]["status"] == "succeeded"
-    assert production.json()["stages"]["relevance_projection"]["status"] == "needs_review"
-    assert production.json()["stages"]["synthesis"]["status"] == "pending"
-    assert production.json()["stages"]["editorial_enrichment"]["status"] == "pending"
-    assert production.json()["stages"]["assembly"]["status"] == "pending"
+    # The relevance projection is rebuilt deterministically on import.
+    assert production.json()["stages"]["relevance_projection"]["status"] == "succeeded"
+    assert production.json()["stages"]["synthesis"]["status"] == "succeeded"
+    assert production.json()["stages"]["editorial_enrichment"]["status"] == "succeeded"
+    assert production.json()["stages"]["assembly"]["status"] == "needs_review"
     imported_artifacts: dict[str, dict[str, Any]] = {}
     for stage in ("references", "extraction", "synthesis", "editorial_enrichment"):
         artifact = await api.get(f"/api/subjects/{subject_id}/production/artifacts/{stage}")
@@ -1806,7 +1807,8 @@ async def test_production_state_import_keeps_history_and_previous_artifacts(
     )
     for run_id in imported_ids:
         artifacts = await uow.production_artifacts.list_for_run(run_id)
-        assert len(artifacts) == 4
+        # Four imported artifacts plus the deterministically rebuilt projection.
+        assert len(artifacts) == 5
         assert all(artifact.status is ProductionArtifactStatus.VERIFIED for artifact in artifacts)
     original_artifacts = await uow.production_artifacts.list_for_run(original.id)
     assert all(

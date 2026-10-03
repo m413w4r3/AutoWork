@@ -415,6 +415,7 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
     assert retry.run.pipeline_generation == 1
     assert retry.staled_artifacts == [
         "extraction",
+        "relevance_projection",
         "synthesis",
         "editorial_enrichment",
         "publication",
@@ -427,6 +428,7 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
         if artifact.status is ProductionArtifactStatus.STALE
     } == {
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
@@ -456,6 +458,9 @@ async def test_operator_retry_is_distinct_and_stales_only_downstream_artifacts(
         ProductionArtifactStage.REFERENCES: initial_versions[ProductionArtifactStage.REFERENCES],
         ProductionArtifactStage.EXTRACTION: (
             initial_versions[ProductionArtifactStage.EXTRACTION] + 1
+        ),
+        ProductionArtifactStage.RELEVANCE_PROJECTION: (
+            initial_versions[ProductionArtifactStage.RELEVANCE_PROJECTION] + 1
         ),
         ProductionArtifactStage.SYNTHESIS: initial_versions[ProductionArtifactStage.SYNTHESIS] + 1,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT: (
@@ -510,7 +515,7 @@ async def test_concurrent_start_requests_create_one_run_and_one_job(
     final, artifacts, _, _ = await _state(scenario)
     assert final.status is ProductionRunStatus.READY
     assert final.pipeline_generation == 0
-    assert len(await _jobs_for_run(scenario)) == 6
+    assert len(await _jobs_for_run(scenario)) == 7
     await _assert_artifact_invariants(scenario, artifacts)
 
 
@@ -543,7 +548,7 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     jobs = await _jobs_for_run(scenario)
     assert len([job for job in jobs if job.kind == extraction_job.kind]) == 1
     assert extraction_job.status is JobStatus.SUCCEEDED
-    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 4
+    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 5
     await _assert_artifact_invariants(scenario, artifacts)
 
 
@@ -847,5 +852,5 @@ async def test_successful_pipeline_drafts_synthesis_once_without_conversation(
     assert len(synthesis_calls) == 1
     assert synthesis_calls[0].conversation_id is None
     assert synthesis_calls[0].web_search is False
-    assert len(await _jobs_for_run(scenario)) == 6
+    assert len(await _jobs_for_run(scenario)) == 7
     await _assert_artifact_invariants(scenario, artifacts)

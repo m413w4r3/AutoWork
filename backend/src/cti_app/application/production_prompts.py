@@ -121,9 +121,9 @@ EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v4-analyti
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
-RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v1"
+RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v2"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v1"
-RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v1"
+RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v2"
 CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,

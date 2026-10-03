@@ -1731,6 +1731,12 @@ async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None
     cloned = artifacts_b.appended[-1]
     assert cloned.reused_from_artifact_id == source_artifact.id
     assert cloned.canonical_blob_id == source_artifact.canonical_blob_id
+    # Assembly checks the projection lineage on a cloned synthesis too.
+    assert source_artifact.metadata["relevance_projection_hash"]
+    assert (
+        cloned.metadata["relevance_projection_hash"]
+        == source_artifact.metadata["relevance_projection_hash"]
+    )
 
 
 @pytest.mark.asyncio

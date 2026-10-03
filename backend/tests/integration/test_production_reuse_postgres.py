@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from io import BytesIO
@@ -34,7 +33,6 @@ from cti_app.application.production_artifact_store import ProductionArtifactStor
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
-    EditorialEnrichmentProposalV1,
     build_editorial_enrichment_evidence_pack,
     compute_editorial_enrichment_input_hash,
     editorial_enrichment_evidence_pack_hash,
@@ -48,11 +46,10 @@ from cti_app.application.production_references import (
     production_reference_corpus_from_json,
     production_reference_corpus_to_json,
 )
+from cti_app.application.production_relevance import build_relevance_projection
+from cti_app.application.production_relevance_model import ModelRelevanceClassifier
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
-    SynthesisClaimProposalV1,
-    SynthesisProposalV1,
-    SynthesisSectionProposalV1,
     build_synthesis_access_policy,
     build_synthesis_evidence_pack,
     canonical_extraction_hash,
@@ -133,6 +130,10 @@ from cti_app.domain.production_references import (
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_relevance import (
+    RelevanceProjectionV1,
+    relevance_projection_to_json,
+)
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -156,6 +157,10 @@ from cti_app.infrastructure.blob_storage.filesystem import FilesystemBlobStore
 from cti_app.integrations.models import BlobModelOutputStore
 from tests.discovery_support import make_discovery_run_for_edition
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
+from tests.integration.production.support import (
+    synthesis_prompt_records,
+    synthesis_proposal_wire,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -245,25 +250,16 @@ async def test_source_extraction_checkpoint_identity_is_durable(
         assert found is None
 
 
-def _proposal_from_canonical_synthesis_prompt(prompt_text: str) -> SynthesisProposalV1:
-    """Answer the canonical drafting prompt with one grounded claim."""
-    payload = json.loads(prompt_text)
-    records = payload["current_evidence_pack"]["narrative_evidence"]
-    fact = next(record for record in records if record["kind"] == "fact")
-    claim = SynthesisClaimProposalV1(
-        text=f"{fact['value']} is documented by the selected publication.",
-        evidence_handles=(fact["handle"],),
+def _synthesis_wire_from_canonical_prompt(prompt_text: str) -> str:
+    """Answer the canonical drafting prompt with one grounded claim (text blocks)."""
+    fact = next(
+        record for record in synthesis_prompt_records(prompt_text) if record.get("kind") == "fact"
     )
-    return SynthesisProposalV1(
-        lead=(claim,),
-        sections=(
-            SynthesisSectionProposalV1(
-                kind=SynthesisSectionKind.OVERVIEW,
-                heading="Overview",
-                claims=(claim,),
-            ),
-        ),
+    claim = (
+        f"{fact['value']} is documented by the selected publication.",
+        (fact["handle"],),
     )
+    return synthesis_proposal_wire([claim], [("overview", [claim])])
 
 
 class _CountingRetryModelAdapter:
@@ -292,7 +288,6 @@ class _CountingRetryModelAdapter:
         del output_schema
         self.calls.append(request)
         if request.prompt_template_id == "production-synthesis":
-            proposal = _proposal_from_canonical_synthesis_prompt(request.text)
             return AdapterResult(
                 status=AdapterResultStatus.COMPLETED,
                 provider=self.provider,
@@ -300,20 +295,25 @@ class _CountingRetryModelAdapter:
                 actual_model_version=self.requested_model,
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
                 response_id=f"retry-synthesis-{request.request_id}",
-                output_text=proposal.model_dump_json(),
-                structured_output=proposal,
+                output_text=_synthesis_wire_from_canonical_prompt(request.text),
             )
-        if request.prompt_template_id == "production-editorial-enrichment":
-            proposal = EditorialEnrichmentProposalV1()
+        if request.prompt_template_id in {
+            "production-editorial-enrichment",
+            "production-relevance-classifier",
+        }:
+            empty = (
+                "NO USEFUL ENRICHMENT"
+                if request.prompt_template_id == "production-editorial-enrichment"
+                else "@@NONE@@"
+            )
             return AdapterResult(
                 status=AdapterResultStatus.COMPLETED,
                 provider=self.provider,
                 requested_model=self.requested_model,
                 actual_model_version=self.requested_model,
                 usage=ModelUsage(input_tokens=1, output_tokens=1, total_tokens=2),
-                response_id=f"retry-enrichment-{request.request_id}",
-                output_text=proposal.model_dump_json(),
-                structured_output=proposal,
+                response_id=f"retry-{request.prompt_template_id}-{request.request_id}",
+                output_text=empty,
             )
         output_text = self._extraction_text
         conversation = request.conversation
@@ -872,8 +872,14 @@ async def _store_canonical_first_pass(
     # participates any more.
     async with uow_factory() as uow:
         policy = await build_synthesis_access_policy(snapshot, extraction, uow.source_documents)
-    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction)
+    # The production orchestrator classifies with the model classifier enabled by
+    # default; its projection identity is part of every later stage identity.
+    projection = build_relevance_projection(
+        snapshot, extraction, classifier=ModelRelevanceClassifier(None)
+    )
+    evidence_pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
     return SimpleNamespace(
+        projection=projection,
         refs_hash=refs_hash,
         refs_raw_id=refs_raw_id,
         refs_blob_id=refs_blob_id,
@@ -900,6 +906,7 @@ async def _store_empty_enrichment(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    projection: RelevanceProjectionV1,
 ) -> ProductionArtifact:
     enrichment = build_empty_editorial_enrichment(
         extraction=extraction,
@@ -911,7 +918,7 @@ async def _store_empty_enrichment(
             snapshot, extraction, uow.source_documents
         )
     evidence_pack_hash = editorial_enrichment_evidence_pack_hash(
-        build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+        build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)
     )
     access_policy_hash = synthesis_access_policy_hash(access_policy)
     return await EditorialEnrichmentService(uow_factory, store).store_editorial_enrichment_result(
@@ -922,6 +929,7 @@ async def _store_empty_enrichment(
             synthesis=synthesis,
             evidence_pack_hash=evidence_pack_hash,
             access_policy_hash=access_policy_hash,
+            projection_hash=projection.projection_hash,
         ),
         enrichment=enrichment,
         extraction=extraction,
@@ -932,6 +940,32 @@ async def _store_empty_enrichment(
         access_policy_hash=access_policy_hash,
         model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
         routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
+        projection_hash=projection.projection_hash,
+    )
+
+
+async def _projection_artifact(
+    store: ProductionArtifactStore,
+    *,
+    run_id: UUID,
+    subject_id: UUID,
+    projection: RelevanceProjectionV1,
+) -> ProductionArtifact:
+    _, canonical_id, _ = await store.store_stage_payloads(
+        canonical=relevance_projection_to_json(projection)
+    )
+    return ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash=projection.input_hash,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=canonical_id,
+        metadata={
+            "projection_hash": projection.projection_hash,
+            "extraction_hash": projection.extraction_hash,
+        },
     )
 
 
@@ -972,6 +1006,7 @@ async def _assert_enrichment_lineage(
         synthesis=synthesis,
         evidence_pack_hash=enrichment_artifact.metadata["evidence_pack_hash"],
         access_policy_hash=enrichment_artifact.metadata["access_policy_hash"],
+        projection_hash=enrichment_artifact.metadata["relevance_projection_hash"],
     )
     assert enrichment_artifact.metadata["extraction_hash"] == enrichment.extraction_hash
     assert enrichment_artifact.metadata["synthesis_hash"] == enrichment.synthesis_hash
@@ -1055,6 +1090,13 @@ async def _seed_reusable_article(
             status=ProductionArtifactStatus.VERIFIED,
             canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
+            metadata={"relevance_projection_hash": first_pass.projection.projection_hash},
+        ),
+        ProductionArtifactStage.RELEVANCE_PROJECTION: await _projection_artifact(
+            store,
+            run_id=source_run.id,
+            subject_id=subject.id,
+            projection=first_pass.projection,
         ),
     }
     async with uow_factory() as uow:
@@ -1070,6 +1112,7 @@ async def _seed_reusable_article(
         snapshot=snapshot,
         extraction=first_pass.extraction,
         synthesis=synthesis,
+        projection=first_pass.projection,
     )
 
     references = production_reference_corpus_from_json(await store.read_json(refs_blob_id))
@@ -1088,6 +1131,7 @@ async def _seed_reusable_article(
             extraction=first_pass.extraction,
             synthesis=synthesis,
             editorial_enrichment=enrichment,
+            relevance_projection=first_pass.projection,
         )
         await uow.commit()
     return source_run, source_artifacts, publication
@@ -1506,6 +1550,13 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             input_hash=synthesis_hash,
             canonical_blob_id=synthesis_canonical_id,
             rendered_blob_id=synthesis_blob_id,
+            metadata={"relevance_projection_hash": first_pass.projection.projection_hash},
+        ),
+        ProductionArtifactStage.RELEVANCE_PROJECTION: await _projection_artifact(
+            store,
+            run_id=run_a.id,
+            subject_id=subject.id,
+            projection=first_pass.projection,
         ),
     }
     async with uow_factory() as uow:
@@ -1521,6 +1572,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
         snapshot=snapshot_a,
         extraction=first_pass.extraction,
         synthesis=synthesis,
+        projection=first_pass.projection,
     )
 
     references_a = production_reference_corpus_from_json(
@@ -1546,6 +1598,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
             extraction=extraction_a,
             synthesis=synthesis,
             editorial_enrichment=enrichment_a,
+            relevance_projection=first_pass.projection,
         )
         await uow.commit()
 
@@ -1576,6 +1629,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     for stage in (
         ProductionStage.REFERENCES,
         ProductionStage.EXTRACTION,
+        ProductionStage.RELEVANCE_PROJECTION,
         ProductionStage.SYNTHESIS,
     ):
         result = await orchestrator.execute_stage(run_b.id, stage)
@@ -1629,6 +1683,7 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert retry.run.force_recompute_from_stage is ProductionStage.EXTRACTION
     assert retry.staled_artifacts == [
         "extraction",
+        "relevance_projection",
         "synthesis",
         "editorial_enrichment",
         "publication",
@@ -1645,6 +1700,10 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     )
     assert (
         stale_artifacts[ProductionArtifactStage.EXTRACTION].status is ProductionArtifactStatus.STALE
+    )
+    assert (
+        stale_artifacts[ProductionArtifactStage.RELEVANCE_PROJECTION].status
+        is ProductionArtifactStatus.STALE
     )
     assert (
         stale_artifacts[ProductionArtifactStage.SYNTHESIS].status is ProductionArtifactStatus.STALE
@@ -1686,13 +1745,20 @@ async def test_real_orchestrator_reuses_run_a_then_freezes_run_b_identity(
     assert len(retry_adapter.calls) == 1
     await production.advance_stage(run_b.id)
 
+    projection_retry = await retry_orchestrator.execute_stage(
+        run_b.id, ProductionStage.RELEVANCE_PROJECTION
+    )
+    assert projection_retry["status"] == "success"
+    assert len(retry_adapter.calls) == 2
+    await production.advance_stage(run_b.id)
+
     synthesis_retry = await retry_orchestrator.execute_stage(run_b.id, ProductionStage.SYNTHESIS)
     assert synthesis_retry["status"] == "success"
     synthesis_technical_replay = await retry_orchestrator.execute_stage(
         run_b.id, ProductionStage.SYNTHESIS
     )
     assert synthesis_technical_replay["status"] == "cached"
-    assert len(retry_adapter.calls) == 2
+    assert len(retry_adapter.calls) == 3
     await production.advance_stage(run_b.id)
     enrichment_retry = await retry_orchestrator.execute_stage(
         run_b.id, ProductionStage.EDITORIAL_ENRICHMENT
@@ -1878,6 +1944,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
         for stage in (
             ProductionStage.REFERENCES,
             ProductionStage.EXTRACTION,
+            ProductionStage.RELEVANCE_PROJECTION,
             ProductionStage.SYNTHESIS,
         ):
             result = await orchestrator.execute_stage(run_id, stage)
@@ -1902,7 +1969,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
     assert second.status is ProductionRunStatus.RUNNING
     await execute_cached(second.id)
     assert await batch_service.on_subject_terminal(batch.id, second.id) is None
-    assert len(cached_results) == 6
+    assert len(cached_results) == 8
     assert len(enrichment_results) == 2
     assert sentinel.calls == 0
 
@@ -1957,7 +2024,7 @@ async def test_two_article_cached_edition_is_sequential_and_uses_new_publication
 
     release = await EditionAssemblyService(uow_factory, store).assemble(accepted.manifest.id)
     edition_json = await store.read_json(release.edition_document_blob_id)
-    assert all(item["document"]["schema_version"] == "4" for item in edition_json["publications"])
+    assert all(item["document"]["schema_version"] == "5" for item in edition_json["publications"])
     assert [item["document"]["title"] for item in edition_json["publications"]] == [
         "Article A",
         "Article B",

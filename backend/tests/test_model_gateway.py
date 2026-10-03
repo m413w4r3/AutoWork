@@ -728,6 +728,36 @@ async def test_succeeded_run_reloads_persisted_output_without_network_call() -> 
     assert second.metadata["checkpoint"] == "hit"
 
 
+async def test_non_bridge_adapters_still_receive_a_per_attempt_request_id() -> None:
+    # The OpenAI Responses adapter sends it as its idempotency key; only the
+    # bridge identity is persisted, but every backend must get a stable key.
+    fake = FakeModelAdapter()
+    model_uow = InMemoryModelRunUnitOfWorkFactory()
+    gateway = ModelGateway(
+        ModelRouter(
+            openai_research=FakeModelAdapter(),
+            openai_structured=FakeModelAdapter(),
+            qwen=FakeModelAdapter(),
+            fake=fake,
+        ),
+        model_uow,
+        InMemoryModelOutputStore(),
+    )
+    run_id = uuid4()
+
+    execution = await gateway.draft(
+        request(
+            external_llm_allowed=False,
+            routing_hint=ModelRoutingHint.STANDARD_DRAFT,
+            provider=ModelProvider.FAKE,
+            run_id=run_id,
+        )
+    )
+
+    assert fake.calls[0].request_id == f"{run_id}:a1"
+    assert execution.run.bridge_request_id is None
+
+
 async def test_needs_review_run_is_never_resubmitted() -> None:
     adapter = NeedsReviewAdapter()
     gateway = ModelGateway(

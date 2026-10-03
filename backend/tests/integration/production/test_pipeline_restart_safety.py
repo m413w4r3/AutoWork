@@ -265,6 +265,8 @@ def _provider_stages(model: ScriptedModelGateway) -> list[str]:
             stages.append("extraction")
         elif request.routing_hint.value == "web_research":
             stages.append("references")
+        elif request.prompt_template_id == "production-relevance-classifier":
+            stages.append("relevance_projection")
         elif request.prompt_template_id == "production-synthesis":
             stages.append("synthesis")
     return stages
@@ -305,12 +307,14 @@ async def test_restart_after_sources_reconstructs_the_pipeline(
         "references",
         "extraction",
         "extraction",
+        "relevance_projection",
         "synthesis",
     ]
     assert _provider_stages(scenario.model) == []
     assert {artifact.stage for artifact in after.artifacts} == {
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,
@@ -345,7 +349,12 @@ async def test_restart_after_references_reads_the_persisted_artifact(
 
     _assert_refetched(before, after)
     assert final.status is ProductionRunStatus.READY
-    assert _provider_stages(restarted.model) == ["extraction", "extraction", "synthesis"]
+    assert _provider_stages(restarted.model) == [
+        "extraction",
+        "extraction",
+        "relevance_projection",
+        "synthesis",
+    ]
     assert _provider_stages(restarted.model).count("references") == 0
     reloaded_references = next(
         artifact
@@ -427,7 +436,7 @@ async def test_restart_after_synthesis_runs_editorial_enrichment_and_assembly(
 ) -> None:
     scenario, _urls = _configured(production_scenario_factory, 1, all_primary=True)
     await scenario.start()
-    await _run_prefix(scenario, 4)
+    await _run_prefix(scenario, 5)
     before = await _reload(scenario)
     assert before.run.current_stage is ProductionStage.EDITORIAL_ENRICHMENT
     synthesis = next(
@@ -526,7 +535,7 @@ async def test_restart_during_reconciliation_preserves_exact_submission_identity
     assert visible.previews == 2
     assert visible.releases == 1
     assert _q2_provider_calls(restarted.model) == []
-    assert _provider_stages(restarted.model) == ["synthesis"]
+    assert _provider_stages(restarted.model) == ["relevance_projection", "synthesis"]
     assert after.run.reconciliation is not None
     assert after.run.reconciliation.model_run_id == model_run_id
 
@@ -554,7 +563,7 @@ async def test_restart_after_non_blocking_source_skip_keeps_skip_durable(
     await scenario.start()
     await _run_prefix(scenario, 3)
     before = await _reload(scenario)
-    assert before.run.current_stage is ProductionStage.SYNTHESIS
+    assert before.run.current_stage is ProductionStage.RELEVANCE_PROJECTION
     assert before.run.extraction_progress is not None
     statuses = {urls[0]: "failed", urls[1]: "succeeded"}
     assert {

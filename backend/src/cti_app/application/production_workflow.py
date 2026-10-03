@@ -498,21 +498,22 @@ class ProductionWorkflowOrchestrator:
             else None
         )
         self._synthesis = SynthesisService(production_uow_factory, artifact_store)
+        self._artifact_reuse = ProductionArtifactReuseService(
+            production_uow_factory, artifact_store, self._diagnostics
+        )
         self._relevance_projection = (
             ProductionRelevanceProjectionService(
                 production_uow_factory,
                 artifact_store,
                 model_gateway=self._model_gateway,
                 model_enabled=get_settings().production_relevance_classifier_enabled,
+                artifact_reuse=self._artifact_reuse,
             )
             if artifact_store is not None
             else None
         )
         self._editorial_enrichment = EditorialEnrichmentService(
             production_uow_factory, artifact_store
-        )
-        self._artifact_reuse = ProductionArtifactReuseService(
-            production_uow_factory, artifact_store, self._diagnostics
         )
         # The canonical SYNTHESIS stage consumes only the frozen snapshot and
         # the current canonical EXTRACTION artifact. Without a gateway and a
@@ -1690,14 +1691,31 @@ class ProductionWorkflowOrchestrator:
                         cast(UUID, relevance_projection.canonical_blob_id)
                     )
                 )
-                if (
-                    relevance_projection.input_hash != canonical_relevance_projection.input_hash
-                    or synthesis.metadata.get("relevance_projection_hash")
-                    != canonical_relevance_projection.projection_hash
-                    or enrichment.metadata.get("relevance_projection_hash")
-                    != canonical_relevance_projection.projection_hash
-                ):
-                    raise ValueError("assembly_relevance_projection_lineage_mismatch")
+                mismatched = [
+                    name
+                    for name, matches in (
+                        (
+                            "projection_input_hash",
+                            relevance_projection.input_hash
+                            == canonical_relevance_projection.input_hash,
+                        ),
+                        (
+                            "synthesis",
+                            synthesis.metadata.get("relevance_projection_hash")
+                            == canonical_relevance_projection.projection_hash,
+                        ),
+                        (
+                            "editorial_enrichment",
+                            enrichment.metadata.get("relevance_projection_hash")
+                            == canonical_relevance_projection.projection_hash,
+                        ),
+                    )
+                    if not matches
+                ]
+                if mismatched:
+                    raise ValueError(
+                        "assembly_relevance_projection_lineage_mismatch:" + ",".join(mismatched)
+                    )
                 canonical_synthesis = production_synthesis_from_json(
                     await self._artifact_store.read_json(cast(UUID, synthesis.canonical_blob_id))
                 )
@@ -1763,14 +1781,14 @@ class ProductionWorkflowOrchestrator:
                     "stage": "assembly",
                     "status": "error",
                     "error": exc.code.value,
-                    "details": str(exc),
+                    "details": {"message": str(exc)},
                 }
             except (KeyError, TypeError, ValueError) as exc:
                 return {
                     "stage": "assembly",
                     "status": "error",
                     "error": "assembly_validation_failed",
-                    "details": str(exc),
+                    "details": {"message": str(exc)},
                 }
 
             if repair_marker is not None:

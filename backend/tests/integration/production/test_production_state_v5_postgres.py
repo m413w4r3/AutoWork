@@ -89,11 +89,13 @@ async def test_imported_v5_state_is_directly_assemblable(
         assert imported_run.current_stage is ProductionStage.ASSEMBLY
         assert imported_run.error_code == "imported_production_state"
         imported_artifacts = await uow.production_artifacts.list_for_run(imported.run_id)
-        assert len(imported_artifacts) == 4
+        assert len(imported_artifacts) == 5
         imported_by_stage = {artifact.stage: artifact for artifact in imported_artifacts}
+        # The relevance projection is rebuilt deterministically on import.
         assert set(imported_by_stage) == {
             ProductionArtifactStage.REFERENCES,
             ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
             ProductionArtifactStage.SYNTHESIS,
             ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         }
@@ -136,7 +138,7 @@ async def test_imported_v5_state_is_directly_assemblable(
         ready = await uow.production_runs.get(imported.run_id)
         assert ready is not None
         artifacts_after_assembly = await uow.production_artifacts.list_for_run(imported.run_id)
-        assert len(artifacts_after_assembly) == 5
+        assert len(artifacts_after_assembly) == 6
         by_stage_after_assembly = {
             artifact.stage: artifact for artifact in artifacts_after_assembly
         }
@@ -150,6 +152,7 @@ async def test_imported_v5_state_is_directly_assemblable(
     assert set(by_stage_after_assembly) == {
         ProductionArtifactStage.REFERENCES,
         ProductionArtifactStage.EXTRACTION,
+        ProductionArtifactStage.RELEVANCE_PROJECTION,
         ProductionArtifactStage.SYNTHESIS,
         ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         ProductionArtifactStage.PUBLICATION,

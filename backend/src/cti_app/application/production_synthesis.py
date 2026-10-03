@@ -761,6 +761,9 @@ SYNTHESIS_METADATA_KEYS = frozenset(
         "routing_policy_version",
         "synthesis_policy_version",
         "diagnostics",
+        # Exact reuse requires an identical input hash, which covers the relevance
+        # projection; assembly still checks this lineage on the cloned artifact.
+        "relevance_projection_hash",
     }
 )
 

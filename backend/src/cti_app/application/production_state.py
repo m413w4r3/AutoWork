@@ -30,6 +30,10 @@ from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import (
     production_reference_corpus_from_json,
 )
+from cti_app.application.production_relevance import (
+    build_relevance_projection,
+    persist_relevance_projection_in_uow,
+)
 from cti_app.application.production_repairs import repair_projection_decision_ids
 from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.subject_production import (
@@ -198,7 +202,7 @@ class ProductionStateImportResult(BaseModel):
 
     run_id: UUID
     status: Literal["needs_review", "running"]
-    current_stage: Literal["relevance_projection"]
+    current_stage: Literal["assembly"]
     imported_stages: tuple[
         Literal["references"],
         Literal["extraction"],
@@ -669,6 +673,10 @@ class ProductionStateService:
             canonical=enrichment_content
         )
         metadata_base = _snapshot_metadata(snapshot, now)
+        # An exported V5 state predates the relevance projection. It is rebuilt
+        # deterministically from the imported extraction (no model call) so the
+        # operator-attested synthesis and enrichment stay directly assemblable.
+        relevance_projection = build_relevance_projection(local_input_snapshot, parsed_extraction)
         refs_meta = {
             **metadata_base,
             "source_count": len(parsed_references.sources),
@@ -709,6 +717,7 @@ class ProductionStateService:
             "word_count": sum(len(part.split()) for part in synthesis_words),
             "warnings_count": len(parsed_synthesis.warnings),
             "diagnostics": {},
+            "relevance_projection_hash": relevance_projection.projection_hash,
         }
         enrichment_meta = {
             **metadata_base,
@@ -720,6 +729,7 @@ class ProductionStateService:
             "warnings_count": len(parsed_enrichment.warnings),
             "extraction_hash": parsed_enrichment.extraction_hash,
             "synthesis_hash": parsed_enrichment.synthesis_hash,
+            "relevance_projection_hash": relevance_projection.projection_hash,
         }
         if repair_block := _snapshot_repair(snapshot):
             audit_metadata = {"imported_repair_audit": repair_block.model_dump(mode="json")}
@@ -767,14 +777,14 @@ class ProductionStateService:
                 edition_id=edition_id,
                 id=run_id,
                 status=ProductionRunStatus.NEEDS_REVIEW,
-                current_stage=ProductionStage.RELEVANCE_PROJECTION,
+                current_stage=ProductionStage.ASSEMBLY,
                 run_number=next_run_number,
                 research_date=snapshot.origin.research_date,
                 error_code=IMPORTED_RUN_ERROR_CODE,
                 error_message=(
                     "État importé : références, extraction, synthèse et enrichissement éditorial "
-                    "restaurés ; le périmètre des preuves et les étapes suivantes doivent être "
-                    "rejoués."
+                    "restaurés, périmètre des preuves reconstruit de façon déterministe ; "
+                    "l'assemblage doit être rejoué."
                 ),
                 started_at=now,
                 finished_at=now,
@@ -831,11 +841,19 @@ class ProductionStateService:
                 metadata=enrichment_meta,
             )
             await uow.production_artifacts.append(enrichment)
+            await persist_relevance_projection_in_uow(
+                uow,
+                run,
+                confirmed_input_snapshot,
+                relevance_projection,
+                self._artifact_store,
+                mark_downstream_stale=False,
+            )
             await uow.commit()
         return ProductionStateImportResult(
             run_id=run.id,
             status="needs_review",
-            current_stage="relevance_projection",
+            current_stage="assembly",
             imported_stages=("references", "extraction", "synthesis", "editorial_enrichment"),
             schema_version=snapshot.schema_version,
             content_sha256=snapshot.content_sha256,

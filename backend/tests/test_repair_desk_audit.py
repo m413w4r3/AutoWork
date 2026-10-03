@@ -304,6 +304,7 @@ def _input_snapshot(run_id: UUID) -> SimpleNamespace:
         edition_id=EDITION_ID,
         subject_id=SUBJECT_A,
         subject_title="Article 1",
+        actor_or_campaign=None,
         research_date=date(2026, 8, 28),
         discovery_snapshot_id=UUID("eeeeeeee-5555-4555-8555-eeeeeeeeeeee"),
         discovery_snapshot_version=7,

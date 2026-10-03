@@ -1058,6 +1058,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         request_id = run.bridge_request_id
         if adapter.backend is ModelBackend.CHATGPT_BRIDGE and request_id is None:
             raise ModelGatewayError("Model submission attempt was not allocated")
+        if request_id is None:
+            # Every other adapter still receives a per-attempt key: the OpenAI
+            # Responses adapter sends it as its idempotency key.
+            request_id = f"{run.id}:a{run.submission_attempt}"
         safe_request = replace(safe_request, request_id=request_id)
         retries_left = _BRIDGE_TERMINAL_FAILURE_RETRIES
         while True:
