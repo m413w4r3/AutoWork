@@ -127,17 +127,23 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
     validate_synthesis_lineage,
 )
+from cti_app.domain.semantic_annotation import (
+    SemanticAnnotationProposalV1,
+    SemanticRole,
+    lead_paragraph_anchor,
+    section_paragraph_anchor,
+)
 
 if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v1"
-EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 2
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v2-semantic-annotations"
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 3
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v4-reserves-contradictions"
+    "editorial-enrichment-evidence-pack-v5-paragraph-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v2"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v3-semantic-annotations"
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = "editorial-enrichment-routing-policy-v1"
 
@@ -308,9 +314,40 @@ class DiagramProposalV1(_StrictEnrichmentProposalModel):
         return _nonempty_proposal_text(value) if value is not None else None
 
 
+class AnnotationProposalV1(_StrictEnrichmentProposalModel):
+    role: SemanticRole
+    paragraph_anchor: StrictStr
+    text: StrictStr
+
+    @field_validator("paragraph_anchor")
+    @classmethod
+    def _validate_anchor(cls, value: str) -> str:
+        if not value or len(value) > 128 or re.fullmatch(r"[a-z][a-z0-9:_-]*", value) is None:
+            raise ValueError("Annotation paragraph anchor is invalid")
+        return value
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, value: str) -> str:
+        if not value:
+            raise ValueError("Annotation text must be non-empty")
+        return value
+
+
+def _proposal_annotation_to_domain(
+    annotation: AnnotationProposalV1,
+) -> SemanticAnnotationProposalV1:
+    return SemanticAnnotationProposalV1(
+        paragraph_anchor=annotation.paragraph_anchor,
+        role=annotation.role,
+        text=annotation.text,
+    )
+
+
 class EditorialEnrichmentProposalV1(_StrictEnrichmentProposalModel):
     tables: tuple[TableProposalV1, ...] = ()
     diagrams: tuple[DiagramProposalV1, ...] = ()
+    annotations: tuple[AnnotationProposalV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -348,7 +385,7 @@ class _EditorialEnrichmentWireBlock:
 _ENRICHMENT_FENCE = re.compile(r"^\s*(?:```|~~~)")
 _ENRICHMENT_BLOCK_WRAPPER = re.compile(r"^@@\s*(.*?)\s*@@$")
 _ENRICHMENT_HEADER = re.compile(
-    r"^(TABLE|DIAGRAM|COLUMN|ROW|NODE|RELATION|EDGE|GROUP)"
+    r"^(TABLE|DIAGRAM|ANNOTATION|COLUMN|ROW|NODE|RELATION|EDGE|GROUP)"
     r"(?:(?:\s*:\s*|\s+)([A-Za-z0-9][A-Za-z0-9._-]*))?\s*:?$",
     re.IGNORECASE,
 )
@@ -385,6 +422,15 @@ _ENRICHMENT_FIELD_ALIASES = {
     "group id": "group_id",
     "nodes": "node_ids",
     "node ids": "node_ids",
+    "category": "role",
+    "role": "role",
+    "anchor": "paragraph_anchor",
+    "paragraph": "paragraph_anchor",
+    "paragraph anchor": "paragraph_anchor",
+    "paragraph_anchor": "paragraph_anchor",
+    "exact text": "text",
+    "segment": "text",
+    "text": "text",
 }
 _ENRICHMENT_CHILD_KINDS = frozenset({"COLUMN", "ROW", "NODE", "RELATION", "EDGE", "GROUP"})
 _ENRICHMENT_CHILD_PARENT = {
@@ -489,6 +535,69 @@ def _block_child_error(
     return None
 
 
+def _synthesis_anchor_texts(
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> dict[str, str]:
+    current = evidence_pack.current_synthesis
+    result: dict[str, str] = {}
+    for paragraph in current.get("lead", ()):
+        if isinstance(paragraph, Mapping):
+            anchor, text = paragraph.get("anchor"), paragraph.get("text")
+            if isinstance(anchor, str) and isinstance(text, str):
+                result[anchor] = text
+    for section in current.get("sections", ()):
+        if not isinstance(section, Mapping):
+            continue
+        for paragraph in section.get("paragraphs", ()):
+            if isinstance(paragraph, Mapping):
+                anchor, text = paragraph.get("anchor"), paragraph.get("text")
+                if isinstance(anchor, str) and isinstance(text, str):
+                    result[anchor] = text
+    return result
+
+
+def _parse_annotation_wire_block(
+    block: _EditorialEnrichmentWireBlock,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> AnnotationProposalV1 | None:
+    def reject(reason: str) -> None:
+        rejections.append(
+            _enrichment_wire_rejection(block, block.block_id, reason, block.raw_lines)
+        )
+
+    allowed = {"role", "paragraph_anchor", "text"}
+    if set(block.fields) - allowed:
+        reject("editorial_enrichment_unknown_field")
+        return None
+    raw_role = _wire_scalar(block, "role")
+    anchor = _wire_scalar(block, "paragraph_anchor")
+    text = _wire_scalar(block, "text")
+    if not raw_role or not anchor or not text:
+        reject("editorial_enrichment_annotation_missing_field")
+        return None
+    try:
+        role = SemanticRole(raw_role.strip().casefold())
+    except ValueError:
+        reject("editorial_enrichment_annotation_category_unknown")
+        return None
+    if role is SemanticRole.TEXT:
+        reject("editorial_enrichment_annotation_category_unknown")
+        return None
+    anchored_text = _synthesis_anchor_texts(evidence_pack).get(anchor)
+    if anchored_text is None:
+        reject("editorial_enrichment_annotation_anchor_unknown")
+        return None
+    if text not in anchored_text:
+        reject("editorial_enrichment_annotation_text_not_found")
+        return None
+    try:
+        return AnnotationProposalV1(role=role, paragraph_anchor=anchor, text=text)
+    except (TypeError, ValueError, ValidationError):
+        reject("editorial_enrichment_annotation_invalid")
+        return None
+
+
 def parse_editorial_enrichment_proposal_wire(
     raw_text: str,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
@@ -546,6 +655,7 @@ def parse_editorial_enrichment_proposal_wire(
         prefix = {
             "TABLE": "T",
             "DIAGRAM": "D",
+            "ANNOTATION": "A",
             "COLUMN": "C",
             "ROW": "R",
             "NODE": "N",
@@ -599,7 +709,7 @@ def parse_editorial_enrichment_proposal_wire(
                 )
                 reject(marker, "editorial_enrichment_empty_marker_conflict")
                 explicit_empty = False
-            if kind in {"TABLE", "DIAGRAM"}:
+            if kind in {"TABLE", "DIAGRAM", "ANNOTATION"}:
                 finish_top()
                 current_top = new_block(kind, local_id, raw_line)
             else:
@@ -615,7 +725,7 @@ def parse_editorial_enrichment_proposal_wire(
             continue
 
         end_match = re.fullmatch(
-            r"END(?:\s+(TABLE|DIAGRAM|COLUMN|ROW|NODE|RELATION|EDGE|GROUP|ITEM))?",
+            r"END(?:\s+(TABLE|DIAGRAM|ANNOTATION|COLUMN|ROW|NODE|RELATION|EDGE|GROUP|ITEM))?",
             line,
             re.I,
         )
@@ -639,6 +749,7 @@ def parse_editorial_enrichment_proposal_wire(
             bare_match = re.match(
                 r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
                 r"TARGET\s+NODE\s+ID|GROUP\s+ID|NODE\s+ID|COLUMN\s+KEY|"
+                r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|CATEGORY|ROLE|ANCHOR|SEGMENT|TEXT|"
                 r"KEY|KIND|TITLE|CAPTION|PLACEMENT|LABEL|CELL|HANDLES|DIRECTION|ID|"
                 r"FROM|TO|SOURCE|TARGET|NODES)\s+(.+)$",
                 line,
@@ -690,6 +801,7 @@ def parse_editorial_enrichment_proposal_wire(
             "RELATION": {"source_node_id", "target_node_id", "label", "evidence_handles"},
             "EDGE": {"source_node_id", "target_node_id", "label", "evidence_handles"},
             "GROUP": {"group_id", "id", "label", "node_ids"},
+            "ANNOTATION": {"role", "paragraph_anchor", "text"},
         }[target.kind]
         if canonical not in allowed:
             target.error_code = target.error_code or "editorial_enrichment_unknown_field"
@@ -718,6 +830,7 @@ def parse_editorial_enrichment_proposal_wire(
 
     tables: list[TableProposalV1] = []
     diagrams: list[DiagramProposalV1] = []
+    annotations: list[AnnotationProposalV1] = []
     canonical_keys: set[str] = set()
     for top in top_blocks:
         if top.error_code is not None:
@@ -734,6 +847,10 @@ def parse_editorial_enrichment_proposal_wire(
             else:
                 canonical_keys.add(table.key)
                 tables.append(table)
+        elif top.kind == "ANNOTATION":
+            annotation = _parse_annotation_wire_block(top, evidence_pack, rejections)
+            if annotation is not None:
+                annotations.append(annotation)
         else:
             diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections)
             if diagram is None:
@@ -745,7 +862,7 @@ def parse_editorial_enrichment_proposal_wire(
             else:
                 canonical_keys.add(diagram.key)
                 diagrams.append(diagram)
-    if not tables and not diagrams:
+    if not tables and not diagrams and not annotations:
         return EditorialEnrichmentWireParseResult(
             None,
             tuple(rejections),
@@ -753,7 +870,9 @@ def parse_editorial_enrichment_proposal_wire(
             transformations=tuple(transformations),
         )
     return EditorialEnrichmentWireParseResult(
-        proposal=EditorialEnrichmentProposalV1(tables=tuple(tables), diagrams=tuple(diagrams)),
+        proposal=EditorialEnrichmentProposalV1(
+            tables=tuple(tables), diagrams=tuple(diagrams), annotations=tuple(annotations)
+        ),
         rejections=tuple(rejections),
         transformations=tuple(transformations),
     )
@@ -1190,8 +1309,9 @@ def _synthesis_prompt_projection(
     synthesis: ProductionSynthesisV1,
     handle_for_ref: Mapping[ExtractionEvidenceRefV1, str],
 ) -> dict[str, Any]:
-    def paragraph(item: Any) -> dict[str, Any]:
+    def paragraph(item: Any, anchor: str) -> dict[str, Any]:
         return {
+            "anchor": anchor,
             "text": item.text,
             "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
         }
@@ -1199,13 +1319,19 @@ def _synthesis_prompt_projection(
     return {
         "language": synthesis.publication_language,
         "title": synthesis.title,
-        "lead": [paragraph(item) for item in synthesis.lead],
+        "lead": [
+            paragraph(item, lead_paragraph_anchor(index))
+            for index, item in enumerate(synthesis.lead, start=1)
+        ],
         "sections": [
             {
                 "section_index": index,
                 "kind": section.kind.value,
                 "heading": section.heading,
-                "paragraphs": [paragraph(item) for item in section.paragraphs],
+                "paragraphs": [
+                    paragraph(item, section_paragraph_anchor(index, paragraph_index))
+                    for paragraph_index, item in enumerate(section.paragraphs, start=1)
+                ],
             }
             for index, section in enumerate(synthesis.sections)
         ],
@@ -1490,8 +1616,20 @@ NODES: step_1, step_2
 END GROUP
 END DIAGRAM
 
+ANNOTATION A001
+CATEGORY: actor
+PARAGRAPH_ANCHOR: lead:0001
+EXACT_TEXT: exact actor name copied from the anchored paragraph
+END ANNOTATION
+
 For no useful enrichment, return exactly: NO USEFUL ENRICHMENT. Do not use
-JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, or generated render syntax.
+JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or generated render
+syntax. Annotation categories are actor, campaign, malware, tool, product,
+english_term, technical, technical_literal, ioc, path, command, protocol_field,
+source, and proof.
+Only annotate text that appears verbatim in the named paragraph. Copy its stable
+anchor from current_synthesis. Repeated exact text is applied to every exact
+occurrence in that paragraph; punctuation outside the copied text is preserved.
 Each table column is a COLUMN block; each row is a ROW block with one CELL line
 per column. Each diagram uses NODE, RELATION, and optional GROUP blocks. Every
 row, node, and relation must cite existing evidence handles from the input. A
@@ -1546,10 +1684,13 @@ def build_editorial_enrichment_model_request(
     )
     prompt_payload = {
         "instructions": (
-            "Tu es un planificateur de représentations éditoriales, pas un chercheur "
+            "Tu es un planificateur de représentations et d'annotations éditoriales, "
+            "pas un chercheur "
             "ni un renderer. Décide uniquement si des informations de la synthèse "
             "gagneraient à être structurées en "
-            "tableaux ou diagrammes sémantiques. N'ajoute aucun fait, n'effectue aucune recherche, "
+            "tableaux ou diagrammes sémantiques, et propose des rôles typographiques uniquement "
+            "pour les segments exacts et évidents d'un paragraphe ancré. N'ajoute aucun fait, "
+            "n'effectue aucune recherche, "
             "et utilise uniquement les preuves fournies. Chaque ligne, nœud et arête doit citer au "
             "moins un evidence handle exact. Une arête exprime une relation factuelle "
             "et doit avoir "
@@ -1728,6 +1869,29 @@ def validate_editorial_enrichment_proposal(
                 technical_support_mutable[literal].add(ref)
     technical_support = dict(technical_support_mutable)
     section_count = len(synthesis.sections)
+    paragraph_text_by_anchor = {
+        **{
+            lead_paragraph_anchor(index): item.text
+            for index, item in enumerate(synthesis.lead, start=1)
+        },
+        **{
+            section_paragraph_anchor(section_index, paragraph_index): paragraph.text
+            for section_index, section in enumerate(synthesis.sections)
+            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
+        },
+    }
+    annotations: list[SemanticAnnotationProposalV1] = []
+    for annotation in parsed.annotations:
+        anchored_text = paragraph_text_by_anchor.get(annotation.paragraph_anchor)
+        if anchored_text is None:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        if annotation.text not in anchored_text or annotation.role is SemanticRole.TEXT:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        annotations.append(_proposal_annotation_to_domain(annotation))
 
     def placement(value: EnrichmentPlacementProposalV1) -> EnrichmentPlacementV1:
         if value.kind is EnrichmentPlacementKind.AFTER_SECTION and (
@@ -1873,6 +2037,7 @@ def validate_editorial_enrichment_proposal(
             diagrams=tuple(diagrams),
             source_figures=source_figures,
             warnings=warnings,
+            annotations=tuple(annotations),
         )
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     except EditorialEnrichmentValidationError as exc:
@@ -2726,6 +2891,25 @@ def validate_editorial_enrichment(
             "editorial_enrichment_lineage_mismatch",
             "Editorial enrichment publication language does not match the canonical synthesis",
         )
+
+    synthesis_paragraphs = {
+        **{
+            lead_paragraph_anchor(index): item.text
+            for index, item in enumerate(synthesis.lead, start=1)
+        },
+        **{
+            section_paragraph_anchor(section_index, paragraph_index): paragraph.text
+            for section_index, section in enumerate(synthesis.sections)
+            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
+        },
+    }
+    for annotation in enrichment.annotations:
+        paragraph_text = synthesis_paragraphs.get(annotation.paragraph_anchor)
+        if paragraph_text is None or annotation.text not in paragraph_text:
+            raise EditorialEnrichmentValidationError(
+                "editorial_enrichment_annotation_invalid",
+                "Semantic annotation does not match its anchored synthesis paragraph",
+            )
 
     unknown_refs = editorial_enrichment_evidence_refs(enrichment) - set(
         extraction_evidence_refs_v1(extraction)

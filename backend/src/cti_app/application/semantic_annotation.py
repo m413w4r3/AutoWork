@@ -15,7 +15,19 @@ from cti_app.application.production_parsers import (
     SemanticType,
     TechnicalExtraction,
 )
+from cti_app.domain.production import ProductionEvidenceBasis
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ProductionExtractionV1,
+)
 from cti_app.domain.publication import ArtifactType, RichSpan, RichSpanKind, RichText
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ROLE_PRIORITY,
+    SemanticAnnotationProposalV1,
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+)
 
 SEMANTIC_ANNOTATOR_VERSION = "1"
 
@@ -75,6 +87,84 @@ class _Candidate:
     priority: int
     source_ids: tuple[str, ...] = ()
     replacement: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _RoleCandidate:
+    start: int
+    end: int
+    role: SemanticRole
+
+
+_FACT_ROLE: dict[str, SemanticRole] = {
+    "actors": SemanticRole.ACTOR,
+    "campaigns": SemanticRole.CAMPAIGN,
+    "malware": SemanticRole.MALWARE,
+    "tools": SemanticRole.TOOL,
+    "products": SemanticRole.PRODUCT,
+    "protocols": SemanticRole.PROTOCOL_FIELD,
+    "commands": SemanticRole.COMMAND,
+    "files": SemanticRole.PATH,
+    "infection_chain": SemanticRole.TECHNICAL,
+    "ttps": SemanticRole.TECHNICAL,
+    "infrastructure": SemanticRole.TECHNICAL,
+    "persistence": SemanticRole.TECHNICAL,
+    "detections": SemanticRole.TECHNICAL,
+    "other_technical": SemanticRole.TECHNICAL,
+}
+_PORT_LITERAL = re.compile(
+    r"\b(?:port\s*(?:[:=]\s*)?(\d{1,5})|(?:tcp|udp)/(\d{1,5})|"
+    r"(\d{1,5})/(?:tcp|udp))\b",
+    re.IGNORECASE,
+)
+_PARAMETER_LITERAL = re.compile(r"(?<![\w.-])[A-Za-z_][A-Za-z0-9_.-]*=[^\s,;]+")
+
+
+def _technical_literal_values(value: str) -> tuple[str, ...]:
+    """Recognize only explicit port and parameter syntax in technical facts."""
+    literals: list[str] = []
+    for match in _PORT_LITERAL.finditer(value):
+        port = next((group for group in match.groups() if group is not None), None)
+        if port is not None and int(port) <= 65535:
+            literals.append(port)
+    for match in _PARAMETER_LITERAL.finditer(value):
+        literal = match.group().rstrip(".,;:!?)]}")
+        if literal:
+            literals.append(literal)
+    return tuple(dict.fromkeys(literals))
+
+
+def semantic_entities_from_extraction(
+    extraction: ProductionExtractionV1,
+) -> tuple[tuple[SemanticRole, str], ...]:
+    """Return only source-verified typed entity and literal terms."""
+    terms: list[tuple[SemanticRole, str]] = []
+    for source in extraction.sources:
+        for fact in source.facts:
+            role = _FACT_ROLE.get(fact.category)
+            if role is not None and fact.evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED:
+                terms.append((role, fact.value))
+                if fact.category == "other_technical":
+                    terms.extend(
+                        (SemanticRole.TECHNICAL_LITERAL, value)
+                        for value in _technical_literal_values(fact.value)
+                    )
+        for indicator in source.indicators:
+            if indicator.artifact_type in {ArtifactType.FILEPATH, ArtifactType.FILENAME}:
+                terms.append((SemanticRole.PATH, indicator.value))
+            elif (
+                indicator.indicator_status is ExtractionIndicatorStatus.CONFIRMED_IOC
+                and indicator.artifact_type
+                in {
+                    ArtifactType.IP,
+                    ArtifactType.DOMAIN,
+                    ArtifactType.URL,
+                    ArtifactType.EMAIL,
+                    ArtifactType.HASH,
+                }
+            ):
+                terms.append((SemanticRole.IOC, indicator.value))
+    return tuple(dict.fromkeys((role, value) for role, value in terms if value.strip()))
 
 
 _KIND_FOR_SEMANTIC = {
@@ -202,3 +292,71 @@ class SemanticAnnotator:
         if cursor < len(text):
             output.append(RichSpan(RichSpanKind.TEXT, text[cursor:]))
         return tuple(output)
+
+    def annotate_paragraph(
+        self,
+        *,
+        anchor: str,
+        text: str,
+        entities: Sequence[tuple[SemanticRole, str]],
+        proposals: Sequence[SemanticAnnotationProposalV1] = (),
+    ) -> SemanticParagraphV1:
+        """Build full-coverage spans without changing any source character."""
+        candidates: list[_RoleCandidate] = []
+        for match in _CITATION.finditer(text):
+            candidates.append(_RoleCandidate(match.start(), match.end(), SemanticRole.SOURCE))
+
+        for role, value in entities:
+            if not value.strip() or role is SemanticRole.TEXT:
+                continue
+            # A slash surrounded by whitespace separates aliases. Keep slashes
+            # inside paths and URLs so they can be annotated as full literals.
+            for alias in (part.strip() for part in re.split(r"\s+/\s+", value)):
+                if not alias:
+                    continue
+                for match in _term_pattern(alias).finditer(text):
+                    candidates.append(_RoleCandidate(match.start(), match.end(), role))
+
+        for span in self._foreign_terms.spans(text):
+            candidates.append(_RoleCandidate(span.start, span.end, SemanticRole.ENGLISH_TERM))
+
+        for proposal in proposals:
+            if proposal.paragraph_anchor != anchor:
+                continue
+            start = 0
+            while True:
+                start = text.find(proposal.text, start)
+                if start < 0:
+                    break
+                candidates.append(_RoleCandidate(start, start + len(proposal.text), proposal.role))
+                start += 1
+
+        selected: list[_RoleCandidate] = []
+        for candidate in sorted(
+            candidates,
+            key=lambda item: (
+                -SEMANTIC_ROLE_PRIORITY[item.role],
+                -(item.end - item.start),
+                item.start,
+                item.role.value,
+            ),
+        ):
+            if any(
+                candidate.start < other.end and candidate.end > other.start for other in selected
+            ):
+                continue
+            selected.append(candidate)
+        selected.sort(key=lambda item: item.start)
+
+        spans: list[SemanticTextSpanV1] = []
+        cursor = 0
+        for candidate in selected:
+            if cursor < candidate.start:
+                spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text[cursor : candidate.start]))
+            spans.append(SemanticTextSpanV1(candidate.role, text[candidate.start : candidate.end]))
+            cursor = candidate.end
+        if cursor < len(text):
+            spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text[cursor:]))
+        if not spans:
+            spans.append(SemanticTextSpanV1(SemanticRole.TEXT, text))
+        return SemanticParagraphV1(anchor=anchor, spans=tuple(spans))

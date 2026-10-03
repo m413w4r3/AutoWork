@@ -15,9 +15,9 @@ from cti_app.application.typst_rendering import (
     project_publication_to_typst_model,
 )
 from cti_app.domain.edition_publication import EditionDocumentV2
-from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v2"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v3-semantic-text"
 
 
 class EditionTypstRendererError(ValueError):
@@ -65,9 +65,9 @@ class EditionTypstRenderer:
         publications: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         for publication in sorted(document.publications, key=lambda item: item.position):
-            if not isinstance(publication.document, PublicationDocumentV4):
+            if not isinstance(publication.document, (PublicationDocumentV4, PublicationDocumentV5)):
                 raise EditionRenderPublicationSchemaUnsupportedError(
-                    "Edition Typst rendering requires every publication to be PublicationDocumentV4"
+                    "Edition Typst rendering requires every publication to use a supported schema"
                 )
             model = project_publication_to_typst_model(publication.document)
             for media_ref in model.media_refs:
@@ -77,14 +77,15 @@ class EditionTypstRenderer:
                         f"Edition asset {media_ref.asset_id} has conflicting media metadata"
                     )
                 media_refs_by_id.setdefault(media_ref.asset_id, media_ref)
-            publications.append(
-                {
-                    "position": publication.position,
-                    "subject_id": str(publication.subject_id),
-                    "title": model.title,
-                    "content_sections": model.content_sections,
-                }
-            )
+            item: dict[str, Any] = {
+                "position": publication.position,
+                "subject_id": str(publication.subject_id),
+                "title": model.title,
+                "content_sections": model.content_sections,
+            }
+            if model.semantic_title is not None:
+                item["title_spans"] = model.semantic_title
+            publications.append(item)
 
         render_data = {
             "schema_version": _EDITION_RENDER_DATA_SCHEMA_VERSION,

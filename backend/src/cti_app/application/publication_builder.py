@@ -18,6 +18,10 @@ from cti_app.application.production_editorial_enrichment import (
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_normalization import normalize_indicator_value
 from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.semantic_annotation import (
+    SemanticAnnotator,
+    semantic_entities_from_extraction,
+)
 from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import (
@@ -69,12 +73,20 @@ from cti_app.domain.publication import (
 )
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
     PublicationDiagramV1,
     PublicationDocumentV4,
+    PublicationDocumentV5,
     PublicationSourceFigureV1,
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticTextV1,
 )
 
 
@@ -316,7 +328,7 @@ def _validate_publication_lineage(
             )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "4-references-synthesis-layout"
+ASSEMBLY_POLICY_VERSION: Final[str] = "5-semantic-annotations-4-references-synthesis-layout"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -342,8 +354,9 @@ def compute_assembly_input_hash(
         "relevance_projection_hash": (
             relevance_projection.projection_hash if relevance_projection is not None else None
         ),
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+        "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
     }
     return _canonical_digest(payload)
 
@@ -597,3 +610,40 @@ def build_publication_document_v4(
         diagrams=diagrams,
         figures=figures,
     )
+
+
+def build_publication_document_v5(
+    *,
+    snapshot: ProductionInputSnapshot,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    editorial_enrichment: EditorialEnrichmentV1,
+    relevance_projection: RelevanceProjectionV1 | None = None,
+) -> PublicationDocumentV5:
+    """Build V4 article data plus a versioned semantic text representation."""
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+        relevance_projection=relevance_projection,
+    )
+    entities = semantic_entities_from_extraction(extraction)
+    annotator = SemanticAnnotator()
+    semantic_paragraphs = tuple(
+        annotator.annotate_paragraph(
+            anchor=anchor,
+            text=text,
+            entities=entities,
+            proposals=editorial_enrichment.annotations,
+        )
+        for anchor, text in publication_document_text_anchors(document).items()
+    )
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=semantic_paragraphs,
+    )
+    return PublicationDocumentV5(document=document, semantic_text=semantic_text)

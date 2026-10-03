@@ -19,6 +19,7 @@ from cti_app.application.publication_assembly import PublicationAssemblyService
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     build_publication_document_v4,
+    build_publication_document_v5,
     compute_assembly_input_hash,
 )
 from cti_app.application.publication_qa import qa_publication_v4
@@ -75,7 +76,6 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import ArtifactType, PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     parse_publication_document,
     serialize_publication_document,
 )
@@ -297,7 +297,7 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
     run = _run(snapshot)
     service, catalog, artifacts = _service()
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
-    document = build_publication_document_v4(
+    document = build_publication_document_v5(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
@@ -340,7 +340,7 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         "diagnostics": _expected_diagnostics(references, extraction, synthesis, enrichment)
     }
     document_json = serialize_publication_document(document)
-    assert document_json["schema_version"] == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
+    assert document_json["schema_version"] == "5"
     assert set(document_json) == {
         "schema_version",
         "subject_id",
@@ -355,6 +355,7 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         "tables",
         "diagrams",
         "figures",
+        "rich_text",
     }
 
 
@@ -554,7 +555,7 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
     changed_enrichment = build_empty_editorial_enrichment(
         extraction=extraction, synthesis=changed_synthesis
     )
-    expected = build_publication_document_v4(
+    expected = build_publication_document_v5(
         snapshot=snapshot,
         references=references,
         extraction=extraction,

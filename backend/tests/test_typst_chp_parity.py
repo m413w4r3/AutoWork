@@ -8,6 +8,7 @@ use the same CHP page identity, shared typography, and reusable content helpers.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 from dataclasses import replace
@@ -17,6 +18,7 @@ from pathlib import Path
 import pytest
 from pypdf import PdfReader
 
+from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_compilation import (
     TYPST_COMPILER_VERSION,
     TypstCompileRequest,
@@ -30,7 +32,18 @@ from cti_app.application.typst_rendering import (
     load_template_bundle,
 )
 from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
-from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
+    PublicationDocumentV5,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticAnnotationProposalV1,
+    SemanticRole,
+    SemanticTextV1,
+)
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 from tests.test_typst_rendering import (
     _diagram_at,
@@ -373,3 +386,77 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "image/png",
     }
     assert _embedded_visual_xobject_count(reader) >= len(render_source.media_refs)
+
+
+async def test_real_typst_renders_annotated_literal_content_without_evaluating_it(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+    chp_parity_document: PublicationDocumentV4,
+) -> None:
+    command = '`curl "$x" #import "evil" ] $math$`'
+    lead_text = f"APT Étoile used the literal command {command}."
+    base = replace(
+        chp_parity_document,
+        title="APT Étoile activity",
+        lead=(
+            replace(chp_parity_document.lead[0], text=lead_text),
+            *chp_parity_document.lead[1:],
+        ),
+    )
+    annotator = SemanticAnnotator(EnglishTermDetector(()))
+    proposal = SemanticAnnotationProposalV1(
+        paragraph_anchor="lead:0001",
+        role=SemanticRole.COMMAND,
+        text=command,
+    )
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            annotator.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=((SemanticRole.ACTOR, "APT Étoile"),),
+                proposals=(proposal,),
+            )
+            for anchor, text in publication_document_text_anchors(base).items()
+        ),
+    )
+    document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = TypstRenderer().render(document, template_bundle)
+    render_data = json.loads(render_source.render_data_bytes)
+    first_paragraph = render_data["content_sections"][1]["blocks"][0]
+    assert any(span["style"] == "semantic-actor" for span in first_paragraph["semantic_spans"])
+    assert any(span["style"] == "semantic-command" for span in first_paragraph["semantic_spans"])
+    assert b"render-publication" in render_source.source_bytes
+    shared_helpers = (_CHP_TYPST_ROOT / "UTILS" / "helpers.typ").read_text(encoding="utf-8")
+    assert "#let semantic-command(body)" in shared_helpers
+    renderer_helpers = (_CHP_TYPST_ROOT / "RENDERER" / "publication_helpers.typ").read_text(
+        encoding="utf-8"
+    )
+    assert "semantic-or-plain(item.text" in renderer_helpers
+
+    workspace_root = tmp_path / "semantic-workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "semantic-font-snapshot"
+    font_root.mkdir()
+    request = TypstCompileRequest(
+        workspace_root=workspace_root,
+        entrypoint_relative_path="RENDERER/publication.typ",
+        font_paths=materialize_font_bundle(font_snapshot, font_root),
+    )
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(request)
+    text, compact_text = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
+
+    assert "APT Étoile" in text
+    assert 'curl "$x"' in text
+    for literal in ("#import", "evil", "]", "$math$", "`"):
+        assert literal in text or literal.replace(" ", "") in compact_text

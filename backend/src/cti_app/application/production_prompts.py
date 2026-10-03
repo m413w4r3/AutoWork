@@ -113,9 +113,9 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v4-reserve-context"
-EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = "editorial-enrichment-block-contract-v1"
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v1"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v5-semantic-annotations"
+EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = "editorial-enrichment-block-contract-v2"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v2-semantic-annotations"
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v1"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v1"
 RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v1"

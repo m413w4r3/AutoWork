@@ -26,6 +26,7 @@ from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+    AnnotationProposalV1,
     EditorialEnrichmentExecutionStatus,
     EditorialEnrichmentProposalControlError,
     EditorialEnrichmentProposalV1,
@@ -43,6 +44,7 @@ from cti_app.application.production_editorial_enrichment import (
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_model_run_id,
     editorial_enrichment_output_contract_example,
+    parse_editorial_enrichment_proposal_wire,
     validate_editorial_enrichment_proposal,
 )
 from cti_app.application.production_synthesis import (
@@ -65,6 +67,8 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentTableKind,
+    editorial_enrichment_from_json,
+    editorial_enrichment_to_json,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -93,6 +97,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_to_json,
 )
 from cti_app.domain.publication import ArtifactType
+from cti_app.domain.semantic_annotation import SemanticRole
 
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
 _DOCUMENT_ID = UUID("b8f83b7b-7088-409a-9667-4f93758c18e1")
@@ -516,6 +521,88 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "D2" in contract
 
 
+def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = (
+        "ANNOTATION A001\n"
+        "CATEGORY: malware\n"
+        "PARAGRAPH_ANCHOR: section:0:paragraph:0001\n"
+        "EXACT_TEXT: ExampleRAT\n"
+        "END ANNOTATION"
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+    assert parsed.proposal is not None
+    assert parsed.proposal.annotations == (
+        AnnotationProposalV1(
+            role=SemanticRole.MALWARE,
+            paragraph_anchor="section:0:paragraph:0001",
+            text="ExampleRAT",
+        ),
+    )
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal, pack, extraction, synthesis
+    )
+    assert enrichment.annotations[0].text == "ExampleRAT"
+    assert enrichment.schema_version == 2
+    assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
+
+
+@pytest.mark.parametrize(
+    ("anchor", "segment", "reason"),
+    [
+        (
+            "lead:0001",
+            "ExampleRAT",
+            "editorial_enrichment_annotation_anchor_unknown",
+        ),
+        (
+            "section:0:paragraph:0001",
+            "MissingFamily",
+            "editorial_enrichment_annotation_text_not_found",
+        ),
+    ],
+)
+def test_annotation_wire_rejects_wrong_anchor_or_missing_exact_segment(
+    anchor: str, segment: str, reason: str
+) -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = (
+        "ANNOTATION A001\nCATEGORY: malware\n"
+        f"PARAGRAPH_ANCHOR: {anchor}\nEXACT_TEXT: {segment}\nEND ANNOTATION"
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is None
+    assert [item.reason_code for item in parsed.rejections] == [reason]
+
+
+def test_annotation_wire_rejects_unknown_category_with_reason_code() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = (
+        "ANNOTATION A001\nCATEGORY: typst\n"
+        "PARAGRAPH_ANCHOR: section:0:paragraph:0001\n"
+        "EXACT_TEXT: ExampleRAT\nEND ANNOTATION"
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is None
+    assert [item.reason_code for item in parsed.rejections] == [
+        "editorial_enrichment_annotation_category_unknown"
+    ]
+
+
 def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
     source_id = _DOCUMENT_ID
     snapshot = _snapshot()
@@ -650,9 +737,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     )
     assert str(source.id) not in request.text
     assert "blob_id" not in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v1"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v2-semantic-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v1"
+        "editorial-enrichment-block-contract-v2"
     )
 
 
@@ -1232,10 +1319,10 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
 @pytest.mark.parametrize(
     ("version_name", "version_value"),
     (
-        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v4"),
+        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v6"),
         (
             "EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION",
-            "editorial-enrichment-block-contract-v2",
+            "editorial-enrichment-block-contract-v3",
         ),
     ),
 )

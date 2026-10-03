@@ -121,7 +121,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v2"
+    assert data["schema_version"] == "typst-edition-model-v3-semantic-text"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "France",

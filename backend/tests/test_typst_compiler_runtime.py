@@ -68,7 +68,7 @@ def typst_binary() -> str:
 
 def _runtime_render_data() -> dict[str, Any]:
     return {
-        "schema_version": "typst-publication-model-v2",
+        "schema_version": "typst-publication-model-v3-semantic-text",
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
         "content_sections": [

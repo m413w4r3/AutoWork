@@ -1,10 +1,15 @@
 # Versioned editorial lexicon; longest expressions win.
 command and control
+data exfiltration
 credential stuffing
 dead drop resolver
+initial access
+lateral movement
+living off the land
 side-loading
 loader
 payload
+threat hunting
 wiper
 phishing
 backdoor

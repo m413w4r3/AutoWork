@@ -5,7 +5,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from cti_app.application.publication_builder import build_publication_document_v4
+from cti_app.application.publication_builder import (
+    build_publication_document_v4,
+    build_publication_document_v5,
+)
 from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
@@ -14,7 +17,8 @@ from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication_document import (
-    PublicationDocumentV4,
+    CanonicalPublicationDocument,
+    PublicationDocumentV5,
     serialize_publication_document,
 )
 
@@ -26,7 +30,7 @@ _INTERNAL_DIAGNOSTIC = re.compile(
 )
 
 
-def qa_publication_v4(
+def qa_publication_v5(
     *,
     snapshot: ProductionInputSnapshot,
     references: ProductionReferenceCorpusV1,
@@ -34,7 +38,7 @@ def qa_publication_v4(
     relevance_projection: RelevanceProjectionV1 | None = None,
     synthesis: ProductionSynthesisV1,
     editorial_enrichment: EditorialEnrichmentV1,
-    publication: PublicationDocumentV4,
+    publication: CanonicalPublicationDocument,
 ) -> dict[str, Any]:
     """Rebuild the pure projection and require byte-for-byte semantic equality."""
     checks: dict[str, bool] = {}
@@ -48,7 +52,12 @@ def qa_publication_v4(
     if not checks["publication_language"]:
         errors.append("Publication language differs from the frozen snapshot")
     try:
-        expected = build_publication_document_v4(
+        expected_builder = (
+            build_publication_document_v5
+            if isinstance(publication, PublicationDocumentV5)
+            else build_publication_document_v4
+        )
+        expected = expected_builder(
             snapshot=snapshot,
             references=references,
             extraction=extraction,
@@ -187,6 +196,11 @@ def qa_publication_v4(
     return {"passed": not errors, "checks": checks, "errors": errors, "warnings": []}
 
 
+# Keep the old consumer name for frozen V4 documents. The validation function
+# selects the matching strict contract from the supplied canonical document.
+qa_publication_v4 = qa_publication_v5
+
+
 class ProductionQAService:
     """QA boundary for the current canonical Production publication."""
 
@@ -199,9 +213,9 @@ class ProductionQAService:
         relevance_projection: RelevanceProjectionV1 | None = None,
         synthesis: ProductionSynthesisV1,
         editorial_enrichment: EditorialEnrichmentV1,
-        publication: PublicationDocumentV4,
+        publication: CanonicalPublicationDocument,
     ) -> dict[str, Any]:
-        return qa_publication_v4(
+        return qa_publication_v5(
             snapshot=snapshot,
             references=references,
             extraction=extraction,

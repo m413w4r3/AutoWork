@@ -58,8 +58,14 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
+from cti_app.domain.semantic_annotation import (
+    SemanticTextV1,
+    semantic_text_from_json,
+    semantic_text_to_json,
+)
 
 PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
+PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
 
 
 @dataclass(frozen=True, slots=True)
@@ -874,7 +880,105 @@ class PublicationDocumentV4:
         )
 
 
-type CanonicalPublicationDocument = PublicationDocumentV4
+def publication_document_text_anchors(
+    document: PublicationDocumentV4,
+) -> dict[str, str]:
+    """Return every text-bearing article field rendered with semantic spans."""
+    result: dict[str, str] = {"title": document.title}
+    result.update(
+        {f"lead:{index:04d}": item.text for index, item in enumerate(document.lead, start=1)}
+    )
+    for section_index, section in enumerate(document.sections):
+        for paragraph_index, paragraph in enumerate(section.paragraphs, start=1):
+            result[f"section:{section_index}:paragraph:{paragraph_index:04d}"] = paragraph.text
+    for index, item in enumerate(document.timeline, start=1):
+        result[f"timeline:{index:04d}"] = item.text
+    for table in document.tables:
+        result[f"table:{table.key}:title"] = table.title
+        if table.caption is not None:
+            result[f"table:{table.key}:caption"] = table.caption
+        for column_index, column in enumerate(table.columns, start=1):
+            result[f"table:{table.key}:column:{column_index:04d}"] = column.label
+        for row_index, row in enumerate(table.rows, start=1):
+            for cell_index, cell in enumerate(row.cells, start=1):
+                result[f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}"] = cell
+    for diagram in document.diagrams:
+        result[f"diagram:{diagram.key}:title"] = diagram.title
+        if diagram.caption is not None:
+            result[f"diagram:{diagram.key}:caption"] = diagram.caption
+    for figure in document.figures:
+        result[f"figure:{figure.key}:caption"] = figure.caption
+        result[f"figure:{figure.key}:provenance"] = figure.provenance
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationDocumentV5:
+    """V4 article data plus an explicit, versioned semantic text projection."""
+
+    document: PublicationDocumentV4
+    semantic_text: SemanticTextV1
+
+    @property
+    def schema_version(self) -> str:
+        return PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION
+
+    def __getattr__(self, name: str) -> Any:
+        # Keep existing read-only publication consumers source-compatible while
+        # making the changed serialized contract an explicit V5 type.
+        return getattr(self.document, name)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.document, PublicationDocumentV4):
+            raise ValueError("PublicationDocumentV5 requires a validated V4 base document")
+        if not isinstance(self.semantic_text, SemanticTextV1):
+            raise ValueError("PublicationDocumentV5 requires versioned semantic text")
+        expected = publication_document_text_anchors(self.document)
+        actual = {item.anchor: item.text for item in self.semantic_text.paragraphs}
+        if actual != expected:
+            raise ValueError("PublicationDocumentV5 semantic spans must preserve every text field")
+
+    def _to_json(self) -> dict[str, Any]:
+        payload = self.document._to_json()
+        payload["schema_version"] = self.schema_version
+        payload["rich_text"] = semantic_text_to_json(self.semantic_text)
+        return payload
+
+    @classmethod
+    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV5:
+        document = json_object(
+            payload,
+            frozenset(
+                {
+                    "schema_version",
+                    "subject_id",
+                    "publication_language",
+                    "title",
+                    "lead",
+                    "sections",
+                    "timeline",
+                    "indicators",
+                    "sources",
+                    "uncertainties",
+                    "tables",
+                    "diagrams",
+                    "figures",
+                    "rich_text",
+                }
+            ),
+            "PublicationDocumentV5",
+        )
+        if document["schema_version"] != PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION:
+            raise ValueError("PublicationDocumentV5 schema version is unsupported")
+        base_payload = dict(document)
+        del base_payload["rich_text"]
+        base_payload["schema_version"] = PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
+        base = PublicationDocumentV4._from_json(base_payload)
+        semantic_text = semantic_text_from_json(document["rich_text"])
+        return cls(document=base, semantic_text=semantic_text)
+
+
+type CanonicalPublicationDocument = PublicationDocumentV4 | PublicationDocumentV5
 
 
 def publication_document_v4_to_json(document: PublicationDocumentV4) -> dict[str, Any]:
@@ -887,22 +991,41 @@ def publication_document_v4_from_json(payload: Mapping[str, Any]) -> Publication
     return PublicationDocumentV4._from_json(payload)
 
 
+def publication_document_v5_to_json(document: PublicationDocumentV5) -> dict[str, Any]:
+    if not isinstance(document, PublicationDocumentV5):
+        raise ValueError("Expected a PublicationDocumentV5")
+    return document._to_json()
+
+
+def publication_document_v5_from_json(payload: Mapping[str, Any]) -> PublicationDocumentV5:
+    return PublicationDocumentV5._from_json(payload)
+
+
+def publication_document_from_json(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
+    version = payload.get("schema_version")
+    if version == PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
+        return publication_document_v4_from_json(payload)
+    if version == PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION:
+        return publication_document_v5_from_json(payload)
+    raise ValueError(f"unsupported publication document schema_version={version!r}")
+
+
 def validate_publication_document(
     value: Mapping[str, Any] | CanonicalPublicationDocument,
 ) -> CanonicalPublicationDocument:
     """Validate one parsed model or canonical JSON payload."""
-    if isinstance(value, PublicationDocumentV4):
-        if value.schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
+    if isinstance(value, (PublicationDocumentV4, PublicationDocumentV5)):
+        if value.schema_version not in {
+            PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+            PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+        }:
             raise ValueError(
                 f"unsupported publication document schema_version={value.schema_version!r}"
             )
         return value
     if not isinstance(value, Mapping):
         raise ValueError("publication document must be a JSON object")
-    schema_version = value.get("schema_version")
-    if schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
-        raise ValueError(f"unsupported publication document schema_version={schema_version!r}")
-    return publication_document_v4_from_json(value)
+    return publication_document_from_json(value)
 
 
 def parse_publication_document(payload: Mapping[str, Any]) -> CanonicalPublicationDocument:
@@ -914,21 +1037,30 @@ def serialize_publication_document(
     document: CanonicalPublicationDocument,
 ) -> dict[str, Any]:
     """Validate and serialize the canonical publication model."""
-    return publication_document_v4_to_json(validate_publication_document(document))
+    validated = validate_publication_document(document)
+    if isinstance(validated, PublicationDocumentV5):
+        return publication_document_v5_to_json(validated)
+    return publication_document_v4_to_json(validated)
 
 
 __all__ = [
     "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
+    "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
     "CanonicalPublicationDocument",
     "PublicationDiagramV1",
     "PublicationDocumentV4",
+    "PublicationDocumentV5",
     "PublicationSourceFigureV1",
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
     "PublicationTableV1",
     "parse_publication_document",
+    "publication_document_from_json",
+    "publication_document_text_anchors",
     "publication_document_v4_from_json",
     "publication_document_v4_to_json",
+    "publication_document_v5_from_json",
+    "publication_document_v5_to_json",
     "serialize_publication_document",
     "validate_publication_document",
 ]

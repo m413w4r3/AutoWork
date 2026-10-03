@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": section-title, timeline, styled-table, ioc-list, source-list
+#import "../UTILS/helpers.typ": section-title, timeline, styled-table, ioc-list, source-list, semantic-text, semantic-or-plain
 #import "../UTILS/colors.typ": grey
 
 #let has-text(value) = value != none and value != ""
@@ -12,6 +12,7 @@
     event.display_date,
     event.text,
     unique-urls(event.source_urls),
+    event.at("semantic_spans", default: none),
   ))
 }
 
@@ -21,14 +22,23 @@
 
 #let render-table(item) = {
   if has-text(item.title) [
-    #text(size: 12pt, weight: "bold")[#item.title]
+    #text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]
     #v(4pt)
   ]
 
   let widths = item.columns.map(column => 1fr)
   let cell-alignments = item.columns.map(column => left)
-  let header-cells = item.columns.map(cell => [#cell])
-  let body-cells = item.rows.flatten().map(cell => [#cell])
+  let semantic-columns = item.at("semantic_columns", default: none)
+  let semantic-cells = item.at("semantic_cells", default: none)
+  let header-cells = item.columns.enumerate().map(((index, cell)) => [
+    #semantic-or-plain(cell, if semantic-columns == none { none } else { semantic-columns.at(index) })
+  ])
+  let body-cells = item.rows.flatten().enumerate().map(((index, cell)) => [
+    #semantic-or-plain(
+      cell,
+      if semantic-cells == none { none } else { semantic-cells.at(index) },
+    )
+  ])
   styled-table(
     widths,
     cell-align: cell-alignments,
@@ -36,28 +46,28 @@
   )
 
   if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#item.caption]
+    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
   ]
 }
 
 #let render-diagram(item) = {
   if has-text(item.title) [
-    #text(size: 12pt, weight: "bold")[#item.title]
+    #text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]
     #v(4pt)
   ]
   image(item.media_path, width: 90%)
   if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#item.caption]
+    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
   ]
 }
 
 #let render-figure(item) = {
   image(item.media_path, width: 90%)
   if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#item.caption]
+    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
   ]
   if has-text(item.provenance) [
-    #text(size: 8pt, fill: grey)[Provenance : #item.provenance]
+    #text(size: 8pt, fill: grey)[Provenance : #semantic-or-plain(item.provenance, item.at("semantic_provenance", default: none))]
   ]
   if has-text(item.locator) [
     #text(size: 8pt, fill: grey)[Repère : #item.locator]
@@ -66,7 +76,7 @@
 
 #let render-body-block(item) = {
   if item.type == "paragraph" {
-    [#item.text #parbreak()]
+    [#semantic-or-plain(item.text, item.at("semantic_spans", default: none)) #parbreak()]
   } else if item.type == "table" {
     render-table(item)
   } else if item.type == "diagram" {
@@ -115,6 +125,6 @@
 }
 
 #let render-publication(publication) = {
-  heading(level: 1)[#publication.title]
+  heading(level: 1)[#semantic-or-plain(publication.title, publication.at("title_spans", default: none))]
   render-publication-body(publication)
 }

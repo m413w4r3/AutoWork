@@ -17,9 +17,15 @@ from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     evidence_ref_sort_key,
 )
+from cti_app.domain.semantic_annotation import (
+    SemanticAnnotationProposalV1,
+    semantic_annotation_proposal_from_json,
+    semantic_annotation_proposal_to_json,
+)
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 1
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v1"
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 2
+EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -464,11 +470,10 @@ class EditorialEnrichmentV1:
     diagrams: tuple[DiagramSpecV1, ...]
     source_figures: tuple[SourceFigureCandidateV1, ...]
     warnings: tuple[str, ...]
+    annotations: tuple[SemanticAnnotationProposalV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or (
-            self.schema_version != EDITORIAL_ENRICHMENT_SCHEMA_VERSION
-        ):
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -477,7 +482,12 @@ class EditorialEnrichmentV1:
             if not isinstance(value, str) or _SHA256.fullmatch(value) is None:
                 raise ValueError(f"Editorial enrichment {field_name} must be a lowercase SHA-256")
         _text(self.publication_language, "Publication language", semantic=True)
-        if self.enrichment_policy_version != EDITORIAL_ENRICHMENT_POLICY_VERSION:
+        expected_policy = (
+            EDITORIAL_ENRICHMENT_V1_POLICY_VERSION
+            if self.schema_version == 1
+            else EDITORIAL_ENRICHMENT_POLICY_VERSION
+        )
+        if self.enrichment_policy_version != expected_policy:
             raise ValueError("Editorial enrichment policy version is unsupported")
         for label, values, item_type in (
             ("tables", self.tables, TableSpecV1),
@@ -492,6 +502,13 @@ class EditorialEnrichmentV1:
             not isinstance(warning, str) or not warning.strip() for warning in self.warnings
         ):
             raise ValueError("Editorial enrichment warnings must be non-empty strings")
+        if not isinstance(self.annotations, tuple) or any(
+            not isinstance(annotation, SemanticAnnotationProposalV1)
+            for annotation in self.annotations
+        ):
+            raise ValueError("Editorial enrichment annotations have an invalid type")
+        if self.schema_version == 1 and self.annotations:
+            raise ValueError("V1 editorial enrichment cannot contain semantic annotations")
         keys = [
             *(table.key for table in self.tables),
             *(diagram.key for diagram in self.diagrams),
@@ -638,7 +655,7 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
     """Return the strict JSON-compatible canonical representation."""
     if not isinstance(enrichment, EditorialEnrichmentV1):
         raise ValueError("Expected an EditorialEnrichmentV1")
-    return {
+    payload = {
         "schema_version": enrichment.schema_version,
         "subject_id": str(enrichment.subject_id),
         "production_input_hash": enrichment.production_input_hash,
@@ -651,9 +668,14 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         "source_figures": [_figure_to_json(figure) for figure in enrichment.source_figures],
         "warnings": list(enrichment.warnings),
     }
+    if enrichment.schema_version >= 2:
+        payload["annotations"] = [
+            semantic_annotation_proposal_to_json(item) for item in enrichment.annotations
+        ]
+    return payload
 
 
-_ROOT_KEYS = frozenset(
+_ROOT_KEYS_V1 = frozenset(
     {
         "schema_version",
         "subject_id",
@@ -668,6 +690,7 @@ _ROOT_KEYS = frozenset(
         "warnings",
     }
 )
+_ROOT_KEYS = _ROOT_KEYS_V1 | {"annotations"}
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
@@ -952,8 +975,15 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode only exact V1 payloads; no unknown fields or coercion are allowed."""
-    body = _object(payload, _ROOT_KEYS, "Editorial enrichment")
+    """Decode strict V1/V2 payloads; old V1 artifacts migrate with no proposals."""
+    if not isinstance(payload, Mapping):
+        raise ValueError("Editorial enrichment must be an object")
+    raw_version = payload.get("schema_version")
+    body = _object(
+        payload,
+        _ROOT_KEYS_V1 if raw_version == 1 else _ROOT_KEYS,
+        "Editorial enrichment",
+    )
     schema_version = body["schema_version"]
     if type(schema_version) is not int:
         raise ValueError("Editorial enrichment schema version must be an integer")
@@ -983,6 +1013,14 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
             _figure_from_json(value) for value in _array(body["source_figures"], "Source figures")
         ),
         warnings=warnings,
+        annotations=(
+            tuple(
+                semantic_annotation_proposal_from_json(value)
+                for value in _array(body["annotations"], "Semantic annotations")
+            )
+            if schema_version >= 2
+            else ()
+        ),
     )
 
 

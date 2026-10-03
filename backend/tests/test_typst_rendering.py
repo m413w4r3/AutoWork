@@ -9,6 +9,7 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 from cti_app.application.typst_rendering import (
     TypstRenderer,
     TypstTemplateBundle,
@@ -32,7 +33,18 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
 )
-from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.publication_document import (
+    PublicationDocumentV4,
+    PublicationDocumentV5,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticAnnotationProposalV1,
+    SemanticRole,
+    SemanticTextV1,
+)
 from tests.test_publication_v4 import _SOURCE_ID, _diagram, _document, _figure, _source, _table
 
 _SECOND_SOURCE_ID = UUID("00000000-0000-0000-0000-000000000002")
@@ -216,7 +228,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v2"
+    assert data["schema_version"] == "typst-publication-model-v3-semantic-text"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -318,6 +330,63 @@ def test_internal_section_heading_is_not_projected(tmp_path: Path) -> None:
     synthesis = data["content_sections"][1]
     assert {"type": "paragraph", "text": "Section body"} in synthesis["blocks"]
     assert all(block["type"] != "section_heading" for block in synthesis["blocks"])
+
+
+def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base = _full_document(
+        tables=(replace(_table(), caption="APT Étoile used -enc."),),
+    )
+    command = "`curl '$x' # marker ]`"
+    lead_text = f"APT Étoile executed {command} over TCP port 443."
+    base = replace(
+        base,
+        title="APT Étoile response",
+        lead=(replace(base.lead[0], text=lead_text), *base.lead[1:]),
+    )
+    annotator = SemanticAnnotator(EnglishTermDetector(()))
+    entities = (
+        (SemanticRole.ACTOR, "APT Étoile"),
+        (SemanticRole.COMMAND, "-enc"),
+        (SemanticRole.TECHNICAL_LITERAL, "443"),
+    )
+    proposals = (
+        SemanticAnnotationProposalV1(
+            paragraph_anchor="lead:0001",
+            role=SemanticRole.COMMAND,
+            text=command,
+        ),
+    )
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            annotator.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=entities,
+                proposals=proposals,
+            )
+            for anchor, text in publication_document_text_anchors(base).items()
+        ),
+    )
+    document = PublicationDocumentV5(document=base, semantic_text=semantic_text)
+
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    synthesis = data["content_sections"][1]
+    paragraph = synthesis["blocks"][0]
+    table = next(block for block in synthesis["blocks"] if block["type"] == "table")
+    styles = {span["style"] for span in paragraph["semantic_spans"]}
+    semantic_cells = table["semantic_cells"]
+
+    assert data["schema_version"] == "typst-publication-model-v3-semantic-text"
+    assert paragraph["text"] == lead_text
+    assert "".join(span["text"] for span in paragraph["semantic_spans"]) == lead_text
+    assert {"semantic-actor", "semantic-command", "semantic-technical-literal"} <= styles
+    assert len(semantic_cells) == sum(len(row) for row in table["rows"])
+    assert all(isinstance(cell_spans, list) for cell_spans in semantic_cells)
+    assert "semantic-command" in {span["style"] for span in semantic_cells[0]}
+    assert "semantic-actor" in {span["style"] for span in table["semantic_caption"]}
 
 
 def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(

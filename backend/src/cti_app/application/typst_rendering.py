@@ -1,4 +1,4 @@
-"""Pure projection of PublicationDocumentV4 into the fixed Typst input format."""
+"""Pure projection of canonical publication documents into Typst input data."""
 
 from __future__ import annotations
 
@@ -20,13 +20,21 @@ from cti_app.domain.publication import (
     PublicationSourceV1,
 )
 from cti_app.domain.publication_document import (
+    CanonicalPublicationDocument,
     PublicationDiagramV1,
     PublicationDocumentV4,
+    PublicationDocumentV5,
     PublicationSourceFigureV1,
     PublicationTableV1,
 )
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ROLE_TYPST_FUNCTION_V1,
+    lead_paragraph_anchor,
+    section_paragraph_anchor,
+    timeline_anchor,
+)
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v2"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v3-semantic-text"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _MEDIA_EXTENSIONS = {
     "image/svg+xml": ".svg",
@@ -70,6 +78,7 @@ class TypstPublicationModelV2:
     title: str
     content_sections: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
+    semantic_title: list[dict[str, str]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +98,7 @@ class TypstRenderer:
     """Build deterministic data and return the fixed production entrypoint."""
 
     def render(
-        self, document: PublicationDocumentV4, template_bundle: TypstTemplateBundle
+        self, document: CanonicalPublicationDocument, template_bundle: TypstTemplateBundle
     ) -> TypstRenderSource:
         entrypoint = next(
             (
@@ -112,6 +121,8 @@ class TypstRenderer:
             "title": model.title,
             "content_sections": model.content_sections,
         }
+        if model.semantic_title is not None:
+            render_data["title_spans"] = model.semantic_title
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -128,9 +139,34 @@ class TypstRenderer:
 
 
 def project_publication_to_typst_model(
-    document: PublicationDocumentV4,
+    value: CanonicalPublicationDocument,
 ) -> TypstPublicationModelV2:
-    """Project one canonical V4 publication into shared Typst article data."""
+    """Project a canonical publication while keeping semantic content as data."""
+    if isinstance(value, PublicationDocumentV5):
+        document = value.document
+        semantic_by_anchor = {item.anchor: item for item in value.semantic_text.paragraphs}
+    elif isinstance(value, PublicationDocumentV4):
+        document = value
+        semantic_by_anchor = {}
+    else:
+        raise ValueError("Unsupported canonical publication document")
+
+    def semantic_spans(anchor: str, text: str) -> list[dict[str, str]] | None:
+        paragraph = semantic_by_anchor.get(anchor)
+        if paragraph is None:
+            return None
+        if paragraph.text != text:
+            raise ValueError(f"Semantic text differs from publication content at {anchor}")
+        return [
+            {"style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[span.role], "text": span.text}
+            for span in paragraph.spans
+        ]
+
+    def rich_block(block: dict[str, Any], field_name: str, anchor: str, text: str) -> None:
+        spans = semantic_spans(anchor, text)
+        if spans is not None:
+            block[field_name] = spans
+
     media_refs_by_id: dict[UUID, TypstMediaRef] = {}
     rich_by_placement: dict[tuple[EnrichmentPlacementKind, int | None], list[dict[str, Any]]] = {}
 
@@ -173,35 +209,91 @@ def project_publication_to_typst_model(
         rich_by_placement.setdefault((kind, section_index), []).append(block)
 
     for table in document.tables:
+        block = _table_block(table)
+        rich_block(block, "semantic_title", f"table:{table.key}:title", table.title)
+        if table.caption is not None:
+            rich_block(block, "semantic_caption", f"table:{table.key}:caption", table.caption)
+        column_spans = [
+            semantic_spans(f"table:{table.key}:column:{column_index:04d}", column.label)
+            for column_index, column in enumerate(table.columns, start=1)
+        ]
+        if column_spans and all(item is not None for item in column_spans):
+            block["semantic_columns"] = column_spans
+        cell_spans = [
+            semantic_spans(f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}", cell)
+            for row_index, row in enumerate(table.rows, start=1)
+            for cell_index, cell in enumerate(row.cells, start=1)
+        ]
+        if cell_spans and all(spans is not None for spans in cell_spans):
+            # Match the renderer's flat row-cell sequence without recursively
+            # flattening each cell's own array of semantic span objects.
+            block["semantic_cells"] = cell_spans
         add_rich(
             table.placement.kind,
             table.placement.section_index,
-            _table_block(table),
+            block,
         )
     for diagram in document.diagrams:
+        block = _diagram_block(diagram, media_ref)
+        rich_block(block, "semantic_title", f"diagram:{diagram.key}:title", diagram.title)
+        if diagram.caption is not None:
+            rich_block(block, "semantic_caption", f"diagram:{diagram.key}:caption", diagram.caption)
         add_rich(
             diagram.placement.kind,
             diagram.placement.section_index,
-            _diagram_block(diagram, media_ref),
+            block,
         )
     for figure in document.figures:
+        block = _figure_block(figure, media_ref)
+        rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
+        rich_block(
+            block,
+            "semantic_provenance",
+            f"figure:{figure.key}:provenance",
+            figure.provenance,
+        )
         add_rich(
             figure.placement.kind,
             figure.placement.section_index,
-            _figure_block(figure, media_ref),
+            block,
         )
 
     reference_blocks = list(
         rich_by_placement.get((EnrichmentPlacementKind.AFTER_TIMELINE, None), ())
     )
     body_blocks: list[dict[str, Any]] = []
-    body_blocks.extend({"type": "paragraph", "text": item.text} for item in document.lead)
+    body_blocks.extend(
+        {
+            "type": "paragraph",
+            "text": item.text,
+            **(
+                {"semantic_spans": spans}
+                if (spans := semantic_spans(lead_paragraph_anchor(index), item.text)) is not None
+                else {}
+            ),
+        }
+        for index, item in enumerate(document.lead, start=1)
+    )
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
     lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
     for section_index, section in enumerate(document.sections):
         body_blocks.extend(
-            {"type": "paragraph", "text": paragraph.text}
-            for paragraph in section.paragraphs
+            {
+                "type": "paragraph",
+                "text": paragraph.text,
+                **(
+                    {"semantic_spans": spans}
+                    if (
+                        spans := semantic_spans(
+                            section_paragraph_anchor(section_index, paragraph_index),
+                            paragraph.text,
+                        )
+                    )
+                    is not None
+                    else {}
+                ),
+            }
+            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
         )
         body_blocks.extend(
@@ -210,14 +302,17 @@ def project_publication_to_typst_model(
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.END, None), ()))
 
     sources_by_id = {source.source_document_id: source for source in document.sources}
-    timeline = [
-        {
+    timeline = []
+    for index, entry in enumerate(document.timeline, start=1):
+        item: dict[str, Any] = {
             "display_date": _display_date(entry.date_text, entry.event_date),
             "text": entry.text,
             "source_urls": _timeline_source_urls(entry.evidence_refs, sources_by_id),
         }
-        for entry in document.timeline
-    ]
+        spans = semantic_spans(timeline_anchor(index), entry.text)
+        if spans is not None:
+            item["semantic_spans"] = spans
+        timeline.append(item)
     sources = [
         {
             "title": source.title,
@@ -250,6 +345,7 @@ def project_publication_to_typst_model(
         title=document.title,
         content_sections=content_sections,
         media_refs=tuple(media_refs_by_id.values()),
+        semantic_title=semantic_spans("title", document.title),
     )
 
 

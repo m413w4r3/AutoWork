@@ -34,8 +34,8 @@ from cti_app.application.typst_rendering import (
 )
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
 from cti_app.domain.publication_document import (
-    publication_document_v4_from_json,
-    publication_document_v4_to_json,
+    publication_document_from_json,
+    serialize_publication_document,
 )
 from cti_app.domain.publication_render import (
     PUBLICATION_RENDER_POLICY_VERSION,
@@ -170,21 +170,21 @@ class PublicationRenderService:
             payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
         except (ValueError, KeyError) as exc:
             raise PublicationRenderDocumentInvalidError(
-                "Publication artifact does not contain valid PublicationDocumentV4 JSON"
+                "Publication artifact does not contain valid canonical publication JSON"
             ) from exc
         except Exception as exc:
             raise PublicationRenderStorageFailedError(
                 "Unable to read the canonical publication blob"
             ) from exc
         try:
-            document = publication_document_v4_from_json(payload)
+            document = publication_document_from_json(payload)
         except (ValueError, KeyError) as exc:
             raise PublicationRenderDocumentInvalidError(
-                "Publication artifact does not contain a valid PublicationDocumentV4"
+                "Publication artifact does not contain a valid canonical publication document"
             ) from exc
 
         publication_content_sha256 = hashlib.sha256(
-            ProductionArtifactStore.canonical_json_bytes(publication_document_v4_to_json(document))
+            ProductionArtifactStore.canonical_json_bytes(serialize_publication_document(document))
         ).hexdigest()
         try:
             template_bundle = load_template_bundle(self._chp_typst_root)

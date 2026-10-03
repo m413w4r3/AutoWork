@@ -2,6 +2,56 @@
 
 #set grid(gutter: 1em)
 
+// The semantic helpers receive only strings from the JSON render projection.
+// text(string) creates literal content, so source text is never parsed as Typst.
+#let semantic-plain(body) = text(body)
+#let semantic-actor(body) = text(weight: "bold", fill: accent)[#text(body)]
+#let semantic-campaign(body) = text(weight: "bold", fill: purple)[#text(body)]
+#let semantic-malware(body) = text(weight: "bold", fill: purple-dark)[#text(body)]
+#let semantic-tool(body) = text(weight: "bold", fill: accent)[#text(body)]
+#let semantic-product(body) = text(weight: "bold", fill: dark)[#text(body)]
+#let semantic-english-term(body) = emph(text(body))
+#let semantic-technical(body) = text(size: 10pt, fill: purple-dark)[#text(body)]
+#let semantic-technical-literal(body) = text(
+  font: "Cascadia Mono",
+  size: 9pt,
+  fill: purple-dark,
+)[#text(body)]
+#let semantic-ioc(body) = text(font: "Cascadia Mono", size: 9pt, fill: accent)[#text(body)]
+#let semantic-path(body) = text(font: "Cascadia Mono", size: 9pt)[#text(body)]
+#let semantic-command(body) = text(font: "Cascadia Mono", size: 9pt, fill: dark)[#text(body)]
+#let semantic-protocol-field(body) = text(font: "Cascadia Mono", size: 9pt, fill: purple-dark)[#text(body)]
+#let semantic-source(body) = text(size: 9pt, fill: accent)[#text(body)]
+#let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#text(body)]
+
+#let semantic-span(span) = {
+  let style = span.style
+  if style == "semantic-plain" { semantic-plain(span.text) }
+  else if style == "semantic-actor" { semantic-actor(span.text) }
+  else if style == "semantic-campaign" { semantic-campaign(span.text) }
+  else if style == "semantic-malware" { semantic-malware(span.text) }
+  else if style == "semantic-tool" { semantic-tool(span.text) }
+  else if style == "semantic-product" { semantic-product(span.text) }
+  else if style == "semantic-english-term" { semantic-english-term(span.text) }
+  else if style == "semantic-technical" { semantic-technical(span.text) }
+  else if style == "semantic-technical-literal" { semantic-technical-literal(span.text) }
+  else if style == "semantic-ioc" { semantic-ioc(span.text) }
+  else if style == "semantic-path" { semantic-path(span.text) }
+  else if style == "semantic-command" { semantic-command(span.text) }
+  else if style == "semantic-protocol-field" { semantic-protocol-field(span.text) }
+  else if style == "semantic-source" { semantic-source(span.text) }
+  else if style == "semantic-proof" { semantic-proof(span.text) }
+  else { panic("unsupported semantic style: " + style) }
+}
+
+#let semantic-text(spans) = {
+  for span in spans { semantic-span(span) }
+}
+
+#let semantic-or-plain(body, spans) = {
+  if spans == none { text(body) } else { semantic-text(spans) }
+}
+
 
 // Petit label de section
 #let tag(content) = box(
@@ -49,6 +99,7 @@
 // Chronologie
 #let timeline(events) = [
   #for event in events {
+    let semantic-spans = if event.len() > 3 { event.at(3) } else { none }
     let source-urls = if event.len() > 2 {
       let sources = event.at(2)
       if type(sources) == str {
@@ -80,7 +131,7 @@
         )[
           #event.at(0)
         ]
-        : #event.at(1)
+        : #semantic-or-plain(event.at(1), semantic-spans)
         #for url in source-urls {
           if url != none and url != "" {
             footnote[#better-link(url)[#url]]

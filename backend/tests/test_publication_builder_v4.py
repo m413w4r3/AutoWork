@@ -12,11 +12,18 @@ import pytest
 import cti_app.application.publication_builder as publication_builder
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
     canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
+    compute_editorial_enrichment_invocation_hash,
+    editorial_enrichment_evidence_pack_hash,
 )
 from cti_app.application.production_extraction import references_corpus_hash
-from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.production_synthesis import (
+    build_synthesis_evidence_pack,
+    canonical_extraction_hash,
+    synthesis_invocation_hash,
+)
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     _project_publication_iocs,
@@ -24,6 +31,7 @@ from cti_app.application.publication_builder import (
     _validate_publication_lineage,
     _validate_synthesis_evidence_refs,
     build_publication_document_v4,
+    build_publication_document_v5,
     compute_assembly_input_hash,
 )
 from cti_app.domain.classification import TLP
@@ -99,11 +107,13 @@ from cti_app.domain.publication import (
     PublicationTimelineEntryV1,
 )
 from cti_app.domain.publication_document import (
-    PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+    PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
     PublicationDiagramV1,
     PublicationDocumentV4,
     publication_document_v4_to_json,
 )
+from cti_app.domain.publication_render import compute_publication_render_input_hash
+from cti_app.domain.semantic_annotation import SEMANTIC_ANNOTATION_POLICY_VERSION
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 
 _EXTRA_SOURCE_ID = UUID(int=20)
@@ -651,8 +661,9 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         ).hexdigest(),
         "editorial_enrichment_hash": canonical_editorial_enrichment_hash(enrichment),
         "relevance_projection_hash": None,
-        "publication_document_schema_version": PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+        "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
+        "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
     }
 
     expected_hash = hashlib.sha256(
@@ -781,7 +792,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
 
     monkeypatch.setattr(
         publication_builder,
-        "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
+        "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
         "changed-schema",
     )
     assert (
@@ -825,6 +836,91 @@ def test_assembly_input_hash_api_excludes_runtime_and_renderer_inputs() -> None:
     assert all(parameter.kind is Parameter.KEYWORD_ONLY for parameter in parameters.values())
 
 
+def test_semantic_policy_invalidates_assembly_but_not_model_call_identities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    assembly_before = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    synthesis_call_before = synthesis_invocation_hash(
+        snapshot,
+        extraction,
+        build_synthesis_evidence_pack(snapshot, extraction),
+        "4" * 64,
+    )
+    enrichment_pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    enrichment_call_before = compute_editorial_enrichment_invocation_hash(
+        extraction=extraction,
+        synthesis=synthesis,
+        evidence_pack_hash=editorial_enrichment_evidence_pack_hash(enrichment_pack),
+        access_policy_hash="5" * 64,
+    )
+
+    monkeypatch.setattr(
+        publication_builder,
+        "SEMANTIC_ANNOTATION_POLICY_VERSION",
+        "semantic-annotation-policy-v2",
+    )
+    assembly_after = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    synthesis_call_after = synthesis_invocation_hash(
+        snapshot,
+        extraction,
+        build_synthesis_evidence_pack(snapshot, extraction),
+        "4" * 64,
+    )
+    enrichment_call_after = compute_editorial_enrichment_invocation_hash(
+        extraction=extraction,
+        synthesis=synthesis,
+        evidence_pack_hash=editorial_enrichment_evidence_pack_hash(enrichment_pack),
+        access_policy_hash="5" * 64,
+    )
+
+    assert assembly_after != assembly_before
+    assert synthesis_call_after == synthesis_call_before
+    assert enrichment_call_after == enrichment_call_before
+
+    render_identity = {
+        "publication_artifact_id": UUID(int=77),
+        "publication_content_sha256": "1" * 64,
+        "renderer": "typst",
+        "renderer_version": "publication-v5-typst-v1",
+        "template_version": "chp-article-v1",
+        "template_sha256": "2" * 64,
+        "compiler": "typst",
+        "compiler_version": "0.15.1",
+        "format": "pdf",
+        "font_bundle_version": "chp-fonts-v1",
+        "render_policy_version": "typst-publication-v1",
+    }
+    palette_before = compute_publication_render_input_hash(**render_identity)
+    palette_after = compute_publication_render_input_hash(
+        **{**render_identity, "template_sha256": "3" * 64}
+    )
+    assert palette_after != palette_before
+    assert (
+        compute_assembly_input_hash(
+            snapshot=snapshot,
+            references=references,
+            extraction=extraction,
+            synthesis=synthesis,
+            editorial_enrichment=enrichment,
+        )
+        == assembly_after
+    )
+
+
 def test_publication_v4_validators_accept_matching_canonical_inputs() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
 
@@ -835,6 +931,34 @@ def test_publication_v4_validators_accept_matching_canonical_inputs() -> None:
         synthesis=synthesis,
     )
     _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
+
+
+def test_publication_v5_applies_deterministic_extraction_roles_without_proposals() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    lead = SynthesisParagraphV1(
+        "Example actor used example.net.",
+        extraction_evidence_refs_v1(extraction),
+    )
+    synthesis = replace(synthesis, lead=(lead,))
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+
+    document = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    lead_spans = next(
+        paragraph.spans
+        for paragraph in document.semantic_text.paragraphs
+        if paragraph.anchor == "lead:0001"
+    )
+
+    assert not enrichment.annotations
+    assert "".join(span.text for span in lead_spans) == document.lead[0].text
+    assert any(span.text == "Example actor" and span.role.value == "actor" for span in lead_spans)
+    assert any(span.text == "example.net" and span.role.value == "technical" for span in lead_spans)
 
 
 @pytest.mark.parametrize("artifact", ("snapshot", "references", "extraction", "synthesis"))

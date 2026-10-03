@@ -328,7 +328,7 @@ class FakeRenderer:
             for file in template_bundle.files
             if file.relative_path == "RENDERER/publication.typ"
         )
-        render_data = b'{"schema_version":"typst-publication-model-v2"}'
+        render_data = b'{"schema_version":"typst-publication-model-v3-semantic-text"}'
         return TypstRenderSource(
             source_bytes=source_bytes,
             source_sha256=hashlib.sha256(source_bytes).hexdigest(),
