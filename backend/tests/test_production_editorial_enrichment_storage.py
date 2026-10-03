@@ -9,6 +9,7 @@ import pytest
 
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+    EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
     compute_editorial_enrichment_input_hash,
 )
 from cti_app.application.production_stages import EditorialEnrichmentService
@@ -63,9 +64,7 @@ async def test_enrichment_storage_is_idempotent_and_stales_only_publication() ->
     assert first.rendered_blob_id is None
     assert first.model_run_id == model_run_id
     assert first.metadata["generator_version"] == EDITORIAL_ENRICHMENT_GENERATOR_VERSION
-    assert first.metadata["validator_version"] == (
-        "editorial-enrichment-validator-v3-semantic-annotations"
-    )
+    assert first.metadata["validator_version"] == EDITORIAL_ENRICHMENT_VALIDATOR_VERSION
     assert first.metadata["evidence_pack_hash"] == evidence_pack_hash
     assert first.metadata["access_policy_hash"] == access_policy_hash
     assert first.metadata["model_policy_version"] == "editorial-enrichment-model-policy-v1"

@@ -6,8 +6,8 @@ import base64
 import binascii
 import hashlib
 import re
-from collections.abc import Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from html.parser import HTMLParser
 from typing import Protocol
 from urllib.parse import unquote_to_bytes
@@ -63,11 +63,24 @@ class ArchivedFigureAsset:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceFigureCatalogMetadata:
+    """Archived source context used only to describe a figure to the model."""
+
+    alt_text: str | None = None
+    caption_text: str | None = None
+    nearby_heading_text: str | None = None
+    anchor: str | None = None
+    width: int | None = None
+    height: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SourceFigureInventoryResult:
     figures: tuple[ResolvedSourceFigureV1, ...]
     truncated: bool = False
     warnings: tuple[str, ...] = ()
     policy_sha256: str | None = None
+    catalog_metadata: Mapping[UUID, SourceFigureCatalogMetadata] = field(default_factory=dict)
 
     @property
     def accepted(self) -> tuple[ResolvedSourceFigureV1, ...]:
@@ -76,6 +89,17 @@ class SourceFigureInventoryResult:
         )
 
     def content_hash(self) -> str:
+        def catalog_metadata_for(figure: ResolvedSourceFigureV1) -> dict[str, int | str | None]:
+            metadata = self.catalog_metadata.get(figure.figure_id, SourceFigureCatalogMetadata())
+            return {
+                "alt_text": metadata.alt_text,
+                "caption_text": metadata.caption_text,
+                "nearby_heading_text": metadata.nearby_heading_text,
+                "anchor": metadata.anchor,
+                "width": metadata.width,
+                "height": metadata.height,
+            }
+
         payload = {
             "truncated": self.truncated,
             "warnings": list(self.warnings),
@@ -98,6 +122,7 @@ class SourceFigureInventoryResult:
                     },
                     "decision": figure.decision.value,
                     "decision_reason": figure.decision_reason,
+                    "catalog_metadata": catalog_metadata_for(figure),
                 }
                 for figure in self.figures
             ],
@@ -186,6 +211,7 @@ class SourceFigureInventory:
         total_figure_bytes = 0
         truncated = False
         warnings: set[str] = set()
+        catalog_metadata: dict[UUID, SourceFigureCatalogMetadata] = {}
 
         def add(
             *,
@@ -199,6 +225,11 @@ class SourceFigureInventory:
             sha256: str | None = None,
             mime_type: str | None = None,
             byte_size: int | None = None,
+            media_record: SourceMediaRecord | None = None,
+            alt_text: str | None = None,
+            caption_text: str | None = None,
+            nearby_heading_text: str | None = None,
+            anchor: str | None = None,
         ) -> bool:
             nonlocal total_figure_bytes, truncated
             if sha256 is not None:
@@ -262,6 +293,18 @@ class SourceFigureInventory:
                 locator=selected_locator,
                 decision=decision,
                 decision_reason=reason,
+            )
+            catalog_metadata[figure.figure_id] = SourceFigureCatalogMetadata(
+                alt_text=(media_record.alt_text if media_record is not None else None) or alt_text,
+                caption_text=(media_record.caption_text if media_record is not None else None)
+                or caption_text,
+                nearby_heading_text=(
+                    media_record.nearby_heading_text if media_record is not None else None
+                )
+                or nearby_heading_text,
+                anchor=(media_record.anchor if media_record is not None else None) or anchor,
+                width=media_record.width if media_record is not None else None,
+                height=media_record.height if media_record is not None else None,
             )
             if sha256 is not None:
                 if duplicate:
@@ -339,6 +382,11 @@ class SourceFigureInventory:
                         provenance=provenance,
                         decision=SourceFigureDecision.REJECTED,
                         reason=observation.pre_exclusion_reason.value,
+                        media_record=media_record,
+                        alt_text=observation.alt_text,
+                        caption_text=observation.caption_text,
+                        nearby_heading_text=observation.nearby_heading_text,
+                        anchor=observation.anchor,
                     ):
                         break
                     continue
@@ -356,6 +404,11 @@ class SourceFigureInventory:
                         sha256=media_record.sha256,
                         mime_type=media_record.mime_type,
                         byte_size=media_record.byte_size,
+                        media_record=media_record,
+                        alt_text=observation.alt_text,
+                        caption_text=observation.caption_text,
+                        nearby_heading_text=observation.nearby_heading_text,
+                        anchor=observation.anchor,
                     ):
                         break
                     continue
@@ -382,6 +435,11 @@ class SourceFigureInventory:
                         sha256=digest,
                         mime_type=image_mime,
                         byte_size=len(content),
+                        media_record=media_record,
+                        alt_text=observation.alt_text,
+                        caption_text=observation.caption_text,
+                        nearby_heading_text=observation.nearby_heading_text,
+                        anchor=observation.anchor,
                     ):
                         break
                     continue
@@ -393,6 +451,11 @@ class SourceFigureInventory:
                         provenance=provenance,
                         decision=SourceFigureDecision.REJECTED,
                         reason="invalid_image_source_url",
+                        media_record=media_record,
+                        alt_text=observation.alt_text,
+                        caption_text=observation.caption_text,
+                        nearby_heading_text=observation.nearby_heading_text,
+                        anchor=observation.anchor,
                     ):
                         break
                     continue
@@ -423,6 +486,11 @@ class SourceFigureInventory:
                     sha256=matched_asset.sha256 if matched_asset is not None else None,
                     mime_type=matched_asset.mime_type if matched_asset is not None else None,
                     byte_size=matched_asset.byte_size if matched_asset is not None else None,
+                    media_record=media_record,
+                    alt_text=observation.alt_text,
+                    caption_text=observation.caption_text,
+                    nearby_heading_text=observation.nearby_heading_text,
+                    anchor=observation.anchor,
                 ):
                     break
             if truncated:
@@ -445,6 +513,7 @@ class SourceFigureInventory:
             truncated=truncated,
             warnings=tuple(sorted(warnings)),
             policy_sha256=policy_sha256,
+            catalog_metadata=catalog_metadata,
         )
 
 

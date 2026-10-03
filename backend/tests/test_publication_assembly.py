@@ -41,11 +41,17 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
+    ResolvedSourceFigureV1,
+    SourceFigureCandidateV1,
+    SourceFigureDecision,
+    SourceFigureInclusionStatus,
+    SourceFigureLocatorV1,
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
+    source_figure_id,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -648,6 +654,67 @@ def _enrichment_citing(
             ),
         ),
     )
+
+
+def test_publication_v5_review_projection_retains_figure_provenance_and_origin() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    locator = SourceFigureLocatorV1(
+        page=2,
+        section="Network overview",
+        figure_label="Execution architecture",
+        original_asset_url="https://cdn.example.com/execution.png",
+    )
+    figure_id = source_figure_id(
+        source_document_id=source.source_document_id,
+        sha256="f" * 64,
+        source=source.canonical_url,
+        locator=locator,
+    )
+    resolved = ResolvedSourceFigureV1(
+        figure_id=figure_id,
+        blob_id=UUID(int=21),
+        sha256="f" * 64,
+        mime_type="image/png",
+        byte_size=4096,
+        source_document_id=source.source_document_id,
+        source=source.canonical_url,
+        provenance="Archived figure from the primary source, page 2",
+        locator=locator,
+        decision=SourceFigureDecision.ACCEPTED,
+        decision_reason="accepted_for_review",
+    )
+    candidate = SourceFigureCandidateV1(
+        key=f"source_figure_{figure_id.hex}",
+        source_document_id=source.source_document_id,
+        source_url=source.canonical_url,
+        caption="Execution architecture",
+        provenance=resolved.provenance,
+        locator=locator,
+        inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        resolved_figure=resolved,
+    )
+    enrichment = replace(
+        _enrichment_citing(extraction, synthesis, extraction_evidence_refs_v1(extraction)[0]),
+        source_figures=(candidate,),
+    )
+
+    document = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    payload = serialize_publication_document(document)
+    published_figure = payload["figures"][0]
+
+    assert published_figure["source_url"] == source.canonical_url
+    assert published_figure["locator"]["original_asset_url"] == (
+        "https://cdn.example.com/execution.png"
+    )
+    assert published_figure["provenance"] == "Archived figure from the primary source, page 2"
 
 
 @pytest.mark.asyncio

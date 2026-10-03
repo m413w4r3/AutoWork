@@ -112,6 +112,7 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
         "Edition command table",
         "Edition diagram",
         "Edition figure",
+        "Figure 1 from the source publication",
         "Display ip",
         "Primary source",
     ):
@@ -126,4 +127,5 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
     assert f"{page_count} / {page_count}" in text
     assert "Brèves" not in text
     assert "N/A" not in text
+    assert "https://example.test/figure.png" not in text
     assert _embedded_visual_xobject_count(reader) >= len(source.media_refs)

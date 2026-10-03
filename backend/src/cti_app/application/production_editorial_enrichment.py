@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import (
@@ -50,6 +51,9 @@ from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
     EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+    EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
+    EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
+    EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION,
 )
 from cti_app.application.production_synthesis import (
     SynthesisAccessPolicyV1,
@@ -68,6 +72,7 @@ from cti_app.application.production_wire_archive import (
     verified_raw_output_text,
 )
 from cti_app.application.source_figure_inventory import (
+    SourceFigureCatalogMetadata,
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
 )
@@ -86,16 +91,24 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
+    EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
     DiagramSpecV1,
     EditorialEnrichmentV1,
+    EditorialFigureDecision,
+    EditorialFigureDecisionActor,
+    EditorialFigureDecisionTraceV1,
+    EditorialResourceNeedV1,
+    EditorialResourceProposalV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
+    ResolvedSourceFigureV1,
+    ResourceNeedKind,
     SourceFigureCandidateV1,
     SourceFigureDecision,
     SourceFigureInclusionStatus,
@@ -139,14 +152,17 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v2-semantic-annotations"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v3-figures-resource-needs"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 3
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v5-paragraph-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v3-semantic-annotations"
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v1"
-EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = "editorial-enrichment-routing-policy-v1"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v4-figure-selection"
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v2-figure-catalog"
+EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
+    "editorial-enrichment-routing-policy-v2-resource-search-off"
+)
+EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1-bounded"
 
 MAX_ENRICHMENT_TABLES = 8
 MAX_ENRICHMENT_DIAGRAMS = 6
@@ -156,6 +172,9 @@ MAX_DIAGRAM_NODES = 50
 MAX_DIAGRAM_EDGES = 100
 MAX_DIAGRAM_GROUPS = 8
 MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE = 128
+MAX_ENRICHMENT_FIGURE_PROPOSALS = 16
+MAX_ENRICHMENT_RESOURCE_NEEDS = 4
+MAX_ENRICHMENT_RESOURCE_PROPOSALS = 12
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _RENDERER_SYNTAX = re.compile(
@@ -335,6 +354,148 @@ class AnnotationProposalV1(_StrictEnrichmentProposalModel):
         return value
 
 
+class FigureProposalV1(_StrictEnrichmentProposalModel):
+    figure_handle: StrictStr
+    caption: StrictStr
+    evidence_handles: tuple[StrictStr, ...]
+    reason: StrictStr
+    placement: EnrichmentPlacementProposalV1
+
+    @field_validator("figure_handle")
+    @classmethod
+    def _handle(cls, value: str) -> str:
+        if re.fullmatch(r"F[0-9]{3,}", value) is None:
+            raise ValueError("Figure handle is invalid")
+        return value
+
+    @field_validator("caption", "reason")
+    @classmethod
+    def _nonempty(cls, value: str) -> str:
+        if not (1 <= len(value.strip()) <= 500):
+            raise ValueError("Figure caption and reason must be bounded text")
+        return value
+
+    @field_validator("evidence_handles")
+    @classmethod
+    def _handles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _nonempty_evidence_handles(value)
+
+
+class ResourceNeedProposalV1(_StrictEnrichmentProposalModel):
+    key: StrictStr
+    kind: ResourceNeedKind
+    reason: StrictStr
+    query_hint: StrictStr
+
+    @field_validator("key")
+    @classmethod
+    def _key(cls, value: str) -> str:
+        if re.fullmatch(r"N[0-9]{3,}", value) is None:
+            raise ValueError("Resource need key is invalid")
+        return value
+
+    @field_validator("reason")
+    @classmethod
+    def _reason(cls, value: str) -> str:
+        if not (1 <= len(value.strip()) <= 500):
+            raise ValueError("Resource need reason must be bounded text")
+        return value
+
+    @field_validator("query_hint")
+    @classmethod
+    def _query_hint(cls, value: str) -> str:
+        if not (1 <= len(value.strip()) <= 240):
+            raise ValueError("Resource need query hint must be bounded text")
+        return value
+
+
+class ResourceProposalV1(_StrictEnrichmentProposalModel):
+    need_key: StrictStr
+    url: StrictStr
+    justification: StrictStr
+
+    @field_validator("need_key")
+    @classmethod
+    def _need_key(cls, value: str) -> str:
+        if re.fullmatch(r"N[0-9]{3,}", value) is None:
+            raise ValueError("Resource proposal need key is invalid")
+        return value
+
+    @field_validator("url")
+    @classmethod
+    def _url(cls, value: str) -> str:
+        if not (1 <= len(value.strip()) <= 2048):
+            raise ValueError("Resource proposal URL must be bounded text")
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Resource proposal URL must be an HTTP(S) URL")
+        return value
+
+    @field_validator("justification")
+    @classmethod
+    def _justification(cls, value: str) -> str:
+        if not (1 <= len(value.strip()) <= 500):
+            raise ValueError("Resource proposal justification must be bounded text")
+        return value
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialFigureCatalogEntry:
+    handle: str
+    source_role: str
+    editorial_role: str
+    figure: ResolvedSourceFigureV1
+    metadata: SourceFigureCatalogMetadata
+
+    @property
+    def source_caption(self) -> str:
+        return (
+            self.metadata.caption_text
+            or self.metadata.alt_text
+            or self.figure.locator.figure_label
+            or "Archived source figure"
+        )
+
+    def prompt_record(self) -> dict[str, Any]:
+        locator = self.figure.locator.figure_label or self.figure.locator.section or "unspecified"
+        return {
+            "handle": self.handle,
+            "source_role": self.source_role,
+            "editorial_role": self.editorial_role,
+            "caption": _bounded_catalog_text(self.metadata.caption_text),
+            "alt": _bounded_catalog_text(self.metadata.alt_text),
+            "nearby_heading": _bounded_catalog_text(
+                self.metadata.nearby_heading_text or self.figure.locator.section
+            ),
+            "figure_label": _bounded_catalog_text(self.figure.locator.figure_label),
+            "page": self.figure.locator.page,
+            "anchor": _bounded_catalog_text(self.metadata.anchor),
+            "dimensions": {
+                "width": self.metadata.width,
+                "height": self.metadata.height,
+            },
+            "mime_type": self.figure.mime_type,
+            "provenance_summary": _bounded_catalog_text(
+                f"Archived source media; role={self.source_role}; locator={locator}"
+            ),
+            "original_asset_url": _bounded_catalog_text(self.figure.locator.original_asset_url),
+            "decision": self.figure.decision.value,
+            "decision_reason": self.figure.decision_reason,
+        }
+
+
+def _bounded_catalog_text(value: str | None, limit: int = 400) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(value.split())
+    return text[:limit] if text else None
+
+
 def _proposal_annotation_to_domain(
     annotation: AnnotationProposalV1,
 ) -> SemanticAnnotationProposalV1:
@@ -349,6 +510,8 @@ class EditorialEnrichmentProposalV1(_StrictEnrichmentProposalModel):
     tables: tuple[TableProposalV1, ...] = ()
     diagrams: tuple[DiagramProposalV1, ...] = ()
     annotations: tuple[AnnotationProposalV1, ...] = ()
+    figures: tuple[FigureProposalV1, ...] = ()
+    resource_needs: tuple[ResourceNeedProposalV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -364,6 +527,14 @@ class EditorialEnrichmentWireParseResult:
     rejections: tuple[EditorialEnrichmentWireRejection, ...] = ()
     error_code: str | None = None
     explicit_empty: bool = False
+    transformations: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialResourceWireParseResult:
+    proposals: tuple[ResourceProposalV1, ...]
+    rejections: tuple[EditorialEnrichmentWireRejection, ...] = ()
+    error_code: str | None = None
     transformations: tuple[str, ...] = ()
 
 
@@ -386,7 +557,7 @@ class _EditorialEnrichmentWireBlock:
 _ENRICHMENT_FENCE = re.compile(r"^\s*(?:```|~~~)")
 _ENRICHMENT_BLOCK_WRAPPER = re.compile(r"^@@\s*(.*?)\s*@@$")
 _ENRICHMENT_HEADER = re.compile(
-    r"^(TABLE|DIAGRAM|ANNOTATION|COLUMN|ROW|NODE|RELATION|EDGE|GROUP)"
+    r"^(TABLE|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|NODE|RELATION|EDGE|GROUP)"
     r"(?:(?:\s*:\s*|\s+)([A-Za-z0-9][A-Za-z0-9._-]*))?\s*:?$",
     re.IGNORECASE,
 )
@@ -429,6 +600,16 @@ _ENRICHMENT_FIELD_ALIASES = {
     "paragraph": "paragraph_anchor",
     "paragraph anchor": "paragraph_anchor",
     "paragraph_anchor": "paragraph_anchor",
+    "figure handle": "figure_handle",
+    "figure_handle": "figure_handle",
+    "need key": "need_key",
+    "need_key": "need_key",
+    "query hint": "query_hint",
+    "query_hint": "query_hint",
+    "reason": "reason",
+    "need": "need_key",
+    "url": "url",
+    "justification": "justification",
     "exact text": "text",
     "segment": "text",
     "text": "text",
@@ -599,9 +780,123 @@ def _parse_annotation_wire_block(
         return None
 
 
+def _parse_figure_wire_block(
+    block: _EditorialEnrichmentWireBlock,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    catalog_by_handle: Mapping[str, EditorialFigureCatalogEntry],
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> FigureProposalV1 | None:
+    def reject(reason: str) -> None:
+        rejections.append(
+            _enrichment_wire_rejection(block, block.block_id, reason, block.raw_lines)
+        )
+
+    if block.error_code is not None:
+        reject(block.error_code)
+        return None
+    handle = _wire_scalar(block, "figure_handle")
+    if not handle:
+        reject("editorial_enrichment_figure_handle_missing")
+        return None
+    catalog_entry = catalog_by_handle.get(handle.strip())
+    if catalog_entry is None:
+        reject("editorial_enrichment_unknown_figure_handle")
+        return None
+    if catalog_entry.figure.decision is SourceFigureDecision.REJECTED:
+        reject("editorial_enrichment_figure_excluded_by_rule")
+        return None
+    if catalog_entry.figure.decision is not SourceFigureDecision.ACCEPTED:
+        reject("editorial_enrichment_figure_not_archived")
+        return None
+    raw_handles = _wire_scalar(block, "evidence_handles")
+    evidence_handles = _wire_handles(raw_handles)
+    if evidence_handles is None:
+        reject("editorial_enrichment_figure_evidence_missing")
+        return None
+    try:
+        refs = _all_refs_for_handles(evidence_handles, evidence_pack)
+    except EditorialEnrichmentProposalControlError:
+        reject("editorial_enrichment_unknown_evidence")
+        return None
+    if not refs or any(
+        ref.source_document_id != catalog_entry.figure.source_document_id for ref in refs
+    ):
+        reject("editorial_enrichment_figure_evidence_source_mismatch")
+        return None
+    raw_placement = _wire_scalar(block, "placement")
+    placement = _wire_placement(block)
+    if raw_placement is None:
+        reject("editorial_enrichment_figure_placement_missing")
+        return None
+    if placement is None:
+        reject("editorial_enrichment_figure_placement_invalid")
+        return None
+    if placement.kind is EnrichmentPlacementKind.AFTER_SECTION and (
+        placement.section_index is None
+        or placement.section_index >= len(evidence_pack.current_synthesis.get("sections", ()))
+    ):
+        reject("editorial_enrichment_figure_placement_anchor_unknown")
+        return None
+    caption = _wire_caption(block)
+    reason = _wire_scalar(block, "reason")
+    if reason is None or not reason.strip():
+        reject("editorial_enrichment_figure_reason_missing")
+        return None
+    if caption is None:
+        caption = catalog_entry.source_caption
+    try:
+        return FigureProposalV1(
+            figure_handle=handle.strip(),
+            caption=caption.strip(),
+            evidence_handles=evidence_handles,
+            reason=reason.strip(),
+            placement=placement,
+        )
+    except (TypeError, ValueError, ValidationError):
+        reject("editorial_enrichment_figure_invalid")
+        return None
+
+
+def _parse_resource_need_wire_block(
+    block: _EditorialEnrichmentWireBlock,
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> ResourceNeedProposalV1 | None:
+    def reject(reason: str) -> None:
+        rejections.append(
+            _enrichment_wire_rejection(block, block.block_id, reason, block.raw_lines)
+        )
+
+    if block.error_code is not None:
+        reject(block.error_code)
+        return None
+    raw_kind = _wire_scalar(block, "kind")
+    kind = next(
+        (
+            item
+            for item in ResourceNeedKind
+            if raw_kind and item.value.casefold() == raw_kind.strip().casefold()
+        ),
+        None,
+    )
+    reason = _wire_scalar(block, "reason")
+    query_hint = _wire_scalar(block, "query_hint")
+    try:
+        return ResourceNeedProposalV1(
+            key=block.block_id,
+            kind=kind,
+            reason=(reason or "").strip(),
+            query_hint=(query_hint or "").strip(),
+        )
+    except (TypeError, ValueError, ValidationError):
+        reject("editorial_enrichment_resource_need_invalid")
+        return None
+
+
 def parse_editorial_enrichment_proposal_wire(
     raw_text: str,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
+    *,
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
 ) -> EditorialEnrichmentWireParseResult:
     """Recover independent text blocks, leaving canonical validation strict."""
     if not isinstance(raw_text, str):
@@ -657,6 +952,8 @@ def parse_editorial_enrichment_proposal_wire(
             "TABLE": "T",
             "DIAGRAM": "D",
             "ANNOTATION": "A",
+            "FIGURE": "P",
+            "NEEDS": "N",
             "COLUMN": "C",
             "ROW": "R",
             "NODE": "N",
@@ -710,7 +1007,7 @@ def parse_editorial_enrichment_proposal_wire(
                 )
                 reject(marker, "editorial_enrichment_empty_marker_conflict")
                 explicit_empty = False
-            if kind in {"TABLE", "DIAGRAM", "ANNOTATION"}:
+            if kind in {"TABLE", "DIAGRAM", "ANNOTATION", "FIGURE", "NEEDS"}:
                 finish_top()
                 current_top = new_block(kind, local_id, raw_line)
             else:
@@ -726,7 +1023,7 @@ def parse_editorial_enrichment_proposal_wire(
             continue
 
         end_match = re.fullmatch(
-            r"END(?:\s+(TABLE|DIAGRAM|ANNOTATION|COLUMN|ROW|NODE|RELATION|EDGE|GROUP|ITEM))?",
+            r"END(?:\s+(TABLE|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|NODE|RELATION|EDGE|GROUP|ITEM))?",
             line,
             re.I,
         )
@@ -750,7 +1047,8 @@ def parse_editorial_enrichment_proposal_wire(
             bare_match = re.match(
                 r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
                 r"TARGET\s+NODE\s+ID|GROUP\s+ID|NODE\s+ID|COLUMN\s+KEY|"
-                r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|CATEGORY|ROLE|ANCHOR|SEGMENT|TEXT|"
+                r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|FIGURE\s+HANDLE|NEED\s+KEY|QUERY\s+HINT|"
+                r"CATEGORY|ROLE|ANCHOR|SEGMENT|TEXT|"
                 r"KEY|KIND|TITLE|CAPTION|PLACEMENT|LABEL|CELL|HANDLES|DIRECTION|ID|"
                 r"FROM|TO|SOURCE|TARGET|NODES)\s+(.+)$",
                 line,
@@ -803,6 +1101,15 @@ def parse_editorial_enrichment_proposal_wire(
             "EDGE": {"source_node_id", "target_node_id", "label", "evidence_handles"},
             "GROUP": {"group_id", "id", "label", "node_ids"},
             "ANNOTATION": {"role", "paragraph_anchor", "text"},
+            "FIGURE": {
+                "figure_handle",
+                "caption",
+                "evidence_handles",
+                "reason",
+                "placement",
+                "section_index",
+            },
+            "NEEDS": {"kind", "reason", "query_hint"},
         }[target.kind]
         if canonical not in allowed:
             target.error_code = target.error_code or "editorial_enrichment_unknown_field"
@@ -832,7 +1139,12 @@ def parse_editorial_enrichment_proposal_wire(
     tables: list[TableProposalV1] = []
     diagrams: list[DiagramProposalV1] = []
     annotations: list[AnnotationProposalV1] = []
+    figures: list[FigureProposalV1] = []
+    resource_needs: list[ResourceNeedProposalV1] = []
     canonical_keys: set[str] = set()
+    catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
+    proposed_figure_handles: set[str] = set()
+    proposed_need_keys: set[str] = set()
     for top in top_blocks:
         if top.error_code is not None:
             reject(top, top.error_code)
@@ -852,6 +1164,28 @@ def parse_editorial_enrichment_proposal_wire(
             annotation = _parse_annotation_wire_block(top, evidence_pack, rejections)
             if annotation is not None:
                 annotations.append(annotation)
+        elif top.kind == "FIGURE":
+            figure = _parse_figure_wire_block(top, evidence_pack, catalog_by_handle, rejections)
+            if figure is None:
+                continue
+            if figure.figure_handle in proposed_figure_handles:
+                reject(top, "editorial_enrichment_duplicate_figure_handle")
+            elif len(figures) >= MAX_ENRICHMENT_FIGURE_PROPOSALS:
+                reject(top, "editorial_enrichment_figure_limit_exceeded")
+            else:
+                proposed_figure_handles.add(figure.figure_handle)
+                figures.append(figure)
+        elif top.kind == "NEEDS":
+            need = _parse_resource_need_wire_block(top, rejections)
+            if need is None:
+                continue
+            if need.key in proposed_need_keys:
+                reject(top, "editorial_enrichment_duplicate_resource_need")
+            elif len(resource_needs) >= MAX_ENRICHMENT_RESOURCE_NEEDS:
+                reject(top, "editorial_enrichment_resource_need_limit_exceeded")
+            else:
+                proposed_need_keys.add(need.key)
+                resource_needs.append(need)
         else:
             diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections)
             if diagram is None:
@@ -863,7 +1197,7 @@ def parse_editorial_enrichment_proposal_wire(
             else:
                 canonical_keys.add(diagram.key)
                 diagrams.append(diagram)
-    if not tables and not diagrams and not annotations:
+    if not tables and not diagrams and not annotations and not figures and not resource_needs:
         return EditorialEnrichmentWireParseResult(
             None,
             tuple(rejections),
@@ -872,10 +1206,145 @@ def parse_editorial_enrichment_proposal_wire(
         )
     return EditorialEnrichmentWireParseResult(
         proposal=EditorialEnrichmentProposalV1(
-            tables=tuple(tables), diagrams=tuple(diagrams), annotations=tuple(annotations)
+            tables=tuple(tables),
+            diagrams=tuple(diagrams),
+            annotations=tuple(annotations),
+            figures=tuple(figures),
+            resource_needs=tuple(resource_needs),
         ),
         rejections=tuple(rejections),
         transformations=tuple(transformations),
+    )
+
+
+def parse_editorial_resource_proposals_wire(
+    raw_text: str,
+    needs: tuple[EditorialResourceNeedV1, ...],
+) -> EditorialResourceWireParseResult:
+    """Parse bounded candidate URLs from a separate, web-search-enabled call."""
+    if not isinstance(raw_text, str):
+        return EditorialResourceWireParseResult((), error_code="resource_response_unintelligible")
+    sanitized = sanitize_bridge_output_text(raw_text).replace("\r\n", "\n").replace("\r", "\n")
+    transformations: list[str] = []
+    if sanitized != raw_text.replace("\r\n", "\n").replace("\r", "\n"):
+        transformations.append("bridge_ui_markers_removed")
+    need_keys = {item.key for item in needs}
+    rejections: list[EditorialEnrichmentWireRejection] = []
+    proposals: list[ResourceProposalV1] = []
+    block: _EditorialEnrichmentWireBlock | None = None
+    last_field: str | None = None
+    recognized = False
+    local_ids: set[str] = set()
+
+    def reject(item: _EditorialEnrichmentWireBlock, reason: str) -> None:
+        rejections.append(_enrichment_wire_rejection(item, item.block_id, reason, item.raw_lines))
+
+    def finish() -> None:
+        nonlocal block, last_field
+        current = block
+        block = None
+        last_field = None
+        if current is None:
+            return
+        if current.error_code is not None:
+            reject(current, current.error_code)
+            return
+        need_key = _wire_scalar(current, "need_key")
+        url = _wire_scalar(current, "url")
+        justification = _wire_scalar(current, "justification")
+        if need_key is None or need_key.strip() not in need_keys:
+            reject(current, "editorial_resource_proposal_unknown_need")
+            return
+        try:
+            proposal = ResourceProposalV1(
+                need_key=need_key.strip(),
+                url=(url or "").strip(),
+                justification=(justification or "").strip(),
+            )
+        except (TypeError, ValueError, ValidationError):
+            reject(current, "editorial_resource_proposal_invalid")
+            return
+        if any(
+            item.need_key == proposal.need_key and item.url == proposal.url for item in proposals
+        ):
+            reject(current, "editorial_resource_proposal_duplicate")
+            return
+        if len(proposals) >= MAX_ENRICHMENT_RESOURCE_PROPOSALS:
+            reject(current, "editorial_resource_proposal_limit_exceeded")
+            return
+        proposals.append(proposal)
+
+    for raw_line in sanitized.splitlines():
+        line = _enrichment_wire_line(raw_line)
+        if not line:
+            continue
+        if _ENRICHMENT_FENCE.match(raw_line):
+            if "markdown_fences_removed" not in transformations:
+                transformations.append("markdown_fences_removed")
+            continue
+        if line.casefold().rstrip(".! ") in {"no resource proposals", "no proposals", "empty"}:
+            finish()
+            recognized = True
+            continue
+        header = re.fullmatch(
+            r"RESOURCE(?:\s*:\s*|\s+)([A-Za-z0-9][A-Za-z0-9._-]*)\s*:?", line, re.I
+        )
+        if header is not None:
+            finish()
+            recognized = True
+            block_id = header.group(1)
+            error_code = None
+            if block_id in local_ids:
+                error_code = "editorial_resource_proposal_duplicate_block_id"
+            local_ids.add(block_id)
+            block = _EditorialEnrichmentWireBlock(
+                kind="RESOURCE",
+                block_id=block_id,
+                raw_lines=[raw_line],
+                error_code=error_code,
+            )
+            continue
+        if re.fullmatch(r"END(?:\s+RESOURCE)?", line, re.I):
+            recognized = True
+            finish()
+            continue
+        if block is None:
+            continue
+        match = _ENRICHMENT_FIELD.fullmatch(re.sub(r"^\*\*(.+?)\*\*\s*:", r"\1:", line))
+        if match is None:
+            if last_field is not None:
+                values = block.fields[last_field]
+                values[-1] = f"{values[-1]}\n{raw_line.strip()}"
+                block.raw_lines.append(raw_line)
+            else:
+                block.error_code = (
+                    block.error_code or "editorial_resource_proposal_unrecognized_line"
+                )
+                block.raw_lines.append(raw_line)
+            continue
+        field_name, field_value = match.groups()
+        canonical = re.sub(r"[\s_-]+", " ", field_name.strip().casefold())
+        canonical = {"need": "need_key", "need key": "need_key", "need_key": "need_key"}.get(
+            canonical, canonical
+        )
+        if canonical not in {"need_key", "url", "justification"}:
+            block.error_code = block.error_code or "editorial_resource_proposal_unknown_field"
+            block.raw_lines.append(raw_line)
+            last_field = None
+            continue
+        block.append_field(canonical, field_value)
+        block.raw_lines.append(raw_line)
+        last_field = canonical
+    finish()
+    if not recognized:
+        return EditorialResourceWireParseResult(
+            tuple(proposals),
+            tuple(rejections),
+            error_code="editorial_resource_proposal_unintelligible_response",
+            transformations=tuple(transformations),
+        )
+    return EditorialResourceWireParseResult(
+        tuple(proposals), tuple(rejections), transformations=tuple(transformations)
     )
 
 
@@ -1237,6 +1706,46 @@ def _source_figure_candidates(
     )
 
 
+def build_editorial_figure_catalog(
+    extraction: ProductionExtractionV1,
+    inventory: SourceFigureInventoryResult,
+) -> tuple[EditorialFigureCatalogEntry, ...]:
+    """Assign prompt-local handles to every full-source media decision."""
+    full_sources = {
+        source.source_document_id: source
+        for source in extraction.sources
+        if source.profile is ExtractionProfile.FULL
+    }
+    figures = [figure for figure in inventory.figures if figure.source_document_id in full_sources]
+    figures.sort(
+        key=lambda item: (
+            full_sources[item.source_document_id].canonical_url,
+            full_sources[item.source_document_id].role.value,
+            item.locator.page or 0,
+            item.locator.section or "",
+            item.locator.figure_label or "",
+            item.locator.original_asset_url or "",
+            item.figure_id.hex,
+        )
+    )
+    entries: list[EditorialFigureCatalogEntry] = []
+    for index, figure in enumerate(figures, start=1):
+        source = full_sources[figure.source_document_id]
+        editorial_role = source.editorial_role or source.role
+        entries.append(
+            EditorialFigureCatalogEntry(
+                handle=f"F{index:03d}",
+                source_role=source.role.value,
+                editorial_role=editorial_role.value,
+                figure=figure,
+                metadata=inventory.catalog_metadata.get(
+                    figure.figure_id, SourceFigureCatalogMetadata()
+                ),
+            )
+        )
+    return tuple(entries)
+
+
 def _source_figure_inventory_warnings(
     inventory: SourceFigureInventoryResult,
 ) -> tuple[str, ...]:
@@ -1560,6 +2069,95 @@ def editorial_enrichment_model_run_id(run: ProductionRun, invocation_hash: str) 
     return uuid5(NAMESPACE_URL, identity)
 
 
+def build_editorial_resource_proposal_model_request(
+    run: ProductionRun,
+    snapshot: ProductionInputSnapshot,
+    access_policy: SynthesisAccessPolicyV1,
+    needs: tuple[EditorialResourceNeedV1, ...],
+    *,
+    enrichment_input_hash: str,
+) -> ModelRequest:
+    """Build the separate, explicitly web-search-enabled proposal request."""
+    if not needs or len(needs) > MAX_ENRICHMENT_RESOURCE_NEEDS:
+        raise ValueError("A resource proposal request requires bounded typed needs")
+    if run.id != snapshot.production_run_id or run.subject_id != snapshot.subject_id:
+        raise ValueError("Editorial resource proposal request identities differ")
+    needs_payload = [
+        {
+            "key": need.key,
+            "kind": need.kind.value,
+            "reason": need.reason,
+            "query_hint": need.query_hint,
+        }
+        for need in needs
+    ]
+    needs_hash = hashlib.sha256(_canonical_json_bytes(needs_payload)).hexdigest()
+    access_hash = synthesis_access_policy_hash(access_policy)
+    request_identity = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "stage": "editorial_resource_proposal",
+                "run_id": str(run.id),
+                "pipeline_generation": run.pipeline_generation,
+                "enrichment_input_hash": enrichment_input_hash,
+                "needs_hash": needs_hash,
+                "access_policy_hash": access_hash,
+                "prompt_version": EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
+                "contract_version": EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
+            }
+        )
+    ).hexdigest()
+    evidence_pack_hash = hashlib.sha256(
+        f"editorial-resource-proposals:{enrichment_input_hash}:{needs_hash}".encode()
+    ).hexdigest()
+    prompt_payload = {
+        "instructions": (
+            "Propose candidate resource URLs for the listed missing needs only. "
+            "This is a subject-bounded search: use only the supplied subject scope and each "
+            "query hint. Return URLs with short justifications as RESOURCE blocks. Do not "
+            "summarize findings, assert facts, or create sources. Every URL is only a proposal "
+            "for later REFERENCES/collector review; do not claim it was collected or verified."
+        ),
+        "subject_scope": {
+            "title": snapshot.subject_title,
+            "actor_or_campaign": snapshot.actor_or_campaign,
+            "period_start": snapshot.period_start.isoformat(),
+            "period_end": snapshot.period_end.isoformat(),
+        },
+        "needs": needs_payload,
+        "output_contract": (
+            "RESOURCE R001\nNEED: N001\nURL: https://example.org/resource\n"
+            "JUSTIFICATION: why this URL may address the named need\nEND RESOURCE\n"
+            "Use NO RESOURCE PROPOSALS when no suitable candidate exists."
+        ),
+        "contract_version": EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
+    }
+    return ModelRequest(
+        text=json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        prompt_template_id="production-editorial-resource-proposals",
+        prompt_template_version=EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
+        evidence_pack_hash=evidence_pack_hash,
+        external_llm_allowed=(
+            access_policy.external_llm_allowed and not access_policy.do_not_submit
+        ),
+        routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
+        sensitivity=access_policy.effective_tlp.value,
+        web_search=True,
+        background=False,
+        conversation=None,
+        run_id=uuid5(NAMESPACE_URL, f"production-editorial-resource-proposal:{request_identity}"),
+        allow_failed_resubmit=True,
+        metadata={
+            "resource_proposal_request_hash": request_identity,
+            "resource_needs_hash": needs_hash,
+            "enrichment_input_hash": enrichment_input_hash,
+            "access_policy_hash": access_hash,
+            "resource_policy_version": EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
+        },
+        parameters={"contract_version": EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION},
+    )
+
+
 def editorial_enrichment_output_contract_example() -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
     return """Return independent plain-text blocks. Give every block a local id.
@@ -1636,7 +2234,28 @@ per column. Each diagram uses NODE, RELATION, and optional GROUP blocks. Every
 row, node, and relation must cite existing evidence handles from the input. A
 relation's handles must support that relation. Never invent evidence or handles.
 Keep titles/captions descriptive, and preserve placement anchors and section
-indexes from the provided guidance."""
+indexes from the provided guidance.
+
+FIGURE P001
+FIGURE_HANDLE: F001
+CAPTION: exact source caption or alt text, without new claims
+EVIDENCE: E001
+PLACEMENT: after_lead
+REASON: why this archived figure helps this subject
+END FIGURE
+
+NEEDS N001
+KIND: MEDIA
+REASON: what relevant media is missing
+QUERY_HINT: short query bounded to the current subject
+END NEEDS
+
+Select only accepted catalog handles. Never select an item excluded by rule or
+pending archive. Each FIGURE needs same-source evidence handles, a source-grounded
+caption, an existing placement, and a reason. NEEDS is optional and only for a
+specific missing media item or technical analysis; query hints must name the
+current subject. Zero figures is valid. Do not return resource URLs in this
+response."""
 
 
 def build_editorial_enrichment_model_request(
@@ -1647,6 +2266,8 @@ def build_editorial_enrichment_model_request(
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     access_policy: SynthesisAccessPolicyV1,
     source_figure_inventory_hash: str | None = None,
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
+    resource_search_enabled: bool = False,
 ) -> ModelRequest:
     if (
         run.id != snapshot.production_run_id
@@ -1674,6 +2295,7 @@ def build_editorial_enrichment_model_request(
         access_policy_hash=access_hash,
         source_figure_inventory_hash=source_figure_inventory_hash,
         projection_hash=evidence_pack.projection_hash,
+        resource_search_enabled=resource_search_enabled,
     )
     invocation_hash = compute_editorial_enrichment_invocation_hash(
         extraction=extraction,
@@ -1691,7 +2313,7 @@ def build_editorial_enrichment_model_request(
             "gagneraient à être structurées en "
             "tableaux ou diagrammes sémantiques, et propose des rôles typographiques uniquement "
             "pour les segments exacts et évidents d'un paragraphe ancré. N'ajoute aucun fait, "
-            "n'effectue aucune recherche, "
+            "n'effectue aucune recherche pendant cet appel, "
             "et utilise uniquement les preuves fournies. Chaque ligne, nœud et arête doit citer au "
             "moins un evidence handle exact. Une arête exprime une relation factuelle "
             "et doit avoir "
@@ -1700,7 +2322,12 @@ def build_editorial_enrichment_model_request(
             "compréhension, renvoie le marqueur explicite prévu. Ne génère ni JSON, tableau "
             "Markdown, HTML, Mermaid, D2, DOT, TikZ, Typst, SVG, image source, ni corps de règle. "
             "Les diagrammes décrivent seulement une spécification sémantique en blocs. Titres et "
-            "captions restent descriptifs."
+            "captions restent descriptifs. Le catalogue figure_catalog contient des médias "
+            "archivés : propose uniquement un handle accepté, avec une caption copiée du contexte "
+            "source, des evidence handles de la même source, un placement et une raison. N'inclus "
+            "pas un média rejeté ou en attente d'archivage. Zéro figure est valide. Si une figure "
+            "ou une analyse manque, tu peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; "
+            "indique une raison et un query_hint borné au sujet. N'inclus aucune URL dans NEEDS."
         ),
         "publication_language": evidence_pack.publication_language,
         "current_synthesis": dict(evidence_pack.current_synthesis),
@@ -1717,6 +2344,7 @@ def build_editorial_enrichment_model_request(
                 ],
             },
         },
+        "figure_catalog": [entry.prompt_record() for entry in figure_catalog],
         "editorial_guidance": {
             "table_kinds": [item.value for item in EnrichmentTableKind],
             "diagram_kinds": [item.value for item in EnrichmentDiagramKind],
@@ -1733,6 +2361,8 @@ def build_editorial_enrichment_model_request(
                 "diagram_nodes": MAX_DIAGRAM_NODES,
                 "diagram_edges": MAX_DIAGRAM_EDGES,
                 "diagram_groups": MAX_DIAGRAM_GROUPS,
+                "figures": MAX_ENRICHMENT_FIGURE_PROPOSALS,
+                "resource_needs": MAX_ENRICHMENT_RESOURCE_NEEDS,
             },
         },
         "output_contract": editorial_enrichment_output_contract_example(),
@@ -1833,6 +2463,9 @@ def validate_editorial_enrichment_proposal(
     synthesis: ProductionSynthesisV1,
     *,
     source_figures: tuple[SourceFigureCandidateV1, ...] = (),
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
+    resource_proposals: tuple[ResourceProposalV1, ...] = (),
+    resource_model_run_id: UUID | None = None,
     warnings: tuple[str, ...] = (),
 ) -> EditorialEnrichmentV1:
     """Resolve exact handles, ground technical literals, and build canonical V1."""
@@ -1850,7 +2483,13 @@ def validate_editorial_enrichment_proposal(
         raise EditorialEnrichmentProposalControlError(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
         )
-    if len(parsed.tables) > MAX_ENRICHMENT_TABLES or len(parsed.diagrams) > MAX_ENRICHMENT_DIAGRAMS:
+    if (
+        len(parsed.tables) > MAX_ENRICHMENT_TABLES
+        or len(parsed.diagrams) > MAX_ENRICHMENT_DIAGRAMS
+        or len(parsed.figures) > MAX_ENRICHMENT_FIGURE_PROPOSALS
+        or len(parsed.resource_needs) > MAX_ENRICHMENT_RESOURCE_NEEDS
+        or len(resource_proposals) > MAX_ENRICHMENT_RESOURCE_PROPOSALS
+    ):
         raise EditorialEnrichmentProposalControlError(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
         )
@@ -2023,6 +2662,142 @@ def validate_editorial_enrichment_proposal(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             ) from exc
 
+    catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
+    proposed_by_handle = {item.figure_handle: item for item in parsed.figures}
+    if len(proposed_by_handle) != len(parsed.figures) or not set(proposed_by_handle) <= set(
+        catalog_by_handle
+    ):
+        raise EditorialEnrichmentProposalControlError(
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+        )
+    figure_decisions: list[EditorialFigureDecisionTraceV1] = []
+    selected_source_figures = list(source_figures)
+    local_warnings = set(warnings)
+    for catalog_entry in figure_catalog:
+        proposed = proposed_by_handle.get(catalog_entry.handle)
+        figure = catalog_entry.figure
+        evidence_refs: tuple[ExtractionEvidenceRefV1, ...] = ()
+        if proposed is not None:
+            if figure.decision is not SourceFigureDecision.ACCEPTED:
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                )
+            evidence_refs = _all_refs_for_handles(proposed.evidence_handles, evidence_pack)
+            if not evidence_refs or any(
+                ref.source_document_id != figure.source_document_id for ref in evidence_refs
+            ):
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+                )
+            evidence_context = [
+                value for ref in evidence_refs for value in _string_values(entries[ref])
+            ]
+            source_context = [
+                catalog_entry.metadata.caption_text,
+                catalog_entry.metadata.alt_text,
+                catalog_entry.metadata.nearby_heading_text,
+                figure.locator.figure_label,
+                figure.locator.section,
+                *evidence_context,
+            ]
+            normalized_caption = " ".join(proposed.caption.casefold().split())
+            grounded_context = "\n".join(
+                " ".join(value.casefold().split()) for value in source_context if value
+            )
+            caption = proposed.caption
+            if not normalized_caption or normalized_caption not in grounded_context:
+                caption = catalog_entry.source_caption
+                local_warnings.add(
+                    f"editorial_enrichment_figure_caption_downgraded:{catalog_entry.handle}"
+                )
+            _validate_plain_editorial_text(caption)
+            try:
+                selected_source_figures.append(
+                    SourceFigureCandidateV1(
+                        key=f"source_figure_{figure.figure_id.hex}",
+                        source_document_id=figure.source_document_id,
+                        source_url=figure.source,
+                        caption=caption,
+                        provenance=figure.provenance,
+                        locator=figure.locator,
+                        inclusion_status=SourceFigureInclusionStatus.INCLUDED,
+                        placement=placement(proposed.placement),
+                        resolved_figure=figure,
+                    )
+                )
+            except ValueError as exc:
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID
+                ) from exc
+            trace_decision = EditorialFigureDecision.INCLUDED_BY_MODEL
+            trace_actor = EditorialFigureDecisionActor.MODEL_PROPOSAL
+            trace_reason_code = "model_selected"
+            trace_reason = proposed.reason
+        elif figure.decision is SourceFigureDecision.REJECTED:
+            trace_decision = EditorialFigureDecision.EXCLUDED_BY_RULE
+            trace_actor = EditorialFigureDecisionActor.DETERMINISTIC_RULE
+            trace_reason_code = figure.decision_reason
+            trace_reason = figure.decision_reason
+        elif figure.decision is SourceFigureDecision.PENDING:
+            trace_decision = EditorialFigureDecision.PENDING_ARCHIVE
+            trace_actor = EditorialFigureDecisionActor.DETERMINISTIC_RULE
+            trace_reason_code = figure.decision_reason
+            trace_reason = figure.decision_reason
+        else:
+            trace_decision = EditorialFigureDecision.NOT_SELECTED_BY_MODEL
+            trace_actor = EditorialFigureDecisionActor.MODEL_PROPOSAL
+            trace_reason_code = "not_proposed"
+            trace_reason = "No FIGURE block selected this accepted catalog item."
+        figure_decisions.append(
+            EditorialFigureDecisionTraceV1(
+                handle=catalog_entry.handle,
+                figure_id=figure.figure_id,
+                source_document_id=figure.source_document_id,
+                decision=trace_decision,
+                actor=trace_actor,
+                reason_code=trace_reason_code,
+                reason=trace_reason,
+                policy_version=EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
+                prompt_version=EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+                contract_version=EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+                parser_version=EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+                evidence_refs=evidence_refs,
+            )
+        )
+
+    needs = tuple(
+        EditorialResourceNeedV1(
+            key=item.key,
+            kind=item.kind,
+            reason=item.reason,
+            query_hint=item.query_hint,
+            policy_version=EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION,
+        )
+        for item in parsed.resource_needs
+    )
+    if resource_proposals:
+        if resource_model_run_id is None:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        persisted_resource_proposals = tuple(
+            EditorialResourceProposalV1(
+                need_key=item.need_key,
+                url=item.url,
+                justification=item.justification,
+                source_model_run_id=resource_model_run_id,
+            )
+            for item in resource_proposals
+        )
+    else:
+        persisted_resource_proposals = ()
+    if any(
+        item.need_key not in {need.key for need in needs} for item in persisted_resource_proposals
+    ):
+        raise EditorialEnrichmentProposalControlError(
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+        )
+
     # Root invariants (e.g. globally unique table/diagram keys) are a model
     # output defect, never an infrastructure error.
     try:
@@ -2036,9 +2811,12 @@ def validate_editorial_enrichment_proposal(
             enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
             tables=tuple(tables),
             diagrams=tuple(diagrams),
-            source_figures=source_figures,
-            warnings=warnings,
+            source_figures=tuple(selected_source_figures),
+            warnings=tuple(local_warnings),
             annotations=tuple(annotations),
+            figure_decisions=tuple(figure_decisions),
+            resource_needs=needs,
+            resource_proposals=persisted_resource_proposals,
         )
         validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
     except EditorialEnrichmentValidationError as exc:
@@ -2082,6 +2860,7 @@ class ProductionEditorialEnrichmentService:
         media_asset_store: MediaAssetStore | None = None,
         diagram_compiler: DiagramCompiler | None = None,
         source_media_archiver: SourceMediaArchiveService | None = None,
+        resource_search_enabled: bool = False,
     ) -> None:
         self._uow_factory = uow_factory
         self._artifact_store = artifact_store
@@ -2094,6 +2873,7 @@ class ProductionEditorialEnrichmentService:
         )
         self._diagram_compiler = diagram_compiler
         self._source_media_archiver = source_media_archiver
+        self._resource_search_enabled = resource_search_enabled
 
     async def execute(
         self,
@@ -2133,6 +2913,7 @@ class ProductionEditorialEnrichmentService:
                     media_archiver=self._source_media_archiver,
                 )
             await self._ingest_source_figures(source_figure_inventory)
+            figure_catalog = build_editorial_figure_catalog(extraction, source_figure_inventory)
             evidence_pack = build_editorial_enrichment_evidence_pack(
                 snapshot, extraction, synthesis, projection
             )
@@ -2145,6 +2926,7 @@ class ProductionEditorialEnrichmentService:
                 access_policy_hash=access_policy_hash,
                 projection_hash=projection.projection_hash if projection is not None else None,
                 source_figure_inventory_hash=source_figure_inventory.functional_hash(),
+                resource_search_enabled=self._resource_search_enabled,
             )
         except _EditorialEnrichmentInputControl as control:
             return ProductionEditorialEnrichmentExecution(
@@ -2188,6 +2970,8 @@ class ProductionEditorialEnrichmentService:
             evidence_pack,
             access_policy,
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
+            figure_catalog=figure_catalog,
+            resource_search_enabled=self._resource_search_enabled,
         )
         model_run_id = request.run_id
         if model_run_id is None:
@@ -2276,8 +3060,12 @@ class ProductionEditorialEnrichmentService:
                 details={"wire_error_code": (raw_error or {}).get("error_code")},
                 model_calls=model_calls,
             )
-        parsed = parse_editorial_enrichment_proposal_wire(raw_text, evidence_pack)
-        parse_identity = await self._record_wire_parse(model_run, evidence_pack, parsed)
+        parsed = parse_editorial_enrichment_proposal_wire(
+            raw_text, evidence_pack, figure_catalog=figure_catalog
+        )
+        parse_identity = await self._record_wire_parse(
+            model_run, evidence_pack, parsed, figure_catalog=figure_catalog
+        )
         wire_details: dict[str, Any] = {
             "parse_identity": parse_identity,
             "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
@@ -2302,13 +3090,56 @@ class ProductionEditorialEnrichmentService:
                 details=wire_details,
                 model_calls=model_calls,
             )
+        resource_proposals: tuple[ResourceProposalV1, ...] = ()
+        resource_model_run_id: UUID | None = None
+        if parsed.proposal.resource_needs:
+            wire_details["resource_needs"] = [
+                item.model_dump(mode="json") for item in parsed.proposal.resource_needs
+            ]
+            if not self._resource_search_enabled:
+                wire_details["resource_proposal_search"] = {"status": "disabled_by_configuration"}
+            elif not access_policy.external_llm_allowed or access_policy.do_not_submit:
+                wire_details["resource_proposal_search"] = {"status": "blocked_by_access_policy"}
+            else:
+                (
+                    resource_model_run_id,
+                    resource_proposals,
+                    resource_calls,
+                    resource_details,
+                ) = await self._search_resource_proposals(
+                    run,
+                    snapshot,
+                    access_policy,
+                    tuple(
+                        EditorialResourceNeedV1(
+                            key=item.key,
+                            kind=item.kind,
+                            reason=item.reason,
+                            query_hint=item.query_hint,
+                        )
+                        for item in parsed.proposal.resource_needs
+                    ),
+                    enrichment_input_hash=input_hash,
+                )
+                model_calls += resource_calls
+                wire_details["resource_proposal_search"] = resource_details
+                wire_details["resource_proposals"] = [
+                    {
+                        "need_key": item.need_key,
+                        "url": item.url,
+                        "justification": item.justification,
+                    }
+                    for item in resource_proposals
+                ]
         try:
             enrichment = validate_editorial_enrichment_proposal(
                 parsed.proposal,
                 evidence_pack,
                 extraction,
                 synthesis,
-                source_figures=_source_figure_candidates(source_figure_inventory),
+                figure_catalog=figure_catalog,
+                resource_proposals=resource_proposals,
+                resource_model_run_id=resource_model_run_id,
                 warnings=_source_figure_inventory_warnings(source_figure_inventory),
             )
         except EditorialEnrichmentProposalControlError as exc:
@@ -2328,6 +3159,33 @@ class ProductionEditorialEnrichmentService:
                     *(
                         f"editorial_enrichment_block_rejected:{item.block_id}:{item.reason_code}"
                         for item in parsed.rejections
+                    ),
+                ),
+            )
+        resource_rejections = (
+            wire_details.get("resource_proposal_search", {}).get("rejections", [])
+            if isinstance(wire_details.get("resource_proposal_search"), Mapping)
+            else []
+        )
+        resource_error = (
+            wire_details.get("resource_proposal_search", {}).get("wire_error_code")
+            if isinstance(wire_details.get("resource_proposal_search"), Mapping)
+            else None
+        )
+        if resource_rejections or resource_error:
+            enrichment = replace(
+                enrichment,
+                warnings=(
+                    *enrichment.warnings,
+                    *(
+                        f"editorial_resource_proposal_rejected:{item.get('block_id')}:{item.get('reason_code')}"
+                        for item in resource_rejections
+                        if isinstance(item, Mapping)
+                    ),
+                    *(
+                        (f"editorial_resource_proposal_error:{resource_error}",)
+                        if isinstance(resource_error, str)
+                        else ()
                     ),
                 ),
             )
@@ -2368,7 +3226,7 @@ class ProductionEditorialEnrichmentService:
             diagram_count=len(enrichment.diagrams),
             source_figure_count=len(enrichment.source_figures),
             warnings=enrichment.warnings,
-            details=wire_details if parsed.rejections else None,
+            details=wire_details if parsed.rejections or parsed.proposal.resource_needs else None,
         )
 
     async def _verified_existing_execution(
@@ -2401,6 +3259,144 @@ class ProductionEditorialEnrichmentService:
             None,
         )
 
+    async def _search_resource_proposals(
+        self,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        access_policy: SynthesisAccessPolicyV1,
+        needs: tuple[EditorialResourceNeedV1, ...],
+        *,
+        enrichment_input_hash: str,
+    ) -> tuple[UUID | None, tuple[ResourceProposalV1, ...], int, dict[str, Any]]:
+        request = build_editorial_resource_proposal_model_request(
+            run,
+            snapshot,
+            access_policy,
+            needs,
+            enrichment_input_hash=enrichment_input_hash,
+        )
+        model_calls = 0
+        try:
+            execution, archive_error = await self._verified_existing_execution(request)
+            if archive_error is not None:
+                return None, (), 0, {"status": "raw_output_unverified", **archive_error}
+            if execution is None:
+                execution = await self._model_gateway.draft(request)
+                model_calls = 1
+        except ModelSubmissionReconciliationRequiredError as exc:
+            return (
+                exc.model_run_id or request.run_id,
+                (),
+                0,
+                {"status": "submission_requires_reconciliation", **exc.details},
+            )
+        except ModelGatewayError as exc:
+            if exc.retryable:
+                raise
+            return (
+                request.run_id,
+                (),
+                model_calls,
+                {"status": "failed", "gateway_error_code": exc.code},
+            )
+
+        model_run = execution.run
+        if model_run_awaits_reconciliation(model_run.error_code):
+            return (
+                model_run.id,
+                (),
+                model_calls,
+                {
+                    "status": "submission_requires_reconciliation",
+                    "model_run_id": str(model_run.id),
+                    "model_error_code": model_run.error_code,
+                },
+            )
+        if model_run.status is not ModelRunStatus.SUCCEEDED:
+            return (
+                model_run.id,
+                (),
+                model_calls,
+                {"status": "failed", "model_run_status": model_run.status.value},
+            )
+        raw_text, raw_error = await self._verified_raw_text(
+            model_run,
+            expected_text=execution.output_text if model_calls else None,
+        )
+        if raw_error is not None or raw_text is None:
+            return (
+                model_run.id,
+                (),
+                model_calls,
+                {"status": "raw_output_unverified", **(raw_error or {})},
+            )
+        parsed = parse_editorial_resource_proposals_wire(raw_text, needs)
+        assert model_run.raw_output_sha256 is not None
+        parse_identity = hashlib.sha256(
+            _canonical_json_bytes(
+                {
+                    "raw_output_sha256": model_run.raw_output_sha256,
+                    "parser_version": EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION,
+                    "contract_version": EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
+                    "prompt_version": EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
+                    "need_mapping": [item.key for item in needs],
+                }
+            )
+        ).hexdigest()
+        validation_errors = [
+            {
+                "path": ["blocks", item.block_id],
+                "code": item.reason_code,
+                "value_sha256": item.raw_sha256,
+            }
+            for item in parsed.rejections
+        ]
+        if parsed.error_code is not None:
+            validation_errors.append(
+                {
+                    "path": ["proposal"],
+                    "code": parsed.error_code,
+                    "value_sha256": model_run.raw_output_sha256,
+                }
+            )
+        normalized = json.dumps(
+            [item.model_dump(mode="json") for item in parsed.proposals],
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        await record_wire_parse_diagnostics(
+            self._model_gateway,
+            model_run,
+            parser_stage="editorial_resource_proposals",
+            parse_identity=parse_identity,
+            validation_errors=validation_errors,
+            transformations=(
+                *parsed.transformations,
+                f"editorial_resource_parser:{EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION}",
+                f"editorial_resource_contract:{EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION}",
+                f"editorial_resource_prompt:{EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION}",
+                "editorial_resource_blocks_to_candidate_proposals",
+            ),
+            normalized_output=normalized,
+        )
+        return (
+            model_run.id,
+            parsed.proposals,
+            model_calls,
+            {
+                "status": "proposed" if parsed.proposals else "no_candidates",
+                "model_run_id": str(model_run.id),
+                "parse_identity": parse_identity,
+                "parser_version": EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION,
+                "rejections": [
+                    {"block_id": item.block_id, "reason_code": item.reason_code}
+                    for item in parsed.rejections
+                ],
+                "wire_error_code": parsed.error_code,
+            },
+        )
+
     async def _verified_raw_text(
         self, run: ModelRun, *, expected_text: str | None = None
     ) -> tuple[str | None, dict[str, Any] | None]:
@@ -2418,10 +3414,14 @@ class ProductionEditorialEnrichmentService:
         run: ModelRun,
         evidence_pack: EditorialEnrichmentEvidencePackV1,
         parsed: EditorialEnrichmentWireParseResult,
+        *,
+        figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
     ) -> str:
         """Persist parse identity and the normalized strict proposal beside raw bytes."""
         assert run.raw_output_sha256 is not None
-        identity = editorial_enrichment_parse_identity(run.raw_output_sha256, evidence_pack)
+        identity = editorial_enrichment_parse_identity(
+            run.raw_output_sha256, evidence_pack, figure_catalog=figure_catalog
+        )
         validation_errors: list[dict[str, Any]] = [
             {
                 "path": ["blocks", item.block_id],
@@ -2810,6 +3810,7 @@ def compute_editorial_enrichment_input_hash(
     prompt_version: str | None = None,
     contract_version: str | None = None,
     parser_version: str | None = None,
+    resource_search_enabled: bool = False,
 ) -> str:
     """Hash canonical enrichment inputs, including the local wire parser."""
     payload = _editorial_enrichment_identity_payload(
@@ -2823,6 +3824,9 @@ def compute_editorial_enrichment_input_hash(
         contract_version=contract_version,
     )
     payload["parser_version"] = parser_version or EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION
+    if type(resource_search_enabled) is not bool:
+        raise ValueError("Resource search enablement must be a boolean")
+    payload["resource_search_enabled"] = resource_search_enabled
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
@@ -2833,6 +3837,7 @@ def editorial_enrichment_parse_identity(
     prompt_version: str | None = None,
     contract_version: str | None = None,
     parser_version: str | None = None,
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...] = (),
 ) -> str:
     """Bind normalized output to verified response bytes and request handles."""
     if _SHA256_RE.fullmatch(raw_output_sha256) is None:
@@ -2845,6 +3850,15 @@ def editorial_enrichment_parse_identity(
         "request_handle_mapping": [
             {"handle": handle, "evidence_ref": repr(ref)}
             for handle, ref in sorted(evidence_pack._handle_to_ref.items())
+        ],
+        "figure_handle_mapping": [
+            {
+                "handle": entry.handle,
+                "figure_id": str(entry.figure.figure_id),
+                "sha256": entry.figure.sha256,
+                "decision": entry.figure.decision.value,
+            }
+            for entry in figure_catalog
         ],
     }
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
@@ -2952,4 +3966,39 @@ def validate_editorial_enrichment(
             raise EditorialEnrichmentValidationError(
                 "editorial_enrichment_source_figure_invalid",
                 "Source figure URL differs from the canonical extraction source URL",
+            )
+    extraction_refs = set(extraction_evidence_refs_v1(extraction))
+    figures_by_id = {
+        figure.resolved_figure.figure_id: figure
+        for figure in enrichment.source_figures
+        if figure.resolved_figure is not None
+    }
+    for decision in enrichment.figure_decisions:
+        if decision.source_document_id not in sources_by_id:
+            raise EditorialEnrichmentValidationError(
+                "editorial_enrichment_source_figure_invalid",
+                "Figure decision references a document absent from the extraction",
+            )
+        if any(
+            ref not in extraction_refs or ref.source_document_id != decision.source_document_id
+            for ref in decision.evidence_refs
+        ):
+            raise EditorialEnrichmentValidationError(
+                "editorial_enrichment_evidence_missing",
+                "Figure decision evidence must belong to its source and extraction",
+            )
+        selected = figures_by_id.get(decision.figure_id)
+        if decision.decision is EditorialFigureDecision.INCLUDED_BY_MODEL:
+            if (
+                selected is None
+                or selected.inclusion_status is not SourceFigureInclusionStatus.INCLUDED
+            ):
+                raise EditorialEnrichmentValidationError(
+                    "editorial_enrichment_source_figure_invalid",
+                    "A model-selected figure must be included in the enrichment",
+                )
+        elif selected is not None:
+            raise EditorialEnrichmentValidationError(
+                "editorial_enrichment_source_figure_invalid",
+                "A figure with a non-included decision cannot be assembled",
             )

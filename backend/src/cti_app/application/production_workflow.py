@@ -545,6 +545,7 @@ class ProductionWorkflowOrchestrator:
                     if collection_service is not None
                     else None
                 ),
+                resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
             )
             if self._model_gateway is not None and artifact_store is not None
             else None

@@ -39,6 +39,7 @@ from cti_app.application.production_editorial_enrichment import (
     TableRowProposalV1,
     build_editorial_enrichment_evidence_pack,
     build_editorial_enrichment_model_request,
+    build_editorial_figure_catalog,
     compute_editorial_enrichment_input_hash,
     compute_editorial_enrichment_invocation_hash,
     editorial_enrichment_evidence_pack_hash,
@@ -50,6 +51,10 @@ from cti_app.application.production_editorial_enrichment import (
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
     canonical_extraction_hash,
+)
+from cti_app.application.source_figure_inventory import (
+    SourceFigureCatalogMetadata,
+    SourceFigureInventoryResult,
 )
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceRole
@@ -67,8 +72,12 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementKind,
     EnrichmentTableKind,
+    ResolvedSourceFigureV1,
+    SourceFigureDecision,
+    SourceFigureLocatorV1,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
+    source_figure_id,
 )
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -227,6 +236,57 @@ def _synthesis(extraction: ProductionExtractionV1) -> ProductionSynthesisV1:
         timeline=(),
         uncertainties=(),
         warnings=(),
+    )
+
+
+def _figure_inventory(
+    extraction: ProductionExtractionV1,
+    *,
+    decision: SourceFigureDecision = SourceFigureDecision.ACCEPTED,
+) -> SourceFigureInventoryResult:
+    source = extraction.sources[0]
+    locator = SourceFigureLocatorV1(
+        page=2,
+        section="Network overview",
+        figure_label="ExampleRAT execution architecture",
+        original_asset_url="https://cdn.example.test/example-rat.png",
+    )
+    digest = "f" * 64
+    figure = ResolvedSourceFigureV1(
+        figure_id=source_figure_id(
+            source_document_id=source.source_document_id,
+            sha256=digest,
+            source=source.canonical_url,
+            locator=locator,
+        ),
+        blob_id=UUID(int=601) if decision is SourceFigureDecision.ACCEPTED else None,
+        sha256=digest,
+        mime_type="image/png",
+        byte_size=4096,
+        source_document_id=source.source_document_id,
+        source=source.canonical_url,
+        provenance=f"archived source document {source.source_document_id}; figure context",
+        locator=locator,
+        decision=decision,
+        decision_reason=(
+            "accepted_for_review"
+            if decision is SourceFigureDecision.ACCEPTED
+            else "boilerplate_pattern"
+        ),
+    )
+    return SourceFigureInventoryResult(
+        figures=(figure,),
+        policy_sha256="d" * 64,
+        catalog_metadata={
+            figure.figure_id: SourceFigureCatalogMetadata(
+                alt_text="ExampleRAT flow",
+                caption_text="ExampleRAT execution architecture",
+                nearby_heading_text="Network overview",
+                anchor="figure:2:network-overview",
+                width=640,
+                height=400,
+            )
+        },
     )
 
 
@@ -517,8 +577,125 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "COLUMN C001" in contract and "ROW R001" in contract
     assert "NODE N001" in contract and "RELATION L001" in contract
     assert "GROUP G001" in contract and "NO USEFUL ENRICHMENT" in contract
+    assert "FIGURE P001" in contract and "NEEDS N001" in contract
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
+
+
+def _figure_wire(
+    *,
+    handle: str = "F001",
+    caption: str = "ExampleRAT execution architecture",
+    placement: str | None = "after_section",
+    section_index: int = 0,
+    extra: str = "",
+) -> str:
+    lines = [
+        "FIGURE P001",
+        f"FIGURE_HANDLE: {handle}",
+        f"CAPTION: {caption}",
+        "EVIDENCE: E001",
+    ]
+    if placement is not None:
+        lines.append(f"PLACEMENT: {placement}")
+    if placement == "after_section":
+        lines.append(f"SECTION_INDEX: {section_index}")
+    lines.extend(
+        ["REASON: The source figure clarifies the execution context.", extra, "END FIGURE"]
+    )
+    return "\n".join(line for line in lines if line)
+
+
+def test_figure_proposal_selects_local_asset_and_downgrades_ungrounded_caption() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    inventory = _figure_inventory(extraction)
+    catalog = build_editorial_figure_catalog(extraction, inventory)
+    parsed = parse_editorial_enrichment_proposal_wire(
+        _figure_wire(caption="Brand-new unsupported claim"), pack, figure_catalog=catalog
+    )
+
+    assert parsed.proposal is not None
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal, pack, extraction, synthesis, figure_catalog=catalog
+    )
+
+    selected = enrichment.source_figures[0]
+    assert selected.inclusion_status.value == "included"
+    assert selected.caption == "ExampleRAT execution architecture"
+    assert selected.resolved_figure is not None
+    assert selected.resolved_figure.sha256 == "f" * 64
+    assert selected.resolved_figure.blob_id == UUID(int=601)
+    assert selected.provenance == inventory.figures[0].provenance
+    assert "editorial_enrichment_figure_caption_downgraded:F001" in enrichment.warnings
+    trace = enrichment.figure_decisions[0]
+    assert trace.decision.value == "included_by_model"
+    assert trace.actor.value == "model_proposal"
+    assert trace.reason == "The source figure clarifies the execution context."
+    assert trace.evidence_refs == (pack.resolve_handle("E001"),)
+
+
+@pytest.mark.parametrize(
+    ("wire", "decision", "reason"),
+    [
+        (
+            _figure_wire(handle="F999"),
+            SourceFigureDecision.ACCEPTED,
+            "editorial_enrichment_unknown_figure_handle",
+        ),
+        (
+            _figure_wire(),
+            SourceFigureDecision.REJECTED,
+            "editorial_enrichment_figure_excluded_by_rule",
+        ),
+        (
+            _figure_wire(placement=None),
+            SourceFigureDecision.ACCEPTED,
+            "editorial_enrichment_figure_placement_missing",
+        ),
+        (
+            _figure_wire(section_index=9),
+            SourceFigureDecision.ACCEPTED,
+            "editorial_enrichment_figure_placement_anchor_unknown",
+        ),
+    ],
+)
+def test_figure_wire_rejects_unknown_excluded_or_unplaced_candidates(
+    wire: str, decision: SourceFigureDecision, reason: str
+) -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(
+        extraction, _figure_inventory(extraction, decision=decision)
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
+
+    assert parsed.proposal is None
+    assert reason in {item.reason_code for item in parsed.rejections}
+
+
+def test_empty_figure_response_is_valid_and_model_cannot_supply_hash_or_image() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+
+    empty = parse_editorial_enrichment_proposal_wire(
+        "NO USEFUL ENRICHMENT", pack, figure_catalog=catalog
+    )
+    altered = parse_editorial_enrichment_proposal_wire(
+        _figure_wire(extra="SHA256: " + "0" * 64), pack, figure_catalog=catalog
+    )
+
+    assert empty.proposal is not None and empty.proposal.figures == ()
+    assert altered.proposal is None
+    assert "editorial_enrichment_unknown_field" in {item.reason_code for item in altered.rejections}
 
 
 def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> None:
@@ -547,7 +724,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 2
+    assert enrichment.schema_version == 3
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -723,8 +900,15 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
 
     access_policy = asyncio.run(create_policy())
     pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    figure_catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
     request = build_editorial_enrichment_model_request(
-        run, snapshot, extraction, synthesis, pack, access_policy
+        run,
+        snapshot,
+        extraction,
+        synthesis,
+        pack,
+        access_policy,
+        figure_catalog=figure_catalog,
     )
 
     assert request.web_search is False
@@ -736,10 +920,14 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
         run, request.metadata["editorial_enrichment_invocation_hash"]
     )
     assert str(source.id) not in request.text
+    assert str(extraction.sources[0].source_document_id) not in request.text
+    assert "F001" in request.text
+    assert "ExampleRAT execution architecture" in request.text
+    assert "640" in request.text and "400" in request.text
     assert "blob_id" not in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v2-semantic-annotations"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v3-figures-resource-needs"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v2"
+        "editorial-enrichment-block-contract-v3-figures-needs"
     )
 
 
@@ -789,6 +977,24 @@ def test_parser_version_changes_artifact_identity_but_not_invocation_identity() 
 
     assert invocation_v1 == invocation_v2
     assert artifact_v1 != artifact_v2
+
+
+def test_resource_search_setting_changes_artifact_identity_without_changing_primary_call() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    common = {
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "evidence_pack_hash": "1" * 64,
+        "access_policy_hash": "2" * 64,
+    }
+
+    primary_call = compute_editorial_enrichment_invocation_hash(**common)
+    off = compute_editorial_enrichment_input_hash(**common, resource_search_enabled=False)
+    on = compute_editorial_enrichment_input_hash(**common, resource_search_enabled=True)
+
+    assert off != on
+    assert primary_call == compute_editorial_enrichment_invocation_hash(**common)
 
 
 @pytest.mark.parametrize(
@@ -1008,6 +1214,18 @@ def _succeeded(request: ModelRequest, proposal: BaseModel | None) -> ModelExecut
     return ModelExecution(run=run, output_text=output_text, structured_output=None)
 
 
+def _succeeded_text(request: ModelRequest, output_text: str) -> ModelExecution:
+    run = _model_run(request)
+    run.succeed(
+        actual_model_version="gpt-5",
+        duration_ms=3,
+        usage=ModelUsage(total_tokens=7),
+        output_references=("model-output://1",),
+        response_id=None,
+    )
+    return ModelExecution(run=run, output_text=output_text, structured_output=None)
+
+
 def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
     payload = proposal.model_dump(mode="json")
     lines: list[str] = []
@@ -1173,6 +1391,40 @@ async def _execute(world: SimpleNamespace) -> ProductionEditorialEnrichmentExecu
 
 
 @pytest.mark.asyncio
+async def test_service_includes_only_the_model_selected_catalog_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, _figure_wire())))
+    inventory = _figure_inventory(world.extraction)
+
+    async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
+        return inventory
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "load_archived_source_figure_inventory",
+        load_inventory,
+    )
+
+    async def no_ingest(_inventory: SourceFigureInventoryResult) -> None:
+        return None
+
+    monkeypatch.setattr(world.service, "_ingest_source_figures", no_ingest)
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    request = world.gateway.calls[0][0]
+    assert "F001" in request.text
+    assert str(world.extraction.sources[0].source_document_id) not in request.text
+    assert result.source_figure_count == 1
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert len(enrichment.source_figures) == 1  # type: ignore[attr-defined]
+    assert enrichment.source_figures[0].inclusion_status.value == "included"  # type: ignore[attr-defined]
+    assert enrichment.source_figures[0].resolved_figure.sha256 == "f" * 64  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> None:
     world = _world(_RecordingGateway(lambda request: _succeeded(request, _proposal("E001"))))
 
@@ -1210,6 +1462,85 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 1)
     assert len(world.writer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> None:
+    needs_wire = (
+        "NEEDS N001\nKIND: MEDIA\n"
+        "REASON: No relevant execution figure is archived.\n"
+        "QUERY_HINT: Example incident ExampleRAT execution diagram\nEND NEEDS"
+    )
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, needs_wire)))
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert world.service._resource_search_enabled is False
+    assert len(world.gateway.calls) == 1
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
+    assert enrichment.resource_needs[0].kind.value == "MEDIA"  # type: ignore[attr-defined]
+    assert enrichment.resource_proposals == ()  # type: ignore[attr-defined]
+    assert result.details["resource_proposal_search"]["status"] == (  # type: ignore[index]
+        "disabled_by_configuration"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_only() -> None:
+    needs_wire = (
+        "NEEDS N001\nKIND: TECHNICAL_ANALYSIS\n"
+        "REASON: A protocol field explanation is missing.\n"
+        "QUERY_HINT: Example incident protocol field analysis\nEND NEEDS"
+    )
+    resource_wire = (
+        "RESOURCE R001\nNEED: N001\nURL: https://vendor.example/report\n"
+        "JUSTIFICATION: The page may explain the named protocol field.\nEND RESOURCE"
+    )
+
+    def respond(request: ModelRequest) -> ModelExecution:
+        return _succeeded_text(request, resource_wire if request.web_search else needs_wire)
+
+    world = _world(_RecordingGateway(respond))
+    world.service._resource_search_enabled = True
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.model_calls == 2
+    assert [request.web_search for request, _schema in world.gateway.calls] == [False, True]
+    assert all(request.conversation is None for request, _schema in world.gateway.calls)
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
+    assert len(enrichment.resource_proposals) == 1  # type: ignore[attr-defined]
+    candidate = enrichment.resource_proposals[0]  # type: ignore[attr-defined]
+    assert candidate.url == "https://vendor.example/report"
+    assert candidate.source_model_run_id == world.gateway.calls[1][0].run_id
+    assert enrichment.source_figures == ()  # type: ignore[attr-defined]
+    assert result.details["resource_proposals"][0]["url"] == candidate.url  # type: ignore[index]
+    assert world.gateway.diagnostics[-1]["parser_stage"] == "editorial_resource_proposals"
+
+
+@pytest.mark.asyncio
+async def test_resource_search_is_blocked_by_external_access_policy_even_when_enabled() -> None:
+    needs_wire = (
+        "NEEDS N001\nKIND: MEDIA\nREASON: Missing figure.\n"
+        "QUERY_HINT: Example incident source media\nEND NEEDS"
+    )
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, needs_wire)),
+        documents=(replace(_document(), external_llm_allowed=False),),
+    )
+    world.service._resource_search_enabled = True
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert len(world.gateway.calls) == 1
+    assert result.details["resource_proposal_search"]["status"] == (  # type: ignore[index]
+        "blocked_by_access_policy"
+    )
 
 
 @pytest.mark.asyncio

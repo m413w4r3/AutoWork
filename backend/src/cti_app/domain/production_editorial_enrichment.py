@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, StrictInt, StrictStr, field_validator, model_validator
@@ -23,9 +24,12 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 2
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 3
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
+EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
+EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v1"
+EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
@@ -304,6 +308,114 @@ class SourceFigureInclusionStatus(StrEnum):
     EXCLUDED = "excluded"
 
 
+class EditorialFigureDecision(StrEnum):
+    INCLUDED_BY_MODEL = "included_by_model"
+    NOT_SELECTED_BY_MODEL = "not_selected_by_model"
+    EXCLUDED_BY_RULE = "excluded_by_rule"
+    PENDING_ARCHIVE = "pending_archive"
+
+
+class EditorialFigureDecisionActor(StrEnum):
+    MODEL_PROPOSAL = "model_proposal"
+    DETERMINISTIC_RULE = "deterministic_rule"
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialFigureDecisionTraceV1:
+    handle: str
+    figure_id: UUID
+    source_document_id: UUID
+    decision: EditorialFigureDecision
+    actor: EditorialFigureDecisionActor
+    reason_code: str
+    reason: str
+    policy_version: str
+    prompt_version: str
+    contract_version: str
+    parser_version: str
+    evidence_refs: tuple[ExtractionEvidenceRefV1, ...] = ()
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"F[0-9]{3,}", self.handle) is None:
+            raise ValueError("Editorial figure handle is invalid")
+        if not isinstance(self.figure_id, UUID):
+            raise ValueError("Editorial figure decision identity is invalid")
+        if not isinstance(self.source_document_id, UUID):
+            raise ValueError("Editorial figure source identity is invalid")
+        if not isinstance(self.decision, EditorialFigureDecision) or not isinstance(
+            self.actor, EditorialFigureDecisionActor
+        ):
+            raise ValueError("Editorial figure decision type is invalid")
+        for name in (
+            "reason_code",
+            "reason",
+            "policy_version",
+            "prompt_version",
+            "contract_version",
+            "parser_version",
+        ):
+            _text(getattr(self, name), f"Editorial figure decision {name}", semantic=True)
+        if not isinstance(self.evidence_refs, tuple) or any(
+            not isinstance(ref, ExtractionEvidenceRefV1) for ref in self.evidence_refs
+        ):
+            raise ValueError("Editorial figure decision evidence references are invalid")
+        if len(self.evidence_refs) != len(set(self.evidence_refs)):
+            raise ValueError("Editorial figure decision evidence references must be unique")
+
+
+class ResourceNeedKind(StrEnum):
+    MEDIA = "MEDIA"
+    TECHNICAL_ANALYSIS = "TECHNICAL_ANALYSIS"
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialResourceNeedV1:
+    key: str
+    kind: ResourceNeedKind
+    reason: str
+    query_hint: str
+    policy_version: str = EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"N[0-9]{3,}", self.key) is None:
+            raise ValueError("Editorial resource need key is invalid")
+        if not isinstance(self.kind, ResourceNeedKind):
+            raise ValueError("Editorial resource need kind is invalid")
+        if not (1 <= len(self.reason.strip()) <= 500):
+            raise ValueError("Editorial resource need reason must be bounded text")
+        if not (1 <= len(self.query_hint.strip()) <= 240):
+            raise ValueError("Editorial resource query hint must be bounded text")
+        _text(self.policy_version, "Editorial resource policy version", semantic=True)
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialResourceProposalV1:
+    need_key: str
+    url: str
+    justification: str
+    source_model_run_id: UUID
+    policy_version: str = EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION
+
+    def __post_init__(self) -> None:
+        if re.fullmatch(r"N[0-9]{3,}", self.need_key) is None:
+            raise ValueError("Editorial resource proposal need key is invalid")
+        if not (1 <= len(self.url.strip()) <= 2048):
+            raise ValueError("Editorial resource proposal URL must be bounded text")
+        parsed = urlsplit(self.url)
+        if (
+            parsed.scheme.casefold() not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+        ):
+            raise ValueError("Editorial resource proposal URL must be an HTTP(S) URL")
+        if not (1 <= len(self.justification.strip()) <= 500):
+            raise ValueError("Editorial resource proposal justification must be bounded text")
+        if not isinstance(self.source_model_run_id, UUID):
+            raise ValueError("Editorial resource proposal model run identity is invalid")
+        _text(self.policy_version, "Editorial resource policy version", semantic=True)
+
+
 @dataclass(frozen=True, slots=True)
 class SourceFigureLocatorV1:
     page: int | None = None
@@ -471,9 +583,12 @@ class EditorialEnrichmentV1:
     source_figures: tuple[SourceFigureCandidateV1, ...]
     warnings: tuple[str, ...]
     annotations: tuple[SemanticAnnotationProposalV1, ...] = ()
+    figure_decisions: tuple[EditorialFigureDecisionTraceV1, ...] = ()
+    resource_needs: tuple[EditorialResourceNeedV1, ...] = ()
+    resource_proposals: tuple[EditorialResourceProposalV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2}:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3}:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -485,6 +600,8 @@ class EditorialEnrichmentV1:
         expected_policy = (
             EDITORIAL_ENRICHMENT_V1_POLICY_VERSION
             if self.schema_version == 1
+            else EDITORIAL_ENRICHMENT_V2_POLICY_VERSION
+            if self.schema_version == 2
             else EDITORIAL_ENRICHMENT_POLICY_VERSION
         )
         if self.enrichment_policy_version != expected_policy:
@@ -509,6 +626,31 @@ class EditorialEnrichmentV1:
             raise ValueError("Editorial enrichment annotations have an invalid type")
         if self.schema_version == 1 and self.annotations:
             raise ValueError("V1 editorial enrichment cannot contain semantic annotations")
+        if self.schema_version < 3 and (
+            self.figure_decisions or self.resource_needs or self.resource_proposals
+        ):
+            raise ValueError("Legacy editorial enrichment cannot contain L7b review data")
+        item_checks: tuple[tuple[str, tuple[object, ...], type[object]], ...] = (
+            ("figure decisions", self.figure_decisions, EditorialFigureDecisionTraceV1),
+            ("resource needs", self.resource_needs, EditorialResourceNeedV1),
+            ("resource proposals", self.resource_proposals, EditorialResourceProposalV1),
+        )
+        for check_label, check_values, check_item_type in item_checks:
+            if not isinstance(check_values, tuple) or any(
+                not isinstance(item, check_item_type) for item in check_values
+            ):
+                raise ValueError(f"Editorial enrichment {check_label} have an invalid type")
+        decision_handles = [item.handle for item in self.figure_decisions]
+        decision_ids = [item.figure_id for item in self.figure_decisions]
+        if len(decision_handles) != len(set(decision_handles)) or len(decision_ids) != len(
+            set(decision_ids)
+        ):
+            raise ValueError("Editorial figure decisions must have unique handles and identities")
+        need_keys = [item.key for item in self.resource_needs]
+        if len(need_keys) != len(set(need_keys)):
+            raise ValueError("Editorial resource needs must have unique keys")
+        if any(item.need_key not in set(need_keys) for item in self.resource_proposals):
+            raise ValueError("Editorial resource proposal references an unknown need")
         keys = [
             *(table.key for table in self.tables),
             *(diagram.key for diagram in self.diagrams),
@@ -537,6 +679,7 @@ def editorial_enrichment_evidence_refs(
         for edge in diagram.edges
         for ref in edge.evidence_refs
     )
+    refs.update(ref for decision in enrichment.figure_decisions for ref in decision.evidence_refs)
     return frozenset(refs)
 
 
@@ -651,6 +794,43 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
     return payload
 
 
+def _figure_decision_to_json(item: EditorialFigureDecisionTraceV1) -> dict[str, Any]:
+    return {
+        "handle": item.handle,
+        "figure_id": str(item.figure_id),
+        "source_document_id": str(item.source_document_id),
+        "decision": item.decision.value,
+        "actor": item.actor.value,
+        "reason_code": item.reason_code,
+        "reason": item.reason,
+        "policy_version": item.policy_version,
+        "prompt_version": item.prompt_version,
+        "contract_version": item.contract_version,
+        "parser_version": item.parser_version,
+        "evidence_refs": [_ref_to_json(ref) for ref in item.evidence_refs],
+    }
+
+
+def _resource_need_to_json(item: EditorialResourceNeedV1) -> dict[str, Any]:
+    return {
+        "key": item.key,
+        "kind": item.kind.value,
+        "reason": item.reason,
+        "query_hint": item.query_hint,
+        "policy_version": item.policy_version,
+    }
+
+
+def _resource_proposal_to_json(item: EditorialResourceProposalV1) -> dict[str, Any]:
+    return {
+        "need_key": item.need_key,
+        "url": item.url,
+        "justification": item.justification,
+        "source_model_run_id": str(item.source_model_run_id),
+        "policy_version": item.policy_version,
+    }
+
+
 def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str, Any]:
     """Return the strict JSON-compatible canonical representation."""
     if not isinstance(enrichment, EditorialEnrichmentV1):
@@ -672,6 +852,16 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         payload["annotations"] = [
             semantic_annotation_proposal_to_json(item) for item in enrichment.annotations
         ]
+    if enrichment.schema_version >= 3:
+        payload["figure_decisions"] = [
+            _figure_decision_to_json(item) for item in enrichment.figure_decisions
+        ]
+        payload["resource_needs"] = [
+            _resource_need_to_json(item) for item in enrichment.resource_needs
+        ]
+        payload["resource_proposals"] = [
+            _resource_proposal_to_json(item) for item in enrichment.resource_proposals
+        ]
     return payload
 
 
@@ -690,7 +880,8 @@ _ROOT_KEYS_V1 = frozenset(
         "warnings",
     }
 )
-_ROOT_KEYS = _ROOT_KEYS_V1 | {"annotations"}
+_ROOT_KEYS_V2 = _ROOT_KEYS_V1 | {"annotations"}
+_ROOT_KEYS_V3 = _ROOT_KEYS_V2 | {"figure_decisions", "resource_needs", "resource_proposals"}
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
@@ -718,6 +909,26 @@ _FIGURE_KEYS = frozenset(
     }
 )
 _FIGURE_BASE_KEYS = _FIGURE_KEYS - {"resolved_figure"}
+_FIGURE_DECISION_KEYS = frozenset(
+    {
+        "handle",
+        "figure_id",
+        "source_document_id",
+        "decision",
+        "actor",
+        "reason_code",
+        "reason",
+        "policy_version",
+        "prompt_version",
+        "contract_version",
+        "parser_version",
+        "evidence_refs",
+    }
+)
+_RESOURCE_NEED_KEYS = frozenset({"key", "kind", "reason", "query_hint", "policy_version"})
+_RESOURCE_PROPOSAL_KEYS = frozenset(
+    {"need_key", "url", "justification", "source_model_run_id", "policy_version"}
+)
 
 
 def _object(raw: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
@@ -974,14 +1185,76 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
     )
 
 
+def _figure_decision_from_json(raw: Any) -> EditorialFigureDecisionTraceV1:
+    payload = _object(raw, _FIGURE_DECISION_KEYS, "Editorial figure decision")
+    return EditorialFigureDecisionTraceV1(
+        handle=_text(payload["handle"], "Editorial figure handle"),
+        figure_id=_uuid(payload["figure_id"], "Editorial figure identity"),
+        source_document_id=_uuid(payload["source_document_id"], "Editorial figure source identity"),
+        decision=_enum(EditorialFigureDecision, payload["decision"], "Editorial figure decision"),
+        actor=_enum(
+            EditorialFigureDecisionActor, payload["actor"], "Editorial figure decision actor"
+        ),
+        reason_code=_text(
+            payload["reason_code"], "Editorial figure decision reason", semantic=True
+        ),
+        reason=_text(payload["reason"], "Editorial figure decision explanation", semantic=True),
+        policy_version=_text(
+            payload["policy_version"], "Editorial figure decision policy", semantic=True
+        ),
+        prompt_version=_text(
+            payload["prompt_version"], "Editorial figure prompt version", semantic=True
+        ),
+        contract_version=_text(
+            payload["contract_version"], "Editorial figure contract version", semantic=True
+        ),
+        parser_version=_text(
+            payload["parser_version"], "Editorial figure parser version", semantic=True
+        ),
+        evidence_refs=_refs_from_json(
+            payload["evidence_refs"], "Editorial figure evidence references"
+        ),
+    )
+
+
+def _resource_need_from_json(raw: Any) -> EditorialResourceNeedV1:
+    payload = _object(raw, _RESOURCE_NEED_KEYS, "Editorial resource need")
+    return EditorialResourceNeedV1(
+        key=_text(payload["key"], "Editorial resource need key"),
+        kind=_enum(ResourceNeedKind, payload["kind"], "Editorial resource need kind"),
+        reason=_text(payload["reason"], "Editorial resource need reason", semantic=True),
+        query_hint=_text(payload["query_hint"], "Editorial resource query hint", semantic=True),
+        policy_version=_text(
+            payload["policy_version"], "Editorial resource policy version", semantic=True
+        ),
+    )
+
+
+def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
+    payload = _object(raw, _RESOURCE_PROPOSAL_KEYS, "Editorial resource proposal")
+    return EditorialResourceProposalV1(
+        need_key=_text(payload["need_key"], "Editorial resource proposal need key"),
+        url=_text(payload["url"], "Editorial resource proposal URL", semantic=True),
+        justification=_text(
+            payload["justification"], "Editorial resource proposal justification", semantic=True
+        ),
+        source_model_run_id=_uuid(
+            payload["source_model_run_id"], "Editorial resource proposal model run identity"
+        ),
+        policy_version=_text(
+            payload["policy_version"], "Editorial resource policy version", semantic=True
+        ),
+    )
+
+
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1/V2 payloads; old V1 artifacts migrate with no proposals."""
+    """Decode strict V1/V2/V3 payloads; pre-L7b artifacts migrate with empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
     body = _object(
         payload,
-        _ROOT_KEYS_V1 if raw_version == 1 else _ROOT_KEYS,
+        _ROOT_KEYS_V1 if raw_version == 1 else _ROOT_KEYS_V2 if raw_version == 2 else _ROOT_KEYS_V3,
         "Editorial enrichment",
     )
     schema_version = body["schema_version"]
@@ -1019,6 +1292,30 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
                 for value in _array(body["annotations"], "Semantic annotations")
             )
             if schema_version >= 2
+            else ()
+        ),
+        figure_decisions=(
+            tuple(
+                _figure_decision_from_json(value)
+                for value in _array(body["figure_decisions"], "Editorial figure decisions")
+            )
+            if schema_version >= 3
+            else ()
+        ),
+        resource_needs=(
+            tuple(
+                _resource_need_from_json(value)
+                for value in _array(body["resource_needs"], "Editorial resource needs")
+            )
+            if schema_version >= 3
+            else ()
+        ),
+        resource_proposals=(
+            tuple(
+                _resource_proposal_from_json(value)
+                for value in _array(body["resource_proposals"], "Editorial resource proposals")
+            )
+            if schema_version >= 3
             else ()
         ),
     )

@@ -38,6 +38,16 @@ def test_webai_defaults_keep_the_verified_gemini_model() -> None:
     assert settings.webai_model == "gemini-3-flash"
 
 
+def test_editorial_resource_search_is_explicitly_disabled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings(_env_file=None)
+    assert settings.production_editorial_resource_search_enabled is False
+
+    monkeypatch.setenv("PRODUCTION_EDITORIAL_RESOURCE_SEARCH_ENABLED", "true")
+    assert Settings(_env_file=None).production_editorial_resource_search_enabled is True
+
+
 def test_qwen_trust_boundary_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("QWEN_BASE_URL", "https://gateway.example.test/v1")
     monkeypatch.setenv("QWEN_IS_EXTERNAL", "false")
