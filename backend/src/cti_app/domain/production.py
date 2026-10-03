@@ -374,7 +374,7 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
-EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-role-depth-v2"
+EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-tier-core-only-v3"
 
 
 class DetectionRuleType(StrEnum):

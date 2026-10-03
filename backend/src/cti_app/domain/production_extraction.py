@@ -96,15 +96,20 @@ class ProductionExtractionOmissionReason(StrEnum):
 
 
 class ExtractionProfileReasonCode(StrEnum):
-    """Why the versioned editorial policy selected one analysis depth."""
+    """Why the versioned policy selected one analysis depth."""
 
     CORE_PRIMARY_SOURCE = "core_primary_source"
+    #: A complementary (SUPPORTING) source contributes IOCs/rules with their context only.
+    SUPPORTING_CONTEXT = "supporting_context"
+    #: A TECHNICAL resource contributes IOCs/rules with their context only.
+    TECHNICAL_ANNEX = "technical_annex"
+    # Reason codes of the superseded role/depth policy (v2). They stay decodable so
+    # persisted artifacts keep loading; the current policy never selects them.
     INDEPENDENT_CORROBORATION = "independent_corroboration"
     COUNTER_ANALYSIS = "counter_analysis"
     SUPPORTING_PRIMARY_ANALYSIS = "supporting_primary_analysis"
     TECHNICAL_ANALYSIS = "technical_analysis"
     CONTEXTUAL_PUBLICATION = "contextual_publication"
-    TECHNICAL_ANNEX = "technical_annex"
 
 
 def extraction_profile_decision(
@@ -113,27 +118,19 @@ def extraction_profile_decision(
     kind: ProductionReferenceKind,
     editorial_role: ProductionEditorialRole,
 ) -> tuple[ExtractionProfile, ExtractionProfileReasonCode]:
-    """Select depth from typed REFERENCES authority and source kind.
+    """Select the analysis depth from the frozen reference tier.
 
-    CORE remains the narrative center. Independent corroboration and
-    counter-analysis receive FULL extraction at any complementary tier. A
-    technical resource marked as context is a technical annex and stays
-    IOC_RULES; other publications and analytically authoritative resources
-    receive FULL extraction.
+    Only CORE sources (the publications of the studied period) are the main
+    subject of an article and receive FULL extraction. SUPPORTING and TECHNICAL
+    sources only add IOCs, rules and their context (IOC_RULES). The editorial
+    role stays available for ordering and review but never raises the depth.
     """
+    del editorial_role
     if tier is ProductionReferenceTier.CORE:
         return ExtractionProfile.FULL, ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE
-    if editorial_role is ProductionEditorialRole.COUNTER_ANALYSIS:
-        return ExtractionProfile.FULL, ExtractionProfileReasonCode.COUNTER_ANALYSIS
-    if editorial_role is ProductionEditorialRole.CORROBORATION:
-        return ExtractionProfile.FULL, ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION
     if kind is ProductionReferenceKind.TECHNICAL_RESOURCE:
-        if editorial_role is ProductionEditorialRole.CONTEXT:
-            return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.TECHNICAL_ANNEX
-        return ExtractionProfile.FULL, ExtractionProfileReasonCode.TECHNICAL_ANALYSIS
-    if editorial_role is ProductionEditorialRole.PRIMARY:
-        return ExtractionProfile.FULL, ExtractionProfileReasonCode.SUPPORTING_PRIMARY_ANALYSIS
-    return ExtractionProfile.FULL, ExtractionProfileReasonCode.CONTEXTUAL_PUBLICATION
+        return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.TECHNICAL_ANNEX
+    return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.SUPPORTING_CONTEXT
 
 
 def _require_text(value: Any, *, label: str) -> str:

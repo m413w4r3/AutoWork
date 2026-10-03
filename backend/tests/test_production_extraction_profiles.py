@@ -93,53 +93,37 @@ PROFILE_POLICY = (
         ExtractionProfile.FULL,
         ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE,
     ),
-    (
-        ProductionReferenceTier.SUPPORTING,
-        ProductionReferenceKind.PUBLICATION,
-        SourceRole.INDEPENDENT,
-        ProductionEditorialRole.CORROBORATION,
-        ExtractionProfile.FULL,
-        ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION,
+    # Only CORE sources are the main subject of an article; every complementary
+    # source adds IOCs, rules and their context whatever its editorial role.
+    *(
+        (
+            ProductionReferenceTier.SUPPORTING,
+            ProductionReferenceKind.PUBLICATION,
+            source_role,
+            editorial_role,
+            ExtractionProfile.IOC_RULES,
+            ExtractionProfileReasonCode.SUPPORTING_CONTEXT,
+        )
+        for source_role, editorial_role in (
+            (SourceRole.INDEPENDENT, ProductionEditorialRole.CORROBORATION),
+            (SourceRole.PRIMARY, ProductionEditorialRole.COUNTER_ANALYSIS),
+            (SourceRole.PRIMARY, ProductionEditorialRole.CONTEXT),
+        )
     ),
-    (
-        ProductionReferenceTier.SUPPORTING,
-        ProductionReferenceKind.PUBLICATION,
-        SourceRole.PRIMARY,
-        ProductionEditorialRole.COUNTER_ANALYSIS,
-        ExtractionProfile.FULL,
-        ExtractionProfileReasonCode.COUNTER_ANALYSIS,
-    ),
-    (
-        ProductionReferenceTier.SUPPORTING,
-        ProductionReferenceKind.PUBLICATION,
-        SourceRole.PRIMARY,
-        ProductionEditorialRole.CONTEXT,
-        ExtractionProfile.FULL,
-        ExtractionProfileReasonCode.CONTEXTUAL_PUBLICATION,
-    ),
-    (
-        ProductionReferenceTier.TECHNICAL,
-        ProductionReferenceKind.TECHNICAL_RESOURCE,
-        SourceRole.PRIMARY,
-        ProductionEditorialRole.CONTEXT,
-        ExtractionProfile.IOC_RULES,
-        ExtractionProfileReasonCode.TECHNICAL_ANNEX,
-    ),
-    (
-        ProductionReferenceTier.TECHNICAL,
-        ProductionReferenceKind.TECHNICAL_RESOURCE,
-        SourceRole.INDEPENDENT,
-        ProductionEditorialRole.CORROBORATION,
-        ExtractionProfile.FULL,
-        ExtractionProfileReasonCode.INDEPENDENT_CORROBORATION,
-    ),
-    (
-        ProductionReferenceTier.TECHNICAL,
-        ProductionReferenceKind.TECHNICAL_RESOURCE,
-        SourceRole.INDEPENDENT,
-        ProductionEditorialRole.CONTEXT,
-        ExtractionProfile.IOC_RULES,
-        ExtractionProfileReasonCode.TECHNICAL_ANNEX,
+    *(
+        (
+            ProductionReferenceTier.TECHNICAL,
+            ProductionReferenceKind.TECHNICAL_RESOURCE,
+            source_role,
+            editorial_role,
+            ExtractionProfile.IOC_RULES,
+            ExtractionProfileReasonCode.TECHNICAL_ANNEX,
+        )
+        for source_role, editorial_role in (
+            (SourceRole.PRIMARY, ProductionEditorialRole.CONTEXT),
+            (SourceRole.INDEPENDENT, ProductionEditorialRole.CORROBORATION),
+            (SourceRole.INDEPENDENT, ProductionEditorialRole.CONTEXT),
+        )
     ),
 )
 
@@ -147,7 +131,7 @@ PROFILE_POLICY = (
 @pytest.mark.parametrize(
     ("tier", "kind", "role", "editorial_role", "expected", "reason_code"), PROFILE_POLICY
 )
-def test_profile_uses_editorial_authority_and_source_kind(
+def test_only_core_sources_receive_full_extraction(
     tier: ProductionReferenceTier,
     kind: ProductionReferenceKind,
     role: SourceRole,
@@ -213,7 +197,7 @@ def test_policy_version_change_invalidates_source_checkpoint_identity(
     monkeypatch.setattr(
         production_extraction,
         "EXTRACTION_PROFILE_POLICY_VERSION",
-        "production-reference-role-depth-v3",
+        "production-reference-tier-core-only-v4-test",
     )
     identity_after = production_extraction.source_checkpoint_identity(
         content_sha256="b" * 64,
