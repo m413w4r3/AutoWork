@@ -6,12 +6,16 @@ from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi import HTTPException
 from pydantic import BaseModel
 
+import cti_app.api.production as production_api
 import cti_app.application.production_editorial_enrichment as enrichment_module
+import cti_app.application.production_enrichment_revision as revision_module
 from cti_app.application.diagram_compilation import CompiledDiagram
 from cti_app.application.model_gateway import (
     ModelExecution,
@@ -22,6 +26,7 @@ from cti_app.application.model_gateway import (
     StructuredOutputError,
 )
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
+from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
@@ -49,9 +54,15 @@ from cti_app.application.production_editorial_enrichment import (
     parse_editorial_enrichment_proposal_wire,
     validate_editorial_enrichment_proposal,
 )
+from cti_app.application.production_enrichment_revision import (
+    EditorialEnrichmentRevisionValidationError,
+    ProductionEditorialEnrichmentRevisionService,
+)
+from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
     canonical_extraction_hash,
+    synthesis_access_policy_hash,
 )
 from cti_app.application.source_figure_inventory import (
     SourceFigureCatalogMetadata,
@@ -66,11 +77,15 @@ from cti_app.domain.production import (
     ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
+    ProductionArtifactStatus,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EditorialEnrichmentRevisionAction,
+    EditorialEnrichmentRevisionOutcome,
     EnrichmentPlacementKind,
     EnrichmentTableKind,
     ResolvedSourceFigureV1,
@@ -1374,7 +1389,7 @@ def test_column_labels_carry_no_evidence_so_they_cannot_state_facts(
 
 class _MemoryArtifactStore:
     def __init__(self) -> None:
-        self.payloads: dict[UUID, dict[str, object]] = {}
+        self.payloads: dict[UUID, dict[str, object] | bytes] = {}
 
     def put(self, payload: dict[str, object]) -> UUID:
         blob_id = uuid4()
@@ -1382,7 +1397,38 @@ class _MemoryArtifactStore:
         return blob_id
 
     async def read_json(self, blob_id: UUID) -> dict[str, object]:
-        return self.payloads[blob_id]
+        payload = self.payloads[blob_id]
+        if isinstance(payload, bytes):
+            value = json.loads(payload)
+            assert isinstance(value, dict)
+            return value
+        return payload
+
+    async def read_bytes(self, blob_id: UUID) -> bytes:
+        payload = self.payloads[blob_id]
+        if isinstance(payload, bytes):
+            return payload
+        return ProductionArtifactStore.canonical_json_bytes(payload)
+
+    async def store_stage_payloads(
+        self,
+        *,
+        raw: str | None = None,
+        canonical: dict[str, object] | None = None,
+        rendered: str | None = None,
+    ) -> tuple[UUID | None, UUID | None, UUID | None]:
+        raw_id = None
+        canonical_id = None
+        rendered_id = None
+        if raw is not None:
+            raw_id = uuid4()
+            self.payloads[raw_id] = raw.encode("utf-8")
+        if canonical is not None:
+            canonical_id = self.put(canonical)
+        if rendered is not None:
+            rendered_id = uuid4()
+            self.payloads[rendered_id] = rendered.encode("utf-8")
+        return raw_id, canonical_id, rendered_id
 
 
 class _MemoryMediaAssetStore:
@@ -2245,3 +2291,397 @@ async def test_invalid_reuse_candidate_reports_no_model_call() -> None:
     assert result.model_calls == 0
     assert result.model_run_id is None
     assert gateway.calls == []
+
+
+class _RevisionArtifactRepository:
+    def __init__(self, artifacts: list[ProductionArtifact]) -> None:
+        self.artifacts = artifacts
+
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return next((item for item in self.artifacts if item.id == artifact_id), None)
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        matches = [
+            item
+            for item in self.artifacts
+            if item.production_run_id == run_id
+            and item.stage.value == stage
+            and item.status is not ProductionArtifactStatus.STALE
+        ]
+        return max(matches, key=lambda item: item.version, default=None)
+
+    async def get_current_for_revision(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        return await self.get_current(run_id, stage)
+
+    async def list_for_run(self, run_id: UUID) -> tuple[ProductionArtifact, ...]:
+        return tuple(item for item in self.artifacts if item.production_run_id == run_id)
+
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.artifacts.append(artifact)
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        if stage != ProductionArtifactStage.EDITORIAL_ENRICHMENT.value:
+            return
+        for item in self.artifacts:
+            if (
+                item.production_run_id == run_id
+                and item.stage is ProductionArtifactStage.PUBLICATION
+            ):
+                item.status = ProductionArtifactStatus.STALE
+
+    async def find_reusable(self, **_kwargs: object) -> None:
+        return None
+
+
+class _RevisionUow:
+    def __init__(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        source_documents: _MemorySourceDocuments,
+        artifacts: _RevisionArtifactRepository,
+    ) -> None:
+        self.production_runs = SimpleNamespace(get_current_for_subject=self._current_run)
+        self.production_input_snapshots = SimpleNamespace(get_by_run=self._snapshot_for_run)
+        self.source_documents = source_documents
+        self.blobs = _MemoryBlobs()
+        self.production_artifacts = artifacts
+        self._run = run
+        self._snapshot = snapshot
+
+    async def _current_run(self, subject_id: UUID) -> ProductionRun | None:
+        return self._run if self._run.subject_id == subject_id else None
+
+    async def _snapshot_for_run(self, run_id: UUID) -> ProductionInputSnapshot | None:
+        return self._snapshot if self._snapshot.production_run_id == run_id else None
+
+    async def __aenter__(self) -> _RevisionUow:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+
+async def _revision_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: _RecordingGateway,
+) -> SimpleNamespace:
+    from cti_app.application.publication_assembly import PublicationAssemblyService
+
+    world = _world(gateway)
+    inventory = _figure_inventory(world.extraction)
+
+    async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
+        return inventory
+
+    monkeypatch.setattr(revision_module, "load_archived_source_figure_inventory", load_inventory)
+    monkeypatch.setattr(
+        revision_module,
+        "production_reference_corpus_from_json",
+        lambda _payload: SimpleNamespace(),
+    )
+
+    source_documents = _MemorySourceDocuments((_document(),))
+    policy = await build_synthesis_access_policy(world.snapshot, world.extraction, source_documents)
+    evidence_pack = build_editorial_enrichment_evidence_pack(
+        world.snapshot, world.extraction, world.synthesis
+    )
+    evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+    access_hash = synthesis_access_policy_hash(policy)
+    inventory_hash = inventory.functional_hash()
+    input_hash = compute_editorial_enrichment_input_hash(
+        extraction=world.extraction,
+        synthesis=world.synthesis,
+        evidence_pack_hash=evidence_pack_hash,
+        access_policy_hash=access_hash,
+        source_figure_inventory_hash=inventory_hash,
+    )
+    enrichment = validate_editorial_enrichment_proposal(
+        _proposal("E001"), evidence_pack, world.extraction, world.synthesis
+    )
+    base_payload = editorial_enrichment_to_json(enrichment)
+    base = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash=input_hash,
+        canonical_blob_id=world.store.put(base_payload),
+        metadata={
+            "evidence_pack_hash": evidence_pack_hash,
+            "access_policy_hash": access_hash,
+            "source_figure_inventory_hash": inventory_hash,
+            "routing_policy_version": "routing-v1",
+        },
+    )
+    reference_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="a" * 64,
+        canonical_blob_id=world.store.put({"schema_version": 1}),
+    )
+    publication_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.PUBLICATION,
+        version=1,
+        input_hash="b" * 64,
+        canonical_blob_id=world.store.put({"schema_version": 5}),
+        metadata={
+            "input_artifacts": {
+                "editorial_enrichment_artifact_id": str(base.id),
+            }
+        },
+    )
+    artifacts = _RevisionArtifactRepository(
+        [
+            reference_artifact,
+            world.extraction_artifact,
+            world.synthesis_artifact,
+            base,
+            publication_artifact,
+        ]
+    )
+
+    def uow_factory() -> _RevisionUow:
+        return _RevisionUow(
+            run=world.run,
+            snapshot=world.snapshot,
+            source_documents=source_documents,
+            artifacts=artifacts,
+        )
+
+    world.service._uow_factory = uow_factory  # type: ignore[assignment]
+    assembled: list[dict[str, Any]] = []
+    rendered: list[UUID] = []
+
+    async def fake_assemble(
+        assembly: Any,
+        *,
+        run: ProductionRun,
+        metadata_extra: dict[str, Any],
+        **_kwargs: Any,
+    ) -> ProductionArtifact:
+        del assembly
+        assembled.append(metadata_extra)
+        existing = await artifacts.list_for_run(run.id)
+        publication = ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=run.subject_id,
+            stage=ProductionArtifactStage.PUBLICATION,
+            version=max(
+                (
+                    item.version
+                    for item in existing
+                    if item.stage is ProductionArtifactStage.PUBLICATION
+                ),
+                default=0,
+            )
+            + 1,
+            input_hash="c" * 64,
+            canonical_blob_id=world.store.put({"schema_version": 5}),
+            metadata=metadata_extra,
+        )
+        await artifacts.append(publication)
+        return publication
+
+    async def render_preview(artifact_id: UUID) -> None:
+        rendered.append(artifact_id)
+
+    monkeypatch.setattr(PublicationAssemblyService, "assemble_publication", fake_assemble)
+    service = ProductionEditorialEnrichmentRevisionService(
+        enrichment_service=world.service,
+        persistence_service=EditorialEnrichmentService(uow_factory, world.store),
+        publication_render_service=SimpleNamespace(render_preview=render_preview),  # type: ignore[arg-type]
+    )
+    return SimpleNamespace(
+        world=world,
+        service=service,
+        artifacts=artifacts,
+        base=base,
+        base_payload=base_payload,
+        base_sha256=hashlib.sha256(
+            await world.store.read_bytes(base.canonical_blob_id)
+        ).hexdigest(),
+        input_hash=input_hash,
+        assembled=assembled,
+        rendered=rendered,
+    )
+
+
+def _revision_args(harness: SimpleNamespace) -> dict[str, Any]:
+    return {
+        "subject_id": harness.world.snapshot.subject_id,
+        "base_artifact_id": harness.base.id,
+        "base_version": harness.base.version,
+        "base_input_hash": harness.input_hash,
+        "base_canonical_sha256": harness.base_sha256,
+        "element_kind": EditorialEnrichmentElementKind.TABLE,
+        "element_key": "tools_table",
+        "action": EditorialEnrichmentRevisionAction.IMPROVE_TABLE,
+        "instruction": "Improve readability without adding facts.",
+    }
+
+
+def _table_revision_wire() -> str:
+    proposal = _proposal("E001")
+    table = proposal.tables[0].model_copy(update={"title": "Documented tools"})
+    targeted = proposal.model_copy(update={"tables": (table,), "diagrams": ()})
+    return _proposal_to_wire(targeted)
+
+
+@pytest.mark.asyncio
+async def test_element_revision_appends_one_version_carries_other_elements_and_is_idempotent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+
+    result = await world.service.revise(**_revision_args(world))
+    repeated = await world.service.revise(**_revision_args(world))
+
+    assert result.outcome is EditorialEnrichmentRevisionOutcome.REVISED
+    assert result.artifact.version == 2
+    assert result.artifact.id == repeated.artifact.id
+    assert len(world.world.gateway.calls) == 1
+    request = world.world.gateway.calls[0][0]
+    assert request.prompt_template_id == "production-editorial-enrichment"
+    assert request.web_search is False
+    assert len(world.assembled) == len(world.rendered) == 1
+    assert result.revision["element_before"] != result.revision["element_after"]
+    old_content = await world.world.store.read_bytes(world.base.canonical_blob_id)
+    assert hashlib.sha256(old_content).hexdigest() == world.base_sha256
+    new_content = await world.world.store.read_json(result.artifact.canonical_blob_id)
+    assert new_content["diagrams"] == world.base_payload["diagrams"]  # type: ignore[index]
+    assert (
+        result.artifact.metadata["evidence_pack_hash"] == world.base.metadata["evidence_pack_hash"]
+    )
+    assert result.previous_publication_artifact_id is not None
+
+
+@pytest.mark.asyncio
+async def test_stale_base_and_changed_hash_are_typed_conflicts_without_model_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stale = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    newer = ProductionArtifact(
+        production_run_id=stale.world.run.id,
+        subject_id=stale.world.snapshot.subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=2,
+        input_hash=stale.input_hash,
+        canonical_blob_id=stale.base.canonical_blob_id,
+    )
+    stale.artifacts.artifacts.append(newer)
+    with pytest.raises(revision_module.EditorialEnrichmentRevisionConflictError) as stale_error:
+        await stale.service.revise(**_revision_args(stale))
+    assert stale_error.value.code == "editorial_enrichment_stale_base"
+    assert stale.world.gateway.calls == []
+
+    changed_hash = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    changed_args = _revision_args(changed_hash)
+    changed_args["base_canonical_sha256"] = "0" * 64
+    with pytest.raises(revision_module.EditorialEnrichmentRevisionConflictError):
+        await changed_hash.service.revise(**changed_args)
+    assert changed_hash.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_revision_api_maps_stale_base_to_http_409(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ConflictingRevisionService:
+        async def revise(self, **_kwargs: object) -> None:
+            from cti_app.application.production_editorial_enrichment import (
+                EditorialEnrichmentRevisionConflictError,
+            )
+
+            raise EditorialEnrichmentRevisionConflictError("base changed")
+
+    monkeypatch.setattr(
+        production_api,
+        "_production_enrichment_revision_service",
+        lambda _request: _ConflictingRevisionService(),
+    )
+    request = production_api.EditorialEnrichmentRevisionRequest(
+        base_artifact_id=uuid4(),
+        base_version=1,
+        base_input_hash="a" * 64,
+        base_canonical_sha256="b" * 64,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        element_key="tools_table",
+        action=EditorialEnrichmentRevisionAction.IMPROVE_TABLE,
+        instruction="Improve readability.",
+    )
+
+    with pytest.raises(HTTPException) as conflict:
+        await production_api.revise_editorial_enrichment_artifact(
+            _SUBJECT_ID, request, SimpleNamespace()
+        )
+
+    assert conflict.value.status_code == 409
+    assert conflict.value.detail["code"] == "editorial_enrichment_stale_base"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_revision_needs_new_evidence_persists_l7b_resource_need(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    needs_wire = (
+        "NEEDS N009\nKIND: TECHNICAL_ANALYSIS\n"
+        "REASON: A protocol detail is absent from the admitted evidence.\n"
+        "QUERY_HINT: ExampleRAT protocol detail\nEND NEEDS"
+    )
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, needs_wire)),
+    )
+
+    result = await world.service.revise(**_revision_args(world))
+
+    assert result.outcome is EditorialEnrichmentRevisionOutcome.NEEDS_NEW_EVIDENCE
+    assert result.revision["resource_need"]["kind"] == "TECHNICAL_ANALYSIS"  # type: ignore[index]
+    stored = await world.world.store.read_json(result.artifact.canonical_blob_id)
+    assert len(stored["resource_needs"]) == 1  # type: ignore[arg-type]
+    assert stored["diagrams"] == world.base_payload["diagrams"]  # type: ignore[index]
+    assert len(world.world.gateway.calls) == 1
+    assert world.world.gateway.calls[0][0].web_search is False
+
+
+@pytest.mark.asyncio
+async def test_revision_surfaces_validator_rejections_and_rejects_oversized_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invalid = _proposal("E999").model_copy(update={"diagrams": ()})
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _proposal_to_wire(invalid))),
+    )
+    with pytest.raises(EditorialEnrichmentRevisionValidationError) as rejected:
+        await world.service.revise(**_revision_args(world))
+    assert rejected.value.rejections
+    assert any("evidence" in item["reason_code"] for item in rejected.value.rejections)
+
+    oversized = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    args = _revision_args(oversized)
+    args["instruction"] = "x" * 2001
+    with pytest.raises(ValueError, match="editorial_enrichment_revision_instruction_invalid"):
+        await oversized.service.revise(**args)
+    assert oversized.world.gateway.calls == []

@@ -3433,6 +3433,12 @@ class _EditorialEnrichmentInputControl(RuntimeError):
         super().__init__(message)
 
 
+class EditorialEnrichmentRevisionConflictError(RuntimeError):
+    """The requested revision no longer targets the current enrichment artifact."""
+
+    code = "editorial_enrichment_stale_base"
+
+
 class ProductionEditorialEnrichmentService:
     """The canonical stateless Editorial Enrichment drafting service."""
 

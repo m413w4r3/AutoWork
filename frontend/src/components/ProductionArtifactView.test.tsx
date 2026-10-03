@@ -169,6 +169,7 @@ function renderArtifact(
     | "extraction"
     | "relevance_projection"
     | "synthesis"
+    | "editorial_enrichment"
     | "publication",
 ) {
   const client = new QueryClient({
@@ -180,6 +181,218 @@ function renderArtifact(
     </QueryClientProvider>,
   );
 }
+
+function revisionBaseArtifact(version = 2) {
+  return {
+    artifact_id: "editorial-enrichment-base",
+    stage: "editorial_enrichment",
+    version,
+    status: "verified",
+    input_hash: "a".repeat(64),
+    canonical_sha256: "b".repeat(64),
+    metadata: {},
+    canonical_content: {
+      tables: [
+        {
+          key: "tools_table",
+          title: "Outils observés",
+          rows: [{ cells: ["ExampleRAT", "malware"] }],
+        },
+      ],
+      diagrams: [{ key: "infection_chain", title: "Séquence observée" }],
+      source_figures: [],
+    },
+  };
+}
+
+function revisionResponse(outcome: "revised" | "needs_new_evidence") {
+  return {
+    outcome,
+    request_identity: "revision-request-identity",
+    artifact_id: "editorial-enrichment-revision",
+    artifact_version: 3,
+    artifact_input_hash: "a".repeat(64),
+    artifact_canonical_sha256: "c".repeat(64),
+    publication_artifact_id: "publication-revision",
+    publication_artifact_version: 2,
+    previous_publication_artifact_id: "publication-previous",
+    revision: {
+      request_identity: "revision-request-identity",
+      outcome,
+      element_kind: "table",
+      element_key: "tools_table",
+      action: "improve_table",
+      instruction: "Clarifier la table sans ajouter de faits.",
+      base_artifact_id: "editorial-enrichment-base",
+      base_version: 2,
+      element_evidence_handles: ["E001"],
+      admitted_evidence_handles: ["E001", "E002"],
+      element_before: { title: "Outils observés" },
+      element_after: { title: "Outils documentés" },
+      validator_results: [
+        { validator: "l8_enrichment_grounding", status: "passed" },
+      ],
+      validator_rejections: [],
+      parse_identity: "parse-identity",
+      previous_publication_artifact_id: "publication-previous",
+      resource_need:
+        outcome === "needs_new_evidence"
+          ? {
+              key: "N001",
+              kind: "TECHNICAL_ANALYSIS",
+              reason: "Le détail demandé est absent des preuves admises.",
+              query_hint: "ExampleRAT détail protocole",
+            }
+          : null,
+    },
+  };
+}
+
+function stubRevisionFetch(
+  revision: ReturnType<typeof revisionResponse> | null,
+  revisionStatus = 200,
+  errorDetail: Record<string, unknown> = {
+    code: "editorial_enrichment_stale_base",
+    message: "L'artifact de base a changé.",
+  },
+) {
+  const currentArtifact = revisionBaseArtifact();
+  const fetchMock = vi.fn(
+    (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      const url = urlOf(input);
+      if (url.endsWith("/production/artifacts/editorial_enrichment")) {
+        return Promise.resolve(Response.json(currentArtifact));
+      }
+      if (
+        url.includes("/production/artifacts/editorial_enrichment/revisions")
+      ) {
+        if (revisionStatus !== 200) {
+          return Promise.resolve(
+            new Response(JSON.stringify({ detail: errorDetail }), {
+              status: revisionStatus,
+              headers: { "Content-Type": "application/json" },
+            }),
+          );
+        }
+        expect(init?.method).toBe("POST");
+        if (revision?.outcome === "revised") {
+          currentArtifact.artifact_id = revision.artifact_id;
+          currentArtifact.version = revision.artifact_version;
+          currentArtifact.canonical_sha256 = revision.artifact_canonical_sha256;
+        }
+        return Promise.resolve(Response.json(revision));
+      }
+      if (url.includes("/production/artifacts/editorial_enrichment/")) {
+        return Promise.resolve(
+          Response.json({
+            ...revisionBaseArtifact(),
+            artifact_id: "editorial-enrichment-base",
+            canonical_content: { history_label: "Ancienne version conservée" },
+          }),
+        );
+      }
+      if (url.includes("/publication/preview")) {
+        return Promise.resolve(
+          Response.json({
+            status: "FAILED",
+            artifact_id: new URL(url, "http://localhost").searchParams.get(
+              "artifact_id",
+            ),
+            artifact_version: 1,
+            error_code: "preview_not_ready",
+            pdf_url: null,
+          }),
+        );
+      }
+      return Promise.resolve(new Response(null, { status: 404 }));
+    },
+  );
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
+function clickFirstRevisionButton() {
+  const [button] = screen.getAllByRole("button", {
+    name: "Réviser cet élément",
+  });
+  if (!button) throw new Error("Revision action button is missing");
+  fireEvent.click(button);
+}
+
+it("submits a targeted element revision and shows its comparison and previous version", async () => {
+  const fetchMock = stubRevisionFetch(revisionResponse("revised"));
+  renderArtifact("editorial_enrichment");
+
+  expect(
+    await screen.findByRole("heading", { name: "Outils observés" }),
+  ).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Instruction pour Outils observés"), {
+    target: { value: "Clarifier la table sans ajouter de faits." },
+  });
+  clickFirstRevisionButton();
+
+  expect(await screen.findByText("Nouvelle version 3")).toBeInTheDocument();
+  expect(
+    await screen.findByText(/Ancienne version conservée/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("PDF de la publication précédente"),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText("PDF de la nouvelle publication 2"),
+  ).toBeInTheDocument();
+  expect(
+    fetchMock.mock.calls.some(
+      ([input, init]) =>
+        urlOf(input).includes("/editorial_enrichment/revisions") &&
+        init?.method === "POST",
+    ),
+  ).toBe(true);
+});
+
+it("explains when a revision needs new evidence", async () => {
+  stubRevisionFetch(revisionResponse("needs_new_evidence"));
+  renderArtifact("editorial_enrichment");
+
+  await screen.findAllByRole("button", { name: "Réviser cet élément" });
+  clickFirstRevisionButton();
+
+  expect(
+    await screen.findByText(/Relancez la collecte et la production/),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/ExampleRAT détail protocole/)).toBeInTheDocument();
+});
+
+it("shows a clear stale-base conflict when the server returns 409", async () => {
+  stubRevisionFetch(null, 409);
+  renderArtifact("editorial_enrichment");
+
+  await screen.findAllByRole("button", { name: "Réviser cet élément" });
+  clickFirstRevisionButton();
+
+  expect(
+    await screen.findByText(
+      "Cette base est obsolète. Rechargez l’enrichissement et réessayez.",
+    ),
+  ).toBeInTheDocument();
+});
+
+it("surfaces validator rejections returned for an invalid revision", async () => {
+  stubRevisionFetch(null, 422, {
+    code: "editorial_enrichment_revision_rejected",
+    rejections: [
+      { block_id: "tools_table", reason_code: "unsupported_evidence_claim" },
+    ],
+  });
+  renderArtifact("editorial_enrichment");
+
+  await screen.findAllByRole("button", { name: "Réviser cet élément" });
+  clickFirstRevisionButton();
+
+  expect(
+    await screen.findByText("tools_table : unsupported_evidence_claim"),
+  ).toBeInTheDocument();
+});
 
 it("keeps ambiguous relevance decisions visible with their reasons", async () => {
   vi.stubGlobal(

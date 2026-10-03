@@ -1,11 +1,16 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getReferencesArtifact,
   getExtractionArtifact,
   getRelevanceProjectionArtifact,
   getSynthesisArtifact,
   getEditorialEnrichmentArtifact,
+  getEditorialEnrichmentArtifactVersion,
+  reviseEditorialEnrichment,
+  type EditorialEnrichmentElementKind,
+  type EditorialEnrichmentRevisionAction,
+  type EditorialEnrichmentRevisionResponse,
   getPublicationArtifact,
   getPublicationArtifactPreview,
   getPublicationPreviewPdf,
@@ -32,6 +37,7 @@ import {
   type ExtractionDocumentV2,
   type ExtractionItemV2,
 } from "../api/production";
+import { ApiError } from "../api/editions";
 
 interface ProductionArtifactViewProps {
   subjectId: string;
@@ -40,6 +46,7 @@ interface ProductionArtifactViewProps {
     | "extraction"
     | "relevance_projection"
     | "synthesis"
+    | "editorial_enrichment"
     | "publication";
   onClose?: () => void;
 }
@@ -49,6 +56,7 @@ const STAGE_LABELS: Record<string, string> = {
   extraction: "Extraction CTI",
   relevance_projection: "Périmètre des preuves",
   synthesis: "Synthèse",
+  editorial_enrichment: "Enrichissement éditorial",
   publication: "Aperçu de la publication",
 };
 
@@ -70,6 +78,8 @@ function getArtifactFetcher(
       return getRelevanceProjectionArtifact;
     case "synthesis":
       return getSynthesisArtifact;
+    case "editorial_enrichment":
+      return getEditorialEnrichmentArtifact;
     case "publication":
       return getPublicationArtifact;
     default:
@@ -1717,6 +1727,448 @@ function PublicationPdfPanel({
   );
 }
 
+function objectArray(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(recordValue).filter((item) => item !== null);
+}
+
+function RevisionPdfPreview({
+  subjectId,
+  artifactId,
+  label,
+}: {
+  subjectId: string;
+  artifactId: string | null;
+  label: string;
+}) {
+  const previewQuery = useQuery({
+    queryKey: ["publication-preview", subjectId, artifactId, "revision"],
+    queryFn: () => {
+      if (artifactId === null)
+        throw new Error("Aucun artifact de publication.");
+      return getPublicationArtifactPreview(subjectId, artifactId);
+    },
+    enabled: artifactId !== null,
+    refetchInterval: (query) =>
+      query.state.data?.status === "IN_PROGRESS" ? 1500 : false,
+  });
+  const preview = previewQuery.data;
+  const pdfQuery = useQuery({
+    queryKey: [
+      "publication-preview-pdf",
+      subjectId,
+      artifactId,
+      preview?.render_identity,
+    ],
+    queryFn: () => {
+      if (!preview)
+        throw new Error("Les métadonnées du PDF sont indisponibles.");
+      return getPublicationPreviewPdf(preview);
+    },
+    enabled:
+      preview !== undefined &&
+      (preview.status === "READY" || preview.status === "STALE") &&
+      preview.pdf_url !== null,
+    retry: false,
+  });
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pdfQuery.data) {
+      setObjectUrl(null);
+      return;
+    }
+    const nextUrl = URL.createObjectURL(pdfQuery.data);
+    setObjectUrl(nextUrl);
+    return () => URL.revokeObjectURL(nextUrl);
+  }, [pdfQuery.data]);
+
+  if (artifactId === null) return null;
+  return (
+    <section className="publication-pdf-preview" aria-label={label}>
+      <h4>{label}</h4>
+      {preview?.status === "STALE" ? (
+        <p role="status">
+          Cette version antérieure reste accessible : artifact{" "}
+          {preview.artifact_id}, version {preview.artifact_version}.
+        </p>
+      ) : null}
+      {preview?.status === "IN_PROGRESS" ? (
+        <p aria-live="polite">Préparation du PDF…</p>
+      ) : null}
+      {preview?.status === "FAILED" ? (
+        <p className="error-message" role="alert">
+          {preview.error_message ??
+            preview.error_code ??
+            "Le rendu PDF a échoué."}
+        </p>
+      ) : null}
+      {previewQuery.error || pdfQuery.error ? (
+        <p className="error-message" role="alert">
+          {String(previewQuery.error ?? pdfQuery.error)}
+        </p>
+      ) : null}
+      {objectUrl ? (
+        <object
+          aria-label={`${label}, version ${preview?.artifact_version ?? ""}`}
+          className="publication-pdf-preview__viewer"
+          data={objectUrl}
+          type="application/pdf"
+        >
+          <a href={objectUrl} rel="noreferrer" target="_blank">
+            Ouvrir le PDF
+          </a>
+        </object>
+      ) : null}
+    </section>
+  );
+}
+
+const REVISION_ACTIONS: Record<
+  EditorialEnrichmentElementKind,
+  Array<{ value: EditorialEnrichmentRevisionAction; label: string }>
+> = {
+  table: [
+    { value: "improve_table", label: "Améliorer ce tableau" },
+    {
+      value: "change_caption_placement",
+      label: "Modifier la légende ou le placement",
+    },
+    { value: "custom", label: "Instruction libre ciblée" },
+  ],
+  diagram: [
+    {
+      value: "detail_diagram",
+      label: "Détailler ce diagramme à partir des preuves",
+    },
+    {
+      value: "change_caption_placement",
+      label: "Modifier la légende ou le placement",
+    },
+    { value: "custom", label: "Instruction libre ciblée" },
+  ],
+  figure: [
+    { value: "choose_another_figure", label: "Choisir une autre figure" },
+    {
+      value: "change_caption_placement",
+      label: "Modifier la légende ou le placement",
+    },
+    { value: "custom", label: "Instruction libre ciblée" },
+  ],
+};
+
+function defaultRevisionAction(
+  kind: EditorialEnrichmentElementKind,
+): EditorialEnrichmentRevisionAction {
+  if (kind === "table") return "improve_table";
+  if (kind === "diagram") return "detail_diagram";
+  return "choose_another_figure";
+}
+
+function isRevisionRejection(
+  value: unknown,
+): value is { block_id: string; reason_code: string } {
+  const record = recordValue(value);
+  return (
+    record !== null &&
+    typeof record.block_id === "string" &&
+    typeof record.reason_code === "string"
+  );
+}
+
+function RevisionElementCard({
+  subjectId,
+  artifact,
+  elementKind,
+  element,
+}: {
+  subjectId: string;
+  artifact: ArtifactResponse;
+  elementKind: EditorialEnrichmentElementKind;
+  element: Record<string, unknown>;
+}) {
+  const queryClient = useQueryClient();
+  const key = typeof element.key === "string" ? element.key : "";
+  const title =
+    (typeof element.title === "string" && element.title) ||
+    (typeof element.caption === "string" && element.caption) ||
+    key;
+  const [action, setAction] = useState(defaultRevisionAction(elementKind));
+  const [instruction, setInstruction] = useState(
+    elementKind === "table"
+      ? "Améliorer la lisibilité sans ajouter de faits."
+      : elementKind === "diagram"
+        ? "Détailler uniquement les relations étayées par les preuves admises."
+        : "Choisir une autre figure déjà admise et adaptée à cet emplacement.",
+  );
+  const mutation = useMutation({
+    mutationFn: () => {
+      if (!artifact.canonical_sha256) {
+        throw new Error("Le hash du contenu de base est indisponible.");
+      }
+      return reviseEditorialEnrichment(subjectId, {
+        base_artifact_id: artifact.artifact_id,
+        base_version: artifact.version,
+        base_input_hash: artifact.input_hash,
+        base_canonical_sha256: artifact.canonical_sha256,
+        element_kind: elementKind,
+        element_key: key,
+        action,
+        instruction,
+      });
+    },
+    onSuccess: async (result) => {
+      queryClient.setQueryData(
+        ["editorial-enrichment-revision", subjectId],
+        result,
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["production-artifact", subjectId, "editorial_enrichment"],
+        }),
+        queryClient.invalidateQueries({
+          queryKey: ["production-artifact", subjectId, "publication"],
+        }),
+      ]);
+    },
+  });
+  const errorCode =
+    mutation.error instanceof Error && "code" in mutation.error
+      ? mutation.error.code
+      : null;
+  const rejectionPayload =
+    mutation.error instanceof ApiError
+      ? mutation.error.details?.rejections
+      : null;
+  const validationRejections = Array.isArray(rejectionPayload)
+    ? rejectionPayload.filter(isRevisionRejection)
+    : [];
+  const errorMessage =
+    errorCode === "editorial_enrichment_stale_base"
+      ? "Cette base est obsolète. Rechargez l’enrichissement et réessayez."
+      : String(mutation.error ?? "");
+
+  return (
+    <article className="editorial-revision-element">
+      <h4>{title}</h4>
+      <details>
+        <summary>Élément actuel · {key}</summary>
+        <pre>{JSON.stringify(element, null, 2)}</pre>
+      </details>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          mutation.mutate();
+        }}
+      >
+        <label>
+          Action de révision
+          <select
+            aria-label={`Action de révision pour ${title}`}
+            value={action}
+            onChange={(event) =>
+              setAction(event.target.value as EditorialEnrichmentRevisionAction)
+            }
+          >
+            {REVISION_ACTIONS[elementKind].map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Instruction ciblée
+          <textarea
+            aria-label={`Instruction pour ${title}`}
+            maxLength={2000}
+            value={instruction}
+            onChange={(event) => setInstruction(event.target.value)}
+          />
+        </label>
+        <button
+          className="button button--secondary"
+          disabled={mutation.isPending || instruction.trim().length === 0}
+          type="submit"
+        >
+          {mutation.isPending ? "Révision en cours…" : "Réviser cet élément"}
+        </button>
+      </form>
+      {mutation.isError ? (
+        <div className="error-message" role="alert">
+          <p>{errorMessage}</p>
+          {validationRejections.length > 0 ? (
+            <ul>
+              {validationRejections.map((item, index) => (
+                <li key={`${item.block_id}-${item.reason_code}-${index}`}>
+                  {item.block_id} : {item.reason_code}
+                </li>
+              ))}
+            </ul>
+          ) : null}
+        </div>
+      ) : null}
+    </article>
+  );
+}
+
+function EditorialEnrichmentRevisionComparison({
+  subjectId,
+  result,
+}: {
+  subjectId: string;
+  result: EditorialEnrichmentRevisionResponse | null;
+}) {
+  const previousArtifactQuery = useQuery({
+    queryKey: [
+      "production-artifact-version",
+      subjectId,
+      result?.revision.base_artifact_id,
+    ],
+    queryFn: () => {
+      if (!result) throw new Error("Aucune version précédente.");
+      return getEditorialEnrichmentArtifactVersion(
+        subjectId,
+        result.revision.base_artifact_id,
+      );
+    },
+    enabled: result !== null,
+  });
+  if (result === null) return null;
+  return (
+    <section
+      className="editorial-revision-comparison"
+      aria-label="Comparaison de révision"
+    >
+      <h3>
+        {result.outcome === "needs_new_evidence"
+          ? "Nouvelles preuves nécessaires"
+          : `Nouvelle version ${result.artifact_version}`}
+      </h3>
+      {result.outcome === "needs_new_evidence" ? (
+        <p role="status">
+          Cette demande requiert de nouvelles preuves. Relancez la collecte et
+          la production avant de réviser cet élément.
+          {result.revision.resource_need ? (
+            <span>
+              {` ${result.revision.resource_need.reason} À rechercher : ${result.revision.resource_need.query_hint}`}
+            </span>
+          ) : null}
+        </p>
+      ) : null}
+      <p>Instruction : {result.revision.instruction}</p>
+      <details open>
+        <summary>Avant / après · {result.revision.element_key}</summary>
+        <div className="editorial-revision-comparison__columns">
+          <section>
+            <h4>Avant</h4>
+            <pre>{JSON.stringify(result.revision.element_before, null, 2)}</pre>
+          </section>
+          <section>
+            <h4>Après</h4>
+            <pre>{JSON.stringify(result.revision.element_after, null, 2)}</pre>
+          </section>
+        </div>
+      </details>
+      <details>
+        <summary>Preuves admises</summary>
+        <p>
+          Élément :{" "}
+          {result.revision.element_evidence_handles.join(", ") || "Aucune"}
+        </p>
+        <p>Paquet : {result.revision.admitted_evidence_handles.join(", ")}</p>
+      </details>
+      <details>
+        <summary>Validateurs et rejets</summary>
+        <ul>
+          {result.revision.validator_results.map((item) => (
+            <li key={item.validator}>
+              {item.validator} : {item.status}
+            </li>
+          ))}
+          {result.revision.validator_rejections.map((item, index) => (
+            <li key={`${item.block_id}-${item.reason_code}-${index}`}>
+              {item.block_id} : {item.reason_code}
+            </li>
+          ))}
+        </ul>
+      </details>
+      <details>
+        <summary>Version précédente {result.revision.base_version}</summary>
+        {previousArtifactQuery.data ? (
+          <pre>
+            {JSON.stringify(
+              previousArtifactQuery.data.canonical_content,
+              null,
+              2,
+            )}
+          </pre>
+        ) : (
+          <p>Chargement de la version précédente…</p>
+        )}
+      </details>
+      <RevisionPdfPreview
+        subjectId={subjectId}
+        artifactId={result.publication_artifact_id}
+        label={`PDF de la nouvelle publication ${result.publication_artifact_version ?? ""}`}
+      />
+      <RevisionPdfPreview
+        subjectId={subjectId}
+        artifactId={result.previous_publication_artifact_id}
+        label="PDF de la publication précédente"
+      />
+    </section>
+  );
+}
+
+function EditorialEnrichmentPreview({
+  subjectId,
+  artifact,
+}: {
+  subjectId: string;
+  artifact: ArtifactResponse;
+}) {
+  const revisionQuery = useQuery<EditorialEnrichmentRevisionResponse | null>({
+    queryKey: ["editorial-enrichment-revision", subjectId],
+    queryFn: () => null,
+    enabled: false,
+    initialData: null,
+  });
+  const content = recordValue(artifact.canonical_content);
+  const tables = objectArray(content?.tables);
+  const diagrams = objectArray(content?.diagrams);
+  const figures = objectArray(content?.source_figures);
+  return (
+    <section className="editorial-enrichment-preview">
+      <p>
+        Artifact {artifact.artifact_id} · version {artifact.version}
+      </p>
+      {[
+        ...tables.map((element) => ({ kind: "table" as const, element })),
+        ...diagrams.map((element) => ({ kind: "diagram" as const, element })),
+        ...figures.map((element) => ({ kind: "figure" as const, element })),
+      ].map(({ kind, element }) => {
+        const elementKey = typeof element.key === "string" ? element.key : "";
+        return (
+          <RevisionElementCard
+            key={`${kind}-${elementKey}`}
+            subjectId={subjectId}
+            artifact={artifact}
+            elementKind={kind}
+            element={element}
+          />
+        );
+      })}
+      {tables.length + diagrams.length + figures.length === 0 ? (
+        <p>Aucun tableau, diagramme ou figure révisable dans cet artifact.</p>
+      ) : null}
+      <EditorialEnrichmentRevisionComparison
+        subjectId={subjectId}
+        result={revisionQuery.data}
+      />
+    </section>
+  );
+}
+
 export function ProductionArtifactView({
   subjectId,
   stage,
@@ -1917,6 +2369,10 @@ export function ProductionArtifactView({
         </>
       )}
 
+      {stage === "editorial_enrichment" && (
+        <EditorialEnrichmentPreview subjectId={subjectId} artifact={artifact} />
+      )}
+
       {stage === "extraction" &&
         isProductionExtractionV1(artifact.canonical_content) && (
           <ProductionExtractionPreview document={artifact.canonical_content} />
@@ -1963,6 +2419,7 @@ export function ProductionArtifactView({
       {stage !== "publication" &&
         stage !== "extraction" &&
         stage !== "relevance_projection" &&
+        stage !== "editorial_enrichment" &&
         !referencesCorpus &&
         !synthesisDocument &&
         renderedContent && (
@@ -1976,6 +2433,7 @@ export function ProductionArtifactView({
       {stage !== "publication" &&
         stage !== "extraction" &&
         stage !== "relevance_projection" &&
+        stage !== "editorial_enrichment" &&
         !referencesCorpus &&
         !synthesisDocument &&
         artifact.canonical_content && (

@@ -540,16 +540,21 @@ async def test_new_publication_artifact_marks_an_older_pdf_stale(subject: Subjec
         uuid4(),
         version=2,
     )
+    pdf_bytes = b"%PDF-1.7\nretained publication"
+    output_blob_id = uuid4()
     old_render = SimpleNamespace(
         id=uuid4(),
         publication_artifact_id=old_artifact.id,
         input_hash="c" * 64,
         status=TypstRenderStatus.SUCCEEDED,
+        output_blob_id=output_blob_id,
+        output_byte_size=len(pdf_bytes),
+        output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
     )
     uow = _Uow(subject, [old_run, current_run], [old_artifact, current_artifact])
     uow.publication_renders.renders[old_render.id] = old_render
     renderer = _PublicationRenderService()
-    app = _app(uow, _Payloads({}), renderer)
+    app = _app(uow, _Payloads({output_blob_id: pdf_bytes}), renderer)
 
     async with await _client(app) as api:
         response = await api.get(
@@ -567,9 +572,9 @@ async def test_new_publication_artifact_marks_an_older_pdf_stale(subject: Subjec
     assert response.json()["artifact_version"] == old_artifact.version
     assert response.json()["render_identity"] == old_render.input_hash
     assert response.json()["current_artifact_id"] == str(current_artifact.id)
-    assert response.json()["pdf_url"] is None
-    assert old_pdf.status_code == 409
-    assert old_pdf.json()["detail"]["code"] == "publication_preview_stale"
+    assert response.json()["pdf_url"] is not None
+    assert old_pdf.status_code == 200
+    assert old_pdf.content == pdf_bytes
     assert renderer.artifact_ids == []
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal, NoReturn, cast
@@ -20,6 +21,14 @@ from cti_app.application.jobs import (
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.production_artifact_resolver import current_publication_artifact
 from cti_app.application.production_batch_repointing import _repoint_batch_item
+from cti_app.application.production_editorial_enrichment import (
+    EditorialEnrichmentRevisionConflictError,
+    ProductionEditorialEnrichmentService,
+)
+from cti_app.application.production_enrichment_revision import (
+    EditorialEnrichmentRevisionValidationError,
+    ProductionEditorialEnrichmentRevisionService,
+)
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
     ProductionStageChain,
@@ -66,6 +75,7 @@ from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
 )
+from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
@@ -100,15 +110,46 @@ from cti_app.domain.production import (
     ProductionStage,
     ProductionSubmissionReconciliation,
 )
+from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
+    EditorialEnrichmentRevisionAction,
+)
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.selection import SubjectDiscoveryOrigin
+from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.logging import get_correlation_id
 
 router = APIRouter(prefix="/api", tags=["production"])
 
 # Collection states that count as "available for analysis".
 _ARCHIVED_STATES = {"archived", "extracted", "completed"}
+
+
+class EditorialEnrichmentRevisionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_artifact_id: UUID
+    base_version: int = Field(ge=1)
+    base_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    base_canonical_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    element_kind: EditorialEnrichmentElementKind
+    element_key: str = Field(min_length=1, max_length=128)
+    action: EditorialEnrichmentRevisionAction
+    instruction: str = Field(min_length=1, max_length=2000)
+
+
+class EditorialEnrichmentRevisionResponse(BaseModel):
+    outcome: Literal["revised", "needs_new_evidence"]
+    request_identity: str
+    artifact_id: UUID
+    artifact_version: int
+    artifact_input_hash: str
+    artifact_canonical_sha256: str
+    publication_artifact_id: UUID | None
+    publication_artifact_version: int | None
+    previous_publication_artifact_id: UUID | None
+    revision: dict[str, Any]
 
 
 class StartEditionProductionRequest(BaseModel):
@@ -388,6 +429,35 @@ def _production_state_service(request: Request) -> ProductionStateService:
             },
         )
     return ProductionStateService(request.app.state.uow_factory, artifact_store)
+
+
+def _production_enrichment_revision_service(
+    request: Request,
+) -> ProductionEditorialEnrichmentRevisionService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    render_service = getattr(request.app.state, "publication_render_service", None)
+    if artifact_store is None or render_service is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "editorial_enrichment_revision_unavailable"},
+        )
+    from cti_app.config import get_settings
+
+    uow_factory = request.app.state.uow_factory
+    enrichment_service = ProductionEditorialEnrichmentService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=request.app.state.model_gateway,
+        editorial_enrichment_service=EditorialEnrichmentService(uow_factory, artifact_store),
+        media_asset_store=getattr(request.app.state, "media_asset_store", None),
+        diagram_compiler=D2DiagramCompiler(),
+        resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
+    )
+    return ProductionEditorialEnrichmentRevisionService(
+        enrichment_service=enrichment_service,
+        persistence_service=EditorialEnrichmentService(uow_factory, artifact_store),
+        publication_render_service=render_service,
+    )
 
 
 def _production_reconciliation_service(request: Request) -> ProductionReconciliationService:
@@ -2301,16 +2371,21 @@ async def _artifact_view_for_run(
         store = getattr(request.app.state, "production_artifact_store", None)
         rendered = None
         canonical = None
+        canonical_sha256 = None
         if store is not None:
             if artifact.rendered_blob_id is not None:
                 rendered = await store.read_text(artifact.rendered_blob_id)
             if artifact.canonical_blob_id is not None:
+                canonical_bytes = await store.read_bytes(artifact.canonical_blob_id)
+                canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
                 canonical = await store.read_json(artifact.canonical_blob_id)
 
         response = {
             "artifact_id": str(artifact.id),
             "stage": artifact.stage.value,
             "version": artifact.version,
+            "input_hash": artifact.input_hash,
+            "canonical_sha256": canonical_sha256,
             "status": artifact.status.value,
             "reused": artifact.reused_from_artifact_id is not None,
             "reused_from_artifact_id": (
@@ -2353,6 +2428,112 @@ async def get_synthesis_artifact(subject_id: UUID, request: Request) -> dict[str
 async def get_editorial_enrichment_artifact(subject_id: UUID, request: Request) -> dict[str, Any]:
     return await _artifact_view(
         request, subject_id, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+    )
+
+
+@router.get("/subjects/{subject_id}/production/artifacts/editorial_enrichment/{artifact_id}")
+async def get_editorial_enrichment_artifact_version(
+    subject_id: UUID,
+    artifact_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    async with request.app.state.uow_factory() as uow:
+        artifact = await uow.production_artifacts.get(artifact_id)
+        if (
+            artifact is None
+            or artifact.subject_id != subject_id
+            or artifact.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"code": "editorial_enrichment_artifact_not_found"},
+            )
+    store = request.app.state.production_artifact_store
+    canonical = None
+    canonical_sha256 = None
+    if artifact.canonical_blob_id is not None:
+        canonical_bytes = await store.read_bytes(artifact.canonical_blob_id)
+        canonical_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
+        canonical = await store.read_json(artifact.canonical_blob_id)
+    return {
+        "artifact_id": str(artifact.id),
+        "stage": artifact.stage.value,
+        "version": artifact.version,
+        "input_hash": artifact.input_hash,
+        "canonical_sha256": canonical_sha256,
+        "status": artifact.status.value,
+        "reused": artifact.reused_from_artifact_id is not None,
+        "metadata": artifact.metadata,
+        "canonical_content": canonical,
+    }
+
+
+@router.post(
+    "/subjects/{subject_id}/production/artifacts/editorial_enrichment/revisions",
+    response_model=EditorialEnrichmentRevisionResponse,
+)
+async def revise_editorial_enrichment_artifact(
+    subject_id: UUID,
+    payload: EditorialEnrichmentRevisionRequest,
+    request: Request,
+) -> EditorialEnrichmentRevisionResponse:
+    service = _production_enrichment_revision_service(request)
+    try:
+        result = await service.revise(
+            subject_id=subject_id,
+            base_artifact_id=payload.base_artifact_id,
+            base_version=payload.base_version,
+            base_input_hash=payload.base_input_hash,
+            base_canonical_sha256=payload.base_canonical_sha256,
+            element_kind=payload.element_kind,
+            element_key=payload.element_key,
+            action=payload.action,
+            instruction=payload.instruction,
+        )
+    except EditorialEnrichmentRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": exc.code,
+                "message": (
+                    "L'artifact de base a changé. Rechargez l'enrichissement avant de réessayer."
+                ),
+            },
+        ) from exc
+    except EditorialEnrichmentRevisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "rejections": exc.rejections},
+        ) from exc
+    except ValueError as exc:
+        code = str(exc) or "editorial_enrichment_revision_invalid"
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": code},
+        ) from exc
+    if result.artifact.canonical_blob_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "editorial_enrichment_revision_artifact_missing"},
+        )
+    canonical_bytes = await request.app.state.production_artifact_store.read_bytes(
+        result.artifact.canonical_blob_id
+    )
+    return EditorialEnrichmentRevisionResponse(
+        outcome=result.outcome.value,
+        request_identity=str(result.revision["request_identity"]),
+        artifact_id=result.artifact.id,
+        artifact_version=result.artifact.version,
+        artifact_input_hash=result.artifact.input_hash,
+        artifact_canonical_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+        publication_artifact_id=(
+            result.publication_artifact.id if result.publication_artifact is not None else None
+        ),
+        publication_artifact_version=(
+            result.publication_artifact.version if result.publication_artifact is not None else None
+        ),
+        previous_publication_artifact_id=result.previous_publication_artifact_id,
+        revision=result.revision,
     )
 
 

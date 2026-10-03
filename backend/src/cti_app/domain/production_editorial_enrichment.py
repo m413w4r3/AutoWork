@@ -33,6 +33,26 @@ EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v1"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
+
+class EditorialEnrichmentRevisionAction(StrEnum):
+    IMPROVE_TABLE = "improve_table"
+    DETAIL_DIAGRAM = "detail_diagram"
+    CHANGE_CAPTION_PLACEMENT = "change_caption_placement"
+    CHOOSE_ANOTHER_FIGURE = "choose_another_figure"
+    CUSTOM = "custom"
+
+
+class EditorialEnrichmentElementKind(StrEnum):
+    TABLE = "table"
+    DIAGRAM = "diagram"
+    FIGURE = "figure"
+
+
+class EditorialEnrichmentRevisionOutcome(StrEnum):
+    REVISED = "revised"
+    NEEDS_NEW_EVIDENCE = "needs_new_evidence"
+
+
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _KEY = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 # Diagram labels are displayed text: line breaks and tabs are allowed, other control

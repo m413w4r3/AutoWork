@@ -271,6 +271,8 @@ export interface ArtifactResponse {
   artifact_id: string;
   stage: string;
   version: number;
+  input_hash: string;
+  canonical_sha256: string | null;
   status: "verified" | "stale" | "needs_review";
   reused?: boolean;
   reused_from_artifact_id?: string | null;
@@ -1295,6 +1297,84 @@ export async function getEditorialEnrichmentArtifact(
   );
 }
 
+export type EditorialEnrichmentElementKind = "table" | "diagram" | "figure";
+export type EditorialEnrichmentRevisionAction =
+  | "improve_table"
+  | "detail_diagram"
+  | "change_caption_placement"
+  | "choose_another_figure"
+  | "custom";
+
+export interface EditorialEnrichmentRevisionRequest {
+  base_artifact_id: string;
+  base_version: number;
+  base_input_hash: string;
+  base_canonical_sha256: string;
+  element_kind: EditorialEnrichmentElementKind;
+  element_key: string;
+  action: EditorialEnrichmentRevisionAction;
+  instruction: string;
+}
+
+export interface EditorialEnrichmentRevisionResponse {
+  outcome: "revised" | "needs_new_evidence";
+  request_identity: string;
+  artifact_id: string;
+  artifact_version: number;
+  artifact_input_hash: string;
+  artifact_canonical_sha256: string;
+  publication_artifact_id: string | null;
+  publication_artifact_version: number | null;
+  previous_publication_artifact_id: string | null;
+  revision: {
+    request_identity: string;
+    outcome: "revised" | "needs_new_evidence";
+    element_kind: EditorialEnrichmentElementKind;
+    element_key: string;
+    action: EditorialEnrichmentRevisionAction;
+    instruction: string;
+    base_artifact_id: string;
+    base_version: number;
+    element_evidence_handles: string[];
+    admitted_evidence_handles: string[];
+    element_before: unknown;
+    element_after: unknown;
+    validator_results: Array<{ validator: string; status: string }>;
+    validator_rejections: Array<{ block_id: string; reason_code: string }>;
+    parse_identity: string;
+    previous_publication_artifact_id: string | null;
+    resource_need: {
+      key: string;
+      kind: "MEDIA" | "TECHNICAL_ANALYSIS";
+      reason: string;
+      query_hint: string;
+    } | null;
+  };
+}
+
+export async function reviseEditorialEnrichment(
+  subjectId: string,
+  requestBody: EditorialEnrichmentRevisionRequest,
+): Promise<EditorialEnrichmentRevisionResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/editorial_enrichment/revisions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    },
+  );
+}
+
+export async function getEditorialEnrichmentArtifactVersion(
+  subjectId: string,
+  artifactId: string,
+): Promise<ArtifactResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/editorial_enrichment/${artifactId}`,
+  );
+}
+
 export async function getPublicationArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
@@ -1314,7 +1394,10 @@ export async function getPublicationArtifactPreview(
 export async function getPublicationPreviewPdf(
   preview: PublicationArtifactPreview,
 ): Promise<Blob> {
-  if (preview.status !== "READY" || preview.pdf_url === null) {
+  if (
+    (preview.status !== "READY" && preview.status !== "STALE") ||
+    preview.pdf_url === null
+  ) {
     throw new Error("Le PDF de cet artifact n’est pas disponible.");
   }
   const response = await fetch(preview.pdf_url);
@@ -1392,7 +1475,8 @@ async function requestOrNull<T>(
 
 async function apiError(response: Response): Promise<ApiError> {
   const body = (await response.json().catch(() => null)) as {
-    detail?: { code?: string; message?: string } | string;
+    detail?:
+      { code?: string; message?: string; [key: string]: unknown } | string;
   } | null;
   const detail = body?.detail;
   const message =
@@ -1406,5 +1490,6 @@ async function apiError(response: Response): Promise<ApiError> {
       ? detail.code
       : "production_error",
     response.status,
+    typeof detail === "object" && detail !== null ? detail : null,
   );
 }

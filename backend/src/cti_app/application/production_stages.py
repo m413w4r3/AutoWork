@@ -7,13 +7,14 @@ import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from cti_app.application.persistence import ProductionUnitOfWorkFactory
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
+    EditorialEnrichmentRevisionConflictError,
     compute_editorial_enrichment_input_hash,
     validate_editorial_enrichment,
 )
@@ -377,6 +378,11 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         routing_policy_version: str,
         projection_hash: str | None = None,
         source_figure_inventory_hash: str | None = None,
+        metadata_extra: Mapping[str, Any] | None = None,
+        artifact_id: UUID | None = None,
+        expected_current_artifact_id: UUID | None = None,
+        expected_current_canonical_sha256: str | None = None,
+        canonical_payload: dict[str, Any] | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
@@ -392,13 +398,46 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             source_figure_inventory_hash=source_figure_inventory_hash,
         ):
             raise ValueError("editorial_enrichment_lineage_mismatch")
-        payload = editorial_enrichment_to_json(enrichment)
+        payload = canonical_payload or editorial_enrichment_to_json(enrichment)
+        if editorial_enrichment_to_json(enrichment) != payload:
+            from cti_app.domain.production_editorial_enrichment import (
+                editorial_enrichment_from_json,
+            )
+
+            if editorial_enrichment_from_json(payload) != enrichment:
+                raise ValueError("editorial_enrichment_revision_payload_mismatch")
         encoded = ProductionArtifactStore.canonical_json_bytes(payload)
         stage = ProductionArtifactStage.EDITORIAL_ENRICHMENT
         async with self._uow_factory() as uow:
-            current = await uow.production_artifacts.get_current(run_id, stage.value)
+            current = (
+                await uow.production_artifacts.get_current_for_revision(run_id, stage.value)
+                if expected_current_artifact_id is not None
+                else await uow.production_artifacts.get_current(run_id, stage.value)
+            )
+            if expected_current_artifact_id is not None and (
+                current is None or current.id != expected_current_artifact_id
+            ):
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The Editorial Enrichment base is no longer current"
+                )
+            if expected_current_artifact_id is not None:
+                if current is None or current.input_hash != input_hash:
+                    raise EditorialEnrichmentRevisionConflictError(
+                        "The Editorial Enrichment base hash changed"
+                    )
+                if expected_current_canonical_sha256 is not None:
+                    assert current.canonical_blob_id is not None
+                    current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                    if (
+                        hashlib.sha256(current_bytes).hexdigest()
+                        != expected_current_canonical_sha256
+                    ):
+                        raise EditorialEnrichmentRevisionConflictError(
+                            "The Editorial Enrichment base content hash changed"
+                        )
             if (
-                current is not None
+                expected_current_artifact_id is None
+                and current is not None
                 and current.status is ProductionArtifactStatus.VERIFIED
                 and current.input_hash == input_hash
                 and current.canonical_blob_id is not None
@@ -429,6 +468,8 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             }
             if source_figure_inventory_hash is not None:
                 artifact_metadata["source_figure_inventory_hash"] = source_figure_inventory_hash
+            if metadata_extra is not None:
+                artifact_metadata.update(dict(metadata_extra))
             artifact = ProductionArtifact(
                 production_run_id=run_id,
                 subject_id=subject_id,
@@ -442,6 +483,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 model_run_id=model_run_id,
                 conversation_turn_id=None,
                 metadata=artifact_metadata,
+                id=artifact_id or uuid4(),
             )
             await uow.production_artifacts.append(artifact)
             await uow.production_artifacts.mark_downstream_stale(run_id, stage.value)

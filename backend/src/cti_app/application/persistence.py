@@ -1004,6 +1004,10 @@ class ProductionArtifactRepository(Protocol):
 
     async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None: ...
 
+    async def get_current_for_revision(
+        self, run_id: UUID, stage: str
+    ) -> ProductionArtifact | None: ...
+
     async def list_current_for_edition(
         self, edition_id: UUID, stage: str
     ) -> Sequence[ProductionArtifact]: ...

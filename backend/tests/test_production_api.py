@@ -682,6 +682,13 @@ class _ArtifactStore:
         assert isinstance(value, dict)
         return value
 
+    async def read_bytes(self, blob_id: UUID) -> bytes:
+        value = self.payloads[blob_id]
+        assert isinstance(value, dict)
+        return json.dumps(
+            value, ensure_ascii=False, allow_nan=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+
     async def read_text(self, blob_id: UUID) -> str:
         value = self.payloads[blob_id]
         assert isinstance(value, str)

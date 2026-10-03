@@ -496,6 +496,14 @@ class SqlAlchemyProductionArtifactRepository:
         row = result.scalar_one_or_none()
         return _production_artifact_from_row(row) if row else None
 
+    async def get_current_for_revision(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        # Serialize revision compare-and-append operations for this run. The
+        # lock is on the run row so even an empty stage has a lock target.
+        await self._session.execute(
+            select(ProductionRunRow.id).where(ProductionRunRow.id == run_id).with_for_update()
+        )
+        return await self.get_current(run_id, stage)
+
     async def list_current_for_edition(
         self, edition_id: UUID, stage: str
     ) -> Sequence[ProductionArtifact]:

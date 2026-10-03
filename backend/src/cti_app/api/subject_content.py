@@ -285,6 +285,14 @@ async def _publication_preview(
                     "A newer publication artifact is current. This render belongs to the "
                     "older artifact version."
                 ),
+                pdf_url=(
+                    f"/api/subjects/{subject_id}/publication/preview/{requested.id}/pdf"
+                    f"?render_identity={old_render.input_hash}"
+                    if old_render is not None
+                    and old_render.status is TypstRenderStatus.SUCCEEDED
+                    and old_render.output_blob_id is not None
+                    else None
+                ),
             ),
             old_render,
         )
@@ -383,7 +391,14 @@ async def get_subject_publication_preview_pdf(
     render_identity: str = Query(pattern=r"^[0-9a-f]{64}$"),
 ) -> Response:
     preview, render = await _publication_preview(subject_id, artifact_id, request)
-    if preview.status is not PublicationPreviewStatus.READY or render is None:
+    can_serve_previous = (
+        preview.status is PublicationPreviewStatus.STALE
+        and render is not None
+        and render.status is TypstRenderStatus.SUCCEEDED
+    )
+    if (
+        preview.status is not PublicationPreviewStatus.READY and not can_serve_previous
+    ) or render is None:
         response_status = (
             status.HTTP_202_ACCEPTED
             if preview.status is PublicationPreviewStatus.IN_PROGRESS
