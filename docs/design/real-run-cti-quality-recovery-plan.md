@@ -222,6 +222,13 @@ Comparer explicitement les cas Chainalysis/Bitquery ; ne pas identifier leurs mo
 
 **Acceptation.** Même capture réutilisée pour deux sujets : extraction source identique, projections différentes. Necurs/DPRK/NFT hors sujet absents de la chronologie iranienne. Réserve Bitquery exploitable dans le récit. Aucun IOC attribué au sujet sans relation documentée. Source complémentaire FULL effectivement disponible aux deux modèles.
 
+> **Décision propriétaire (2026-10-03) — supersede la profondeur FULL décrite ci-dessus.** Seules les sources
+> CORE (publications de la période étudiée) reçoivent l'extraction FULL et constituent les sujets principaux
+> d'un article ; les sources SUPPORTING et TECHNICAL n'ajoutent que des IOC, des règles et leur contexte
+> (profil IOC_RULES, politique `production-reference-tier-core-only-v3`). Le rôle éditorial reste un critère
+> d'ordre et de revue. Conséquence : une contre-analyse complémentaire (cas Bitquery) ne contribue ni faits ni
+> relation inter-sources au récit, sauf si REFERENCES la classe CORE.
+
 ### L4 — Regroupement Discovery dès le premier intake — P1
 
 **Travail.** Clarifier l'unité éditoriale dans le prompt : campagne/incident/recherche cohérente ; une même publication multi-campagnes peut légitimement soutenir plusieurs sujets. En cas de découpage, demander des périmètres distincts et une justification ; réunir les sous-parties d'une même recherche lorsqu'elles ne représentent pas des activités autonomes.
