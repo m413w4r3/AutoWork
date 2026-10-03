@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from uuid import UUID
 
 from cti_app.domain.typst_render import (
@@ -16,6 +17,18 @@ from cti_app.domain.typst_render import (
 )
 
 PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v4-v1"
+
+
+class PublicationPreviewStatus(StrEnum):
+    IN_PROGRESS = "IN_PROGRESS"
+    READY = "READY"
+    FAILED = "FAILED"
+    STALE = "STALE"
+
+
+class PublicationPreviewDisposition(StrEnum):
+    ACCEPTED_VERSION = "ACCEPTED_VERSION"
+    EXPLICIT_RENDER = "EXPLICIT_RENDER"
 
 
 @dataclass(frozen=True, slots=True)

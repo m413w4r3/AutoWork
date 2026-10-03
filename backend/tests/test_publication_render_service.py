@@ -678,6 +678,23 @@ async def test_publication_render_service_reuses_succeeded_render(
 
 
 @pytest.mark.asyncio
+async def test_publication_render_preview_exposes_and_reuses_the_lifecycle_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, artifact, _, _, _, compiler = _make_service(tmp_path, monkeypatch)
+
+    first = await service.render_preview(artifact.id)
+    second = await service.render_preview(artifact.id)
+
+    assert first.status is TypstRenderStatus.SUCCEEDED
+    assert first.render is not None
+    assert second.status is TypstRenderStatus.SUCCEEDED
+    assert second.render == first.render
+    assert second.render.input_hash == first.render.input_hash
+    assert compiler.call_count == 1
+
+
+@pytest.mark.asyncio
 async def test_publication_render_service_creates_new_row_when_template_changes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

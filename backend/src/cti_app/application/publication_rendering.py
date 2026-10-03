@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -16,6 +18,8 @@ from cti_app.application.typst_compilation import (
     TYPST_COMPILER,
     TYPST_COMPILER_VERSION,
     FontBundleInvalidError,
+    FontBundleSnapshot,
+    TypstCompilationError,
     TypstCompiler,
     load_font_bundle_snapshot,
 )
@@ -30,6 +34,7 @@ from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstRenderer,
     TypstRenderSource,
+    TypstTemplateBundle,
     load_template_bundle,
 )
 from cti_app.domain.production import ProductionArtifactStage, ProductionArtifactStatus
@@ -113,6 +118,24 @@ _PUBLICATION_RENDER_ERRORS = TypstRenderErrors(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class PublicationRenderAttempt:
+    """Render lifecycle state for the publication review preview."""
+
+    status: TypstRenderStatus
+    render: PublicationRender | None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedPublicationRender:
+    proposed: PublicationRender
+    template_bundle: TypstTemplateBundle
+    font_bundle: FontBundleSnapshot
+    build_source: Callable[[], TypstRenderSource]
+
+
 class PublicationRenderService:
     def __init__(
         self,
@@ -149,6 +172,52 @@ class PublicationRenderService:
         )
 
     async def render_pdf(self, publication_artifact_id: UUID) -> PublicationRender:
+        prepared = await self._prepare(publication_artifact_id)
+        return await self._runner.run(
+            prepared.proposed,
+            template_bundle=prepared.template_bundle,
+            font_bundle=prepared.font_bundle,
+            build_source=prepared.build_source,
+        )
+
+    async def render_preview(self, publication_artifact_id: UUID) -> PublicationRenderAttempt:
+        """Run or inspect the shared render lifecycle without hiding its state."""
+        try:
+            prepared = await self._prepare(publication_artifact_id)
+        except (PublicationRenderError, TypstCompilationError) as exc:
+            return PublicationRenderAttempt(
+                status=TypstRenderStatus.FAILED,
+                render=None,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+
+        try:
+            render = await self._runner.run(
+                prepared.proposed,
+                template_bundle=prepared.template_bundle,
+                font_bundle=prepared.font_bundle,
+                build_source=prepared.build_source,
+            )
+        except (PublicationRenderError, TypstCompilationError) as exc:
+            async with self._uow_factory() as uow:
+                persisted_render = await uow.publication_renders.get_by_input_hash(
+                    prepared.proposed.input_hash
+                )
+            return PublicationRenderAttempt(
+                status=(
+                    persisted_render.status
+                    if persisted_render is not None
+                    else TypstRenderStatus.FAILED
+                ),
+                render=persisted_render,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+
+        return PublicationRenderAttempt(status=render.status, render=render)
+
+    async def _prepare(self, publication_artifact_id: UUID) -> _PreparedPublicationRender:
         async with self._uow_factory() as uow:
             artifact = await uow.production_artifacts.get(publication_artifact_id)
             if artifact is None:
@@ -244,8 +313,8 @@ class PublicationRenderService:
             except ValueError as exc:
                 raise PublicationRenderDocumentInvalidError(str(exc)) from exc
 
-        return await self._runner.run(
-            proposed,
+        return _PreparedPublicationRender(
+            proposed=proposed,
             template_bundle=template_bundle,
             font_bundle=font_bundle,
             build_source=build_source,

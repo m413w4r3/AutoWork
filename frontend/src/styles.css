@@ -2972,3 +2972,186 @@ h1 {
     width: 100%;
   }
 }
+
+.publication-pdf-preview,
+.publication-diagnostics {
+  display: grid;
+  gap: 0.9rem;
+  margin: 1.25rem 0;
+  padding: 1rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.publication-pdf-preview__header,
+.publication-lineage-panel__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.publication-pdf-preview__header h3,
+.publication-lineage-panel__header h4 {
+  margin: 0;
+}
+
+.publication-pdf-preview__metadata {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr));
+  gap: 0.75rem 1rem;
+  margin: 0;
+}
+
+.publication-pdf-preview__metadata dt {
+  color: #53635a;
+  font-size: 0.82rem;
+  font-weight: 700;
+}
+
+.publication-pdf-preview__metadata dd {
+  margin: 0.15rem 0 0;
+  overflow-wrap: anywhere;
+}
+
+.publication-pdf-preview__warning {
+  margin: 0;
+  padding: 0.75rem;
+  border-left: 4px solid #b36a00;
+  background: #fff4dc;
+  color: #654000;
+  font-weight: 700;
+}
+
+.publication-pdf-preview__viewer {
+  width: 100%;
+  min-height: min(78vh, 68rem);
+  border: 1px solid #aebdb3;
+  border-radius: 0.35rem;
+  background: #e8ece9;
+}
+
+.publication-preview__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(17rem, 22rem);
+  align-items: start;
+  gap: 1rem;
+}
+
+.publication-preview {
+  min-width: 0;
+  padding: 1.25rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 0.75rem;
+  background: #fff;
+  line-height: 1.65;
+}
+
+.publication-preview > section {
+  margin-top: 1.5rem;
+}
+
+.publication-preview__passage {
+  margin-block: 0.8rem;
+}
+
+.publication-preview__lineage-trigger {
+  padding: 0;
+  border: 0;
+  color: #1f6042;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.publication-preview__provenance {
+  margin-left: 0.4rem;
+  font-size: 0.85em;
+}
+
+.publication-preview__provenance::before {
+  content: "(";
+}
+
+.publication-preview__provenance::after {
+  content: ")";
+}
+
+.publication-preview figure {
+  margin: 0.8rem 0;
+}
+
+.publication-preview figure img {
+  display: block;
+  max-width: 100%;
+  max-height: 42rem;
+  margin-inline: auto;
+  object-fit: contain;
+}
+
+.publication-preview figcaption {
+  margin-top: 0.45rem;
+  color: #53635a;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.publication-lineage-panel {
+  position: sticky;
+  top: 1rem;
+  display: grid;
+  gap: 0.75rem;
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.publication-lineage-panel blockquote {
+  margin: 0;
+  padding-left: 0.8rem;
+  border-left: 3px solid #9bb9a3;
+}
+
+.publication-lineage-panel ul {
+  display: grid;
+  gap: 0.8rem;
+  margin: 0;
+  padding-left: 1.1rem;
+}
+
+.publication-lineage-panel li code {
+  overflow-wrap: anywhere;
+}
+
+.semantic-role--technical {
+  padding: 0.02em 0.16em;
+  border-radius: 0.2em;
+  background: #edf2ee;
+}
+
+.semantic-role--actor,
+.semantic-role--campaign,
+.semantic-role--malware,
+.semantic-role--tool,
+.semantic-role--product {
+  font-weight: 700;
+}
+
+@media (max-width: 800px) {
+  .publication-preview__layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .publication-lineage-panel {
+    position: static;
+    max-height: none;
+  }
+}

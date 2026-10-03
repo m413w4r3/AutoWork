@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { isProductionSynthesisV1 } from "../api/production";
@@ -255,17 +255,47 @@ it("ne rend pas une publication dont le schema n'est pas V4", async () => {
 it("affiche la publication V4 et ses enrichissements", async () => {
   vi.stubGlobal(
     "fetch",
-    vi.fn(() =>
-      Promise.resolve(
+    vi.fn((input: RequestInfo | URL) => {
+      if (urlOf(input).includes("/editorial_enrichment")) {
+        return Promise.resolve(
+          Response.json({
+            artifact_id: "editorial-enrichment-v4",
+            stage: "editorial_enrichment",
+            version: 2,
+            status: "verified",
+            metadata: {},
+            canonical_content: {
+              schema_version: "3",
+              warnings: ["figure_candidate_unavailable"],
+              resource_needs: [
+                {
+                  key: "need-command-telemetry",
+                  kind: "MEDIA",
+                  reason: "Illustration de télémétrie absente.",
+                },
+              ],
+            },
+          }),
+        );
+      }
+      return Promise.resolve(
         Response.json({
           artifact_id: "publication-v4",
           stage: "publication",
           version: 1,
           status: "verified",
           metadata: {
+            input_artifacts: {
+              editorial_enrichment_artifact_id: "editorial-enrichment-v4",
+            },
             diagnostics: {
               warnings_by_stage: {
                 synthesis: ["synthesis_output_invalid"],
+              },
+              synthesis: {
+                rejected_blocks: [
+                  { block_id: "B003", reason_code: "unsupported_claim" },
+                ],
               },
             },
           },
@@ -409,8 +439,8 @@ it("affiche la publication V4 et ses enrichissements", async () => {
             ],
           },
         }),
-      ),
-    ),
+      );
+    }),
   );
 
   renderArtifact("publication");
@@ -440,6 +470,10 @@ it("affiche la publication V4 et ses enrichissements", async () => {
   });
   expect(diagnosticsPanel).toHaveTextContent("synthesis_output_invalid");
   expect(
+    await within(diagnosticsPanel).findByText(/need-command-telemetry/),
+  ).toBeInTheDocument();
+  expect(diagnosticsPanel).toHaveTextContent("B003");
+  expect(
     diagnosticsPanel.compareDocumentPosition(referencesHeading) &
       Node.DOCUMENT_POSITION_FOLLOWING,
   ).toBeTruthy();
@@ -460,14 +494,30 @@ it("affiche la publication V4 et ses enrichissements", async () => {
     screen.getByRole("heading", { name: "Chaîne d’infection" }),
   ).toBeInTheDocument();
   expect(
-    screen.getByText("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
-  ).toBeInTheDocument();
+    screen.getByRole("img", { name: "Chaîne d’infection" }),
+  ).toHaveAttribute(
+    "src",
+    "/api/subjects/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/publication/assets/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  );
   expect(
-    screen.getByText("Figure 1 from the vendor report."),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("https://vendor.example/figure.png"),
-  ).toBeInTheDocument();
+    screen.getByRole("img", { name: "Architecture source." }),
+  ).toHaveAttribute(
+    "src",
+    "/api/subjects/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb/publication/assets/bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  );
+  const diagram = screen.getByRole("img", { name: "Chaîne d’infection" });
+  expect(diagram.closest("article")).not.toHaveTextContent(
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  );
+  expect(diagnosticsPanel.querySelector("pre")).toHaveTextContent(
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  );
+  expect(diagnosticsPanel.querySelector("pre")).toHaveTextContent(
+    "Figure 1 from the vendor report.",
+  );
+  expect(diagnosticsPanel.querySelector("pre")).toHaveTextContent(
+    "https://vendor.example/figure.png",
+  );
   expect(screen.getAllByRole("link", { name: "Rapport" })[0]).toHaveAttribute(
     "href",
     VENDOR_URL,
@@ -475,6 +525,260 @@ it("affiche la publication V4 et ses enrichissements", async () => {
   expect(
     screen.getAllByRole("link", { name: "IOC source" })[0],
   ).toHaveAttribute("href", IOC_URL);
+  const [lineageButton] = screen.getAllByRole("button", {
+    name: "Voir les sources et preuves",
+  });
+  if (!lineageButton) throw new Error("Aucun bouton de sources et preuves.");
+  fireEvent.click(lineageButton);
+  const lineagePanel = screen.getByRole("complementary", {
+    name: "Sources et preuves du passage",
+  });
+  expect(
+    within(lineagePanel).getByRole("link", { name: "Rapport" }),
+  ).toHaveAttribute("href", VENDOR_URL);
+  expect(lineagePanel).toHaveTextContent(EVIDENCE_KEY);
+});
+
+it("affiche le PDF compilé avec son artifact, son rendu et son statut", async () => {
+  const artifactId = "55555555-5555-4555-8555-555555555555";
+  const renderIdentity = "e".repeat(64);
+  const originalCreateObjectURL = Object.getOwnPropertyDescriptor(
+    URL,
+    "createObjectURL",
+  );
+  const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(
+    URL,
+    "revokeObjectURL",
+  );
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn().mockReturnValue("blob:publication-preview"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
+  });
+  let unmount: (() => void) | undefined;
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/publication/preview?")) {
+        return Promise.resolve(
+          Response.json({
+            status: "READY",
+            artifact_id: artifactId,
+            artifact_version: 8,
+            artifact_input_hash: "a".repeat(64),
+            current_artifact_id: artifactId,
+            current_artifact_version: 8,
+            render_id: "66666666-6666-4666-8666-666666666666",
+            render_identity: renderIdentity,
+            render_disposition: "ACCEPTED_VERSION",
+            published_edition_version: 12,
+            error_code: null,
+            error_message: null,
+            pdf_url: "/api/subjects/subject-1/publication/preview/pdf",
+          }),
+        );
+      }
+      if (url.endsWith("/publication/preview/pdf")) {
+        return Promise.resolve(
+          new Response(new Uint8Array([37, 80, 68, 70]), {
+            headers: { "Content-Type": "application/pdf" },
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          artifact_id: artifactId,
+          stage: "publication",
+          version: 8,
+          status: "verified",
+          metadata: {},
+          canonical_content: {
+            schema_version: "4",
+            subject_id: SYNTHESIS_SUBJECT_ID,
+            publication_language: "fr",
+            title: "Publication PDF",
+            lead: [],
+            sections: [],
+            timeline: [],
+            indicators: [],
+            sources: [],
+            uncertainties: [],
+            tables: [],
+            diagrams: [],
+            figures: [],
+          },
+        }),
+      );
+    }),
+  );
+
+  try {
+    unmount = renderArtifact("publication").unmount;
+
+    const viewer = await screen.findByTestId("publication-pdf-viewer");
+    expect(viewer).toHaveAttribute("type", "application/pdf");
+    expect(await screen.findByText("PDF prêt")).toBeInTheDocument();
+    expect(screen.getByText(renderIdentity)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Version acceptée de l’édition 12/),
+    ).toBeInTheDocument();
+  } finally {
+    unmount?.();
+    if (originalCreateObjectURL) {
+      Object.defineProperty(URL, "createObjectURL", originalCreateObjectURL);
+    }
+    if (originalRevokeObjectURL) {
+      Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectURL);
+    }
+  }
+});
+
+it("signale un PDF obsolète sans l’afficher avec la nouvelle proposition", async () => {
+  const currentId = "77777777-7777-4777-8777-777777777777";
+  const oldId = "88888888-8888-4888-8888-888888888888";
+  vi.stubGlobal(
+    "fetch",
+    vi.fn((input: RequestInfo | URL) => {
+      const url = urlOf(input);
+      if (url.includes("/publication/preview?")) {
+        return Promise.resolve(
+          Response.json({
+            status: "STALE",
+            artifact_id: oldId,
+            artifact_version: 2,
+            artifact_input_hash: "a".repeat(64),
+            current_artifact_id: currentId,
+            current_artifact_version: 3,
+            render_id: "99999999-9999-4999-8999-999999999999",
+            render_identity: "d".repeat(64),
+            render_disposition: "EXPLICIT_RENDER",
+            published_edition_version: null,
+            error_code: "publication_preview_stale",
+            error_message: "A newer artifact is current.",
+            pdf_url: null,
+          }),
+        );
+      }
+      return Promise.resolve(
+        Response.json({
+          artifact_id: currentId,
+          stage: "publication",
+          version: 3,
+          status: "verified",
+          metadata: {},
+          canonical_content: {
+            schema_version: "4",
+            subject_id: SYNTHESIS_SUBJECT_ID,
+            publication_language: "fr",
+            title: "Proposition récente",
+            lead: [],
+            sections: [],
+            timeline: [],
+            indicators: [],
+            sources: [],
+            uncertainties: [],
+            tables: [],
+            diagrams: [],
+            figures: [],
+          },
+        }),
+      );
+    }),
+  );
+
+  renderArtifact("publication");
+
+  expect(await screen.findByText("Obsolète")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "n’est pas affiché avec cette proposition",
+  );
+  expect(
+    screen.queryByTestId("publication-pdf-viewer"),
+  ).not.toBeInTheDocument();
+});
+
+it("applique les rôles typographiques sémantiques d’un document V5", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "publication-v5",
+        stage: "publication",
+        version: 5,
+        status: "verified",
+        metadata: {},
+        canonical_content: {
+          schema_version: "5",
+          subject_id: SYNTHESIS_SUBJECT_ID,
+          publication_language: "fr",
+          title: "APT Fjord utilise PowerShell",
+          lead: [
+            {
+              text: "APT Fjord lance PowerShell et déclenche un beacon.",
+              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+            },
+          ],
+          sections: [],
+          timeline: [],
+          indicators: [],
+          sources: [
+            {
+              source_document_id: VENDOR_DOCUMENT_ID,
+              canonical_url: VENDOR_URL,
+              title: "Rapport",
+              publisher: "Vendor",
+              published_at: null,
+              tier: "core",
+              kind: "publication",
+              role: "primary",
+            },
+          ],
+          uncertainties: [],
+          tables: [],
+          diagrams: [],
+          figures: [],
+          rich_text: {
+            schema_version: "1",
+            policy_version: "semantic-annotation-policy-v1",
+            paragraphs: [
+              {
+                anchor: "title",
+                spans: [
+                  { role: "actor", text: "APT Fjord" },
+                  { role: "text", text: " utilise PowerShell" },
+                ],
+              },
+              {
+                anchor: "lead:0001",
+                spans: [
+                  { role: "actor", text: "APT Fjord" },
+                  { role: "text", text: " lance " },
+                  { role: "command", text: "PowerShell" },
+                  { role: "text", text: " et déclenche un " },
+                  { role: "english_term", text: "beacon" },
+                  { role: "text", text: "." },
+                ],
+              },
+            ],
+          },
+        },
+      }),
+    ),
+  );
+
+  renderArtifact("publication");
+
+  expect(
+    await screen.findAllByText("APT Fjord", { selector: "strong" }),
+  ).toHaveLength(2);
+  expect(
+    screen.getByText("PowerShell", { selector: "code" }),
+  ).toBeInTheDocument();
+  expect(screen.getByText("beacon", { selector: "em" })).toBeInTheDocument();
 });
 
 it("affiche une publication V4 sans enrichissement comme une publication narrative", async () => {

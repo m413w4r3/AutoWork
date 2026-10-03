@@ -280,6 +280,7 @@ export interface ArtifactResponse {
   rendered_content?: string | null;
   canonical_content:
     | PublicationDocumentV4
+    | PublicationDocumentV5
     | ProductionExtractionV1
     | ProductionSynthesisV1
     | ExtractionDocumentV2
@@ -1027,6 +1028,68 @@ export interface PublicationDocumentV4 {
   figures: PublicationSourceFigureV1[];
 }
 
+export type PublicationSemanticRoleV1 =
+  | "text"
+  | "actor"
+  | "campaign"
+  | "malware"
+  | "tool"
+  | "product"
+  | "english_term"
+  | "technical"
+  | "technical_literal"
+  | "ioc"
+  | "path"
+  | "command"
+  | "protocol_field"
+  | "source"
+  | "proof";
+
+export interface PublicationSemanticSpanV1 {
+  role: PublicationSemanticRoleV1;
+  text: string;
+}
+
+export interface PublicationSemanticParagraphV1 {
+  anchor: string;
+  spans: PublicationSemanticSpanV1[];
+}
+
+export interface PublicationSemanticTextV1 {
+  schema_version: "1";
+  policy_version: string;
+  paragraphs: PublicationSemanticParagraphV1[];
+}
+
+export interface PublicationDocumentV5 extends Omit<
+  PublicationDocumentV4,
+  "schema_version"
+> {
+  schema_version: "5";
+  rich_text: PublicationSemanticTextV1;
+}
+
+export type PublicationDocument = PublicationDocumentV4 | PublicationDocumentV5;
+
+export type PublicationPreviewStatus =
+  "IN_PROGRESS" | "READY" | "FAILED" | "STALE";
+
+export interface PublicationArtifactPreview {
+  status: PublicationPreviewStatus;
+  artifact_id: string;
+  artifact_version: number;
+  artifact_input_hash: string;
+  current_artifact_id: string;
+  current_artifact_version: number;
+  render_id: string | null;
+  render_identity: string | null;
+  render_disposition: "ACCEPTED_VERSION" | "EXPLICIT_RENDER";
+  published_edition_version: number | null;
+  error_code: string | null;
+  error_message: string | null;
+  pdf_url: string | null;
+}
+
 export async function restartProductionWithNewSources(
   subjectId: string,
 ): Promise<{ run_id: string; replaced_run_id: string }> {
@@ -1224,10 +1287,42 @@ export async function getSynthesisArtifact(
   return request(`/api/subjects/${subjectId}/production/artifacts/synthesis`);
 }
 
+export async function getEditorialEnrichmentArtifact(
+  subjectId: string,
+): Promise<ArtifactResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/editorial_enrichment`,
+  );
+}
+
 export async function getPublicationArtifact(
   subjectId: string,
 ): Promise<ArtifactResponse> {
   return request(`/api/subjects/${subjectId}/production/artifacts/publication`);
+}
+
+export async function getPublicationArtifactPreview(
+  subjectId: string,
+  artifactId: string,
+): Promise<PublicationArtifactPreview> {
+  const params = new URLSearchParams({ artifact_id: artifactId });
+  return request(
+    `/api/subjects/${subjectId}/publication/preview?${params.toString()}`,
+  );
+}
+
+export async function getPublicationPreviewPdf(
+  preview: PublicationArtifactPreview,
+): Promise<Blob> {
+  if (preview.status !== "READY" || preview.pdf_url === null) {
+    throw new Error("Le PDF de cet artifact n’est pas disponible.");
+  }
+  const response = await fetch(preview.pdf_url);
+  if (!response.ok) throw await apiError(response);
+  if (!response.headers.get("content-type")?.includes("application/pdf")) {
+    throw new Error("La réponse de l’aperçu n’est pas un PDF.");
+  }
+  return response.blob();
 }
 
 // Edition production API

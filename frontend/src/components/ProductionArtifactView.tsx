@@ -1,13 +1,18 @@
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   getReferencesArtifact,
   getExtractionArtifact,
   getRelevanceProjectionArtifact,
   getSynthesisArtifact,
+  getEditorialEnrichmentArtifact,
   getPublicationArtifact,
+  getPublicationArtifactPreview,
+  getPublicationPreviewPdf,
   isProductionExtractionV1,
   isProductionSynthesisV1,
   type ArtifactResponse,
+  type PublicationArtifactPreview,
   type ProductionExtractionEvidenceV1,
   type ProductionExtractionOmissionReasonV1,
   type ProductionExtractionReuseStateV1,
@@ -18,9 +23,10 @@ import {
   type ProductionSynthesisParagraphV1,
   type ProductionSynthesisTimelineEntryV1,
   type ProductionSynthesisV1,
-  type PublicationDocumentV4,
+  type PublicationDocument,
   type PublicationDiagramV1,
   type PublicationEvidenceRefV1,
+  type PublicationSemanticRoleV1,
   type PublicationSourceFigureV1,
   type PublicationTableV1,
   type ExtractionDocumentV2,
@@ -71,10 +77,49 @@ function getArtifactFetcher(
   }
 }
 
-function isPublicationDocument(value: unknown): value is PublicationDocumentV4 {
+const SEMANTIC_ROLES = new Set<PublicationSemanticRoleV1>([
+  "text",
+  "actor",
+  "campaign",
+  "malware",
+  "tool",
+  "product",
+  "english_term",
+  "technical",
+  "technical_literal",
+  "ioc",
+  "path",
+  "command",
+  "protocol_field",
+  "source",
+  "proof",
+]);
+
+function isSemanticText(value: unknown): boolean {
   return (
     isRecord(value) &&
-    value.schema_version === "4" &&
+    value.schema_version === "1" &&
+    typeof value.policy_version === "string" &&
+    Array.isArray(value.paragraphs) &&
+    value.paragraphs.every(
+      (paragraph) =>
+        isRecord(paragraph) &&
+        typeof paragraph.anchor === "string" &&
+        Array.isArray(paragraph.spans) &&
+        paragraph.spans.every(
+          (span) =>
+            isRecord(span) &&
+            typeof span.role === "string" &&
+            SEMANTIC_ROLES.has(span.role as PublicationSemanticRoleV1) &&
+            typeof span.text === "string",
+        ),
+    )
+  );
+}
+
+function isPublicationDocument(value: unknown): value is PublicationDocument {
+  if (!isRecord(value)) return false;
+  const common =
     typeof value.title === "string" &&
     typeof value.subject_id === "string" &&
     Array.isArray(value.lead) &&
@@ -85,7 +130,11 @@ function isPublicationDocument(value: unknown): value is PublicationDocumentV4 {
     Array.isArray(value.uncertainties) &&
     Array.isArray(value.tables) &&
     Array.isArray(value.diagrams) &&
-    Array.isArray(value.figures)
+    Array.isArray(value.figures);
+  if (!common) return false;
+  return (
+    value.schema_version === "4" ||
+    (value.schema_version === "5" && isSemanticText(value.rich_text))
   );
 }
 
@@ -1011,11 +1060,87 @@ function ProductionSynthesisView({
   );
 }
 
+function semanticContent(
+  document: PublicationDocument,
+  text: string,
+  anchor: string,
+) {
+  if (document.schema_version !== "5") return text;
+  const paragraph = document.rich_text.paragraphs.find(
+    (item) => item.anchor === anchor,
+  );
+  if (
+    !paragraph ||
+    paragraph.spans.map((span) => span.text).join("") !== text
+  ) {
+    return text;
+  }
+  return paragraph.spans.map((span, index) => {
+    const key = `${anchor}-${index}`;
+    switch (span.role) {
+      case "actor":
+      case "campaign":
+      case "malware":
+      case "tool":
+      case "product":
+        return (
+          <strong
+            className={`semantic-role semantic-role--${span.role}`}
+            key={key}
+          >
+            {span.text}
+          </strong>
+        );
+      case "english_term":
+        return (
+          <em className="semantic-role semantic-role--english-term" key={key}>
+            {span.text}
+          </em>
+        );
+      case "technical":
+        return (
+          <span className="semantic-role semantic-role--technical" key={key}>
+            {span.text}
+          </span>
+        );
+      case "technical_literal":
+      case "ioc":
+      case "path":
+      case "command":
+      case "protocol_field":
+        return (
+          <code
+            className={`semantic-role semantic-role--${span.role}`}
+            key={key}
+          >
+            {span.text}
+          </code>
+        );
+      case "source":
+      case "proof":
+        return (
+          <span
+            className={`semantic-role semantic-role--${span.role}`}
+            key={key}
+          >
+            {span.text}
+          </span>
+        );
+      case "text":
+        return <span key={key}>{span.text}</span>;
+    }
+  });
+}
+
 export function PublicationDocumentView({
   document,
 }: {
-  document: PublicationDocumentV4;
+  document: PublicationDocument;
 }) {
+  const [selectedPassage, setSelectedPassage] = useState<{
+    text: string;
+    evidenceRefs: PublicationEvidenceRefV1[];
+  } | null>(null);
   const sources = new Map(
     document.sources.map((source) => [source.source_document_id, source]),
   );
@@ -1037,15 +1162,31 @@ export function PublicationDocumentView({
   const paragraph = (
     item: { text: string; evidence_refs: PublicationEvidenceRefV1[] },
     key: string,
+    anchor: string,
   ) => (
-    <p key={key}>
-      {item.text}
-      {provenance(item.evidence_refs.map((ref) => ref.source_document_id))}
-    </p>
+    <div className="publication-preview__passage" key={key}>
+      <p>
+        {semanticContent(document, item.text, anchor)}
+        {provenance(item.evidence_refs.map((ref) => ref.source_document_id))}
+      </p>
+      <button
+        className="publication-preview__lineage-trigger"
+        onClick={() =>
+          setSelectedPassage({
+            text: item.text,
+            evidenceRefs: item.evidence_refs,
+          })
+        }
+        type="button"
+      >
+        Voir les sources et preuves
+      </button>
+    </div>
   );
   const enrichmentsAt = (kind: string, sectionIndex: number | null) => (
     <>
       <PublicationTablesView
+        document={document}
         tables={document.tables.filter(
           (item) =>
             item.placement.kind === kind &&
@@ -1053,6 +1194,8 @@ export function PublicationDocumentView({
         )}
       />
       <PublicationDiagramsView
+        document={document}
+        subjectId={document.subject_id}
         diagrams={document.diagrams.filter(
           (item) =>
             item.placement.kind === kind &&
@@ -1060,6 +1203,8 @@ export function PublicationDocumentView({
         )}
       />
       <PublicationFiguresView
+        document={document}
+        subjectId={document.subject_id}
         figures={document.figures.filter(
           (item) =>
             item.placement.kind === kind &&
@@ -1069,96 +1214,224 @@ export function PublicationDocumentView({
     </>
   );
   return (
-    <article className="publication-preview">
-      <h3>{document.title}</h3>
-      <section aria-label="RÉFÉRENCES">
-        <h4>RÉFÉRENCES</h4>
-        {document.timeline.length > 0 ? (
-          <div>
-            <h5>Chronologie</h5>
-            {document.timeline.map((item, index) => (
-              <p key={`timeline-${index}`}>
-                {item.event_date || item.date_text ? (
-                  <strong>{item.date_text || item.event_date} : </strong>
-                ) : null}
-                {item.text}
-                {provenance(
-                  item.evidence_refs.map((ref) => ref.source_document_id),
-                )}
-              </p>
-            ))}
-          </div>
-        ) : null}
-        {enrichmentsAt("after_timeline", null)}
-        {document.sources.length > 0 ? (
-          <section>
-            <h5>Sources complémentaires</h5>
-            <ul>
-              {document.sources.map((source) => (
-                <li key={source.source_document_id}>
-                  <a
-                    href={source.canonical_url}
-                    rel="noreferrer"
-                    target="_blank"
+    <div className="publication-preview__layout">
+      <article className="publication-preview">
+        <h3>{semanticContent(document, document.title, "title")}</h3>
+        <section aria-label="RÉFÉRENCES">
+          <h4>RÉFÉRENCES</h4>
+          {document.timeline.length > 0 ? (
+            <div>
+              <h5>Chronologie</h5>
+              {document.timeline.map((item, index) => {
+                const anchor = `timeline:${String(index + 1).padStart(4, "0")}`;
+                return (
+                  <div
+                    className="publication-preview__passage"
+                    key={`timeline-${index}`}
                   >
-                    {source.title || source.canonical_url}
-                  </a>
-                  {source.publisher ? ` — ${source.publisher}` : ""}
-                </li>
-              ))}
-            </ul>
-          </section>
-        ) : null}
-      </section>
-      <section aria-label="SYNTHÈSE">
-        <h4>SYNTHÈSE</h4>
-        {document.lead.map((item, index) => paragraph(item, `lead-${index}`))}
-        {enrichmentsAt("after_lead", null)}
-        {document.sections.map((section, index) => (
-          <div key={`${section.kind}-${index}`}>
-            {section.paragraphs.map((item, paragraphIndex) =>
-              paragraph(item, `${index}-${paragraphIndex}`),
-            )}
-            {enrichmentsAt("after_section", index)}
-          </div>
-        ))}
-        {enrichmentsAt("end", null)}
-      </section>
-      {document.indicators.length > 0 && (
-        <section aria-label="ANNEXE TECHNIQUE — INDICATEURS">
-          <h4>ANNEXE TECHNIQUE — INDICATEURS</h4>
-          {document.indicators.map((group) => (
-            <div key={group.artifact_type}>
-              <h5>{IOC_LABELS[group.artifact_type] || group.artifact_type}</h5>
+                    <p>
+                      {item.event_date || item.date_text ? (
+                        <strong>{item.date_text || item.event_date} : </strong>
+                      ) : null}
+                      {semanticContent(document, item.text, anchor)}
+                      {provenance(
+                        item.evidence_refs.map((ref) => ref.source_document_id),
+                      )}
+                    </p>
+                    <button
+                      className="publication-preview__lineage-trigger"
+                      onClick={() =>
+                        setSelectedPassage({
+                          text: item.text,
+                          evidenceRefs: item.evidence_refs,
+                        })
+                      }
+                      type="button"
+                    >
+                      Voir les sources et preuves
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
+          {enrichmentsAt("after_timeline", null)}
+          {document.sources.length > 0 ? (
+            <section>
+              <h5>Sources complémentaires</h5>
               <ul>
-                {group.indicators.map((item) => (
-                  <li key={`${item.artifact_type}-${item.normalized_value}`}>
-                    <code>{item.normalized_value}</code>
-                    {provenance(item.source_document_ids)}
+                {document.sources.map((source) => (
+                  <li key={source.source_document_id}>
+                    <a
+                      href={source.canonical_url}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      {source.title || source.canonical_url}
+                    </a>
+                    {source.publisher ? ` — ${source.publisher}` : ""}
                   </li>
                 ))}
               </ul>
+            </section>
+          ) : null}
+        </section>
+        <section aria-label="SYNTHÈSE">
+          <h4>SYNTHÈSE</h4>
+          {document.lead.map((item, index) =>
+            paragraph(
+              item,
+              `lead-${index}`,
+              `lead:${String(index + 1).padStart(4, "0")}`,
+            ),
+          )}
+          {enrichmentsAt("after_lead", null)}
+          {document.sections.map((section, index) => (
+            <div key={`${section.kind}-${index}`}>
+              {section.paragraphs.map((item, paragraphIndex) =>
+                paragraph(
+                  item,
+                  `${index}-${paragraphIndex}`,
+                  `section:${index}:paragraph:${String(paragraphIndex + 1).padStart(4, "0")}`,
+                ),
+              )}
+              {enrichmentsAt("after_section", index)}
             </div>
           ))}
+          {enrichmentsAt("end", null)}
         </section>
-      )}
-    </article>
+        {document.indicators.length > 0 && (
+          <section aria-label="ANNEXE TECHNIQUE — INDICATEURS">
+            <h4>ANNEXE TECHNIQUE — INDICATEURS</h4>
+            {document.indicators.map((group) => (
+              <div key={group.artifact_type}>
+                <h5>
+                  {IOC_LABELS[group.artifact_type] || group.artifact_type}
+                </h5>
+                <ul>
+                  {group.indicators.map((item) => (
+                    <li key={`${item.artifact_type}-${item.normalized_value}`}>
+                      <code>{item.normalized_value}</code>
+                      {provenance(item.source_document_ids)}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </section>
+        )}
+      </article>
+      {selectedPassage ? (
+        <aside
+          aria-label="Sources et preuves du passage"
+          className="publication-lineage-panel"
+        >
+          <div className="publication-lineage-panel__header">
+            <h4>Sources et preuves</h4>
+            <button
+              aria-label="Fermer le panneau des preuves"
+              className="button button--secondary"
+              onClick={() => setSelectedPassage(null)}
+              type="button"
+            >
+              Fermer
+            </button>
+          </div>
+          <blockquote>{selectedPassage.text}</blockquote>
+          <ul>
+            {selectedPassage.evidenceRefs.map((ref) => {
+              const source = sources.get(ref.source_document_id);
+              return (
+                <li
+                  key={`${ref.source_document_id}-${ref.kind}-${ref.evidence_key}`}
+                >
+                  <p>
+                    {source ? (
+                      <a
+                        href={source.canonical_url}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        {source.title ||
+                          source.publisher ||
+                          source.canonical_url}
+                      </a>
+                    ) : (
+                      <span>Source {ref.source_document_id}</span>
+                    )}
+                    {" · "}
+                    {ref.kind}
+                  </p>
+                  <code>{ref.evidence_key}</code>
+                </li>
+              );
+            })}
+          </ul>
+        </aside>
+      ) : null}
+    </div>
   );
 }
 
 function PublicationDiagnosticsPanel({
   diagnostics,
+  document,
+  editorialEnrichment,
 }: {
   diagnostics: unknown;
+  document: PublicationDocument;
+  editorialEnrichment: ArtifactResponse | undefined;
 }) {
-  const serialized = JSON.stringify(diagnostics ?? {}, null, 2);
+  const mediaAssets = [
+    ...document.diagrams.map((diagram) => ({
+      asset_id: diagram.asset_id,
+      key: diagram.key,
+      kind: diagram.kind,
+      mime_type: "image/svg+xml",
+      placement: diagram.placement,
+    })),
+    ...document.figures.map((figure) => ({
+      asset_id: figure.asset_id,
+      key: figure.key,
+      kind: "source_figure",
+      sha256: figure.sha256,
+      mime_type: figure.mime_type,
+      byte_size: figure.byte_size,
+      source_document_id: figure.source_document_id,
+      source_url: figure.source_url,
+      provenance: figure.provenance,
+      locator: figure.locator,
+      placement: figure.placement,
+    })),
+  ];
+  const serialized = JSON.stringify(
+    {
+      diagnostics: diagnostics ?? {},
+      editorial_enrichment: editorialEnrichment
+        ? {
+            artifact_id: editorialEnrichment.artifact_id,
+            version: editorialEnrichment.version,
+            metadata: editorialEnrichment.metadata,
+            canonical_content: editorialEnrichment.canonical_content,
+          }
+        : null,
+      media_assets: mediaAssets,
+    },
+    null,
+    2,
+  );
+  const diagnosticsValue = diagnostics ?? {};
+  const hasDiagnostics =
+    typeof diagnosticsValue === "object" &&
+    diagnosticsValue !== null &&
+    Object.keys(diagnosticsValue).length > 0;
   return (
     <section
       className="publication-diagnostics"
       aria-label="Diagnostics de publication"
     >
       <h3>Diagnostics techniques</h3>
-      {serialized === "{}" ? (
+      {!hasDiagnostics && mediaAssets.length === 0 ? (
         <p>Aucun diagnostic technique.</p>
       ) : (
         <pre>{serialized}</pre>
@@ -1167,24 +1440,49 @@ function PublicationDiagnosticsPanel({
   );
 }
 
-function PublicationTablesView({ tables }: { tables: PublicationTableV1[] }) {
+function recordValue(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function PublicationTablesView({
+  document,
+  tables,
+}: {
+  document: PublicationDocument;
+  tables: PublicationTableV1[];
+}) {
   if (tables.length === 0) return null;
   return (
     <section>
       <h4>Tableaux</h4>
       {tables.map((table) => (
         <article key={table.key}>
-          <h5>{table.title}</h5>
-          <p>
-            {table.key} · {table.kind}
-          </p>
-          {table.caption && <p>{table.caption}</p>}
-          <p>Placement : {table.placement.kind}</p>
+          <h5>
+            {semanticContent(document, table.title, `table:${table.key}:title`)}
+          </h5>
+          {table.caption && (
+            <p>
+              {semanticContent(
+                document,
+                table.caption,
+                `table:${table.key}:caption`,
+              )}
+            </p>
+          )}
           <table>
             <thead>
               <tr>
-                {table.columns.map((column) => (
-                  <th key={column.key}>{column.label}</th>
+                {table.columns.map((column, columnIndex) => (
+                  <th key={column.key}>
+                    {semanticContent(
+                      document,
+                      column.label,
+                      `table:${table.key}:column:${String(columnIndex + 1).padStart(4, "0")}`,
+                    )}
+                  </th>
                 ))}
                 <th>Preuves</th>
               </tr>
@@ -1193,7 +1491,13 @@ function PublicationTablesView({ tables }: { tables: PublicationTableV1[] }) {
               {table.rows.map((row, rowIndex) => (
                 <tr key={rowIndex}>
                   {row.cells.map((cell, cellIndex) => (
-                    <td key={cellIndex}>{cell}</td>
+                    <td key={cellIndex}>
+                      {semanticContent(
+                        document,
+                        cell,
+                        `table:${table.key}:row:${String(rowIndex + 1).padStart(4, "0")}:cell:${String(cellIndex + 1).padStart(4, "0")}`,
+                      )}
+                    </td>
                   ))}
                   <td>{row.evidence_refs.length} preuves</td>
                 </tr>
@@ -1207,8 +1511,12 @@ function PublicationTablesView({ tables }: { tables: PublicationTableV1[] }) {
 }
 
 function PublicationDiagramsView({
+  document,
+  subjectId,
   diagrams,
 }: {
+  document: PublicationDocument;
+  subjectId: string;
   diagrams: PublicationDiagramV1[];
 }) {
   if (diagrams.length === 0) return null;
@@ -1217,20 +1525,29 @@ function PublicationDiagramsView({
       <h4>Diagrammes</h4>
       {diagrams.map((diagram) => (
         <article key={diagram.key}>
-          <h5>{diagram.title}</h5>
-          <p>
-            {diagram.key} · {diagram.kind} · {diagram.direction}
-          </p>
-          <p>
-            {diagram.nodes.length} nœuds · {diagram.edges.length} relations
-          </p>
-          <dl>
-            <dt>Asset ID</dt>
-            <dd>{diagram.asset_id}</dd>
-            <dt>Placement</dt>
-            <dd>{diagram.placement.kind}</dd>
-          </dl>
-          {diagram.caption && <p>{diagram.caption}</p>}
+          <h5>
+            {semanticContent(
+              document,
+              diagram.title,
+              `diagram:${diagram.key}:title`,
+            )}
+          </h5>
+          <figure>
+            <img
+              alt={diagram.title}
+              loading="lazy"
+              src={`/api/subjects/${encodeURIComponent(subjectId)}/publication/assets/${encodeURIComponent(diagram.asset_id)}`}
+            />
+            {diagram.caption ? (
+              <figcaption>
+                {semanticContent(
+                  document,
+                  diagram.caption,
+                  `diagram:${diagram.key}:caption`,
+                )}
+              </figcaption>
+            ) : null}
+          </figure>
         </article>
       ))}
     </section>
@@ -1238,8 +1555,12 @@ function PublicationDiagramsView({
 }
 
 function PublicationFiguresView({
+  document,
+  subjectId,
   figures,
 }: {
+  document: PublicationDocument;
+  subjectId: string;
   figures: PublicationSourceFigureV1[];
 }) {
   if (figures.length === 0) return null;
@@ -1248,32 +1569,150 @@ function PublicationFiguresView({
       <h4>Figures source</h4>
       {figures.map((figure) => (
         <article key={figure.key}>
-          <h5>{figure.key}</h5>
-          <p>{figure.caption}</p>
-          <dl>
-            <dt>Provenance</dt>
-            <dd>{figure.provenance}</dd>
-            <dt>Source URL</dt>
-            <dd>
-              <a href={figure.source_url} rel="noreferrer" target="_blank">
-                {figure.source_url}
-              </a>
-            </dd>
-            <dt>Asset ID</dt>
-            <dd>{figure.asset_id}</dd>
-            <dt>SHA-256</dt>
-            <dd>{figure.sha256}</dd>
-            <dt>MIME</dt>
-            <dd>{figure.mime_type}</dd>
-            <dt>Taille</dt>
-            <dd>{figure.byte_size} octets</dd>
-            <dt>Locator</dt>
-            <dd>{JSON.stringify(figure.locator)}</dd>
-            <dt>Placement</dt>
-            <dd>{figure.placement.kind}</dd>
-          </dl>
+          <figure>
+            <img
+              alt={figure.caption || "Figure issue de la source"}
+              loading="lazy"
+              src={`/api/subjects/${encodeURIComponent(subjectId)}/publication/assets/${encodeURIComponent(figure.asset_id)}`}
+            />
+            {figure.caption ? (
+              <figcaption>
+                {semanticContent(
+                  document,
+                  figure.caption,
+                  `figure:${figure.key}:caption`,
+                )}
+              </figcaption>
+            ) : null}
+          </figure>
         </article>
       ))}
+    </section>
+  );
+}
+
+const PUBLICATION_PREVIEW_STATUS_LABELS: Record<string, string> = {
+  IN_PROGRESS: "Rendu en cours",
+  READY: "PDF prêt",
+  FAILED: "Échec du rendu",
+  STALE: "Obsolète",
+};
+
+function PublicationPdfPanel({
+  artifact,
+  preview,
+  pdf,
+  loading,
+  error,
+}: {
+  artifact: ArtifactResponse;
+  preview: PublicationArtifactPreview | undefined;
+  pdf: Blob | undefined;
+  loading: boolean;
+  error: Error | null;
+}) {
+  const [objectUrl, setObjectUrl] = useState<string | null>(null);
+  useEffect(() => {
+    if (!pdf) {
+      setObjectUrl(null);
+      return;
+    }
+    const nextUrl = URL.createObjectURL(pdf);
+    setObjectUrl(nextUrl);
+    return () => URL.revokeObjectURL(nextUrl);
+  }, [pdf]);
+
+  const stale =
+    preview?.status === "STALE" ||
+    (preview !== undefined && preview.artifact_id !== artifact.artifact_id) ||
+    (preview !== undefined && preview.artifact_version !== artifact.version) ||
+    (preview !== undefined &&
+      preview.current_artifact_id !== preview.artifact_id);
+  const currentId = preview?.current_artifact_id ?? artifact.artifact_id;
+
+  return (
+    <section
+      className="publication-pdf-preview"
+      aria-label="Aperçu PDF compilé"
+    >
+      <div className="publication-pdf-preview__header">
+        <h3>PDF compilé</h3>
+        <span
+          className={`badge is-${stale ? "stale" : (preview?.status ?? "loading").toLowerCase()}`}
+          role="status"
+        >
+          {stale
+            ? PUBLICATION_PREVIEW_STATUS_LABELS.STALE
+            : (preview && PUBLICATION_PREVIEW_STATUS_LABELS[preview.status]) ||
+              (loading ? "Préparation du PDF" : "État indisponible")}
+        </span>
+      </div>
+      {preview ? (
+        <dl className="publication-pdf-preview__metadata">
+          <div>
+            <dt>Artifact</dt>
+            <dd>
+              {preview.artifact_id} · version {preview.artifact_version}
+            </dd>
+          </div>
+          <div>
+            <dt>Identité du rendu</dt>
+            <dd>{preview.render_identity ?? "En attente de calcul"}</dd>
+          </div>
+          <div>
+            <dt>Version publiée</dt>
+            <dd>
+              {preview.render_disposition === "ACCEPTED_VERSION"
+                ? `Version acceptée de l’édition ${preview.published_edition_version ?? ""}`
+                : "Rendu explicite de cet artifact"}
+            </dd>
+          </div>
+        </dl>
+      ) : null}
+      {stale ? (
+        <p className="publication-pdf-preview__warning" role="alert">
+          Ce PDF correspond à l’artifact{" "}
+          {preview?.artifact_id ?? artifact.artifact_id}, version{" "}
+          {preview?.artifact_version ?? artifact.version}. L’artifact courant
+          est {currentId}, version{" "}
+          {preview?.current_artifact_version ?? artifact.version}; le PDF
+          obsolète n’est pas affiché avec cette proposition.
+        </p>
+      ) : null}
+      {preview?.status === "IN_PROGRESS" ? (
+        <p aria-live="polite">
+          Le rendu Typst est en cours. Cette vue se mettra à jour
+          automatiquement.
+        </p>
+      ) : null}
+      {preview?.status === "FAILED" ? (
+        <p className="error-message" role="alert">
+          {preview.error_message ??
+            preview.error_code ??
+            "Le PDF n’a pas pu être compilé."}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="error-message" role="alert">
+          {String(error)}
+        </p>
+      ) : null}
+      {preview?.status === "READY" && !stale && objectUrl ? (
+        <object
+          aria-label={`PDF de l’artifact ${preview.artifact_id}, version ${preview.artifact_version}`}
+          className="publication-pdf-preview__viewer"
+          data={objectUrl}
+          data-testid="publication-pdf-viewer"
+          type="application/pdf"
+        >
+          <p>
+            Le lecteur PDF du navigateur n’est pas disponible.{" "}
+            <a href={objectUrl} rel="noreferrer" target="_blank">
+              Ouvrir le PDF
+            </a>
+          </p>
+        </object>
+      ) : null}
     </section>
   );
 }
@@ -1292,6 +1731,74 @@ export function ProductionArtifactView({
   } = useQuery({
     queryKey: ["production-artifact", subjectId, stage],
     queryFn: () => fetcher(subjectId),
+    refetchInterval: stage === "publication" ? 2500 : false,
+  });
+
+  const publicationDocument =
+    stage === "publication" &&
+    artifact &&
+    isPublicationDocument(artifact.canonical_content)
+      ? artifact.canonical_content
+      : null;
+  const publicationInputArtifacts = recordValue(
+    artifact?.metadata.input_artifacts,
+  );
+  const expectedEditorialEnrichmentArtifactId =
+    publicationInputArtifacts?.editorial_enrichment_artifact_id;
+  const editorialEnrichmentArtifactQuery = useQuery({
+    queryKey: [
+      "production-artifact",
+      subjectId,
+      "editorial_enrichment",
+      expectedEditorialEnrichmentArtifactId,
+    ],
+    queryFn: () => getEditorialEnrichmentArtifact(subjectId),
+    enabled:
+      publicationDocument !== null &&
+      typeof expectedEditorialEnrichmentArtifactId === "string",
+  });
+  const editorialEnrichmentArtifact =
+    typeof expectedEditorialEnrichmentArtifactId === "string" &&
+    editorialEnrichmentArtifactQuery.data?.artifact_id ===
+      expectedEditorialEnrichmentArtifactId
+      ? editorialEnrichmentArtifactQuery.data
+      : undefined;
+  const publicationPreviewQuery = useQuery({
+    queryKey: [
+      "publication-preview",
+      subjectId,
+      artifact?.artifact_id,
+      artifact?.version,
+    ],
+    queryFn: () => {
+      if (!artifact?.artifact_id) {
+        throw new Error("Aucun artifact de publication à rendre.");
+      }
+      return getPublicationArtifactPreview(subjectId, artifact.artifact_id);
+    },
+    enabled: publicationDocument !== null,
+    refetchInterval: (query) =>
+      query.state.data?.status === "IN_PROGRESS" ? 1500 : false,
+  });
+  const publicationPreview = publicationPreviewQuery.data;
+  const publicationPdfQuery = useQuery({
+    queryKey: [
+      "publication-preview-pdf",
+      subjectId,
+      artifact?.artifact_id,
+      publicationPreview?.render_identity,
+    ],
+    queryFn: () => {
+      if (!publicationPreview) {
+        throw new Error("Les métadonnées du PDF sont indisponibles.");
+      }
+      return getPublicationPreviewPdf(publicationPreview);
+    },
+    enabled:
+      publicationDocument !== null &&
+      publicationPreview?.status === "READY" &&
+      publicationPreview.artifact_id === artifact?.artifact_id,
+    retry: false,
   });
 
   // Canonical evidence presentation needs the exact source metadata, never a
@@ -1381,6 +1888,7 @@ export function ProductionArtifactView({
       </div>
 
       {stage !== "extraction" &&
+        stage !== "publication" &&
         artifact.metadata &&
         Object.keys(artifact.metadata).length > 0 && (
           <div className="artifact-metadata">
@@ -1391,15 +1899,23 @@ export function ProductionArtifactView({
           </div>
         )}
 
-      {stage === "publication" &&
-        isPublicationDocument(artifact.canonical_content) && (
-          <>
-            <PublicationDiagnosticsPanel
-              diagnostics={artifact.metadata.diagnostics}
-            />
-            <PublicationDocumentView document={artifact.canonical_content} />
-          </>
-        )}
+      {stage === "publication" && publicationDocument && (
+        <>
+          <PublicationPdfPanel
+            artifact={artifact}
+            preview={publicationPreview}
+            pdf={publicationPdfQuery.data}
+            loading={publicationPreviewQuery.isLoading}
+            error={publicationPreviewQuery.error ?? publicationPdfQuery.error}
+          />
+          <PublicationDiagnosticsPanel
+            diagnostics={artifact.metadata}
+            document={publicationDocument}
+            editorialEnrichment={editorialEnrichmentArtifact}
+          />
+          <PublicationDocumentView document={publicationDocument} />
+        </>
+      )}
 
       {stage === "extraction" &&
         isProductionExtractionV1(artifact.canonical_content) && (

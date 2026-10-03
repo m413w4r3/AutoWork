@@ -33,6 +33,15 @@ class SqlAlchemyPublicationRenderRepository:
         )
         return _publication_render_from_row(row) if row is not None else None
 
+    async def get_latest_for_artifact(self, artifact_id: UUID) -> PublicationRender | None:
+        row = await self._session.scalar(
+            select(PublicationRenderRow)
+            .where(PublicationRenderRow.publication_artifact_id == artifact_id)
+            .order_by(PublicationRenderRow.created_at.desc(), PublicationRenderRow.id.desc())
+            .limit(1)
+        )
+        return _publication_render_from_row(row) if row is not None else None
+
     async def acquire_for_render(
         self, proposed: PublicationRender, *, stale_running_before: datetime
     ) -> TypstRenderAcquisition[PublicationRender]:

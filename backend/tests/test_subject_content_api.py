@@ -14,6 +14,7 @@ from httpx import ASGITransport, AsyncClient
 from cti_app.api.subject_content import router
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.application.publication_rendering import (
+    PublicationRenderAttempt,
     PublicationRenderDocumentInvalidError,
     PublicationRenderStorageFailedError,
 )
@@ -31,6 +32,8 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     publication_document_v4_to_json,
 )
+from cti_app.domain.publication_render import PublicationPreviewStatus
+from cti_app.domain.typst_render import TypstRenderStatus
 
 SUBJECT_ID = uuid4()
 
@@ -66,6 +69,50 @@ class _Artifacts:
         ]
         return max(matches, key=lambda artifact: artifact.version) if matches else None
 
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return next((item for item in self.artifacts if item.id == artifact_id), None)
+
+
+class _PublicationRenders:
+    def __init__(self) -> None:
+        self.renders: dict[UUID, object] = {}
+
+    async def get_latest_for_artifact(self, artifact_id: UUID) -> object | None:
+        matches = [
+            render
+            for render in self.renders.values()
+            if getattr(render, "publication_artifact_id", None) == artifact_id
+        ]
+        return matches[-1] if matches else None
+
+    async def get_by_input_hash(self, input_hash: str) -> object | None:
+        return next(
+            (
+                render
+                for render in self.renders.values()
+                if getattr(render, "input_hash", None) == input_hash
+            ),
+            None,
+        )
+
+
+class _PublicationManifests:
+    def __init__(self) -> None:
+        self.manifest: object | None = None
+
+    async def get_latest_for_edition(self, edition_id: UUID) -> object | None:
+        del edition_id
+        return self.manifest
+
+
+class _EditionReleases:
+    def __init__(self) -> None:
+        self.release: object | None = None
+
+    async def get_by_manifest(self, manifest_id: UUID) -> object | None:
+        del manifest_id
+        return self.release
+
 
 class _Sources:
     def __init__(self, values: list[SourceDocument]) -> None:
@@ -97,6 +144,9 @@ class _Uow:
         self.production_artifacts = _Artifacts(artifacts or [])
         self.source_documents = _Sources(sources or [])
         self.samples = _Samples(samples or [])
+        self.publication_renders = _PublicationRenders()
+        self.publication_manifests = _PublicationManifests()
+        self.edition_releases = _EditionReleases()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -138,10 +188,19 @@ class _ExplodingPayloads(_Payloads):
 
 
 class _PublicationRenderService:
-    def __init__(self, *, result: object | None = None, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        result: object | None = None,
+        error: Exception | None = None,
+        preview_attempt: object | None = None,
+    ) -> None:
         self.result = result
         self.error = error
+        self.preview_attempt = preview_attempt
         self.artifact_ids: list[UUID] = []
+        self.preview_compile_count = 0
+        self._cached_preview_attempt: object | None = None
 
     async def render_pdf(self, artifact_id: UUID) -> object:
         self.artifact_ids.append(artifact_id)
@@ -149,6 +208,19 @@ class _PublicationRenderService:
             raise self.error
         assert self.result is not None
         return self.result
+
+    async def render_preview(self, artifact_id: UUID) -> object:
+        self.artifact_ids.append(artifact_id)
+        if self.error is not None:
+            raise self.error
+        if self._cached_preview_attempt is not None:
+            return self._cached_preview_attempt
+        assert self.preview_attempt is not None
+        attempt_status = getattr(self.preview_attempt, "status", None)
+        if attempt_status is TypstRenderStatus.SUCCEEDED:
+            self.preview_compile_count += 1
+            self._cached_preview_attempt = self.preview_attempt
+        return self.preview_attempt
 
 
 def _app(
@@ -161,6 +233,7 @@ def _app(
     app.state.subject_content_service = SubjectContentService(
         cast(UnitOfWorkFactory, lambda: uow), payloads
     )
+    app.state.uow_factory = lambda: uow
     app.state.production_artifact_store = payloads
     if publication_render_service is not None:
         app.state.publication_render_service = publication_render_service
@@ -307,6 +380,7 @@ async def test_subject_publication_pdf_uses_current_verified_artifact(
     output_blob_id = uuid4()
     pdf_bytes = b"%PDF-1.7\npublication"
     render = SimpleNamespace(
+        input_hash="e" * 64,
         output_blob_id=output_blob_id,
         output_byte_size=len(pdf_bytes),
         output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
@@ -328,7 +402,175 @@ async def test_subject_publication_pdf_uses_current_verified_artifact(
         f'attachment; filename="publication-{SUBJECT_ID}.pdf"'
     )
     assert response.content == pdf_bytes
+    assert response.headers["x-publication-render-identity"] == render.input_hash
     assert renderer.artifact_ids == [current_artifact.id]
+
+
+@pytest.mark.anyio
+async def test_publication_preview_reuses_the_publication_render_for_an_accepted_version(
+    subject: Subject,
+) -> None:
+    run = _run(generation=4)
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, uuid4(), version=3)
+    output_blob_id = uuid4()
+    pdf_bytes = b"%PDF-1.7\naccepted article"
+    render = SimpleNamespace(
+        id=uuid4(),
+        publication_artifact_id=artifact.id,
+        input_hash="f" * 64,
+        output_blob_id=output_blob_id,
+        output_byte_size=len(pdf_bytes),
+        output_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+        status=TypstRenderStatus.SUCCEEDED,
+    )
+    attempt = PublicationRenderAttempt(
+        status=TypstRenderStatus.SUCCEEDED,
+        render=render,
+    )
+    renderer = _PublicationRenderService(result=render, preview_attempt=attempt)
+    uow = _Uow(subject, [run], [artifact])
+    manifest_id = uuid4()
+    uow.publication_manifests.manifest = SimpleNamespace(
+        id=manifest_id,
+        edition_version=7,
+        entries=[
+            SimpleNamespace(
+                subject_id=artifact.subject_id,
+                production_run_id=artifact.production_run_id,
+                pipeline_generation=run.pipeline_generation,
+                document_artifact_id=artifact.id,
+                document_artifact_version=artifact.version,
+                document_input_hash=artifact.input_hash,
+            )
+        ],
+    )
+    uow.edition_releases.release = object()
+    payloads = _Payloads({output_blob_id: pdf_bytes})
+    app = _app(uow, payloads, renderer)
+
+    async with await _client(app) as api:
+        metadata = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview",
+            params={"artifact_id": str(artifact.id)},
+        )
+        metadata_again = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview",
+            params={"artifact_id": str(artifact.id)},
+        )
+        preview_pdf = await api.get(metadata.json()["pdf_url"])
+        published_pdf = await api.get(f"/api/subjects/{SUBJECT_ID}/publication/pdf")
+
+    assert metadata.status_code == 200, metadata.text
+    assert metadata.json()["status"] == PublicationPreviewStatus.READY.value
+    assert metadata.json()["artifact_id"] == str(artifact.id)
+    assert metadata.json()["artifact_version"] == artifact.version
+    assert metadata.json()["render_identity"] == render.input_hash
+    assert metadata.json()["render_disposition"] == "ACCEPTED_VERSION"
+    assert metadata.json()["published_edition_version"] == 7
+    assert metadata_again.json()["render_identity"] == render.input_hash
+    assert renderer.preview_compile_count == 1
+    assert preview_pdf.status_code == 200, preview_pdf.text
+    assert preview_pdf.content == pdf_bytes
+    assert preview_pdf.headers["x-publication-render-identity"] == render.input_hash
+    assert published_pdf.status_code == 200, published_pdf.text
+    assert published_pdf.headers["x-publication-render-identity"] == render.input_hash
+
+
+@pytest.mark.anyio
+async def test_publication_preview_reports_in_progress_and_failed_causes(
+    subject: Subject,
+) -> None:
+    run = _run()
+    artifact = _artifact(run, ProductionArtifactStage.PUBLICATION, uuid4())
+    running = SimpleNamespace(
+        id=uuid4(),
+        publication_artifact_id=artifact.id,
+        input_hash="a" * 64,
+        status=TypstRenderStatus.RUNNING,
+    )
+    failed = SimpleNamespace(
+        id=uuid4(),
+        publication_artifact_id=artifact.id,
+        input_hash="b" * 64,
+        status=TypstRenderStatus.FAILED,
+        error_code="typst_compile_failed",
+        error_message="Typst found an invalid layout.",
+    )
+    renderer = _PublicationRenderService(
+        preview_attempt=PublicationRenderAttempt(
+            status=TypstRenderStatus.RUNNING,
+            render=running,
+            error_code="publication_render_in_progress",
+            error_message="The same render is still running.",
+        )
+    )
+    app = _app(_Uow(subject, [run], [artifact]), _Payloads({}), renderer)
+
+    async with await _client(app) as api:
+        in_progress = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview",
+            params={"artifact_id": str(artifact.id)},
+        )
+        renderer.preview_attempt = PublicationRenderAttempt(
+            status=TypstRenderStatus.FAILED,
+            render=failed,
+            error_code="typst_compile_failed",
+            error_message="Typst found an invalid layout.",
+        )
+        failed_response = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview",
+            params={"artifact_id": str(artifact.id)},
+        )
+
+    assert in_progress.json()["status"] == PublicationPreviewStatus.IN_PROGRESS.value
+    assert in_progress.json()["render_identity"] == running.input_hash
+    assert failed_response.json()["status"] == PublicationPreviewStatus.FAILED.value
+    assert failed_response.json()["error_code"] == "typst_compile_failed"
+    assert failed_response.json()["error_message"] == "Typst found an invalid layout."
+
+
+@pytest.mark.anyio
+async def test_new_publication_artifact_marks_an_older_pdf_stale(subject: Subject) -> None:
+    old_run = _run(created_at=datetime.now(UTC), generation=1)
+    current_run = _run(created_at=datetime.now(UTC) + timedelta(seconds=1), generation=2)
+    old_artifact = _artifact(old_run, ProductionArtifactStage.PUBLICATION, uuid4())
+    current_artifact = _artifact(
+        current_run,
+        ProductionArtifactStage.PUBLICATION,
+        uuid4(),
+        version=2,
+    )
+    old_render = SimpleNamespace(
+        id=uuid4(),
+        publication_artifact_id=old_artifact.id,
+        input_hash="c" * 64,
+        status=TypstRenderStatus.SUCCEEDED,
+    )
+    uow = _Uow(subject, [old_run, current_run], [old_artifact, current_artifact])
+    uow.publication_renders.renders[old_render.id] = old_render
+    renderer = _PublicationRenderService()
+    app = _app(uow, _Payloads({}), renderer)
+
+    async with await _client(app) as api:
+        response = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview",
+            params={"artifact_id": str(old_artifact.id)},
+        )
+        old_pdf = await api.get(
+            f"/api/subjects/{SUBJECT_ID}/publication/preview/{old_artifact.id}/pdf",
+            params={"render_identity": old_render.input_hash},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == PublicationPreviewStatus.STALE.value
+    assert response.json()["artifact_id"] == str(old_artifact.id)
+    assert response.json()["artifact_version"] == old_artifact.version
+    assert response.json()["render_identity"] == old_render.input_hash
+    assert response.json()["current_artifact_id"] == str(current_artifact.id)
+    assert response.json()["pdf_url"] is None
+    assert old_pdf.status_code == 409
+    assert old_pdf.json()["detail"]["code"] == "publication_preview_stale"
+    assert renderer.artifact_ids == []
 
 
 @pytest.mark.anyio
