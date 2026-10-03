@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -95,7 +96,9 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
+    DiagramRelationType,
     DiagramSpecV1,
+    EditorialAnalyticPurposeV1,
     EditorialEnrichmentV1,
     EditorialFigureDecision,
     EditorialFigureDecisionActor,
@@ -118,6 +121,7 @@ from cti_app.domain.production_editorial_enrichment import (
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
+    normalize_analytic_question,
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
@@ -152,25 +156,22 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v3-figures-resource-needs"
-EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 3
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v4-analytic-purpose"
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 4
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v5-paragraph-anchors"
+    "editorial-enrichment-evidence-pack-v6-analytic-reserve-context"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v4-figure-selection"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v5-analytic-purpose"
+EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
+    "editorial-enrichment-analytic-policy-v1-token-dice-0.80"
+)
+TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v2-figure-catalog"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
     "editorial-enrichment-routing-policy-v2-resource-search-off"
 )
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1-bounded"
 
-MAX_ENRICHMENT_TABLES = 8
-MAX_ENRICHMENT_DIAGRAMS = 6
-MAX_TABLE_COLUMNS = 12
-MAX_TABLE_ROWS = 50
-MAX_DIAGRAM_NODES = 50
-MAX_DIAGRAM_EDGES = 100
-MAX_DIAGRAM_GROUPS = 8
 MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE = 128
 MAX_ENRICHMENT_FIGURE_PROPOSALS = 16
 MAX_ENRICHMENT_RESOURCE_NEEDS = 4
@@ -243,6 +244,36 @@ class TableRowProposalV1(_StrictEnrichmentProposalModel):
         return _nonempty_evidence_handles(value)
 
 
+class AnalyticPurposeProposalV1(_StrictEnrichmentProposalModel):
+    question: StrictStr
+    available_data: StrictStr
+    comprehension_gain: StrictStr
+    scope: StrictStr
+    evidence_handles: tuple[StrictStr, ...]
+    knowledge_limits: StrictStr
+    placement_reason: StrictStr
+
+    @field_validator(
+        "question",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "knowledge_limits",
+        "placement_reason",
+    )
+    @classmethod
+    def _nonempty_bounded(cls, value: str) -> str:
+        cleaned = _nonempty_proposal_text(value)
+        if len(cleaned) > 1000:
+            raise ValueError("Analytic purpose fields must be at most 1000 characters")
+        return cleaned
+
+    @field_validator("evidence_handles")
+    @classmethod
+    def _handles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _nonempty_evidence_handles(value)
+
+
 class TableProposalV1(_StrictEnrichmentProposalModel):
     key: StrictStr
     kind: EnrichmentTableKind
@@ -251,6 +282,7 @@ class TableProposalV1(_StrictEnrichmentProposalModel):
     columns: tuple[TableColumnProposalV1, ...]
     rows: tuple[TableRowProposalV1, ...]
     placement: EnrichmentPlacementProposalV1
+    purpose: AnalyticPurposeProposalV1
 
     @field_validator("key", "title")
     @classmethod
@@ -283,6 +315,7 @@ class DiagramEdgeProposalV1(_StrictEnrichmentProposalModel):
     source_node_id: StrictStr
     target_node_id: StrictStr
     label: StrictStr | None = None
+    relation_type: DiagramRelationType
     evidence_handles: tuple[StrictStr, ...]
 
     @field_validator("source_node_id", "target_node_id")
@@ -322,6 +355,7 @@ class DiagramProposalV1(_StrictEnrichmentProposalModel):
     edges: tuple[DiagramEdgeProposalV1, ...]
     groups: tuple[DiagramGroupProposalV1, ...] = ()
     placement: EnrichmentPlacementProposalV1
+    purpose: AnalyticPurposeProposalV1
 
     @field_validator("key", "title")
     @classmethod
@@ -572,6 +606,20 @@ _ENRICHMENT_FIELD_ALIASES = {
     "placement": "placement",
     "section index": "section_index",
     "section_index": "section_index",
+    "purpose": "purpose",
+    "question": "purpose",
+    "data": "available_data",
+    "available data": "available_data",
+    "gain": "comprehension_gain",
+    "comprehension gain": "comprehension_gain",
+    "scope": "scope",
+    "purpose evidence": "purpose_evidence_handles",
+    "purpose evidence handles": "purpose_evidence_handles",
+    "limits": "knowledge_limits",
+    "knowledge limits": "knowledge_limits",
+    "placement reason": "placement_reason",
+    "relation type": "relation_type",
+    "relation_type": "relation_type",
     "column key": "key",
     "label": "label",
     "cell": "cell",
@@ -678,6 +726,78 @@ def _wire_node_ids(value: str | None) -> tuple[str, ...] | None:
     residue = _ENRICHMENT_NODE_ID.sub("", value)
     residue = re.sub(r"[\s,;|]+", "", residue)
     return node_ids if node_ids and not residue else None
+
+
+def _parse_analytic_purpose(
+    block: _EditorialEnrichmentWireBlock,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> AnalyticPurposeProposalV1 | None:
+    values = {
+        name: _wire_scalar(block, name)
+        for name in (
+            "purpose",
+            "available_data",
+            "comprehension_gain",
+            "scope",
+            "purpose_evidence_handles",
+            "knowledge_limits",
+            "placement_reason",
+        )
+    }
+    handles = _wire_handles(values["purpose_evidence_handles"])
+    if any(not isinstance(value, str) or not value.strip() for value in values.values()) or (
+        handles is None
+    ):
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_analytic_purpose_missing_or_invalid",
+                block.raw_lines,
+            )
+        )
+        return None
+    if not normalize_analytic_question(values["purpose"] or ""):
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_analytic_purpose_invalid",
+                block.raw_lines,
+            )
+        )
+        return None
+    if any(handle not in evidence_pack._handle_to_ref for handle in handles):
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_unknown_evidence_handle",
+                block.raw_lines,
+            )
+        )
+        return None
+    try:
+        return AnalyticPurposeProposalV1(
+            question=values["purpose"],
+            available_data=values["available_data"],
+            comprehension_gain=values["comprehension_gain"],
+            scope=values["scope"],
+            evidence_handles=handles,
+            knowledge_limits=values["knowledge_limits"],
+            placement_reason=values["placement_reason"],
+        )
+    except (TypeError, ValueError, ValidationError):
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_analytic_purpose_invalid",
+                block.raw_lines,
+            )
+        )
+        return None
 
 
 def _wire_placement(block: _EditorialEnrichmentWireBlock) -> EnrichmentPlacementProposalV1 | None:
@@ -892,6 +1012,291 @@ def _parse_resource_need_wire_block(
         return None
 
 
+_ANALYTIC_TOKEN = re.compile(r"[^\W_]+(?:_[^\W_]+)*", re.UNICODE)
+_ANALYTIC_STOP_WORDS = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "of",
+        "for",
+        "and",
+        "or",
+        "to",
+        "in",
+        "on",
+        "de",
+        "du",
+        "des",
+        "le",
+        "la",
+        "les",
+        "et",
+        "un",
+        "une",
+        "au",
+        "aux",
+    }
+)
+
+
+def _analytic_tokens(value: str) -> frozenset[str]:
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return frozenset(_ANALYTIC_TOKEN.findall(normalized))
+
+
+def _endpoint_tokens(label: str) -> frozenset[str]:
+    return frozenset(
+        token for token in _analytic_tokens(label) if token not in _ANALYTIC_STOP_WORDS
+    )
+
+
+def _record_mentions(record: Mapping[str, Any], label: str) -> bool:
+    terms = _endpoint_tokens(label)
+    return bool(terms) and terms <= _analytic_tokens(" ".join(_string_values(record)))
+
+
+def _synthesis_sentences(pack: EditorialEnrichmentEvidencePackV1) -> tuple[str, ...]:
+    current = pack.current_synthesis
+    paragraphs: list[Mapping[str, Any]] = []
+    for value in current.get("lead", ()):
+        if isinstance(value, Mapping):
+            paragraphs.append(value)
+    for section in current.get("sections", ()):
+        if isinstance(section, Mapping):
+            paragraphs.extend(
+                item for item in section.get("paragraphs", ()) if isinstance(item, Mapping)
+            )
+    sentences: list[str] = []
+    for paragraph in paragraphs:
+        value = paragraph.get("text")
+        if isinstance(value, str):
+            sentences.extend(
+                sentence.strip()
+                for sentence in re.split(r"(?<=[.!?])\s+", value)
+                if sentence.strip()
+            )
+    return tuple(sentences)
+
+
+def _token_dice(left: str, right: str) -> float:
+    left_tokens = _analytic_tokens(left)
+    right_tokens = _analytic_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return 2 * len(left_tokens & right_tokens) / (len(left_tokens) + len(right_tokens))
+
+
+def _reject_paraphrase_rows(
+    block: _EditorialEnrichmentWireBlock,
+    table: TableProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> TableProposalV1 | None:
+    sentences = _synthesis_sentences(evidence_pack)
+    if not sentences:
+        return table
+    kept_rows: list[TableRowProposalV1] = []
+    duplicate_count = 0
+    for row in table.rows:
+        row_text = " ".join(row.cells)
+        if any(
+            _token_dice(row_text, sentence) >= TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD
+            for sentence in sentences
+        ):
+            duplicate_count += 1
+            rejections.append(
+                _enrichment_wire_rejection(
+                    block,
+                    f"{block.block_id}:row:{duplicate_count:03d}",
+                    "editorial_enrichment_table_row_paraphrase_only",
+                    block.raw_lines,
+                )
+            )
+        else:
+            kept_rows.append(row)
+    if not kept_rows:
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_table_paraphrase_only",
+                block.raw_lines,
+            )
+        )
+        return None
+    if not set(table.purpose.evidence_handles) <= {
+        handle for row in kept_rows for handle in row.evidence_handles
+    }:
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_purpose_evidence_not_relevant",
+                block.raw_lines,
+            )
+        )
+        return None
+    if duplicate_count:
+        return table.model_copy(update={"rows": tuple(kept_rows)})
+    return table
+
+
+def _edge_projection_rejection(
+    diagram: DiagramProposalV1,
+    edge: DiagramEdgeProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+) -> str | None:
+    node_by_id = {item.node_id: item for item in diagram.nodes}
+    source_label = node_by_id[edge.source_node_id].label
+    target_label = node_by_id[edge.target_node_id].label
+    records_by_handle = {
+        str(item.get("handle")): item
+        for item in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence)
+        if isinstance(item.get("handle"), str)
+    }
+    edge_records = [
+        records_by_handle[handle] for handle in edge.evidence_handles if handle in records_by_handle
+    ]
+    source_supported = any(_record_mentions(item, source_label) for item in edge_records)
+    target_supported = any(_record_mentions(item, target_label) for item in edge_records)
+    same_record_support = any(
+        _record_mentions(item, source_label) and _record_mentions(item, target_label)
+        for item in edge_records
+    )
+    label = edge.label or ""
+    relation_text_support = bool(_endpoint_tokens(label)) and any(
+        _record_mentions(item, source_label)
+        and _record_mentions(item, target_label)
+        and _endpoint_tokens(label) <= _analytic_tokens(" ".join(_string_values(item)))
+        for item in edge_records
+    )
+    if not source_supported or not target_supported:
+        return "editorial_enrichment_diagram_relation_endpoint_unsupported"
+    if edge.relation_type is DiagramRelationType.COMPARISON:
+        if diagram.kind is EnrichmentDiagramKind.INFECTION_CHAIN:
+            return "editorial_enrichment_comparison_cannot_be_infection_chain"
+        if edge.label is None or "comparison" not in _analytic_tokens(edge.label):
+            return "editorial_enrichment_comparison_relation_not_labelled"
+    if diagram.kind is EnrichmentDiagramKind.INFECTION_CHAIN and (
+        edge.relation_type is not DiagramRelationType.FACTUAL or not relation_text_support
+    ):
+        return "editorial_enrichment_infection_chain_sequence_not_documented"
+    if edge.relation_type is DiagramRelationType.FACTUAL and not same_record_support:
+        return "editorial_enrichment_diagram_relation_without_endpoint_support"
+    if edge.relation_type is DiagramRelationType.FACTUAL and not relation_text_support:
+        return "editorial_enrichment_diagram_relation_text_not_supported"
+    if edge.relation_type is not DiagramRelationType.COMPARISON:
+        source_node_source_ids = {
+            evidence_pack._handle_to_ref[handle].source_document_id
+            for handle in node_by_id[edge.source_node_id].evidence_handles
+            if handle in evidence_pack._handle_to_ref
+        }
+        target_node_source_ids = {
+            evidence_pack._handle_to_ref[handle].source_document_id
+            for handle in node_by_id[edge.target_node_id].evidence_handles
+            if handle in evidence_pack._handle_to_ref
+        }
+        counter_records = [
+            item
+            for item in evidence_pack.reserve_evidence
+            if item.get("projection_classification")
+            == RelevanceClassification.COUNTER_INDICATION.value
+        ]
+        if any(
+            _record_mentions(item, source_label) and _record_mentions(item, target_label)
+            for item in counter_records
+        ):
+            return "editorial_enrichment_relation_counter_indicated"
+
+        for relation in evidence_pack.source_pair_relations:
+            if relation.get("relation") != "link_not_demonstrated":
+                continue
+            reserve_handles = relation.get("supporting_handles", ())
+            reserve_refs = {
+                evidence_pack._reserve_handle_to_ref[handle]
+                for handle in reserve_handles
+                if isinstance(handle, str) and handle in evidence_pack._reserve_handle_to_ref
+            }
+            if not reserve_refs:
+                continue
+            pair_source_ids = {ref.source_document_id for ref in reserve_refs}
+            edge_source_ids = {
+                evidence_pack._handle_to_ref[handle].source_document_id
+                for handle in edge.evidence_handles
+                if handle in evidence_pack._handle_to_ref
+            }
+            related_reserve_records = [
+                item
+                for item in evidence_pack.reserve_evidence
+                if isinstance(item.get("handle"), str) and item.get("handle") in reserve_handles
+            ]
+            endpoints_appear_in_pair = any(
+                _record_mentions(item, source_label) for item in related_reserve_records
+            ) and any(_record_mentions(item, target_label) for item in related_reserve_records)
+            spans_sources_in_pair = any(
+                source_id != target_id
+                and source_id in pair_source_ids
+                and target_id in pair_source_ids
+                for source_id in source_node_source_ids
+                for target_id in target_node_source_ids
+            )
+            if (
+                endpoints_appear_in_pair
+                and spans_sources_in_pair
+                and edge_source_ids & pair_source_ids
+            ):
+                return "editorial_enrichment_relation_contradicts_projection"
+    return None
+
+
+def _filter_diagram_relations(
+    block: _EditorialEnrichmentWireBlock,
+    diagram: DiagramProposalV1,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    rejections: list[EditorialEnrichmentWireRejection],
+) -> DiagramProposalV1 | None:
+    valid_edges: list[DiagramEdgeProposalV1] = []
+    rejected_count = 0
+    for edge in diagram.edges:
+        reason = _edge_projection_rejection(diagram, edge, evidence_pack)
+        if reason is None:
+            valid_edges.append(edge)
+            continue
+        rejected_count += 1
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                f"{block.block_id}:relation:{rejected_count:03d}",
+                reason,
+                block.raw_lines,
+            )
+        )
+    if not valid_edges:
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_diagram_has_no_supported_relations",
+                block.raw_lines,
+            )
+        )
+        return None
+    valid_handles = {handle for edge in valid_edges for handle in edge.evidence_handles}
+    valid_handles.update(handle for node in diagram.nodes for handle in node.evidence_handles)
+    if not set(diagram.purpose.evidence_handles) <= valid_handles:
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_purpose_evidence_not_relevant",
+                block.raw_lines,
+            )
+        )
+        return None
+    return diagram.model_copy(update={"edges": tuple(valid_edges)})
+
+
 def parse_editorial_enrichment_proposal_wire(
     raw_text: str,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
@@ -1084,7 +1489,21 @@ def parse_editorial_enrichment_proposal_wire(
             last_field = None
             continue
         allowed = {
-            "TABLE": {"key", "kind", "title", "caption", "placement", "section_index"},
+            "TABLE": {
+                "key",
+                "kind",
+                "title",
+                "caption",
+                "placement",
+                "section_index",
+                "purpose",
+                "available_data",
+                "comprehension_gain",
+                "scope",
+                "purpose_evidence_handles",
+                "knowledge_limits",
+                "placement_reason",
+            },
             "DIAGRAM": {
                 "key",
                 "kind",
@@ -1093,12 +1512,31 @@ def parse_editorial_enrichment_proposal_wire(
                 "placement",
                 "section_index",
                 "direction",
+                "purpose",
+                "available_data",
+                "comprehension_gain",
+                "scope",
+                "purpose_evidence_handles",
+                "knowledge_limits",
+                "placement_reason",
             },
             "COLUMN": {"key", "label"},
             "ROW": {"cell", "evidence_handles"},
             "NODE": {"node_id", "id", "label", "evidence_handles"},
-            "RELATION": {"source_node_id", "target_node_id", "label", "evidence_handles"},
-            "EDGE": {"source_node_id", "target_node_id", "label", "evidence_handles"},
+            "RELATION": {
+                "source_node_id",
+                "target_node_id",
+                "label",
+                "relation_type",
+                "evidence_handles",
+            },
+            "EDGE": {
+                "source_node_id",
+                "target_node_id",
+                "label",
+                "relation_type",
+                "evidence_handles",
+            },
             "GROUP": {"group_id", "id", "label", "node_ids"},
             "ANNOTATION": {"role", "paragraph_anchor", "text"},
             "FIGURE": {
@@ -1142,6 +1580,7 @@ def parse_editorial_enrichment_proposal_wire(
     figures: list[FigureProposalV1] = []
     resource_needs: list[ResourceNeedProposalV1] = []
     canonical_keys: set[str] = set()
+    analytic_questions: set[str] = set()
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
     proposed_figure_handles: set[str] = set()
     proposed_need_keys: set[str] = set()
@@ -1153,12 +1592,18 @@ def parse_editorial_enrichment_proposal_wire(
             table = _parse_enrichment_wire_table(top, evidence_pack, rejections)
             if table is None:
                 continue
+            table = _reject_paraphrase_rows(top, table, evidence_pack, rejections)
+            if table is None:
+                continue
+            question_key = normalize_analytic_question(table.purpose.question)
+            if not question_key or question_key in analytic_questions:
+                reject(top, "editorial_enrichment_duplicate_analytic_purpose")
+                continue
             if table.key in canonical_keys:
                 reject(top, "editorial_enrichment_duplicate_key")
-            elif len(tables) >= MAX_ENRICHMENT_TABLES:
-                reject(top, "editorial_enrichment_table_limit_exceeded")
             else:
                 canonical_keys.add(table.key)
+                analytic_questions.add(question_key)
                 tables.append(table)
         elif top.kind == "ANNOTATION":
             annotation = _parse_annotation_wire_block(top, evidence_pack, rejections)
@@ -1190,12 +1635,18 @@ def parse_editorial_enrichment_proposal_wire(
             diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections)
             if diagram is None:
                 continue
+            diagram = _filter_diagram_relations(top, diagram, evidence_pack, rejections)
+            if diagram is None:
+                continue
+            question_key = normalize_analytic_question(diagram.purpose.question)
+            if not question_key or question_key in analytic_questions:
+                reject(top, "editorial_enrichment_duplicate_analytic_purpose")
+                continue
             if diagram.key in canonical_keys:
                 reject(top, "editorial_enrichment_duplicate_key")
-            elif len(diagrams) >= MAX_ENRICHMENT_DIAGRAMS:
-                reject(top, "editorial_enrichment_diagram_limit_exceeded")
             else:
                 canonical_keys.add(diagram.key)
+                analytic_questions.add(question_key)
                 diagrams.append(diagram)
     if not tables and not diagrams and not annotations and not figures and not resource_needs:
         return EditorialEnrichmentWireParseResult(
@@ -1356,7 +1807,21 @@ def _parse_enrichment_wire_table(
     def reject(item: _EditorialEnrichmentWireBlock, code: str) -> None:
         rejections.append(_enrichment_wire_rejection(item, item.block_id, code, item.raw_lines))
 
-    allowed_top_fields = {"key", "kind", "title", "caption", "placement", "section_index"}
+    allowed_top_fields = {
+        "key",
+        "kind",
+        "title",
+        "caption",
+        "placement",
+        "section_index",
+        "purpose",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "purpose_evidence_handles",
+        "knowledge_limits",
+        "placement_reason",
+    }
     if set(block.fields) - allowed_top_fields:
         reject(block, "editorial_enrichment_unknown_field")
         return None
@@ -1374,6 +1839,9 @@ def _parse_enrichment_wire_table(
     title = _wire_scalar(block, "title")
     if not key or not title or kind is None or placement is None:
         reject(block, "editorial_enrichment_table_missing_or_invalid_field")
+        return None
+    purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
+    if purpose is None:
         return None
     columns: list[TableColumnProposalV1] = []
     for child in block.children:
@@ -1393,7 +1861,7 @@ def _parse_enrichment_wire_table(
     if len(column_keys) != len(set(column_keys)):
         reject(block, "editorial_enrichment_duplicate_column_key")
         return None
-    if not 2 <= len(columns) <= MAX_TABLE_COLUMNS:
+    if len(columns) < 2:
         reject(block, "editorial_enrichment_table_column_count_invalid")
         return None
     rows: list[TableRowProposalV1] = []
@@ -1415,15 +1883,16 @@ def _parse_enrichment_wire_table(
         if any(handle not in evidence_pack._handle_to_ref for handle in handles):
             reject(child, "editorial_enrichment_unknown_evidence_handle")
             continue
-        if len(rows) >= MAX_TABLE_ROWS:
-            reject(child, "editorial_enrichment_table_row_limit_exceeded")
-            continue
         try:
             rows.append(TableRowProposalV1(cells=cells, evidence_handles=handles))
         except (TypeError, ValueError, ValidationError):
             reject(child, "editorial_enrichment_table_row_invalid")
     if not rows:
         reject(block, "editorial_enrichment_table_has_no_valid_rows")
+        return None
+    row_handles = {handle for row in rows for handle in row.evidence_handles}
+    if not set(purpose.evidence_handles) <= row_handles:
+        reject(block, "editorial_enrichment_purpose_evidence_not_relevant")
         return None
     try:
         return TableProposalV1(
@@ -1434,6 +1903,7 @@ def _parse_enrichment_wire_table(
             columns=tuple(columns),
             rows=tuple(rows),
             placement=placement,
+            purpose=purpose,
         )
     except (TypeError, ValueError, ValidationError):
         reject(block, "editorial_enrichment_table_invalid")
@@ -1456,6 +1926,13 @@ def _parse_enrichment_wire_diagram(
         "placement",
         "section_index",
         "direction",
+        "purpose",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "purpose_evidence_handles",
+        "knowledge_limits",
+        "placement_reason",
     }
     if set(block.fields) - allowed_top_fields:
         reject(block, "editorial_enrichment_unknown_field")
@@ -1483,6 +1960,9 @@ def _parse_enrichment_wire_diagram(
     title = _wire_scalar(block, "title")
     if not key or not title or kind is None or direction is None or placement is None:
         reject(block, "editorial_enrichment_diagram_missing_or_invalid_field")
+        return None
+    purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
+    if purpose is None:
         return None
 
     nodes: list[DiagramNodeProposalV1] = []
@@ -1522,16 +2002,37 @@ def _parse_enrichment_wire_diagram(
             continue
         error = _block_child_error(
             child,
-            frozenset({"source_node_id", "target_node_id", "label", "evidence_handles"}),
+            frozenset(
+                {
+                    "source_node_id",
+                    "target_node_id",
+                    "label",
+                    "relation_type",
+                    "evidence_handles",
+                }
+            ),
         )
         source = _wire_scalar(child, "source_node_id")
         target = _wire_scalar(child, "target_node_id")
+        raw_relation_type = _wire_scalar(child, "relation_type")
+        relation_type = next(
+            (
+                item
+                for item in DiagramRelationType
+                if raw_relation_type
+                and item.value.casefold() == raw_relation_type.strip().casefold()
+            ),
+            None,
+        )
         handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
         if error is not None:
             reject(child, error)
             continue
         if not source or not target:
             reject(child, "editorial_enrichment_diagram_relation_missing_endpoint")
+            continue
+        if relation_type is None:
+            reject(child, "editorial_enrichment_diagram_relation_type_invalid")
             continue
         if source not in known_nodes or target not in known_nodes:
             reject(child, "editorial_enrichment_diagram_relation_unknown_node")
@@ -1548,6 +2049,7 @@ def _parse_enrichment_wire_diagram(
                     source_node_id=source,
                     target_node_id=target,
                     label=_wire_scalar(child, "label"),
+                    relation_type=relation_type,
                     evidence_handles=handles,
                 )
             )
@@ -1586,11 +2088,14 @@ def _parse_enrichment_wire_diagram(
             continue
         group_ids.add(group_id)
         grouped_nodes.update(node_ids)
-    if len(nodes) < 2 or len(nodes) > MAX_DIAGRAM_NODES or not edges:
+    if len(nodes) < 2 or not edges:
         reject(block, "editorial_enrichment_diagram_incomplete_after_rejections")
         return None
-    if len(edges) > MAX_DIAGRAM_EDGES or len(groups) > MAX_DIAGRAM_GROUPS:
-        reject(block, "editorial_enrichment_diagram_item_limit_exceeded")
+    diagram_handles = {handle for node in nodes for handle in node.evidence_handles} | {
+        handle for edge in edges for handle in edge.evidence_handles
+    }
+    if not set(purpose.evidence_handles) <= diagram_handles:
+        reject(block, "editorial_enrichment_purpose_evidence_not_relevant")
         return None
     try:
         return DiagramProposalV1(
@@ -1603,6 +2108,7 @@ def _parse_enrichment_wire_diagram(
             edges=tuple(edges),
             groups=tuple(groups),
             placement=placement,
+            purpose=purpose,
         )
     except (TypeError, ValueError, ValidationError):
         reject(block, "editorial_enrichment_diagram_invalid")
@@ -1622,6 +2128,9 @@ class EditorialEnrichmentEvidencePackV1:
     projection_hash: str | None = None
     policy_version: str = EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+    _reserve_handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
         default_factory=dict, repr=False, compare=False
     )
 
@@ -1996,17 +2505,20 @@ def build_editorial_enrichment_evidence_pack(
         for ref in ordered_refs
         if ref.kind in {EvidenceKind.INDICATOR, EvidenceKind.RULE}
     )
-    reserve_evidence = tuple(
-        MappingProxyType(
-            _prompt_evidence_record(
-                reserve_handle_for_ref[ref],
-                ref.kind,
-                entries[ref],
-                source=source_by_id[ref.source_document_id],
-            )
+    reserve_records: list[Mapping[str, Any]] = []
+    for ref in ordered_reserve_refs:
+        record = _prompt_evidence_record(
+            reserve_handle_for_ref[ref],
+            ref.kind,
+            entries[ref],
+            source=source_by_id[ref.source_document_id],
         )
-        for ref in ordered_reserve_refs
-    )
+        if projection is not None and ref in counter_refs:
+            classification = projection.classification_for(ref)
+            record["projection_classification"] = classification.classification.value
+            record["projection_reason_code"] = classification.reason_code.value
+        reserve_records.append(MappingProxyType(record))
+    reserve_evidence = tuple(reserve_records)
     source_pair_relations = tuple(
         MappingProxyType(
             {
@@ -2029,6 +2541,9 @@ def build_editorial_enrichment_evidence_pack(
         source_pair_relations=source_pair_relations,
         projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
+        _reserve_handle_to_ref=MappingProxyType(
+            {handle: ref for ref, handle in reserve_handle_for_ref.items()}
+        ),
     )
 
 
@@ -2161,58 +2676,74 @@ def build_editorial_resource_proposal_model_request(
 def editorial_enrichment_output_contract_example() -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
     return """Return independent plain-text blocks. Give every block a local id.
-Use these fields and keep every literal value verbatim:
+For each TABLE and DIAGRAM, fill every typed analytic-purpose field:
+PURPOSE (the reader's question), DATA (what the evidence contains), GAIN (why
+this form is clearer than prose), SCOPE, PURPOSE_EVIDENCE, LIMITS, PLACEMENT,
+and PLACEMENT_REASON. Values and handles must be non-empty.
 
 TABLE T001
-KEY: commands
-KIND: commands
-TITLE: Commands observed
-CAPTION: optional text, or omit this field
-PLACEMENT: after_lead
-SECTION_INDEX: omit unless placement is after_section
+KEY: mechanism_comparison
+KIND: custom
+TITLE: Reported mechanism observations
+PURPOSE: Which reported mechanism details can be compared?
+DATA: Placeholder field names and values from E001 and E002.
+GAIN: Adjacent cells expose differences that are easy to miss in prose.
+SCOPE: Only the two observations cited below.
+PURPOSE_EVIDENCE: E001, E002
+LIMITS: The sources do not establish that the mechanisms are linked.
+PLACEMENT: after_section
+SECTION_INDEX: 0
+PLACEMENT_REASON: Place beside the paragraph introducing the observations.
 COLUMN C001
-KEY: command
-LABEL: Command
+KEY: mechanism
+LABEL: Reported mechanism
 END COLUMN
 COLUMN C002
-KEY: purpose
-LABEL: Purpose
+KEY: observation
+LABEL: Observed detail
 END COLUMN
 ROW R001
-CELL: exact command literal
-CELL: evidence-grounded purpose
+CELL: Mechanism A
+CELL: [verbatim placeholder detail from E001]
 EVIDENCE: E001
+END ROW
+ROW R002
+CELL: Mechanism B
+CELL: [verbatim placeholder detail from E002]
+EVIDENCE: E002
 END ROW
 END TABLE
 
 DIAGRAM D001
-KEY: infection_chain
-KIND: infection_chain
-TITLE: Infection chain
+KEY: mechanism_comparison
+KIND: custom
+TITLE: Comparison of reported mechanisms
+PURPOSE: How do the two reported mechanisms differ?
+DATA: Their separately documented roles in E001 and E002.
+GAIN: A labelled comparison keeps distinct observations visually separate.
+SCOPE: The two named mechanisms only.
+PURPOSE_EVIDENCE: E001, E002
+LIMITS: No infection sequence or cross-source link is established.
 DIRECTION: left_to_right
-PLACEMENT: after_section
-SECTION_INDEX: 0
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place after the paragraph that introduces both observations.
 NODE N001
-ID: step_1
-LABEL: Observed initial step
+ID: mechanism_a
+LABEL: Mechanism A
 EVIDENCE: E001
 END NODE
 NODE N002
-ID: step_2
-LABEL: Observed following step
+ID: mechanism_b
+LABEL: Mechanism B
 EVIDENCE: E002
 END NODE
 RELATION L001
-FROM: step_1
-TO: step_2
-LABEL: leads to
-EVIDENCE: E003
+FROM: mechanism_a
+TO: mechanism_b
+RELATION_TYPE: comparison
+LABEL: comparison of reported mechanisms
+EVIDENCE: E001, E002
 END RELATION
-GROUP G001
-ID: initial-stage
-LABEL: Initial stage
-NODES: step_1, step_2
-END GROUP
 END DIAGRAM
 
 ANNOTATION A001
@@ -2221,20 +2752,39 @@ PARAGRAPH_ANCHOR: lead:0001
 EXACT_TEXT: exact actor name copied from the anchored paragraph
 END ANNOTATION
 
-For no useful enrichment, return exactly: NO USEFUL ENRICHMENT. Do not use
-JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or generated render
-syntax. Annotation categories are actor, campaign, malware, tool, product,
-english_term, technical, technical_literal, ioc, path, command, protocol_field,
-source, and proof.
-Only annotate text that appears verbatim in the named paragraph. Copy its stable
-anchor from current_synthesis. Repeated exact text is applied to every exact
-occurrence in that paragraph; punctuation outside the copied text is preserved.
-Each table column is a COLUMN block; each row is a ROW block with one CELL line
-per column. Each diagram uses NODE, RELATION, and optional GROUP blocks. Every
-row, node, and relation must cite existing evidence handles from the input. A
-relation's handles must support that relation. Never invent evidence or handles.
-Keep titles/captions descriptive, and preserve placement anchors and section
-indexes from the provided guidance.
+No enrichment is required when paragraphs suffice. The exact standalone empty
+marker is:
+NO USEFUL ENRICHMENT
+Do not add rows, nodes, groups, or visual detail for decoration; no row or node target exists.
+A table that restates synthesis sentences is rejected.
+Include only data that answers the stated analytic question.
+
+Neutral intent examples (bracketed details are placeholders, not facts):
+- Compare a command with its documented effect: [command] produces [effect].
+- Compare component functions or observations from different sources: [role A]
+  and [role B]; label this comparison, not an execution sequence.
+- Compare documented protocol channels/fields or control-plane and data-plane
+  flows; show an infrastructure timeline or annotated sequence only when the
+  roles, dates, endpoints, and relations are documented in cited evidence.
+
+Do not use JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or
+generated render syntax. Annotation categories are actor, campaign, malware,
+tool, product, english_term, technical, technical_literal, ioc, path, command,
+protocol_field, source, and proof. Only annotate text that appears verbatim in
+the named paragraph. Copy its stable anchor from current_synthesis. Repeated
+exact text is applied to every exact occurrence; preserve surrounding punctuation.
+
+Each column is a COLUMN block; each row is a ROW block with one CELL per column.
+Each diagram uses NODE, RELATION, and optional GROUP blocks. Every row, node,
+and relation needs existing evidence handles. Each cell must be grounded by its
+row's handles. A factual relation needs a cited evidence item whose text/context
+mentions both endpoints. If evidence supports endpoints separately but the
+relationship is analysis, type it as inference and cite supporting handles.
+Type and label comparisons as comparison; do not present them as infection
+sequences. Use infection_chain only when a cited passage documents both endpoints
+and the stated sequence relation. Reject links marked counter-indicated or
+LINK_NOT_DEMONSTRATED in reserve context. Never invent evidence or handles.
+Preserve supplied placement anchors and section indexes.
 
 FIGURE P001
 FIGURE_HANDLE: F001
@@ -2252,10 +2802,9 @@ END NEEDS
 
 Select only accepted catalog handles. Never select an item excluded by rule or
 pending archive. Each FIGURE needs same-source evidence handles, a source-grounded
-caption, an existing placement, and a reason. NEEDS is optional and only for a
-specific missing media item or technical analysis; query hints must name the
-current subject. Zero figures is valid. Do not return resource URLs in this
-response."""
+caption, an existing placement, and a reason. NEEDS is optional only for a
+specific missing media item or technical analysis. Zero figures is valid. Do not
+return resource URLs in this response."""
 
 
 def build_editorial_enrichment_model_request(
@@ -2307,27 +2856,36 @@ def build_editorial_enrichment_model_request(
     )
     prompt_payload = {
         "instructions": (
-            "Tu es un planificateur de représentations et d'annotations éditoriales, "
-            "pas un chercheur "
-            "ni un renderer. Décide uniquement si des informations de la synthèse "
-            "gagneraient à être structurées en "
-            "tableaux ou diagrammes sémantiques, et propose des rôles typographiques uniquement "
-            "pour les segments exacts et évidents d'un paragraphe ancré. N'ajoute aucun fait, "
-            "n'effectue aucune recherche pendant cet appel, "
-            "et utilise uniquement les preuves fournies. Chaque ligne, nœud et arête doit citer au "
-            "moins un evidence handle exact. Une arête exprime une relation factuelle "
-            "et doit avoir "
-            "sa propre preuve. Conserve chaque commande, chemin, nom, date, adresse, hash et autre "
-            "littéral exactement comme dans la preuve. Si aucune représentation n'améliore la "
-            "compréhension, renvoie le marqueur explicite prévu. Ne génère ni JSON, tableau "
-            "Markdown, HTML, Mermaid, D2, DOT, TikZ, Typst, SVG, image source, ni corps de règle. "
-            "Les diagrammes décrivent seulement une spécification sémantique en blocs. Titres et "
-            "captions restent descriptifs. Le catalogue figure_catalog contient des médias "
-            "archivés : propose uniquement un handle accepté, avec une caption copiée du contexte "
-            "source, des evidence handles de la même source, un placement et une raison. N'inclus "
-            "pas un média rejeté ou en attente d'archivage. Zéro figure est valide. Si une figure "
-            "ou une analyse manque, tu peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; "
-            "indique une raison et un query_hint borné au sujet. N'inclus aucune URL dans NEEDS."
+            "Tu es un planificateur de représentations et d'annotations éditoriales, pas un "
+            "chercheur ni un renderer. Choisis une représentation uniquement quand elle répond à "
+            "une question analytique distincte et clarifie les preuves mieux que la prose. Chaque "
+            "table et diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
+            "(comprehension gain : avantage sur le paragraphe), SCOPE, "
+            "PURPOSE_EVIDENCE, LIMITS, PLACEMENT et "
+            "PLACEMENT_REASON; tous sont obligatoires et non vides. Refuse un tableau qui "
+            "reformule seulement les phrases de synthèse. N'impose aucun minimum de lignes ou de "
+            "nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro diagramme sont "
+            "valides lorsque la prose suffit. Propose des rôles typographiques uniquement pour "
+            "les segments exacts et évidents d'un paragraphe ancré. N'ajoute aucun fait, "
+            "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
+            "fournies. Chaque ligne, nœud et arête cite des evidence handles existants et "
+            "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
+            "les deux endpoints. Une inférence doit être typée inference et citée par ses handles "
+            "de support. Une comparaison doit être typée et étiquetée comparison; ne la présente "
+            "jamais comme une séquence d'infection. infection_chain exige que la preuve documente "
+            "les deux endpoints et leur séquence. Respecte les réserves counter_indicated et "
+            "LINK_NOT_DEMONSTRATED; elles ne prouvent aucun lien. Conserve chaque commande, "
+            "chemin, nom, date, adresse, hash et autre littéral exactement comme dans la preuve. "
+            "Si aucune représentation n'améliore la compréhension, renvoie le marqueur explicite "
+            "prévu. Ne génère ni JSON, tableau Markdown, HTML, Mermaid, D2, DOT, TikZ, Typst, "
+            "SVG, image source, ni corps de règle. Les diagrammes décrivent seulement une "
+            "spécification sémantique en blocs. Titres et captions restent descriptifs. Le "
+            "catalogue figure_catalog contient des médias archivés : propose uniquement un "
+            "handle accepté, avec une caption copiée du contexte source, des evidence handles de "
+            "la même source, un placement et une raison. N'inclus pas un média rejeté ou en "
+            "attente d'archivage. Zéro figure est valide. Si une figure ou une analyse manque, tu "
+            "peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; indique une raison et un "
+            "query_hint borné au sujet. N'inclus aucune URL dans NEEDS."
         ),
         "publication_language": evidence_pack.publication_language,
         "current_synthesis": dict(evidence_pack.current_synthesis),
@@ -2353,17 +2911,7 @@ def build_editorial_enrichment_model_request(
             "section_indexes": [
                 int(item["section_index"]) for item in evidence_pack.current_synthesis["sections"]
             ],
-            "limits": {
-                "tables": MAX_ENRICHMENT_TABLES,
-                "diagrams": MAX_ENRICHMENT_DIAGRAMS,
-                "table_columns": MAX_TABLE_COLUMNS,
-                "table_rows": MAX_TABLE_ROWS,
-                "diagram_nodes": MAX_DIAGRAM_NODES,
-                "diagram_edges": MAX_DIAGRAM_EDGES,
-                "diagram_groups": MAX_DIAGRAM_GROUPS,
-                "figures": MAX_ENRICHMENT_FIGURE_PROPOSALS,
-                "resource_needs": MAX_ENRICHMENT_RESOURCE_NEEDS,
-            },
+            "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         },
         "output_contract": editorial_enrichment_output_contract_example(),
         "output_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
@@ -2382,6 +2930,7 @@ def build_editorial_enrichment_model_request(
         "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
         "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
         "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
+        "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
     }
     if source_figure_inventory_hash is not None:
         metadata["source_figure_inventory_hash"] = source_figure_inventory_hash
@@ -2403,6 +2952,7 @@ def build_editorial_enrichment_model_request(
             "evidence_pack_schema_version": EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION,
             "generator_version": EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
             "contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+            "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         },
     )
 
@@ -2484,9 +3034,7 @@ def validate_editorial_enrichment_proposal(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
         )
     if (
-        len(parsed.tables) > MAX_ENRICHMENT_TABLES
-        or len(parsed.diagrams) > MAX_ENRICHMENT_DIAGRAMS
-        or len(parsed.figures) > MAX_ENRICHMENT_FIGURE_PROPOSALS
+        len(parsed.figures) > MAX_ENRICHMENT_FIGURE_PROPOSALS
         or len(parsed.resource_needs) > MAX_ENRICHMENT_RESOURCE_NEEDS
         or len(resource_proposals) > MAX_ENRICHMENT_RESOURCE_PROPOSALS
     ):
@@ -2545,9 +3093,7 @@ def validate_editorial_enrichment_proposal(
     tables: list[TableSpecV1] = []
     diagrams: list[DiagramSpecV1] = []
     for table in parsed.tables:
-        if not 2 <= len(table.columns) <= MAX_TABLE_COLUMNS or not (
-            1 <= len(table.rows) <= MAX_TABLE_ROWS
-        ):
+        if len(table.columns) < 2 or not table.rows:
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             )
@@ -2572,6 +3118,20 @@ def validate_editorial_enrichment_proposal(
                 entries,
                 technical_support,
             )
+        purpose_refs = _all_refs_for_handles(table.purpose.evidence_handles, evidence_pack)
+        if not set(purpose_refs) <= table_refs:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        for value in (
+            table.purpose.question,
+            table.purpose.available_data,
+            table.purpose.comprehension_gain,
+            table.purpose.scope,
+            table.purpose.knowledge_limits,
+            table.purpose.placement_reason,
+        ):
+            _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
         try:
             tables.append(
                 TableSpecV1(
@@ -2584,6 +3144,15 @@ def validate_editorial_enrichment_proposal(
                     ),
                     rows=tuple(rows),
                     placement=placement(table.placement),
+                    purpose=EditorialAnalyticPurposeV1(
+                        question=table.purpose.question,
+                        available_data=table.purpose.available_data,
+                        comprehension_gain=table.purpose.comprehension_gain,
+                        scope=table.purpose.scope,
+                        evidence_refs=purpose_refs,
+                        knowledge_limits=table.purpose.knowledge_limits,
+                        placement_reason=table.purpose.placement_reason,
+                    ),
                 )
             )
         except ValueError as exc:
@@ -2592,13 +3161,7 @@ def validate_editorial_enrichment_proposal(
             ) from exc
 
     for diagram in parsed.diagrams:
-        if (
-            len(diagram.nodes) < 2
-            or len(diagram.nodes) > MAX_DIAGRAM_NODES
-            or not diagram.edges
-            or len(diagram.edges) > MAX_DIAGRAM_EDGES
-            or len(diagram.groups) > MAX_DIAGRAM_GROUPS
-        ):
+        if len(diagram.nodes) < 2 or not diagram.edges:
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             )
@@ -2626,6 +3189,7 @@ def validate_editorial_enrichment_proposal(
                         target_node_id=edge.target_node_id,
                         label=edge.label,
                         evidence_refs=refs,
+                        relation_type=edge.relation_type,
                     )
                 )
             for group in diagram.groups:
@@ -2644,6 +3208,20 @@ def validate_editorial_enrichment_proposal(
                     entries,
                     technical_support,
                 )
+            purpose_refs = _all_refs_for_handles(diagram.purpose.evidence_handles, evidence_pack)
+            if not set(purpose_refs) <= diagram_refs:
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                )
+            for value in (
+                diagram.purpose.question,
+                diagram.purpose.available_data,
+                diagram.purpose.comprehension_gain,
+                diagram.purpose.scope,
+                diagram.purpose.knowledge_limits,
+                diagram.purpose.placement_reason,
+            ):
+                _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
             diagrams.append(
                 DiagramSpecV1(
                     key=diagram.key,
@@ -2655,6 +3233,15 @@ def validate_editorial_enrichment_proposal(
                     edges=tuple(edges),
                     groups=tuple(groups),
                     placement=placement(diagram.placement),
+                    purpose=EditorialAnalyticPurposeV1(
+                        question=diagram.purpose.question,
+                        available_data=diagram.purpose.available_data,
+                        comprehension_gain=diagram.purpose.comprehension_gain,
+                        scope=diagram.purpose.scope,
+                        evidence_refs=purpose_refs,
+                        knowledge_limits=diagram.purpose.knowledge_limits,
+                        placement_reason=diagram.purpose.placement_reason,
+                    ),
                 )
             )
         except ValueError as exc:
@@ -3766,6 +4353,7 @@ def _editorial_enrichment_identity_payload(
         "prompt_version": prompt_version or EDITORIAL_ENRICHMENT_PROMPT_VERSION,
         "contract_version": contract_version or EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
         "validator_version": EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
+        "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         "model_policy_version": EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
         "routing_policy_version": EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
     }
@@ -3796,6 +4384,13 @@ def compute_editorial_enrichment_invocation_hash(
         prompt_version=prompt_version,
         contract_version=contract_version,
     )
+    for local_only_version in (
+        "schema_version",
+        "policy_version",
+        "validator_version",
+        "analytic_validation_policy_version",
+    ):
+        payload.pop(local_only_version, None)
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 
@@ -3847,6 +4442,7 @@ def editorial_enrichment_parse_identity(
         "parser_version": parser_version or EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
         "contract_version": contract_version or EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
         "prompt_version": prompt_version or EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+        "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         "request_handle_mapping": [
             {"handle": handle, "evidence_ref": repr(ref)}
             for handle, ref in sorted(evidence_pack._handle_to_ref.items())

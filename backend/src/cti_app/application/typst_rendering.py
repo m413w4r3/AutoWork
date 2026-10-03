@@ -34,7 +34,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v3-semantic-text"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v4-table-layout"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _MEDIA_EXTENSIONS = {
     "image/svg+xml": ".svg",
@@ -470,8 +470,20 @@ def _table_block(table: PublicationTableV1) -> dict[str, Any]:
         "title": table.title,
         "caption": table.caption,
         "columns": [column.label for column in table.columns],
+        "column_weights": _table_column_weights(table),
         "rows": [list(row.cells) for row in table.rows],
     }
+
+
+def _table_column_weights(table: PublicationTableV1) -> list[float]:
+    """Use bounded, content-derived Typst fractions so wider fields get more room."""
+    weights: list[float] = []
+    for index, column in enumerate(table.columns):
+        values = [column.label, *(row.cells[index] for row in table.rows)]
+        longest = max((len(value.strip()) for value in values), default=1)
+        weight = min(2.4, max(0.8, longest / 16))
+        weights.append(round(weight, 2))
+    return weights
 
 
 def _diagram_block(

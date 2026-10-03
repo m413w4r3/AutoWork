@@ -87,7 +87,7 @@ async def test_media_asset_store_deduplicates_and_persists_complete_manifests(
         media_sha256=hashlib.sha256(svg).hexdigest(),
         compiler="d2",
         compiler_version="0.9.0",
-        compiler_policy_version="diagram-d2-svg-v2",
+        compiler_policy_version="diagram-d2-svg-v3-relation-semantics",
     )
     diagram_manifest = await asset_store.store_diagram(
         compiled, source=f"production_run:{uuid4()}:diagram:network_flow"
@@ -99,7 +99,7 @@ async def test_media_asset_store_deduplicates_and_persists_complete_manifests(
     )
     assert diagram_manifest.compiler_name == "d2"
     assert diagram_manifest.compiler_version == "0.9.0"
-    assert diagram_manifest.policy_version == "diagram-d2-svg-v2"
+    assert diagram_manifest.policy_version == "diagram-d2-svg-v3-relation-semantics"
     assert diagram_manifest.source.startswith("production_run:")
     assert diagram_manifest.provenance is None
     assert diagram_manifest.locator is None

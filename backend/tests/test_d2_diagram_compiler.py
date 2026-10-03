@@ -25,6 +25,7 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
+    DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
@@ -160,6 +161,42 @@ def test_omits_only_none_edge_labels() -> None:
     assert encode_d2_source(diagram).decode().splitlines()[-1] == "n001 -> n002"
 
 
+@pytest.mark.parametrize(
+    ("relation_type", "encoded_label"),
+    (
+        (DiagramRelationType.INFERENCE, "inference: may connect"),
+        (DiagramRelationType.COMPARISON, "comparison: may connect"),
+    ),
+)
+def test_d2_labels_inference_and_comparison_without_changing_the_graph_authority(
+    relation_type: DiagramRelationType, encoded_label: str
+) -> None:
+    edge = replace(
+        _edge("source", "target", "may connect"),
+        relation_type=relation_type,
+    )
+    source = encode_d2_source(_diagram(edges=(edge,))).decode()
+
+    assert f'"{encoded_label}"' in source
+    assert "n001 -> n002" in source
+
+
+def test_comparison_relation_changes_rendering_identity() -> None:
+    factual = _diagram()
+    comparison = replace(
+        factual,
+        edges=(
+            replace(
+                factual.edges[0],
+                relation_type=DiagramRelationType.COMPARISON,
+                label="comparison of observations",
+            ),
+        ),
+    )
+
+    assert diagram_semantic_sha256(comparison) != diagram_semantic_sha256(factual)
+
+
 def test_encoding_and_semantic_hash_are_stable_and_key_sensitive() -> None:
     diagram = _diagram()
 
@@ -179,7 +216,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v2"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v3-relation-semantics"
 
 
 @dataclass(frozen=True, slots=True)

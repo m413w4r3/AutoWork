@@ -26,6 +26,7 @@ from cti_app.application.diagram_compilation import (
     DiagramCompilerVersionError,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
 )
@@ -120,6 +121,7 @@ def _semantic_projection(diagram: DiagramSpecV1) -> dict[str, Any]:
                 "source_node_id": edge.source_node_id,
                 "target_node_id": edge.target_node_id,
                 "label": edge.label,
+                "relation_type": edge.relation_type.value,
                 "evidence_refs": [_ref_projection(ref) for ref in edge.evidence_refs],
             }
             for edge in diagram.edges
@@ -178,8 +180,18 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
 
     for edge in diagram.edges:
         line = f"{node_references[edge.source_node_id]} -> {node_references[edge.target_node_id]}"
-        if edge.label is not None:
-            line += f": {_escape_d2_label(edge.label)}"
+        label = edge.label or ""
+        if edge.relation_type is DiagramRelationType.INFERENCE and not label.casefold().startswith(
+            "inference"
+        ):
+            label = f"inference: {label}".rstrip()
+        elif (
+            edge.relation_type is DiagramRelationType.COMPARISON
+            and not label.casefold().startswith("comparison")
+        ):
+            label = f"comparison: {label}".rstrip()
+        if label:
+            line += f": {_escape_d2_label(label)}"
         lines.append(line)
 
     return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)

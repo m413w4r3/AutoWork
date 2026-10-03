@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
@@ -24,10 +25,11 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 3
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 4
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
+EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v1"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
@@ -107,6 +109,42 @@ class EnrichmentTableKind(StrEnum):
     CUSTOM = "custom"
 
 
+def normalize_analytic_question(value: str) -> str:
+    """Return a stable, punctuation-insensitive key for analytic questions."""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    normalized = "".join(char if char.isalnum() or char == "_" else " " for char in normalized)
+    return " ".join(normalized.split())
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialAnalyticPurposeV1:
+    question: str
+    available_data: str
+    comprehension_gain: str
+    scope: str
+    evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+    knowledge_limits: str
+    placement_reason: str
+
+    def __post_init__(self) -> None:
+        for name in (
+            "question",
+            "available_data",
+            "comprehension_gain",
+            "scope",
+            "knowledge_limits",
+            "placement_reason",
+        ):
+            value = _text(getattr(self, name), f"Analytic purpose {name}", semantic=True)
+            if len(value.strip()) > 1000:
+                raise ValueError(f"Analytic purpose {name} must be at most 1000 characters")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _normalize_evidence_refs(self.evidence_refs, "Analytic purpose evidence references"),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class TableColumnV1:
     key: str
@@ -143,6 +181,7 @@ class TableSpecV1:
     columns: tuple[TableColumnV1, ...]
     rows: tuple[TableRowV1, ...]
     placement: EnrichmentPlacementV1
+    purpose: EditorialAnalyticPurposeV1 | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Table key")
@@ -172,6 +211,8 @@ class TableSpecV1:
             raise ValueError("Table row width must match the number of columns")
         if not isinstance(self.placement, EnrichmentPlacementV1):
             raise ValueError("Table placement is invalid")
+        if self.purpose is not None and not isinstance(self.purpose, EditorialAnalyticPurposeV1):
+            raise ValueError("Table analytic purpose is invalid")
 
 
 class EnrichmentDiagramKind(StrEnum):
@@ -186,6 +227,12 @@ class EnrichmentDiagramKind(StrEnum):
 class EnrichmentDiagramDirection(StrEnum):
     LEFT_TO_RIGHT = "left_to_right"
     TOP_TO_BOTTOM = "top_to_bottom"
+
+
+class DiagramRelationType(StrEnum):
+    FACTUAL = "factual"
+    INFERENCE = "inference"
+    COMPARISON = "comparison"
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,12 +257,15 @@ class DiagramEdgeV1:
     target_node_id: str
     label: str | None
     evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+    relation_type: DiagramRelationType = DiagramRelationType.FACTUAL
 
     def __post_init__(self) -> None:
         _text(self.source_node_id, "Diagram edge source node ID", semantic=True)
         _text(self.target_node_id, "Diagram edge target node ID", semantic=True)
         if self.label is not None:
             _diagram_label(self.label, "Diagram edge label", semantic=False)
+        if not isinstance(self.relation_type, DiagramRelationType):
+            raise ValueError("Diagram edge relation type is invalid")
         object.__setattr__(
             self,
             "evidence_refs",
@@ -254,6 +304,7 @@ class DiagramSpecV1:
     groups: tuple[DiagramGroupV1, ...]
     placement: EnrichmentPlacementV1
     compiled_asset_id: UUID | None = None
+    purpose: EditorialAnalyticPurposeV1 | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Diagram key")
@@ -300,6 +351,8 @@ class DiagramSpecV1:
             raise ValueError("Diagram placement is invalid")
         if self.compiled_asset_id is not None and not isinstance(self.compiled_asset_id, UUID):
             raise ValueError("Compiled diagram asset identity must be a UUID")
+        if self.purpose is not None and not isinstance(self.purpose, EditorialAnalyticPurposeV1):
+            raise ValueError("Diagram analytic purpose is invalid")
 
 
 class SourceFigureInclusionStatus(StrEnum):
@@ -588,7 +641,7 @@ class EditorialEnrichmentV1:
     resource_proposals: tuple[EditorialResourceProposalV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3}:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4}:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -602,6 +655,8 @@ class EditorialEnrichmentV1:
             if self.schema_version == 1
             else EDITORIAL_ENRICHMENT_V2_POLICY_VERSION
             if self.schema_version == 2
+            else EDITORIAL_ENRICHMENT_V3_POLICY_VERSION
+            if self.schema_version == 3
             else EDITORIAL_ENRICHMENT_POLICY_VERSION
         )
         if self.enrichment_policy_version != expected_policy:
@@ -658,6 +713,18 @@ class EditorialEnrichmentV1:
         ]
         if len(keys) != len(set(keys)):
             raise ValueError("Editorial enrichment keys must be globally unique")
+        if self.schema_version >= 4:
+            purposes = [table.purpose for table in self.tables] + [
+                diagram.purpose for diagram in self.diagrams
+            ]
+            typed_purposes = tuple(purpose for purpose in purposes if purpose is not None)
+            if len(typed_purposes) != len(purposes):
+                raise ValueError("V4 tables and diagrams require analytic purposes")
+            questions = [
+                normalize_analytic_question(purpose.question) for purpose in typed_purposes
+            ]
+            if any(not question for question in questions) or len(questions) != len(set(questions)):
+                raise ValueError("Editorial enrichment analytic questions must be distinct")
         object.__setattr__(self, "warnings", tuple(sorted(set(self.warnings))))
 
 
@@ -669,6 +736,12 @@ def editorial_enrichment_evidence_refs(
     refs = {ref for table in enrichment.tables for row in table.rows for ref in row.evidence_refs}
     refs.update(
         ref
+        for table in enrichment.tables
+        if table.purpose is not None
+        for ref in table.purpose.evidence_refs
+    )
+    refs.update(
+        ref
         for diagram in enrichment.diagrams
         for node in diagram.nodes
         for ref in node.evidence_refs
@@ -678,6 +751,12 @@ def editorial_enrichment_evidence_refs(
         for diagram in enrichment.diagrams
         for edge in diagram.edges
         for ref in edge.evidence_refs
+    )
+    refs.update(
+        ref
+        for diagram in enrichment.diagrams
+        if diagram.purpose is not None
+        for ref in diagram.purpose.evidence_refs
     )
     refs.update(ref for decision in enrichment.figure_decisions for ref in decision.evidence_refs)
     return frozenset(refs)
@@ -700,8 +779,20 @@ def placement_to_json(placement: EnrichmentPlacementV1) -> dict[str, Any]:
     return _placement_to_json(placement)
 
 
-def _table_to_json(table: TableSpecV1) -> dict[str, Any]:
+def _purpose_to_json(purpose: EditorialAnalyticPurposeV1) -> dict[str, Any]:
     return {
+        "question": purpose.question,
+        "available_data": purpose.available_data,
+        "comprehension_gain": purpose.comprehension_gain,
+        "scope": purpose.scope,
+        "evidence_refs": [_ref_to_json(ref) for ref in purpose.evidence_refs],
+        "knowledge_limits": purpose.knowledge_limits,
+        "placement_reason": purpose.placement_reason,
+    }
+
+
+def _table_to_json(table: TableSpecV1, *, include_analytic: bool = False) -> dict[str, Any]:
+    payload = {
         "key": table.key,
         "kind": table.kind.value,
         "title": table.title,
@@ -716,9 +807,14 @@ def _table_to_json(table: TableSpecV1) -> dict[str, Any]:
         ],
         "placement": _placement_to_json(table.placement),
     }
+    if include_analytic:
+        if table.purpose is None:
+            raise ValueError("V4 editorial table is missing its analytic purpose")
+        payload["purpose"] = _purpose_to_json(table.purpose)
+    return payload
 
 
-def _diagram_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
+def _diagram_to_json(diagram: DiagramSpecV1, *, include_analytic: bool = False) -> dict[str, Any]:
     payload = {
         "key": diagram.key,
         "kind": diagram.kind.value,
@@ -726,12 +822,19 @@ def _diagram_to_json(diagram: DiagramSpecV1) -> dict[str, Any]:
         "caption": diagram.caption,
         "direction": diagram.direction.value,
         "nodes": [diagram_node_to_json(node) for node in diagram.nodes],
-        "edges": [diagram_edge_to_json(edge) for edge in diagram.edges],
+        "edges": [
+            diagram_edge_to_json(edge, include_relation_type=include_analytic)
+            for edge in diagram.edges
+        ],
         "groups": [diagram_group_to_json(group) for group in diagram.groups],
         "placement": _placement_to_json(diagram.placement),
     }
     if diagram.compiled_asset_id is not None:
         payload["compiled_asset_id"] = str(diagram.compiled_asset_id)
+    if include_analytic:
+        if diagram.purpose is None:
+            raise ValueError("V4 editorial diagram is missing its analytic purpose")
+        payload["purpose"] = _purpose_to_json(diagram.purpose)
     return payload
 
 
@@ -743,13 +846,18 @@ def diagram_node_to_json(node: DiagramNodeV1) -> dict[str, Any]:
     }
 
 
-def diagram_edge_to_json(edge: DiagramEdgeV1) -> dict[str, Any]:
-    return {
+def diagram_edge_to_json(
+    edge: DiagramEdgeV1, *, include_relation_type: bool = False
+) -> dict[str, Any]:
+    payload = {
         "source_node_id": edge.source_node_id,
         "target_node_id": edge.target_node_id,
         "label": edge.label,
         "evidence_refs": [evidence_ref_to_json(ref) for ref in edge.evidence_refs],
     }
+    if include_relation_type:
+        payload["relation_type"] = edge.relation_type.value
+    return payload
 
 
 def diagram_group_to_json(group: DiagramGroupV1) -> dict[str, Any]:
@@ -843,8 +951,14 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         "synthesis_hash": enrichment.synthesis_hash,
         "publication_language": enrichment.publication_language,
         "enrichment_policy_version": enrichment.enrichment_policy_version,
-        "tables": [_table_to_json(table) for table in enrichment.tables],
-        "diagrams": [_diagram_to_json(diagram) for diagram in enrichment.diagrams],
+        "tables": [
+            _table_to_json(table, include_analytic=enrichment.schema_version >= 4)
+            for table in enrichment.tables
+        ],
+        "diagrams": [
+            _diagram_to_json(diagram, include_analytic=enrichment.schema_version >= 4)
+            for diagram in enrichment.diagrams
+        ],
         "source_figures": [_figure_to_json(figure) for figure in enrichment.source_figures],
         "warnings": list(enrichment.warnings),
     }
@@ -882,18 +996,34 @@ _ROOT_KEYS_V1 = frozenset(
 )
 _ROOT_KEYS_V2 = _ROOT_KEYS_V1 | {"annotations"}
 _ROOT_KEYS_V3 = _ROOT_KEYS_V2 | {"figure_decisions", "resource_needs", "resource_proposals"}
+_ROOT_KEYS_V4 = _ROOT_KEYS_V3
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
 _ROW_KEYS = frozenset({"cells", "evidence_refs"})
-_TABLE_KEYS = frozenset({"key", "kind", "title", "caption", "columns", "rows", "placement"})
+_TABLE_BASE_KEYS = frozenset({"key", "kind", "title", "caption", "columns", "rows", "placement"})
+_TABLE_KEYS = _TABLE_BASE_KEYS | {"purpose"}
+_PURPOSE_KEYS = frozenset(
+    {
+        "question",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "evidence_refs",
+        "knowledge_limits",
+        "placement_reason",
+    }
+)
 _NODE_KEYS = frozenset({"node_id", "label", "evidence_refs"})
-_EDGE_KEYS = frozenset({"source_node_id", "target_node_id", "label", "evidence_refs"})
+_EDGE_BASE_KEYS = frozenset({"source_node_id", "target_node_id", "label", "evidence_refs"})
+_EDGE_KEYS = _EDGE_BASE_KEYS | {"relation_type"}
 _GROUP_KEYS = frozenset({"group_id", "label", "node_ids"})
 _DIAGRAM_BASE_KEYS = frozenset(
     {"key", "kind", "title", "caption", "direction", "nodes", "edges", "groups", "placement"}
 )
 _DIAGRAM_KEYS = _DIAGRAM_BASE_KEYS | {"compiled_asset_id"}
+_DIAGRAM_ANALYTIC_BASE_KEYS = _DIAGRAM_BASE_KEYS | {"purpose"}
+_DIAGRAM_ANALYTIC_KEYS = _DIAGRAM_KEYS | {"purpose"}
 _LOCATOR_KEYS = frozenset({"page", "section", "figure_label", "original_asset_url"})
 _FIGURE_KEYS = frozenset(
     {
@@ -993,8 +1123,32 @@ def _placement_from_json(raw: Any) -> EnrichmentPlacementV1:
     )
 
 
-def _table_from_json(raw: Any) -> TableSpecV1:
-    payload = _object(raw, _TABLE_KEYS, "Editorial table")
+def _purpose_from_json(raw: Any) -> EditorialAnalyticPurposeV1:
+    payload = _object(raw, _PURPOSE_KEYS, "Editorial analytic purpose")
+    return EditorialAnalyticPurposeV1(
+        question=_text(payload["question"], "Analytic purpose question", semantic=True),
+        available_data=_text(
+            payload["available_data"], "Analytic purpose available data", semantic=True
+        ),
+        comprehension_gain=_text(
+            payload["comprehension_gain"], "Analytic purpose comprehension gain", semantic=True
+        ),
+        scope=_text(payload["scope"], "Analytic purpose scope", semantic=True),
+        evidence_refs=_refs_from_json(
+            payload["evidence_refs"], "Analytic purpose evidence references"
+        ),
+        knowledge_limits=_text(
+            payload["knowledge_limits"], "Analytic purpose knowledge limits", semantic=True
+        ),
+        placement_reason=_text(
+            payload["placement_reason"], "Analytic purpose placement reason", semantic=True
+        ),
+    )
+
+
+def _table_from_json(raw: Any, *, require_analytic: bool = False) -> TableSpecV1:
+    allowed_keys = _TABLE_KEYS if require_analytic else _TABLE_BASE_KEYS
+    payload = _object(raw, allowed_keys, "Editorial table")
     caption = payload["caption"]
     if caption is not None:
         caption = _text(caption, "Table caption")
@@ -1031,6 +1185,7 @@ def _table_from_json(raw: Any) -> TableSpecV1:
         columns=columns,
         rows=rows,
         placement=_placement_from_json(payload["placement"]),
+        purpose=_purpose_from_json(payload["purpose"]) if require_analytic else None,
     )
 
 
@@ -1043,8 +1198,9 @@ def _node_from_json(raw: Any) -> DiagramNodeV1:
     )
 
 
-def _edge_from_json(raw: Any) -> DiagramEdgeV1:
-    payload = _object(raw, _EDGE_KEYS, "Diagram edge")
+def _edge_from_json(raw: Any, *, require_relation_type: bool = False) -> DiagramEdgeV1:
+    allowed_keys = _EDGE_KEYS if require_relation_type else _EDGE_BASE_KEYS
+    payload = _object(raw, allowed_keys, "Diagram edge")
     label = payload["label"]
     if label is not None:
         label = _text(label, "Diagram edge label")
@@ -1057,6 +1213,11 @@ def _edge_from_json(raw: Any) -> DiagramEdgeV1:
         ),
         label=label,
         evidence_refs=_refs_from_json(payload["evidence_refs"], "Diagram edge evidence references"),
+        relation_type=(
+            _enum(DiagramRelationType, payload["relation_type"], "Diagram relation type")
+            if require_relation_type
+            else DiagramRelationType.FACTUAL
+        ),
     )
 
 
@@ -1072,11 +1233,13 @@ def _group_from_json(raw: Any) -> DiagramGroupV1:
     )
 
 
-def _diagram_from_json(raw: Any) -> DiagramSpecV1:
-    if not isinstance(raw, Mapping) or frozenset(raw) not in {
-        _DIAGRAM_BASE_KEYS,
-        _DIAGRAM_KEYS,
-    }:
+def _diagram_from_json(raw: Any, *, require_analytic: bool = False) -> DiagramSpecV1:
+    allowed_key_sets = (
+        {_DIAGRAM_ANALYTIC_BASE_KEYS, _DIAGRAM_ANALYTIC_KEYS}
+        if require_analytic
+        else {_DIAGRAM_BASE_KEYS, _DIAGRAM_KEYS}
+    )
+    if not isinstance(raw, Mapping) or frozenset(raw) not in allowed_key_sets:
         raise ValueError("Editorial diagram has missing or extra fields")
     payload = raw
     caption = payload["caption"]
@@ -1089,7 +1252,10 @@ def _diagram_from_json(raw: Any) -> DiagramSpecV1:
         caption=caption,
         direction=_enum(EnrichmentDiagramDirection, payload["direction"], "Diagram direction"),
         nodes=tuple(_node_from_json(value) for value in _array(payload["nodes"], "Diagram nodes")),
-        edges=tuple(_edge_from_json(value) for value in _array(payload["edges"], "Diagram edges")),
+        edges=tuple(
+            _edge_from_json(value, require_relation_type=require_analytic)
+            for value in _array(payload["edges"], "Diagram edges")
+        ),
         groups=tuple(
             _group_from_json(value) for value in _array(payload["groups"], "Diagram groups")
         ),
@@ -1099,6 +1265,7 @@ def _diagram_from_json(raw: Any) -> DiagramSpecV1:
             if "compiled_asset_id" in payload
             else None
         ),
+        purpose=_purpose_from_json(payload["purpose"]) if require_analytic else None,
     )
 
 
@@ -1248,15 +1415,21 @@ def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1/V2/V3 payloads; pre-L7b artifacts migrate with empty review data."""
+    """Decode strict V1-V4 payloads; older artifacts retain empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
-    body = _object(
-        payload,
-        _ROOT_KEYS_V1 if raw_version == 1 else _ROOT_KEYS_V2 if raw_version == 2 else _ROOT_KEYS_V3,
-        "Editorial enrichment",
-    )
+    if type(raw_version) is not int:
+        raise ValueError("Editorial enrichment schema version must be an integer")
+    root_keys = {
+        1: _ROOT_KEYS_V1,
+        2: _ROOT_KEYS_V2,
+        3: _ROOT_KEYS_V3,
+        4: _ROOT_KEYS_V4,
+    }.get(raw_version)
+    if root_keys is None:
+        raise ValueError("Editorial enrichment schema version is unsupported")
+    body = _object(payload, root_keys, "Editorial enrichment")
     schema_version = body["schema_version"]
     if type(schema_version) is not int:
         raise ValueError("Editorial enrichment schema version must be an integer")
@@ -1277,10 +1450,12 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
             body["enrichment_policy_version"], "Enrichment policy version"
         ),
         tables=tuple(
-            _table_from_json(value) for value in _array(body["tables"], "Editorial tables")
+            _table_from_json(value, require_analytic=schema_version >= 4)
+            for value in _array(body["tables"], "Editorial tables")
         ),
         diagrams=tuple(
-            _diagram_from_json(value) for value in _array(body["diagrams"], "Editorial diagrams")
+            _diagram_from_json(value, require_analytic=schema_version >= 4)
+            for value in _array(body["diagrams"], "Editorial diagrams")
         ),
         source_figures=tuple(
             _figure_from_json(value) for value in _array(body["source_figures"], "Source figures")

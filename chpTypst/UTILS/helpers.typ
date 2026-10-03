@@ -325,8 +325,10 @@
     }
   })
 
+  set text(size: 9pt)
   align(center, table(
     columns: columns,
+    inset: (x: 5pt, y: 4pt),
 
     align: (x, y) => {
       if y == 0 {
@@ -344,7 +346,7 @@
       }
     },
 
-    stroke: 1pt + gray,
+    stroke: 0.6pt + gray,
     ..styled-cells,
   ))
 }

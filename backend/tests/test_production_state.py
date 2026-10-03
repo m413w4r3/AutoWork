@@ -37,6 +37,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialAnalyticPurposeV1,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
@@ -190,6 +191,15 @@ def canonical_production_state_artifacts(
                     ),
                 ),
                 placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+                purpose=EditorialAnalyticPurposeV1(
+                    question="What reported fact is relevant?",
+                    available_data="ExampleRAT appears in the evidence.",
+                    comprehension_gain="The row pairs the named fact with its context.",
+                    scope="The cited ExampleRAT observation.",
+                    evidence_refs=(evidence_ref,),
+                    knowledge_limits="No additional behavior is stated.",
+                    placement_reason="Place after the opening paragraph.",
+                ),
             ),
         ),
     )

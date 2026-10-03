@@ -26,6 +26,7 @@ from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+    AnalyticPurposeProposalV1,
     AnnotationProposalV1,
     EditorialEnrichmentExecutionStatus,
     EditorialEnrichmentProposalControlError,
@@ -171,8 +172,8 @@ def _source(
                 category="malware",
                 value="ExampleRAT",
                 attack_id=None,
-                context="",
-                evidence_quote="ExampleRAT",
+                context="ExampleRAT launches execution.",
+                evidence_quote="ExampleRAT launches execution.",
                 evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
                 source_document_ids=(document_id,),
             ),
@@ -305,6 +306,15 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                     TableRowProposalV1(cells=("ExampleRAT", "malware"), evidence_handles=(handle,)),
                 ),
                 placement=EnrichmentPlacementProposalV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
+                purpose=AnalyticPurposeProposalV1(
+                    question="Which named tool is documented?",
+                    available_data="The report names ExampleRAT.",
+                    comprehension_gain="A compact row pairs the tool with its role.",
+                    scope="The single named tool in this evidence item.",
+                    evidence_handles=(handle,),
+                    knowledge_limits="No additional tool behavior is documented.",
+                    placement_reason="Place after the opening paragraph introducing the tool.",
+                ),
             ),
         ),
         diagrams=(
@@ -322,10 +332,20 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                         "source_node_id": "malware",
                         "target_node_id": "execution",
                         "label": "launches",
+                        "relation_type": "factual",
                         "evidence_handles": [handle],
                     }
                 ],
                 "placement": {"kind": "after_section", "section_index": 0},
+                "purpose": {
+                    "question": "Does ExampleRAT launch an execution step?",
+                    "available_data": "The source states that ExampleRAT launches execution.",
+                    "comprehension_gain": "A short sequence shows the documented action.",
+                    "scope": "Only the two endpoints in this evidence item.",
+                    "evidence_handles": [handle],
+                    "knowledge_limits": "No later infection stages are documented.",
+                    "placement_reason": "Place beside the paragraph describing execution.",
+                },
             },
         ),
     )
@@ -522,7 +542,12 @@ def test_strict_proposal_rejects_extra_keys_missing_evidence_and_unknown_handles
 def _colliding_proposal(collision: str) -> dict[str, object]:
     proposal = _proposal("E001").model_dump(mode="json")
     if collision == "duplicate_table_keys":
-        proposal["tables"] = [proposal["tables"][0], dict(proposal["tables"][0])]
+        duplicate = dict(proposal["tables"][0])
+        duplicate["purpose"] = {
+            **duplicate["purpose"],
+            "question": "Which different named tool is documented?",
+        }
+        proposal["tables"] = [proposal["tables"][0], duplicate]
     else:
         proposal["diagrams"][0]["key"] = proposal["tables"][0]["key"]
     return proposal
@@ -576,10 +601,325 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert isinstance(contract, str)
     assert "COLUMN C001" in contract and "ROW R001" in contract
     assert "NODE N001" in contract and "RELATION L001" in contract
-    assert "GROUP G001" in contract and "NO USEFUL ENRICHMENT" in contract
+    assert "RELATION_TYPE: comparison" in contract and "NO USEFUL ENRICHMENT" in contract
     assert "FIGURE P001" in contract and "NEEDS N001" in contract
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
+
+
+def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
+    snapshot = _snapshot()
+    run = ProductionRun(subject_id=_SUBJECT_ID, edition_id=uuid4())
+    snapshot = replace(snapshot, production_run_id=run.id)
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    document = _document()
+    import asyncio
+
+    access_policy = asyncio.run(
+        build_synthesis_access_policy(snapshot, extraction, _MemorySourceDocuments((document,)))
+    )
+    request = build_editorial_enrichment_model_request(
+        run, snapshot, extraction, synthesis, pack, access_policy
+    )
+    prompt_payload = json.loads(request.text)
+
+    for field in (
+        "PURPOSE",
+        "DATA",
+        "GAIN",
+        "SCOPE",
+        "PURPOSE_EVIDENCE",
+        "LIMITS",
+        "PLACEMENT",
+        "PLACEMENT_REASON",
+    ):
+        assert field in request.text
+    assert "comprehension gain" in request.text.lower() or "avantage sur le paragraphe" in (
+        request.text.lower()
+    )
+    assert "table_rows" not in request.text
+    assert "diagram_nodes" not in request.text
+    assert "row or node target exists" in request.text
+    assert "control-plane and data-plane" in request.text
+    assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
+        enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
+    )
+
+
+def test_parser_does_not_impose_table_row_or_diagram_node_targets() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    proposal = _proposal("E001")
+    table = proposal.tables[0].model_copy(
+        update={
+            "rows": tuple(
+                TableRowProposalV1(
+                    cells=(f"Item {index:03d}", f"Detail {index:03d}"),
+                    evidence_handles=("E001",),
+                )
+                for index in range(1, 52)
+            )
+        }
+    )
+    diagram = proposal.diagrams[0]
+    nodes = (
+        *diagram.nodes,
+        *(
+            diagram.nodes[0].model_copy(
+                update={"node_id": f"component_{index}", "label": f"Component {index}"}
+            )
+            for index in range(3, 52)
+        ),
+    )
+    diagram = diagram.model_copy(update={"nodes": nodes})
+    proposal = proposal.model_copy(update={"tables": (table,), "diagrams": (diagram,)})
+
+    result = parse_editorial_enrichment_proposal_wire(_proposal_to_wire(proposal), pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.tables[0].rows) == 51
+    assert len(result.proposal.diagrams[0].nodes) == 51
+
+
+def test_purpose_is_required_and_duplicate_questions_reject_only_one_sibling() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+
+    missing_purpose = wire.replace("PURPOSE: Which named tool is documented?", "PURPOSE:", 1)
+    missing_result = parse_editorial_enrichment_proposal_wire(missing_purpose, pack)
+    assert missing_result.proposal is not None
+    assert missing_result.proposal.tables == ()
+    assert len(missing_result.proposal.diagrams) == 1
+    assert "editorial_enrichment_analytic_purpose_missing_or_invalid" in {
+        item.reason_code for item in missing_result.rejections
+    }
+
+    duplicate_purpose = wire.replace(
+        "PURPOSE: Does ExampleRAT launch an execution step?",
+        "PURPOSE: Which named tool is documented?!",
+        1,
+    )
+    duplicate_result = parse_editorial_enrichment_proposal_wire(duplicate_purpose, pack)
+    assert duplicate_result.proposal is not None
+    assert len(duplicate_result.proposal.tables) == 1
+    assert duplicate_result.proposal.diagrams == ()
+    assert "editorial_enrichment_duplicate_analytic_purpose" in {
+        item.reason_code for item in duplicate_result.rejections
+    }
+
+
+def test_paraphrase_only_table_is_rejected_while_a_valid_table_sibling_survives() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace(
+        "CELL: ExampleRAT\nCELL: malware",
+        "CELL: ExampleRAT was observed.\nCELL: ExampleRAT was observed.",
+        1,
+    )
+    wire += """
+TABLE T002
+KEY: documented_action
+KIND: custom
+TITLE: Documented action
+PURPOSE: Which action is stated in the evidence?
+DATA: ExampleRAT launches execution.
+GAIN: The pair distinguishes the named actor from the action.
+SCOPE: One action from E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: No later stage is described.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place after the paragraph introducing the action.
+COLUMN C003
+KEY: actor
+LABEL: Actor
+END COLUMN
+COLUMN C004
+KEY: action
+LABEL: Action
+END COLUMN
+ROW R002
+CELL: ExampleRAT
+CELL: launches execution
+EVIDENCE: E001
+END ROW
+END TABLE
+"""
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert [item.key for item in result.proposal.tables] == ["documented_action"]
+    assert {item.reason_code for item in result.rejections} >= {
+        "editorial_enrichment_table_paraphrase_only"
+    }
+
+
+def test_relation_without_endpoint_support_is_rejected_without_dropping_table() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("LABEL: ExampleRAT", "LABEL: OP_RETURN", 1)
+    wire = wire.replace("LABEL: Execution", "LABEL: JSON-RPC", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.tables) == 1
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_relation_endpoint_unsupported" in {
+        item.reason_code for item in result.rejections
+    }
+
+
+def test_factual_relation_needs_both_endpoints_in_the_same_cited_evidence_item() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    second_ref = replace(pack.resolve_handle("E001"), evidence_key="e" * 64)
+    separated_pack = replace(
+        pack,
+        narrative_evidence=(
+            *pack.narrative_evidence,
+            {"handle": "E002", "context": "OP_RETURN appears in a separate observation."},
+        ),
+        _handle_to_ref={**pack._handle_to_ref, "E002": second_ref},
+    )
+    wire = _proposal_to_wire(_proposal("E001")).replace(
+        "KIND: infection_chain", "KIND: component_relationship", 1
+    )
+    wire = wire.replace(
+        "ID: execution\nLABEL: Execution\nEVIDENCE: E001",
+        "ID: execution\nLABEL: OP_RETURN\nEVIDENCE: E002",
+        1,
+    )
+    wire = wire.replace(
+        "LABEL: launches\nEVIDENCE: E001\nEND RELATION",
+        "LABEL: launches\nEVIDENCE: E001, E002\nEND RELATION",
+        1,
+    )
+
+    result = parse_editorial_enrichment_proposal_wire(wire, separated_pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.tables) == 1
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_relation_without_endpoint_support" in {
+        item.reason_code for item in result.rejections
+    }
+
+
+def test_inference_relation_is_explicit_and_kept_with_supporting_handles() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("KIND: infection_chain", "KIND: component_relationship", 1)
+    wire = wire.replace("RELATION_TYPE: factual", "RELATION_TYPE: inference", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams[0].edges[0].relation_type.value == "inference"
+    assert result.proposal.diagrams[0].edges[0].evidence_handles == ("E001",)
+
+
+def test_link_not_demonstrated_projection_rejects_a_factual_cross_source_edge() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    first_ref = pack.resolve_handle("E001")
+    second_ref = replace(first_ref, source_document_id=uuid4(), evidence_key="e" * 64)
+    contradictory_pack = replace(
+        pack,
+        narrative_evidence=(
+            *pack.narrative_evidence,
+            {"handle": "E002", "context": "Execution is mentioned by source B."},
+        ),
+        reserve_evidence=(
+            {"handle": "R001", "context": "ExampleRAT is mentioned."},
+            {"handle": "R002", "context": "Execution is mentioned."},
+        ),
+        source_pair_relations=(
+            {
+                "relation": "link_not_demonstrated",
+                "reason": "The two source observations are not linked.",
+                "supporting_handles": ("R001", "R002"),
+            },
+        ),
+        _handle_to_ref={**pack._handle_to_ref, "E002": second_ref},
+        _reserve_handle_to_ref={"R001": first_ref, "R002": second_ref},
+    )
+    wire = _proposal_to_wire(_proposal("E001")).replace(
+        "ID: execution\nLABEL: Execution\nEVIDENCE: E001",
+        "ID: execution\nLABEL: Execution\nEVIDENCE: E002",
+        1,
+    )
+
+    result = parse_editorial_enrichment_proposal_wire(wire, contradictory_pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_relation_contradicts_projection" in {
+        item.reason_code for item in result.rejections
+    }
+
+
+def test_comparison_is_not_an_infection_sequence_and_sequences_need_relation_evidence() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    comparison = wire.replace("KIND: infection_chain", "KIND: custom", 1)
+    comparison = comparison.replace("RELATION_TYPE: factual", "RELATION_TYPE: comparison", 1)
+    comparison = comparison.replace("LABEL: launches", "LABEL: comparison of observations", 1)
+    comparison_result = parse_editorial_enrichment_proposal_wire(comparison, pack)
+    assert comparison_result.proposal is not None
+    assert comparison_result.proposal.diagrams[0].edges[0].relation_type.value == "comparison"
+
+    false_sequence = wire.replace("LABEL: launches", "LABEL: triggers a later stage", 1)
+    sequence_result = parse_editorial_enrichment_proposal_wire(false_sequence, pack)
+    assert sequence_result.proposal is not None
+    assert sequence_result.proposal.diagrams == ()
+    assert "editorial_enrichment_infection_chain_sequence_not_documented" in {
+        item.reason_code for item in sequence_result.rejections
+    }
+
+    comparison_sequence = comparison.replace("KIND: custom", "KIND: infection_chain", 1)
+    invalid_result = parse_editorial_enrichment_proposal_wire(comparison_sequence, pack)
+    assert invalid_result.proposal is not None
+    assert invalid_result.proposal.diagrams == ()
+    assert "editorial_enrichment_comparison_cannot_be_infection_chain" in {
+        item.reason_code for item in invalid_result.rejections
+    }
+
+
+def test_zero_tables_and_diagrams_are_a_valid_explicit_empty_decision() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+
+    result = parse_editorial_enrichment_proposal_wire("NO USEFUL ENRICHMENT", pack)
+
+    assert result.explicit_empty is True
+    assert result.proposal is not None
+    assert result.proposal.tables == result.proposal.diagrams == ()
 
 
 def _figure_wire(
@@ -724,7 +1064,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 3
+    assert enrichment.schema_version == 4
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -823,6 +1163,15 @@ def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
                 ],
                 "rows": [{"cells": ["203.0.113.9", "C2"], "evidence_handles": [example_handle]}],
                 "placement": {"kind": "after_lead"},
+                "purpose": {
+                    "question": "Which infrastructure indicator is recorded?",
+                    "available_data": "One infrastructure observation is present.",
+                    "comprehension_gain": "The row pairs the literal and its role.",
+                    "scope": "Only the indicator cited by this row.",
+                    "evidence_handles": [example_handle],
+                    "knowledge_limits": "No additional indicator details are stated.",
+                    "placement_reason": "Place with the paragraph introducing infrastructure.",
+                },
             }
         ],
         "diagrams": [],
@@ -925,9 +1274,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "ExampleRAT execution architecture" in request.text
     assert "640" in request.text and "400" in request.text
     assert "blob_id" not in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v3-figures-resource-needs"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v4-analytic-purpose"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v3-figures-needs"
+        "editorial-enrichment-block-contract-v4-analytic-purpose"
     )
 
 
@@ -1060,7 +1409,7 @@ class _MemoryDiagramCompiler:
             media_sha256=hashlib.sha256(svg).hexdigest(),
             compiler="d2",
             compiler_version="0.9.0",
-            compiler_policy_version="diagram-d2-svg-v2",
+            compiler_policy_version="diagram-d2-svg-v3-relation-semantics",
         )
 
 
@@ -1238,6 +1587,18 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                 f"TITLE: {table['title']}",
             ]
         )
+        purpose = table["purpose"]
+        lines.extend(
+            [
+                f"PURPOSE: {purpose['question']}",
+                f"DATA: {purpose['available_data']}",
+                f"GAIN: {purpose['comprehension_gain']}",
+                f"SCOPE: {purpose['scope']}",
+                f"PURPOSE_EVIDENCE: {', '.join(purpose['evidence_handles'])}",
+                f"LIMITS: {purpose['knowledge_limits']}",
+                f"PLACEMENT_REASON: {purpose['placement_reason']}",
+            ]
+        )
         if table.get("caption") is not None:
             lines.append(f"CAPTION: {table['caption']}")
         placement = table["placement"]
@@ -1268,6 +1629,18 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                 f"TITLE: {diagram['title']}",
             ]
         )
+        purpose = diagram["purpose"]
+        lines.extend(
+            [
+                f"PURPOSE: {purpose['question']}",
+                f"DATA: {purpose['available_data']}",
+                f"GAIN: {purpose['comprehension_gain']}",
+                f"SCOPE: {purpose['scope']}",
+                f"PURPOSE_EVIDENCE: {', '.join(purpose['evidence_handles'])}",
+                f"LIMITS: {purpose['knowledge_limits']}",
+                f"PLACEMENT_REASON: {purpose['placement_reason']}",
+            ]
+        )
         if diagram.get("caption") is not None:
             lines.append(f"CAPTION: {diagram['caption']}")
         lines.append(f"DIRECTION: {diagram['direction']}")
@@ -1291,6 +1664,7 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                     f"RELATION L{index:03d}_{edge_index:03d}",
                     f"FROM: {edge['source_node_id']}",
                     f"TO: {edge['target_node_id']}",
+                    f"RELATION_TYPE: {edge['relation_type']}",
                 ]
             )
             if edge.get("label") is not None:
@@ -1554,7 +1928,8 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     wire = wire.replace(
         "END DIAGRAM",
         "GROUP G_VALID\nID: stage\nLABEL: Execution stage\nNODES: malware, execution\n"
-        "END GROUP\nRELATION L_UNKNOWN\nFROM: malware\nTO: missing\nLABEL: leads to\n"
+        "END GROUP\nRELATION L_UNKNOWN\nFROM: malware\nTO: missing\n"
+        "RELATION_TYPE: factual\nLABEL: leads to\n"
         "EVIDENCE: E001\nEND RELATION\nEND DIAGRAM",
         1,
     )
@@ -1650,10 +2025,10 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
 @pytest.mark.parametrize(
     ("version_name", "version_value"),
     (
-        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v6"),
+        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v8-test"),
         (
             "EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION",
-            "editorial-enrichment-block-contract-v3",
+            "editorial-enrichment-block-contract-v5-test",
         ),
     ),
 )

@@ -13,6 +13,7 @@ from cti_app.application.semantic_annotation import EnglishTermDetector, Semanti
 from cti_app.application.typst_rendering import (
     TypstRenderer,
     TypstTemplateBundle,
+    _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
 )
@@ -228,7 +229,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v3-semantic-text"
+    assert data["schema_version"] == "typst-publication-model-v4-table-layout"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -379,7 +380,9 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v3-semantic-text"
+    assert data["schema_version"] == "typst-publication-model-v4-table-layout"
+    assert table["column_weights"] == _table_column_weights(base.tables[0])
+    assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
     assert "".join(span["text"] for span in paragraph["semantic_spans"]) == lead_text
     assert {"semantic-actor", "semantic-command", "semantic-technical-literal"} <= styles
@@ -589,3 +592,32 @@ def test_figure_media_extension_matches_mime_type(
     rendered = renderer.render(_document(figures=(figure,)), bundle)
 
     assert rendered.media_refs[0].media_path.endswith(extension)
+
+
+def test_table_column_weights_are_deterministic_bounded_and_content_sensitive() -> None:
+    table = _table(key="layout")
+    narrow = replace(
+        table,
+        columns=(replace(table.columns[0], label="ID"), replace(table.columns[1], label="Note")),
+        rows=(replace(table.rows[0], cells=("A1", "Short")),),
+    )
+    wide = replace(
+        narrow,
+        rows=(
+            replace(
+                narrow.rows[0],
+                cells=(
+                    "A1",
+                    "A substantially longer evidence-grounded explanation that should wrap in its "
+                    "own wider column rather than forcing equal widths.",
+                ),
+            ),
+        ),
+    )
+
+    narrow_weights = _table_column_weights(narrow)
+    wide_weights = _table_column_weights(wide)
+
+    assert narrow_weights == _table_column_weights(narrow)
+    assert all(0.8 <= weight <= 2.4 for weight in wide_weights)
+    assert wide_weights[1] > wide_weights[0]

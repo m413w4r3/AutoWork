@@ -107,7 +107,7 @@ class _DiagramCompiler:
             media_sha256=hashlib.sha256(self.svg).hexdigest(),
             compiler="d2",
             compiler_version="0.9.0",
-            compiler_policy_version="diagram-d2-svg-v2",
+            compiler_policy_version="diagram-d2-svg-v3-relation-semantics",
         )
 
 
@@ -319,6 +319,6 @@ async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() 
     assert manifest.kind is MediaAssetKind.DIAGRAM_SVG
     assert manifest.compiler_name == "d2"
     assert manifest.compiler_version == "0.9.0"
-    assert manifest.policy_version == "diagram-d2-svg-v2"
+    assert manifest.policy_version == "diagram-d2-svg-v3-relation-semantics"
     assert manifest.source == f"production_run:{run_id}:diagram:network_flow"
     assert await asset_store.read(manifest.asset_id) == compiler.svg

@@ -48,6 +48,7 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramGroupV1,
     DiagramNodeV1,
     DiagramSpecV1,
+    EditorialAnalyticPurposeV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
     EnrichmentPlacementKind,
@@ -148,6 +149,15 @@ def _table(ref: ExtractionEvidenceRefV1, *, key: str = "commands") -> TableSpecV
         ),
         rows=(TableRowV1(("-enc", "Execution"), (ref,)),),
         placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        purpose=EditorialAnalyticPurposeV1(
+            question="Which command is reported?",
+            available_data="The source records -enc.",
+            comprehension_gain="The cells pair the command and its role.",
+            scope="The command supported by this evidence.",
+            evidence_refs=(ref,),
+            knowledge_limits="No other command behavior is stated.",
+            placement_reason="Place beside the command explanation.",
+        ),
     )
 
 
@@ -171,6 +181,15 @@ def _diagram(
         groups=(DiagramGroupV1("host", "Victim host", ("loader", "payload")),),
         placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
         compiled_asset_id=asset_id,
+        purpose=EditorialAnalyticPurposeV1(
+            question="What documented action links the loader and payload?",
+            available_data="The report states that the loader loads the payload.",
+            comprehension_gain="The edge shows the documented action directly.",
+            scope="Only the two named components.",
+            evidence_refs=(ref,),
+            knowledge_limits="No later execution stages are covered.",
+            placement_reason="Place beside the execution explanation.",
+        ),
     )
 
 
@@ -896,7 +915,7 @@ def test_semantic_policy_invalidates_assembly_but_not_model_call_identities(
         "publication_content_sha256": "1" * 64,
         "renderer": "typst",
         "renderer_version": "publication-v5-typst-v1",
-        "template_version": "chp-article-v1",
+        "template_version": "chp-article-v2-analytic-layout",
         "template_sha256": "2" * 64,
         "compiler": "typst",
         "compiler_version": "0.15.1",

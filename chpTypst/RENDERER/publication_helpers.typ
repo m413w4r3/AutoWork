@@ -26,7 +26,8 @@
     #v(4pt)
   ]
 
-  let widths = item.columns.map(column => 1fr)
+  let weights = item.at("column_weights", default: item.columns.map(column => 1.0))
+  let widths = weights.map(weight => weight * 1fr)
   let cell-alignments = item.columns.map(column => left)
   let semantic-columns = item.at("semantic_columns", default: none)
   let semantic-cells = item.at("semantic_cells", default: none)
@@ -45,6 +46,7 @@
     ..(header-cells + body-cells),
   )
 
+  v(4pt)
   if has-text(item.caption) [
     #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
   ]
@@ -55,7 +57,8 @@
     #text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]
     #v(4pt)
   ]
-  image(item.media_path, width: 90%)
+  image(item.media_path, width: 100%)
+  v(4pt)
   if has-text(item.caption) [
     #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
   ]

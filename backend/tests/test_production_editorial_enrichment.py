@@ -22,6 +22,7 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramGroupV1,
     DiagramNodeV1,
     DiagramSpecV1,
+    EditorialAnalyticPurposeV1,
     EditorialEnrichmentV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
@@ -158,6 +159,15 @@ def _populated_enrichment(
                 columns=(TableColumnV1("command", "Command"), TableColumnV1("purpose", "Purpose")),
                 rows=(TableRowV1(("-enc", "Execution"), (ref,)),),
                 placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_SECTION, 0),
+                purpose=EditorialAnalyticPurposeV1(
+                    question="Which command is documented?",
+                    available_data="The report records -enc.",
+                    comprehension_gain="The adjacent cells pair the literal and role.",
+                    scope="The single command listed in the evidence.",
+                    evidence_refs=(ref,),
+                    knowledge_limits="No other command effects are stated.",
+                    placement_reason="Place after the section that introduces the command.",
+                ),
             ),
         ),
         diagrams=(
@@ -174,6 +184,15 @@ def _populated_enrichment(
                 edges=(DiagramEdgeV1("loader", "payload", "loads", (ref,)),),
                 groups=(DiagramGroupV1("host", "Victim host", ("loader", "payload")),),
                 placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+                purpose=EditorialAnalyticPurposeV1(
+                    question="What documented action connects the loader and payload?",
+                    available_data="The source describes a loader action.",
+                    comprehension_gain="A compact edge exposes the documented action.",
+                    scope="Only the two named components.",
+                    evidence_refs=(ref,),
+                    knowledge_limits="No other stages are documented.",
+                    placement_reason="Place after the technical explanation.",
+                ),
             ),
         ),
         source_figures=(
@@ -209,8 +228,66 @@ def test_populated_contract_round_trips_canonically() -> None:
     enrichment = _populated_enrichment(extraction, synthesis)
 
     payload = editorial_enrichment_to_json(enrichment)
+    assert payload["tables"][0]["purpose"]["question"] == "Which command is documented?"
+    assert payload["diagrams"][0]["edges"][0]["relation_type"] == "factual"
     assert editorial_enrichment_from_json(payload) == enrichment
     assert editorial_enrichment_to_json(editorial_enrichment_from_json(payload)) == payload
+
+
+def test_v3_enrichment_payload_remains_readable_without_v4_analytic_fields() -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    enrichment = _populated_enrichment(extraction, synthesis)
+    payload = editorial_enrichment_to_json(enrichment)
+    payload["schema_version"] = 3
+    payload["enrichment_policy_version"] = "editorial-enrichment-v3-figures-resource-proposals"
+    for table in payload["tables"]:
+        table.pop("purpose")
+    for diagram in payload["diagrams"]:
+        diagram.pop("purpose")
+        for edge in diagram["edges"]:
+            edge.pop("relation_type")
+
+    decoded = editorial_enrichment_from_json(payload)
+
+    assert decoded.schema_version == 3
+    assert decoded.tables[0].purpose is None
+    assert decoded.diagrams[0].purpose is None
+    assert decoded.diagrams[0].edges[0].relation_type.value == "factual"
+    assert editorial_enrichment_to_json(decoded) == payload
+
+
+def test_v4_analytic_questions_must_normalize_to_distinct_nonempty_keys() -> None:
+    extraction = _extraction()
+    enrichment = _populated_enrichment(extraction, _synthesis(extraction))
+    table = enrichment.tables[0]
+    diagram = enrichment.diagrams[0]
+    assert table.purpose is not None and diagram.purpose is not None
+
+    with pytest.raises(ValueError, match="analytic questions must be distinct"):
+        replace(
+            enrichment,
+            tables=(
+                replace(
+                    table,
+                    purpose=replace(table.purpose, question="!!!"),
+                ),
+            ),
+        )
+
+    with pytest.raises(ValueError, match="analytic questions must be distinct"):
+        replace(
+            enrichment,
+            diagrams=(
+                replace(
+                    diagram,
+                    purpose=replace(
+                        diagram.purpose,
+                        question="Which command is documented?",
+                    ),
+                ),
+            ),
+        )
 
 
 def test_compiled_diagram_asset_identity_round_trips_in_canonical_enrichment() -> None:

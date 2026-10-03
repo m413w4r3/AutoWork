@@ -37,6 +37,7 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialAnalyticPurposeV1,
     EditorialEnrichmentV1,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
@@ -651,6 +652,15 @@ def _enrichment_citing(
                 columns=(TableColumnV1("item", "Item"), TableColumnV1("note", "Note")),
                 rows=(TableRowV1(("Observed", "Reported by the source"), (ref,)),),
                 placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+                purpose=EditorialAnalyticPurposeV1(
+                    question="What observation is reported?",
+                    available_data="One observation and its source context.",
+                    comprehension_gain="The row keeps the observation beside its context.",
+                    scope="The cited source observation.",
+                    evidence_refs=(ref,),
+                    knowledge_limits="No further details are reported.",
+                    placement_reason="Place after the synthesis passage about the observation.",
+                ),
             ),
         ),
     )

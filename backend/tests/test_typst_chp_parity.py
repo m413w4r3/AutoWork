@@ -35,6 +35,8 @@ from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKi
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationTableColumnV1,
+    PublicationTableRowV1,
     publication_document_text_anchors,
 )
 from cti_app.domain.semantic_annotation import (
@@ -64,14 +66,38 @@ _IDENTIFIER_RE = re.compile(r"\*|[A-Za-z_][A-Za-z_0-9-]*")
 @pytest.fixture
 def chp_parity_document() -> PublicationDocumentV4:
     """Use the existing domain-backed V4 fixture and its rich-block helpers."""
-    document = _full_document(
-        tables=(
-            _table_at(
-                "parity-table",
-                "Observed command table",
-                EnrichmentPlacementKind.AFTER_LEAD,
+    table = _table_at(
+        "parity-table",
+        "Observed command table",
+        EnrichmentPlacementKind.AFTER_LEAD,
+    )
+    wide_table = replace(
+        table,
+        columns=(
+            PublicationTableColumnV1("command", "Command literal and documented invocation"),
+            PublicationTableColumnV1("effect", "Purpose, effect, and evidence scope"),
+        ),
+        rows=(
+            PublicationTableRowV1(
+                (
+                    "-enc powershell.exe [placeholder invocation from evidence]",
+                    "Execution role and observed effect, with limits stated beside the "
+                    "mechanism rather than compressed into prose.",
+                ),
+                table.rows[0].evidence_refs,
+            ),
+            PublicationTableRowV1(
+                (
+                    "[second documented command placeholder]",
+                    "A longer effect description demonstrates predictable wrapping within "
+                    "the content-derived column width.",
+                ),
+                table.rows[0].evidence_refs,
             ),
         ),
+    )
+    document = _full_document(
+        tables=(wide_table,),
         diagrams=(
             replace(
                 _diagram_at(
@@ -199,11 +225,19 @@ def _build_workspace(
         destination.parent.mkdir(parents=True, exist_ok=True)
         if media_ref.expected_mime_type == "image/svg+xml":
             destination.write_text(
-                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 90">'
-                '<rect x="2" y="2" width="236" height="86" rx="8" '
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 160">'
+                '<rect x="8" y="34" width="180" height="92" rx="8" '
                 'fill="#E8EEF3" stroke="#243B53" stroke-width="3"/>'
-                '<path d="M35 45h65m0 0-12-12m12 12-12 12M100 45h70" '
-                'fill="none" stroke="#243B53" stroke-width="4"/></svg>',
+                '<rect x="292" y="34" width="180" height="92" rx="8" '
+                'fill="#E8EEF3" stroke="#243B53" stroke-width="3"/>'
+                '<path d="M190 80h96m0 0-14-12m14 12-14 12" '
+                'fill="none" stroke="#243B53" stroke-width="4"/>'
+                '<text x="26" y="85" font-family="sans-serif" font-size="19" '
+                'fill="#243B53">ExampleRAT</text>'
+                '<text x="328" y="85" font-family="sans-serif" font-size="19" '
+                'fill="#243B53">Execution</text>'
+                '<text x="201" y="112" font-family="sans-serif" font-size="13" '
+                'fill="#243B53">launches</text></svg>',
                 encoding="utf-8",
             )
         elif media_ref.expected_mime_type == "image/png":
