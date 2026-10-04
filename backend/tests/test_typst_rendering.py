@@ -266,7 +266,7 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
             "source_urls": ["https://example.test/one"],
         },
         {
-            "display_date": "2025-02-03",
+            "display_date": "3 février 2025",
             "text": "One source event",
             "source_urls": ["https://example.test/two"],
         },

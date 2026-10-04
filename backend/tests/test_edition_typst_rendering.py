@@ -53,16 +53,16 @@ _EDITION_ID = UUID("11111111-1111-4111-8111-111111111111")
 def _edition_metadata() -> dict[str, object]:
     return {
         "id": str(_EDITION_ID),
-        "country": "France",
-        "country_code": "FR",
-        "period_start": "2026-08-01",
-        "period_end": "2026-08-31",
+        "country": "Iran",
+        "country_code": "IR",
+        "period_start": "2026-09-01",
+        "period_end": "2026-09-30",
         "tlp": "TLP:GREEN",
         "languages": ["fr"],
         "state": "open",
         "version": 4,
-        "created_at": "2026-08-01T00:00:00+00:00",
-        "updated_at": "2026-08-02T00:00:00+00:00",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-02T00:00:00+00:00",
     }
 
 
@@ -121,16 +121,18 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v3-semantic-text"
+    assert data["schema_version"] == "typst-edition-model-v4-edition-identity"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
-        "country": "France",
-        "country_code": "FR",
-        "period_start": "2026-08-01",
-        "period_end": "2026-08-31",
+        "country": "Iran",
+        "country_code": "IR",
+        "period_start": "2026-09-01",
+        "period_end": "2026-09-30",
         "tlp": "TLP:GREEN",
         "languages": ["fr"],
         "version": 4,
+        "bulletin_country": "Iran",
+        "bulletin_period": "septembre 2026",
     }
     assert [item["title"] for item in data["publications"]] == ["Single article"]
 
@@ -434,7 +436,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v1"
+    assert bundle.template_version == "chp-edition-v2-reference-identity"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

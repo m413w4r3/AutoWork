@@ -96,34 +96,29 @@
   }
 }
 
-// Chronologie
-#let timeline(events) = [
-  #for event in events {
-    let semantic-spans = if event.len() > 3 { event.at(3) } else { none }
-    let source-urls = if event.len() > 2 {
-      let sources = event.at(2)
-      if type(sources) == str {
-        if sources == "" { () } else { (sources,) }
-      } else if sources == none {
-        ()
-      } else {
-        sources
-      }
-    } else {
-      ()
-    }
+#let timeline-event-source-urls(event) = {
+  let sources = if event.len() > 2 { event.at(2) } else { () }
+  if type(sources) == str {
+    if sources == "" { () } else { (sources,) }
+  } else if sources == none {
+    ()
+  } else {
+    sources
+  }
+}
 
-    grid(
-      columns: (0.25cm, auto, 1fr),
-      gutter: 2pt,
-      pad(left: 2em)[
-        #text(
-          size: 11pt,
-          fill: dark,
-          weight: "bold",
-        )[•]
-      ],
-      pad(left: 2em)[
+#let timeline(events) = {
+  let all-source-urls = events.fold((), (all, event) => {
+    timeline-event-source-urls(event).fold(all, (result, url) => {
+      if url in result { result } else { result + (url,) }
+    })
+  })
+  for event in events {
+    let semantic-spans = if event.len() > 3 { event.at(3) } else { none }
+    let source-urls = timeline-event-source-urls(event)
+
+    block[
+      #if event.at(0) != "" [
         #text(
           size: 11pt,
           weight: "extrabold",
@@ -131,17 +126,26 @@
         )[
           #event.at(0)
         ]
-        : #semantic-or-plain(event.at(1), semantic-spans)
-        #for url in source-urls {
-          if url != none and url != "" {
-            footnote[#better-link(url)[#url]]
-          }
-        }
+        :
       ]
-    )
-
+      #semantic-or-plain(event.at(1), semantic-spans)
+      #for url in source-urls {
+        if url != none and url != "" {
+          let source-index = all-source-urls.position(candidate => candidate == url)
+          super[#str(source-index + 1)]
+        }
+      }
+    ]
   }
-]
+
+  for (source-index, url) in all-source-urls.enumerate() {
+    block[
+      #super[#str(source-index + 1)]
+      #h(3pt)
+      #better-link(url)[#url]
+    ]
+  }
+}
 
 #let separator() = line(
   length: 100%,

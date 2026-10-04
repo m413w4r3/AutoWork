@@ -9,13 +9,13 @@
 // PAGE DE GARDE
 
 
-// = Actualité des codes et infrastructures X
+// Page de garde générique sans métadonnées d'édition.
 #align(center)[
   #text(
     size: 20pt,
     weight: "extrabold",  
     fill: purple,
-  )[Actualité des codes et infrastructures X]
+  )[Actualité des codes et infrastructures]
 ]
 
 #v(16pt)

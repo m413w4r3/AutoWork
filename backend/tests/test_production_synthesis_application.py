@@ -1190,7 +1190,9 @@ async def test_synthesis_hash_request_and_model_identity_are_functional_and_stat
 
 
 @pytest.mark.asyncio
-async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_timestamps():
+async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+):
     subject_id, source_id = uuid4(), uuid4()
     snapshot = make_snapshot(subject_id)
     extraction = make_extraction(
@@ -1229,6 +1231,14 @@ async def test_synthesis_input_hash_changes_with_policy_but_ignores_run_ids_and_
         other_run_pack,
         synthesis_access_policy_hash(permissive),
     )
+    with monkeypatch.context() as changed_policy:
+        changed_policy.setattr(
+            "cti_app.application.production_synthesis.SYNTHESIS_TIMELINE_POLICY_VERSION",
+            "synthesis-timeline-v5-test-policy",
+        )
+        assert original_hash != synthesis_input_hash(
+            snapshot, extraction, pack, synthesis_access_policy_hash(permissive)
+        )
 
 
 @pytest.mark.asyncio

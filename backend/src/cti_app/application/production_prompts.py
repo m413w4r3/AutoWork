@@ -16,7 +16,7 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v4-editorial-prose"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v5-public-source-editorial-prose"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v2-headingless"
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v2-headingless-diagnostics"
 
@@ -29,6 +29,17 @@ formats exactly as documented. Explain what each mechanism does and how the
 steps connect; do not replace documented detail with generic phrases. Use only
 the supplied evidence blocks; add no facts, dates, identifiers, causal links,
 or source details from memory or outside research.
+
+Never refer in publication prose to the drafting materials or production
+system. Avoid process framing such as "sur la seule base du pack fourni",
+"les éléments fournis ne comportent pas…", "base du pack", "pack de preuves"
+or "evidence pack"; do not mention internal evidence handles or identifiers
+shaped as E followed by three digits. When public sources do not establish a
+detail, phrase the limit as "les sources publiques consultées ne permettent
+pas d'établir…" or equivalent. Technical uses of words such as model,
+extraction, handle, pack, and pipeline remain appropriate when they describe
+source-grounded CTI concepts, including a Windows handle, an exploit pack,
+data extraction, or a CI/CD pipeline.
 
 Return the lead first. It is the first synthesis paragraph and must not repeat
 the article title or add a second introduction. Continue the narrative in this
@@ -62,8 +73,9 @@ For every detection pivot, explain the concrete observable, the telemetry
 needed to see it, its link to the described mechanism, and its limits. Never
 present an invented rule as a published rule. Do not turn a technical value
 into an IOC attribution unless the evidence supports that relation. If the
-pack lacks detail on a theme, do not invent it or pad the prose; report the
-coverage gap only in the optional diagnostics block.
+consulted public sources do not establish detail on a theme, do not invent it
+or pad the prose; report the coverage gap only in the optional diagnostics
+block.
 
 Do not duplicate recommendations or add vague defensive advice. Do not repeat
 the reference timeline merely to restate it. Mention dates in the synthesis

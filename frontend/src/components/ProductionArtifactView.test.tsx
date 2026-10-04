@@ -731,6 +731,15 @@ it("affiche la publication V4 et ses enrichissements", async () => {
   const referencesHeading = screen.getByRole("heading", {
     name: "RÉFÉRENCES",
   });
+  expect(screen.getAllByRole("heading", { name: "RÉFÉRENCES" })).toHaveLength(
+    1,
+  );
+  expect(
+    screen.queryByRole("heading", { name: "Chronologie" }),
+  ).not.toBeInTheDocument();
+  expect(
+    screen.queryByRole("heading", { name: "Sources complémentaires" }),
+  ).not.toBeInTheDocument();
   const synthesisHeading = screen.getByRole("heading", {
     name: "SYNTHÈSE",
   });
@@ -763,6 +772,7 @@ it("affiche la publication V4 et ses enrichissements", async () => {
   ).not.toBeInTheDocument();
   expect(screen.getByText("Paragraphe sourcé.")).toBeInTheDocument();
   expect(screen.getByText("Événement.")).toBeInTheDocument();
+  expect(screen.getByText("1 septembre 2026 :")).toBeInTheDocument();
   expect(screen.getByText("evil.example")).toBeInTheDocument();
   expect(screen.queryByText("Attribution incertaine.")).not.toBeInTheDocument();
   expect(

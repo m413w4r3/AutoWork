@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": section-title, timeline, styled-table, ioc-list, source-list, semantic-text, semantic-or-plain
+#import "../UTILS/helpers.typ": section-title, timeline, styled-table, ioc-list, semantic-text, semantic-or-plain
 #import "../UTILS/colors.typ": grey
 
 #let has-text(value) = value != none and value != ""
@@ -93,20 +93,17 @@
 
 #let render-publication-body(publication) = {
   for content_section in publication.content_sections {
-    if content_section.type == "references" [
-      #section-title[RÉFÉRENCES]
-      #if content_section.timeline.len() > 0 [
-        #section-title[Chronologie]
-        #render-publication-timeline(content_section.timeline)
+    if content_section.type == "references" {
+      if content_section.timeline.len() > 0 or content_section.blocks.len() > 0 [
+        #section-title[RÉFÉRENCES]
+        #if content_section.timeline.len() > 0 [
+          #render-publication-timeline(content_section.timeline)
+        ]
+        #for item in content_section.blocks {
+          render-body-block(item)
+        }
       ]
-      #for item in content_section.blocks {
-        render-body-block(item)
-      }
-      #if content_section.sources.len() > 0 [
-        #section-title[Sources complémentaires]
-        #source-list(content_section.sources)
-      ]
-    ] else if content_section.type == "synthesis" [
+    } else if content_section.type == "synthesis" [
       #section-title[SYNTHÈSE]
       #for item in content_section.blocks {
         render-body-block(item)

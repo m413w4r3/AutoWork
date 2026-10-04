@@ -104,7 +104,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_stages import SynthesisService
 
 SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v6-ranked-uncertainty-handles"
-SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v3-subject-relevance-projection"
+SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v2-headingless-reserve-handles"
@@ -1979,9 +1979,9 @@ def build_synthesis_timeline(
     for ref, payload in extraction_evidence_elements(extraction):
         if ref.kind is not EvidenceKind.EVENT:
             continue
-        if projection is not None and projection.classification_for(ref).classification in {
-            RelevanceClassification.OUT_OF_SCOPE,
-            RelevanceClassification.INDETERMINATE,
+        if projection is not None and projection.classification_for(ref).classification not in {
+            RelevanceClassification.DIRECT,
+            RelevanceClassification.CORROBORATION,
         }:
             continue
         identity = dedupe_identity(payload)

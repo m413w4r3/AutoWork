@@ -60,6 +60,26 @@ def _assert_failed(inputs: dict[str, Any], publication: PublicationDocumentV4) -
     return result
 
 
+def _with_synthesis_title(
+    inputs: dict[str, Any], publication: PublicationDocumentV4, title: str
+) -> tuple[dict[str, Any], PublicationDocumentV4]:
+    synthesis = replace(inputs["synthesis"], title=title)
+    extraction = inputs["extraction"]
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    enrichment = _enrichment_with(
+        extraction=extraction,
+        synthesis=synthesis,
+        tables=(_table(evidence),),
+        diagrams=(_diagram(evidence),),
+    )
+    updated_inputs = {
+        **inputs,
+        "synthesis": synthesis,
+        "editorial_enrichment": enrichment,
+    }
+    return updated_inputs, replace(publication, title=title)
+
+
 def test_correct_v4_passes_and_title_tampering_fails() -> None:
     inputs, publication = _rich_inputs()
     assert qa_publication_v4(publication=publication, **inputs)["passed"] is True
@@ -170,6 +190,51 @@ def test_publication_format_checks_reject_headings_uncertainties_language_and_di
     result = qa_publication_v4(publication=publication, **inputs)
     assert result["checks"]["references_then_synthesis"] is False
     assert result["passed"] is False
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    (
+        "Sur la seule base du pack fourni, aucune victime n'est établie.",
+        "les éléments fournis ne comportent pas d'information sur la chaîne d'infection.",
+        "La base du pack ne décrit pas cette valeur.",
+        "Le pack de preuves rassemble ces éléments.",
+        "Les evidence packs sont conservés en interne.",
+        "Les éléments fournis par le pack ne suffisent pas.",
+        "The evidence handles identify internal records.",
+        "Le code interne E011 apparaît dans le rapport.",
+    ),
+)
+def test_pipeline_vocabulary_leaks_fail_publication_qa(sentence: str) -> None:
+    inputs, publication = _rich_inputs()
+    inputs, publication = _with_synthesis_title(inputs, publication, sentence)
+
+    result = _assert_failed(inputs, publication)
+
+    assert result["checks"]["exact_projection"] is True
+    assert result["checks"]["no_pipeline_vocabulary_leaks"] is False
+    assert any("no_pipeline_vocabulary_leaks" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    (
+        "Le modèle BDD décrit par la source explique le comportement observé.",
+        "Le handle Windows reste ouvert après l'exécution.",
+        "L'extraction de données intervient après la connexion.",
+        "Le pipeline CI/CD publie les mises à jour signées.",
+        "L'exploit pack cible les systèmes anciens.",
+        "Le hash SHA-256 a1e011fab reste associé à l'événement.",
+    ),
+)
+def test_cti_vocabulary_and_embedded_hash_ids_pass_publication_qa(sentence: str) -> None:
+    inputs, publication = _rich_inputs()
+    inputs, publication = _with_synthesis_title(inputs, publication, sentence)
+
+    result = qa_publication_v4(publication=publication, **inputs)
+
+    assert result["passed"] is True
+    assert result["checks"]["no_pipeline_vocabulary_leaks"] is True
 
 
 def test_source_removal_is_rejected_by_the_v4_document_boundary() -> None:

@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v2-analytic-layout",
+  "template_version": "chp-article-v3-reference-identity",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

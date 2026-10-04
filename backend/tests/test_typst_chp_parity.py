@@ -169,18 +169,6 @@ def _resolved_imports(
     }
 
 
-def _header_footer_labels(source: str) -> set[str]:
-    """Read visible CHP labels from the literals in header_footer.typ itself."""
-    labels = {
-        " ".join(match.group(1).split()) for match in re.finditer(r"\)\s*\[([^\[\]#]+)\]", source)
-    }
-    labels.update(
-        " ".join(match.group(1).split())
-        for match in re.finditer(r"(?m)^\s{4,}([A-ZÀ-ÖØ-Þ][^#\n\[\](),:]{2,})\s*$", source)
-    )
-    return {label for label in labels if label}
-
-
 def _normalized_pdf_text(reader: PdfReader) -> tuple[str, str]:
     # Zero-width spaces are display-only break opportunities inserted in long
     # IOC/path/command spans; they are not part of the canonical text.
@@ -294,14 +282,14 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
         "timeline",
         "styled-table",
         "ioc-list",
-        "source-list",
     }
+    assert "source-list" not in production_helpers_imports[shared_helpers]
     assert production_helpers_imports[colors] == {"grey"}
     style_imports = _resolved_imports(document_style)
     assert style_imports[header_footer] == {"report-header", "report-footer"}
     assert style_imports[colors] == {"purple"}
     assert _resolved_imports(shared_helpers)[colors] == {"*"}
-    assert _resolved_imports(header_footer)[colors] == {"*"}
+    assert _resolved_imports(header_footer)[colors] == {"dark", "light-grey"}
     style_source = document_style.read_text(encoding="utf-8")
     helper_source = shared_helpers.read_text(encoding="utf-8")
     color_source = colors.read_text(encoding="utf-8")
@@ -346,22 +334,22 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert len(reader.pages) >= 1
     assert not reader.is_encrypted
 
-    text, compact_text = _normalized_pdf_text(reader)
-    header_source = (_CHP_TYPST_ROOT / "UTILS" / "header_footer.typ").read_text(encoding="utf-8")
-    header_labels = _header_footer_labels(header_source)
-    assert header_labels
-    for label in header_labels:
-        assert label in text
+    text, _ = _normalized_pdf_text(reader)
+    for placeholder in (
+        "Bulletin-CODE",
+        "Bulletin n°XX",
+        "infrastructures X",
+        "XX",
+        "CODE",
+    ):
+        assert placeholder not in text
 
     expected_text = (
         "CHP visual parity fixture",
         "RÉFÉRENCES",
-        "Chronologie",
         "No display date",
         "One source event",
         "Several source event",
-        "Sources complémentaires",
-        "Primary source",
         "SYNTHÈSE",
         "Synthesis lead paragraph for parity coverage.",
         "A second lead paragraph.",
@@ -381,8 +369,8 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Display email",
         "Display hash",
         "ANNEXE TECHNIQUE — INDICATEURS",
-        "Example Lab",
-        "Duplicate URL source",
+        "https://example.test/one",
+        "https://example.test/two",
     )
     for expected in expected_text:
         assert expected in text
@@ -390,38 +378,56 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
     assert "Attribution remains unresolved" not in text
-
-    for url in (
-        "https://example.test/one",
-        "https://example.test/two",
-    ):
-        assert url.replace(" ", "") in compact_text
-    assert "2025-01-02" in text
-    ordered_markers = (
-        "CHP visual parity fixture",
-        "RÉFÉRENCES",
-        "Chronologie",
-        "No display date",
-        "Sources complémentaires",
-        "SYNTHÈSE",
-        "Synthesis lead paragraph for parity coverage.",
-        "Observed command table",
-        "Diagram asset title",
-        "Source figure caption.",
-        "ANNEXE TECHNIQUE — INDICATEURS",
-        "Display ip",
-    )
-    marker_positions = tuple(text.index(marker) for marker in ordered_markers)
-    assert marker_positions == tuple(sorted(marker_positions))
-    assert text.count("Primary source") == 1
+    assert text.count("RÉFÉRENCES") == 1
+    assert "Chronologie" not in text
+    assert "Sources complémentaires" not in text
+    assert text.count("https://example.test/one") == 1
+    assert text.count("https://example.test/two") == 1
+    assert re.search(r"No display date\s*1", text)
+    assert re.search(r"Several source event\s*1", text)
+    assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
     assert text.count("Synthesis lead paragraph for parity coverage.") == 1
     assert text.count("A second lead paragraph.") == 1
-
+    assert "Primary source" not in text
     assert {media_ref.expected_mime_type for media_ref in render_source.media_refs} == {
         "image/svg+xml",
         "image/png",
     }
     assert _embedded_visual_xobject_count(reader) >= len(render_source.media_refs)
+
+
+@pytest.mark.asyncio
+async def test_real_typst_omits_references_heading_when_timeline_is_empty(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+    chp_parity_document: PublicationDocumentV4,
+) -> None:
+    document = replace(chp_parity_document, timeline=())
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = TypstRenderer().render(document, template_bundle)
+    workspace_root = tmp_path / "workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "font-snapshot"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    text, _ = _normalized_pdf_text(PdfReader(BytesIO(compiled.content), strict=True))
+
+    assert "SYNTHÈSE" in text
+    assert "RÉFÉRENCES" not in text
 
 
 async def test_real_typst_renders_annotated_literal_content_without_evaluating_it(

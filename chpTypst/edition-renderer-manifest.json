@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v1",
+  "template_version": "chp-edition-v2-reference-identity",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

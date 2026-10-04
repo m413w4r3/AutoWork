@@ -17,6 +17,7 @@ from cti_app.application.production_relevance import (
 )
 from cti_app.application.production_synthesis import (
     MAX_SYNTHESIS_UNCERTAINTIES,
+    SYNTHESIS_TIMELINE_POLICY_VERSION,
     SynthesisEvidencePackV1,
     build_synthesis_evidence_pack,
     build_synthesis_timeline,
@@ -507,6 +508,58 @@ def test_indeterminate_stays_in_projection_and_is_omitted_from_synthesis() -> No
         relevance_projection=projection,
     )
     assert published.indicators == ()
+
+
+def test_synthesis_timeline_keeps_only_direct_and_corroborating_events() -> None:
+    snapshot = _snapshot()
+    source_id = uuid4()
+    classifications = {
+        "Direct activity event": RelevanceClassification.DIRECT,
+        "Corroborating activity event": RelevanceClassification.CORROBORATION,
+        "Context-only event": RelevanceClassification.CONTEXT,
+        "Out-of-scope event": RelevanceClassification.OUT_OF_SCOPE,
+        "Indeterminate event": RelevanceClassification.INDETERMINATE,
+        "Counter-indication event": RelevanceClassification.COUNTER_INDICATION,
+    }
+    extraction = _extraction(
+        snapshot,
+        (
+            _source(
+                source_id,
+                events=tuple(
+                    _event(
+                        source_id,
+                        text,
+                        event_date=date(2024, 1, index),
+                    )
+                    for index, text in enumerate(classifications, start=1)
+                ),
+            ),
+        ),
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    classification_by_ref = {
+        ref: classifications[payload["text"]]
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.EVENT
+    }
+    classified_projection = replace(
+        projection,
+        classifications=tuple(
+            replace(item, classification=classification_by_ref[item.evidence_ref])
+            if item.evidence_ref in classification_by_ref
+            else item
+            for item in projection.classifications
+        ),
+    )
+
+    timeline = build_synthesis_timeline(extraction, projection=classified_projection)
+
+    assert [entry.text for entry in timeline] == [
+        "Direct activity event",
+        "Corroborating activity event",
+    ]
+    assert SYNTHESIS_TIMELINE_POLICY_VERSION == "synthesis-timeline-v4-direct-corroboration-only"
 
 
 def test_uncertainties_deduplicate_and_rank_impact_before_the_cap() -> None:

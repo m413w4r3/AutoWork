@@ -36,6 +36,20 @@ from cti_app.domain.semantic_annotation import (
 
 _RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v4-table-layout"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
+_FRENCH_MONTH_NAMES = (
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+)
 _MEDIA_EXTENSIONS = {
     "image/svg+xml": ".svg",
     "image/png": ".png",
@@ -459,7 +473,7 @@ def _display_date(date_text: str | None, event_date: date | None) -> str:
     if date_text:
         return date_text
     if event_date is not None:
-        return event_date.isoformat()
+        return f"{event_date.day} {_FRENCH_MONTH_NAMES[event_date.month - 1]} {event_date.year}"
     # The render-data contract requires text, and blank preserves the absence
     # of a date instead of inventing one.
     return ""

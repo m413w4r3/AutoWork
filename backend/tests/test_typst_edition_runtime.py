@@ -56,10 +56,10 @@ def _edition_document() -> EditionDocumentV2:
     return EditionDocumentV2(
         edition={
             "id": "00000000-0000-4000-8000-000000000020",
-            "country": "France",
-            "country_code": "FR",
-            "period_start": "2026-08-01",
-            "period_end": "2026-08-31",
+            "country": "Iran",
+            "country_code": "IR",
+            "period_start": "2026-09-01",
+            "period_end": "2026-09-30",
             "tlp": "GREEN",
             "languages": ["fr"],
             "version": 1,
@@ -104,9 +104,9 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
     assert len(reader.pages) >= 4
     for expected in (
         "Bulletin de veille CTI",
-        "France",
-        "2026-08-01",
-        "2026-08-31",
+        "Iran",
+        "IR",
+        "septembre 2026",
         "Alpha first article",
         "Zulu second article",
         "Edition command table",
@@ -114,7 +114,6 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
         "Edition figure",
         "Figure 1 from the source publication",
         "Display ip",
-        "Primary source",
     ):
         assert expected in text
     # L5: the uncertainty list is no longer published inside the article body.
@@ -122,7 +121,15 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
     assert text.count("RÉFÉRENCES") >= 1
     assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
     assert text.index("Alpha first article") < text.index("Zulu second article")
-    assert "France — 2026-08-01 / 2026-08-31" in text
+    assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
+    for placeholder in (
+        "Bulletin-CODE",
+        "Bulletin n°XX",
+        "infrastructures X",
+        "XX",
+        "CODE",
+    ):
+        assert placeholder not in text
     page_count = len(reader.pages)
     assert f"{page_count} / {page_count}" in text
     assert "Brèves" not in text

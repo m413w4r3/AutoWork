@@ -111,7 +111,7 @@ Des endpoints de preview PDF d'édition existent déjà dans [l'API de publicati
 
 Après le titre général de l'article :
 
-1. **RÉFÉRENCES** : chronologie sourcée et limitée à l'activité étudiée, avec liens/notes adaptés au rendu. Une liste compacte des sources peut compléter cette zone si nécessaire ; pas de seconde bibliographie imposée après la synthèse.
+1. **RÉFÉRENCES** : une seule partie d'entrées datées et sourcées, limitée à l'activité étudiée, sans sous-titres ni seconde bibliographie.
 2. **SYNTHÈSE** : prose continue, sans titres internes, sous-titres ni listes d'incertitudes. Tables et figures utiles s'insèrent à proximité des paragraphes concernés.
 
 Progression des paragraphes : contexte et attribution qualifiée ; campagne, victimologie et chaîne d'infection/exécution ; TTP et mécanismes distinctifs ; outils/composants ; protocole et infrastructure réseau lorsque documentés ; enfin limites de confiance et observations de l'analyste CTI sous forme de paragraphes.

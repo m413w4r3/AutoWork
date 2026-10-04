@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 from cti_app.application.publication_builder import (
@@ -26,6 +27,34 @@ _LEGACY_CITATION = re.compile(r"\[S\d+\]", re.IGNORECASE)
 _INTERNAL_DIAGNOSTIC = re.compile(
     r"\b(?:extraction_source_skipped|synthesis_[a-z0-9]+(?:_[a-z0-9]+)+)\b"
     r"|\bdiagnostics?\s*[:=]",
+    re.IGNORECASE,
+)
+_PIPELINE_VOCABULARY_TERMS = (
+    "pack fourni",
+    "packs fournis",
+    "éléments fournis",
+    "base du pack",
+    "base des packs",
+    "pack de preuves",
+    "packs de preuves",
+    "evidence pack",
+    "evidence packs",
+    "éléments fournis par le pack",
+    "éléments fournis par les packs",
+    "evidence handle",
+    "evidence handles",
+)
+
+
+def _fold_accents(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+_PIPELINE_VOCABULARY = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(_fold_accents(term)) for term in _PIPELINE_VOCABULARY_TERMS)
+    + r"|e[0-9]{3})(?!\w)",
     re.IGNORECASE,
 )
 
@@ -193,6 +222,15 @@ def qa_publication_v5(
     )
     if not checks["no_diagnostic_code_leaks"]:
         errors.append("Publication contains an internal diagnostic code")
+
+    checks["no_pipeline_vocabulary_leaks"] = not any(
+        _PIPELINE_VOCABULARY.search(_fold_accents(text)) for text in editorial_text
+    )
+    if not checks["no_pipeline_vocabulary_leaks"]:
+        errors.append(
+            "Publication failed no_pipeline_vocabulary_leaks: internal production "
+            "vocabulary is present"
+        )
     return {"passed": not errors, "checks": checks, "errors": errors, "warnings": []}
 
 

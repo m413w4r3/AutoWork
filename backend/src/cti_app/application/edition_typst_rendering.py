@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from typing import Any
 from uuid import UUID
 
@@ -17,7 +18,35 @@ from cti_app.application.typst_rendering import (
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v3-semantic-text"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v4-edition-identity"
+_FRENCH_MONTH_NAMES = (
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+)
+
+
+def _period_label(edition: dict[str, Any]) -> str | None:
+    try:
+        start = date.fromisoformat(edition["period_start"])
+        end = date.fromisoformat(edition["period_end"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if start.year == end.year and start.month == end.month:
+        return f"{_FRENCH_MONTH_NAMES[start.month - 1]} {start.year}"
+    return (
+        f"{_FRENCH_MONTH_NAMES[start.month - 1]} {start.year} — "
+        f"{_FRENCH_MONTH_NAMES[end.month - 1]} {end.year}"
+    )
 
 
 class EditionTypstRendererError(ValueError):
@@ -62,6 +91,11 @@ class EditionTypstRenderer:
             "version",
         )
         edition = {field: document.edition[field] for field in edition_fields}
+        country = edition.get("country")
+        edition["bulletin_country"] = (
+            country.strip() if isinstance(country, str) and country.strip() else None
+        )
+        edition["bulletin_period"] = _period_label(edition)
         publications: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
         for publication in sorted(document.publications, key=lambda item: item.position):

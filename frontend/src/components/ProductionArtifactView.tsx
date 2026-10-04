@@ -222,6 +222,19 @@ function publicationParagraphFingerprint(text: string): string {
   return folded.trim().split(/\s+/u).filter(Boolean).join(" ");
 }
 
+function publicationTimelineDateLabel(entry: {
+  event_date: string | null;
+  date_text: string | null;
+}): string {
+  if (entry.date_text) return entry.date_text;
+  if (entry.event_date) {
+    return new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(
+      new Date(`${entry.event_date}T00:00:00`),
+    );
+  }
+  return "";
+}
+
 function isProductionReferenceSource(
   value: unknown,
 ): value is ProductionReferenceSource {
@@ -1166,6 +1179,12 @@ export function PublicationDocumentView({
   const leadFingerprints = new Set(
     document.lead.map((item) => publicationParagraphFingerprint(item.text)),
   );
+  const hasReferenceEnrichments = [
+    ...document.tables,
+    ...document.diagrams,
+    ...document.figures,
+  ].some((item) => item.placement.kind === "after_timeline");
+  const hasReferences = document.timeline.length > 0 || hasReferenceEnrichments;
   const provenance = (sourceIds: string[]) => (
     <span className="publication-preview__provenance">
       {Array.from(new Set(sourceIds)).map((sourceId, index) => {
@@ -1239,65 +1258,42 @@ export function PublicationDocumentView({
     <div className="publication-preview__layout">
       <article className="publication-preview">
         <h3>{semanticContent(document, document.title, "title")}</h3>
-        <section aria-label="RÉFÉRENCES">
-          <h4>RÉFÉRENCES</h4>
-          {document.timeline.length > 0 ? (
-            <div>
-              <h5>Chronologie</h5>
-              {document.timeline.map((item, index) => {
-                const anchor = `timeline:${String(index + 1).padStart(4, "0")}`;
-                return (
-                  <div
-                    className="publication-preview__passage"
-                    key={`timeline-${index}`}
+        {hasReferences ? (
+          <section aria-label="RÉFÉRENCES">
+            <h4>RÉFÉRENCES</h4>
+            {document.timeline.map((item, index) => {
+              const anchor = `timeline:${String(index + 1).padStart(4, "0")}`;
+              const dateLabel = publicationTimelineDateLabel(item);
+              return (
+                <div
+                  className="publication-preview__passage"
+                  key={`timeline-${index}`}
+                >
+                  <p>
+                    {dateLabel ? <strong>{dateLabel} : </strong> : null}
+                    {semanticContent(document, item.text, anchor)}
+                    {provenance(
+                      item.evidence_refs.map((ref) => ref.source_document_id),
+                    )}
+                  </p>
+                  <button
+                    className="publication-preview__lineage-trigger"
+                    onClick={() =>
+                      setSelectedPassage({
+                        text: item.text,
+                        evidenceRefs: item.evidence_refs,
+                      })
+                    }
+                    type="button"
                   >
-                    <p>
-                      {item.event_date || item.date_text ? (
-                        <strong>{item.date_text || item.event_date} : </strong>
-                      ) : null}
-                      {semanticContent(document, item.text, anchor)}
-                      {provenance(
-                        item.evidence_refs.map((ref) => ref.source_document_id),
-                      )}
-                    </p>
-                    <button
-                      className="publication-preview__lineage-trigger"
-                      onClick={() =>
-                        setSelectedPassage({
-                          text: item.text,
-                          evidenceRefs: item.evidence_refs,
-                        })
-                      }
-                      type="button"
-                    >
-                      Voir les sources et preuves
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
-          ) : null}
-          {enrichmentsAt("after_timeline", null)}
-          {document.sources.length > 0 ? (
-            <section>
-              <h5>Sources complémentaires</h5>
-              <ul>
-                {document.sources.map((source) => (
-                  <li key={source.source_document_id}>
-                    <a
-                      href={source.canonical_url}
-                      rel="noreferrer"
-                      target="_blank"
-                    >
-                      {source.title || source.canonical_url}
-                    </a>
-                    {source.publisher ? ` — ${source.publisher}` : ""}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-        </section>
+                    Voir les sources et preuves
+                  </button>
+                </div>
+              );
+            })}
+            {enrichmentsAt("after_timeline", null)}
+          </section>
+        ) : null}
         <section aria-label="SYNTHÈSE">
           <h4>SYNTHÈSE</h4>
           {document.lead.map((item, index) =>
