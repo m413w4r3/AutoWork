@@ -51,6 +51,8 @@ from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+    EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION,
+    EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
@@ -156,7 +158,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v4-analytic-purpose"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v5-relation-types-repair"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 4
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v6-analytic-reserve-context"
@@ -564,6 +566,30 @@ class EditorialEnrichmentWireRejection:
     block_id: str
     reason_code: str
     raw_sha256: str
+    scope_id: str | None = None
+    parent_scope_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialEnrichmentRejectedBlock:
+    """A rejected top-level block available to the bounded repair pass."""
+
+    kind: str
+    block_id: str
+    scope_id: str
+    raw_text: str
+    raw_sha256: str
+    reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialEnrichmentAcceptedBlock:
+    """Wire identity for one accepted top-level proposal."""
+
+    kind: str
+    block_id: str
+    scope_id: str
+    proposal_key: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -573,6 +599,9 @@ class EditorialEnrichmentWireParseResult:
     error_code: str | None = None
     explicit_empty: bool = False
     transformations: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()
+    rejected_blocks: tuple[EditorialEnrichmentRejectedBlock, ...] = ()
+    accepted_blocks: tuple[EditorialEnrichmentAcceptedBlock, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -587,6 +616,8 @@ class EditorialResourceWireParseResult:
 class _EditorialEnrichmentWireBlock:
     kind: str
     block_id: str
+    scope_id: str = ""
+    parent_scope_id: str | None = None
     raw_lines: list[str] = field(default_factory=list)
     fields: dict[str, list[str]] = field(default_factory=dict)
     children: list[_EditorialEnrichmentWireBlock] = field(default_factory=list)
@@ -707,6 +738,8 @@ def _enrichment_wire_rejection(
         block_id=block.block_id if block is not None else block_id,
         reason_code=reason_code,
         raw_sha256=hashlib.sha256(raw).hexdigest(),
+        scope_id=block.scope_id if block is not None and block.scope_id else None,
+        parent_scope_id=block.parent_scope_id if block is not None else None,
     )
 
 
@@ -809,6 +842,34 @@ def _parse_analytic_purpose(
             )
         )
         return None
+
+
+def _trim_analytic_purpose_evidence(
+    block: _EditorialEnrichmentWireBlock,
+    purpose: AnalyticPurposeProposalV1,
+    carried_handles: set[str],
+    rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
+) -> AnalyticPurposeProposalV1 | None:
+    retained = tuple(handle for handle in purpose.evidence_handles if handle in carried_handles)
+    dropped = tuple(handle for handle in purpose.evidence_handles if handle not in carried_handles)
+    if not retained:
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_purpose_evidence_not_relevant",
+                block.raw_lines,
+            )
+        )
+        return None
+    if dropped:
+        warnings.append(
+            "editorial_enrichment_purpose_evidence_trimmed:"
+            f"{block.kind}:{block.block_id}:" + ",".join(dropped)
+        )
+        return purpose.model_copy(update={"evidence_handles": retained})
+    return purpose
 
 
 def _wire_placement(block: _EditorialEnrichmentWireBlock) -> EnrichmentPlacementProposalV1 | None:
@@ -1103,6 +1164,7 @@ def _reject_paraphrase_rows(
     table: TableProposalV1,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
 ) -> TableProposalV1 | None:
     sentences = _synthesis_sentences(evidence_pack)
     if not sentences:
@@ -1136,20 +1198,19 @@ def _reject_paraphrase_rows(
             )
         )
         return None
-    if not set(table.purpose.evidence_handles) <= {
-        handle for row in kept_rows for handle in row.evidence_handles
-    }:
-        rejections.append(
-            _enrichment_wire_rejection(
-                block,
-                block.block_id,
-                "editorial_enrichment_purpose_evidence_not_relevant",
-                block.raw_lines,
-            )
-        )
+    purpose = _trim_analytic_purpose_evidence(
+        block,
+        table.purpose,
+        {handle for row in kept_rows for handle in row.evidence_handles},
+        rejections,
+        warnings,
+    )
+    if purpose is None:
         return None
     if duplicate_count:
-        return table.model_copy(update={"rows": tuple(kept_rows)})
+        return table.model_copy(update={"rows": tuple(kept_rows), "purpose": purpose})
+    if purpose != table.purpose:
+        return table.model_copy(update={"purpose": purpose})
     return table
 
 
@@ -1266,6 +1327,7 @@ def _filter_diagram_relations(
     diagram: DiagramProposalV1,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
 ) -> DiagramProposalV1 | None:
     valid_edges: list[DiagramEdgeProposalV1] = []
     rejected_count = 0
@@ -1295,17 +1357,12 @@ def _filter_diagram_relations(
         return None
     valid_handles = {handle for edge in valid_edges for handle in edge.evidence_handles}
     valid_handles.update(handle for node in diagram.nodes for handle in node.evidence_handles)
-    if not set(diagram.purpose.evidence_handles) <= valid_handles:
-        rejections.append(
-            _enrichment_wire_rejection(
-                block,
-                block.block_id,
-                "editorial_enrichment_purpose_evidence_not_relevant",
-                block.raw_lines,
-            )
-        )
+    purpose = _trim_analytic_purpose_evidence(
+        block, diagram.purpose, valid_handles, rejections, warnings
+    )
+    if purpose is None:
         return None
-    return diagram.model_copy(update={"edges": tuple(valid_edges)})
+    return diagram.model_copy(update={"edges": tuple(valid_edges), "purpose": purpose})
 
 
 def parse_editorial_enrichment_proposal_wire(
@@ -1321,6 +1378,7 @@ def parse_editorial_enrichment_proposal_wire(
         )
     sanitized = sanitize_bridge_output_text(raw_text).replace("\r\n", "\n").replace("\r", "\n")
     transformations: list[str] = []
+    warnings: list[str] = []
     if sanitized != raw_text.replace("\r\n", "\n").replace("\r", "\n"):
         transformations.append("bridge_ui_markers_removed")
     top_blocks: list[_EditorialEnrichmentWireBlock] = []
@@ -1328,8 +1386,9 @@ def parse_editorial_enrichment_proposal_wire(
     current_top: _EditorialEnrichmentWireBlock | None = None
     current_child: _EditorialEnrichmentWireBlock | None = None
     last_field: tuple[_EditorialEnrichmentWireBlock, str] | None = None
-    local_ids: set[str] = set()
-    sequences: dict[str, int] = defaultdict(int)
+    local_ids: set[tuple[str, str]] = set()
+    sequences: dict[tuple[str, str], int] = defaultdict(int)
+    block_sequence = 0
     recognized = False
     explicit_empty = False
 
@@ -1363,7 +1422,7 @@ def parse_editorial_enrichment_proposal_wire(
         last_field = None
 
     def new_block(kind: str, local_id: str | None, raw_line: str) -> _EditorialEnrichmentWireBlock:
-        sequences[kind] += 1
+        nonlocal block_sequence
         prefix = {
             "TABLE": "T",
             "DIAGRAM": "D",
@@ -1377,15 +1436,30 @@ def parse_editorial_enrichment_proposal_wire(
             "EDGE": "L",
             "GROUP": "G",
         }[kind]
-        block_id = local_id or f"{prefix}{sequences[kind]:03d}"
+        child = kind in _ENRICHMENT_CHILD_KINDS
+        parent_scope_id = current_top.scope_id if child and current_top is not None else None
+        namespace = parent_scope_id or "<top-level>"
+        if local_id is None:
+            sequence_key = (namespace, prefix)
+            while True:
+                sequences[sequence_key] += 1
+                generated_id = f"{prefix}{sequences[sequence_key]:03d}"
+                if (namespace, generated_id) not in local_ids:
+                    local_id = generated_id
+                    break
+        block_id = local_id
+        assert block_id is not None
         error_code = None
-        if block_id in local_ids:
+        if (namespace, block_id) in local_ids:
             error_code = "editorial_enrichment_duplicate_local_block_id"
         else:
-            local_ids.add(block_id)
+            local_ids.add((namespace, block_id))
+        block_sequence += 1
         return _EditorialEnrichmentWireBlock(
             kind=kind,
             block_id=block_id,
+            scope_id=f"B{block_sequence:06d}",
+            parent_scope_id=parent_scope_id,
             raw_lines=[raw_line],
             error_code=error_code,
         )
@@ -1577,6 +1651,7 @@ def parse_editorial_enrichment_proposal_wire(
             tuple(rejections),
             error_code="editorial_enrichment_unintelligible_response",
             transformations=tuple(transformations),
+            warnings=tuple(warnings),
         )
     if explicit_empty and not top_blocks and not rejections:
         return EditorialEnrichmentWireParseResult(
@@ -1590,81 +1665,114 @@ def parse_editorial_enrichment_proposal_wire(
     annotations: list[AnnotationProposalV1] = []
     figures: list[FigureProposalV1] = []
     resource_needs: list[ResourceNeedProposalV1] = []
+    accepted_blocks: list[EditorialEnrichmentAcceptedBlock] = []
+    rejected_blocks: list[EditorialEnrichmentRejectedBlock] = []
     canonical_keys: set[str] = set()
     analytic_questions: set[str] = set()
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
     proposed_figure_handles: set[str] = set()
     proposed_need_keys: set[str] = set()
     for top in top_blocks:
+        rejection_start = len(rejections)
+        accepted = False
+        proposal_key = ""
         if top.error_code is not None:
             reject(top, top.error_code)
-            continue
-        if top.kind == "TABLE":
-            table = _parse_enrichment_wire_table(top, evidence_pack, rejections)
-            if table is None:
-                continue
-            table = _reject_paraphrase_rows(top, table, evidence_pack, rejections)
-            if table is None:
-                continue
-            question_key = normalize_analytic_question(table.purpose.question)
-            if not question_key or question_key in analytic_questions:
-                reject(top, "editorial_enrichment_duplicate_analytic_purpose")
-                continue
-            if table.key in canonical_keys:
-                reject(top, "editorial_enrichment_duplicate_key")
-            else:
-                canonical_keys.add(table.key)
-                analytic_questions.add(question_key)
-                tables.append(table)
+        elif top.kind == "TABLE":
+            table = _parse_enrichment_wire_table(top, evidence_pack, rejections, warnings)
+            if table is not None:
+                table = _reject_paraphrase_rows(top, table, evidence_pack, rejections, warnings)
+            if table is not None:
+                question_key = normalize_analytic_question(table.purpose.question)
+                if not question_key or question_key in analytic_questions:
+                    reject(top, "editorial_enrichment_duplicate_analytic_purpose")
+                elif table.key in canonical_keys:
+                    reject(top, "editorial_enrichment_duplicate_key")
+                else:
+                    canonical_keys.add(table.key)
+                    analytic_questions.add(question_key)
+                    tables.append(table)
+                    accepted = True
+                    proposal_key = table.key
         elif top.kind == "ANNOTATION":
             annotation = _parse_annotation_wire_block(top, evidence_pack, rejections)
             if annotation is not None:
                 annotations.append(annotation)
+                accepted = True
+                proposal_key = f"{annotation.paragraph_anchor}:{annotation.text}"
         elif top.kind == "FIGURE":
             figure = _parse_figure_wire_block(top, evidence_pack, catalog_by_handle, rejections)
-            if figure is None:
-                continue
-            if figure.figure_handle in proposed_figure_handles:
-                reject(top, "editorial_enrichment_duplicate_figure_handle")
-            elif len(figures) >= MAX_ENRICHMENT_FIGURE_PROPOSALS:
-                reject(top, "editorial_enrichment_figure_limit_exceeded")
-            else:
-                proposed_figure_handles.add(figure.figure_handle)
-                figures.append(figure)
+            if figure is not None:
+                if figure.figure_handle in proposed_figure_handles:
+                    reject(top, "editorial_enrichment_duplicate_figure_handle")
+                elif len(figures) >= MAX_ENRICHMENT_FIGURE_PROPOSALS:
+                    reject(top, "editorial_enrichment_figure_limit_exceeded")
+                else:
+                    proposed_figure_handles.add(figure.figure_handle)
+                    figures.append(figure)
+                    accepted = True
+                    proposal_key = figure.figure_handle
         elif top.kind == "NEEDS":
             need = _parse_resource_need_wire_block(top, rejections)
-            if need is None:
-                continue
-            if need.key in proposed_need_keys:
-                reject(top, "editorial_enrichment_duplicate_resource_need")
-            elif len(resource_needs) >= MAX_ENRICHMENT_RESOURCE_NEEDS:
-                reject(top, "editorial_enrichment_resource_need_limit_exceeded")
-            else:
-                proposed_need_keys.add(need.key)
-                resource_needs.append(need)
+            if need is not None:
+                if need.key in proposed_need_keys:
+                    reject(top, "editorial_enrichment_duplicate_resource_need")
+                elif len(resource_needs) >= MAX_ENRICHMENT_RESOURCE_NEEDS:
+                    reject(top, "editorial_enrichment_resource_need_limit_exceeded")
+                else:
+                    proposed_need_keys.add(need.key)
+                    resource_needs.append(need)
+                    accepted = True
+                    proposal_key = need.key
         else:
-            diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections)
-            if diagram is None:
-                continue
-            diagram = _filter_diagram_relations(top, diagram, evidence_pack, rejections)
-            if diagram is None:
-                continue
-            question_key = normalize_analytic_question(diagram.purpose.question)
-            if not question_key or question_key in analytic_questions:
-                reject(top, "editorial_enrichment_duplicate_analytic_purpose")
-                continue
-            if diagram.key in canonical_keys:
-                reject(top, "editorial_enrichment_duplicate_key")
-            else:
-                canonical_keys.add(diagram.key)
-                analytic_questions.add(question_key)
-                diagrams.append(diagram)
+            diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections, warnings)
+            if diagram is not None:
+                diagram = _filter_diagram_relations(
+                    top, diagram, evidence_pack, rejections, warnings
+                )
+            if diagram is not None:
+                question_key = normalize_analytic_question(diagram.purpose.question)
+                if not question_key or question_key in analytic_questions:
+                    reject(top, "editorial_enrichment_duplicate_analytic_purpose")
+                elif diagram.key in canonical_keys:
+                    reject(top, "editorial_enrichment_duplicate_key")
+                else:
+                    canonical_keys.add(diagram.key)
+                    analytic_questions.add(question_key)
+                    diagrams.append(diagram)
+                    accepted = True
+                    proposal_key = diagram.key
+        if accepted:
+            accepted_blocks.append(
+                EditorialEnrichmentAcceptedBlock(top.kind, top.block_id, top.scope_id, proposal_key)
+            )
+        elif top.kind in {"TABLE", "DIAGRAM", "FIGURE"}:
+            block_rejections = tuple(
+                dict.fromkeys(
+                    item.reason_code
+                    for item in rejections[rejection_start:]
+                    if item.scope_id == top.scope_id or item.parent_scope_id == top.scope_id
+                )
+            )
+            rejected_blocks.append(
+                EditorialEnrichmentRejectedBlock(
+                    kind=top.kind,
+                    block_id=top.block_id,
+                    scope_id=top.scope_id,
+                    raw_text="\n".join(top.raw_lines),
+                    raw_sha256=hashlib.sha256("\n".join(top.raw_lines).encode()).hexdigest(),
+                    reason_codes=block_rejections,
+                )
+            )
     if not tables and not diagrams and not annotations and not figures and not resource_needs:
         return EditorialEnrichmentWireParseResult(
             None,
             tuple(rejections),
             error_code="editorial_enrichment_no_valid_blocks",
             transformations=tuple(transformations),
+            warnings=tuple(dict.fromkeys(warnings)),
+            rejected_blocks=tuple(rejected_blocks),
+            accepted_blocks=tuple(accepted_blocks),
         )
     return EditorialEnrichmentWireParseResult(
         proposal=EditorialEnrichmentProposalV1(
@@ -1676,6 +1784,173 @@ def parse_editorial_enrichment_proposal_wire(
         ),
         rejections=tuple(rejections),
         transformations=tuple(transformations),
+        warnings=tuple(dict.fromkeys(warnings)),
+        rejected_blocks=tuple(rejected_blocks),
+        accepted_blocks=tuple(accepted_blocks),
+    )
+
+
+def _merge_repaired_editorial_enrichment_proposal(
+    first_pass: EditorialEnrichmentWireParseResult,
+    repair_pass: EditorialEnrichmentWireParseResult,
+    repair_targets: tuple[EditorialEnrichmentRejectedBlock, ...],
+) -> tuple[
+    EditorialEnrichmentWireParseResult,
+    tuple[tuple[str, str], ...],
+    tuple[str, ...],
+]:
+    """Merge only validated replacements whose top-level wire identity was targeted."""
+    empty = EditorialEnrichmentProposalV1()
+    original = first_pass.proposal or empty
+    repaired = repair_pass.proposal or empty
+    target_by_identity = {(item.kind, item.block_id): item for item in repair_targets}
+    target_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for target in repair_targets:
+        target_counts[(target.kind, target.block_id)] += 1
+    accepted_top_level_ids = {item.block_id for item in first_pass.accepted_blocks}
+    repaired_by_identity: dict[tuple[str, str], Any] = {}
+    unexpected: list[str] = []
+
+    proposal_values: dict[str, dict[str, Any]] = {
+        "TABLE": {item.key: item for item in repaired.tables},
+        "DIAGRAM": {item.key: item for item in repaired.diagrams},
+        "FIGURE": {item.figure_handle: item for item in repaired.figures},
+    }
+    for block in repair_pass.accepted_blocks:
+        identity = (block.kind, block.block_id)
+        candidate: Any = proposal_values.get(block.kind, {}).get(block.proposal_key)
+        if identity not in target_by_identity or candidate is None:
+            unexpected.append(f"{block.kind}:{block.block_id}")
+            continue
+        if target_counts[identity] != 1 or block.block_id in accepted_top_level_ids:
+            unexpected.append(f"{block.kind}:{block.block_id}:ambiguous_or_duplicate_id")
+            continue
+        repaired_by_identity[identity] = candidate
+
+    tables = list(original.tables)
+    diagrams = list(original.diagrams)
+    figures = list(original.figures)
+    keys = {item.key for item in tables} | {item.key for item in diagrams}
+    questions = {normalize_analytic_question(item.purpose.question) for item in tables} | {
+        normalize_analytic_question(item.purpose.question) for item in diagrams
+    }
+    figure_handles = {item.figure_handle for item in figures}
+    used_top_level_ids = set(accepted_top_level_ids)
+    new_rejections = list(first_pass.rejections)
+    repaired_identities: list[tuple[str, str]] = []
+    repaired_blocks: list[EditorialEnrichmentAcceptedBlock] = []
+
+    for target in repair_targets:
+        identity = (target.kind, target.block_id)
+        candidate = repaired_by_identity.get(identity)
+        if candidate is None:
+            continue
+        reason: str | None = None
+        if target.block_id in used_top_level_ids:
+            reason = "editorial_enrichment_duplicate_local_block_id"
+        if target.kind == "TABLE":
+            assert isinstance(candidate, TableProposalV1)
+            question = normalize_analytic_question(candidate.purpose.question)
+            if reason is not None:
+                pass
+            elif candidate.key in keys:
+                reason = "editorial_enrichment_duplicate_key"
+            elif not question or question in questions:
+                reason = "editorial_enrichment_duplicate_analytic_purpose"
+            else:
+                tables.append(candidate)
+                keys.add(candidate.key)
+                questions.add(question)
+        elif target.kind == "DIAGRAM":
+            assert isinstance(candidate, DiagramProposalV1)
+            question = normalize_analytic_question(candidate.purpose.question)
+            if reason is not None:
+                pass
+            elif candidate.key in keys:
+                reason = "editorial_enrichment_duplicate_key"
+            elif not question or question in questions:
+                reason = "editorial_enrichment_duplicate_analytic_purpose"
+            else:
+                diagrams.append(candidate)
+                keys.add(candidate.key)
+                questions.add(question)
+        elif target.kind == "FIGURE":
+            assert isinstance(candidate, FigureProposalV1)
+            if reason is not None:
+                pass
+            elif candidate.figure_handle in figure_handles:
+                reason = "editorial_enrichment_duplicate_figure_handle"
+            else:
+                figures.append(candidate)
+                figure_handles.add(candidate.figure_handle)
+        if reason is not None:
+            new_rejections.append(
+                EditorialEnrichmentWireRejection(
+                    block_id=target.block_id,
+                    reason_code=reason,
+                    raw_sha256=target.raw_sha256,
+                    scope_id=target.scope_id,
+                )
+            )
+            continue
+        repaired_identities.append(identity)
+        used_top_level_ids.add(target.block_id)
+        repaired_blocks.append(
+            EditorialEnrichmentAcceptedBlock(
+                kind=target.kind,
+                block_id=target.block_id,
+                scope_id=target.scope_id,
+                proposal_key=(
+                    candidate.figure_handle if target.kind == "FIGURE" else candidate.key
+                ),
+            )
+        )
+
+    repaired_identity_set = set(repaired_identities)
+    remaining_rejections = tuple(
+        item
+        for item in first_pass.rejected_blocks
+        if (item.kind, item.block_id) not in repaired_identity_set
+    )
+    proposal = EditorialEnrichmentProposalV1(
+        tables=tuple(tables),
+        diagrams=tuple(diagrams),
+        annotations=original.annotations,
+        figures=tuple(figures),
+        resource_needs=original.resource_needs,
+    )
+    has_content = any(
+        (
+            proposal.tables,
+            proposal.diagrams,
+            proposal.annotations,
+            proposal.figures,
+            proposal.resource_needs,
+        )
+    )
+    transformations = first_pass.transformations
+    warnings = first_pass.warnings
+    accepted_blocks = (*first_pass.accepted_blocks, *repaired_blocks)
+    if repaired_identities:
+        transformations = (
+            *transformations,
+            *repair_pass.transformations,
+            f"editorial_enrichment_repair_blocks_repaired:{len(repaired_identities)}",
+        )
+        warnings = (*warnings, *repair_pass.warnings)
+    return (
+        EditorialEnrichmentWireParseResult(
+            proposal=proposal if has_content else None,
+            rejections=tuple((*new_rejections, *repair_pass.rejections)),
+            error_code=None if has_content else first_pass.error_code or repair_pass.error_code,
+            explicit_empty=first_pass.explicit_empty,
+            transformations=tuple(dict.fromkeys(transformations)),
+            warnings=tuple(dict.fromkeys(warnings)),
+            rejected_blocks=remaining_rejections,
+            accepted_blocks=accepted_blocks,
+        ),
+        tuple(repaired_identities),
+        tuple(unexpected),
     )
 
 
@@ -1814,6 +2089,7 @@ def _parse_enrichment_wire_table(
     block: _EditorialEnrichmentWireBlock,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
 ) -> TableProposalV1 | None:
     def reject(item: _EditorialEnrichmentWireBlock, code: str) -> None:
         rejections.append(_enrichment_wire_rejection(item, item.block_id, code, item.raw_lines))
@@ -1902,8 +2178,8 @@ def _parse_enrichment_wire_table(
         reject(block, "editorial_enrichment_table_has_no_valid_rows")
         return None
     row_handles = {handle for row in rows for handle in row.evidence_handles}
-    if not set(purpose.evidence_handles) <= row_handles:
-        reject(block, "editorial_enrichment_purpose_evidence_not_relevant")
+    purpose = _trim_analytic_purpose_evidence(block, purpose, row_handles, rejections, warnings)
+    if purpose is None:
         return None
     try:
         return TableProposalV1(
@@ -1925,6 +2201,7 @@ def _parse_enrichment_wire_diagram(
     block: _EditorialEnrichmentWireBlock,
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
 ) -> DiagramProposalV1 | None:
     def reject(item: _EditorialEnrichmentWireBlock, code: str) -> None:
         rejections.append(_enrichment_wire_rejection(item, item.block_id, code, item.raw_lines))
@@ -2035,6 +2312,23 @@ def _parse_enrichment_wire_diagram(
             ),
             None,
         )
+        if relation_type is None and kind is EnrichmentDiagramKind.INFECTION_CHAIN:
+            normalized_relation = (
+                " ".join(raw_relation_type.casefold().replace("_", " ").replace("-", " ").split())
+                if raw_relation_type
+                else ""
+            )
+            if normalized_relation in {
+                "infection chain",
+                "infection sequence",
+                "sequence",
+                "sequential",
+            }:
+                relation_type = DiagramRelationType.FACTUAL
+                warnings.append(
+                    "editorial_enrichment_relation_type_normalized:"
+                    f"{block.block_id}/{child.block_id}:{normalized_relation}->factual"
+                )
         handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
         if error is not None:
             reject(child, error)
@@ -2105,8 +2399,8 @@ def _parse_enrichment_wire_diagram(
     diagram_handles = {handle for node in nodes for handle in node.evidence_handles} | {
         handle for edge in edges for handle in edge.evidence_handles
     }
-    if not set(purpose.evidence_handles) <= diagram_handles:
-        reject(block, "editorial_enrichment_purpose_evidence_not_relevant")
+    purpose = _trim_analytic_purpose_evidence(block, purpose, diagram_handles, rejections, warnings)
+    if purpose is None:
         return None
     try:
         return DiagramProposalV1(
@@ -2167,6 +2461,7 @@ class EditorialEnrichmentStageErrorCode(StrEnum):
     ACCESS_POLICY_UNAVAILABLE = "editorial_enrichment_access_policy_unavailable"
     POLICY_BLOCKED = "editorial_enrichment_policy_blocked"
     OUTPUT_INVALID = "editorial_enrichment_output_invalid"
+    EMPTY_AFTER_REJECTIONS = "editorial_enrichment_empty_after_rejections"
     UNKNOWN_EVIDENCE = "editorial_enrichment_unknown_evidence"
     UNKNOWN_TECHNICAL_VALUE = "editorial_enrichment_unknown_technical_value"
     PLACEMENT_INVALID = "editorial_enrichment_placement_invalid"
@@ -2270,7 +2565,15 @@ def _source_figure_inventory_warnings(
     inventory: SourceFigureInventoryResult,
 ) -> tuple[str, ...]:
     warnings = set(inventory.warnings)
-    if any(figure.decision is not SourceFigureDecision.ACCEPTED for figure in inventory.figures):
+    pending_inventory_warnings = {
+        "source_figure_pdf_page_excerpt_needed",
+        "source_figure_source_exceeds_byte_limit",
+        "source_figure_source_document_unavailable",
+        "source_figure_source_blob_unavailable",
+    }
+    if any(figure.decision is SourceFigureDecision.PENDING for figure in inventory.figures) or (
+        pending_inventory_warnings & warnings
+    ):
         warnings.add("source_figure_inventory_contains_unresolved_items")
     if inventory.truncated:
         warnings.add("source_figure_inventory_truncated")
@@ -2819,12 +3122,14 @@ exact text is applied to every exact occurrence; preserve surrounding punctuatio
 Each column is a COLUMN block; each row is a ROW block with one CELL per column.
 Each diagram uses NODE, RELATION, and optional GROUP blocks. Every row, node,
 and relation needs existing evidence handles. Each cell must be grounded by its
-row's handles. A factual relation needs a cited evidence item whose text/context
-mentions both endpoints. If evidence supports endpoints separately but the
-relationship is analysis, type it as inference and cite supporting handles.
-Type and label comparisons as comparison; do not present them as infection
-sequences. Use infection_chain only when a cited passage documents both endpoints
-and the stated sequence relation. Reject links marked counter-indicated or
+row's handles. Use RELATION_TYPE: factual | inference | comparison (choose exactly
+one value). A factual relation needs a cited evidence item
+whose text/context mentions both endpoints and supports the relation label. If
+evidence supports endpoints separately but the relationship is analysis, type it
+as inference and cite supporting handles. Type and label comparisons as
+comparison; do not present them as infection sequences. infection_chain is a
+DIAGRAM KIND only; use RELATION_TYPE: factual only when cited evidence documents
+the stated sequence. Reject links marked counter-indicated or
 LINK_NOT_DEMONSTRATED in reserve context. Never invent evidence or handles.
 Preserve supplied placement anchors and section indexes.
 
@@ -2912,10 +3217,14 @@ def build_editorial_enrichment_model_request(
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
             "fournies. Chaque ligne, nœud et arête cite des evidence handles existants et "
             "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
-            "les deux endpoints. Une inférence doit être typée inference et citée par ses handles "
+            "les deux endpoints et soutient le libellé de la relation. RELATION_TYPE est "
+            "obligatoire : RELATION_TYPE: factual | inference | comparison, avec une seule "
+            "valeur choisie. Une inférence doit être typée inference et citée par ses handles "
             "de support. Une comparaison doit être typée et étiquetée comparison; ne la présente "
-            "jamais comme une séquence d'infection. infection_chain exige que la preuve documente "
-            "les deux endpoints et leur séquence. Respecte les réserves counter_indicated et "
+            "jamais comme une séquence d'infection. infection_chain est uniquement une valeur de "
+            "KIND pour un DIAGRAM. Dans ce diagramme, utilise RELATION_TYPE factual seulement si "
+            "la preuve citée documente les deux endpoints et la séquence affirmée. Respecte les "
+            "réserves counter_indicated et "
             "LINK_NOT_DEMONSTRATED; elles ne prouvent aucun lien. Conserve chaque commande, "
             "chemin, nom, date, adresse, hash et autre littéral exactement comme dans la preuve. "
             "Si aucune représentation n'améliore la compréhension, renvoie le marqueur explicite "
@@ -2997,6 +3306,101 @@ def build_editorial_enrichment_model_request(
             "analytic_validation_policy_version": EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION,
         },
     )
+
+
+def build_editorial_enrichment_repair_request(
+    base_request: ModelRequest,
+    *,
+    raw_output_sha256: str,
+    rejected_blocks: tuple[EditorialEnrichmentRejectedBlock, ...],
+) -> tuple[ModelRequest, str]:
+    """Build one deterministic repair request with the original admitted proofs."""
+    if not rejected_blocks or base_request.run_id is None:
+        raise ValueError("Editorial enrichment repair requires rejected blocks and a base run")
+    if len(raw_output_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in raw_output_sha256
+    ):
+        raise ValueError("Editorial enrichment repair requires the first output hash")
+    base_payload = json.loads(base_request.text)
+    identity_payload = {
+        "base_run_id": str(base_request.run_id),
+        "base_output_sha256": raw_output_sha256,
+        "evidence_pack_hash": base_request.evidence_pack_hash,
+        "repair_prompt_version": EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION,
+        "repair_contract_version": EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION,
+        "prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
+        "contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+        "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+        "rejected_blocks": [
+            {
+                "kind": item.kind,
+                "block_id": item.block_id,
+                "scope_id": item.scope_id,
+                "raw_sha256": item.raw_sha256,
+                "reason_codes": list(item.reason_codes),
+            }
+            for item in rejected_blocks
+        ],
+    }
+    identity = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(identity_payload)
+    ).hexdigest()
+    repair_run_id = uuid5(NAMESPACE_URL, f"production-editorial-enrichment-repair:{identity}")
+    prompt_payload = {
+        "instructions": (
+            "Repair only the rejected TABLE, DIAGRAM, or FIGURE blocks listed below. Return "
+            "corrected replacements in the same plain-text block format and preserve each exact "
+            "block kind and local header id. Use only the current synthesis, evidence pack, "
+            "figure catalog, and exact evidence handles already supplied here. Add no facts, "
+            "handles, sources, or blocks; do not return accepted siblings. Fix only the listed "
+            "machine error codes. If a block cannot be corrected from this evidence, omit it."
+        ),
+        "publication_language": base_payload["publication_language"],
+        "current_synthesis": base_payload["current_synthesis"],
+        "current_evidence_pack": base_payload["current_evidence_pack"],
+        "figure_catalog": base_payload["figure_catalog"],
+        "editorial_guidance": base_payload["editorial_guidance"],
+        "output_contract": base_payload["output_contract"],
+        "output_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+        "repair_contract_version": EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION,
+        "rejected_blocks": [
+            {
+                "kind": item.kind,
+                "block_id": item.block_id,
+                "reason_codes": list(item.reason_codes),
+                "wire_block": item.raw_text,
+            }
+            for item in rejected_blocks
+        ],
+    }
+    request = ModelRequest(
+        text=json.dumps(prompt_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        prompt_template_id="production-editorial-enrichment-repair",
+        prompt_template_version=EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION,
+        evidence_pack_hash=base_request.evidence_pack_hash,
+        external_llm_allowed=base_request.external_llm_allowed,
+        routing_hint=base_request.routing_hint,
+        sensitivity=base_request.sensitivity,
+        metadata={
+            **base_request.metadata,
+            "editorial_enrichment_repair_identity": identity,
+            "editorial_enrichment_repair_base_run_id": str(base_request.run_id),
+            "editorial_enrichment_repair_base_output_sha256": raw_output_sha256,
+            "editorial_enrichment_repair_contract_version": (
+                EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION
+            ),
+        },
+        parameters={
+            **base_request.parameters,
+            "contract_version": EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION,
+            "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+        },
+        web_search=False,
+        background=False,
+        conversation=None,
+        run_id=repair_run_id,
+    )
+    return request, identity
 
 
 def _validate_plain_editorial_text(value: str) -> None:
@@ -3711,14 +4115,60 @@ class ProductionEditorialEnrichmentService:
             "rejections": [
                 {
                     "block_id": item.block_id,
+                    "scope_id": item.scope_id,
                     "reason_code": item.reason_code,
                     "raw_sha256": item.raw_sha256,
                 }
                 for item in parsed.rejections
             ],
+            "warnings": list(parsed.warnings),
+            "transformations": list(parsed.transformations),
         }
         if parsed.error_code is not None:
             wire_details["wire_error_code"] = parsed.error_code
+        first_pass = parsed
+        if first_pass.rejected_blocks:
+            parsed, repair_details, repair_calls = await self._repair_rejected_blocks(
+                request=request,
+                first_model_run=model_run,
+                first_pass=first_pass,
+                evidence_pack=evidence_pack,
+                figure_catalog=figure_catalog,
+            )
+            model_calls += repair_calls
+            wire_details["repair"] = repair_details
+            wire_details["repaired_block_count"] = repair_details["blocks_repaired"]
+            wire_details["final_rejections"] = [
+                {
+                    "block_id": item.block_id,
+                    "reason_code": item.reason_code,
+                    "raw_sha256": item.raw_sha256,
+                    "scope_id": item.scope_id,
+                }
+                for item in parsed.rejections
+            ]
+            wire_details["warnings"] = list(parsed.warnings)
+            wire_details["transformations"] = list(parsed.transformations)
+
+        target_kinds = {"TABLE", "DIAGRAM", "FIGURE"}
+        initially_proposed_targets = tuple(
+            item for item in first_pass.accepted_blocks if item.kind in target_kinds
+        ) + tuple(item for item in first_pass.rejected_blocks if item.kind in target_kinds)
+        finally_accepted_targets = tuple(
+            item for item in parsed.accepted_blocks if item.kind in target_kinds
+        )
+        if initially_proposed_targets and not finally_accepted_targets:
+            return self._needs_review(
+                input_hash=input_hash,
+                model_run_id=model_run.id,
+                error_code=EditorialEnrichmentStageErrorCode.EMPTY_AFTER_REJECTIONS,
+                error_message=(
+                    "Every proposed table, diagram, or figure was rejected after the bounded "
+                    "repair attempt."
+                ),
+                details=wire_details,
+                model_calls=model_calls,
+            )
         if parsed.proposal is None:
             return self._needs_review(
                 input_hash=input_hash,
@@ -3778,7 +4228,10 @@ class ProductionEditorialEnrichmentService:
                 figure_catalog=figure_catalog,
                 resource_proposals=resource_proposals,
                 resource_model_run_id=resource_model_run_id,
-                warnings=_source_figure_inventory_warnings(source_figure_inventory),
+                warnings=(
+                    *_source_figure_inventory_warnings(source_figure_inventory),
+                    *parsed.warnings,
+                ),
             )
         except EditorialEnrichmentProposalControlError as exc:
             return self._needs_review(
@@ -3795,9 +4248,19 @@ class ProductionEditorialEnrichmentService:
                 warnings=(
                     *enrichment.warnings,
                     *(
-                        f"editorial_enrichment_block_rejected:{item.block_id}:{item.reason_code}"
+                        "editorial_enrichment_block_rejected:"
+                        f"{item.scope_id or 'unknown'}:{item.block_id}:{item.reason_code}"
                         for item in parsed.rejections
                     ),
+                ),
+            )
+        repaired_block_count = int(wire_details.get("repaired_block_count", 0))
+        if repaired_block_count:
+            enrichment = replace(
+                enrichment,
+                warnings=(
+                    *enrichment.warnings,
+                    f"editorial_enrichment_repair_blocks_repaired:{repaired_block_count}",
                 ),
             )
         resource_rejections = (
@@ -3872,6 +4335,10 @@ class ProductionEditorialEnrichmentService:
             model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
             routing_policy_version=EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION,
             source_figure_inventory_hash=source_figure_inventory.functional_hash(),
+            metadata_extra={
+                "editorial_enrichment_wire_details": wire_details,
+                "repaired_block_count": repaired_block_count,
+            },
         )
         return ProductionEditorialEnrichmentExecution(
             status=EditorialEnrichmentExecutionStatus.SUCCEEDED,
@@ -3886,11 +4353,142 @@ class ProductionEditorialEnrichmentService:
             details=(
                 wire_details
                 if parsed.rejections
+                or parsed.warnings
                 or parsed.proposal.resource_needs
+                or wire_details.get("repair")
                 or wire_details.get("diagram_rejections")
                 else None
             ),
         )
+
+    async def _repair_rejected_blocks(
+        self,
+        *,
+        request: ModelRequest,
+        first_model_run: ModelRun,
+        first_pass: EditorialEnrichmentWireParseResult,
+        evidence_pack: EditorialEnrichmentEvidencePackV1,
+        figure_catalog: tuple[EditorialFigureCatalogEntry, ...],
+    ) -> tuple[EditorialEnrichmentWireParseResult, dict[str, Any], int]:
+        targets = first_pass.rejected_blocks
+        details: dict[str, Any] = {
+            "status": "unavailable",
+            "blocks_sent": [
+                {
+                    "kind": item.kind,
+                    "block_id": item.block_id,
+                    "scope_id": item.scope_id,
+                    "raw_sha256": item.raw_sha256,
+                    "reason_codes": list(item.reason_codes),
+                }
+                for item in targets
+            ],
+            "blocks_repaired": 0,
+        }
+        if not targets or first_model_run.raw_output_sha256 is None:
+            details["reason"] = "repair_identity_unavailable"
+            return first_pass, details, 0
+        model_calls = 0
+        try:
+            repair_request, repair_identity = build_editorial_enrichment_repair_request(
+                request,
+                raw_output_sha256=first_model_run.raw_output_sha256,
+                rejected_blocks=targets,
+            )
+            details["repair_identity"] = repair_identity
+            details["prompt_version"] = EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION
+            details["contract_version"] = EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION
+            assert repair_request.run_id is not None
+            details["model_run_id"] = str(repair_request.run_id)
+            prior_run = await self._model_gateway.get_run(repair_request.run_id)
+            if prior_run is not None:
+                if prior_run.status is not ModelRunStatus.SUCCEEDED:
+                    details["status"] = "prior_attempt_not_succeeded"
+                    details["model_run_status"] = prior_run.status.value
+                    return first_pass, details, model_calls
+                execution, archive_error = await self._verified_existing_execution(repair_request)
+                if archive_error is not None or execution is None:
+                    details["status"] = "prior_output_unverified"
+                    details["error"] = archive_error
+                    return first_pass, details, model_calls
+            else:
+                model_calls = 1
+                execution = await self._model_gateway.draft(repair_request)
+        except ModelSubmissionReconciliationRequiredError as exc:
+            details.update(
+                {
+                    "status": "submission_requires_reconciliation",
+                    "error_code": exc.code,
+                    "model_run_id": str(exc.model_run_id)
+                    if exc.model_run_id is not None
+                    else details.get("model_run_id"),
+                }
+            )
+            return first_pass, details, 1
+        except Exception as exc:
+            details.update(
+                {"status": "failed", "error_code": getattr(exc, "code", type(exc).__name__)}
+            )
+            return first_pass, details, model_calls
+
+        details["model_run_id"] = str(execution.run.id)
+        if execution.run.status is not ModelRunStatus.SUCCEEDED:
+            details.update(
+                {
+                    "status": "failed",
+                    "model_run_status": execution.run.status.value,
+                    "error_code": execution.run.error_code,
+                }
+            )
+            return first_pass, details, model_calls
+        raw_text, raw_error = await self._verified_raw_text(
+            execution.run,
+            expected_text=execution.output_text if model_calls else None,
+        )
+        if raw_error is not None or raw_text is None:
+            details.update({"status": "raw_output_unverified", "error": raw_error})
+            return first_pass, details, model_calls
+        try:
+            repair_pass = parse_editorial_enrichment_proposal_wire(
+                raw_text, evidence_pack, figure_catalog=figure_catalog
+            )
+            parse_identity = await self._record_wire_parse(
+                execution.run,
+                evidence_pack,
+                repair_pass,
+                figure_catalog=figure_catalog,
+            )
+            merged, repaired_identities, unexpected = _merge_repaired_editorial_enrichment_proposal(
+                first_pass, repair_pass, targets
+            )
+        except Exception as exc:
+            details.update({"status": "invalid_repair_result", "error_code": type(exc).__name__})
+            return first_pass, details, model_calls
+        details.update(
+            {
+                "status": "repaired" if repaired_identities else "no_blocks_repaired",
+                "parse_identity": parse_identity,
+                "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+                "repaired_blocks": [
+                    {"kind": kind, "block_id": block_id} for kind, block_id in repaired_identities
+                ],
+                "blocks_repaired": len(repaired_identities),
+                "unexpected_accepted_blocks": list(unexpected),
+                "rejections": [
+                    {
+                        "block_id": item.block_id,
+                        "scope_id": item.scope_id,
+                        "reason_code": item.reason_code,
+                        "raw_sha256": item.raw_sha256,
+                    }
+                    for item in repair_pass.rejections
+                ],
+                "wire_error_code": repair_pass.error_code,
+                "warnings": list(repair_pass.warnings),
+                "transformations": list(repair_pass.transformations),
+            }
+        )
+        return (merged if repaired_identities else first_pass), details, model_calls
 
     async def _verified_existing_execution(
         self, request: ModelRequest
@@ -4082,12 +4680,29 @@ class ProductionEditorialEnrichmentService:
     ) -> str:
         """Persist parse identity and the normalized strict proposal beside raw bytes."""
         assert run.raw_output_sha256 is not None
+        is_repair = run.prompt_template_id == "production-editorial-enrichment-repair"
+        prompt_version = (
+            EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION
+            if is_repair
+            else EDITORIAL_ENRICHMENT_PROMPT_VERSION
+        )
+        contract_version = (
+            EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION
+            if is_repair
+            else EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION
+        )
         identity = editorial_enrichment_parse_identity(
-            run.raw_output_sha256, evidence_pack, figure_catalog=figure_catalog
+            run.raw_output_sha256,
+            evidence_pack,
+            prompt_version=prompt_version,
+            contract_version=contract_version,
+            parser_version=EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
+            figure_catalog=figure_catalog,
         )
         validation_errors: list[dict[str, Any]] = [
             {
-                "path": ["blocks", item.block_id],
+                "path": ["blocks", item.scope_id or item.block_id],
+                "block_id": item.block_id,
                 "code": item.reason_code,
                 "value_sha256": item.raw_sha256,
             }
@@ -4103,9 +4718,10 @@ class ProductionEditorialEnrichmentService:
             )
         transformations = [
             *parsed.transformations,
+            *parsed.warnings,
             f"editorial_enrichment_parser:{EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION}",
-            f"editorial_enrichment_contract:{EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION}",
-            f"editorial_enrichment_prompt:{EDITORIAL_ENRICHMENT_PROMPT_VERSION}",
+            f"editorial_enrichment_contract:{contract_version}",
+            f"editorial_enrichment_prompt:{prompt_version}",
         ]
         normalized = None
         if parsed.proposal is not None:

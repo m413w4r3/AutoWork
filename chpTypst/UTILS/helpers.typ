@@ -116,6 +116,9 @@
   for event in events {
     let semantic-spans = if event.len() > 3 { event.at(3) } else { none }
     let source-urls = timeline-event-source-urls(event)
+    let source-indices = source-urls
+      .filter(url => url != none and url != "")
+      .map(url => all-source-urls.position(candidate => candidate == url) + 1)
 
     block[
       #if event.at(0) != "" [
@@ -129,11 +132,8 @@
         :
       ]
       #semantic-or-plain(event.at(1), semantic-spans)
-      #for url in source-urls {
-        if url != none and url != "" {
-          let source-index = all-source-urls.position(candidate => candidate == url)
-          super[#str(source-index + 1)]
-        }
+      #if source-indices.len() > 0 {
+        super[#source-indices.map(str).join(", ")]
       }
     ]
   }

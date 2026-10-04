@@ -124,6 +124,29 @@ function status(
 afterEach(() => vi.unstubAllGlobals());
 
 describe("SubjectProduction retry from stage", () => {
+  it("explique le rejet de toutes les propositions d’enrichissement", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        Response.json({
+          ...status("needs_review", "editorial_enrichment"),
+          error_code: "editorial_enrichment_empty_after_rejections",
+          error_message:
+            "Every proposed table, diagram, or figure was rejected after the bounded repair attempt.",
+        }),
+      ),
+    );
+    renderProduction();
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(
+      "Toutes les tables, tous les diagrammes et toutes les figures proposés ont été rejetés.",
+    );
+    expect(alert).toHaveTextContent(
+      "editorial_enrichment_empty_after_rejections",
+    );
+  });
+
   it("démarre un run via le batch et réutilise la même clé après une erreur réseau", async () => {
     const postCalls: RequestInit[] = [];
     let attempts = 0;

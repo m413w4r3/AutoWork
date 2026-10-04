@@ -14,12 +14,14 @@ from cti_app.application.source_figure_inventory import (
     ArchivedFigureSource,
     SourceFigureInventory,
 )
+from cti_app.application.source_media_extraction import extract_source_media_observations
 from cti_app.domain.production_editorial_enrichment import (
     ResolvedSourceFigureV1,
     SourceFigureDecision,
     SourceFigureLocatorV1,
     source_figure_id,
 )
+from cti_app.domain.source_media import SourceMediaReasonCode, SourceMediaRecord, SourceMediaStatus
 
 _DOCUMENT_ID = UUID("10000000-0000-0000-0000-000000000001")
 _IMAGE_DOCUMENT_ID = UUID("20000000-0000-0000-0000-000000000002")
@@ -133,6 +135,26 @@ def test_external_image_url_stays_pending_without_a_network_fetch() -> None:
     assert result.figures[0].decision is SourceFigureDecision.PENDING
     assert result.figures[0].decision_reason == "image_not_in_local_archive"
     assert result.figures[0].blob_id is None
+
+
+def test_collection_failure_remains_pending_in_the_figure_inventory() -> None:
+    source = _source(_html('<img src="/figures/chart.png" alt="Chart">'))
+    (observation,) = extract_source_media_observations((source,))
+    failed_collection = SourceMediaRecord(
+        subject_id=_DOCUMENT_ID,
+        source_document_id=_DOCUMENT_ID,
+        policy_version="source-media-v1",
+        policy_sha256="b" * 64,
+        status=SourceMediaStatus.COLLECTION_FAILED,
+        reason_code=SourceMediaReasonCode.COLLECTION_UNAVAILABLE,
+        dom_locator=observation.dom_locator,
+    )
+
+    result = SourceFigureInventory().inventory((source,), (), media_candidates=(failed_collection,))
+
+    assert len(result.figures) == 1
+    assert result.figures[0].decision is SourceFigureDecision.PENDING
+    assert result.figures[0].decision_reason == "collection_unavailable"
 
 
 def test_duplicate_image_bytes_are_deduplicated_by_sha256() -> None:

@@ -384,7 +384,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     assert text.count("https://example.test/one") == 1
     assert text.count("https://example.test/two") == 1
     assert re.search(r"No display date\s*1", text)
-    assert re.search(r"Several source event\s*1", text)
+    assert re.search(r"Several source event\s*1\s*,\s*2", text)
     assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
     assert text.count("Synthesis lead paragraph for parity coverage.") == 1
     assert text.count("A second lead paragraph.") == 1

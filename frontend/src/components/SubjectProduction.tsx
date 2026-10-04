@@ -144,6 +144,9 @@ function issueCopy(
   if (errorCode === "synthesis_validation_failed") {
     return "Validation de synthèse échouée — consultez les détails de l’étape.";
   }
+  if (errorCode === "editorial_enrichment_empty_after_rejections") {
+    return "Toutes les tables, tous les diagrammes et toutes les figures proposés ont été rejetés. Vérifiez l’enrichissement éditorial avant de poursuivre.";
+  }
   if (errorCode && CONVERSATION_ERROR_CODES.has(errorCode)) {
     return "Intervention requise — la soumission du modèle doit être réconciliée avant de poursuivre.";
   }

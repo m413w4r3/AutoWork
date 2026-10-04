@@ -429,16 +429,38 @@ class SourceFigureInventory:
                     ):
                         break
                     continue
-                if media_record is not None and media_record.status in {
-                    SourceMediaStatus.EXCLUDED_BY_RULE,
-                    SourceMediaStatus.COLLECTION_FAILED,
-                }:
+                if (
+                    media_record is not None
+                    and media_record.status is SourceMediaStatus.EXCLUDED_BY_RULE
+                ):
                     if not add(
                         source=source,
                         locator=locator,
                         asset_url=asset_url,
                         provenance=provenance,
                         decision=SourceFigureDecision.REJECTED,
+                        reason=media_record.reason_code.value,
+                        sha256=media_record.sha256,
+                        mime_type=media_record.mime_type,
+                        byte_size=media_record.byte_size,
+                        media_record=media_record,
+                        alt_text=observation.alt_text,
+                        caption_text=observation.caption_text,
+                        nearby_heading_text=observation.nearby_heading_text,
+                        anchor=observation.anchor,
+                    ):
+                        break
+                    continue
+                if (
+                    media_record is not None
+                    and media_record.status is SourceMediaStatus.COLLECTION_FAILED
+                ):
+                    if not add(
+                        source=source,
+                        locator=locator,
+                        asset_url=asset_url,
+                        provenance=provenance,
+                        decision=SourceFigureDecision.PENDING,
                         reason=media_record.reason_code.value,
                         sha256=media_record.sha256,
                         mime_type=media_record.mime_type,

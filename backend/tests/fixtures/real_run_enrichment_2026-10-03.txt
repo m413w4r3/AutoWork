@@ -1,0 +1,149 @@
+DIAGRAM D001
+KEY: iran_bitcoin_bdd_flow
+KIND: infection_chain
+TITLE: Chaîne de résolution C2 via Bitcoin
+PURPOSE: Comment le malware récupère-t-il des données C2 depuis la blockchain avant de rejoindre l’infrastructure hors chaîne ?
+DATA: Les transactions Bitcoin stockent des données de routage C2 encodées ; les appareils compromis interrogent les emplacements blockchain par RPC, décodent les données puis se connectent à l’infrastructure hors chaîne.
+GAIN: Une séquence visuelle distingue clairement la fonction de stockage/résolution on-chain de la phase de communication hors chaîne.
+SCOPE: Uniquement le mécanisme de récupération BDD décrit pour le cas iranien et la séquence générique explicitement documentée pour les BDD.
+PURPOSE_EVIDENCE: E011, E023, E029
+LIMITS: E011 et E023 décrivent le fonctionnement général des BDD ; les éléments fournis n’établissent pas que chaque étape ou chaque type de charge mentionné dans E023 est spécifique au cas iranien.
+DIRECTION: left_to_right
+PLACEMENT: after_section
+SECTION_INDEX: 1
+PLACEMENT_REASON: Le diagramme complète le paragraphe décrivant la chaîne de récupération on-chain puis le passage hors chaîne.
+NODE N001
+ID: bitcoin_transaction
+LABEL: Transaction Bitcoin contenant des données de routage C2 encodées
+EVIDENCE: E029
+END NODE
+NODE N002
+ID: compromised_device
+LABEL: Appareil compromis interrogeant l’emplacement blockchain
+EVIDENCE: E011
+END NODE
+NODE N003
+ID: decoded_c2_data
+LABEL: Données C2 décodées
+EVIDENCE: E011
+END NODE
+NODE N004
+ID: offchain_infrastructure
+LABEL: Infrastructure hors chaîne
+EVIDENCE: E011, E023
+END NODE
+RELATION L001
+FROM: compromised_device
+TO: bitcoin_transaction
+RELATION_TYPE: infection_chain
+LABEL: récupère les données de routage C2
+EVIDENCE: E029
+END RELATION
+RELATION L002
+FROM: bitcoin_transaction
+TO: decoded_c2_data
+RELATION_TYPE: infection_chain
+LABEL: données récupérées puis décodées
+EVIDENCE: E011, E029
+END RELATION
+RELATION L003
+FROM: decoded_c2_data
+TO: offchain_infrastructure
+RELATION_TYPE: infection_chain
+LABEL: permet la connexion à l’infrastructure récupérée
+EVIDENCE: E011
+END RELATION
+END DIAGRAM
+
+TABLE T001
+KEY: detection_pivots
+KIND: custom
+TITLE: Pivots de détection complémentaires
+PURPOSE: Quelles télémétries permettent d’observer le comportement BDD, et quelles limites s’appliquent à chacune ?
+DATA: La source documente la surveillance des appels JSON-RPC sortants côté endpoint et l’analyse on-chain des wallets, resolver contracts, chaînes de financement et historiques de mise à jour.
+GAIN: Le tableau sépare immédiatement les deux plans d’observation — endpoint et blockchain — ainsi que leur portée et leurs limites respectives.
+SCOPE: Uniquement les deux pivots de détection explicitement décrits dans les preuves fournies.
+PURPOSE_EVIDENCE: E013, E014, E018, E026
+LIMITS: Ces signaux sont contextuels ; ils ne constituent pas à eux seuls une attribution d’identité, et les appels vers des endpoints blockchain peuvent aussi provenir d’usages légitimes.
+PLACEMENT: after_section
+SECTION_INDEX: 4
+PLACEMENT_REASON: Le tableau synthétise les deux méthodes de détection développées dans les deux paragraphes de cette section sans introduire de nouvelle technique.
+COLUMN C001
+KEY: telemetry
+LABEL: Télémétrie
+END COLUMN
+COLUMN C002
+KEY: observable
+LABEL: Élément observable
+END COLUMN
+COLUMN C003
+KEY: analytic_use
+LABEL: Utilité analytique
+END COLUMN
+COLUMN C004
+KEY: limit
+LABEL: Limite
+END COLUMN
+ROW R001
+CELL: Visibilité endpoint
+CELL: Appels JSON-RPC sortants vers des endpoints blockchain publics
+CELL: Signal d’alerte précoce sur l’interrogation de services blockchain
+CELL: Signal contextuel utilisant aussi une infrastructure légitime
+EVIDENCE: E014
+END ROW
+ROW R002
+CELL: Analyse on-chain
+CELL: Wallets opérateurs, resolver contracts, chaînes de financement et historiques de mises à jour
+CELL: Rapprochement de campagnes distinctes et suivi des rotations horodatées
+CELL: Une corrélation blockchain ne constitue pas à elle seule une preuve d’identité
+EVIDENCE: E013, E026
+END ROW
+END TABLE
+
+ANNOTATION A001
+CATEGORY: actor
+PARAGRAPH_ANCHOR: lead:0001
+EXACT_TEXT: Ministry of Intelligence iranien
+END ANNOTATION
+
+ANNOTATION A002
+CATEGORY: technical
+PARAGRAPH_ANCHOR: lead:0001
+EXACT_TEXT: couche de résolution C2
+END ANNOTATION
+
+ANNOTATION A003
+CATEGORY: protocol_field
+PARAGRAPH_ANCHOR: lead:0001
+EXACT_TEXT: Bitcoin OP_RETURN
+END ANNOTATION
+
+ANNOTATION A004
+CATEGORY: technical
+PARAGRAPH_ANCHOR: section:2:paragraph:0001
+EXACT_TEXT: blockchain dead drop
+END ANNOTATION
+
+ANNOTATION A005
+CATEGORY: technical_literal
+PARAGRAPH_ANCHOR: section:2:paragraph:0001
+EXACT_TEXT: MITRE ATT&CK T1102.002
+END ANNOTATION
+
+ANNOTATION A006
+CATEGORY: english_term
+PARAGRAPH_ANCHOR: section:2:paragraph:0001
+EXACT_TEXT: Web Service: Dead Drop Resolver
+END ANNOTATION
+
+ANNOTATION A007
+CATEGORY: technical_literal
+PARAGRAPH_ANCHOR: section:4:paragraph:0001
+EXACT_TEXT: JSON-RPC
+END ANNOTATION
+
+NEEDS N001
+KIND: MEDIA
+REASON: Le catalogue ne contient pas de média accepté explicitement rattaché à « Case study 2: Iran operators using Bitcoin OP_RETURN » ; le seul élément identifié à proximité de cette étude de cas est rejeté comme doublon perceptuel.
+QUERY_HINT: schéma archivé du cas iranien Bitcoin OP_RETURN blockchain dead drop
+END NEEDS
