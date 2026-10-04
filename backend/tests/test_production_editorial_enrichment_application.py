@@ -1309,9 +1309,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "640" in request.text and "400" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v5-relation-types-repair"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v5-relation-types"
+        "editorial-enrichment-block-contract-v6-table-diagram-only"
     )
 
     revision_request = ProductionEditorialEnrichmentRevisionService._model_request(
@@ -1542,7 +1542,10 @@ class _RecordingGateway:
         self.calls.append((request, output_schema))
         if isinstance(self._responder, Exception):
             raise self._responder
-        execution = self._responder(request)
+        if request.prompt_template_version == enrichment_module.SEMANTIC_ANNOTATION_PROMPT_VERSION:
+            execution = _succeeded_text(request, "NO ANNOTATIONS")
+        else:
+            execution = self._responder(request)
         if execution.output_text is None:
             return execution
         raw = execution.output_text.encode("utf-8")
@@ -1903,7 +1906,7 @@ async def test_service_drafts_once_statelessly_and_stores_model_provenance() -> 
     result = await _execute(world)
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert (result.model_calls, result.table_count, result.diagram_count) == (1, 1, 1)
+    assert (result.model_calls, result.table_count, result.diagram_count) == (2, 1, 1)
     assert result.source_figure_count == 0
     request, schema = world.gateway.calls[0]
     assert schema is None
@@ -2006,7 +2009,7 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
     result = await _execute(world)
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 1)
+    assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 2)
     assert len(world.writer.calls) == 1
 
 
@@ -2023,7 +2026,7 @@ async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> N
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert world.service._resource_search_enabled is False
-    assert len(world.gateway.calls) == 1
+    assert len(world.gateway.calls) == 2
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
     assert enrichment.resource_needs[0].kind.value == "MEDIA"  # type: ignore[attr-defined]
@@ -2054,8 +2057,8 @@ async def test_resource_search_opt_in_uses_separate_call_and_persists_proposals_
     result = await _execute(world)
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert result.model_calls == 2
-    assert [request.web_search for request, _schema in world.gateway.calls] == [False, True]
+    assert result.model_calls == 3
+    assert [request.web_search for request, _schema in world.gateway.calls] == [False, True, False]
     assert all(request.conversation is None for request, _schema in world.gateway.calls)
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.resource_needs) == 1  # type: ignore[attr-defined]
@@ -2194,7 +2197,7 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
 
     assert first.status is second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert second.model_calls == 0
-    assert len(world.gateway.calls) == 1
+    assert len(world.gateway.calls) == 2
     assert second.model_run_id == first.model_run_id
     assert second.input_hash != first.input_hash
     reparsed = world.writer.calls[1]["enrichment"]
@@ -2217,10 +2220,10 @@ async def test_parser_version_bump_reparses_archived_output_without_model_call(
 @pytest.mark.parametrize(
     ("version_name", "version_value"),
     (
-        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v8-test"),
+        ("EDITORIAL_ENRICHMENT_PROMPT_VERSION", "editorial-enrichment-text-blocks-v9-test"),
         (
             "EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION",
-            "editorial-enrichment-block-contract-v5-test",
+            "editorial-enrichment-block-contract-v6-test",
         ),
     ),
 )
@@ -2234,7 +2237,7 @@ async def test_prompt_or_contract_version_bump_uses_a_new_model_invocation(
     second = await _execute(world)
 
     assert second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert len(world.gateway.calls) == 2
+    assert len(world.gateway.calls) == 3
     assert second.model_calls == 1
     assert second.input_hash != first.input_hash
     assert second.model_run_id != first.model_run_id
@@ -2259,7 +2262,7 @@ async def test_restart_resumes_from_verified_raw_output_with_identical_result() 
 
     assert resumed.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert resumed.model_calls == 0
-    assert len(world.gateway.calls) == 1
+    assert len(world.gateway.calls) == 2
     assert resumed.model_run_id == first.model_run_id
     resumed_enrichment = world.writer.calls[1]["enrichment"]
     assert resumed_enrichment.tables == first_enrichment.tables  # type: ignore[attr-defined]
@@ -2410,7 +2413,7 @@ async def test_key_collision_rejects_only_the_conflicting_wire_block(
         for item in result.details["rejections"]
     )
     # One conflicting table is rejected and receives the bounded repair attempt.
-    assert result.model_calls == 2
+    assert result.model_calls == 3
     assert len(world.writer.calls) == 1
 
 
@@ -3140,10 +3143,10 @@ async def test_targeted_repair_is_single_call_versioned_and_reused_on_replay() -
 
     assert first.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert first.table_count == first.diagram_count == 1
-    assert first.model_calls == 2
+    assert first.model_calls == 3
     assert second.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert second.model_calls == 0
-    assert len(world.gateway.calls) == 2
+    assert len(world.gateway.calls) == 3
     stored_call = world.writer.calls[0]
     assert stored_call["metadata_extra"]["repaired_block_count"] == 1  # type: ignore[index]
     assert stored_call["metadata_extra"]["editorial_enrichment_wire_details"]["rejections"]  # type: ignore[index]
@@ -3169,7 +3172,7 @@ async def test_repair_failure_keeps_first_pass_and_all_rejected_proposals_need_r
     fallback = await _execute(world)
     assert fallback.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert fallback.table_count == fallback.diagram_count == 1
-    assert fallback.model_calls == 2
+    assert fallback.model_calls == 3
     assert fallback.details is not None
     assert fallback.details["repair"]["status"] == "failed"  # type: ignore[index]
 

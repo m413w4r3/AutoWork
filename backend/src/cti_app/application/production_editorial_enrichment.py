@@ -57,6 +57,11 @@ from cti_app.application.production_prompts import (
     EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION,
     EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION,
+    SEMANTIC_ANNOTATION_CONTRACT_VERSION,
+    SEMANTIC_ANNOTATION_OUTPUT_CONTRACT,
+    SEMANTIC_ANNOTATION_PROMPT_VERSION,
+    SEMANTIC_ANNOTATION_ROLE_GUIDANCE,
+    SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
 )
 from cti_app.application.production_synthesis import (
     SynthesisAccessPolicyV1,
@@ -148,22 +153,25 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_lineage,
 )
 from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ROLE_PRIORITY,
     SemanticAnnotationProposalV1,
     SemanticRole,
     lead_paragraph_anchor,
     section_paragraph_anchor,
+    timeline_anchor,
 )
 
 if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v5-relation-types-repair"
-EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 4
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v6-dedicated-annotations"
+EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v6-analytic-reserve-context"
+    "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v5-analytic-purpose"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v6-annotation-anchors"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v1-token-dice-0.80"
 )
@@ -605,6 +613,41 @@ class EditorialEnrichmentWireParseResult:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticAnnotationWireParseResult:
+    proposals: tuple[SemanticAnnotationProposalV1, ...] = ()
+    rejections: tuple[tuple[str, str], ...] = ()
+    error_code: str | None = None
+
+
+def _merge_semantic_annotation_proposals(
+    *proposal_groups: tuple[SemanticAnnotationProposalV1, ...],
+) -> tuple[SemanticAnnotationProposalV1, ...]:
+    """Keep one stable provenance anchor per exact term, resolving role conflicts."""
+    selected: dict[str, SemanticAnnotationProposalV1] = {}
+    for proposal in (item for group in proposal_groups for item in group):
+        current = selected.get(proposal.text)
+        if (
+            current is None
+            or SEMANTIC_ROLE_PRIORITY[proposal.role] > SEMANTIC_ROLE_PRIORITY[current.role]
+            or (
+                SEMANTIC_ROLE_PRIORITY[proposal.role] == SEMANTIC_ROLE_PRIORITY[current.role]
+                and proposal.role.value < current.role.value
+            )
+            or (
+                proposal.role is current.role
+                and proposal.paragraph_anchor < current.paragraph_anchor
+            )
+        ):
+            selected[proposal.text] = proposal
+    return tuple(
+        sorted(
+            selected.values(),
+            key=lambda item: (item.paragraph_anchor, item.text, item.role.value),
+        )
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class EditorialResourceWireParseResult:
     proposals: tuple[ResourceProposalV1, ...]
     rejections: tuple[EditorialEnrichmentWireRejection, ...] = ()
@@ -914,6 +957,9 @@ def _synthesis_anchor_texts(
 ) -> dict[str, str]:
     current = evidence_pack.current_synthesis
     result: dict[str, str] = {}
+    title = current.get("title")
+    if isinstance(title, str):
+        result["title"] = title
     for paragraph in current.get("lead", ()):
         if isinstance(paragraph, Mapping):
             anchor, text = paragraph.get("anchor"), paragraph.get("text")
@@ -927,7 +973,299 @@ def _synthesis_anchor_texts(
                 anchor, text = paragraph.get("anchor"), paragraph.get("text")
                 if isinstance(anchor, str) and isinstance(text, str):
                     result[anchor] = text
+    for index, timeline_entry in enumerate(current.get("timeline", ()), start=1):
+        if isinstance(timeline_entry, Mapping):
+            anchor = timeline_entry.get("anchor")
+            text = timeline_entry.get("text")
+            if isinstance(anchor, str) and isinstance(text, str):
+                result[anchor] = text
+            elif isinstance(text, str):
+                result[timeline_anchor(index)] = text
     return result
+
+
+def semantic_annotation_anchor_texts(
+    synthesis: ProductionSynthesisV1,
+    enrichment: EditorialEnrichmentV1 | None = None,
+) -> dict[str, str]:
+    """Mirror the text-bearing V5 publication anchors from its canonical inputs."""
+    result: dict[str, str] = {"title": synthesis.title}
+    result.update(
+        {
+            lead_paragraph_anchor(index): paragraph.text
+            for index, paragraph in enumerate(synthesis.lead, start=1)
+        }
+    )
+    for section_index, section in enumerate(synthesis.sections):
+        for paragraph_index, paragraph in enumerate(section.paragraphs, start=1):
+            result[section_paragraph_anchor(section_index, paragraph_index)] = paragraph.text
+    result.update(
+        {
+            timeline_anchor(index): entry.text
+            for index, entry in enumerate(synthesis.timeline, start=1)
+        }
+    )
+    if enrichment is None:
+        return result
+    for table in enrichment.tables:
+        result[f"table:{table.key}:title"] = table.title
+        if table.caption is not None:
+            result[f"table:{table.key}:caption"] = table.caption
+        for column_index, column in enumerate(table.columns, start=1):
+            result[f"table:{table.key}:column:{column_index:04d}"] = column.label
+        for row_index, row in enumerate(table.rows, start=1):
+            for cell_index, cell in enumerate(row.cells, start=1):
+                result[f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}"] = cell
+    for diagram in enrichment.diagrams:
+        result[f"diagram:{diagram.key}:title"] = diagram.title
+        if diagram.caption is not None:
+            result[f"diagram:{diagram.key}:caption"] = diagram.caption
+    for figure in enrichment.source_figures:
+        result[f"figure:{figure.key}:caption"] = figure.caption
+        result[f"figure:{figure.key}:provenance"] = figure.provenance
+    return result
+
+
+_SEMANTIC_ANNOTATION_BLOCK = re.compile(
+    r"^(?:TERM|ANNOTATION)\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*:?$",
+    re.IGNORECASE,
+)
+_SEMANTIC_ANNOTATION_FIELD = re.compile(
+    r"^(TERM|EXACT\s+TEXT|TEXT|ROLE|PARAGRAPH(?:\s+|_)ANCHOR|ANCHOR)\s*:\s?(.*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_semantic_annotation_wire(
+    raw_text: str,
+    anchor_texts: Mapping[str, str],
+) -> SemanticAnnotationWireParseResult:
+    """Parse independent term blocks and reject each invalid item separately."""
+    sanitized = sanitize_bridge_output_text(raw_text).replace("\r\n", "\n").replace("\r", "\n")
+    proposals: list[SemanticAnnotationProposalV1] = []
+    rejections: list[tuple[str, str]] = []
+    current: dict[str, str] | None = None
+    item_number = 0
+    recognized = False
+    explicit_empty = False
+
+    def finish() -> None:
+        nonlocal current, item_number
+        if current is None:
+            return
+        item_number += 1
+        item_id = current.get("id", f"A{item_number:03d}")
+        text = current.get("term", "").strip()
+        role_text = current.get("role", "").strip().casefold()
+        anchor = current.get("anchor", "").strip()
+        if not text or not role_text or not anchor:
+            rejections.append((item_id, "semantic_annotation_missing_field"))
+            current = None
+            return
+        try:
+            role = SemanticRole(role_text)
+        except ValueError:
+            rejections.append((item_id, "semantic_annotation_role_unknown"))
+            current = None
+            return
+        if role is SemanticRole.TEXT:
+            rejections.append((item_id, "semantic_annotation_role_unknown"))
+            current = None
+            return
+        anchored_text = anchor_texts.get(anchor)
+        if anchored_text is None:
+            rejections.append((item_id, "semantic_annotation_anchor_unknown"))
+            current = None
+            return
+        if text not in anchored_text:
+            rejections.append((item_id, "semantic_annotation_text_not_found"))
+            current = None
+            return
+        try:
+            proposals.append(SemanticAnnotationProposalV1(anchor, role, text))
+        except (TypeError, ValueError):
+            rejections.append((item_id, "semantic_annotation_item_invalid"))
+        current = None
+
+    for raw_line in sanitized.splitlines():
+        line = _enrichment_wire_line(raw_line)
+        if not line or _ENRICHMENT_FENCE.match(raw_line):
+            continue
+        if line.casefold().rstrip(".! ") in {"no annotations", "no semantic annotations"}:
+            finish()
+            recognized = True
+            explicit_empty = True
+            continue
+        wrapped = _ENRICHMENT_BLOCK_WRAPPER.fullmatch(raw_line.strip())
+        header_value = _enrichment_wire_line(wrapped.group(1)) if wrapped else line
+        header = _SEMANTIC_ANNOTATION_BLOCK.fullmatch(header_value)
+        if header is not None:
+            finish()
+            current = {"id": header.group(1) or f"A{item_number + 1:03d}"}
+            recognized = True
+            continue
+        if re.fullmatch(r"END(?:\s+(?:TERM|ANNOTATION))?", line, re.IGNORECASE):
+            finish()
+            recognized = True
+            continue
+        match = _SEMANTIC_ANNOTATION_FIELD.fullmatch(line)
+        if match is None:
+            if current is not None:
+                rejections.append(
+                    (current.get("id", "unknown"), "semantic_annotation_line_invalid")
+                )
+                current = None
+            continue
+        recognized = True
+        field_name = re.sub(r"[_\s]+", " ", match.group(1).casefold())
+        field_key = {
+            "term": "term",
+            "exact text": "term",
+            "text": "term",
+            "role": "role",
+            "paragraph anchor": "anchor",
+            "anchor": "anchor",
+        }[field_name]
+        if field_key == "term" and current is not None and current.get("term"):
+            finish()
+        if current is None:
+            current = {}
+        if field_key in current:
+            rejections.append((current.get("id", "unknown"), "semantic_annotation_duplicate_field"))
+            current = None
+            continue
+        current[field_key] = match.group(2).strip()
+    finish()
+    if not recognized:
+        return SemanticAnnotationWireParseResult(
+            tuple(proposals), tuple(rejections), "semantic_annotation_unrecognized_response"
+        )
+    if not proposals and not rejections and not explicit_empty:
+        return SemanticAnnotationWireParseResult(
+            tuple(proposals), tuple(rejections), "semantic_annotation_no_items"
+        )
+    return SemanticAnnotationWireParseResult(tuple(proposals), tuple(rejections))
+
+
+def semantic_annotation_input_hash(
+    *,
+    anchor_texts: Mapping[str, str],
+    access_policy_hash: str,
+) -> str:
+    if _SHA256_RE.fullmatch(access_policy_hash) is None:
+        raise ValueError("Semantic annotation request hashes must be lowercase SHA-256")
+    return hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "anchors": dict(sorted(anchor_texts.items())),
+                "access_policy_hash": access_policy_hash,
+                "prompt_version": SEMANTIC_ANNOTATION_PROMPT_VERSION,
+                "contract_version": SEMANTIC_ANNOTATION_CONTRACT_VERSION,
+                "parser_version": SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
+                "policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
+            }
+        )
+    ).hexdigest()
+
+
+def build_semantic_annotation_model_request(
+    run: ProductionRun,
+    snapshot: ProductionInputSnapshot,
+    access_policy: SynthesisAccessPolicyV1,
+    anchor_texts: Mapping[str, str],
+    *,
+    enrichment_input_hash: str,
+    attempt: int = 0,
+    repair_items: tuple[str, ...] = (),
+) -> ModelRequest:
+    if run.id != snapshot.production_run_id or run.subject_id != snapshot.subject_id:
+        raise ValueError("Semantic annotation request identities differ")
+    if attempt not in {0, 1}:
+        raise ValueError("Semantic annotation permits only one bounded retry")
+    if not anchor_texts:
+        raise ValueError("Semantic annotation requires anchored publication text")
+    access_hash = synthesis_access_policy_hash(access_policy)
+    annotation_hash = semantic_annotation_input_hash(
+        anchor_texts=anchor_texts,
+        access_policy_hash=access_hash,
+    )
+    anchor_payload_hash = hashlib.sha256(
+        _canonical_json_bytes(dict(sorted(anchor_texts.items())))
+    ).hexdigest()
+    evidence_hash = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "semantic_annotation_input_hash": annotation_hash,
+                "anchor_payload_hash": anchor_payload_hash,
+            }
+        )
+    ).hexdigest()
+    prompt_parts = [
+        "Identify exact semantic terms in the final publication anchors below.",
+        "Do not add facts or do research. Return term blocks only.",
+        SEMANTIC_ANNOTATION_ROLE_GUIDANCE,
+        SEMANTIC_ANNOTATION_OUTPUT_CONTRACT,
+    ]
+    if attempt:
+        prompt_parts.extend(
+            (
+                "BOUNDED FORMAT REPAIR: correct only the invalid items below. Use the same",
+                "anchored publication text. Do not introduce any new term or fact.",
+                "INVALID ITEMS:",
+                *repair_items,
+            )
+        )
+    prompt_parts.append("FINAL PUBLICATION TEXT ANCHORS")
+    for anchor, text in sorted(anchor_texts.items()):
+        prompt_parts.extend((f"@@ANCHOR {anchor}@@", text, "@@END ANCHOR@@"))
+    request_identity = hashlib.sha256(
+        _canonical_json_bytes(
+            {
+                "annotation_input_hash": annotation_hash,
+                "attempt": attempt,
+                "repair_items": repair_items,
+            }
+        )
+    ).hexdigest()
+    request_id = uuid5(
+        NAMESPACE_URL,
+        ":".join(
+            (
+                "production-semantic-annotation-v1",
+                str(run.id),
+                str(run.pipeline_generation),
+                request_identity,
+            )
+        ),
+    )
+    return ModelRequest(
+        text="\n\n".join(prompt_parts),
+        prompt_template_id="production-semantic-annotation",
+        prompt_template_version=SEMANTIC_ANNOTATION_PROMPT_VERSION,
+        evidence_pack_hash=evidence_hash,
+        external_llm_allowed=access_policy.external_llm_allowed and not access_policy.do_not_submit,
+        routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
+        sensitivity=access_policy.effective_tlp.value,
+        web_search=False,
+        background=False,
+        conversation=None,
+        run_id=request_id,
+        allow_failed_resubmit=True,
+        metadata={
+            "editorial_enrichment_input_hash": enrichment_input_hash,
+            "semantic_annotation_input_hash": annotation_hash,
+            "semantic_annotation_anchor_hash": anchor_payload_hash,
+            "semantic_annotation_access_policy_hash": access_hash,
+            "semantic_annotation_contract_version": SEMANTIC_ANNOTATION_CONTRACT_VERSION,
+            "semantic_annotation_parser_version": SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
+            "semantic_annotation_attempt": attempt,
+        },
+        parameters={
+            "contract_version": SEMANTIC_ANNOTATION_CONTRACT_VERSION,
+            "parser_version": SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
+            "attempt": attempt,
+        },
+    )
 
 
 def _parse_annotation_wire_block(
@@ -2684,12 +3022,13 @@ def _synthesis_prompt_projection(
         "sections": sections,
         "timeline": [
             {
+                "anchor": timeline_anchor(index),
                 "event_date": item.event_date.isoformat() if item.event_date else None,
                 "date_text": item.date_text,
                 "text": item.text,
                 "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
             }
-            for item in synthesis.timeline
+            for index, item in enumerate(synthesis.timeline, start=1)
             if not any(
                 ref.kind is EvidenceKind.UNCERTAINTY and ref not in handle_for_ref
                 for ref in item.evidence_refs
@@ -3091,12 +3430,6 @@ EVIDENCE: E001, E002
 END RELATION
 END DIAGRAM
 
-ANNOTATION A001
-CATEGORY: actor
-PARAGRAPH_ANCHOR: lead:0001
-EXACT_TEXT: exact actor name copied from the anchored paragraph
-END ANNOTATION
-
 No enrichment is required when paragraphs suffice. The exact standalone empty
 marker is:
 NO USEFUL ENRICHMENT
@@ -3113,11 +3446,8 @@ Neutral intent examples (bracketed details are placeholders, not facts):
   roles, dates, endpoints, and relations are documented in cited evidence.
 
 Do not use JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or
-generated render syntax. Annotation categories are actor, campaign, malware,
-tool, product, english_term, technical, technical_literal, ioc, path, command,
-protocol_field, source, and proof. Only annotate text that appears verbatim in
-the named paragraph. Copy its stable anchor from current_synthesis. Repeated
-exact text is applied to every exact occurrence; preserve surrounding punctuation.
+generated render syntax. Keep every table, diagram, and figure label grounded
+in the supplied text and evidence handles.
 
 Each column is a COLUMN block; each row is a ROW block with one CELL per column.
 Each diagram uses NODE, RELATION, and optional GROUP blocks. Every row, node,
@@ -3203,7 +3533,7 @@ def build_editorial_enrichment_model_request(
     )
     prompt_payload = {
         "instructions": (
-            "Tu es un planificateur de représentations et d'annotations éditoriales, pas un "
+            "Tu es un planificateur de représentations éditoriales, pas un "
             "chercheur ni un renderer. Choisis une représentation uniquement quand elle répond à "
             "une question analytique distincte et clarifie les preuves mieux que la prose. Chaque "
             "table et diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
@@ -3212,8 +3542,7 @@ def build_editorial_enrichment_model_request(
             "PLACEMENT_REASON; tous sont obligatoires et non vides. Refuse un tableau qui "
             "reformule seulement les phrases de synthèse. N'impose aucun minimum de lignes ou de "
             "nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro diagramme sont "
-            "valides lorsque la prose suffit. Propose des rôles typographiques uniquement pour "
-            "les segments exacts et évidents d'un paragraphe ancré. N'ajoute aucun fait, "
+            "valides lorsque la prose suffit. N'ajoute aucun fait, "
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
             "fournies. Chaque ligne, nœud et arête cite des evidence handles existants et "
             "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
@@ -3503,17 +3832,7 @@ def validate_editorial_enrichment_proposal(
                 technical_support_mutable[literal].add(ref)
     technical_support = dict(technical_support_mutable)
     section_count = len(synthesis.sections)
-    paragraph_text_by_anchor = {
-        **{
-            lead_paragraph_anchor(index): item.text
-            for index, item in enumerate(synthesis.lead, start=1)
-        },
-        **{
-            section_paragraph_anchor(section_index, paragraph_index): paragraph.text
-            for section_index, section in enumerate(synthesis.sections)
-            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
-        },
-    }
+    paragraph_text_by_anchor = semantic_annotation_anchor_texts(synthesis)
     annotations: list[SemanticAnnotationProposalV1] = []
     for annotation in parsed.annotations:
         anchored_text = paragraph_text_by_anchor.get(annotation.paragraph_anchor)
@@ -4320,6 +4639,31 @@ class ProductionEditorialEnrichmentService:
                     for item in compilation.rejections
                 ]
             validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+        (
+            annotation_proposals,
+            annotation_calls,
+            annotation_details,
+        ) = await self._propose_semantic_annotations(
+            run=run,
+            snapshot=snapshot,
+            access_policy=access_policy,
+            enrichment_input_hash=input_hash,
+            anchor_texts=semantic_annotation_anchor_texts(synthesis, enrichment),
+        )
+        model_calls += annotation_calls
+        enrichment = replace(
+            enrichment,
+            annotations=_merge_semantic_annotation_proposals(
+                enrichment.annotations, annotation_proposals
+            ),
+            warnings=(*enrichment.warnings, *annotation_details["warnings"]),
+        )
+        wire_details["semantic_annotation"] = {
+            key: value for key, value in annotation_details.items() if key != "warnings"
+        }
+        if annotation_details["warnings"]:
+            wire_details["semantic_annotation"]["warnings"] = list(annotation_details["warnings"])
+        validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
         artifact = await self._editorial_enrichment_service.store_editorial_enrichment_result(
             run_id=run.id,
             subject_id=snapshot.subject_id,
@@ -4357,8 +4701,118 @@ class ProductionEditorialEnrichmentService:
                 or parsed.proposal.resource_needs
                 or wire_details.get("repair")
                 or wire_details.get("diagram_rejections")
+                or annotation_details["warnings"]
+                or annotation_details["proposal_count"]
                 else None
             ),
+        )
+
+    async def _propose_semantic_annotations(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        access_policy: SynthesisAccessPolicyV1,
+        enrichment_input_hash: str,
+        anchor_texts: Mapping[str, str],
+    ) -> tuple[
+        tuple[SemanticAnnotationProposalV1, ...],
+        int,
+        dict[str, Any],
+    ]:
+        """Make an independent, idempotent annotation call with one repair attempt."""
+        proposals: list[SemanticAnnotationProposalV1] = []
+        calls = 0
+        warnings: list[str] = []
+        run_ids: list[str] = []
+        repair_items: tuple[str, ...] = ()
+        status = "empty"
+        for attempt in range(2):
+            request = build_semantic_annotation_model_request(
+                run,
+                snapshot,
+                access_policy,
+                anchor_texts,
+                enrichment_input_hash=enrichment_input_hash,
+                attempt=attempt,
+                repair_items=repair_items,
+            )
+            if request.run_id is None:
+                warnings.append("semantic_annotation_request_identity_missing")
+                status = "failed"
+                break
+            run_ids.append(str(request.run_id))
+            try:
+                execution, archive_error = await self._verified_existing_execution(request)
+                if archive_error is not None:
+                    warnings.append("semantic_annotation_existing_output_unverified")
+                    status = "unverified_output"
+                    if attempt == 0:
+                        repair_items = ("The prior archived output could not be verified.",)
+                        continue
+                    break
+                drafted = execution is None
+                if execution is None:
+                    execution = await self._model_gateway.draft(request)
+                    calls += 1
+                model_run = execution.run
+                if model_run_awaits_reconciliation(model_run.error_code):
+                    warnings.append("semantic_annotation_reconciliation_required")
+                    status = "reconciliation_required"
+                    break
+                if model_run.status is not ModelRunStatus.SUCCEEDED:
+                    warnings.append("semantic_annotation_model_run_failed")
+                    status = "model_failed"
+                    if attempt == 0:
+                        repair_items = ("The prior model attempt did not complete successfully.",)
+                        continue
+                    break
+                raw_text, raw_error = await self._verified_raw_text(
+                    model_run,
+                    expected_text=execution.output_text if drafted else None,
+                )
+                if raw_error is not None or raw_text is None:
+                    warnings.append("semantic_annotation_output_unverified")
+                    status = "unverified_output"
+                    if attempt == 0:
+                        repair_items = ("The prior response could not be verified.",)
+                        continue
+                    break
+                parsed = parse_semantic_annotation_wire(raw_text, anchor_texts)
+                proposals.extend(parsed.proposals)
+                if parsed.error_code is None and not parsed.rejections:
+                    status = "accepted" if parsed.proposals else "empty"
+                    break
+                if parsed.error_code is not None:
+                    warnings.append(parsed.error_code)
+                warnings.extend(f"{reason}:{item_id}" for item_id, reason in parsed.rejections)
+                status = "partial" if parsed.proposals else "rejected"
+                if attempt == 0:
+                    repair_items = (raw_text[:8000],)
+            except ModelSubmissionReconciliationRequiredError:
+                warnings.append("semantic_annotation_reconciliation_required")
+                status = "reconciliation_required"
+                break
+            except Exception as exc:
+                warnings.append(f"semantic_annotation_call_failed:{type(exc).__name__}")
+                status = "model_failed"
+                if attempt == 0:
+                    repair_items = ("The prior annotation call failed.",)
+                    continue
+                break
+        return (
+            _merge_semantic_annotation_proposals((), tuple(proposals)),
+            calls,
+            {
+                "status": status,
+                "model_run_ids": run_ids,
+                "attempt_count": len(run_ids),
+                "proposal_count": len(proposals),
+                "warnings": tuple(dict.fromkeys(warnings)),
+                "prompt_version": SEMANTIC_ANNOTATION_PROMPT_VERSION,
+                "contract_version": SEMANTIC_ANNOTATION_CONTRACT_VERSION,
+                "parser_version": SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION,
+            },
         )
 
     async def _repair_rejected_blocks(
@@ -5111,6 +5565,10 @@ def compute_editorial_enrichment_input_hash(
         contract_version=contract_version,
     )
     payload["parser_version"] = parser_version or EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION
+    payload["semantic_annotation_prompt_version"] = SEMANTIC_ANNOTATION_PROMPT_VERSION
+    payload["semantic_annotation_contract_version"] = SEMANTIC_ANNOTATION_CONTRACT_VERSION
+    payload["semantic_annotation_parser_version"] = SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION
+    payload["semantic_annotation_policy_version"] = SEMANTIC_ANNOTATION_POLICY_VERSION
     if type(resource_search_enabled) is not bool:
         raise ValueError("Resource search enablement must be a boolean")
     payload["resource_search_enabled"] = resource_search_enabled
@@ -5198,17 +5656,7 @@ def validate_editorial_enrichment(
             "Editorial enrichment publication language does not match the canonical synthesis",
         )
 
-    synthesis_paragraphs = {
-        **{
-            lead_paragraph_anchor(index): item.text
-            for index, item in enumerate(synthesis.lead, start=1)
-        },
-        **{
-            section_paragraph_anchor(section_index, paragraph_index): paragraph.text
-            for section_index, section in enumerate(synthesis.sections)
-            for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
-        },
-    }
+    synthesis_paragraphs = semantic_annotation_anchor_texts(synthesis, enrichment)
     for annotation in enrichment.annotations:
         paragraph_text = synthesis_paragraphs.get(annotation.paragraph_anchor)
         if paragraph_text is None or annotation.text not in paragraph_text:

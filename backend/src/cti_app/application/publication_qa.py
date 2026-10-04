@@ -51,6 +51,52 @@ def _fold_accents(value: str) -> str:
     return "".join(character for character in decomposed if not unicodedata.combining(character))
 
 
+def _semantic_annotation_has_full_occurrence_coverage(publication: PublicationDocumentV5) -> bool:
+    """Every exact term styled once must remain styled at all exact occurrences."""
+    paragraphs = publication.semantic_text.paragraphs
+    terms = {
+        span.text
+        for paragraph in paragraphs
+        for span in paragraph.spans
+        if span.role.value != "text" and span.text
+    }
+    for term in terms:
+        for paragraph in paragraphs:
+            text = paragraph.text
+            ranges: list[tuple[int, int]] = []
+            cursor = 0
+            for span in paragraph.spans:
+                end = cursor + len(span.text)
+                if span.role.value != "text":
+                    ranges.append((cursor, end))
+                cursor = end
+            start = 0
+            left_word = term[0].isalnum() or term[0] == "_"
+            right_word = term[-1].isalnum() or term[-1] == "_"
+            while True:
+                start = text.find(term, start)
+                if start < 0:
+                    break
+                end = start + len(term)
+                if (
+                    left_word
+                    and start > 0
+                    and (text[start - 1].isalnum() or text[start - 1] == "_")
+                ) or (right_word and end < len(text) and (text[end].isalnum() or text[end] == "_")):
+                    start += 1
+                    continue
+                covered_until = start
+                for range_start, range_end in ranges:
+                    if range_start <= covered_until < range_end:
+                        covered_until = range_end
+                        if covered_until >= end:
+                            break
+                if covered_until < end:
+                    return False
+                start += 1
+    return True
+
+
 _PIPELINE_VOCABULARY = re.compile(
     r"(?<!\w)(?:"
     + "|".join(re.escape(_fold_accents(term)) for term in _PIPELINE_VOCABULARY_TERMS)
@@ -72,6 +118,7 @@ def qa_publication_v5(
     """Rebuild the pure projection and require byte-for-byte semantic equality."""
     checks: dict[str, bool] = {}
     errors: list[str] = []
+    warnings: list[str] = []
     checks["subject_lineage"] = publication.subject_id == snapshot.subject_id
     if not checks["subject_lineage"]:
         errors.append("Publication subject differs from the frozen snapshot")
@@ -80,6 +127,30 @@ def qa_publication_v5(
     )
     if not checks["publication_language"]:
         errors.append("Publication language differs from the frozen snapshot")
+    if isinstance(publication, PublicationDocumentV5):
+        checks["semantic_annotation_coverage"] = _semantic_annotation_has_full_occurrence_coverage(
+            publication
+        )
+        if not checks["semantic_annotation_coverage"]:
+            errors.append("A semantic annotation is missing from another exact occurrence")
+        semantic_paragraphs = publication.semantic_text.paragraphs
+        annotated_spans = sum(
+            span.role.value != "text"
+            for paragraph in semantic_paragraphs
+            for span in paragraph.spans
+        )
+        document_characters = sum(len(paragraph.text) for paragraph in semantic_paragraphs)
+        empty_long_paragraph = any(
+            len(paragraph.text) >= 300
+            and not any(span.role.value != "text" for span in paragraph.spans)
+            for paragraph in semantic_paragraphs
+        )
+        if empty_long_paragraph or (
+            document_characters > 0 and annotated_spans * 600 < document_characters
+        ):
+            warnings.append("semantic_annotation_sparse")
+    else:
+        checks["semantic_annotation_coverage"] = True
     try:
         expected_builder = (
             build_publication_document_v5
@@ -231,7 +302,7 @@ def qa_publication_v5(
             "Publication failed no_pipeline_vocabulary_leaks: internal production "
             "vocabulary is present"
         )
-    return {"passed": not errors, "checks": checks, "errors": errors, "warnings": []}
+    return {"passed": not errors, "checks": checks, "errors": errors, "warnings": warnings}
 
 
 # Keep the old consumer name for frozen V4 documents. The validation function

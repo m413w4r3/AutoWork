@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -29,7 +30,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticTextSpanV1,
 )
 
-SEMANTIC_ANNOTATOR_VERSION = "1"
+SEMANTIC_ANNOTATOR_VERSION = "2-document-lexicon-technical-literals"
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,133 @@ _PORT_LITERAL = re.compile(
     re.IGNORECASE,
 )
 _PARAMETER_LITERAL = re.compile(r"(?<![\w.-])[A-Za-z_][A-Za-z0-9_.-]*=[^\s,;]+")
+_NAME_SENTENCE_PUNCTUATION = re.compile(r"[!?;:]|,(?=\s)|\.(?=\s|$)")
+_FINITE_VERB_PHRASE = re.compile(
+    r"\b(?:est|sont|était|étaient|a|ont|utilise|utilisent|utilisé|utilisée|"
+    r"décrit|décrite|décrivent|mentionne|mentionnent|stocke|stockent|permet|"
+    r"permettent|contient|contiennent|correspond|correspondent|déploie|déploient)\b",
+    re.IGNORECASE,
+)
+_CVE_LITERAL = re.compile(r"(?<![\w-])CVE-\d{4}-\d{4,}(?![\w-])", re.IGNORECASE)
+_ATTACK_LITERAL = re.compile(
+    r"(?<![\w])(?:MITRE\s+ATT&CK\s+)?T\d{4}(?:\.\d{3})?(?![\w]|\.\d)", re.IGNORECASE
+)
+_IPV4_CANDIDATE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?!\w|\.\d)")
+_IPV6_CANDIDATE = re.compile(
+    r"(?<![\w:])(?:[0-9A-Fa-f]{0,4}:){2,}"
+    r"(?:[0-9A-Fa-f]{0,4}|(?:\d{1,3}\.){3}\d{1,3})(?![\w:])"
+)
+_HASH_LITERAL = re.compile(
+    r"(?<![A-Fa-f0-9])(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64})"
+    r"(?![A-Fa-f0-9])"
+)
+_PORT_SYNTAX = re.compile(
+    r"(?<![\w/])(?:port\s*(?:[:=]\s*)?\d{1,5}|(?:tcp|udp)/\d{1,5}|"
+    r"\d{1,5}/(?:tcp|udp))(?![\w])",
+    re.IGNORECASE,
+)
+_FILE_EXTENSION = (
+    "exe|dll|sys|ps1|bat|cmd|vbs|js|hta|py|sh|bin|dat|json|conf|txt|zip|"
+    "doc|docx|pdf|lnk|so|dylib|msi|scr|jar|class|elf|ocx|tmp"
+)
+_FILE_PATH = re.compile(
+    rf"(?<![\w.-])(?:[A-Za-z]:[\\/]|/|\.{{1,2}}[\\/])"
+    rf"(?:[A-Za-z0-9_. -]+[\\/])*[A-Za-z0-9_. -]+\.(?:{_FILE_EXTENSION})\b"
+    rf"|(?<![\w.-])[A-Za-z0-9_.-]+\.(?:{_FILE_EXTENSION})\b",
+    re.IGNORECASE,
+)
+_BACKTICKED = re.compile(r"`([^`\n]+)`")
+_COMMAND_HEAD = re.compile(
+    r"^(?:\$|\.\.?[\\/]|(?:sudo|cmd(?:\.exe)?|powershell(?:\.exe)?|pwsh|bash|sh|"
+    r"curl|wget|python(?:[0-9.]*)?|perl|ruby|wscript|cscript|mshta|rundll32|"
+    r"regsvr32|certutil|bitsadmin|wmic|schtasks|sc|net|whoami|ipconfig|ping|"
+    r"chmod|nc|ncat|ssh|tar)(?:\s|$))",
+    re.IGNORECASE,
+)
+_UPPER_TECHNICAL_IDENTIFIER = re.compile(r"(?<![\w])(?:[A-Z][A-Z0-9]*)(?:[_-][A-Z0-9]+)+(?![\w])")
+
+
+def _name_like_fact_value(value: str) -> bool:
+    """Keep only short entity-like fact values; never turn prose into lexicon terms."""
+    tokens = value.split()
+    return (
+        1 <= len(tokens) <= 5
+        and _NAME_SENTENCE_PUNCTUATION.search(value) is None
+        and _FINITE_VERB_PHRASE.search(value) is None
+    )
+
+
+def _valid_ip_spans(text: str) -> tuple[TextSpan, ...]:
+    spans: list[TextSpan] = []
+    for expression in (_IPV4_CANDIDATE, _IPV6_CANDIDATE):
+        for match in expression.finditer(text):
+            try:
+                ipaddress.ip_address(match.group())
+            except ValueError:
+                continue
+            spans.append(TextSpan(match.start(), match.end()))
+    return tuple(spans)
+
+
+def _looks_like_backticked_command(value: str) -> bool:
+    command = value.strip()
+    if not command or "\n" in command:
+        return False
+    if _COMMAND_HEAD.match(command) is not None:
+        return True
+    # A quoted executable path with arguments is command syntax; a single
+    # backticked noun or identifier remains ordinary text.
+    return bool(_FILE_PATH.match(command) and re.search(r"\s+[/\-]", command))
+
+
+def _technical_literal_spans(text: str) -> tuple[tuple[TextSpan, SemanticRole], ...]:
+    """Find conservative, explicitly formatted technical literals in prose."""
+    found: list[tuple[TextSpan, SemanticRole]] = []
+
+    def add(expression: re.Pattern[str], role: SemanticRole) -> None:
+        found.extend(
+            (TextSpan(match.start(), match.end()), role) for match in expression.finditer(text)
+        )
+
+    add(_CVE_LITERAL, SemanticRole.TECHNICAL_LITERAL)
+    add(_ATTACK_LITERAL, SemanticRole.TECHNICAL_LITERAL)
+    found.extend((span, SemanticRole.IOC) for span in _valid_ip_spans(text))
+    add(_HASH_LITERAL, SemanticRole.IOC)
+    for match in _PORT_SYNTAX.finditer(text):
+        port = re.search(r"\d{1,5}", match.group())
+        if port is not None and int(port.group()) <= 65535:
+            start = match.start() + port.start()
+            found.append(
+                (
+                    TextSpan(start, start + len(port.group())),
+                    SemanticRole.TECHNICAL_LITERAL,
+                )
+            )
+    add(_FILE_PATH, SemanticRole.PATH)
+    for match in _BACKTICKED.finditer(text):
+        if _looks_like_backticked_command(match.group(1)):
+            found.append((TextSpan(match.start(), match.end()), SemanticRole.COMMAND))
+    add(_UPPER_TECHNICAL_IDENTIFIER, SemanticRole.TECHNICAL_LITERAL)
+    return tuple(found)
+
+
+def _exact_word_matches(text: str, term: str) -> tuple[TextSpan, ...]:
+    """Return case-sensitive exact occurrences whose outer word edges are bounded."""
+    spans: list[TextSpan] = []
+    start = 0
+    while True:
+        start = text.find(term, start)
+        if start < 0:
+            break
+        end = start + len(term)
+        left_word = term[0].isalnum() or term[0] == "_"
+        right_word = term[-1].isalnum() or term[-1] == "_"
+        if not (
+            left_word and start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_")
+        ) and not (right_word and end < len(text) and (text[end].isalnum() or text[end] == "_")):
+            spans.append(TextSpan(start, end))
+        start += 1
+    return tuple(spans)
 
 
 def _technical_literal_values(value: str) -> tuple[str, ...]:
@@ -143,7 +271,8 @@ def semantic_entities_from_extraction(
         for fact in source.facts:
             role = _FACT_ROLE.get(fact.category)
             if role is not None and fact.evidence_basis is ProductionEvidenceBasis.SOURCE_VERIFIED:
-                terms.append((role, fact.value))
+                if _name_like_fact_value(fact.value):
+                    terms.append((role, fact.value))
                 if fact.category == "other_technical":
                     terms.extend(
                         (SemanticRole.TECHNICAL_LITERAL, value)
@@ -320,16 +449,28 @@ class SemanticAnnotator:
         for span in self._foreign_terms.spans(text):
             candidates.append(_RoleCandidate(span.start, span.end, SemanticRole.ENGLISH_TERM))
 
+        document_terms: dict[str, SemanticRole] = {}
         for proposal in proposals:
-            if proposal.paragraph_anchor != anchor:
-                continue
-            start = 0
-            while True:
-                start = text.find(proposal.text, start)
-                if start < 0:
-                    break
-                candidates.append(_RoleCandidate(start, start + len(proposal.text), proposal.role))
-                start += 1
+            current = document_terms.get(proposal.text)
+            if (
+                current is None
+                or SEMANTIC_ROLE_PRIORITY[proposal.role] > SEMANTIC_ROLE_PRIORITY[current]
+                or (
+                    SEMANTIC_ROLE_PRIORITY[proposal.role] == SEMANTIC_ROLE_PRIORITY[current]
+                    and proposal.role.value < current.value
+                )
+            ):
+                document_terms[proposal.text] = proposal.role
+        for term, role in document_terms.items():
+            candidates.extend(
+                _RoleCandidate(span.start, span.end, role)
+                for span in _exact_word_matches(text, term)
+            )
+
+        candidates.extend(
+            _RoleCandidate(span.start, span.end, role)
+            for span, role in _technical_literal_spans(text)
+        )
 
         selected: list[_RoleCandidate] = []
         for candidate in sorted(

@@ -125,13 +125,16 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v8-relation-types"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v9-table-diagram-only"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v5-relation-types"
+    "editorial-enrichment-block-contract-v6-table-diagram-only"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v5-scoped-ids"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v6-legacy-annotation-blocks"
 EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v1-targeted"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = "editorial-enrichment-repair-contract-v1"
+SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v1"
+SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v1"
+SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v1-exact-anchors"
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
@@ -144,6 +147,42 @@ CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,
 }
+
+SEMANTIC_ANNOTATION_ROLE_GUIDANCE = """ROLE VOCABULARY
+text: ordinary prose role used by the renderer; never propose it as an annotation. Example: observed.
+actor: named person, organization, or threat actor. Example: Ministry of Intelligence.
+campaign: named operation or campaign. Example: Operation Example.
+malware: malware family or component. Example: Necurs.
+tool: named offensive or defensive utility. Example: Cobalt Strike.
+product: named commercial or software product. Example: Microsoft Defender.
+english_term: English editorial term retained in French prose. Example: infostealer.
+technical: technical mechanism, platform, protocol, or concept. Example: Namecoin.
+technical_literal: exact identifier or code-like technical token. Example: T1102.002.
+ioc: exact IP, domain, URL, email, or hash indicator. Example: 203.0.113.8.
+path: exact file name or file-system path. Example: C:\\Windows\\System32\\sample.dll.
+command: exact shell or process command. Example: powershell -nop -w hidden.
+protocol_field: exact protocol field or transaction field. Example: OP_RETURN.
+source: source marker or citation label. Example: [S3].
+proof: exact proof/evidence marker when it appears in publication text. Example: E001.
+
+List each distinct proper noun, tool, malware family, protocol, and technical
+element once. Do not add facts, infer an entity absent from the text, browse,
+or conduct research. Use only exact text copied from one of the supplied
+anchors. Keep the anchor as provenance. Prefer the narrowest useful role; a
+named blockchain/protocol is technical, while a literal field/identifier uses
+technical_literal or protocol_field as defined above."""
+
+SEMANTIC_ANNOTATION_OUTPUT_CONTRACT = """OUTPUT FORMAT
+Return only independent text blocks. Do not return JSON or prose outside blocks.
+
+TERM A001
+TERM: exact text copied from an anchor
+ROLE: one value from the role vocabulary
+PARAGRAPH_ANCHOR: exact anchor containing the term
+END TERM
+
+Repeat one TERM block per distinct term. Malformed items do not invalidate
+other blocks. Return NO ANNOTATIONS when no term qualifies."""
 
 
 # The semantic contract is shared by single-source and batch extraction. The

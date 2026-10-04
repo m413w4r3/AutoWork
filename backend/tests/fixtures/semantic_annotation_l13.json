@@ -1,0 +1,38 @@
+{
+  "title": "Opérateur iranien soupçonné lié au MOIS utilisant Bitcoin OP_RETURN comme dead drop de C2",
+  "lead": [
+    "Chainalysis décrit des acteurs qu’elle soupçonne d’être liés au Ministry of Intelligence iranien comme utilisant Bitcoin en couche de résolution C2 : dans le cas présenté, des transactions stockent des données de routage C2 encodées que le malware peut récupérer ultérieurement, et la synthèse de l’éditeur rattache plus précisément cette étude de cas à l’usage de champs Bitcoin OP_RETURN. L’attribution doit rester qualifiée : Chainalysis précise que le nexus iranien repose sur la famille de malware, sa logique de décodage, le calendrier opérationnel et l’infrastructure C2 associés à une activité précédemment reliée à des acteurs iraniens, et non sur l’activité blockchain prise isolément."
+  ],
+  "sections": [
+    [
+      "Cette activité s’inscrit dans une adoption croissante des blockchain dead drops par des groupes liés à des États selon la catégorisation de Chainalysis. Les cybercriminels représentaient encore pratiquement toutes les instructions de malware publiées sur des blockchains jusqu’au début de 2024, puis les acteurs liés à des États ont commencé à apparaître de manière significative à partir de mi-2024. La publication situe à fin 2024 les premiers acteurs iraniens associés dans son analyse au Ministry of Intelligence intégrant des données C2 dans des transactions Bitcoin ; au T2 2026, les groupes liés à des États représentaient selon ses mesures environ deux tiers de la nouvelle activité BDD par trimestre et la moitié de l’activité BDD totale."
+    ],
+    [
+      "Dans le modèle BDD décrit par la source, la blockchain ne constitue pas nécessairement le canal de compromission final mais un emplacement durable depuis lequel le malware récupère des informations de coordination. Le stockage fondé sur les transactions permet de publier des configurations C2, des références de payloads ou des pointeurs d’infrastructure ; les appareils déjà compromis interrogent ces emplacements par des appels RPC blockchain standards, décodent les données reçues puis se connectent à l’infrastructure hors chaîne ainsi obtenue. Une fois les informations nécessaires récupérées, l’opération bascule hors chaîne pour la compromission effective ; Chainalysis indique de manière générale que certaines campagnes BDD déploient des infostealers visant wallets et identifiants tandis que d’autres installent des remote access trojans, sans établir dans les éléments fournis que ces charges correspondent spécifiquement au cas iranien."
+    ],
+    [
+      "Le mécanisme distinctif du cas iranien est donc un dead drop fondé sur des transactions Bitcoin, la publication identifiant l’usage de champs OP_RETURN pour cette étude de cas tandis que les transactions contiennent des données de routage C2 encodées récupérables par le malware. Chainalysis emploie blockchain dead drop comme catégorie englobante pour ce type de tradecraft, qui comprend notamment le stockage dans des champs de transaction et les relais inter-chaînes, et associe cette catégorie à MITRE ATT&CK T1102.002, Web Service: Dead Drop Resolver. Cette classification décrit le rôle de résolution assuré par le service blockchain ; elle ne constitue pas, à elle seule, un élément d’attribution à l’opérateur iranien."
+    ],
+    [
+      "L’intérêt opérationnel attribué aux BDD dans la publication tient à la durabilité de la couche de coordination plutôt qu’à une capacité destructive supérieure. Des données ou pointeurs C2 inscrits on-chain peuvent rester disponibles malgré des saisies de domaines, retraits d’hébergement, suppressions de dépôts ou autres perturbations d’infrastructure web2, ce qui permet aux machines infectées de continuer à récupérer à la demande les éléments nécessaires à la communication. La permanence de la blockchain déplace ainsi une partie de la fonction de résolution vers une infrastructure que l’opérateur n’a pas besoin de maintenir comme un relayer C2 traditionnel."
+    ],
+    [
+      "Un pivot de détection directement lié au mécanisme est la présence d’appels JSON-RPC sortants vers des endpoints blockchain publics : la télémétrie requise est une visibilité endpoint permettant d’observer ces communications, qui correspondent au comportement décrit lorsque le malware interroge la blockchain avant de décoder les données et de rejoindre l’infrastructure hors chaîne. Ce signal reste contextuel plutôt qu’attributif, car des applications blockchain légitimes utilisent les mêmes services. La source juge en outre irréaliste un blocage global du trafic blockchain : dans le cas d’Ethereum, bloquer les endpoints RPC publics perturberait également wallets, applications et services DeFi légitimes, tandis qu’un attaquant pourrait encore exploiter son propre nœud.",
+      "L’analyse on-chain fournit un second pivot complémentaire : chaque rotation enregistrée sur la blockchain est décrite comme permanente, horodatée et détectable, ce qui permet à des capacités d’analyse blockchain de cartographier wallets opérateurs, resolver contracts, chaînes de financement et historiques de mise à jour afin de rapprocher des campagnes distinctes. La télémétrie nécessaire est ici la visibilité sur l’activité on-chain et ses relations transactionnelles ; elle peut combler une partie du manque de visibilité des plateformes traditionnelles de threat intelligence, mais elle ne transforme pas une corrélation blockchain en preuve d’identité de l’opérateur. Cette limite est particulièrement importante dans le cas iranien, pour lequel Chainalysis exclut explicitement de fonder le nexus sur la seule blockchain."
+    ],
+    [
+      "Sur la seule base du pack fourni, une appréciation analytique de confiance modérée est appropriée pour le lien entre cette activité BDD et un opérateur associé au Ministry of Intelligence iranien : la source primaire elle-même emploie une formulation de soupçon et fonde son rapprochement sur plusieurs éléments extérieurs à la blockchain — malware, logique de décodage, calendrier opérationnel et infrastructure C2 — tout en précisant que les transactions Bitcoin ne suffisent pas à l’attribution. Cette confiance ne doit donc pas être étendue à l’idée qu’un artefact OP_RETURN ou une activité Bitcoin similaire identifierait par lui-même le même acteur ; les éléments fournis ne comportent pas de corroboration indépendante permettant de lever cette réserve."
+    ]
+  ],
+  "timeline": [
+    "Une variante du botnet Necurs stocke des domaines C2 sur Namecoin.",
+    "Les opérateurs de Glupteba écrivent des informations malveillantes dans le champ Bitcoin OP_RETURN.",
+    "Des cybercriminels encodent des adresses IP C2 de malware bancaire dans le montant de Satoshis transféré.",
+    "Les BDD arrivent sur les chaînes EVM avec EtherHiding.",
+    "Les cybercriminels représentent alors pratiquement toutes les instructions de malware publiées sur des blockchains.",
+    "Les acteurs liés à des États commencent à apparaître de manière significative dans l’activité BDD.",
+    "Des acteurs iraniens liés au Ministry of Intelligence commencent à intégrer des données C2 dans des transactions Bitcoin.",
+    "La publication situe au lancement de LLM chinois open-weight suffisamment puissants une baisse de la barrière technique à l’usage des BDD.",
+    "Les groupes liés à des États représentent environ deux tiers de la nouvelle activité BDD par trimestre et la moitié de l’activité BDD totale."
+  ]
+}

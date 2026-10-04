@@ -8,7 +8,7 @@ from enum import StrEnum
 from types import MappingProxyType
 
 SEMANTIC_ANNOTATION_SCHEMA_VERSION = "1"
-SEMANTIC_ANNOTATION_POLICY_VERSION = "semantic-annotation-policy-v1"
+SEMANTIC_ANNOTATION_POLICY_VERSION = "semantic-annotation-policy-v2-document-lexicon"
 
 
 class SemanticRole(StrEnum):

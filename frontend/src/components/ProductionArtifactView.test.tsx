@@ -1033,7 +1033,7 @@ it("applique les rôles typographiques sémantiques d’un document V5", async (
           figures: [],
           rich_text: {
             schema_version: "1",
-            policy_version: "semantic-annotation-policy-v1",
+            policy_version: "semantic-annotation-policy-v2-document-lexicon",
             paragraphs: [
               {
                 anchor: "title",
