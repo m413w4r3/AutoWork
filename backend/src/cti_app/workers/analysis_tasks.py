@@ -60,6 +60,8 @@ async def _execute_analysis_job(job_id: UUID) -> None:
             create_analysis_job_registry(service, capabilities_service),
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
+            bridge_ui_retry_base_seconds=settings.job_bridge_ui_retry_base_seconds,
+            bridge_ui_retry_max_seconds=settings.job_bridge_ui_retry_max_seconds,
         )
         result = await executor.execute(job_id)
         if (

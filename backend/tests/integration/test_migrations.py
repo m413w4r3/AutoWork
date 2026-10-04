@@ -734,6 +734,9 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     }
     assert repair_triggers == {(_REPAIR_TABLE, _REPAIR_TRIGGER): "reject_evidence_mutation"}
     schema_definitions = asyncio.run(_database_snapshot(temporary_postgres_url))
+    batch_item_schema = schema_definitions["edition_production_batch_items"]
+    assert "verified_reemission_count" in batch_item_schema["columns"]
+    assert "ck_batch_item_verified_reemission_count" in batch_item_schema["checks"]
     publication_manifest_schema = schema_definitions["publication_manifests"]
     assert (
         frozenset({"edition_id", "edition_version"}) not in publication_manifest_schema["uniques"]

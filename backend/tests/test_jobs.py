@@ -124,6 +124,47 @@ async def test_synchronous_dispatcher_retries_transient_bridge_timeout() -> None
     assert calls == 3
 
 
+async def test_bridge_ui_timeout_uses_longer_backoff_and_keeps_diagnostic_code() -> None:
+    factory = InMemoryJobUnitOfWorkFactory()
+    registry = JobRegistry()
+
+    async def ui_timeout(parameters: JobParameters, context: JobExecutionContext) -> str:
+        del parameters, context
+        raise JobHandlerError(
+            "bridge_ui_timeout",
+            "Composer Temporary Chat introuvable.",
+            transient=True,
+        )
+
+    registry.register("test.bridge-ui", DemoJobParameters, ui_timeout)
+    service = JobService(factory, registry)
+    executor = JobExecutor(
+        factory,
+        registry,
+        retry_base_seconds=1,
+        retry_max_seconds=10,
+        bridge_ui_retry_base_seconds=240,
+        bridge_ui_retry_max_seconds=900,
+    )
+    job = await service.submit(
+        kind="test.bridge-ui",
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key="bridge-ui-timeout",
+        correlation_id="test",
+        input_parameters={"steps": 1},
+        max_attempts=3,
+    )
+    before = datetime.now(UTC)
+
+    scheduled = await executor.execute(job.id)
+
+    assert scheduled.status is JobStatus.QUEUED
+    assert scheduled.error_code == "bridge_ui_timeout"
+    assert scheduled.next_retry_at is not None
+    assert (scheduled.next_retry_at - before).total_seconds() >= 239
+
+
 async def test_permanent_and_unexpected_errors_are_not_retried_or_leaked() -> None:
     factory = InMemoryJobUnitOfWorkFactory()
     registry = JobRegistry()

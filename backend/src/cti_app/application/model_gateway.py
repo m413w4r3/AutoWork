@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -234,6 +235,7 @@ class SafeModelRequest:
     authorized_input_hash: str
     request_id: str | None = None
     conversation: ConversationContext | None = None
+    timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,12 +478,29 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         uow_factory: ModelRunUnitOfWorkFactory,
         output_store: ModelOutputStore,
         diagnostics: DiagnosticsLog | None = None,
-        background_wait_timeout_seconds: float = 900.0,
+        background_wait_timeout_seconds: float = 5400.0,
+        *,
+        background_idle_timeout_seconds: float = 1200.0,
+        background_wait_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
+        background_idle_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
+        request_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
+        bridge_wait_timeout_seconds_by_role: Mapping[ModelRole, float] | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._router = router
         self._uow_factory = uow_factory
         self._output_store = output_store
         self._background_wait_timeout_seconds = background_wait_timeout_seconds
+        self._background_idle_timeout_seconds = background_idle_timeout_seconds
+        self._background_wait_timeout_seconds_by_role = dict(
+            background_wait_timeout_seconds_by_role or {}
+        )
+        self._background_idle_timeout_seconds_by_role = dict(
+            background_idle_timeout_seconds_by_role or {}
+        )
+        self._request_timeout_seconds_by_role = dict(request_timeout_seconds_by_role or {})
+        self._bridge_wait_timeout_seconds_by_role = dict(bridge_wait_timeout_seconds_by_role or {})
+        self._clock = clock or (lambda: datetime.now(UTC))
         # Research, merge, extraction and drafting all funnel through _execute,
         # so a bridge or Qwen failure is recorded once here for every caller.
         self._diagnostics = diagnostics or DiagnosticsLog(None)
@@ -819,47 +838,73 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 or adapter.transport is not run.transport
             ):
                 raise ModelGatewayError("Persisted ModelRun backend/transport is not configured")
-            elapsed_ms = max(
-                0,
-                int((datetime.now(UTC) - run.started_at).total_seconds() * 1000),
+            now = self._clock()
+            elapsed_ms = max(0, int((now - run.started_at).total_seconds() * 1000))
+            wait_budget = self._background_wait_timeout_seconds_by_role.get(
+                run.model_role, self._background_wait_timeout_seconds
             )
-            if elapsed_ms >= self._background_wait_timeout_seconds * 1000:
-                details = {
-                    "diagnostic_code": "model_background_wait_budget_exceeded",
-                    "bridge_response_id": run.response_id,
-                    "wait_budget_seconds": self._background_wait_timeout_seconds,
-                }
-                run.mark_external_state_unknown()
-                run.require_review(
-                    "model_background_wait_budget_exceeded",
-                    "La réponse du modèle dépasse le budget d'attente configuré.",
-                    details=details,
-                    response_id=run.response_id,
-                )
-                await uow.model_runs.save(run)
-                await uow.commit()
-                return ModelExecution(run, metadata=details)
+            idle_budget = self._background_idle_timeout_seconds_by_role.get(
+                run.model_role, self._background_idle_timeout_seconds
+            )
             try:
                 result = await adapter.resume(
                     run.response_id, role=run.model_role, output_schema=output_schema
                 )
                 if result.status is AdapterResultStatus.WAITING_BACKGROUND:
+                    background_status = str(result.metadata.get("background_status", "unknown"))
+                    progress = (
+                        result.metadata.get("bridge_progress", {})
+                        if isinstance(result.metadata.get("bridge_progress"), dict)
+                        else {}
+                    )
+                    now = self._clock()
+                    last_progress_at = _record_background_wait_state(
+                        run, progress=progress, bridge_status=background_status, now=now
+                    )
                     run.wait_for_background(
                         response_id=result.response_id or run.response_id,
                         actual_model_version=result.actual_model_version,
                         usage=result.usage,
                     )
+                    elapsed_seconds = max(0.0, (now - run.started_at).total_seconds())
+                    idle_seconds = max(0.0, (now - last_progress_at).total_seconds())
+                    diagnostic_code: str | None = None
+                    if elapsed_seconds >= wait_budget:
+                        diagnostic_code = "model_background_safety_ceiling_exceeded"
+                    elif progress and idle_seconds >= idle_budget:
+                        diagnostic_code = "model_background_progress_stalled"
+                    if diagnostic_code is not None:
+                        details = {
+                            "diagnostic_code": diagnostic_code,
+                            "bridge_status": background_status,
+                            "bridge_response_id": result.response_id or run.response_id,
+                            "bridge_progress": _sanitize_mapping(progress),
+                            "elapsed_seconds": int(elapsed_seconds),
+                            "idle_seconds": int(idle_seconds),
+                            "idle_timeout_seconds": idle_budget,
+                            "wait_safety_ceiling_seconds": wait_budget,
+                            "last_progress_at": last_progress_at.isoformat(),
+                        }
+                        run.mark_external_state_unknown()
+                        run.require_review(
+                            diagnostic_code,
+                            "La réponse du modèle n'a pas progressé dans "
+                            "la fenêtre d'attente prévue."
+                            if diagnostic_code == "model_background_progress_stalled"
+                            else "La réponse du modèle a atteint son plafond de sécurité.",
+                            details=details,
+                            response_id=result.response_id or run.response_id,
+                        )
+                        await uow.model_runs.save(run)
+                        await uow.commit()
+                        return ModelExecution(run, metadata=details)
                     await uow.model_runs.save(run)
                     await uow.commit()
                     raise BackgroundResponsePendingError(
                         "Background response is still pending",
                         response_id=result.response_id or run.response_id,
-                        background_status=str(result.metadata.get("background_status", "unknown")),
-                        progress=(
-                            result.metadata.get("bridge_progress", {})
-                            if isinstance(result.metadata.get("bridge_progress"), dict)
-                            else {}
-                        ),
+                        background_status=background_status,
+                        progress=progress,
                     )
                 if result.status is AdapterResultStatus.NEEDS_REVIEW:
                     run.mark_external_state_unknown()
@@ -875,7 +920,7 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         run=run,
                         output_text=None,
                         conversation=result.conversation,
-                        metadata=dict(result.metadata),
+                        metadata={**result.metadata, "bridge_status": "needs_review"},
                     )
                 execution = await self._complete_run(run, result, duration_ms=elapsed_ms)
                 await uow.model_runs.save(run)
@@ -885,7 +930,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                 raise
             except Exception as exc:
                 details = _error_details(exc)
-                requires_reconciliation = _submission_may_have_started(exc)
+                verified_terminal_failure = _is_verified_terminal_background_failure(exc, run)
+                requires_reconciliation = (
+                    _submission_may_have_started(exc) and not verified_terminal_failure
+                )
                 if requires_reconciliation:
                     run.mark_external_state_unknown()
                     run.require_review(
@@ -899,6 +947,10 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                         response_id=getattr(exc, "bridge_run_id", None) or run.response_id,
                     )
                 else:
+                    if verified_terminal_failure:
+                        run.mark_verified_terminal_failure(
+                            response_id=getattr(exc, "bridge_run_id", None) or run.response_id
+                        )
                     run.fail(
                         str(getattr(exc, "code", "model_resume_failed")),
                         _public_error(exc),
@@ -925,6 +977,13 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
         adapter = self._router.select(request, role, structured_output=requires_structured_output)
         _ensure_capabilities(adapter, request, structured_output=requires_structured_output)
         safe_request = sanitize_model_request(request)
+        timeout_map = (
+            self._bridge_wait_timeout_seconds_by_role
+            if adapter.backend is ModelBackend.CHATGPT_BRIDGE
+            else self._request_timeout_seconds_by_role
+        )
+        if role in timeout_map:
+            safe_request = replace(safe_request, timeout_seconds=timeout_map[role])
         run = self.build_run(request, role, structured_output=requires_structured_output)
         persisted_success: ModelRun | None = None
         resume_run_id: UUID | None = None
@@ -1079,10 +1138,22 @@ class ModelGateway(ResearchModel, StructuredExtractionModel, DraftingModel, Crit
                     if result.status is AdapterResultStatus.WAITING_BACKGROUND:
                         if not result.response_id:
                             raise ModelGatewayError("Background adapter omitted response id")
+                        background_status = str(result.metadata.get("background_status", "unknown"))
+                        progress = (
+                            result.metadata.get("bridge_progress", {})
+                            if isinstance(result.metadata.get("bridge_progress"), dict)
+                            else {}
+                        )
                         persisted.wait_for_background(
                             response_id=result.response_id,
                             actual_model_version=result.actual_model_version,
                             usage=result.usage,
+                        )
+                        _record_background_wait_state(
+                            persisted,
+                            progress=progress,
+                            bridge_status=background_status,
+                            now=self._clock(),
                         )
                         await uow.model_runs.save(persisted)
                         await uow.commit()
@@ -1453,6 +1524,52 @@ def _is_confirmed_terminal_bridge_failure(exc: Exception, request: ModelRequest)
         and getattr(exc, "verified_no_answer", False) is True
         and getattr(exc, "code", None) not in _BRIDGE_NON_REPLAYABLE_CODES
     )
+
+
+def _is_verified_terminal_background_failure(exc: Exception, run: ModelRun) -> bool:
+    """A retrieved background run can fail only when its exact answer is closed."""
+    return (
+        getattr(exc, "bridge_status", None) == "failed"
+        and bool(getattr(exc, "bridge_run_id", None) or run.response_id)
+        and getattr(exc, "verified_no_answer", False) is True
+        and getattr(exc, "code", None) not in _BRIDGE_NON_REPLAYABLE_CODES
+    )
+
+
+def _record_background_wait_state(
+    run: ModelRun,
+    *,
+    progress: dict[str, Any],
+    bridge_status: str,
+    now: datetime,
+) -> datetime:
+    """Persist a safe progress snapshot and when that exact snapshot last changed."""
+    details = dict(run.error_details or {})
+    previous_value = details.get("background_wait")
+    if isinstance(previous_value, dict):
+        previous = previous_value
+        has_previous_state = True
+    else:
+        previous = {}
+        has_previous_state = False
+    previous_progress = previous.get("progress")
+    safe_progress = _sanitize_mapping(progress)
+    raw_last_progress_at = previous.get("last_progress_at")
+    try:
+        if not isinstance(raw_last_progress_at, str):
+            raise ValueError("missing background progress timestamp")
+        last_progress_at = datetime.fromisoformat(raw_last_progress_at)
+    except ValueError:
+        last_progress_at = now
+    if not has_previous_state or safe_progress != previous_progress:
+        last_progress_at = now
+    details["background_wait"] = {
+        "progress": safe_progress,
+        "last_progress_at": last_progress_at.isoformat(),
+    }
+    details["bridge_status"] = bridge_status[:64]
+    run.error_details = details
+    return last_progress_at
 
 
 def _submission_may_have_started(exc: Exception) -> bool:

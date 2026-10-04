@@ -579,6 +579,7 @@ class SubjectProductionService:
         *,
         force_recompute: bool = True,
         automatic: bool = False,
+        verified_no_answer: bool = False,
     ) -> SubjectProductionRetryResult:
         async with self._uow_factory() as uow:
             # A user retry must acquire locks in the same order as edition
@@ -618,12 +619,31 @@ class SubjectProductionService:
                 # repeats the fence under the run lock.
                 if initial_run.requires_reconciliation:
                     raise ProductionReconciliationRequiredError
+                if verified_no_answer and (
+                    not automatic or initial_run.error_code != "bridge_run_unavailable"
+                ):
+                    raise ValueError("verified_reemission_requires_released_bridge_run")
 
                 item = await uow.edition_production_batch_items.get_by_run(run_id)
-                if automatic and (
-                    item is None or not ProductionRecoveryPolicyV1.eligible(item, initial_run)
-                ):
-                    raise ValueError("automatic_recovery_not_allowed")
+                if automatic:
+                    if item is None:
+                        raise ValueError("automatic_recovery_not_allowed")
+                    if verified_no_answer:
+                        if not ProductionRecoveryPolicyV1.is_auto_recoverable(
+                            initial_run.error_code
+                        ):
+                            raise ValueError("automatic_recovery_not_allowed")
+                        if not ProductionRecoveryPolicyV1.is_verified_reemission_stage(
+                            initial_run.current_stage
+                        ):
+                            raise ValueError("verified_reemission_stage_not_stateless")
+                        if (
+                            item.verified_reemission_count
+                            >= ProductionRecoveryPolicyV1.VERIFIED_REEMISSION_LIMIT
+                        ):
+                            raise ValueError("verified_reemission_limit_reached")
+                    elif not ProductionRecoveryPolicyV1.eligible(item, initial_run):
+                        raise ValueError("automatic_recovery_not_allowed")
 
                 # Edition, then batch, then run: a Review-time retry usually
                 # targets a batch that already finished with issues, and the
@@ -642,7 +662,10 @@ class SubjectProductionService:
                     force_recompute=force_recompute,
                 )
                 if automatic and item is not None:
-                    item.auto_recovery_count += 1
+                    if verified_no_answer:
+                        item.verified_reemission_count += 1
+                    else:
+                        item.auto_recovery_count += 1
                     save_item = getattr(uow.edition_production_batch_items, "save", None)
                     if save_item is not None:
                         await save_item(item)

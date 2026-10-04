@@ -33,6 +33,10 @@ from cti_app.domain.model_runs import (
 )
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
+    EditionProductionBatch,
+    EditionProductionBatchItem,
+    ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
@@ -64,9 +68,45 @@ class _Models:
 
 
 class _BatchItems:
-    async def get_by_run(self, run_id: UUID) -> None:
-        del run_id
-        return None
+    def __init__(self, items: list[EditionProductionBatchItem] | None = None) -> None:
+        self.items = list(items or [])
+
+    async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
+        return next((item for item in self.items if item.production_run_id == run_id), None)
+
+    async def list_for_batch(self, batch_id: UUID) -> list[EditionProductionBatchItem]:
+        return [item for item in self.items if item.batch_id == batch_id]
+
+    async def save(self, item: EditionProductionBatchItem) -> None:
+        for index, current in enumerate(self.items):
+            if current.id == item.id:
+                self.items[index] = item
+                return
+        self.items.append(item)
+
+
+class _Batches:
+    def __init__(self, batch: EditionProductionBatch) -> None:
+        self.items = {batch.id: batch}
+
+    async def get(self, batch_id: UUID) -> EditionProductionBatch | None:
+        return self.items.get(batch_id)
+
+    async def get_for_update(self, batch_id: UUID) -> EditionProductionBatch | None:
+        return self.items.get(batch_id)
+
+    async def save(self, batch: EditionProductionBatch) -> None:
+        self.items[batch.id] = batch
+
+
+class _Artifacts:
+    async def get_current(self, run_id: UUID, stage: str) -> object:
+        del run_id, stage
+        return object()
+
+    async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
+        del run_id, stage
+        return []
 
 
 class _EditionRepo:
@@ -87,13 +127,33 @@ class _Uow:
         model: ModelRun,
         *,
         with_edition: bool = False,
+        with_batch_item: bool = False,
         edition_state: EditionStatus = EditionStatus.OPEN,
     ) -> None:
         self.production_runs = _Runs(run)
         self.model_runs = _Models(model)
-        if with_edition:
+        if with_edition or with_batch_item:
             self.editions = _EditionRepo(SimpleNamespace(id=run.edition_id, state=edition_state))
-        self.edition_production_batch_items = _BatchItems()
+        if with_batch_item:
+            batch = EditionProductionBatch(
+                edition_id=run.edition_id,
+                status=ProductionBatchStatus.RUNNING,
+                phase=ProductionBatchPhase.INITIAL,
+            )
+            self.edition_production_batches = _Batches(batch)
+            self.edition_production_batch_items = _BatchItems(
+                [
+                    EditionProductionBatchItem(
+                        batch_id=batch.id,
+                        subject_id=run.subject_id,
+                        production_run_id=run.id,
+                        position=1,
+                    )
+                ]
+            )
+            self.production_artifacts = _Artifacts()
+        else:
+            self.edition_production_batch_items = _BatchItems()
 
     async def __aenter__(self) -> _Uow:
         return self
@@ -153,6 +213,7 @@ def _fixture(
     bridge_result: dict[str, Any] | Exception,
     *,
     with_edition: bool = False,
+    with_batch_item: bool = False,
     edition_state: EditionStatus = EditionStatus.OPEN,
 ) -> tuple[
     ProductionReconciliationResolver,
@@ -209,6 +270,7 @@ def _fixture(
         run,
         model,
         with_edition=with_edition,
+        with_batch_item=with_batch_item,
         edition_state=edition_state,
     )
     bridge = _Bridge(bridge_result)
@@ -238,7 +300,7 @@ async def test_retryable_bridge_error_stays_undecided() -> None:
 
 
 @pytest.mark.asyncio
-async def test_bridge_404_releases_references_without_model_conversation() -> None:
+async def test_bridge_404_does_not_prove_that_the_submission_cannot_answer() -> None:
     resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError(
             "bridge_protocol_error",
@@ -248,10 +310,10 @@ async def test_bridge_404_releases_references_without_model_conversation() -> No
         )
     )
 
-    assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
     assert bridge.calls == ["bridge-request:a1"]
-    assert run.requires_reconciliation is False
-    assert run.error_code == "bridge_run_unavailable"
+    assert run.requires_reconciliation is True
+    assert run.error_code == PRODUCTION_RECONCILIATION_ERROR_CODE
     assert gateway.calls == []
 
 
@@ -294,7 +356,12 @@ async def test_archived_edition_keeps_resolver_undecided() -> None:
 @pytest.mark.asyncio
 async def test_terminal_failure_releases_without_adopting_output() -> None:
     resolver, run, model, _, gateway = _fixture(
-        {"id": "resp_123", "status": "failed", "error": {"code": "bridge_server_error"}}
+        {
+            "id": "resp_123",
+            "status": "failed",
+            "verified_no_answer": True,
+            "error": {"code": "bridge_server_error"},
+        }
     )
 
     assert await resolver.resolve(run.id) is ReconciliationOutcome.RELEASED
@@ -305,7 +372,17 @@ async def test_terminal_failure_releases_without_adopting_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable() -> None:
+async def test_failed_payload_without_verified_no_answer_stays_undecided() -> None:
+    resolver, run, _, _, _ = _fixture(
+        {"id": "resp_123", "status": "failed", "error": {"code": "bridge_server_error"}}
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    assert run.requires_reconciliation
+
+
+@pytest.mark.asyncio
+async def test_failed_bridge_transport_releases_with_verified_no_answer() -> None:
     resolver, run, model, _, gateway = _fixture(
         BridgeTransportError(
             "bridge_server_error",
@@ -313,6 +390,7 @@ async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable
             retryable=True,
             status_code=503,
             bridge_status="failed",
+            verified_no_answer=True,
         )
     )
 
@@ -321,6 +399,25 @@ async def test_failed_bridge_transport_result_releases_even_if_http_is_retryable
     assert model.status is ModelRunStatus.NEEDS_REVIEW
     assert gateway.calls == []
     assert not hasattr(run, "synthesis_conversation_id")
+
+
+@pytest.mark.asyncio
+async def test_failed_bridge_transport_without_proof_stays_undecided() -> None:
+    resolver, run, model, _, gateway = _fixture(
+        BridgeTransportError(
+            "bridge_server_error",
+            "the bridge recorded a failed run",
+            retryable=False,
+            status_code=503,
+            bridge_status="failed",
+            verified_no_answer=False,
+        )
+    )
+
+    assert await resolver.resolve(run.id) is ReconciliationOutcome.UNDECIDED
+    assert run.requires_reconciliation
+    assert model.status is ModelRunStatus.NEEDS_REVIEW
+    assert gateway.calls == []
 
 
 @pytest.mark.asyncio
@@ -395,20 +492,22 @@ class _ProbeContext:
 
 
 @pytest.mark.asyncio
-async def test_probe_404_restarts_the_same_production_stage_without_posting() -> None:
+async def test_probe_verified_failure_reemits_the_same_stateless_stage() -> None:
     resolver, run, _, bridge, _ = _fixture(
-        BridgeTransportError(
-            "bridge_protocol_error",
-            "not found",
-            retryable=False,
-            status_code=404,
-        ),
+        {
+            "id": "resp_123",
+            "status": "failed",
+            "verified_no_answer": True,
+            "error": {"code": "bridge_server_error"},
+        },
+        with_edition=True,
+        with_batch_item=True,
     )
-    run.current_stage = ProductionStage.SOURCES
+    run.current_stage = ProductionStage.SYNTHESIS
     run.reconciliation = ProductionSubmissionReconciliation(
         production_run_id=run.id,
         model_run_id=run.reconciliation.model_run_id,
-        stage=ProductionStage.SOURCES,
+        stage=ProductionStage.SYNTHESIS,
         bridge_response_id=None,
         bridge_request_id="bridge-request:a1",
         submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
@@ -429,20 +528,21 @@ async def test_probe_404_restarts_the_same_production_stage_without_posting() ->
 
     handler = registry.handler(production_reconciliation_probe_job_kind())
     result = await handler(
-        ProductionReconciliationProbeParameters(run_id=run.id),
+        ProductionReconciliationProbeParameters(run_id=run.id, attempt=2),
         _ProbeContext(),  # type: ignore[arg-type]
     )
 
     assert result.endswith("#released")
     assert run.status is ProductionRunStatus.RUNNING
     assert run.pipeline_generation == 1
-    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SOURCES)]
+    assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SYNTHESIS)]
     assert bridge.calls == ["bridge-request:a1"]
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("attempt", "next_attempt"), ((0, 1), (1, 2)))
 async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
-    tmp_path: Path,
+    tmp_path: Path, attempt: int, next_attempt: int
 ) -> None:
     resolver, run, _, bridge, gateway = _fixture(
         BridgeTransportError("bridge_timeout", "timeout", retryable=True)
@@ -464,18 +564,18 @@ async def test_probe_logs_and_reschedules_an_undecided_bridge_result(
 
     handler = registry.handler(production_reconciliation_probe_job_kind())
     result = await handler(
-        ProductionReconciliationProbeParameters(run_id=run.id, attempt=0),
+        ProductionReconciliationProbeParameters(run_id=run.id, attempt=attempt),
         _ProbeContext(),  # type: ignore[arg-type]
     )
 
     assert result.endswith("#retry")
     assert len(jobs.submitted) == 1
     assert jobs.submitted[0].kind == production_reconciliation_probe_job_kind()
-    assert jobs.submitted[0].input_parameters["attempt"] == 1
+    assert jobs.submitted[0].input_parameters["attempt"] == next_attempt
     event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[-1])
     assert event["event"] == "production.reconciliation_probe"
     assert event["run_id"] == str(run.id)
     assert event["subject_id"] == str(run.subject_id)
     assert event["bridge_run_id"] == "bridge-request:a1"
-    assert event["attempt"] == 0
+    assert event["attempt"] == attempt
     assert event["outcome"] == ReconciliationOutcome.UNDECIDED.value

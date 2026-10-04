@@ -15,6 +15,7 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        env_ignore_empty=True,
     )
 
     app_env: str = "development"
@@ -35,6 +36,8 @@ class Settings(BaseSettings):
     readiness_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
     job_retry_base_seconds: float = Field(default=1.0, gt=0, le=3600)
     job_retry_max_seconds: float = Field(default=300.0, gt=0, le=86400)
+    job_bridge_ui_retry_base_seconds: float = Field(default=300.0, gt=0, le=3600)
+    job_bridge_ui_retry_max_seconds: float = Field(default=1800.0, gt=0, le=86400)
     job_heartbeat_timeout_seconds: float = Field(default=120.0, gt=1, le=86400)
     job_recovery_interval_seconds: float = Field(default=30.0, gt=1, le=3600)
     # Doit rester supérieur au BRIDGE_TOTAL_TIMEOUT du bridge : le worker attend
@@ -56,7 +59,10 @@ class Settings(BaseSettings):
     openai_bridge_api_key: SecretStr | None = None
     openai_bridge_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
     openai_bridge_capabilities_timeout_seconds: float = Field(default=2.0, gt=0, le=2)
-    openai_bridge_wait_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
+    # Legacy/default synchronous request budget. Research has a separate longer
+    # role budget below; the old OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS name remains valid.
+    openai_bridge_wait_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    openai_bridge_wait_timeout_research_seconds: float = Field(default=900.0, gt=0, le=3600)
     # Fermer un onglet exige un aller-retour WebSocket vers l'extension Chrome.
     # Le budget doit couvrir BRIDGE_UI_TIMEOUT (30 s) plus la fenêtre de
     # reconnexion BRIDGE_RECONNECT_GRACE (20 s) du service worker MV3.
@@ -101,8 +107,18 @@ class Settings(BaseSettings):
     model_route_discovery_merge: Literal["chatgpt_bridge", "gemini_webai", "qwen", "fake"] = (
         "chatgpt_bridge"
     )
-    model_request_timeout_seconds: float = Field(default=900.0, gt=0, le=3600)
-    model_background_wait_timeout_seconds: float = Field(default=900.0, gt=0, le=86400)
+    model_request_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
+    model_request_timeout_research_seconds: float = Field(default=900.0, gt=0, le=3600)
+    # This legacy setting is now the background safety ceiling, not a fixed
+    # deadline that overrides bridge progress.
+    model_background_wait_timeout_seconds: float = Field(default=5400.0, gt=0, le=86400)
+    model_background_wait_timeout_research_seconds: float | None = Field(
+        default=None, ge=5400, le=86400
+    )
+    model_background_idle_timeout_seconds: float = Field(default=1200.0, gt=0, le=86400)
+    model_background_idle_timeout_research_seconds: float | None = Field(
+        default=None, gt=0, le=86400
+    )
     code_version: str = "0.1.0"
     worker_code_version: str | None = None
     model_conversation_retention_days: int = Field(default=90, ge=1, le=3650)
@@ -200,6 +216,13 @@ class Settings(BaseSettings):
             raise ValueError("production model jitter max must be >= min")
         if self.production_cooldown_max_seconds < self.production_cooldown_min_seconds:
             raise ValueError("production cooldown max must be >= min")
+        if self.job_bridge_ui_retry_max_seconds < self.job_bridge_ui_retry_base_seconds:
+            raise ValueError("bridge UI retry max must be >= base")
+        # Preserve deployments using the former short total deadline, while
+        # preventing it from cutting off active background work early.
+        self.model_background_wait_timeout_seconds = max(
+            5400.0, self.model_background_wait_timeout_seconds
+        )
         return self
 
 

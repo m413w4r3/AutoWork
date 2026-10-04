@@ -30,7 +30,6 @@ class ReconciliationTransport(Protocol):
 _PENDING_STATUSES = frozenset({"queued", "running", "in_progress", "pending"})
 _SUCCESS_STATUSES = frozenset({"completed", "succeeded", "success"})
 _FAILED_STATUSES = frozenset({"failed", "error", "cancelled", "canceled", "rejected"})
-_NOT_FOUND_CODES = frozenset({"bridge_run_not_found", "bridge_not_found", "not_found"})
 
 
 class ProductionReconciliationResolver:
@@ -69,12 +68,11 @@ class ProductionReconciliationResolver:
                 bridge_status = exc.bridge_status
                 if bridge_status is None and exc.status_code == 404:
                     bridge_status = "not_found"
-                if exc.status_code == 404 or exc.code in _NOT_FOUND_CODES:
+                if bridge_status in _FAILED_STATUSES and exc.verified_no_answer:
                     outcome = await self._release(run_id, run)
                     return outcome
-                if bridge_status in _FAILED_STATUSES:
-                    outcome = await self._release(run_id, run)
-                    return outcome
+                # A missing lookup or a generic transport failure does not prove
+                # that the exact submission can no longer yield an answer.
                 if exc.retryable:
                     return outcome
                 return outcome
@@ -91,12 +89,11 @@ class ProductionReconciliationResolver:
                 return outcome
             if bridge_status in _PENDING_STATUSES:
                 return outcome
-            if bridge_status in _FAILED_STATUSES or bridge_status is None:
+            if bridge_status in _FAILED_STATUSES and _verified_no_answer(payload):
                 outcome = await self._release(run_id, run)
                 return outcome
-            # Unknown bridge states are treated as a terminal negative result by
-            # the bridge contract; no output is adopted on this branch.
-            outcome = await self._release(run_id, run)
+            # Failed without verified_no_answer, missing, and unknown states all
+            # remain undecided. They must never authorize a new prompt POST.
             return outcome
         finally:
             self._last_bridge_status = bridge_status
@@ -293,6 +290,13 @@ def _bridge_run_id(run: ProductionRun) -> str | None:
 def _status(payload: dict[str, Any]) -> str | None:
     value = payload.get("status")
     return value.strip().casefold() if isinstance(value, str) and value.strip() else None
+
+
+def _verified_no_answer(payload: dict[str, Any]) -> bool:
+    if payload.get("verified_no_answer") is True:
+        return True
+    error = payload.get("error")
+    return isinstance(error, dict) and error.get("verified_no_answer") is True
 
 
 def _output_text(payload: dict[str, Any]) -> str | None:

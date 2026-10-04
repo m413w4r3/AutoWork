@@ -351,10 +351,14 @@ class ModelRun:
         self, *, response_id: str | None = None, now: datetime | None = None
     ) -> None:
         """Record an explicit provider guarantee that this attempt has no answer."""
-        if self.status is not ModelRunStatus.RUNNING:
-            raise ValueError("Only running ModelRuns can record a terminal provider failure")
-        if self.submission_state is not ModelSubmissionState.EXTERNAL_STATE_UNKNOWN:
+        if self.status not in {ModelRunStatus.RUNNING, ModelRunStatus.WAITING_BACKGROUND}:
+            raise ValueError("Only active ModelRuns can record a terminal provider failure")
+        if self.submission_state not in {
+            ModelSubmissionState.SUBMISSION_IN_PROGRESS,
+            ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        }:
             raise ValueError("ModelRun has no unresolved provider submission")
+        self.status = ModelRunStatus.RUNNING
         self.submission_state = ModelSubmissionState.VERIFIED_TERMINAL_FAILURE
         self.response_id = response_id or self.response_id
         self.updated_at = now or datetime.now(UTC)

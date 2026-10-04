@@ -203,10 +203,17 @@ dans le DOM, et refuse le run quand la vérification échoue. Côté AutoWork, s
 Les appels longs utilisent `background: true`. L'identifiant `resp_*` est conservé dans le
 `ModelRun`; un job `model.openai.background.poll` appelle ensuite `GET /v1/responses/{id}`.
 Il poll seulement tant que le statut est `queued` ou `in_progress`, conformément à la
-[documentation Background mode](https://developers.openai.com/api/docs/guides/background). Le
-budget d'attente `MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS` et l'intervalle
-`DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS` sont configurables. À expiration, le run passe en
-réconciliation avec `model_background_wait_budget_exceeded` ; aucun nouveau POST n'est émis.
+[documentation Background mode](https://developers.openai.com/api/docs/guides/background). Tant
+que le Bridge annonce un état en cours et fait progresser sa réponse, le poll continue.
+`MODEL_BACKGROUND_IDLE_TIMEOUT_SECONDS` (20 minutes par défaut) déclenche une revue après
+absence de changement de progression ; `MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS` (90 minutes par
+défaut) reste un plafond de sécurité configurable. Ces deux réglages conservent leurs noms
+historiques ; une ancienne valeur configurée sous 90 minutes est portée à 90 minutes. Les
+overrides optionnels `MODEL_BACKGROUND_IDLE_TIMEOUT_RESEARCH_SECONDS` et
+`MODEL_BACKGROUND_WAIT_TIMEOUT_RESEARCH_SECONDS` règlent spécifiquement le rôle recherche ; sans
+eux, il hérite des valeurs globales. Une réponse terminée est adoptée même si elle arrive après
+l'ancien plafond de 15 minutes. `DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS` garde son rôle
+d'intervalle de poll.
 Un futur transport direct vers OpenAI devra en plus tenir compte du fait que ce mode n'est pas
 compatible Zero Data Retention, avant de l'autoriser pour une classification sensible.
 
@@ -359,9 +366,24 @@ de la stack. Configuration effective :
 
 Chaque POST au Bridge est une seule tentative HTTP : une relance éventuelle relève du
 `ModelGateway`, à partir de l'erreur typée, de l'identifiant exact et du signal explicite
-`verified_no_answer`. `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP AutoWork ; une
-expiration après le POST signifie « état externe inconnu » et ne prétend pas annuler la génération
-côté Bridge.
+`verified_no_answer`. `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP synchrone
+(5 minutes par défaut) ; `OPENAI_BRIDGE_WAIT_TIMEOUT_RESEARCH_SECONDS` garde 15 minutes pour le
+rôle recherche. Les routes Qwen/WebAI utilisent `MODEL_REQUEST_TIMEOUT_SECONDS` (5 minutes) et
+`MODEL_REQUEST_TIMEOUT_RESEARCH_SECONDS` (15 minutes). Ces budgets sont configurables par rôle.
+Les anciens noms `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` et `MODEL_REQUEST_TIMEOUT_SECONDS` restent
+acceptés. Une expiration après le POST signifie « état externe inconnu » et ne prétend pas annuler
+la génération côté Bridge.
+
+Une réconciliation ne libère une soumission que si le statut est terminal `failed` et que la
+réponse du Bridge confirme `verified_no_answer: true` pour l'identité exacte interrogée. Un 404,
+un statut inconnu ou un `failed` sans cette preuve reste `external_state_unknown` : aucun nouveau
+POST n'est émis. Après la preuve, la production peut réémettre au plus deux fois les étapes
+stateless d'extraction, de pertinence, de synthèse et d'enrichissement éditorial, avec un compteur
+PostgreSQL séparé des reprises génériques.
+
+Pour `bridge_ui_timeout`, les jobs utilisent un délai initial de 5 minutes puis un backoff
+exponentiel plafonné à 30 minutes (`JOB_BRIDGE_UI_RETRY_BASE_SECONDS` et
+`JOB_BRIDGE_UI_RETRY_MAX_SECONDS`). Le code diagnostique reste `bridge_ui_timeout`.
 
 Le `.env.example` pointe vers le gateway Qwen retenu. Placer la clé uniquement dans `.env` ou
 un secret manager ; elle n'est jamais nécessaire pour les tests. La décision de confiance

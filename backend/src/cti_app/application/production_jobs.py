@@ -464,12 +464,31 @@ def register_production_jobs(
                     run.current_stage,
                     force_recompute=False,
                     automatic=True,
+                    verified_no_answer=True,
                 )
-            except ValueError:
+            except ValueError as exc:
                 # The negative bridge decision is durable, but a batch/edition
                 # fence may still prevent this automatic retry. Leave the run
                 # reviewable instead of bypassing that fence.
+                if diagnostics_to_use is not None:
+                    diagnostics_to_use.record(
+                        event="production.reconciliation_reemission",
+                        run_id=parameters.run_id,
+                        subject_id=run.subject_id,
+                        stage=run.current_stage.value if run.current_stage else None,
+                        outcome="blocked",
+                        diagnostic_code=str(exc)[:96],
+                    )
                 return f"production-reconciliation://{parameters.run_id}#needs_review"
+            if diagnostics_to_use is not None:
+                diagnostics_to_use.record(
+                    event="production.reconciliation_reemission",
+                    run_id=parameters.run_id,
+                    subject_id=run.subject_id,
+                    stage=run.current_stage.value if run.current_stage else None,
+                    outcome="scheduled",
+                    reemission_limit=ProductionRecoveryPolicyV1.VERIFIED_REEMISSION_LIMIT,
+                )
             await dispatch_reconciled_stage(retry.run, context, resume=False)
             return f"production-reconciliation://{parameters.run_id}#released"
         if run.requires_reconciliation and (

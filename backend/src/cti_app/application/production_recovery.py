@@ -8,6 +8,7 @@ from cti_app.domain.production import (
     EditionProductionBatchItem,
     ProductionRun,
     ProductionRunStatus,
+    ProductionStage,
 )
 
 
@@ -17,13 +18,22 @@ class ProductionRecoveryDisposition(StrEnum):
 
 
 class ProductionRecoveryPolicyV1:
-    """Allow exactly one automatic retry for known operational failures."""
+    """Allow one generic automatic retry; verified Bridge reemissions are separate."""
 
     MANUAL_ONLY_ERROR_CODES = frozenset(
         {
             # A provider request may already exist outside our database. No
             # automatic retry can safely resolve that ambiguity.
             "model_submission_reconciliation_required",
+        }
+    )
+    VERIFIED_REEMISSION_LIMIT = 2
+    VERIFIED_REEMISSION_STAGES = frozenset(
+        {
+            ProductionStage.EXTRACTION,
+            ProductionStage.RELEVANCE_PROJECTION,
+            ProductionStage.SYNTHESIS,
+            ProductionStage.EDITORIAL_ENRICHMENT,
         }
     )
 
@@ -63,6 +73,10 @@ class ProductionRecoveryPolicyV1:
     @classmethod
     def is_auto_recoverable(cls, error_code: str | None) -> bool:
         return cls.disposition(error_code) is cls.AUTO
+
+    @classmethod
+    def is_verified_reemission_stage(cls, stage: ProductionStage | None) -> bool:
+        return stage in cls.VERIFIED_REEMISSION_STAGES
 
     @classmethod
     def disposition_for_run(cls, run: ProductionRun) -> ProductionRecoveryDisposition:

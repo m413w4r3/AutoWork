@@ -12,7 +12,7 @@ from cti_app.application.model_gateway import (
 )
 from cti_app.application.persistence import UnitOfWorkFactory
 from cti_app.config import Settings
-from cti_app.domain.model_runs import ModelBackend, ModelProvider
+from cti_app.domain.model_runs import ModelBackend, ModelProvider, ModelRole
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.integrations.models import (
     BlobModelOutputStore,
@@ -32,20 +32,29 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
     bridge_transport = ChatGPTBridgeClient(
         settings.openai_bridge_base_url,
         api_key=_secret_value(settings.openai_bridge_api_key),
-        timeout_seconds=settings.openai_bridge_wait_timeout_seconds,
+        timeout_seconds=max(
+            settings.openai_bridge_wait_timeout_seconds,
+            settings.openai_bridge_wait_timeout_research_seconds,
+        ),
         connect_timeout_seconds=settings.openai_bridge_connect_timeout_seconds,
         capabilities_timeout_seconds=settings.openai_bridge_capabilities_timeout_seconds,
     )
     qwen_transport = HttpChatCompletionsTransport(
         settings.qwen_base_url,
         api_key=_secret_value(settings.qwen_api_key),
-        timeout_seconds=settings.model_request_timeout_seconds,
+        timeout_seconds=max(
+            settings.model_request_timeout_seconds,
+            settings.model_request_timeout_research_seconds,
+        ),
         provider="qwen",
     )
     webai_transport = HttpChatCompletionsTransport(
         settings.webai_base_url,
         api_key=_secret_value(settings.webai_api_key),
-        timeout_seconds=settings.model_request_timeout_seconds,
+        timeout_seconds=max(
+            settings.model_request_timeout_seconds,
+            settings.model_request_timeout_research_seconds,
+        ),
         provider="gemini",
     )
     openai_research = OpenAIResearchAdapter(bridge_transport, model=settings.openai_research_model)
@@ -119,6 +128,31 @@ def create_model_gateway(settings: Settings, uow_factory: UnitOfWorkFactory) -> 
         output_store,
         diagnostics=DiagnosticsLog.from_env(settings.diagnostics_log_root),
         background_wait_timeout_seconds=settings.model_background_wait_timeout_seconds,
+        background_idle_timeout_seconds=settings.model_background_idle_timeout_seconds,
+        background_wait_timeout_seconds_by_role={
+            ModelRole.RESEARCH: (
+                settings.model_background_wait_timeout_research_seconds
+                or settings.model_background_wait_timeout_seconds
+            ),
+        },
+        background_idle_timeout_seconds_by_role={
+            ModelRole.RESEARCH: (
+                settings.model_background_idle_timeout_research_seconds
+                or settings.model_background_idle_timeout_seconds
+            ),
+        },
+        request_timeout_seconds_by_role={
+            ModelRole.RESEARCH: settings.model_request_timeout_research_seconds,
+            ModelRole.DRAFTING: settings.model_request_timeout_seconds,
+            ModelRole.STRUCTURED_EXTRACTION: settings.model_request_timeout_seconds,
+            ModelRole.CRITIC: settings.model_request_timeout_seconds,
+        },
+        bridge_wait_timeout_seconds_by_role={
+            ModelRole.RESEARCH: settings.openai_bridge_wait_timeout_research_seconds,
+            ModelRole.DRAFTING: settings.openai_bridge_wait_timeout_seconds,
+            ModelRole.STRUCTURED_EXTRACTION: settings.openai_bridge_wait_timeout_seconds,
+            ModelRole.CRITIC: settings.openai_bridge_wait_timeout_seconds,
+        },
     )
 
 

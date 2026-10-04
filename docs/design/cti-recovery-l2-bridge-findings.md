@@ -44,11 +44,31 @@ L'adaptateur préserve des codes distincts pour racines de réponse ambiguës
 `ModelRun.error_details.diagnostic_code` même si `ModelRun.error_code` indique l'état de
 réconciliation.
 
-`OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP d'une génération synchrone ; sa valeur
-par défaut est 900 secondes. `MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS` borne les reprises d'une
-réponse de fond ; sa valeur par défaut est aussi 900 secondes. L'intervalle de poll Discovery
-existant reste configurable par `DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS`. Une expiration côté
-client ne démontre pas l'annulation du travail par le Bridge.
+`OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP synchrone ; sa valeur par défaut est
+300 secondes. `OPENAI_BRIDGE_WAIT_TIMEOUT_RESEARCH_SECONDS` conserve 900 secondes pour le rôle
+recherche. Les transports Qwen/WebAI utilisent `MODEL_REQUEST_TIMEOUT_SECONDS` (300 secondes) et
+`MODEL_REQUEST_TIMEOUT_RESEARCH_SECONDS` (900 secondes). Les anciens noms globaux restent
+acceptés.
+
+`MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS` garde son nom historique et devient le plafond de
+sécurité total, 5400 secondes par défaut. `MODEL_BACKGROUND_IDLE_TIMEOUT_SECONDS` (1200 secondes
+par défaut) déclenche une revue si la progression Bridge n'a pas changé. Tant que le Bridge
+rapporte `queued`/`running` et que cette progression évolue, le poll continue au-delà de l'ancien
+plafond de 900 secondes ; une ancienne valeur configurée sous 5400 secondes est portée à 5400.
+Les overrides optionnels
+`MODEL_BACKGROUND_WAIT_TIMEOUT_RESEARCH_SECONDS` et
+`MODEL_BACKGROUND_IDLE_TIMEOUT_RESEARCH_SECONDS` ciblent le rôle recherche et héritent des
+valeurs globales lorsqu'ils sont absents. L'intervalle Discovery reste configurable par
+`DISCOVERY_BRIDGE_POLL_INTERVAL_SECONDS`. Une expiration côté client ne démontre pas l'annulation
+du travail par le Bridge.
+
+La réconciliation n'autorise une nouvelle émission que sur l'identité exacte avec statut
+terminal `failed` et `verified_no_answer: true`. Un 404, un état inconnu ou `failed` sans preuve
+reste `external_state_unknown`. Après cette preuve, les étapes stateless peuvent être réémises au
+plus deux fois pour l'extraction, la projection de pertinence, la synthèse et l'enrichissement
+éditorial ; le compteur PostgreSQL dédié reste distinct du compteur de reprise générique.
+`bridge_ui_timeout` garde son code diagnostic et utilise un backoff job de 300 secondes au départ,
+plafonné à 1800 secondes.
 
 Les événements locaux du run mentionnent un timeout, `ambiguous_response_roots`, une extension
 déconnectée et une attente d'environ 44 min 40 s. Le journal examiné ne contient pas les réponses

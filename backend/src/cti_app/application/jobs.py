@@ -393,6 +393,8 @@ class JobExecutor:
         *,
         retry_base_seconds: float = 1.0,
         retry_max_seconds: float = 300.0,
+        bridge_ui_retry_base_seconds: float = 300.0,
+        bridge_ui_retry_max_seconds: float = 1800.0,
         heartbeat_interval_seconds: float = 20.0,
         diagnostics: DiagnosticsLog | None = None,
     ) -> None:
@@ -400,6 +402,8 @@ class JobExecutor:
         self._registry = registry
         self._retry_base_seconds = retry_base_seconds
         self._retry_max_seconds = retry_max_seconds
+        self._bridge_ui_retry_base_seconds = bridge_ui_retry_base_seconds
+        self._bridge_ui_retry_max_seconds = bridge_ui_retry_max_seconds
         self._heartbeat_interval_seconds = heartbeat_interval_seconds
         # Every stage of the chain runs as a job, so this is the one place that
         # sees each failure regardless of which service produced it.
@@ -549,10 +553,13 @@ class JobExecutor:
             if job.cancellation_requested:
                 job.mark_cancelled()
             elif error.transient and job.attempt < job.max_attempts:
-                delay_seconds = min(
-                    self._retry_max_seconds,
-                    self._retry_base_seconds * (2 ** (job.attempt - 1)),
-                )
+                if error.code == "bridge_ui_timeout":
+                    retry_base = self._bridge_ui_retry_base_seconds
+                    retry_max = self._bridge_ui_retry_max_seconds
+                else:
+                    retry_base = self._retry_base_seconds
+                    retry_max = self._retry_max_seconds
+                delay_seconds = min(retry_max, retry_base * (2 ** (job.attempt - 1)))
                 job.schedule_retry(
                     error.code,
                     _clean_public_message(error.public_message),

@@ -2680,7 +2680,7 @@ async def test_reconciliation_probe_rejects_a_run_without_reconciliation(
     assert response.json()["detail"]["code"] == "production_reconciliation_not_required"
 
 
-async def test_reconciliation_probe_404_releases_the_run(
+async def test_reconciliation_probe_404_keeps_the_run_unresolved(
     api: AsyncClient, uow: _Uow, production_app: FastAPI
 ) -> None:
     run = _reconciliation_run(uuid4(), uuid4())
@@ -2690,8 +2690,8 @@ async def test_reconciliation_probe_404_releases_the_run(
     response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"outcome": "released", "bridge_status": "not_found"}
-    assert uow.production_runs.items[run.id].requires_reconciliation is False
+    assert response.json() == {"outcome": "undecided", "bridge_status": "not_found"}
+    assert uow.production_runs.items[run.id].requires_reconciliation is True
 
 
 async def test_declare_lost_returns_resumed_without_releasing_when_probe_finds_answer(

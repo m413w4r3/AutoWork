@@ -12,6 +12,7 @@ fixes it, and the barriers that must survive it.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 from typing import Any, cast
@@ -112,10 +113,15 @@ class _BatchItems:
         return [item for item in self.items if item.batch_id == batch_id]
 
     async def get_by_run(self, run_id: UUID) -> EditionProductionBatchItem | None:
-        return next((i for i in self.items if i.production_run_id == run_id), None)
+        item = next((i for i in self.items if i.production_run_id == run_id), None)
+        return replace(item) if item is not None else None
 
     async def save(self, item: EditionProductionBatchItem) -> None:
-        return None
+        for index, current in enumerate(self.items):
+            if current.id == item.id:
+                self.items[index] = replace(item)
+                return
+        self.items.append(replace(item))
 
 
 class _Editions:
@@ -817,3 +823,55 @@ async def test_reconciliation_keeps_the_same_running_sibling_fence() -> None:
 
     assert error.value.reason == "active_sibling"
     assert world.batch.status is ProductionBatchStatus.COMPLETED_WITH_ISSUES
+
+
+async def test_verified_reconciliation_reemissions_are_bounded_separately() -> None:
+    world = _World()
+    repository = world.uow.edition_production_batch_items
+    repository.items[0].auto_recovery_count = 1
+    world.run.error_code = "bridge_run_unavailable"
+    service = SubjectProductionService(cast(Any, world.factory))
+
+    for expected_reemissions in (1, 2):
+        world.run.status = ProductionRunStatus.NEEDS_REVIEW
+        world.run.error_code = "bridge_run_unavailable"
+        result = await service.retry_from_stage(
+            world.run.id,
+            ProductionStage.EXTRACTION,
+            force_recompute=False,
+            automatic=True,
+            verified_no_answer=True,
+        )
+        assert result.run.status is ProductionRunStatus.RUNNING
+        persisted_item = await repository.get_by_run(world.run.id)
+        assert persisted_item is not None
+        assert persisted_item.verified_reemission_count == expected_reemissions
+        assert persisted_item.auto_recovery_count == 1
+
+    world.run.status = ProductionRunStatus.NEEDS_REVIEW
+    world.run.error_code = "bridge_run_unavailable"
+    with pytest.raises(ValueError, match="verified_reemission_limit_reached"):
+        await service.retry_from_stage(
+            world.run.id,
+            ProductionStage.EXTRACTION,
+            force_recompute=False,
+            automatic=True,
+            verified_no_answer=True,
+        )
+    persisted_item = await repository.get_by_run(world.run.id)
+    assert persisted_item is not None
+    assert persisted_item.verified_reemission_count == 2
+
+    world.run.status = ProductionRunStatus.NEEDS_REVIEW
+    world.run.error_code = "bridge_run_unavailable"
+    world.run.current_stage = ProductionStage.SOURCES
+    repository.items[0].verified_reemission_count = 0
+    with pytest.raises(ValueError, match="verified_reemission_stage_not_stateless"):
+        await service.retry_from_stage(
+            world.run.id,
+            ProductionStage.SOURCES,
+            force_recompute=False,
+            automatic=True,
+            verified_no_answer=True,
+        )
+    assert repository.items[0].verified_reemission_count == 0

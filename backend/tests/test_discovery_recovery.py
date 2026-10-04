@@ -1,4 +1,4 @@
-"""Tests de caractérisation des invariants Recovery Discovery (R26).
+"""Tests de caractérisation des invariants Recovery Discovery (R26/L10).
 
 Ces tests verrouillent le comportement actuel de ``DiscoveryService`` autour
 de la récupération (visible, manuelle, completion, reprise d'un
@@ -7,7 +7,6 @@ propre module. Ils ne couvrent que ce qui n'est pas déjà verrouillé par
 ``test_discovery.py`` / ``test_discovery_api.py`` : voir R26 pour la liste
 des invariants visés.
 
-Aucun code de production n'est modifié par ce fichier.
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from cti_app.application.discovery.contracts import (
     discovery_job_idempotency_key,
 )
 from cti_app.application.discovery.jobs import DISCOVERY_JOB_KIND
+from cti_app.application.discovery.recovery import DiscoveryRecoveryCoordinator
 from cti_app.application.discovery.service import DiscoveryService
 from cti_app.application.jobs import (
     JobExecutor,
@@ -29,7 +29,12 @@ from cti_app.application.jobs import (
     SynchronousJobDispatcher,
     create_job_registry,
 )
-from cti_app.application.model_gateway import ModelGateway, ModelGatewayError, ModelRouter
+from cti_app.application.model_gateway import (
+    ModelExecution,
+    ModelGateway,
+    ModelGatewayError,
+    ModelRouter,
+)
 from cti_app.domain.discovery_cumulative import DiscoveryInputMode
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.model_runs import (
@@ -620,3 +625,64 @@ async def test_standalone_import_calls_after_persisted_batch_callback_on_new() -
     assert batch2.id == batch1.id
     assert len(callback_invocations) == 1
     assert adapter.calls == []
+
+
+async def test_background_review_observation_keeps_the_actual_bridge_state() -> None:
+    params = parameters(axis="background-review-state")
+    waiting = persisted_research_run(params, status=ModelRunStatus.WAITING_BACKGROUND)
+    waiting.response_id = "resp_stalled"
+    review = persisted_research_run(params, status=ModelRunStatus.NEEDS_REVIEW)
+    review.response_id = "resp_stalled"
+    review.require_review(
+        "model_background_progress_stalled",
+        "progress stalled",
+        details={"diagnostic_code": "model_background_progress_stalled"},
+    )
+    execution = ModelExecution(
+        run=review,
+        metadata={
+            "diagnostic_code": "model_background_progress_stalled",
+            "bridge_status": "running",
+            "bridge_progress": {"phase": "research"},
+        },
+    )
+
+    class ReviewArchive:
+        async def get_run(self, run_id: UUID) -> ModelRun:
+            assert run_id == waiting.id
+            return waiting
+
+        async def resume(self, run_id: UUID) -> ModelExecution:
+            assert run_id == waiting.id
+            return execution
+
+    class StoppedAtReview(Exception):
+        pass
+
+    class PollContext:
+        def __init__(self) -> None:
+            self.observations: list[dict[str, object]] = []
+
+        async def check_cancelled(self) -> None:
+            return None
+
+        async def heartbeat(self) -> None:
+            return None
+
+        async def record_diagnostics(self, event: dict[str, object]) -> None:
+            self.observations.append(event)
+
+        async def wait_for_human(self, message: str, details: dict[str, object]) -> None:
+            del message, details
+            raise StoppedAtReview
+
+    context = PollContext()
+    recovery = DiscoveryRecoveryCoordinator(
+        TransientResearchAdapter(),
+        archive=ReviewArchive(),
+    )
+
+    with pytest.raises(StoppedAtReview):
+        await recovery.poll_background_research(waiting.id, context)  # type: ignore[arg-type]
+
+    assert context.observations[0]["bridge_state"] == "running"

@@ -1664,6 +1664,7 @@ class EditionProductionBatchItem:
     production_run_id: UUID
     position: int
     auto_recovery_count: int = 0
+    verified_reemission_count: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     id: UUID = field(default_factory=uuid4)
 
@@ -1672,3 +1673,5 @@ class EditionProductionBatchItem:
             raise ValueError("position must be >= 1")
         if self.auto_recovery_count not in (0, 1):
             raise ValueError("auto_recovery_count must be between 0 and 1")
+        if self.verified_reemission_count not in (0, 1, 2):
+            raise ValueError("verified_reemission_count must be between 0 and 2")

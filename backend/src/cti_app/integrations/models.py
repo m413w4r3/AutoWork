@@ -50,14 +50,20 @@ _ARCHIVE_ERROR_CODES = {
 
 class ResponsesTransport(Protocol):
     async def create(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]: ...
 
     async def retrieve(self, response_id: str) -> dict[str, Any]: ...
 
 
 class ChatCompletionsTransport(Protocol):
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+    async def create(
+        self, payload: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]: ...
 
 
 class HttpResponsesTransport:
@@ -86,10 +92,18 @@ class HttpResponsesTransport:
         return bool(self._base_url)
 
     async def create(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         return await self._request(
-            "POST", "/responses", json_body=payload, idempotency_key=idempotency_key
+            "POST",
+            "/responses",
+            json_body=payload,
+            idempotency_key=idempotency_key,
+            timeout_seconds=timeout_seconds,
         )
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
@@ -586,14 +600,19 @@ class HttpChatCompletionsTransport:
     def is_configured(self) -> bool:
         return bool(self._base_url)
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create(
+        self, payload: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
         url = f"{self._base_url}/chat/completions"
+        timeout = httpx.Timeout(timeout_seconds) if timeout_seconds is not None else self._timeout
         try:
             if self._client is not None:
-                response = await self._client.post(url, json=payload, headers=headers)
+                response = await self._client.post(
+                    url, json=payload, headers=headers, timeout=timeout
+                )
             else:
-                async with httpx.AsyncClient(timeout=self._timeout) as client:
+                async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.post(url, json=payload, headers=headers)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
             # The connection never opened: no byte of the request reached the provider.
@@ -823,8 +842,11 @@ class OpenAIResearchAdapter:
             payload["include"] = ["web_search_call.action.sources"]
         payload.update(_bridge_extensions(request))
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
+        create_kwargs: dict[str, Any] = {"idempotency_key": request.request_id}
+        if request.timeout_seconds is not None:
+            create_kwargs["timeout_seconds"] = request.timeout_seconds
         return _responses_result(
-            await self._transport.create(payload, idempotency_key=request.request_id),
+            await self._transport.create(payload, **create_kwargs),
             self.provider,
         )
 
@@ -893,8 +915,11 @@ class OpenAIStructuredAdapter:
             payload["bridge_ui_model"] = request.conversation.ui_model
         payload.update(_bridge_extensions(request))
         payload.update(_allowed_parameters(request.parameters, _RESPONSES_PARAMETERS))
+        create_kwargs: dict[str, Any] = {"idempotency_key": request.request_id}
+        if request.timeout_seconds is not None:
+            create_kwargs["timeout_seconds"] = request.timeout_seconds
         return _responses_result(
-            await self._transport.create(payload, idempotency_key=request.request_id),
+            await self._transport.create(payload, **create_kwargs),
             self.provider,
             output_schema=(
                 None if request.metadata.get("defer_validation") is True else output_schema
@@ -971,7 +996,11 @@ class OpenAICompatibleChatAdapter:
         elif role is ModelRole.STRUCTURED_EXTRACTION:
             raise ModelGatewayError("Structured extraction requires an output schema")
         payload.update(_allowed_parameters(request.parameters, _CHAT_PARAMETERS))
-        raw = await self._transport.create(payload)
+        raw = (
+            await self._transport.create(payload, timeout_seconds=request.timeout_seconds)
+            if request.timeout_seconds is not None
+            else await self._transport.create(payload)
+        )
         output_text = _chat_output_text(raw)
         defer_validation = request.metadata.get("defer_validation") is True
         structured = None

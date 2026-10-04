@@ -1036,6 +1036,7 @@ class SqlAlchemyEditionProductionBatchItemRepository:
                 production_run_id=item.production_run_id,
                 position=item.position,
                 auto_recovery_count=item.auto_recovery_count,
+                verified_reemission_count=item.verified_reemission_count,
                 created_at=item.created_at,
             )
             self._session.add(row)
@@ -1064,6 +1065,7 @@ class SqlAlchemyEditionProductionBatchItemRepository:
             .values(
                 production_run_id=item.production_run_id,
                 auto_recovery_count=item.auto_recovery_count,
+                verified_reemission_count=item.verified_reemission_count,
             )
         )
 
@@ -1433,6 +1435,7 @@ def _edition_production_batch_item_from_row(
         production_run_id=row.production_run_id,
         position=row.position,
         auto_recovery_count=row.auto_recovery_count,
+        verified_reemission_count=row.verified_reemission_count,
         created_at=row.created_at,
     )
 

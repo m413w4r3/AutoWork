@@ -328,6 +328,8 @@ async def _execute_job(job_id: UUID) -> int | None:
             registry,
             retry_base_seconds=settings.job_retry_base_seconds,
             retry_max_seconds=settings.job_retry_max_seconds,
+            bridge_ui_retry_base_seconds=settings.job_bridge_ui_retry_base_seconds,
+            bridge_ui_retry_max_seconds=settings.job_bridge_ui_retry_max_seconds,
             heartbeat_interval_seconds=min(20.0, settings.job_heartbeat_timeout_seconds / 3),
             diagnostics=production_diagnostics,
         )

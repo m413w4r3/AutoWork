@@ -500,6 +500,10 @@ class EditionProductionBatchItemRow(Base):
         CheckConstraint(
             "auto_recovery_count BETWEEN 0 AND 1", name="ck_batch_item_auto_recovery_count"
         ),
+        CheckConstraint(
+            "verified_reemission_count BETWEEN 0 AND 2",
+            name="ck_batch_item_verified_reemission_count",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True)
@@ -518,6 +522,7 @@ class EditionProductionBatchItemRow(Base):
     )
     position: Mapped[int] = mapped_column(nullable=False)
     auto_recovery_count: Mapped[int] = mapped_column(nullable=False, server_default="0")
+    verified_reemission_count: Mapped[int] = mapped_column(nullable=False, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 

@@ -69,12 +69,38 @@ def test_discovery_bridge_poll_interval_is_configurable_and_bounded(
 
 
 def test_model_wait_budgets_are_configurable_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    defaults = Settings(_env_file=None)
+    assert defaults.openai_bridge_wait_timeout_seconds == 300
+    assert defaults.openai_bridge_wait_timeout_research_seconds == 900
+    assert defaults.model_request_timeout_seconds == 300
+    assert defaults.model_request_timeout_research_seconds == 900
+    assert defaults.model_background_wait_timeout_seconds == 5400
+    assert defaults.model_background_wait_timeout_research_seconds is None
+    assert defaults.model_background_idle_timeout_seconds == 1200
+    assert defaults.model_background_idle_timeout_research_seconds is None
+    assert defaults.job_bridge_ui_retry_base_seconds == 300
+    assert defaults.job_bridge_ui_retry_max_seconds == 1800
+
     monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "1200")
-    monkeypatch.setenv("MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS", "3600")
+    monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_RESEARCH_SECONDS", "1500")
+    monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_SECONDS", "240")
+    monkeypatch.setenv("MODEL_REQUEST_TIMEOUT_RESEARCH_SECONDS", "1000")
+    monkeypatch.setenv("MODEL_BACKGROUND_WAIT_TIMEOUT_SECONDS", "900")
+    monkeypatch.setenv("MODEL_BACKGROUND_WAIT_TIMEOUT_RESEARCH_SECONDS", "7200")
+    monkeypatch.setenv("MODEL_BACKGROUND_IDLE_TIMEOUT_SECONDS", "900")
+    monkeypatch.setenv("MODEL_BACKGROUND_IDLE_TIMEOUT_RESEARCH_SECONDS", "1800")
+    monkeypatch.setenv("JOB_BRIDGE_UI_RETRY_BASE_SECONDS", "420")
     settings = Settings(_env_file=None)
 
     assert settings.openai_bridge_wait_timeout_seconds == 1200
-    assert settings.model_background_wait_timeout_seconds == 3600
+    assert settings.openai_bridge_wait_timeout_research_seconds == 1500
+    assert settings.model_request_timeout_seconds == 240
+    assert settings.model_request_timeout_research_seconds == 1000
+    assert settings.model_background_wait_timeout_seconds == 5400
+    assert settings.model_background_wait_timeout_research_seconds == 7200
+    assert settings.model_background_idle_timeout_seconds == 900
+    assert settings.model_background_idle_timeout_research_seconds == 1800
+    assert settings.job_bridge_ui_retry_base_seconds == 420
 
     monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "3601")
     with pytest.raises(ValidationError):

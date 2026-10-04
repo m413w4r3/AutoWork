@@ -42,13 +42,19 @@ class FakeResponsesTransport:
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
         self.created_payloads: list[dict[str, Any]] = []
+        self.create_timeouts: list[float | None] = []
         self.retrieved: list[str] = []
 
     async def create(
-        self, payload: dict[str, Any], *, idempotency_key: str | None = None
+        self,
+        payload: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         del idempotency_key
         self.created_payloads.append(payload)
+        self.create_timeouts.append(timeout_seconds)
         return self.response
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
@@ -60,13 +66,19 @@ class FakeChatTransport:
     def __init__(self, response: dict[str, Any]) -> None:
         self.response = response
         self.payloads: list[dict[str, Any]] = []
+        self.create_timeouts: list[float | None] = []
 
-    async def create(self, payload: dict[str, Any]) -> dict[str, Any]:
+    async def create(
+        self, payload: dict[str, Any], *, timeout_seconds: float | None = None
+    ) -> dict[str, Any]:
         self.payloads.append(payload)
+        self.create_timeouts.append(timeout_seconds)
         return self.response
 
 
-def safe_request(*, background: bool = False) -> SafeModelRequest:
+def safe_request(
+    *, background: bool = False, timeout_seconds: float | None = None
+) -> SafeModelRequest:
     return SafeModelRequest(
         text="Texte autorisé",
         prompt_template_id="contract-test",
@@ -79,6 +91,7 @@ def safe_request(*, background: bool = False) -> SafeModelRequest:
         web_search=False,
         background=background,
         authorized_input_hash="b" * 64,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -176,6 +189,22 @@ async def test_openai_research_uses_responses_web_search_and_background() -> Non
     assert payload["background"] is True
     assert payload["include"] == ["web_search_call.action.sources"]
     assert payload["input"] == [{"role": "user", "content": "Texte autorisé"}]
+
+
+async def test_adapters_pass_selected_role_wait_budget_to_transport() -> None:
+    responses = FakeResponsesTransport(
+        {"id": "resp_timeout", "status": "completed", "output_text": "answer"}
+    )
+    await OpenAIResearchAdapter(responses, model="chatgpt-web").invoke(
+        safe_request(timeout_seconds=900), role=ModelRole.RESEARCH
+    )
+    assert responses.create_timeouts == [900]
+
+    chat = FakeChatTransport({"choices": [{"message": {"content": "answer"}}]})
+    await QwenAdapter(chat, model="Qwen3-32B", is_external=False).invoke(
+        safe_request(timeout_seconds=300), role=ModelRole.DRAFTING
+    )
+    assert chat.create_timeouts == [300]
 
 
 async def test_chatgpt_bridge_client_uses_standard_responses_endpoints() -> None:

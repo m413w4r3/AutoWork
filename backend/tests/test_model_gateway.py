@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -17,6 +18,7 @@ from cti_app.application.jobs import (
 from cti_app.application.model_gateway import (
     AdapterResult,
     AdapterResultStatus,
+    BackgroundResponsePendingError,
     BinaryModelInputError,
     ExternalModelBlockedError,
     ModelCapabilities,
@@ -84,6 +86,7 @@ class SequencedResponsesTransport:
         self.create_calls = 0
         self.retrieve_calls = 0
         self.idempotency_keys: list[str | None] = []
+        self._response_id: str | None = None
 
     async def create(
         self, payload: dict[str, Any], *, idempotency_key: str | None = None
@@ -91,10 +94,12 @@ class SequencedResponsesTransport:
         del payload
         self.create_calls += 1
         self.idempotency_keys.append(idempotency_key)
-        return self._responses[0]
+        response = self._responses[0]
+        self._response_id = response.get("id")
+        return response
 
     async def retrieve(self, response_id: str) -> dict[str, Any]:
-        assert response_id == "resp_background"
+        assert response_id == self._response_id
         self.retrieve_calls += 1
         return self._responses[min(self.retrieve_calls, len(self._responses) - 1)]
 
@@ -967,25 +972,203 @@ async def test_background_openai_response_is_resumed_by_job_polling() -> None:
     assert list(output_store.objects.values()) == [b"Recherche termin\xc3\xa9e"]
 
 
-async def test_background_wait_budget_becomes_reconciliation_without_another_poll() -> None:
+async def test_background_progress_can_continue_past_the_old_wait_budget() -> None:
     transport = SequencedResponsesTransport(
-        [{"id": "resp_budget", "status": "queued", "model": "chatgpt-web"}]
+        [
+            {"id": "resp_budget", "status": "queued", "model": "chatgpt-web"},
+            {
+                "id": "resp_budget",
+                "status": "running",
+                "model": "chatgpt-web",
+                "metadata": {"bridge_progress": {"completed": 1}},
+            },
+            {
+                "id": "resp_budget",
+                "status": "completed",
+                "model": "chatgpt-web",
+                "output_text": "Recherche terminée",
+            },
+        ]
     )
     gateway, model_uow, _ = gateway_with_transport(transport)
-    gateway._background_wait_timeout_seconds = 0
+    clock = [datetime.now(UTC)]
+    gateway._clock = lambda: clock[0]
     execution = await gateway.research(
         request(external_llm_allowed=True, background=True, run_id=uuid4())
     )
+    clock[0] += timedelta(seconds=901)
+    with pytest.raises(BackgroundResponsePendingError):
+        await gateway.resume(execution.run.id)
+    assert model_uow.state[execution.run.id].status is ModelRunStatus.WAITING_BACKGROUND
 
     recovered = await gateway.resume(execution.run.id)
     run = model_uow.state[execution.run.id]
 
-    assert recovered.run.status is ModelRunStatus.NEEDS_REVIEW
-    assert run.error_code == "model_background_wait_budget_exceeded"
-    assert run.error_details["diagnostic_code"] == "model_background_wait_budget_exceeded"
+    assert recovered.run.status is ModelRunStatus.SUCCEEDED
+    assert recovered.output_text == "Recherche terminée"
+    assert run.status is ModelRunStatus.SUCCEEDED
+    assert run.error_code is None
+    assert transport.retrieve_calls == 2
+
+
+async def test_idle_window_starts_when_background_status_is_first_observed() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {"id": "resp_initial_idle", "status": "queued", "model": "chatgpt-web"},
+            {"id": "resp_initial_idle", "status": "running", "model": "chatgpt-web"},
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    clock = [datetime.now(UTC) + timedelta(seconds=1500)]
+    gateway._clock = lambda: clock[0]
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+
+    with pytest.raises(BackgroundResponsePendingError):
+        await gateway.resume(execution.run.id)
+
+    assert model_uow.state[execution.run.id].status is ModelRunStatus.WAITING_BACKGROUND
+
+
+async def test_background_without_progress_waits_for_safety_ceiling() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {"id": "resp_stalled", "status": "queued", "model": "chatgpt-web"},
+            {"id": "resp_stalled", "status": "running", "model": "chatgpt-web"},
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    clock = [datetime.now(UTC)]
+    gateway._clock = lambda: clock[0]
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+    clock[0] += timedelta(seconds=1201)
+
+    with pytest.raises(BackgroundResponsePendingError):
+        await gateway.resume(execution.run.id)
+    run = model_uow.state[execution.run.id]
+
+    assert run.status is ModelRunStatus.WAITING_BACKGROUND
+    assert run.error_code is None
+    assert transport.retrieve_calls == 1
+
+
+async def test_constant_nonempty_progress_is_reviewed_after_idle_window() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {
+                "id": "resp_stalled_progress",
+                "status": "queued",
+                "model": "chatgpt-web",
+                "metadata": {"bridge_progress": {"completed": 1, "total": 4}},
+            },
+            {
+                "id": "resp_stalled_progress",
+                "status": "running",
+                "model": "chatgpt-web",
+                "metadata": {"bridge_progress": {"completed": 1, "total": 4}},
+            },
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    clock = [datetime.now(UTC)]
+    gateway._clock = lambda: clock[0]
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+    clock[0] += timedelta(seconds=1201)
+
+    stalled = await gateway.resume(execution.run.id)
+    run = model_uow.state[execution.run.id]
+
+    assert stalled.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert stalled.run.error_code == "model_background_progress_stalled"
+    assert stalled.metadata["diagnostic_code"] == "model_background_progress_stalled"
+    assert stalled.metadata["bridge_status"] == "running"
     assert run.submission_state.value == "external_state_unknown"
-    assert run.response_id == "resp_budget"
-    assert transport.retrieve_calls == 0
+
+
+async def test_background_safety_ceiling_is_a_separate_large_fallback() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {"id": "resp_ceiling", "status": "queued", "model": "chatgpt-web"},
+            {
+                "id": "resp_ceiling",
+                "status": "running",
+                "model": "chatgpt-web",
+                "metadata": {"bridge_progress": {"completed": 4}},
+            },
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    clock = [datetime.now(UTC)]
+    gateway._clock = lambda: clock[0]
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+    clock[0] += timedelta(seconds=5401)
+
+    reviewed = await gateway.resume(execution.run.id)
+
+    assert reviewed.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert reviewed.run.error_code == "model_background_safety_ceiling_exceeded"
+    assert reviewed.metadata["wait_safety_ceiling_seconds"] == 5400
+    assert model_uow.state[execution.run.id].submission_state.value == "external_state_unknown"
+
+
+async def test_background_without_progress_reaches_only_the_safety_ceiling() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {"id": "resp_no_progress_ceiling", "status": "queued", "model": "chatgpt-web"},
+            {"id": "resp_no_progress_ceiling", "status": "running", "model": "chatgpt-web"},
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    clock = [datetime.now(UTC)]
+    gateway._clock = lambda: clock[0]
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+    clock[0] += timedelta(seconds=5401)
+
+    reviewed = await gateway.resume(execution.run.id)
+
+    assert reviewed.run.status is ModelRunStatus.NEEDS_REVIEW
+    assert reviewed.run.error_code == "model_background_safety_ceiling_exceeded"
+    assert reviewed.metadata["diagnostic_code"] == "model_background_safety_ceiling_exceeded"
+    assert model_uow.state[execution.run.id].submission_state.value == "external_state_unknown"
+
+
+async def test_explicit_verified_background_failure_fails_without_unknown_state() -> None:
+    transport = SequencedResponsesTransport(
+        [
+            {"id": "resp_failed", "status": "queued", "model": "chatgpt-web"},
+            {
+                "id": "resp_failed",
+                "status": "failed",
+                "model": "chatgpt-web",
+                "error": {
+                    "code": "bridge_server_error",
+                    "submission_state": "post_submission",
+                    "verified_no_answer": True,
+                },
+            },
+        ]
+    )
+    gateway, model_uow, _ = gateway_with_transport(transport)
+    execution = await gateway.research(
+        request(external_llm_allowed=True, background=True, run_id=uuid4())
+    )
+
+    with pytest.raises(BridgeTransportError):
+        await gateway.resume(execution.run.id)
+
+    run = model_uow.state[execution.run.id]
+    assert run.status is ModelRunStatus.FAILED
+    assert run.error_code == "bridge_server_error"
+    assert run.submission_state.value == "verified_terminal_failure"
 
 
 class _CountingChatTransport:
@@ -1072,7 +1255,7 @@ async def test_production_factory_builds_gemini_fail_closed_for_structured_outpu
         )
 
 
-async def test_bridge_generation_read_timeout_uses_configured_wait_budget() -> None:
+async def test_bridge_wait_budgets_are_configured_per_model_role() -> None:
     from typing import cast
 
     from cti_app.application.persistence import UnitOfWorkFactory
@@ -1080,13 +1263,23 @@ async def test_bridge_generation_read_timeout_uses_configured_wait_budget() -> N
     from cti_app.integrations.model_factory import create_model_gateway
 
     gateway = create_model_gateway(
-        Settings(_env_file=None, openai_bridge_wait_timeout_seconds=321),
+        Settings(
+            _env_file=None,
+            openai_bridge_wait_timeout_seconds=321,
+            openai_bridge_wait_timeout_research_seconds=1234,
+            model_background_wait_timeout_research_seconds=7200,
+            model_background_idle_timeout_research_seconds=1800,
+        ),
         cast(UnitOfWorkFactory, lambda: None),
     )
     bridge = gateway._router.by_backend(ModelBackend.CHATGPT_BRIDGE, ModelRole.RESEARCH)
 
     transport = bridge._transport  # type: ignore[attr-defined]
-    assert transport._timeout == 321
+    assert transport._timeout == 1234
+    assert gateway._bridge_wait_timeout_seconds_by_role[ModelRole.DRAFTING] == 321
+    assert gateway._bridge_wait_timeout_seconds_by_role[ModelRole.RESEARCH] == 1234
+    assert gateway._background_wait_timeout_seconds_by_role[ModelRole.RESEARCH] == 7200
+    assert gateway._background_idle_timeout_seconds_by_role[ModelRole.RESEARCH] == 1800
 
 
 async def test_preflight_reports_missing_provider_without_submission() -> None:

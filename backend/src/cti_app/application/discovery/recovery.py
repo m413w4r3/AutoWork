@@ -342,14 +342,22 @@ class DiscoveryRecoveryCoordinator:
                 await self._background_waiter(self._background_poll_interval_seconds)
                 continue
             polls += 1
+            bridge_state = execution.metadata.get("bridge_status")
+            if not isinstance(bridge_state, str) or not bridge_state:
+                bridge_state = (
+                    "completed"
+                    if execution.run.status is ModelRunStatus.SUCCEEDED
+                    else execution.run.status.value
+                )
+            progress = execution.metadata.get("bridge_progress", {})
             await self._record_background_observation(
                 context,
                 model_run_id=model_run_id,
                 bridge_run_id=execution.run.response_id or current.response_id,
-                bridge_state="completed",
+                bridge_state=bridge_state,
                 polls=polls,
                 elapsed_seconds=time.monotonic() - started,
-                progress={},
+                progress=progress if isinstance(progress, dict) else {},
             )
             if execution.run.status is not ModelRunStatus.SUCCEEDED:
                 if execution.run.status is ModelRunStatus.NEEDS_REVIEW:
