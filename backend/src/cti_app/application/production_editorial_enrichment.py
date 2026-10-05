@@ -99,6 +99,8 @@ from cti_app.domain.production import (
     model_run_awaits_reconciliation,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS,
+    DIAGRAM_VERTICAL_AFTER_NODES,
     EDITORIAL_ENRICHMENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
     EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
@@ -128,6 +130,7 @@ from cti_app.domain.production_editorial_enrichment import (
     TableColumnV1,
     TableRowV1,
     TableSpecV1,
+    diagram_requires_vertical_layout,
     editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
@@ -2876,9 +2879,9 @@ def _parse_enrichment_wire_diagram(
     layout_labels = [item.label for item in nodes]
     layout_labels.extend(item.label for item in edges if item.label is not None)
     layout_labels.extend(item.label for item in groups)
-    if (
-        len(nodes) > 4 or any(len(label) > 30 for label in layout_labels)
-    ) and direction is not EnrichmentDiagramDirection.TOP_TO_BOTTOM:
+    if diagram_requires_vertical_layout(len(nodes), layout_labels) and (
+        direction is not EnrichmentDiagramDirection.TOP_TO_BOTTOM
+    ):
         reject(block, "editorial_enrichment_diagram_direction_requires_top_to_bottom")
         return None
     if len(nodes) < 2 or not edges:
@@ -3724,8 +3727,9 @@ def build_editorial_enrichment_model_request(
             "la preuve citée documente les deux endpoints et la séquence affirmée. Pour les "
             "graphes : limite-toi à 8 nœuds; chaque nœud exprime une seule idée, avec "
             "6 mots et environ 40 caractères au maximum; un libellé d'arête a au plus 5 mots. "
-            "Choisis DIRECTION: top_to_bottom dès qu'il y a plus de 4 nœuds ou qu'un libellé "
-            "dépasse 30 caractères. Choisis le rôle parmi actor, victim, malware_tool, "
+            "Choisis DIRECTION parmi left_to_right et top_to_bottom selon les seuils de "
+            "diagram_layout_budgets; ils s'appliquent aux libellés des nœuds, relations et "
+            "groupes. Choisis le rôle parmi actor, victim, malware_tool, "
             "infrastructure, data_artifact, technique_step et unknown. Utilise network_flow pour "
             "un flux de résolution, de données ou de paiement; infrastructure pour les hôtes, "
             "services et connexions; component_relationship pour les liens entre composants. "
@@ -3777,8 +3781,8 @@ def build_editorial_enrichment_model_request(
                 "maximum_node_words": 6,
                 "maximum_node_characters": 40,
                 "maximum_edge_label_words": 5,
-                "vertical_when_nodes_over": 4,
-                "vertical_when_label_characters_over": 30,
+                "vertical_when_nodes_over": DIAGRAM_VERTICAL_AFTER_NODES,
+                "vertical_when_label_characters_over": DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS,
             },
             "placements": [item.value for item in EnrichmentPlacementKind],
             "section_indexes": [

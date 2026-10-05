@@ -682,6 +682,10 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "control-plane and data-plane" in request.text
     assert "diagram_node_roles" in prompt_payload["editorial_guidance"]
     assert prompt_payload["editorial_guidance"]["diagram_layout_budgets"]["maximum_nodes"] == 8
+    layout_budgets = prompt_payload["editorial_guidance"]["diagram_layout_budgets"]
+    assert layout_budgets["vertical_when_nodes_over"] == 3
+    assert layout_budgets["vertical_when_label_characters_over"] == 30
+    assert "plus de 4 nœuds" not in request.text
     assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
     assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
         enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
@@ -737,6 +741,37 @@ def test_diagram_with_long_labels_requires_top_to_bottom_direction() -> None:
     )
 
     result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" in {
+        item.reason_code for item in result.rejections
+    }
+
+
+@pytest.mark.parametrize("label_kind", ("relation", "group"))
+def test_diagram_relation_and_group_labels_require_top_to_bottom_direction(
+    label_kind: str,
+) -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    proposal_payload = _proposal("E001").model_dump(mode="json")
+    diagram_payload = proposal_payload["diagrams"][0]
+    if label_kind == "relation":
+        diagram_payload["edges"][0]["label"] = "x" * 31
+    else:
+        diagram_payload["groups"] = [
+            {
+                "group_id": "source-group",
+                "label": "x" * 31,
+                "node_ids": ["malware"],
+            }
+        ]
+    proposal = EditorialEnrichmentProposalV1.model_validate(proposal_payload)
+
+    result = parse_editorial_enrichment_proposal_wire(_proposal_to_wire(proposal), pack)
 
     assert result.proposal is not None
     assert result.proposal.diagrams == ()

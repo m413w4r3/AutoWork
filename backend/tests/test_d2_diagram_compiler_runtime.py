@@ -102,7 +102,7 @@ def test_real_d2_compilation_is_byte_deterministic(d2_binary: str) -> None:
 
     assert first.source_bytes == second.source_bytes
     assert first.source_bytes.startswith(b"direction: right\n")
-    assert b"shape: oval" in first.source_bytes
+    assert b"shape: rectangle" in first.source_bytes
     assert b'fill: "#F1F1EF"' in first.source_bytes
     assert first.source_bytes.endswith(b"\n") and not first.source_bytes.endswith(b"\n\n")
     assert first.source_sha256 == second.source_sha256

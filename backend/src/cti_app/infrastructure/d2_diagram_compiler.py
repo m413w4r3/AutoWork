@@ -30,6 +30,7 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
+    diagram_requires_vertical_layout,
 )
 
 D2_COMPILER = "d2"
@@ -195,7 +196,7 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     graph_labels = [node.label for node in diagram.nodes]
     graph_labels.extend(edge.label or "" for edge in diagram.edges)
     graph_labels.extend(group.label for group in diagram.groups)
-    force_vertical = len(diagram.nodes) > 4 or any(len(label) > 30 for label in graph_labels)
+    force_vertical = diagram_requires_vertical_layout(len(diagram.nodes), graph_labels)
     direction = "down" if force_vertical else _D2_DIRECTION_BY_V1[diagram.direction]
     lines = [f"direction: {direction}"]
 

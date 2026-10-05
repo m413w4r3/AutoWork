@@ -168,7 +168,7 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v11-readable-diagrams"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v12-readable-diagrams"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
     "editorial-enrichment-block-contract-v7-diagram-node-roles"
 )

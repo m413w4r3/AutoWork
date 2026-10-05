@@ -151,7 +151,7 @@ def test_escapes_hostile_labels_as_double_quoted_content() -> None:
     assert '@import(\\"https://example.test\\")' in source
     assert "\\" + "$" + "{D2_VAR}" in source
     assert "\\" + "$CONFIG" in source
-    assert "shape: oval" in source
+    assert "shape: rectangle" in source
 
 
 def test_omits_only_none_edge_labels() -> None:
@@ -214,8 +214,8 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
     source = encode_d2_source(diagram).decode()
     assert "shape: person" in source
     assert "shape: cylinder" in source
-    assert 'fill: "#E8F0F0"' in source
-    assert 'fill: "#EEF3F3"' in source
+    assert 'fill: "#FBE3E6"' in source
+    assert 'fill: "#DFF3E1"' in source
     assert "direction: right" in source
     assert diagram_semantic_sha256(
         replace(
@@ -225,9 +225,15 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
     ) != diagram_semantic_sha256(diagram)
 
 
-def test_graphs_with_more_than_four_nodes_force_a_vertical_layout() -> None:
-    nodes = tuple(_node(f"node-{index}") for index in range(7))
-    edges = tuple(_edge(f"node-{index}", f"node-{index + 1}") for index in range(6))
+@pytest.mark.parametrize(
+    ("node_count", "expected_direction"),
+    ((3, "right"), (4, "down")),
+)
+def test_node_count_selects_vertical_layout_after_three_nodes(
+    node_count: int, expected_direction: str
+) -> None:
+    nodes = tuple(_node(f"node-{index}") for index in range(node_count))
+    edges = tuple(_edge(f"node-{index}", f"node-{index + 1}") for index in range(node_count - 1))
 
     source = encode_d2_source(
         _diagram(
@@ -236,6 +242,36 @@ def test_graphs_with_more_than_four_nodes_force_a_vertical_layout() -> None:
             edges=edges,
         )
     ).decode()
+
+    assert source.startswith(f"direction: {expected_direction}\n")
+
+
+@pytest.mark.parametrize(
+    ("label_length", "expected_direction"),
+    ((30, "right"), (31, "down")),
+)
+def test_label_length_selects_vertical_layout_after_thirty_characters(
+    label_length: int, expected_direction: str
+) -> None:
+    diagram = _diagram(
+        nodes=(_node("source", "S"), _node("target", "x" * label_length)),
+    )
+
+    source = encode_d2_source(diagram).decode()
+
+    assert source.startswith(f"direction: {expected_direction}\n")
+
+
+@pytest.mark.parametrize("label_kind", ("relation", "group"))
+def test_long_relation_and_group_labels_force_vertical_layout(label_kind: str) -> None:
+    label = "x" * 31
+    overrides: dict[str, object] = {}
+    if label_kind == "relation":
+        overrides["edges"] = (_edge("source", "target", label),)
+    else:
+        overrides["groups"] = (DiagramGroupV1("long-label", label, ("source",)),)
+
+    source = encode_d2_source(_diagram(**overrides)).decode()
 
     assert source.startswith("direction: down\n")
 
