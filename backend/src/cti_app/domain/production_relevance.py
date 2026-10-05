@@ -20,8 +20,8 @@ from cti_app.domain.production_synthesis import (
 )
 
 RELEVANCE_PROJECTION_SCHEMA_VERSION = 2
-RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-model-proposal-v3"
-DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v3-core-default"
+RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-counter-analysis-v4"
+DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v4-counter-reserve"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -62,6 +62,8 @@ class RelevanceSourcePairRelation(StrEnum):
     TECHNICAL_COMPARISON = "technical_comparison"
     LINK_NOT_DEMONSTRATED = "link_not_demonstrated"
     CONTRADICTION = "contradiction"
+    COUNTER_INDICATION = "counter_indication"
+    CORROBORATION = "corroboration"
 
 
 class RelevanceProposalRejectionReason(StrEnum):
@@ -79,6 +81,8 @@ class RelevanceProposalRejectionReason(StrEnum):
     CORE_PRIMARY_DEFAULT_GUARD = "core_primary_default_guard"
     RELATION_MISSING_REASON = "relation_missing_reason"
     RELATION_DUPLICATE_SOURCE_PAIR = "relation_duplicate_source_pair"
+    RELATION_SOURCES_NOT_ELIGIBLE = "relation_sources_not_eligible"
+    COUNTER_ANALYSIS_RESERVE_GUARD = "counter_analysis_reserve_guard"
 
 
 def _canonical_json(payload: Any) -> bytes:
@@ -475,8 +479,18 @@ def validate_relevance_projection_lineage(
     for relation in projection.source_pair_relations:
         if not set(relation.supporting_evidence_refs) <= set(projection.extraction_evidence_refs):
             raise ValueError("Projection source-pair relation references are unknown")
-        if any(
-            source_by_id[ref.source_document_id].profile is not ExtractionProfile.FULL
-            for ref in relation.supporting_evidence_refs
-        ):
-            raise ValueError("Projection source-pair relations require FULL sources")
+        pair_sources = tuple(
+            source_by_id[source_id]
+            for source_id in {ref.source_document_id for ref in relation.supporting_evidence_refs}
+        )
+        both_full = all(source.profile is ExtractionProfile.FULL for source in pair_sources)
+        primary_full_with_secondary = any(
+            source.profile is ExtractionProfile.FULL
+            and getattr(source.editorial_role, "value", source.editorial_role) == "primary"
+            for source in pair_sources
+        ) and any(
+            getattr(source.editorial_role, "value", source.editorial_role) != "primary"
+            for source in pair_sources
+        )
+        if not (both_full or primary_full_with_secondary):
+            raise ValueError("Projection source-pair relation sources are not eligible")

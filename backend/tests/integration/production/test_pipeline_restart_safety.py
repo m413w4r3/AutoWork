@@ -448,7 +448,8 @@ async def test_restart_after_synthesis_runs_editorial_enrichment_and_assembly(
     synthesis_bytes = before.blobs[synthesis.rendered_blob_id]
 
     async with _fresh_runtime(scenario, migrated_postgres_url) as restarted:
-        # The persisted synthesis is reused; enrichment drafts once after restart.
+        # The persisted synthesis is reused; enrichment drafts, then annotates,
+        # once after restart.
         await restarted.enqueue_persisted_jobs()
         final = await restarted.run_until_terminal()
         after = await _reload(restarted)
@@ -456,7 +457,8 @@ async def test_restart_after_synthesis_runs_editorial_enrichment_and_assembly(
     _assert_refetched(before, after)
     assert final.status is ProductionRunStatus.READY
     assert [request.prompt_template_id for request in restarted.model.provider_calls] == [
-        "production-editorial-enrichment"
+        "production-editorial-enrichment",
+        "production-semantic-annotation",
     ]
     reloaded_synthesis = next(
         artifact

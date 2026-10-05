@@ -16,7 +16,7 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v5-public-source-editorial-prose"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v6-counter-analysis-reserve"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v2-headingless"
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v2-headingless-diagnostics"
 
@@ -63,11 +63,14 @@ an adverse claim, independent corroboration, a hypothesis, and an analytical
 inference. A reserve that qualifies attribution or causality must qualify the
 same passage it concerns, not only the conclusion.
 
-Use reserve and source-pair context to qualify claims. R handles are citeable
-only for passages that state the relevant qualification or contradiction; do
-not present reserved material as an unqualified established fact. When
-composing a cross-source account, cite each handle that supports the combined
-paragraph and state what each source does and does not establish.
+Use reserve and source-pair context to qualify the exact claim it bears on.
+Weave counter-analysis into the prose as an analytic limit, name the source
+that supplies the limit, and cite its R handle in that passage. R handles are
+citeable only for passages that state the relevant qualification or
+contradiction; do not present reserved material as an unqualified established
+fact. When composing a cross-source account, cite each handle that supports
+the combined paragraph and state what each source does and does not establish.
+Every source cited through an R handle must appear in the publication sources.
 
 For every detection pivot, explain the concrete observable, the telemetry
 needed to see it, its link to the described mechanism, and its limits. Never
@@ -140,9 +143,9 @@ EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-bloc
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
 EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v1"
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = "editorial-enrichment-revision-contract-v1"
-RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v2"
-RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v1"
-RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v2"
+RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v3-counter-analysis"
+RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v2-reason-pairs"
+RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v3-repair-reserves"
 CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
@@ -21,14 +22,23 @@ from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_model_request,
     editorial_enrichment_evidence_pack_hash,
 )
+from cti_app.application.production_prompts import (
+    RELEVANCE_CLASSIFIER_CONTRACT_VERSION,
+    RELEVANCE_CLASSIFIER_PROMPT_VERSION,
+    RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION,
+)
 from cti_app.application.production_relevance import (
     ProductionRelevanceProjectionService,
     RelevanceProjectionExecutionStatus,
     build_relevance_projection,
+    production_evidence_gate_details,
+    relevance_projection_input_hash,
+    subject_relevance_evidence_counts,
 )
 from cti_app.application.production_relevance_model import (
     ModelRelevanceClassifier,
     RelevanceProposalStatus,
+    build_relevance_classifier_model_request,
     build_relevance_model_evidence_pack,
     parse_relevance_classifier_wire,
 )
@@ -41,11 +51,16 @@ from cti_app.application.production_synthesis import (
     extraction_evidence_elements,
     synthesis_evidence_pack_hash,
 )
+from cti_app.application.publication_builder import (
+    _project_publication_sources,
+    _project_synthesis_publication,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
+    PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -57,9 +72,17 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
+    ProductionReferenceTier,
+)
 from cti_app.domain.production_relevance import (
     DEFAULT_RELEVANCE_CLASSIFIER_VERSION,
+    RELEVANCE_PROJECTION_POLICY_VERSION,
     RelevanceClassification,
     RelevanceDecisionProvenance,
     RelevanceProposalRejectionReason,
@@ -67,13 +90,16 @@ from cti_app.domain.production_relevance import (
     relevance_projection_from_json,
 )
 from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
     ProductionSynthesisV1,
+    SynthesisParagraphV1,
     extraction_evidence_refs_v1,
 )
 from cti_app.domain.publication import ArtifactType
 from tests.test_production_relevance_domain import (
+    _event,
     _extraction,
     _fact,
     _indicator,
@@ -613,10 +639,10 @@ async def test_model_classifier_replays_parser_changes_and_invokes_on_prompt_cha
 
     first = await ModelRelevanceClassifier(gateway).propose(run, snapshot, extraction, access)
     parser_bump = await ModelRelevanceClassifier(
-        gateway, parser_version="subject-relevance-wire-v3"
+        gateway, parser_version="subject-relevance-wire-v4-test"
     ).propose(run, snapshot, extraction, access)
     prompt_bump = await ModelRelevanceClassifier(
-        gateway, prompt_version="subject-relevance-classifier-v3"
+        gateway, prompt_version="subject-relevance-classifier-v4-test"
     ).propose(run, snapshot, extraction, access)
 
     assert first.status is RelevanceProposalStatus.SUCCEEDED
@@ -791,7 +817,9 @@ async def test_classifier_retries_after_fallback_with_model_classifier_identity(
     assert first.status is RelevanceProjectionExecutionStatus.SUCCEEDED
     assert second.status is RelevanceProjectionExecutionStatus.SUCCEEDED
     assert first.projection.classifier_version == DEFAULT_RELEVANCE_CLASSIFIER_VERSION
-    assert second.projection.classifier_version.startswith("model-subject-scope-v2:")
+    assert second.projection.classifier_version.startswith(
+        "model-subject-scope-v3-counter-analysis:"
+    )
     assert len(gateway.calls) == 2
 
 
@@ -912,8 +940,10 @@ def test_reserve_and_contradiction_context_is_handle_addressed_and_leak_guard_cl
     reserve_handles = tuple(str(item["handle"]) for item in synthesis_pack.reserve_evidence)
     assert reserve_handles
     assert all(f"@@EVIDENCE {handle}@@" in synthesis_request.text for handle in reserve_handles)
-    assert "R handles are citeable" in synthesis_request.text
-    assert "only for passages" in synthesis_request.text
+    assert "citeable only for" in synthesis_request.text
+    assert "Every source cited through an R handle must appear in the publication sources." in (
+        synthesis_request.text
+    )
     assert all(str(source_id) not in synthesis_request.text for source_id in source_ids)
     assert "reserves_and_contradictions_non_authoritative" in enrichment_request.text
     assert all(str(source_id) not in enrichment_request.text for source_id in source_ids)
@@ -948,3 +978,411 @@ def test_model_relevance_context_and_projection_are_subject_specific_for_shared_
     assert first_pack.evidence_pack_hash != second_pack.evidence_pack_hash
     assert first_projection.input_hash != second_projection.input_hash
     assert first_projection.projection_hash != second_projection.projection_hash
+
+
+def _real_run_fixture_extraction(snapshot: ProductionInputSnapshot):
+    """Synthetic evidence layout for replaying the saved real-run wire blocks.
+
+    The fixture retains its actual C001-C068 text, but the corresponding E001-E068
+    extraction items are synthetic: 3 primary events, one OP_RETURN claim fact,
+    54 primary indicators, and 10 Bitquery-style reserve uncertainties. This
+    supplies a deterministic handle map without implying the original extraction
+    was saved in the repository. Two extra non-primary context facts occupy
+    E069-E070 solely to exercise non-upgrading reason repairs.
+    """
+    primary_id, counter_id = UUID(int=1), UUID(int=2)
+    claim = _fact(
+        primary_id,
+        "Iranian MOIS Bitcoin OP_RETURN attribution",
+        context="Chainalysis links this OP_RETURN activity to the Iranian operator.",
+    )
+    primary = replace(
+        _source(
+            primary_id,
+            facts=(claim,),
+            events=tuple(
+                _event(primary_id, f"Synthetic primary chronology item {index}")
+                for index in range(3)
+            ),
+            indicators=tuple(
+                _indicator(
+                    primary_id,
+                    f"synthetic-primary-indicator-{index:03d}",
+                    ArtifactType.FILENAME,
+                    context="Synthetic primary item for fixture handle mapping.",
+                )
+                for index in range(54)
+            ),
+        ),
+        canonical_url="https://chainalysis.com/report",
+    )
+    counter = replace(
+        _source(
+            counter_id,
+            tier=ProductionReferenceTier.SUPPORTING,
+            editorial_role=ProductionEditorialRole.COUNTER_ANALYSIS,
+            role=SourceRole.INDEPENDENT,
+            uncertainties=(
+                "Le motif Bitcoin OP_RETURN observé depuis 2020 n'est attribué à aucun acteur.",
+                *(f"Synthetic Bitquery reserve limitation {index}." for index in range(9)),
+            ),
+        ),
+        canonical_url="https://bitquery.io/report",
+    )
+    other_id = UUID(int=3)
+    other = _source(
+        other_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        role=SourceRole.RELAY,
+        facts=(
+            _fact(other_id, "Synthetic independent context item one"),
+            _fact(other_id, "Synthetic independent context item two"),
+        ),
+    )
+    return (
+        _extraction(snapshot, (primary, counter, other)),
+        (primary_id, counter_id, other_id),
+        claim,
+    )
+
+
+@pytest.mark.asyncio
+async def test_saved_fixture_repairs_reasons_and_publishes_counter_reserve() -> None:
+    snapshot = _snapshot(title="Iranian operator Bitcoin OP_RETURN dead drop")
+    extraction, source_ids, primary_claim = _real_run_fixture_extraction(snapshot)
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    claim_ref = _ref_for(extraction, EvidenceKind.FACT, primary_claim.value)
+    counter_ref = next(
+        ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.UNCERTAINTY and "OP_RETURN" in str(payload.get("text"))
+    )
+
+    fixture_path = Path(__file__).parent / "fixtures/real_run_relevance_classifier_2026-10-03.txt"
+    fixture = fixture_path.read_text(encoding="utf-8")
+    assert fixture.count("@@ CLASSIFICATION ") == 68
+    assert "@@ RELATION " not in fixture
+    wire = "\n".join(
+        (
+            fixture,
+            _wire_classification("E999", "DIRECT", "malicious_subject_relation", block_id="C069"),
+            _wire_classification("E003", "DIRECT", "generic_filename", block_id="C070"),
+            _wire_classification(
+                "E069", "INDETERMINATE", "malicious_subject_relation", block_id="C071"
+            ),
+            _wire_classification(
+                "E070", "OUT_OF_SCOPE", "explicit_counter_analysis", block_id="C072"
+            ),
+        )
+    )
+    parsed = parse_relevance_classifier_wire(wire, pack, extraction)
+
+    assert parsed.error_code is None
+    assert len(parsed.classifications) == 70
+    assert len(parsed.warnings) == 10
+    assert (
+        "relevance_reason_repaired:C015:subject_link_not_demonstrated->explicit_other_actor"
+        in parsed.warnings
+    )
+    parsed_by_block = {item.block_id: item for item in parsed.classifications}
+    assert parsed_by_block["C015"].classification is RelevanceClassification.OUT_OF_SCOPE
+    assert parsed_by_block["C071"].classification is RelevanceClassification.INDETERMINATE
+    assert parsed_by_block["C072"].classification is RelevanceClassification.OUT_OF_SCOPE
+    assert (
+        sum(
+            item.reason_code is RelevanceProposalRejectionReason.UNKNOWN_HANDLE
+            for item in parsed.rejections
+        )
+        == 1
+    )
+    assert (
+        sum(
+            item.reason_code is RelevanceProposalRejectionReason.INVALID_REASON_FOR_CLASSIFICATION
+            for item in parsed.rejections
+        )
+        == 1
+    )
+
+    relation_wire = _wire_relation(
+        f"{pack._handle_for_ref[claim_ref]}, {pack._handle_for_ref[counter_ref]}",
+        relation="COUNTER_INDICATION",
+    )
+    mixed_profile_relation = parse_relevance_classifier_wire(relation_wire, pack, extraction)
+    assert len(mixed_profile_relation.source_pair_relations) == 1
+    assert (
+        mixed_profile_relation.source_pair_relations[0].relation
+        is RelevanceSourcePairRelation.COUNTER_INDICATION
+    )
+
+    gateway = _FakeGateway([wire])
+    world = _service_world(snapshot, extraction, source_ids, gateway)
+    result = await world.service.execute(world.run, snapshot, world.extraction_artifact)
+
+    assert result.status is RelevanceProjectionExecutionStatus.SUCCEEDED
+    assert result.artifact is not None
+    decisions = {item.evidence_ref: item for item in result.projection.classifications}
+    assert decisions[claim_ref].classification is RelevanceClassification.DIRECT
+    assert decisions[counter_ref].classification is RelevanceClassification.COUNTER_INDICATION
+    assert decisions[counter_ref].classification is not RelevanceClassification.INDETERMINATE
+    assert set(decisions[counter_ref].supporting_evidence_refs) == {claim_ref, counter_ref}
+    assert subject_relevance_evidence_counts(result.projection) == {
+        "direct_count": 1,
+        "context_count": 3,
+        "out_of_scope_count": 1,
+    }
+    assert len(result.projection.source_pair_relations) == 1
+    relation = result.projection.source_pair_relations[0]
+    assert relation.relation is RelevanceSourcePairRelation.COUNTER_INDICATION
+    assert set(relation.supporting_evidence_refs) == {claim_ref, counter_ref}
+
+    metadata = result.artifact.metadata
+    assert metadata["model_proposal_rejection_count"] >= 2
+    assert "unknown_handle" in metadata["model_proposal_rejection_codes"]
+    assert "invalid_reason_for_classification" in metadata["model_proposal_rejection_codes"]
+    assert len(metadata["model_proposal_warnings"]) == 10
+    assert metadata["source_pair_relation_count"] == 1
+
+    synthesis_pack = build_synthesis_evidence_pack(snapshot, extraction, result.projection)
+    reserve = next(
+        item
+        for item in synthesis_pack.reserve_evidence
+        if item["source_label"] == "bitquery.io"
+        and item["text"].startswith("Le motif Bitcoin OP_RETURN")
+    )
+    reserve_handle = str(reserve["handle"])
+    assert reserve["source_label"] == "bitquery.io"
+    assert reserve["text"].startswith("Le motif Bitcoin OP_RETURN")
+    synthesis_request = build_synthesis_model_request(
+        world.run,
+        snapshot,
+        extraction,
+        synthesis_pack,
+        _access_policy(snapshot, source_ids),
+        SynthesisMode.FRESH,
+    )
+    assert "bitquery.io" in synthesis_request.text
+    assert f"@@EVIDENCE {reserve_handle}@@" in synthesis_request.text
+    assert "analytic limit" in synthesis_request.text.casefold()
+    assert "publication sources" in synthesis_request.text.casefold()
+
+    synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=snapshot.subject_id,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(extraction),
+        publication_language="fr",
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=snapshot.subject_title,
+        lead=(
+            SynthesisParagraphV1(
+                text=(
+                    "Bitquery rappelle que ce motif OP_RETURN reste sans attribution indépendante."
+                ),
+                evidence_refs=(counter_ref, claim_ref),
+            ),
+        ),
+        sections=(),
+        timeline=(),
+        uncertainties=(),
+        warnings=(),
+    )
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+    references = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=snapshot.subject_id,
+        research_date=snapshot.research_date,
+        production_input_hash=snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url="https://chainalysis.com/report",
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                title="Chainalysis report",
+                publisher="Chainalysis",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=source_ids[0],
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=(str(source_ids[0].int).zfill(64))[-64:],
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+                editorial_role=ProductionEditorialRole.PRIMARY,
+            ),
+            ProductionReferenceSourceV1(
+                canonical_url="https://bitquery.io/report",
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="Bitquery report",
+                publisher="Bitquery",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=source_ids[1],
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=(str(source_ids[1].int).zfill(64))[-64:],
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+                editorial_role=ProductionEditorialRole.COUNTER_ANALYSIS,
+            ),
+        ),
+        warnings=(),
+    )
+    publication_sources = _project_publication_sources(
+        references=references,
+        used_source_document_ids=narrative.used_source_document_ids,
+    )
+    assert {item.source_document_id for item in publication_sources} == set(source_ids[:2])
+    assert any(item.publisher == "Bitquery" for item in publication_sources)
+
+
+@pytest.mark.parametrize(
+    ("direct_count", "minimum", "blocked"),
+    ((3, 4, True), (4, 4, False), (5, 4, False), (0, 0, False)),
+)
+def test_insufficient_subject_evidence_gate_thresholds(
+    direct_count: int, minimum: int, blocked: bool
+) -> None:
+    counts = {"direct_count": direct_count, "context_count": 6, "out_of_scope_count": 7}
+    details = production_evidence_gate_details(
+        counts,
+        minimum=minimum,
+        projection_artifact_id=UUID(int=42),
+        override_active=False,
+    )
+    assert (details is not None) is blocked
+    if details is not None:
+        assert details == {
+            "direct_count": direct_count,
+            "minimum": minimum,
+            "context_count": 6,
+            "out_of_scope_count": 7,
+            "projection_artifact_id": str(UUID(int=42)),
+        }
+
+
+def test_insufficient_subject_evidence_override_is_audited_idempotent_and_bypasses_gate() -> None:
+    snapshot = _snapshot()
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    projection_artifact_id = UUID(int=42)
+    decision = run.record_insufficient_subject_evidence_override(
+        projection_artifact_id=projection_artifact_id,
+        minimum=4,
+        direct_count=2,
+        context_count=8,
+        out_of_scope_count=3,
+        actor_id="analyst-7",
+        reason="Review confirmed sufficient qualitative context.",
+    )
+    repeated = run.record_insufficient_subject_evidence_override(
+        projection_artifact_id=projection_artifact_id,
+        minimum=4,
+        direct_count=2,
+        context_count=8,
+        out_of_scope_count=3,
+        actor_id="analyst-7",
+        reason="Review confirmed sufficient qualitative context.",
+    )
+
+    assert repeated == decision
+    assert len(run.review_overrides) == 1
+    assert decision["actor_id"] == "analyst-7"
+    assert decision["code"] == PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE
+    assert run.has_insufficient_subject_evidence_override(
+        projection_artifact_id=projection_artifact_id, minimum=4
+    )
+    assert (
+        production_evidence_gate_details(
+            {"direct_count": 2, "context_count": 8, "out_of_scope_count": 3},
+            minimum=4,
+            projection_artifact_id=projection_artifact_id,
+            override_active=run.has_insufficient_subject_evidence_override(
+                projection_artifact_id=projection_artifact_id, minimum=4
+            ),
+        )
+        is None
+    )
+
+
+def test_relevance_contract_versions_invalidate_old_classifier_reuse() -> None:
+    assert RELEVANCE_CLASSIFIER_PROMPT_VERSION == "subject-relevance-classifier-v3-counter-analysis"
+    assert RELEVANCE_CLASSIFIER_CONTRACT_VERSION == "subject-relevance-text-blocks-v2-reason-pairs"
+    assert RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION == "subject-relevance-wire-v3-repair-reserves"
+    assert RELEVANCE_PROJECTION_POLICY_VERSION == "subject-relevance-counter-analysis-v4"
+    assert DEFAULT_RELEVANCE_CLASSIFIER_VERSION == "deterministic-subject-scope-v4-counter-reserve"
+
+    snapshot, extraction, source_ids = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    access = _access_policy(snapshot, source_ids)
+    current_request = build_relevance_classifier_model_request(
+        run,
+        snapshot,
+        pack,
+        access,
+        extraction_hash=canonical_extraction_hash(extraction),
+    )
+    old_request = build_relevance_classifier_model_request(
+        run,
+        snapshot,
+        pack,
+        access,
+        extraction_hash=canonical_extraction_hash(extraction),
+        prompt_version="subject-relevance-classifier-v2",
+        contract_version="subject-relevance-text-blocks-v1",
+    )
+    assert (
+        current_request.metadata["relevance_classifier_invocation_hash"]
+        != (old_request.metadata["relevance_classifier_invocation_hash"])
+    )
+
+    projection = build_relevance_projection(snapshot, extraction)
+    assert projection.input_hash != relevance_projection_input_hash(
+        snapshot,
+        extraction,
+        classifier_version="deterministic-subject-scope-v3",
+    )
+
+
+def test_relevance_classifier_prompt_lists_only_valid_reason_pairs_and_counter_examples() -> None:
+    snapshot, extraction, source_ids = _world()
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    run = ProductionRun(
+        id=snapshot.production_run_id,
+        subject_id=snapshot.subject_id,
+        edition_id=snapshot.edition_id,
+    )
+    request = build_relevance_classifier_model_request(
+        run,
+        snapshot,
+        pack,
+        _access_policy(snapshot, source_ids),
+        extraction_hash=canonical_extraction_hash(extraction),
+    )
+    for pair in (
+        "DIRECT: primary_core_default, subject_matched_primary, malicious_subject_relation",
+        "CORROBORATION: subject_matched_corroboration, malicious_subject_corroboration",
+        "CONTEXT: context_source_without_relation, malicious_role_not_demonstrated",
+        "COUNTER_INDICATION: explicit_counter_analysis, explicit_subject_denial",
+        "OUT_OF_SCOPE: explicit_other_actor",
+        "INDETERMINATE: relation_not_established, subject_link_not_demonstrated",
+    ):
+        assert pair in request.text
+    assert "Chainalysis" in request.text
+    assert "Bitquery" in request.text
+    assert "OP_RETURN" in request.text
+    assert "Record a COUNTER_INDICATION relation" in request.text

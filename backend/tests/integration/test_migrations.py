@@ -476,6 +476,29 @@ async def _edition_schema(database_url: str) -> tuple[set[str], dict[str, str], 
         await engine.dispose()
 
 
+async def _review_overrides_column(database_url: str) -> tuple[str, bool, str | None]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+
+            def inspect_column(sync_connection: Connection) -> tuple[str, bool, str | None]:
+                column = next(
+                    item
+                    for item in inspect(sync_connection).get_columns("production_runs")
+                    if item["name"] == "review_overrides"
+                )
+                default = column.get("default")
+                return (
+                    _type_category(column["type"]),
+                    bool(column["nullable"]),
+                    str(default).replace(" ", "") if default is not None else None,
+                )
+
+            return await connection.run_sync(inspect_column)
+    finally:
+        await engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # 1 & 2: exact table set, and concordance with Base.metadata.tables
 # ---------------------------------------------------------------------------
@@ -696,6 +719,11 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     command.current(config)
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
     assert _head_revision() == "0001_baseline"
+    assert asyncio.run(_review_overrides_column(temporary_postgres_url)) == (
+        "jsonb",
+        False,
+        "'{}'::jsonb",
+    )
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -751,6 +779,11 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     # no-op for the schema and trigger definitions.
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert asyncio.run(_review_overrides_column(temporary_postgres_url)) == (
+        "jsonb",
+        False,
+        "'{}'::jsonb",
+    )
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables
     assert asyncio.run(_database_snapshot(temporary_postgres_url)) == schema_definitions
     assert asyncio.run(_trigger_definitions(temporary_postgres_url)) == trigger_definitions

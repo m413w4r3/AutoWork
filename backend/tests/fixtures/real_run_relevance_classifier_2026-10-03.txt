@@ -1,0 +1,340 @@
+@@ CLASSIFICATION C001 @@
+handle: E001
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C002 @@
+handle: E002
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C003 @@
+handle: E003
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C004 @@
+handle: E004
+classification: DIRECT
+reason_code: subject_matched_primary
+END CLASSIFICATION
+@@ CLASSIFICATION C005 @@
+handle: E005
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C006 @@
+handle: E006
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C007 @@
+handle: E007
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C008 @@
+handle: E008
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C009 @@
+handle: E009
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C010 @@
+handle: E010
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C011 @@
+handle: E011
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C012 @@
+handle: E012
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C013 @@
+handle: E013
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C014 @@
+handle: E014
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C015 @@
+handle: E015
+classification: OUT_OF_SCOPE
+reason_code: subject_link_not_demonstrated
+END CLASSIFICATION
+@@ CLASSIFICATION C016 @@
+handle: E016
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C017 @@
+handle: E017
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C018 @@
+handle: E018
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C019 @@
+handle: E019
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C020 @@
+handle: E020
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C021 @@
+handle: E021
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C022 @@
+handle: E022
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C023 @@
+handle: E023
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C024 @@
+handle: E024
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C025 @@
+handle: E025
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C026 @@
+handle: E026
+classification: DIRECT
+reason_code: malicious_subject_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C027 @@
+handle: E027
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C028 @@
+handle: E028
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C029 @@
+handle: E029
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C030 @@
+handle: E030
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C031 @@
+handle: E031
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C032 @@
+handle: E032
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C033 @@
+handle: E033
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C034 @@
+handle: E034
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C035 @@
+handle: E035
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C036 @@
+handle: E036
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C037 @@
+handle: E037
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C038 @@
+handle: E038
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C039 @@
+handle: E039
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C040 @@
+handle: E040
+classification: DIRECT
+reason_code: subject_matched_primary
+END CLASSIFICATION
+@@ CLASSIFICATION C041 @@
+handle: E041
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C042 @@
+handle: E042
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C043 @@
+handle: E043
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C044 @@
+handle: E044
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C045 @@
+handle: E045
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C046 @@
+handle: E046
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C047 @@
+handle: E047
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C048 @@
+handle: E048
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C049 @@
+handle: E049
+classification: DIRECT
+reason_code: malicious_subject_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C050 @@
+handle: E050
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C051 @@
+handle: E051
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C052 @@
+handle: E052
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C053 @@
+handle: E053
+classification: DIRECT
+reason_code: malicious_subject_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C054 @@
+handle: E054
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C055 @@
+handle: E055
+classification: CONTEXT
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C056 @@
+handle: E056
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C057 @@
+handle: E057
+classification: DIRECT
+reason_code: subject_matched_primary
+END CLASSIFICATION
+@@ CLASSIFICATION C058 @@
+handle: E058
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION
+@@ CLASSIFICATION C059 @@
+handle: E059
+classification: OUT_OF_SCOPE
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C060 @@
+handle: E060
+classification: OUT_OF_SCOPE
+reason_code: subject_link_not_demonstrated
+END CLASSIFICATION
+@@ CLASSIFICATION C061 @@
+handle: E061
+classification: OUT_OF_SCOPE
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C062 @@
+handle: E062
+classification: OUT_OF_SCOPE
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C063 @@
+handle: E063
+classification: OUT_OF_SCOPE
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C064 @@
+handle: E064
+classification: OUT_OF_SCOPE
+reason_code: context_source_without_relation
+END CLASSIFICATION
+@@ CLASSIFICATION C065 @@
+handle: E065
+classification: INDETERMINATE
+reason_code: subject_link_not_demonstrated
+END CLASSIFICATION
+@@ CLASSIFICATION C066 @@
+handle: E066
+classification: OUT_OF_SCOPE
+reason_code: subject_link_not_demonstrated
+END CLASSIFICATION
+@@ CLASSIFICATION C067 @@
+handle: E067
+classification: INDETERMINATE
+reason_code: subject_link_not_demonstrated
+END CLASSIFICATION
+@@ CLASSIFICATION C068 @@
+handle: E068
+classification: OUT_OF_SCOPE
+reason_code: explicit_other_actor
+END CLASSIFICATION

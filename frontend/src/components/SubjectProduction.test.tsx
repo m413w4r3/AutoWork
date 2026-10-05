@@ -147,6 +147,65 @@ describe("SubjectProduction retry from stage", () => {
     );
   });
 
+  it("enregistre le choix explicite de poursuivre sous le seuil de preuves", async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.href
+            : input.url;
+      if (init?.method === "POST") {
+        return Promise.resolve(Response.json({ status: "running" }));
+      }
+      if (url.endsWith("/production/runs")) {
+        return Promise.resolve(Response.json([]));
+      }
+      return Promise.resolve(
+        Response.json({
+          ...status("needs_review", "synthesis"),
+          error_code: "production_insufficient_subject_evidence",
+          error_message:
+            "Le sujet n'est étayé que par 2 éléments directs ; la synthèse serait générique.",
+          error_details: {
+            direct_count: 2,
+            minimum: 4,
+            context_count: 9,
+            out_of_scope_count: 3,
+            projection_artifact_id: "projection-1",
+          },
+        }),
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const user = userEvent.setup();
+    renderProduction();
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Le sujet n'est étayé que par 2 éléments directs",
+    );
+    await user.click(
+      screen.getByRole("button", {
+        name: "Continuer malgré le seuil de preuves",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/subjects/${SUBJECT_ID}/production/retry`,
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            stage: "synthesis",
+            override_insufficient_subject_evidence: true,
+            override_reason:
+              "Le relecteur a choisi de poursuivre malgré le seuil de preuves directes.",
+          }),
+        }),
+      ),
+    );
+  });
+
   it("démarre un run via le batch et réutilise la même clé après une erreur réseau", async () => {
     const postCalls: RequestInit[] = [];
     let attempts = 0;

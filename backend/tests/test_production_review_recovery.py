@@ -41,6 +41,7 @@ from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
+    PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -155,9 +156,10 @@ class _Artifacts:
     def __init__(self) -> None:
         self.staled: list[str] = []
         self.missing: set[str] = set()
+        self.current: dict[str, Any] = {}
 
     async def get_current(self, run_id: UUID, stage: str) -> Any:
-        return None if stage in self.missing else object()
+        return None if stage in self.missing else self.current.get(stage, object())
 
     async def mark_from_stage_stale(self, run_id: UUID, stage: str) -> list[str]:
         self.staled.append(stage)
@@ -444,13 +446,54 @@ async def test_review_retry_reopens_the_finished_batch_and_reaches_assembly(
     ]
     assert jobs.cancelled == []
     assert world.run.status is ProductionRunStatus.READY
-    # The batch closes itself again once the corrected article is terminal —
-    # cleanly this time, since every article of the batch is now ready.
     assert world.batch.status is ProductionBatchStatus.COMPLETED
     assert world.batch.phase is ProductionBatchPhase.REVIEW
-    # Review-time recovery never changes the edition state or version.
     assert world.uow.editions.edition.state is EditionStatus.OPEN
     assert world.uow.editions.edition.version == 1
+
+
+async def test_insufficient_evidence_override_records_once_and_retries_synthesis() -> None:
+    world = _World(stage=ProductionStage.SYNTHESIS)
+    projection_artifact_id = uuid4()
+    world.run.error_code = PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE
+    world.run.error_message = (
+        "Le sujet n'est étayé que par 2 éléments directs ; la synthèse serait générique."
+    )
+    world.run.error_details = {
+        "projection_artifact_id": str(projection_artifact_id),
+        "minimum": 4,
+        "direct_count": 2,
+        "context_count": 8,
+        "out_of_scope_count": 3,
+    }
+    world.uow.production_artifacts.current[ProductionStage.RELEVANCE_PROJECTION.value] = (
+        SimpleNamespace(id=projection_artifact_id)
+    )
+    service = SubjectProductionService(cast(Any, world.factory))
+
+    first = await service.retry_from_stage(
+        world.run.id,
+        ProductionStage.SYNTHESIS,
+        override_insufficient_subject_evidence=True,
+        override_actor_id="analyst-7",
+        override_reason="Reviewed the counter-analysis and chose to proceed.",
+    )
+    second = await service.retry_from_stage(
+        world.run.id,
+        ProductionStage.SYNTHESIS,
+        override_insufficient_subject_evidence=True,
+        override_actor_id="analyst-7",
+        override_reason="Reviewed the counter-analysis and chose to proceed.",
+    )
+
+    assert first.run.status is ProductionRunStatus.RUNNING
+    assert first.review_override is not None
+    assert first.review_override["actor_id"] == "analyst-7"
+    assert len(first.run.review_overrides) == 1
+    assert second.already_applied is True
+    assert second.review_override == first.review_override
+    assert second.run.pipeline_generation == first.run.pipeline_generation
+    assert len(second.run.review_overrides) == 1
 
 
 async def test_a_still_running_batch_keeps_its_own_phase_on_retry(

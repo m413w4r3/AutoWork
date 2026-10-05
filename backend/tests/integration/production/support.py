@@ -302,6 +302,9 @@ class ScriptedModelScript:
                 else self._editorial_enrichment
             )
 
+        if request.prompt_template_id == "production-semantic-annotation":
+            return "NO ANNOTATIONS"
+
         raise AssertionError(
             "No scripted model response for "
             f"{request.prompt_template_id}/{request.routing_hint.value}"

@@ -11,7 +11,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from cti_app.application import production_workflow
 from cti_app.application.persistence import UnitOfWorkFactory
+from cti_app.config import get_settings
 from cti_app.infrastructure.database.session import (
     create_postgres_engine,
     create_session_factory,
@@ -101,3 +103,10 @@ def uow_factory(migrated_postgres_url: str) -> UnitOfWorkFactory:
         return SqlAlchemyUnitOfWork(session_factory)
 
     return factory
+
+
+@pytest.fixture
+def production_evidence_gate_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disable only the gate for integration suites whose fake data is minimal."""
+    runtime_settings = get_settings().model_copy(update={"production_min_direct_evidence_items": 0})
+    monkeypatch.setattr(production_workflow, "get_settings", lambda: runtime_settings)

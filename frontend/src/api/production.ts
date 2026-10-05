@@ -1140,6 +1140,10 @@ export async function importProductionState(
 export async function retryProductionStage(
   subjectId: string,
   stage: ProductionStage,
+  options: {
+    overrideInsufficientSubjectEvidence?: boolean;
+    overrideReason?: string;
+  } = {},
 ): Promise<{
   run_id: string;
   status: string;
@@ -1149,7 +1153,15 @@ export async function retryProductionStage(
   return request(`/api/subjects/${subjectId}/production/retry`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ stage }),
+    body: JSON.stringify({
+      stage,
+      ...(options.overrideInsufficientSubjectEvidence
+        ? { override_insufficient_subject_evidence: true }
+        : {}),
+      ...(options.overrideReason
+        ? { override_reason: options.overrideReason }
+        : {}),
+    }),
   });
 }
 

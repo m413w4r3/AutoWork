@@ -55,6 +55,7 @@ from cti_app.domain.production_relevance import (
     RelevanceProposalRejectionReason,
     RelevanceProposalRejectionV1,
     RelevanceReasonCode,
+    RelevanceSourcePairRelation,
     RelevanceSourcePairRelationV1,
     relevance_projection_from_json,
     relevance_projection_to_json,
@@ -86,6 +87,13 @@ _GENERIC_FILENAMES = frozenset(
         "requirements.txt",
         "package.json",
     }
+)
+_COUNTER_ANALYSIS_TECHNIQUE_PATTERNS = (
+    ("OP_RETURN", re.compile(r"(?<![a-z0-9])op[ _-]*return(?![a-z0-9])", re.I)),
+    ("Bitcoin", re.compile(r"(?<![a-z0-9])bitcoin(?![a-z0-9])", re.I)),
+    ("Ethereum", re.compile(r"(?<![a-z0-9])ethereum(?![a-z0-9])", re.I)),
+    ("EVM", re.compile(r"(?<![a-z0-9])evm(?![a-z0-9])", re.I)),
+    ("JSON-RPC", re.compile(r"(?<![a-z0-9])json[ _-]*rpc(?![a-z0-9])", re.I)),
 )
 _BROAD_SCOPE_WORDS = frozenset(
     {
@@ -369,6 +377,147 @@ class DeterministicRelevanceClassifier:
         return tuple(classifications)
 
 
+def _counter_analysis_overlap_fallback(
+    extraction: ProductionExtractionV1,
+    evidence: tuple[tuple[ExtractionEvidenceRefV1, Mapping[str, Any]], ...],
+    classifications: tuple[RelevanceClassificationItemV1, ...],
+) -> tuple[
+    Mapping[ExtractionEvidenceRefV1, tuple[ExtractionEvidenceRefV1, ...]],
+    tuple[RelevanceSourcePairRelationV1, ...],
+]:
+    """Link named protocol overlaps in reserve uncertainties to primary claims.
+
+    Only a curated set of protocol/technique names and exact primary IOC values
+    can create this fallback. Generic word overlap is intentionally insufficient.
+    It changes an uncertain counter-reading into reserve evidence, never a direct
+    claim.
+    """
+    sources = {source.source_document_id: source for source in extraction.sources}
+    payloads = dict(evidence)
+    decisions = {item.evidence_ref: item for item in classifications}
+    direct_claims: list[ExtractionEvidenceRefV1] = []
+    for ref, item in decisions.items():
+        source = sources[ref.source_document_id]
+        if (
+            item.classification is RelevanceClassification.DIRECT
+            and source.profile.value == "full"
+            and source.editorial_role is ProductionEditorialRole.PRIMARY
+            and ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT, EvidenceKind.INDICATOR}
+        ):
+            direct_claims.append(ref)
+
+    def named_tokens(ref: ExtractionEvidenceRefV1, payload: Mapping[str, Any]) -> set[str]:
+        text = _item_text(ref.kind, payload)
+        tokens = {
+            label for label, pattern in _COUNTER_ANALYSIS_TECHNIQUE_PATTERNS if pattern.search(text)
+        }
+        if ref.kind is EvidenceKind.INDICATOR:
+            value = str(payload.get("value") or "").strip()
+            if len(value) >= 5 and value.casefold() in text.casefold():
+                tokens.add(value.casefold())
+        return tokens
+
+    direct_tokens = {ref: named_tokens(ref, payloads[ref]) for ref in direct_claims}
+    supporting_for_counter: dict[ExtractionEvidenceRefV1, tuple[ExtractionEvidenceRefV1, ...]] = {}
+    relation_refs: dict[tuple[UUID, UUID], set[ExtractionEvidenceRefV1]] = {}
+    relation_tokens: dict[tuple[UUID, UUID], set[str]] = {}
+    for ref, payload in evidence:
+        source = sources[ref.source_document_id]
+        if (
+            ref.kind is not EvidenceKind.UNCERTAINTY
+            or source.editorial_role is not ProductionEditorialRole.COUNTER_ANALYSIS
+        ):
+            continue
+        counter_text = _item_text(ref.kind, payload)
+        counter_tokens = {
+            label
+            for label, pattern in _COUNTER_ANALYSIS_TECHNIQUE_PATTERNS
+            if pattern.search(counter_text)
+        }
+        if not counter_tokens:
+            continue
+        matches = [
+            (direct_ref, counter_tokens & direct_tokens[direct_ref])
+            for direct_ref in direct_claims
+            if counter_tokens & direct_tokens[direct_ref]
+        ]
+        if not matches:
+            continue
+        matches.sort(key=lambda entry: (-len(entry[1]), evidence_ref_sort_key(entry[0])))
+        direct_ref, overlap = matches[0]
+        supporting_for_counter[ref] = (direct_ref,)
+        ordered_source_ids = sorted(
+            {ref.source_document_id, direct_ref.source_document_id},
+            key=str,
+        )
+        pair = (ordered_source_ids[0], ordered_source_ids[1])
+        relation_refs.setdefault(pair, set()).update((ref, direct_ref))
+        relation_tokens.setdefault(pair, set()).update(overlap)
+
+    relations = tuple(
+        RelevanceSourcePairRelationV1(
+            relation=RelevanceSourcePairRelation.COUNTER_INDICATION,
+            reason=(
+                "Counter-analysis uncertainty shares the named technique/protocol "
+                f"{', '.join(sorted(relation_tokens[pair], key=str.casefold))} with a "
+                "primary direct claim. Treat it as a qualification; it does not prove "
+                "the same transactions or attribution."
+            ),
+            supporting_evidence_refs=tuple(sorted(relation_refs[pair], key=evidence_ref_sort_key)),
+            provenance=RelevanceDecisionProvenance.DETERMINISTIC_POLICY,
+        )
+        for pair in sorted(relation_refs, key=lambda value: tuple(map(str, value)))
+    )
+    return supporting_for_counter, relations
+
+
+def subject_relevance_evidence_counts(
+    projection: RelevanceProjectionV1,
+) -> dict[str, int]:
+    """Count narrative facts/events for the production substance gate."""
+    narrative = tuple(
+        item
+        for item in projection.classifications
+        if item.evidence_ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
+    )
+    return {
+        # Corroboration is independently supported subject evidence for this gate.
+        "direct_count": sum(
+            item.classification
+            in {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
+            for item in narrative
+        ),
+        "context_count": sum(
+            item.classification is RelevanceClassification.CONTEXT for item in narrative
+        ),
+        "out_of_scope_count": sum(
+            item.classification is RelevanceClassification.OUT_OF_SCOPE for item in narrative
+        ),
+    }
+
+
+def production_evidence_gate_details(
+    counts: Mapping[str, int],
+    *,
+    minimum: int,
+    projection_artifact_id: UUID,
+    override_active: bool,
+) -> dict[str, Any] | None:
+    """Return a review payload only when current evidence is below the gate."""
+    if minimum < 0:
+        raise ValueError("Production evidence minimum cannot be negative")
+    direct_count = counts["direct_count"]
+    if minimum == 0 or direct_count >= minimum or override_active:
+        return None
+    return {
+        "direct_count": direct_count,
+        "minimum": minimum,
+        "context_count": counts["context_count"],
+        "out_of_scope_count": counts["out_of_scope_count"],
+        "projection_artifact_id": str(projection_artifact_id),
+    }
+
+
 def relevance_projection_input_hash(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
@@ -404,6 +553,32 @@ def build_relevance_projection(
     evidence = tuple(
         (ref, evidence_by_ref[ref]) for ref in sorted(evidence_by_ref, key=evidence_ref_sort_key)
     )
+    classifications = selected_classifier.classify(snapshot, extraction, evidence)
+    counter_supporting, fallback_relations = _counter_analysis_overlap_fallback(
+        extraction, evidence, classifications
+    )
+    classifications = tuple(
+        RelevanceClassificationItemV1(
+            evidence_ref=item.evidence_ref,
+            classification=RelevanceClassification.COUNTER_INDICATION,
+            reason_code=RelevanceReasonCode.EXPLICIT_COUNTER_ANALYSIS,
+            supporting_evidence_refs=tuple(
+                sorted(
+                    {item.evidence_ref, *counter_supporting[item.evidence_ref]},
+                    key=evidence_ref_sort_key,
+                )
+            ),
+            provenance=RelevanceDecisionProvenance.DETERMINISTIC_POLICY,
+        )
+        if item.evidence_ref in counter_supporting
+        else item
+        for item in classifications
+    )
+    supplied_pairs = {item.source_pair for item in source_pair_relations}
+    source_pair_relations = (
+        *source_pair_relations,
+        *(item for item in fallback_relations if item.source_pair not in supplied_pairs),
+    )
     projection = RelevanceProjectionV1(
         subject_id=snapshot.subject_id,
         production_input_hash=snapshot.input_hash,
@@ -412,7 +587,7 @@ def build_relevance_projection(
             snapshot, extraction, classifier_version=selected_classifier.version
         ),
         extraction_evidence_refs=extraction_evidence_refs_v1(extraction),
-        classifications=selected_classifier.classify(snapshot, extraction, evidence),
+        classifications=classifications,
         source_pair_relations=source_pair_relations,
         model_proposal_rejections=model_proposal_rejections,
         classifier_version=selected_classifier.version,
@@ -504,6 +679,17 @@ async def persist_relevance_projection_in_uow(
             "indeterminate_count": sum(
                 item.classification is RelevanceClassification.INDETERMINATE
                 for item in projection.classifications
+            ),
+            "subject_evidence_counts": subject_relevance_evidence_counts(projection),
+            "model_proposal_rejection_count": len(projection.model_proposal_rejections),
+            "model_proposal_rejection_codes": sorted(
+                {item.reason_code.value for item in projection.model_proposal_rejections}
+            ),
+            "source_pair_relation_count": len(projection.source_pair_relations),
+            "counter_analysis_fallback_relation_count": sum(
+                item.provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+                and item.relation is RelevanceSourcePairRelation.COUNTER_INDICATION
+                for item in projection.source_pair_relations
             ),
             **dict(artifact_metadata or {}),
         },
@@ -632,6 +818,8 @@ class ProductionRelevanceProjectionService:
                     error_code=proposal.error_code or "relevance_classifier_model_call_failed",
                     reason=proposal.error or "The relevance classifier proposal is unavailable.",
                     details=proposal.details,
+                    model_proposal_rejections=proposal.rejections,
+                    model_proposal_warnings=proposal.warnings,
                     model_calls=proposal.model_calls,
                     model_run_id=proposal.model_run_id,
                     invocation_hash=proposal.invocation_hash,
@@ -645,7 +833,16 @@ class ProductionRelevanceProjectionService:
                 "model_invocation_hash": proposal.invocation_hash,
                 "model_parse_identity": proposal.parse_identity,
                 "model_proposal_rejection_count": len(projection.model_proposal_rejections),
+                "model_proposal_rejection_codes": sorted(
+                    {item.reason_code.value for item in projection.model_proposal_rejections}
+                ),
+                "model_proposal_warnings": list(proposal.warnings),
                 "source_pair_relation_count": len(projection.source_pair_relations),
+                "counter_analysis_fallback_relation_count": sum(
+                    item.provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+                    and item.relation is RelevanceSourcePairRelation.COUNTER_INDICATION
+                    for item in projection.source_pair_relations
+                ),
             }
         async with self._uow_factory() as uow:
             execution = await persist_relevance_projection_in_uow(
@@ -669,6 +866,10 @@ class ProductionRelevanceProjectionService:
                 details={
                     **dict(proposal.details),
                     "model_proposal_rejection_count": len(projection.model_proposal_rejections),
+                    "model_proposal_rejection_codes": sorted(
+                        {item.reason_code.value for item in projection.model_proposal_rejections}
+                    ),
+                    "model_proposal_warnings": list(proposal.warnings),
                     "source_pair_relation_count": len(projection.source_pair_relations),
                 },
             )
@@ -682,12 +883,18 @@ class ProductionRelevanceProjectionService:
         error_code: str,
         reason: str,
         details: Mapping[str, Any] | None = None,
+        model_proposal_rejections: tuple[RelevanceProposalRejectionV1, ...] = (),
+        model_proposal_warnings: tuple[str, ...] = (),
         model_calls: int = 0,
         model_run_id: UUID | None = None,
         invocation_hash: str | None = None,
         parse_identity: str | None = None,
     ) -> RelevanceProjectionExecution:
         fallback = {"error_code": error_code, "reason": reason}
+        baseline = replace(
+            baseline,
+            model_proposal_rejections=model_proposal_rejections,
+        )
         async with self._uow_factory() as uow:
             execution = await persist_relevance_projection_in_uow(
                 uow,
@@ -695,7 +902,15 @@ class ProductionRelevanceProjectionService:
                 snapshot,
                 baseline,
                 self._artifact_store,
-                artifact_metadata={"model_classifier_fallback": fallback},
+                artifact_metadata={
+                    "model_classifier_fallback": fallback,
+                    "model_proposal_rejection_count": len(model_proposal_rejections),
+                    "model_proposal_rejection_codes": sorted(
+                        {item.reason_code.value for item in model_proposal_rejections}
+                    ),
+                    "model_proposal_warnings": list(model_proposal_warnings),
+                    "source_pair_relation_count": len(baseline.source_pair_relations),
+                },
             )
             if execution.artifact is not None:
                 execution.artifact.metadata = {
@@ -714,7 +929,15 @@ class ProductionRelevanceProjectionService:
             model_run_id=model_run_id,
             invocation_hash=invocation_hash,
             parse_identity=parse_identity,
-            details={**dict(details or {}), "model_classifier_fallback": fallback},
+            details={
+                **dict(details or {}),
+                "model_classifier_fallback": fallback,
+                "model_proposal_rejection_count": len(model_proposal_rejections),
+                "model_proposal_rejection_codes": sorted(
+                    {item.reason_code.value for item in model_proposal_rejections}
+                ),
+                "model_proposal_warnings": list(model_proposal_warnings),
+            },
         )
 
     async def _reuse_exact(
@@ -755,6 +978,18 @@ class ProductionRelevanceProjectionService:
         evidence = dict(extraction_evidence_elements(extraction))
         decisions = {item.evidence_ref: item for item in baseline.classifications}
         rejections = list(proposal.rejections)
+        fallback_supporting, fallback_relations = _counter_analysis_overlap_fallback(
+            extraction,
+            tuple(sorted(evidence.items(), key=lambda entry: evidence_ref_sort_key(entry[0]))),
+            baseline.classifications,
+        )
+        model_relation_pairs = {item.source_pair for item in proposal.source_pair_relations}
+        fallback_pair_by_ref = {
+            ref: relation.source_pair
+            for relation in fallback_relations
+            for ref in relation.supporting_evidence_refs
+            if ref in fallback_supporting
+        }
         seen: set[ExtractionEvidenceRefV1] = set()
         for item in proposal.classifications:
             if item.evidence_ref in seen:
@@ -789,9 +1024,31 @@ class ProductionRelevanceProjectionService:
                     )
                     continue
             baseline_decision = decisions[item.evidence_ref]
+            fallback_pair = fallback_pair_by_ref.get(item.evidence_ref)
+            if (
+                fallback_pair is not None
+                and fallback_pair not in model_relation_pairs
+                and item.classification
+                not in {
+                    RelevanceClassification.CONTEXT,
+                    RelevanceClassification.COUNTER_INDICATION,
+                }
+            ):
+                rejections.append(
+                    RelevanceProposalRejectionV1(
+                        item.block_id,
+                        RelevanceProposalRejectionReason.COUNTER_ANALYSIS_RESERVE_GUARD,
+                        item.raw_sha256,
+                    )
+                )
+                continue
             supporting = tuple(
                 sorted(
-                    {item.evidence_ref, *item.supporting_evidence_refs},
+                    {
+                        item.evidence_ref,
+                        *item.supporting_evidence_refs,
+                        *fallback_supporting.get(item.evidence_ref, ()),
+                    },
                     key=evidence_ref_sort_key,
                 )
             )
@@ -853,10 +1110,12 @@ class ProductionRelevanceProjectionService:
                 provenance=RelevanceDecisionProvenance.MODEL_PROPOSAL,
             )
 
+        relation_by_pair = {item.source_pair: item for item in baseline.source_pair_relations}
+        relation_by_pair.update({item.source_pair: item for item in proposal.source_pair_relations})
         projection = replace(
             baseline,
             classifications=tuple(decisions.values()),
-            source_pair_relations=proposal.source_pair_relations,
+            source_pair_relations=tuple(relation_by_pair.values()),
             model_proposal_rejections=tuple(rejections),
         )
         validate_relevance_projection_lineage(

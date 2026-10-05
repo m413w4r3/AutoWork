@@ -548,7 +548,8 @@ async def test_duplicate_job_delivery_has_one_business_effect(
     jobs = await _jobs_for_run(scenario)
     assert len([job for job in jobs if job.kind == extraction_job.kind]) == 1
     assert extraction_job.status is JobStatus.SUCCEEDED
-    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 5
+    # The editorial semantic annotation now has its own persisted ModelRun.
+    assert len({call.model_run_id for call in scenario.model.calls if call.model_run_id}) == 6
     await _assert_artifact_invariants(scenario, artifacts)
 
 
@@ -639,6 +640,7 @@ class _MissingBridgeRun:
             "run not found",
             retryable=False,
             status_code=404,
+            verified_no_answer=True,
         )
 
 
@@ -703,11 +705,17 @@ async def test_automatic_probe_404_restarts_production_without_resubmitting_prob
     await runner.run_until_idle()
 
     final, _, item, batch = await _state(scenario)
-    assert final.status is ProductionRunStatus.READY
+    assert final.status is ProductionRunStatus.READY, (
+        final.error_code,
+        final.error_message,
+        final.error_details,
+    )
     assert final.error_code is None
     assert final.reconciliation is None
     assert final.pipeline_generation == 1
-    assert item is not None and item.auto_recovery_count == 1
+    assert item is not None
+    assert item.auto_recovery_count == 0
+    assert item.verified_reemission_count == 1
     assert batch is not None and batch.status is ProductionBatchStatus.COMPLETED
     assert bridge.calls == [f"{review.reconciliation.model_run_id}:a1"]
     extraction_calls = [call for call in scenario.model.calls if call.stage == "extraction"]

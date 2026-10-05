@@ -51,7 +51,10 @@ addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
-markers = ["integration: requires a temporary PostgreSQL database"]
+markers = [
+  "integration: requires a temporary PostgreSQL database",
+  "production_evidence_gate: exercises the production subject-evidence threshold",
+]
 
 [tool.ruff]
 line-length = 100

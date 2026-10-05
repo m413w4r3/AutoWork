@@ -466,6 +466,7 @@ def test_technical_pack_is_contextual_body_free_deterministic_and_bounded():
         "kind",
         "source_role",
         "editorial_role",
+        "source_label",
         "type",
         "name",
         "sha256",

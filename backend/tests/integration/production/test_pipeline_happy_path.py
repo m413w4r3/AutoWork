@@ -306,11 +306,15 @@ async def test_complete_production_pipeline_reaches_ready(
         for call in scenario.model.provider_calls
         if call.prompt_template_id == "production-editorial-enrichment"
     ]
+    semantic_annotation_requests = [
+        call
+        for call in scenario.model.provider_calls
+        if call.prompt_template_id == "production-semantic-annotation"
+    ]
     assert model_calls[0].stage == "references"
     assert model_calls[-1].stage == "editorial_enrichment"
-    assert all(call.stage == "extraction" for call in model_calls[1:-3])
-    assert model_calls[-3].stage == "relevance_projection"
-    assert model_calls[-2].stage == "synthesis"
+    assert len([call for call in model_calls if call.stage == "relevance_projection"]) == 1
+    assert len([call for call in model_calls if call.stage == "synthesis"]) == 1
     # Canonical Synthesis is one stateless structured draft through the gateway.
     assert len(synthesis_requests) == 1
     assert synthesis_requests[0].web_search is False
@@ -318,11 +322,15 @@ async def test_complete_production_pipeline_reaches_ready(
     assert len(editorial_requests) == 1
     assert editorial_requests[0].web_search is False
     assert editorial_requests[0].conversation is None
+    # Editorial Enrichment drafts its grounded structures, then independently
+    # proposes semantic annotations for the final publication text.
+    assert len(semantic_annotation_requests) == 1
     covered_q2_urls = tuple(url for call in q2_calls for url in call.source_urls)
     assert set(covered_q2_urls) == set(SOURCE_URLS)
     assert covered_q2_urls == SOURCE_URLS
-    # references, relevance projection, synthesis and editorial enrichment
-    assert len(model_calls) == 4 + len(q2_calls)
+    # references, relevance projection, synthesis, semantic annotation and
+    # editorial enrichment, in addition to the source extraction calls.
+    assert len(model_calls) == 5 + len(q2_calls)
     # Only the References stage searches the web; extraction and synthesis are
     # stateless and offline.
     assert all(call.web_search is (call.stage == "references") for call in model_calls)

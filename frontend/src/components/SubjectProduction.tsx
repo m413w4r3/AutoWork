@@ -144,6 +144,9 @@ function issueCopy(
   if (errorCode === "synthesis_validation_failed") {
     return "Validation de synthèse échouée — consultez les détails de l’étape.";
   }
+  if (errorCode === "production_insufficient_subject_evidence") {
+    return "La synthèse est suspendue : le sujet ne dispose pas d’assez d’éléments directs.";
+  }
   if (errorCode === "editorial_enrichment_empty_after_rejections") {
     return "Toutes les tables, tous les diagrammes et toutes les figures proposés ont été rejetés. Vérifiez l’enrichissement éditorial avant de poursuivre.";
   }
@@ -208,6 +211,15 @@ export function SubjectProduction({
 
   const retryStageMutation = useMutation({
     mutationFn: (stage: RetryStage) => retryProductionStage(subjectId, stage),
+    onSuccess: () => refetch(),
+  });
+  const evidenceOverrideMutation = useMutation({
+    mutationFn: () =>
+      retryProductionStage(subjectId, "synthesis", {
+        overrideInsufficientSubjectEvidence: true,
+        overrideReason:
+          "Le relecteur a choisi de poursuivre malgré le seuil de preuves directes.",
+      }),
     onSuccess: () => refetch(),
   });
 
@@ -541,6 +553,32 @@ export function SubjectProduction({
             </button>
           </div>
         )}
+
+      {status.status === "needs_review" &&
+      issueCode === "production_insufficient_subject_evidence" ? (
+        <div className="production-retry-primary">
+          <p>
+            Vous pouvez examiner le périmètre des preuves, puis choisir
+            explicitement de continuer malgré ce seuil. Cette décision sera
+            enregistrée avec votre identité.
+          </p>
+          <button
+            className="button button--secondary"
+            onClick={() => evidenceOverrideMutation.mutate()}
+            disabled={evidenceOverrideMutation.isPending}
+          >
+            {evidenceOverrideMutation.isPending
+              ? "Poursuite…"
+              : "Continuer malgré le seuil de preuves"}
+          </button>
+          {evidenceOverrideMutation.error ? (
+            <p className="error-message" role="alert">
+              La dérogation n’a pas pu être enregistrée :{" "}
+              {String(evidenceOverrideMutation.error)}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
 
       {retryStageMutation.error ? (
         <p className="error-message" role="alert">

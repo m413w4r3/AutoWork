@@ -103,7 +103,7 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v6-ranked-uncertainty-handles"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v7-counter-reserve"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
@@ -986,10 +986,12 @@ def _prompt_evidence_record(
     source: Any,
 ) -> dict[str, Any]:
     """Project source-local extraction evidence without internal document IDs."""
+    source_label = (urlsplit(source.canonical_url).hostname or "source").removeprefix("www.")
     if kind is EvidenceKind.FACT:
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_label": source_label,
             "source_role": source.role.value,
             "editorial_role": source.editorial_role.value,
             "category": payload["category"],
@@ -1002,6 +1004,7 @@ def _prompt_evidence_record(
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_label": source_label,
             "source_role": source.role.value,
             "editorial_role": source.editorial_role.value,
             "event_date": payload["event_date"],
@@ -1014,6 +1017,7 @@ def _prompt_evidence_record(
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_label": source_label,
             "source_role": source.role.value,
             "editorial_role": source.editorial_role.value,
             "value": payload["value"],
@@ -1025,6 +1029,7 @@ def _prompt_evidence_record(
         return {
             "handle": handle,
             "kind": kind.value,
+            "source_label": source_label,
             "source_role": source.role.value,
             "editorial_role": source.editorial_role.value,
             "text": payload["text"],
@@ -1032,6 +1037,7 @@ def _prompt_evidence_record(
     return {
         "handle": handle,
         "kind": kind.value,
+        "source_label": source_label,
         "source_role": source.role.value,
         "editorial_role": source.editorial_role.value,
         "type": payload["rule_type"],
@@ -1127,10 +1133,6 @@ def build_synthesis_evidence_pack(
         ref
         for ref in entries
         if projection is not None
-        and (
-            ref.kind is not EvidenceKind.UNCERTAINTY
-            or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
-        )
         and projection.classification_for(ref).classification
         is RelevanceClassification.COUNTER_INDICATION
     }
@@ -1139,10 +1141,6 @@ def build_synthesis_evidence_pack(
             ref
             for relation in projection.source_pair_relations
             for ref in relation.supporting_evidence_refs
-            if (
-                ref.kind is not EvidenceKind.UNCERTAINTY
-                or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
-            )
         }
         if projection is not None
         else set()
@@ -1158,7 +1156,7 @@ def build_synthesis_evidence_pack(
                 and admitted(ref)
                 and ref not in counter_refs
             )
-            or ref in uncertainty_refs
+            or (ref in uncertainty_refs and ref not in counter_refs and ref not in relation_refs)
         )
     }
     technical_candidates = [
@@ -1474,6 +1472,8 @@ def build_synthesis_model_request(
             (
                 "@@RESERVES / CONTRADICTIONS — NON-AUTHORITATIVE CONTEXT@@",
                 "These R handles preserve qualifications and source-pair analysis.",
+                "Each reserve includes SOURCE_LABEL.",
+                "Name that source when weaving its limit into the prose.",
                 "They are not claim evidence handles and must not be presented as confirmed facts.",
             )
         )

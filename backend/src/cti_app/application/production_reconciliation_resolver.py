@@ -68,7 +68,7 @@ class ProductionReconciliationResolver:
                 bridge_status = exc.bridge_status
                 if bridge_status is None and exc.status_code == 404:
                     bridge_status = "not_found"
-                if bridge_status in _FAILED_STATUSES and exc.verified_no_answer:
+                if bridge_status in _FAILED_STATUSES | {"not_found"} and exc.verified_no_answer:
                     outcome = await self._release(run_id, run)
                     return outcome
                 # A missing lookup or a generic transport failure does not prove

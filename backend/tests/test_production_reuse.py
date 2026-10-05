@@ -1641,8 +1641,14 @@ def _synthesis_proposal(handles: dict[str, str]) -> dict[str, object]:
     }
 
 
-def _synthesis_world() -> SimpleNamespace:
+def _synthesis_world(
+    monkeypatch: pytest.MonkeyPatch, *, min_direct_evidence_items: int = 0
+) -> SimpleNamespace:
     """One canonical extraction, ready for the SYNTHESIS stage."""
+    settings = production_workflow.get_settings().model_copy(
+        update={"production_min_direct_evidence_items": min_direct_evidence_items}
+    )
+    monkeypatch.setattr(production_workflow, "get_settings", lambda: settings)
     run = _synthesis_run()
     snapshot = _synthesis_snapshot(run)
     source_id = uuid4()
@@ -1707,8 +1713,31 @@ def _synthesis_world() -> SimpleNamespace:
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_uses_extraction_and_only_its_relevance_projection() -> None:
-    world = _synthesis_world()
+async def test_synthesis_stage_blocks_below_configured_subject_evidence_minimum(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _synthesis_world(monkeypatch, min_direct_evidence_items=4)
+
+    result = await world.orchestrator.execute_stage(world.run.id, ProductionStage.SYNTHESIS)
+
+    assert result["status"] == "needs_review"
+    assert result["error_code"] == "production_insufficient_subject_evidence"
+    assert result["error"] == (
+        "Le sujet n'est étayé que par 2 éléments directs ; la synthèse serait générique."
+    )
+    assert result["details"]["direct_count"] == 2
+    assert result["details"]["minimum"] == 4
+    assert result["details"]["context_count"] == 0
+    assert result["details"]["out_of_scope_count"] == 0
+    assert result["details"]["projection_artifact_id"] == str(world.projection_artifact.id)
+    assert world.gateway.requests == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_stage_uses_extraction_and_only_its_relevance_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _synthesis_world(monkeypatch)
     for legacy_input in (
         "load_reference_projection",
         "legacy_technical_extraction_from_payload",
@@ -1745,8 +1774,10 @@ async def test_synthesis_stage_uses_extraction_and_only_its_relevance_projection
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None:
-    first = _synthesis_world()
+async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _synthesis_world(monkeypatch)
     result = await first.orchestrator.execute_stage(first.run.id, ProductionStage.SYNTHESIS)
     assert result["status"] == "success"
     source_artifact = first.artifacts.appended[-1]
@@ -1800,8 +1831,10 @@ async def test_synthesis_stage_exact_reuse_returns_zero_drafting_calls() -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["invalid_payload", "not_verified"])
-async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(failure: str) -> None:
-    world = _synthesis_world()
+async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(
+    failure: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    world = _synthesis_world(monkeypatch)
     if failure == "invalid_payload":
         world.store.blobs[world.extraction_blob_id] = b'{"schema_version": 1}'
     else:
@@ -1818,8 +1851,10 @@ async def test_synthesis_stage_rejects_an_invalid_canonical_extraction(failure: 
 
 
 @pytest.mark.asyncio
-async def test_synthesis_stage_returns_needs_review_without_format_repair() -> None:
-    world = _synthesis_world()
+async def test_synthesis_stage_returns_needs_review_without_format_repair(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = _synthesis_world(monkeypatch)
     world.gateway.proposal = {
         "lead": [{"text": "FooRAT was identified.", "evidence_handles": ["E999"]}],
         "sections": [],

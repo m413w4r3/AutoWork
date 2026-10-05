@@ -71,6 +71,8 @@ from cti_app.application.production_relevance import (
     ProductionRelevanceProjectionService,
     RelevanceProjectionExecution,
     RelevanceProjectionExecutionStatus,
+    production_evidence_gate_details,
+    subject_relevance_evidence_counts,
 )
 from cti_app.application.production_repair_payloads import ProductionRepairPayloadResolver
 from cti_app.application.production_repairs import (
@@ -97,6 +99,7 @@ from cti_app.application.publication_qa import ProductionQAService
 from cti_app.config import get_settings
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.production import (
+    PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
     DetectionRuleType,
     ExtractionProfile,
     ProductionArtifact,
@@ -1390,6 +1393,50 @@ class ProductionWorkflowOrchestrator:
                 "error_code": "synthesis_inputs_missing",
                 "error": "Relevance projection artifact not found",
             }
+        minimum = self._settings.production_min_direct_evidence_items
+        if minimum > 0:
+            if (
+                projection_artifact.status is not ProductionArtifactStatus.VERIFIED
+                or projection_artifact.canonical_blob_id is None
+            ):
+                return {
+                    "stage": "synthesis",
+                    "status": "terminal_error",
+                    "error_code": "synthesis_inputs_missing",
+                    "error": "Verified relevance projection artifact not found",
+                }
+            if self._artifact_store is None:
+                return {
+                    "stage": "synthesis",
+                    "status": "terminal_error",
+                    "error_code": "synthesis_inputs_missing",
+                    "error": "Evidence artifacts are not readable for the production gate",
+                }
+            projection = relevance_projection_from_json(
+                await self._artifact_store.read_json(projection_artifact.canonical_blob_id)
+            )
+            counts = subject_relevance_evidence_counts(projection)
+            gate_details = production_evidence_gate_details(
+                counts,
+                minimum=minimum,
+                projection_artifact_id=projection_artifact.id,
+                override_active=run.has_insufficient_subject_evidence_override(
+                    projection_artifact_id=projection_artifact.id,
+                    minimum=minimum,
+                ),
+            )
+            if gate_details is not None:
+                return {
+                    "stage": "synthesis",
+                    "status": "needs_review",
+                    "error_code": PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
+                    "error": (
+                        f"Le sujet n'est étayé que par {gate_details['direct_count']} "
+                        "éléments directs ; "
+                        "la synthèse serait générique."
+                    ),
+                    "details": gate_details,
+                }
         try:
             execution = await service.execute(
                 run, snapshot, extraction_artifact, projection_artifact

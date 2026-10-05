@@ -115,6 +115,21 @@ _REASON_CODES: dict[RelevanceClassification, frozenset[RelevanceReasonCode]] = {
     ),
 }
 
+_REASON_CLASSIFICATIONS: dict[RelevanceReasonCode, frozenset[RelevanceClassification]] = {
+    reason: frozenset(
+        classification for classification, reasons in _REASON_CODES.items() if reason in reasons
+    )
+    for reason in RelevanceReasonCode
+}
+_REPAIR_REASON_BY_CLASSIFICATION = {
+    RelevanceClassification.DIRECT: RelevanceReasonCode.PRIMARY_CORE_DEFAULT,
+    RelevanceClassification.CORROBORATION: RelevanceReasonCode.SUBJECT_MATCHED_CORROBORATION,
+    RelevanceClassification.CONTEXT: RelevanceReasonCode.CONTEXT_SOURCE_WITHOUT_RELATION,
+    RelevanceClassification.COUNTER_INDICATION: RelevanceReasonCode.EXPLICIT_COUNTER_ANALYSIS,
+    RelevanceClassification.OUT_OF_SCOPE: RelevanceReasonCode.EXPLICIT_OTHER_ACTOR,
+    RelevanceClassification.INDETERMINATE: RelevanceReasonCode.RELATION_NOT_ESTABLISHED,
+}
+
 
 class RelevanceProposalStatus(StrEnum):
     SUCCEEDED = "succeeded"
@@ -173,6 +188,7 @@ class RelevanceWireParseResult:
     transformations: tuple[str, ...] = ()
     #: The model explicitly proposed no change (``@@NONE@@``): a valid empty answer.
     explicit_none: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +205,7 @@ class ModelRelevanceProposalExecution:
     error: str | None = None
     details: Mapping[str, Any] = field(default_factory=dict)
     reconciliation_required: bool = False
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -384,15 +401,38 @@ def build_relevance_classifier_model_request(
         ),
         "Allowed classifications: " + categories,
         "Allowed reason codes: " + reason_codes,
+        "VALID CLASSIFICATION x REASON_CODE PAIRS (use only these exact pairs):",
+        "DIRECT: primary_core_default, subject_matched_primary, malicious_subject_relation",
+        "CORROBORATION: subject_matched_corroboration, malicious_subject_corroboration",
+        "CONTEXT: context_source_without_relation, malicious_role_not_demonstrated",
+        "COUNTER_INDICATION: explicit_counter_analysis, explicit_subject_denial",
+        "OUT_OF_SCOPE: explicit_other_actor",
+        "INDETERMINATE: relation_not_established, subject_link_not_demonstrated",
         (
             "For DIRECT or CORROBORATION on an indicator, cite at least one additional "
             "supporting evidence handle that documents the subject relation."
         ),
         (
-            "For source-pair notes use a RELATION block, cite evidence from exactly "
-            "two FULL sources, and give a concise reason."
+            "For source-pair notes use a RELATION block, cite evidence from exactly two "
+            "sources, including a primary FULL source. A non-primary source may use "
+            "IOC_RULES when its uncertainty bears on the primary claim."
         ),
         "Allowed source-pair relations: " + relations,
+        (
+            "Evaluate uncertainties and limitations from counter_analysis sources and "
+            "other non-primary sources against the relevant primary claims. Keep their "
+            "evidence as CONTEXT or COUNTER_INDICATION and relate it to the primary claim."
+        ),
+        (
+            "Example: Chainalysis attributes an Iranian operation through malware/MOIS; "
+            "Bitquery says the Bitcoin OP_RETURN pattern predates the operation and is "
+            "not attributed to an actor. Record a COUNTER_INDICATION relation against "
+            "the Iranian OP_RETURN attribution claim; do not claim the transactions match."
+        ),
+        (
+            "Example: if a Bitquery uncertainty says an OP_RETURN pattern is unattributed, "
+            "cite both that uncertainty and the Chainalysis OP_RETURN claim in the RELATION block."
+        ),
         "If you propose no classification and no relation, return only @@NONE@@.",
         "Output text blocks only; do not output JSON.",
         "",
@@ -565,6 +605,7 @@ def parse_relevance_classifier_wire(
     classifications: list[RelevanceModelClassificationProposal] = []
     relations: list[RelevanceSourcePairRelationV1] = []
     rejections: list[RelevanceWireRejection] = []
+    warnings: list[str] = []
     seen_block_ids: set[str] = set()
     seen_targets: set[ExtractionEvidenceRefV1] = set()
     seen_pairs: set[tuple[UUID, UUID]] = set()
@@ -605,8 +646,19 @@ def parse_relevance_classifier_wire(
                 reject(block, RelevanceProposalRejectionReason.UNKNOWN_REASON_CODE)
                 continue
             if reason not in _REASON_CODES[classification]:
-                reject(block, RelevanceProposalRejectionReason.INVALID_REASON_FOR_CLASSIFICATION)
-                continue
+                valid_classifications = _REASON_CLASSIFICATIONS[reason]
+                if len(valid_classifications) != 1 or classification in valid_classifications:
+                    reject(
+                        block,
+                        RelevanceProposalRejectionReason.INVALID_REASON_FOR_CLASSIFICATION,
+                    )
+                    continue
+                repaired_reason = _REPAIR_REASON_BY_CLASSIFICATION[classification]
+                warnings.append(
+                    f"relevance_reason_repaired:{block.block_id}:"
+                    f"{reason.value}->{repaired_reason.value}"
+                )
+                reason = repaired_reason
             supporting: set[ExtractionEvidenceRefV1] = set()
             support_text = block.fields.get("supporting_handles", "")
             if support_text:
@@ -669,10 +721,21 @@ def parse_relevance_classifier_wire(
             reject(block, RelevanceProposalRejectionReason.UNKNOWN_HANDLE)
             continue
         source_ids = {ref.source_document_id for ref in support_refs}
-        if len(source_ids) != 2 or any(
-            sources[source_id].profile.value != "full" for source_id in source_ids
-        ):
+        if len(source_ids) != 2:
             reject(block, RelevanceProposalRejectionReason.RELATION_REQUIRES_TWO_FULL_SOURCES)
+            continue
+        pair_sources = tuple(sources[source_id] for source_id in source_ids)
+        both_full = all(source.profile.value == "full" for source in pair_sources)
+        primary_full_with_secondary = any(
+            source.profile.value == "full"
+            and getattr(source.editorial_role, "value", source.editorial_role) == "primary"
+            for source in pair_sources
+        ) and any(
+            getattr(source.editorial_role, "value", source.editorial_role) != "primary"
+            for source in pair_sources
+        )
+        if not (both_full or primary_full_with_secondary):
+            reject(block, RelevanceProposalRejectionReason.RELATION_SOURCES_NOT_ELIGIBLE)
             continue
         ordered_source_ids = sorted(source_ids, key=str)
         pair = (ordered_source_ids[0], ordered_source_ids[1])
@@ -694,6 +757,7 @@ def parse_relevance_classifier_wire(
         tuple(rejections),
         transformations=transformations,
         explicit_none=explicit_none,
+        warnings=tuple(warnings),
     )
 
 
@@ -759,7 +823,7 @@ class ModelRelevanceClassifier:
     def version(self) -> str:
         return ":".join(
             (
-                "model-subject-scope-v2",
+                "model-subject-scope-v3-counter-analysis",
                 self._contract_version,
                 self._prompt_version,
                 self._parser_version,
@@ -952,6 +1016,7 @@ class ModelRelevanceClassifier:
             return ModelRelevanceProposalExecution(
                 status=RelevanceProposalStatus.NEEDS_REVIEW,
                 rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+                warnings=parsed.warnings,
                 model_calls=model_calls,
                 model_run_id=model_run.id,
                 invocation_hash=invocation_hash,
@@ -961,6 +1026,10 @@ class ModelRelevanceClassifier:
                 details={
                     "parse_identity": parse_identity,
                     "rejection_count": len(parsed.rejections),
+                    "rejection_codes": sorted(
+                        {item.reason_code.value for item in parsed.rejections}
+                    ),
+                    "warnings": list(parsed.warnings),
                     "raw_output_sha256": model_run.raw_output_sha256,
                 },
             )
@@ -969,6 +1038,7 @@ class ModelRelevanceClassifier:
             classifications=parsed.classifications,
             source_pair_relations=parsed.source_pair_relations,
             rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+            warnings=parsed.warnings,
             model_calls=model_calls,
             model_run_id=model_run.id,
             invocation_hash=invocation_hash,
@@ -976,6 +1046,8 @@ class ModelRelevanceClassifier:
             details={
                 "raw_output_sha256": model_run.raw_output_sha256,
                 "rejection_count": len(parsed.rejections),
+                "rejection_codes": sorted({item.reason_code.value for item in parsed.rejections}),
+                "warnings": list(parsed.warnings),
             },
         )
 

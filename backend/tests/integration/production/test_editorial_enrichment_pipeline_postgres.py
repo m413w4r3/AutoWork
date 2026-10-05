@@ -127,7 +127,16 @@ async def test_editorial_enrichment_persists_grounded_structures_on_postgres(
     assert len(publication.tables) == len(publication.diagrams) == 1
     assert publication.tables[0].rows[0].cells
     assert publication.diagrams[0].asset_id == compiled_asset_id
-    assert len([call for call in scenario.model.calls if call.stage == "editorial_enrichment"]) == 1
+    assert (
+        len(
+            [
+                request
+                for request in scenario.model.provider_calls
+                if request.prompt_template_id == "production-editorial-enrichment"
+            ]
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio

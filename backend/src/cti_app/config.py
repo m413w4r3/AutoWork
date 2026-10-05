@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     production_model_jitter_min_seconds: float = Field(default=8.0, ge=0)
     production_model_jitter_max_seconds: float = Field(default=20.0, ge=0)
     production_relevance_classifier_enabled: bool = True
+    production_min_direct_evidence_items: int = Field(default=4, ge=0)
     # External web search from Editorial Enrichment is an explicit operator opt-in.
     production_editorial_resource_search_enabled: bool = False
     # Palier de repos long inséré périodiquement pour laisser le bridge

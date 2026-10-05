@@ -159,7 +159,11 @@ class StartEditionProductionRequest(BaseModel):
 
 
 class RetryProductionStageRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     stage: ProductionStage
+    override_insufficient_subject_evidence: bool = False
+    override_reason: str | None = Field(default=None, max_length=500)
 
 
 class ProductionReuseInvalidationRequest(BaseModel):
@@ -743,6 +747,20 @@ def _extraction_rejections(artifact: Any | None) -> ExtractionRejections:
     )
 
 
+def _production_review_message(run: ProductionRun) -> str | None:
+    if run.error_message:
+        return run.error_message
+    if run.error_code != "production_insufficient_subject_evidence":
+        return None
+    direct_count = (run.error_details or {}).get("direct_count")
+    if isinstance(direct_count, int):
+        return (
+            f"Le sujet n'est étayé que par {direct_count} éléments directs ; "
+            "la synthèse serait générique."
+        )
+    return "Le sujet n'est pas suffisamment étayé pour produire une synthèse fiable."
+
+
 def _run_view(run: ProductionRun, edition_id: UUID, *, job_id: UUID | None) -> dict[str, Any]:
     return {
         "run_id": str(run.id),
@@ -753,7 +771,7 @@ def _run_view(run: ProductionRun, edition_id: UUID, *, job_id: UUID | None) -> d
         "job_id": str(job_id) if job_id else None,
         "created_at": run.created_at.isoformat(),
         "error_code": run.error_code,
-        "error_message": run.error_message,
+        "error_message": _production_review_message(run),
         "error_details": run.error_details,
     }
 
@@ -1054,6 +1072,18 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
     "production_active_sibling": (
         "Un autre article du lot est en cours de production. Réessayez quand il sera terminé."
     ),
+    "production_evidence_override_requires_synthesis": (
+        "Cette décision ne s'applique qu'à la synthèse."
+    ),
+    "production_evidence_override_not_available": (
+        "Cette production ne demande pas une dérogation au seuil de preuves."
+    ),
+    "production_evidence_override_details_invalid": (
+        "Les détails de la revue du seuil sont invalides. Rechargez la production."
+    ),
+    "production_evidence_override_projection_changed": (
+        "Le périmètre des preuves a changé. Rechargez la production avant de décider."
+    ),
     "production_batch_not_recoverable": "Le lot de production ne peut pas être rouvert.",
 }
 
@@ -1102,7 +1132,13 @@ async def _retry_production_run(
 
     service = SubjectProductionService(uow_factory)
     try:
-        retry = await service.retry_from_stage(run_id, payload.stage)
+        retry = await service.retry_from_stage(
+            run_id,
+            payload.stage,
+            override_insufficient_subject_evidence=payload.override_insufficient_subject_evidence,
+            override_actor_id=actor_id if payload.override_insufficient_subject_evidence else None,
+            override_reason=payload.override_reason,
+        )
     except ProductionRunNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1114,6 +1150,11 @@ async def _retry_production_run(
             detail=_retry_conflict_detail(e),
         ) from e
     run = retry.run
+    if retry.already_applied:
+        view = _run_view(run, run.edition_id, job_id=None)
+        view["action"] = "production_evidence_override_already_recorded"
+        view["review_override"] = retry.review_override
+        return view
     old_generation = retry.old_generation
     staled = retry.staled_artifacts
 
@@ -1160,6 +1201,8 @@ async def _retry_production_run(
     view["old_generation"] = old_generation
     view["pipeline_generation"] = run.pipeline_generation
     view["staled_artifacts"] = staled
+    if retry.review_override is not None:
+        view["review_override"] = retry.review_override
     return view
 
 

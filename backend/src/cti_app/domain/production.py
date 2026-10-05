@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 from enum import StrEnum
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from cti_app.domain.classification import TLP
 from cti_app.domain.discovery import SourceCandidate, SourceRole
@@ -24,6 +24,9 @@ class ProductionRunStatus(StrEnum):
     NEEDS_REVIEW = "needs_review"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE = "production_insufficient_subject_evidence"
 
 
 class ProductionStage(StrEnum):
@@ -828,6 +831,7 @@ class ProductionRun:
     error_code: str | None = None
     error_message: str | None = None
     error_details: dict[str, Any] | None = None
+    review_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     reconciliation: ProductionSubmissionReconciliation | None = None
     extraction_progress: dict[str, Any] | None = None
     started_at: datetime | None = None
@@ -966,6 +970,58 @@ class ProductionRun:
         self.finished_at = self._timestamp(now, "finished_at")
         self.updated_at = self.finished_at
         self.version += 1
+
+    def record_insufficient_subject_evidence_override(
+        self,
+        *,
+        projection_artifact_id: UUID,
+        minimum: int,
+        direct_count: int,
+        context_count: int,
+        out_of_scope_count: int,
+        actor_id: str,
+        reason: str | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Append one idempotent, actor-attributed decision for this projection."""
+        if minimum < 1 or direct_count < 0 or direct_count >= minimum:
+            raise ValueError("production_evidence_override_not_required")
+        actor_id = " ".join(str(actor_id).replace("\x00", "").split())[:200]
+        if not actor_id:
+            raise ValueError("production_evidence_override_actor_required")
+        cleaned_reason = (
+            " ".join(reason.replace("\x00", "").split())[:500]
+            if reason
+            else "Analyst chose to continue despite insufficient subject evidence."
+        )
+        key = f"{PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE}:{projection_artifact_id}:{minimum}"
+        existing = self.review_overrides.get(key)
+        if existing is not None:
+            return dict(existing)
+        decision_id = uuid5(NAMESPACE_URL, f"production-run-override:{self.id}:{key}")
+        recorded_at = self._timestamp(now, "recorded_at")
+        decision = {
+            "decision_id": str(decision_id),
+            "code": PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
+            "projection_artifact_id": str(projection_artifact_id),
+            "minimum": minimum,
+            "direct_count": direct_count,
+            "context_count": context_count,
+            "out_of_scope_count": out_of_scope_count,
+            "actor_id": actor_id,
+            "reason": cleaned_reason,
+            "created_at": recorded_at.isoformat(),
+        }
+        self.review_overrides = {**self.review_overrides, key: decision}
+        self.updated_at = recorded_at
+        self.version += 1
+        return dict(decision)
+
+    def has_insufficient_subject_evidence_override(
+        self, *, projection_artifact_id: UUID, minimum: int
+    ) -> bool:
+        key = f"{PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE}:{projection_artifact_id}:{minimum}"
+        return key in self.review_overrides
 
     @property
     def requires_reconciliation(self) -> bool:
