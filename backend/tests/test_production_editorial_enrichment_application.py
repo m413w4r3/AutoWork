@@ -98,6 +98,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
     EditorialEnrichmentRevisionOutcome,
+    EditorialMediaType,
     EnrichmentDiagramDirection,
     EnrichmentPlacementKind,
     EnrichmentTableKind,
@@ -672,6 +673,13 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "FIGURE P001" in contract and "NEEDS N001" in contract
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
+    assert "CHART" in contract
+    assert "CHART est une branche conceptuelle" in contract
+    assert (
+        "Une représentation existante de la source est prioritaire sur une représentation "
+        "reconstruite, lorsque les deux répondent à la même question analytique."
+    ) in contract
+    assert "Deux enrichissements ne doivent pas répondre à la même question analytique." in contract
 
 
 def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
@@ -717,6 +725,9 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert layout_budgets["vertical_when_label_characters_over"] == 30
     assert "plus de 4 nœuds" not in request.text
     assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
+    assert "Commence par identifier une question analytique" in request.text
+    assert "CHART est une branche conceptuelle" in request.text
+    assert "Aucun quota minimal de médias ne s'applique" in request.text
     assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
         enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
     )
@@ -838,6 +849,208 @@ def test_purpose_is_required_and_duplicate_questions_reject_only_one_sibling() -
     assert "editorial_enrichment_duplicate_analytic_purpose" in {
         item.reason_code for item in duplicate_result.rejections
     }
+
+
+def test_fixture_a_source_figure_wins_over_duplicate_diagram_and_table() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+    question = "What execution action does ExampleRAT perform?"
+    proposal_wire = _proposal_to_wire(_proposal("E001"))
+    table_wire = _top_wire_block(proposal_wire, "TABLE T001").replace(
+        "PURPOSE: Which named tool is documented?", f"PURPOSE: {question}", 1
+    )
+    diagram_wire = _top_wire_block(proposal_wire, "DIAGRAM D001").replace(
+        "PURPOSE: Does ExampleRAT launch an execution step?", f"PURPOSE: {question}", 1
+    )
+    wire = "\n\n".join((_figure_wire(purpose_question=question), table_wire, diagram_wire))
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
+
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.figures) == 1
+    assert parsed.proposal.tables == ()
+    assert parsed.proposal.diagrams == ()
+    assert {item.reason_code for item in parsed.rejections} == {
+        "editorial_enrichment_source_figure_preferred_over_reconstruction"
+    }
+    assert any(
+        warning.startswith("editorial_enrichment_source_figure_preferred_over_reconstruction:F001:")
+        for warning in parsed.warnings
+    )
+
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        synthesis,
+        figure_catalog=catalog,
+        warnings=parsed.warnings,
+    )
+    figure = next(item for item in enrichment.source_figures if item.purpose is not None)
+    payload = editorial_enrichment_to_json(enrichment)
+    restored = editorial_enrichment_from_json(payload)
+    assert figure.purpose is not None
+    assert restored.source_figures[-1].purpose == figure.purpose
+
+
+def test_fixture_b_c2_without_source_figure_keeps_the_diagram() -> None:
+    text = "ExampleRAT sends commands to c2.example.test through DNS."
+    fact = ExtractionFactV1(
+        category="infrastructure",
+        value=text,
+        attack_id=None,
+        context=text,
+        evidence_quote=text,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    snapshot = _snapshot()
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = """DIAGRAM D001
+KEY: c2_flow
+KIND: network_flow
+TITLE: Communication avec le serveur C2
+PURPOSE: How does ExampleRAT contact its C2 server?
+DATA: ExampleRAT sends commands to c2.example.test through DNS.
+GAIN: Two nodes make the documented communication path visible.
+SCOPE: The single communication path stated in E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: No other C2 endpoint is documented.
+DIRECTION: left_to_right
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the paragraph that describes the C2 communication.
+NODE N001
+ID: implant
+ROLE: malware_tool
+LABEL: ExampleRAT
+EVIDENCE: E001
+END NODE
+NODE N002
+ID: c2
+ROLE: infrastructure
+LABEL: c2.example.test
+EVIDENCE: E001
+END NODE
+RELATION L001
+FROM: implant
+TO: c2
+RELATION_TYPE: factual
+LABEL: sends commands to
+EVIDENCE: E001
+END RELATION
+END DIAGRAM"""
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.tables == ()
+    assert len(parsed.proposal.diagrams) == 1
+    assert parsed.proposal.figures == ()
+
+
+def test_fixture_c_chart_branch_is_prompted_without_a_chart_wire_contract() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    contract = editorial_enrichment_output_contract_example()
+
+    assert EditorialMediaType.CHART.value == "chart"
+    assert "les informations sont-elles principalement temporelles" in contract
+    assert "OUI → CHART" in contract
+    assert "ce contrat n'accepte pas encore de bloc\nCHART" in contract
+    assert "CHART C001" not in contract
+    unsupported = parse_editorial_enrichment_proposal_wire(
+        "CHART C001\nPURPOSE: When were these domains created?\nEND CHART", pack
+    )
+    assert unsupported.proposal is None
+    assert unsupported.error_code == "editorial_enrichment_unintelligible_response"
+
+
+def test_fixture_d_structured_exfiltration_mapping_keeps_one_table() -> None:
+    text = (
+        "Credentials are collected during exfiltration at the collection step under "
+        "identifier account_id. Passwords are exfiltrated during credential theft under "
+        "identifier password_list."
+    )
+    fact = ExtractionFactV1(
+        category="other_technical",
+        value=text,
+        attack_id=None,
+        context=text,
+        evidence_quote=text,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    snapshot = _snapshot()
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = """TABLE T001
+KEY: exfiltration_mapping
+KIND: custom
+TITLE: Correspondances d'exfiltration documentées
+PURPOSE: Which information is exfiltrated at each step and under which identifier?
+DATA: E001 pairs each information type with its step and identifier.
+GAIN: The three fields make each documented mapping easy to consult.
+SCOPE: The two information mappings in E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: Only the two mappings stated in E001 are included.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the paragraph describing the exfiltration mappings.
+COLUMN C001
+KEY: information
+LABEL: Information
+END COLUMN
+COLUMN C002
+KEY: step
+LABEL: Step
+END COLUMN
+COLUMN C003
+KEY: identifier
+LABEL: Identifier
+END COLUMN
+ROW R001
+CELL: Credentials
+CELL: collection
+CELL: account_id
+EVIDENCE: E001
+END ROW
+ROW R002
+CELL: Passwords
+CELL: credential theft
+CELL: password_list
+EVIDENCE: E001
+END ROW
+END TABLE"""
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.tables) == 1
+    assert parsed.proposal.diagrams == ()
+    assert parsed.proposal.figures == ()
+
+
+def test_fixture_e_trivial_prose_accepts_nothing() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+
+    parsed = parse_editorial_enrichment_proposal_wire("NO USEFUL ENRICHMENT", pack)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.figures == ()
+    assert parsed.proposal.tables == ()
+    assert parsed.proposal.diagrams == ()
+    assert parsed.proposal.annotations == ()
+    assert parsed.proposal.resource_needs == ()
 
 
 def test_paraphrase_only_table_is_rejected_while_a_valid_table_sibling_survives() -> None:
@@ -1051,6 +1264,7 @@ def _figure_wire(
     *,
     handle: str = "F001",
     caption: str = "ExampleRAT execution architecture",
+    purpose_question: str = "What execution action does ExampleRAT perform?",
     placement: str | None = "after_section",
     section_index: int = 0,
     extra: str = "",
@@ -1059,6 +1273,13 @@ def _figure_wire(
         "FIGURE P001",
         f"FIGURE_HANDLE: {handle}",
         f"CAPTION: {caption}",
+        f"PURPOSE: {purpose_question}",
+        "DATA: ExampleRAT launches execution.",
+        "GAIN: The figure clarifies the execution action.",
+        "SCOPE: The launch of execution by ExampleRAT.",
+        "PURPOSE_EVIDENCE: E001",
+        "LIMITS: The evidence states only that ExampleRAT launches execution.",
+        "PLACEMENT_REASON: Place beside the statement that ExampleRAT launches execution.",
         "EVIDENCE: E001",
     ]
     if placement is not None:
@@ -1337,7 +1558,10 @@ def test_figure_selection_accepts_at_most_three_figures() -> None:
     catalog = build_editorial_figure_catalog(extraction, inventory)
 
     over_limit = "\n\n".join(
-        _figure_wire(handle=f"F{index:03d}").replace("FIGURE P001", f"FIGURE P{index:03d}")
+        _figure_wire(
+            handle=f"F{index:03d}",
+            purpose_question=f"Which documented execution detail does figure {index} show?",
+        ).replace("FIGURE P001", f"FIGURE P{index:03d}")
         for index in range(1, 5)
     )
     parsed = parse_editorial_enrichment_proposal_wire(over_limit, pack, figure_catalog=catalog)
@@ -1597,7 +1821,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v8-source-figure-captions"
+        "editorial-enrichment-block-contract-v9-analytic-media-arbitration"
     )
 
     assert "sélectionne zéro ou une image" in request.text

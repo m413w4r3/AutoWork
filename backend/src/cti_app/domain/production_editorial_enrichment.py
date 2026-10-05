@@ -31,7 +31,8 @@ EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annot
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
 EDITORIAL_ENRICHMENT_V4_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
 EDITORIAL_ENRICHMENT_V5_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-roles"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
+EDITORIAL_ENRICHMENT_V6_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v7-analytic-media-arbitration"
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
@@ -129,6 +130,16 @@ class EnrichmentTableKind(StrEnum):
     TIMELINE = "timeline"
     CONFIGURATION = "configuration"
     CUSTOM = "custom"
+
+
+class EditorialMediaType(StrEnum):
+    """Internal arbiter vocabulary; values do not define wire or render contracts."""
+
+    SOURCE_FIGURE = "source_figure"
+    CHART = "chart"
+    DIAGRAM = "diagram"
+    TABLE = "table"
+    NONE = "none"
 
 
 def normalize_analytic_question(value: str) -> str:
@@ -646,6 +657,7 @@ class SourceFigureCandidateV1:
     inclusion_status: SourceFigureInclusionStatus
     placement: EnrichmentPlacementV1
     resolved_figure: ResolvedSourceFigureV1 | None = None
+    purpose: EditorialAnalyticPurposeV1 | None = None
 
     def __post_init__(self) -> None:
         _key(self.key, "Source figure key")
@@ -668,6 +680,8 @@ class SourceFigureCandidateV1:
             or self.resolved_figure.locator != self.locator
         ):
             raise ValueError("A source figure candidate must reference an accepted local figure")
+        if self.purpose is not None and not isinstance(self.purpose, EditorialAnalyticPurposeV1):
+            raise ValueError("Source figure analytic purpose is invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -709,9 +723,14 @@ class EditorialEnrichmentV1:
             if self.schema_version == 4
             else EDITORIAL_ENRICHMENT_V5_POLICY_VERSION
             if self.schema_version == 5
-            else EDITORIAL_ENRICHMENT_POLICY_VERSION
+            else None
         )
-        if self.enrichment_policy_version != expected_policy:
+        supported_policies = (
+            {EDITORIAL_ENRICHMENT_V6_POLICY_VERSION, EDITORIAL_ENRICHMENT_POLICY_VERSION}
+            if self.schema_version == 6
+            else {expected_policy}
+        )
+        if self.enrichment_policy_version not in supported_policies:
             raise ValueError("Editorial enrichment policy version is unsupported")
         for label, values, item_type in (
             ("tables", self.tables, TableSpecV1),
@@ -766,12 +785,15 @@ class EditorialEnrichmentV1:
         if len(keys) != len(set(keys)):
             raise ValueError("Editorial enrichment keys must be globally unique")
         if self.schema_version >= 4:
-            purposes = [table.purpose for table in self.tables] + [
+            required_purposes = [table.purpose for table in self.tables] + [
                 diagram.purpose for diagram in self.diagrams
             ]
-            typed_purposes = tuple(purpose for purpose in purposes if purpose is not None)
-            if len(typed_purposes) != len(purposes):
+            if any(purpose is None for purpose in required_purposes):
                 raise ValueError("V4 tables and diagrams require analytic purposes")
+            typed_purposes = tuple(purpose for purpose in required_purposes if purpose is not None)
+            typed_purposes += tuple(
+                figure.purpose for figure in self.source_figures if figure.purpose is not None
+            )
             questions = [
                 normalize_analytic_question(purpose.question) for purpose in typed_purposes
             ]
@@ -809,6 +831,12 @@ def editorial_enrichment_evidence_refs(
         for diagram in enrichment.diagrams
         if diagram.purpose is not None
         for ref in diagram.purpose.evidence_refs
+    )
+    refs.update(
+        ref
+        for figure in enrichment.source_figures
+        if figure.purpose is not None
+        for ref in figure.purpose.evidence_refs
     )
     refs.update(ref for decision in enrichment.figure_decisions for ref in decision.evidence_refs)
     return frozenset(refs)
@@ -956,6 +984,8 @@ def _figure_to_json(figure: SourceFigureCandidateV1) -> dict[str, Any]:
             "decision": resolved.decision.value,
             "decision_reason": resolved.decision_reason,
         }
+    if figure.purpose is not None:
+        payload["purpose"] = _purpose_to_json(figure.purpose)
     return payload
 
 
@@ -1103,6 +1133,8 @@ _FIGURE_KEYS = frozenset(
     }
 )
 _FIGURE_BASE_KEYS = _FIGURE_KEYS - {"resolved_figure"}
+_FIGURE_PURPOSE_BASE_KEYS = _FIGURE_BASE_KEYS | {"purpose"}
+_FIGURE_PURPOSE_KEYS = _FIGURE_KEYS | {"purpose"}
 _FIGURE_DECISION_KEYS = frozenset(
     {
         "handle",
@@ -1364,7 +1396,12 @@ def _locator_from_json(raw: Any) -> SourceFigureLocatorV1:
 
 
 def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
-    if not isinstance(raw, Mapping) or frozenset(raw) not in {_FIGURE_BASE_KEYS, _FIGURE_KEYS}:
+    if not isinstance(raw, Mapping) or frozenset(raw) not in {
+        _FIGURE_BASE_KEYS,
+        _FIGURE_KEYS,
+        _FIGURE_PURPOSE_BASE_KEYS,
+        _FIGURE_PURPOSE_KEYS,
+    }:
         raise ValueError("Source figure candidate has missing or extra fields")
     payload = raw
     resolved_figure = None
@@ -1426,6 +1463,7 @@ def _figure_from_json(raw: Any) -> SourceFigureCandidateV1:
         ),
         placement=_placement_from_json(payload["placement"]),
         resolved_figure=resolved_figure,
+        purpose=_purpose_from_json(payload["purpose"]) if "purpose" in payload else None,
     )
 
 

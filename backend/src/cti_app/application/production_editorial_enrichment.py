@@ -115,6 +115,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialFigureDecision,
     EditorialFigureDecisionActor,
     EditorialFigureDecisionTraceV1,
+    EditorialMediaType,
     EditorialResourceNeedV1,
     EditorialResourceProposalV1,
     EnrichmentDiagramDirection,
@@ -181,14 +182,27 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v6-annotation-anchors"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v7-analytic-media-purpose"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v1-token-dice-0.80"
+    "editorial-enrichment-analytic-policy-v2-cross-media-normalized-question"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = (
-    "editorial-enrichment-model-policy-v3-source-figure-editorial-selection"
+    "editorial-enrichment-model-policy-v4-analytic-media-arbitration"
 )
+_ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
+    "FIGURE": EditorialMediaType.SOURCE_FIGURE,
+    "CHART": EditorialMediaType.CHART,
+    "DIAGRAM": EditorialMediaType.DIAGRAM,
+    "TABLE": EditorialMediaType.TABLE,
+}
+_ENRICHMENT_MEDIA_ARBITRATION_PRIORITY = {
+    EditorialMediaType.SOURCE_FIGURE: 0,
+    EditorialMediaType.CHART: 1,
+    EditorialMediaType.DIAGRAM: 1,
+    EditorialMediaType.TABLE: 1,
+    EditorialMediaType.NONE: 2,
+}
 SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION = "source-figure-provenance-v1"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
     "editorial-enrichment-routing-policy-v2-resource-search-off"
@@ -231,6 +245,13 @@ def _nonempty_evidence_handles(value: tuple[str, ...]) -> tuple[str, ...]:
     ):
         raise ValueError("Evidence handles must be a non-empty tuple of unique handles")
     return value
+
+
+def _editorial_enrichment_media_priority(block_kind: str) -> int:
+    media_type = _ENRICHMENT_MEDIA_TYPE_BY_BLOCK.get(block_kind)
+    if media_type is None:
+        return _ENRICHMENT_MEDIA_ARBITRATION_PRIORITY[EditorialMediaType.NONE]
+    return _ENRICHMENT_MEDIA_ARBITRATION_PRIORITY[media_type]
 
 
 class EnrichmentPlacementProposalV1(_StrictEnrichmentProposalModel):
@@ -418,6 +439,7 @@ class FigureProposalV1(_StrictEnrichmentProposalModel):
     evidence_handles: tuple[StrictStr, ...]
     reason: StrictStr
     placement: EnrichmentPlacementProposalV1
+    purpose: AnalyticPurposeProposalV1
 
     @field_validator("figure_handle")
     @classmethod
@@ -1388,6 +1410,7 @@ def _parse_figure_wire_block(
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     catalog_by_handle: Mapping[str, EditorialFigureCatalogEntry],
     rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
 ) -> FigureProposalV1 | None:
     def reject(reason: str) -> None:
         rejections.append(
@@ -1426,6 +1449,14 @@ def _parse_figure_wire_block(
     ):
         reject("editorial_enrichment_figure_evidence_source_mismatch")
         return None
+    purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
+    if purpose is None:
+        return None
+    purpose = _trim_analytic_purpose_evidence(
+        block, purpose, set(evidence_handles), rejections, warnings
+    )
+    if purpose is None:
+        return None
     raw_placement = _wire_scalar(block, "placement")
     placement = _wire_placement(block)
     if raw_placement is None:
@@ -1457,6 +1488,7 @@ def _parse_figure_wire_block(
             evidence_handles=evidence_handles,
             reason=reason.strip(),
             placement=placement,
+            purpose=purpose,
         )
     except (TypeError, ValueError, ValidationError):
         reject("editorial_enrichment_figure_invalid")
@@ -2126,6 +2158,13 @@ def parse_editorial_enrichment_proposal_wire(
                 "reason",
                 "placement",
                 "section_index",
+                "purpose",
+                "available_data",
+                "comprehension_gain",
+                "scope",
+                "purpose_evidence_handles",
+                "knowledge_limits",
+                "placement_reason",
             },
             "NEEDS": {"kind", "reason", "query_hint"},
         }[target.kind]
@@ -2164,10 +2203,16 @@ def parse_editorial_enrichment_proposal_wire(
     rejected_blocks: list[EditorialEnrichmentRejectedBlock] = []
     canonical_keys: set[str] = set()
     analytic_questions: set[str] = set()
+    source_figure_questions: dict[str, str] = {}
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
     proposed_figure_handles: set[str] = set()
     proposed_need_keys: set[str] = set()
-    for top in top_blocks:
+    # Source figures are considered first so an equivalent reconstructed form
+    # cannot win just because the model emitted it earlier in the response.
+    processing_blocks = sorted(
+        top_blocks, key=lambda item: _editorial_enrichment_media_priority(item.kind)
+    )
+    for top in processing_blocks:
         rejection_start = len(rejections)
         accepted = False
         proposal_key = ""
@@ -2179,7 +2224,14 @@ def parse_editorial_enrichment_proposal_wire(
                 table = _reject_paraphrase_rows(top, table, evidence_pack, rejections, warnings)
             if table is not None:
                 question_key = normalize_analytic_question(table.purpose.question)
-                if not question_key or question_key in analytic_questions:
+                preferred_figure = source_figure_questions.get(question_key)
+                if preferred_figure is not None:
+                    reject(top, "editorial_enrichment_source_figure_preferred_over_reconstruction")
+                    warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{preferred_figure}:{top.kind}:{top.block_id}"
+                    )
+                elif not question_key or question_key in analytic_questions:
                     reject(top, "editorial_enrichment_duplicate_analytic_purpose")
                 elif table.key in canonical_keys:
                     reject(top, "editorial_enrichment_duplicate_key")
@@ -2196,15 +2248,22 @@ def parse_editorial_enrichment_proposal_wire(
                 accepted = True
                 proposal_key = f"{annotation.paragraph_anchor}:{annotation.text}"
         elif top.kind == "FIGURE":
-            figure = _parse_figure_wire_block(top, evidence_pack, catalog_by_handle, rejections)
+            figure = _parse_figure_wire_block(
+                top, evidence_pack, catalog_by_handle, rejections, warnings
+            )
             if figure is not None:
+                question_key = normalize_analytic_question(figure.purpose.question)
                 if figure.figure_handle in proposed_figure_handles:
                     reject(top, "editorial_enrichment_duplicate_figure_handle")
+                elif not question_key or question_key in analytic_questions:
+                    reject(top, "editorial_enrichment_duplicate_analytic_purpose")
                 elif len(figures) >= MAX_ENRICHMENT_FIGURE_PROPOSALS:
                     reject(top, "editorial_enrichment_figure_limit_exceeded")
                 else:
                     proposed_figure_handles.add(figure.figure_handle)
                     figures.append(figure)
+                    analytic_questions.add(question_key)
+                    source_figure_questions[question_key] = figure.figure_handle
                     accepted = True
                     proposal_key = figure.figure_handle
         elif top.kind == "NEEDS":
@@ -2227,7 +2286,14 @@ def parse_editorial_enrichment_proposal_wire(
                 )
             if diagram is not None:
                 question_key = normalize_analytic_question(diagram.purpose.question)
-                if not question_key or question_key in analytic_questions:
+                preferred_figure = source_figure_questions.get(question_key)
+                if preferred_figure is not None:
+                    reject(top, "editorial_enrichment_source_figure_preferred_over_reconstruction")
+                    warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{preferred_figure}:{top.kind}:{top.block_id}"
+                    )
+                elif not question_key or question_key in analytic_questions:
                     reject(top, "editorial_enrichment_duplicate_analytic_purpose")
                 elif diagram.key in canonical_keys:
                     reject(top, "editorial_enrichment_duplicate_key")
@@ -2329,13 +2395,19 @@ def _merge_repaired_editorial_enrichment_proposal(
     questions = {normalize_analytic_question(item.purpose.question) for item in tables} | {
         normalize_analytic_question(item.purpose.question) for item in diagrams
     }
+    source_figure_questions = {
+        normalize_analytic_question(item.purpose.question): item.figure_handle for item in figures
+    }
+    questions.update(source_figure_questions)
     figure_handles = {item.figure_handle for item in figures}
     used_top_level_ids = set(accepted_top_level_ids)
     new_rejections = list(first_pass.rejections)
+    new_warnings = list(first_pass.warnings)
+    discarded_accepted_blocks: set[tuple[str, str]] = set()
     repaired_identities: list[tuple[str, str]] = []
     repaired_blocks: list[EditorialEnrichmentAcceptedBlock] = []
 
-    for target in repair_targets:
+    for target in sorted(repair_targets, key=lambda item: item.kind != "FIGURE"):
         identity = (target.kind, target.block_id)
         candidate = repaired_by_identity.get(identity)
         if candidate is None:
@@ -2350,6 +2422,12 @@ def _merge_repaired_editorial_enrichment_proposal(
                 pass
             elif candidate.key in keys:
                 reason = "editorial_enrichment_duplicate_key"
+            elif question in source_figure_questions:
+                reason = "editorial_enrichment_source_figure_preferred_over_reconstruction"
+                new_warnings.append(
+                    "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                    f"{source_figure_questions[question]}:TABLE:{candidate.key}"
+                )
             elif not question or question in questions:
                 reason = "editorial_enrichment_duplicate_analytic_purpose"
             else:
@@ -2363,6 +2441,12 @@ def _merge_repaired_editorial_enrichment_proposal(
                 pass
             elif candidate.key in keys:
                 reason = "editorial_enrichment_duplicate_key"
+            elif question in source_figure_questions:
+                reason = "editorial_enrichment_source_figure_preferred_over_reconstruction"
+                new_warnings.append(
+                    "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                    f"{source_figure_questions[question]}:DIAGRAM:{candidate.key}"
+                )
             elif not question or question in questions:
                 reason = "editorial_enrichment_duplicate_analytic_purpose"
             else:
@@ -2371,13 +2455,64 @@ def _merge_repaired_editorial_enrichment_proposal(
                 questions.add(question)
         elif target.kind == "FIGURE":
             assert isinstance(candidate, FigureProposalV1)
+            question = normalize_analytic_question(candidate.purpose.question)
             if reason is not None:
                 pass
             elif candidate.figure_handle in figure_handles:
                 reason = "editorial_enrichment_duplicate_figure_handle"
+            elif not question:
+                reason = "editorial_enrichment_analytic_purpose_invalid"
+            elif question in source_figure_questions:
+                reason = "editorial_enrichment_duplicate_analytic_purpose"
             else:
+                # A figure made valid through repair retains priority over an
+                # already accepted reconstruction of the same question.
+                colliding_tables = [
+                    table_item
+                    for table_item in tables
+                    if normalize_analytic_question(table_item.purpose.question) == question
+                ]
+                colliding_diagrams = [
+                    diagram_item
+                    for diagram_item in diagrams
+                    if normalize_analytic_question(diagram_item.purpose.question) == question
+                ]
+                for table_item in colliding_tables:
+                    keys.discard(table_item.key)
+                    new_warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{candidate.figure_handle}:TABLE:{table_item.key}"
+                    )
+                    discarded_accepted_blocks.update(
+                        (block.kind, block.block_id)
+                        for block in first_pass.accepted_blocks
+                        if block.kind == "TABLE" and block.proposal_key == table_item.key
+                    )
+                for diagram_item in colliding_diagrams:
+                    keys.discard(diagram_item.key)
+                    new_warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{candidate.figure_handle}:DIAGRAM:{diagram_item.key}"
+                    )
+                    discarded_accepted_blocks.update(
+                        (block.kind, block.block_id)
+                        for block in first_pass.accepted_blocks
+                        if block.kind == "DIAGRAM" and block.proposal_key == diagram_item.key
+                    )
+                if colliding_tables or colliding_diagrams:
+                    tables = [
+                        table_item for table_item in tables if table_item not in colliding_tables
+                    ]
+                    diagrams = [
+                        diagram_item
+                        for diagram_item in diagrams
+                        if diagram_item not in colliding_diagrams
+                    ]
+                    questions.discard(question)
                 figures.append(candidate)
                 figure_handles.add(candidate.figure_handle)
+                source_figure_questions[question] = candidate.figure_handle
+                questions.add(question)
         if reason is not None:
             new_rejections.append(
                 EditorialEnrichmentWireRejection(
@@ -2424,8 +2559,15 @@ def _merge_repaired_editorial_enrichment_proposal(
         )
     )
     transformations = first_pass.transformations
-    warnings = first_pass.warnings
-    accepted_blocks = (*first_pass.accepted_blocks, *repaired_blocks)
+    warnings = tuple(dict.fromkeys(new_warnings))
+    accepted_blocks = (
+        *(
+            block
+            for block in first_pass.accepted_blocks
+            if (block.kind, block.block_id) not in discarded_accepted_blocks
+        ),
+        *repaired_blocks,
+    )
     if repaired_identities:
         transformations = (
             *transformations,
@@ -3632,8 +3774,35 @@ def build_editorial_resource_proposal_model_request(
 
 def editorial_enrichment_output_contract_example() -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
-    return """Return independent plain-text blocks. Give every block a local id.
-For each TABLE and DIAGRAM, fill every typed analytic-purpose field:
+    return (
+        """Return independent plain-text blocks. Give every block a local id.
+Commence par identifier une question analytique pour chaque besoin.
+
+Pour chaque question analytique :
+1. Une figure de la publication source répond-elle déjà correctement
+   à la question ?
+      OUI → FIGURE SOURCE
+2. Sinon, les informations sont-elles principalement temporelles
+   ou quantitatives ?
+      OUI → CHART
+3. Sinon, faut-il montrer des relations, une séquence,
+   une architecture, un routage ou un flux ?
+      OUI → DIAGRAM
+4. Sinon, faut-il comparer plusieurs objets selon les mêmes champs
+   ou représenter une correspondance structurée ?
+      OUI → TABLE
+5. Sinon → aucun enrichissement.
+
+CHART est une branche conceptuelle; ce contrat n'accepte pas encore de bloc
+CHART. Si cette branche répond à la question, n'émets pas de bloc pour ce besoin
+et ne le convertis pas en DIAGRAM ou TABLE.
+"""
+        + "Une représentation existante de la source est prioritaire sur une représentation "
+        + "reconstruite, lorsque les deux répondent à la même question analytique.\n"
+        + """Deux enrichissements ne doivent pas répondre à la même question analytique.
+Aucun quota minimal de médias ne s'applique; RIEN est une décision valide.
+
+For each FIGURE, TABLE, and DIAGRAM, fill every typed analytic-purpose field:
 PURPOSE (the reader's question), DATA (what the evidence contains), GAIN (why
 this form is clearer than prose), SCOPE, PURPOSE_EVIDENCE, LIMITS, PLACEMENT,
 and PLACEMENT_REASON. Values and handles must be non-empty.
@@ -3743,9 +3912,16 @@ Preserve supplied placement anchors and section indexes.
 FIGURE P001
 FIGURE_HANDLE: F001
 CAPTION: legende que tu rediges, dans la langue de publication, de ce que montre l'image
+PURPOSE: What does this source figure already explain?
+DATA: The evidence-supported content shown by this source figure.
+GAIN: The source figure makes this information clearer than prose.
+SCOPE: Only the information shown by the selected source figure.
+PURPOSE_EVIDENCE: E001
+LIMITS: Do not infer details that are not documented by the evidence.
 EVIDENCE: E001
 PLACEMENT: after_section
 SECTION_INDEX: 2
+PLACEMENT_REASON: Place beside the paragraph that discusses this information.
 REASON: pourquoi cette image aide ce sujet et pourquoi ici
 END FIGURE
 
@@ -3774,9 +3950,9 @@ evidence handles. Une figure de la mauvaise source ne peut pas être rattachée 
 
 Sélectionne uniquement un FIGURE_HANDLE fourni par AutoWork, jamais une URL d'image. Une URL,
 un média ou une description inventés ne sont pas des preuves. Utilise uniquement les evidence
-handles listés pour cette figure et vérifie que chaque preuve vient du même article. La figure
-source est prioritaire sur une représentation reconstruite si elle répond déjà correctement à
-la même question. Zéro figure est une décision valide.
+handles listés pour cette figure et vérifie que chaque preuve vient du même article. Le purpose
+de la figure décrit la question analytique à laquelle le média répond. Zéro figure est une
+décision valide.
 
 Rédige une caption courte et descriptive, dans la langue de publication, qui dit ce que montre
 l'image sans renforcer une attribution ni ajouter de détail non vérifié. Si tu ne peux pas
@@ -3784,6 +3960,7 @@ proposer de caption fiable, omets la figure; le code peut utiliser SOURCE_CAPTIO
 repli. Sans caption modèle, caption source ou alt exploitable, la figure ne sera pas publiée.
 Choisis un emplacement valide avec PLACEMENT et SECTION_INDEX. NEEDS est facultatif et ne doit
 décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans la réponse."""
+    )
 
 
 def build_editorial_enrichment_model_request(
@@ -3835,10 +4012,27 @@ def build_editorial_enrichment_model_request(
     )
     prompt_payload = {
         "instructions": (
-            "Tu es un planificateur de représentations éditoriales, pas un "
-            "chercheur ni un renderer. Choisis une représentation uniquement quand elle répond à "
-            "une question analytique distincte et clarifie les preuves mieux que la prose. Chaque "
-            "table et diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
+            "Tu es un arbitre de représentations éditoriales, pas un chercheur ni un renderer. "
+            "Commence par identifier une question analytique pour chaque besoin. Pour chaque "
+            "question analytique : 1. Une figure de la publication source répond-elle déjà "
+            "correctement à la question ? OUI → FIGURE SOURCE. 2. Sinon, les informations "
+            "sont-elles principalement temporelles ou quantitatives ? OUI → CHART. 3. Sinon, "
+            "faut-il montrer des relations, une séquence, une architecture, un routage "
+            "ou un flux ? "
+            "OUI → DIAGRAM. "
+            "4. Sinon, faut-il comparer plusieurs objets selon les mêmes champs ou représenter une "
+            "correspondance structurée ? OUI → TABLE. 5. Sinon → aucun enrichissement. CHART est "
+            "une branche conceptuelle sans bloc pris en charge dans ce contrat; "
+            "si elle répond à la question, n'émets pas de bloc pour ce besoin "
+            "et ne le convertis pas "
+            "en DIAGRAM ou TABLE. "
+            "Une représentation existante de la source est prioritaire sur une représentation "
+            "reconstruite, lorsque les deux répondent à la même question analytique. Deux "
+            "enrichissements ne doivent pas répondre à la même question analytique. Aucun quota "
+            "minimal de médias ne s'applique; RIEN est une décision valide. Choisis une "
+            "représentation uniquement quand elle clarifie les preuves mieux que la prose. Chaque "
+            "FIGURE, table et "
+            "diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
             "(comprehension gain : avantage sur le paragraphe), SCOPE, "
             "PURPOSE_EVIDENCE, LIMITS, PLACEMENT et "
             "PLACEMENT_REASON; tous sont obligatoires et non vides. Refuse un tableau qui "
@@ -4016,6 +4210,9 @@ def build_editorial_enrichment_repair_request(
         "instructions": (
             "Repair only the rejected TABLE, DIAGRAM, or FIGURE blocks listed below. Return "
             "corrected replacements in the same plain-text block format and preserve each exact "
+            "analytic question and all required purpose fields, including for FIGURE blocks. "
+            "Respect the source-figure priority and never make two repaired or existing blocks "
+            "answer the same normalized analytic question. "
             "block kind and local header id. Use only the current synthesis, evidence pack, "
             "figure catalog, and exact evidence handles already supplied here. Add no facts, "
             "handles, sources, or blocks; do not return accepted siblings. Fix only the listed "
@@ -4387,6 +4584,29 @@ def validate_editorial_enrichment_proposal(
                 raise EditorialEnrichmentProposalControlError(
                     EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
                 )
+            purpose_refs = _all_refs_for_handles(proposed.purpose.evidence_handles, evidence_pack)
+            if not purpose_refs or not set(purpose_refs) <= set(evidence_refs):
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                )
+            for value in (
+                proposed.purpose.question,
+                proposed.purpose.available_data,
+                proposed.purpose.comprehension_gain,
+                proposed.purpose.scope,
+                proposed.purpose.knowledge_limits,
+                proposed.purpose.placement_reason,
+            ):
+                _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+            figure_purpose = EditorialAnalyticPurposeV1(
+                question=proposed.purpose.question,
+                available_data=proposed.purpose.available_data,
+                comprehension_gain=proposed.purpose.comprehension_gain,
+                scope=proposed.purpose.scope,
+                evidence_refs=purpose_refs,
+                knowledge_limits=proposed.purpose.knowledge_limits,
+                placement_reason=proposed.purpose.placement_reason,
+            )
             # The model writes the caption after looking at the image; only an
             # empty or non-plain one falls back to the archived source caption.
             caption = proposed.caption.strip()
@@ -4413,6 +4633,7 @@ def validate_editorial_enrichment_proposal(
                         inclusion_status=SourceFigureInclusionStatus.INCLUDED,
                         placement=placement(proposed.placement),
                         resolved_figure=figure,
+                        purpose=figure_purpose,
                     )
                 )
             except ValueError as exc:
