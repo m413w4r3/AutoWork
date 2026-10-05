@@ -94,6 +94,8 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramNodeRole,
+    DiagramProfile,
+    DiagramRelationDirection,
     DiagramRelationType,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
@@ -385,7 +387,9 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
             {
                 "key": "infection_chain",
                 "kind": "infection_chain",
+                "profile": "flow",
                 "title": "Observed sequence",
+                "caption": "ExampleRAT launches the documented execution step.",
                 "direction": "left_to_right",
                 "nodes": [
                     {"node_id": "malware", "label": "ExampleRAT", "evidence_handles": [handle]},
@@ -397,6 +401,7 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                         "target_node_id": "execution",
                         "label": "launches",
                         "relation_type": "factual",
+                        "direction": "directed",
                         "evidence_handles": [handle],
                     }
                 ],
@@ -669,6 +674,8 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "TITLE: Résolution via une adresse Bitcoin" in contract
     assert "RELATION_TYPE is required" in contract
     assert "factual | inference | comparison" in contract
+    assert "PROFILE: FLOW" in contract
+    assert "DIRECTION: directed" in contract
     assert "NO USEFUL ENRICHMENT" in contract
     assert "FIGURE P001" in contract and "NEEDS N001" in contract
     assert "EVIDENCE: E001" in contract
@@ -719,6 +726,21 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "row or node target exists" in request.text
     assert "control-plane and data-plane" in request.text
     assert "diagram_node_roles" in prompt_payload["editorial_guidance"]
+    assert prompt_payload["editorial_guidance"]["diagram_profiles"] == {
+        "flow": (
+            "Documented infection, exploitation, exfiltration, C2, and malware-loading sequences."
+        ),
+        "architecture": "Victim, proxy, backend, C2, and framework components.",
+        "relationship": (
+            "Document, file, URL, domain, IP, sample, parent, and hunting pivots; "
+            "composition reference: figure 21 of the Russian bulletin."
+        ),
+    }
+    assert "nœud est un nom court" in request.text
+    assert "caption qui porte le détail utile" in request.text.lower()
+    assert "Les comparaisons sont toujours undirected" in request.text
+    assert "aucun groupe décoratif" in request.text
+    assert "diagrammes : choisis PROFILE" in request.text
     assert prompt_payload["editorial_guidance"]["diagram_layout_budgets"]["maximum_nodes"] == 8
     layout_budgets = prompt_payload["editorial_guidance"]["diagram_layout_budgets"]
     assert layout_budgets["vertical_when_nodes_over"] == 3
@@ -1308,6 +1330,7 @@ def test_comparison_is_not_an_infection_sequence_and_sequences_need_relation_evi
     wire = _proposal_to_wire(_proposal("E001"))
     comparison = wire.replace("KIND: infection_chain", "KIND: custom", 1)
     comparison = comparison.replace("RELATION_TYPE: factual", "RELATION_TYPE: comparison", 1)
+    comparison = comparison.replace("DIRECTION: directed", "DIRECTION: undirected", 1)
     comparison = comparison.replace("LABEL: launches", "LABEL: comparison of observations", 1)
     comparison_result = parse_editorial_enrichment_proposal_wire(comparison, pack)
     assert comparison_result.proposal is not None
@@ -1327,6 +1350,58 @@ def test_comparison_is_not_an_infection_sequence_and_sequences_need_relation_evi
     assert invalid_result.proposal.diagrams == ()
     assert "editorial_enrichment_comparison_cannot_be_infection_chain" in {
         item.reason_code for item in invalid_result.rejections
+    }
+
+
+def test_diagram_profiles_are_typed_and_old_wire_gets_a_legacy_hint() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+
+    architecture = parse_editorial_enrichment_proposal_wire(
+        wire.replace("PROFILE: flow", "PROFILE: architecture", 1), pack
+    )
+    assert architecture.proposal is not None
+    assert architecture.proposal.diagrams[0].profile is DiagramProfile.ARCHITECTURE
+
+    invalid = parse_editorial_enrichment_proposal_wire(
+        wire.replace("PROFILE: flow", "PROFILE: terminal", 1), pack
+    )
+    assert invalid.proposal is not None
+    assert invalid.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_missing_or_invalid_field" in {
+        item.reason_code for item in invalid.rejections
+    }
+
+    legacy = wire.replace("PROFILE: flow\n", "", 1).replace("DIRECTION: directed\n", "", 1)
+    parsed_legacy = parse_editorial_enrichment_proposal_wire(legacy, pack)
+    assert parsed_legacy.proposal is not None
+    assert parsed_legacy.proposal.diagrams[0].profile is DiagramProfile.FLOW
+    assert (
+        parsed_legacy.proposal.diagrams[0].edges[0].direction is DiagramRelationDirection.DIRECTED
+    )
+    assert any("diagram_profile_missing" in warning for warning in parsed_legacy.warnings)
+    assert any("relation_direction_missing" in warning for warning in parsed_legacy.warnings)
+
+
+def test_comparison_relation_cannot_request_directional_arrows() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("KIND: infection_chain", "KIND: custom", 1)
+    wire = wire.replace("RELATION_TYPE: factual", "RELATION_TYPE: comparison", 1)
+    wire = wire.replace("LABEL: launches", "LABEL: comparison of observations", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_comparison_direction_invalid" in {
+        item.reason_code for item in result.rejections
     }
 
 
@@ -1681,7 +1756,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 7
+    assert enrichment.schema_version == 8
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -1904,7 +1979,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v10-timeline-charts"
+        "editorial-enrichment-block-contract-v11-d2-diagram-profiles"
     )
 
     assert "sélectionne zéro ou une image" in request.text
@@ -2324,6 +2399,7 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                 f"DIAGRAM D{index:03d}",
                 f"KEY: {diagram['key']}",
                 f"KIND: {diagram['kind']}",
+                f"PROFILE: {diagram['profile']}",
                 f"TITLE: {diagram['title']}",
             ]
         )
@@ -2364,6 +2440,7 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                     f"FROM: {edge['source_node_id']}",
                     f"TO: {edge['target_node_id']}",
                     f"RELATION_TYPE: {edge['relation_type']}",
+                    f"DIRECTION: {edge['direction']}",
                 ]
             )
             if edge.get("label") is not None:

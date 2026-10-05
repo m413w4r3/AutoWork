@@ -26,6 +26,8 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramGroupV1,
     DiagramNodeRole,
     DiagramNodeV1,
+    DiagramProfile,
+    DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
@@ -62,12 +64,21 @@ def _node(
     )
 
 
-def _edge(source: str, target: str, label: str | None = None) -> DiagramEdgeV1:
+def _edge(
+    source: str,
+    target: str,
+    label: str | None = None,
+    *,
+    relation_type: DiagramRelationType = DiagramRelationType.FACTUAL,
+    direction: DiagramRelationDirection | None = None,
+) -> DiagramEdgeV1:
     return DiagramEdgeV1(
         source_node_id=source,
         target_node_id=target,
         label=label,
         evidence_refs=(_EVIDENCE,),
+        relation_type=relation_type,
+        direction=direction,
     )
 
 
@@ -75,6 +86,7 @@ def _diagram(**overrides: object) -> DiagramSpecV1:
     fields: dict[str, object] = {
         "key": "diagram-main",
         "kind": EnrichmentDiagramKind.CUSTOM,
+        "profile": DiagramProfile.FLOW,
         "title": "Ignored title",
         "caption": "Ignored caption",
         "direction": EnrichmentDiagramDirection.LEFT_TO_RIGHT,
@@ -175,15 +187,35 @@ def test_d2_labels_inference_and_comparison_without_changing_the_graph_authority
     edge = replace(
         _edge("source", "target", "may connect"),
         relation_type=relation_type,
+        direction=(
+            DiagramRelationDirection.UNDIRECTED
+            if relation_type is DiagramRelationType.COMPARISON
+            else DiagramRelationDirection.DIRECTED
+        ),
     )
     source = encode_d2_source(_diagram(edges=(edge,))).decode()
 
     assert encoded_label in source
     if relation_type is DiagramRelationType.COMPARISON:
-        assert 'n001 <-> n002: "may connect" {' in source
+        assert 'n001 -- n002: "may connect" {' in source
+        assert "stroke-dash: 5" not in source
     else:
         assert 'n001 -> n002: "may connect" {' in source
-    assert "stroke-dash: 5" in source
+        assert "stroke-dash: 5" in source
+
+
+def test_factual_undirected_relation_is_solid_and_has_no_arrowhead() -> None:
+    edge = _edge(
+        "source",
+        "target",
+        "associated with",
+        direction=DiagramRelationDirection.UNDIRECTED,
+    )
+
+    source = encode_d2_source(_diagram(edges=(edge,))).decode()
+
+    assert 'n001 -- n002: "associated with" {' in source
+    assert "stroke-dash: 5" not in source
 
 
 def test_comparison_relation_changes_rendering_identity() -> None:
@@ -194,6 +226,7 @@ def test_comparison_relation_changes_rendering_identity() -> None:
             replace(
                 factual.edges[0],
                 relation_type=DiagramRelationType.COMPARISON,
+                direction=DiagramRelationDirection.UNDIRECTED,
                 label="comparison of observations",
             ),
         ),
@@ -223,6 +256,19 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
             nodes=(replace(diagram.nodes[0], role=DiagramNodeRole.VICTIM), diagram.nodes[1]),
         )
     ) != diagram_semantic_sha256(diagram)
+
+
+def test_profile_and_relation_direction_change_semantic_identity() -> None:
+    diagram = _diagram()
+
+    assert diagram_semantic_sha256(
+        replace(diagram, profile=DiagramProfile.RELATIONSHIP)
+    ) != diagram_semantic_sha256(diagram)
+    undirected = replace(
+        diagram,
+        edges=(replace(diagram.edges[0], direction=DiagramRelationDirection.UNDIRECTED),),
+    )
+    assert diagram_semantic_sha256(undirected) != diagram_semantic_sha256(diagram)
 
 
 @pytest.mark.parametrize(
@@ -295,7 +341,9 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v4-role-styles-print-layout"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == (
+        "diagram-d2-svg-v5-profile-aware-relation-direction"
+    )
 
 
 @dataclass(frozen=True, slots=True)

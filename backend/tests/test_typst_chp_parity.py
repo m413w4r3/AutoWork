@@ -44,8 +44,11 @@ from cti_app.application.typst_rendering import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
+    DiagramGroupV1,
     DiagramNodeRole,
     DiagramNodeV1,
+    DiagramProfile,
+    DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
@@ -202,6 +205,11 @@ def _write_diagram_figure_review_artifacts(
     diagram_page = next(
         index + 1 for index, text in enumerate(page_text) if "Résolution du C2 iranien" in text
     )
+    relationship_page = next(
+        index + 1
+        for index, text in enumerate(page_text)
+        if "Documents, fichiers déposés et infrastructure de résolution documentés" in text
+    )
     figure_page = next(
         index + 1
         for index, text in enumerate(page_text)
@@ -209,6 +217,7 @@ def _write_diagram_figure_review_artifacts(
     )
     for page_number, output_name in (
         (diagram_page, "diagram-bitcoin-flow"),
+        (relationship_page, "diagram-relationship"),
         (figure_page, "figure-archived-source"),
     ):
         subprocess.run(
@@ -649,6 +658,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
             title=diagram.title,
             caption=diagram.caption,
             direction=diagram.direction,
+            profile=DiagramProfile.FLOW,
             nodes=diagram.nodes,
             edges=diagram.edges,
             groups=diagram.groups,
@@ -689,6 +699,53 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
         )
     compiled_diagram = await D2DiagramCompiler(binary=d2_binary).compile(semantic_diagram)
 
+    relationship_title = "Relations entre document, fichiers et infrastructure"
+    relationship_caption = "Documents, fichiers déposés et infrastructure de résolution documentés."
+    relationship_diagram = replace(
+        _diagram_at(
+            "relationship-pivots",
+            relationship_title,
+            EnrichmentPlacementKind.AFTER_LEAD,
+            asset_id=UUID(int=8183),
+        ),
+        caption=relationship_caption,
+    )
+    relationship_nodes = (
+        DiagramNodeV1("document", "Document Word", evidence_refs, DiagramNodeRole.DATA_ARTIFACT),
+        DiagramNodeV1("dll", "sample.dll", evidence_refs, DiagramNodeRole.DATA_ARTIFACT),
+        DiagramNodeV1(
+            "url", "https://drop.example/a", evidence_refs, DiagramNodeRole.INFRASTRUCTURE
+        ),
+        DiagramNodeV1("domain", "drop.example", evidence_refs, DiagramNodeRole.INFRASTRUCTURE),
+        DiagramNodeV1("ip", "203.0.113.8", evidence_refs, DiagramNodeRole.INFRASTRUCTURE),
+    )
+    relationship_edges = (
+        DiagramEdgeV1("document", "dll", "dépose", evidence_refs),
+        DiagramEdgeV1("document", "url", "référence", evidence_refs),
+        DiagramEdgeV1("domain", "ip", "résout vers", evidence_refs),
+        DiagramEdgeV1(
+            "dll",
+            "url",
+            "pivot possible",
+            evidence_refs,
+            DiagramRelationType.INFERENCE,
+            DiagramRelationDirection.UNDIRECTED,
+        ),
+    )
+    semantic_relationship = DiagramSpecV1(
+        key="relationship-pivots",
+        kind=EnrichmentDiagramKind.COMPONENT_RELATIONSHIP,
+        profile=DiagramProfile.RELATIONSHIP,
+        title=relationship_title,
+        caption=relationship_diagram.caption,
+        direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+        nodes=relationship_nodes,
+        edges=relationship_edges,
+        groups=(DiagramGroupV1("operator-infra", "Infrastructure opérateur", ("domain", "ip")),),
+        placement=relationship_diagram.placement,
+    )
+    compiled_relationship = await D2DiagramCompiler(binary=d2_binary).compile(semantic_relationship)
+
     png_bytes = _small_png_fixture()
     figure = replace(
         _figure_at(
@@ -700,7 +757,7 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
         sha256=hashlib.sha256(png_bytes).hexdigest(),
         byte_size=len(png_bytes),
     )
-    document = _full_document(diagrams=(diagram,), figures=(figure,))
+    document = _full_document(diagrams=(diagram, relationship_diagram), figures=(figure,))
     production_bundle = load_template_bundle(_CHP_TYPST_ROOT)
     # Keep this render focused on the production diagram/figure helpers. The shared
     # general-purpose helper currently has an unrelated Typst syntax error in its
@@ -744,9 +801,13 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
         ),
     )
     render_source = TypstRenderer().render(document, template_bundle)
+    compiled_by_asset_id = {
+        UUID(int=8181): compiled_diagram,
+        UUID(int=8183): compiled_relationship,
+    }
     media = {
         media_ref.asset_id: (
-            compiled_diagram.media_bytes
+            compiled_by_asset_id[media_ref.asset_id].media_bytes
             if media_ref.expected_mime_type == "image/svg+xml"
             else png_bytes
         )
@@ -771,7 +832,8 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
     page_text = [page.extract_text() or "" for page in reader.pages]
     normalized = " ".join(" ".join(text.split()) for text in page_text)
     assert "Figure 1 - Résolution du C2 iranien via Bitcoin" in normalized
-    assert "Figure 2 - Capture d'une preuve technique" in normalized
+    assert f"Figure 2 - {relationship_caption}" in normalized
+    assert "Figure 3 - Capture d'une preuve technique" in normalized
     assert "Provenance : Figure 1 from the source publication" in normalized
 
     review_directory = Path(os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", tmp_path / "review"))

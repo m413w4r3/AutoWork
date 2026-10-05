@@ -27,6 +27,7 @@ from cti_app.application.diagram_compilation import (
 )
 from cti_app.domain.production_editorial_enrichment import (
     DiagramNodeRole,
+    DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
@@ -125,6 +126,7 @@ def _semantic_projection(diagram: DiagramSpecV1) -> dict[str, Any]:
     return {
         "key": diagram.key,
         "kind": diagram.kind.value,
+        "profile": diagram.profile.value if diagram.profile is not None else None,
         "title": diagram.title,
         "caption": diagram.caption,
         "direction": diagram.direction.value,
@@ -143,6 +145,7 @@ def _semantic_projection(diagram: DiagramSpecV1) -> dict[str, Any]:
                 "target_node_id": edge.target_node_id,
                 "label": edge.label,
                 "relation_type": edge.relation_type.value,
+                "direction": edge.direction.value if edge.direction is not None else None,
                 "evidence_refs": [_ref_projection(ref) for ref in edge.evidence_refs],
             }
             for edge in diagram.edges
@@ -233,7 +236,12 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
         )
 
     for edge in diagram.edges:
-        connector = "<->" if edge.relation_type is DiagramRelationType.COMPARISON else "->"
+        connector = (
+            "->"
+            if edge.direction is DiagramRelationDirection.DIRECTED
+            and edge.relation_type is not DiagramRelationType.COMPARISON
+            else "--"
+        )
         line = (
             f"{node_references[edge.source_node_id]} {connector} "
             f"{node_references[edge.target_node_id]}"
@@ -248,7 +256,7 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             "    stroke-width: 2",
             f"    font-size: {_EDGE_FONT_SIZE}",
         ]
-        if edge.relation_type is not DiagramRelationType.FACTUAL:
+        if edge.relation_type is DiagramRelationType.INFERENCE:
             edge_lines.append("    stroke-dash: 5")
         edge_lines.extend(("  }", "}"))
         lines.extend(edge_lines)

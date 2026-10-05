@@ -51,6 +51,7 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
+    DiagramProfile,
     DiagramSpecV1,
     EditorialAnalyticPurposeV1,
     EnrichmentDiagramDirection,
@@ -205,6 +206,7 @@ def _diagram(
     return DiagramSpecV1(
         key=key,
         kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+        profile=DiagramProfile.FLOW,
         title="Infection chain",
         caption="Observed execution flow",
         direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,

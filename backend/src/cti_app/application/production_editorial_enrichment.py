@@ -115,6 +115,8 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramGroupV1,
     DiagramNodeRole,
     DiagramNodeV1,
+    DiagramProfile,
+    DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
     EditorialAnalyticPurposeV1,
@@ -190,12 +192,14 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v8-timeline-charts"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v9-d2-diagram-profiles"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v3-timeline-charts"
+    "editorial-enrichment-analytic-policy-v4-d2-diagram-profiles"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v5-timeline-charts"
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = (
+    "editorial-enrichment-model-policy-v6-d2-diagram-profiles"
+)
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -418,6 +422,7 @@ class DiagramEdgeProposalV1(_StrictEnrichmentProposalModel):
     target_node_id: StrictStr
     label: StrictStr | None = None
     relation_type: DiagramRelationType
+    direction: DiagramRelationDirection
     evidence_handles: tuple[StrictStr, ...]
 
     @field_validator("source_node_id", "target_node_id")
@@ -458,6 +463,7 @@ class DiagramProposalV1(_StrictEnrichmentProposalModel):
     groups: tuple[DiagramGroupProposalV1, ...] = ()
     placement: EnrichmentPlacementProposalV1
     purpose: AnalyticPurposeProposalV1
+    profile: DiagramProfile
 
     @field_validator("key", "title")
     @classmethod
@@ -838,6 +844,8 @@ _ENRICHMENT_FIELD_ALIASES = {
     "kind": "kind",
     "title": "title",
     "caption": "caption",
+    "profile": "profile",
+    "diagram profile": "profile",
     "placement": "placement",
     "section index": "section_index",
     "section_index": "section_index",
@@ -2204,6 +2212,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "kind",
                 "title",
                 "caption",
+                "profile",
                 "placement",
                 "section_index",
                 "direction",
@@ -2224,6 +2233,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "target_node_id",
                 "label",
                 "relation_type",
+                "direction",
                 "evidence_handles",
             },
             "EDGE": {
@@ -2231,6 +2241,7 @@ def parse_editorial_enrichment_proposal_wire(
                 "target_node_id",
                 "label",
                 "relation_type",
+                "direction",
                 "evidence_handles",
             },
             "GROUP": {"group_id", "id", "label", "node_ids"},
@@ -2891,6 +2902,7 @@ def _parse_enrichment_wire_table(
         "kind",
         "title",
         "caption",
+        "profile",
         "placement",
         "section_index",
         "purpose",
@@ -3003,6 +3015,7 @@ def _parse_enrichment_wire_chart(
         "kind",
         "title",
         "caption",
+        "profile",
         "placement",
         "section_index",
         "purpose",
@@ -3106,6 +3119,7 @@ def _parse_enrichment_wire_diagram(
     allowed_top_fields = {
         "key",
         "kind",
+        "profile",
         "title",
         "caption",
         "placement",
@@ -3131,6 +3145,31 @@ def _parse_enrichment_wire_diagram(
         ),
         None,
     )
+    raw_profile = _wire_scalar(block, "profile")
+    profile = next(
+        (
+            item
+            for item in DiagramProfile
+            if raw_profile and item.value.casefold() == raw_profile.strip().casefold()
+        ),
+        None,
+    )
+    if raw_profile is None and kind is not None:
+        # Archived pre-v8 responses did not carry a composition profile. Keep them
+        # parseable with a deterministic, kind-based hint while new prompts require it.
+        profile = (
+            DiagramProfile.FLOW
+            if kind
+            in {
+                EnrichmentDiagramKind.INFECTION_CHAIN,
+                EnrichmentDiagramKind.NETWORK_FLOW,
+                EnrichmentDiagramKind.EXECUTION_SEQUENCE,
+            }
+            else DiagramProfile.ARCHITECTURE
+            if kind is EnrichmentDiagramKind.INFRASTRUCTURE
+            else DiagramProfile.RELATIONSHIP
+        )
+        warnings.append(f"editorial_enrichment_diagram_profile_missing:{block.block_id}")
     raw_direction = _wire_scalar(block, "direction")
     direction = next(
         (
@@ -3143,9 +3182,23 @@ def _parse_enrichment_wire_diagram(
     placement = _wire_placement(block)
     key = _wire_scalar(block, "key")
     title = _wire_scalar(block, "title")
-    if not key or not title or kind is None or direction is None or placement is None:
+    if (
+        not key
+        or not title
+        or kind is None
+        or direction is None
+        or profile is None
+        or placement is None
+    ):
         reject(block, "editorial_enrichment_diagram_missing_or_invalid_field")
         return None
+    caption = _wire_caption(block)
+    if raw_profile is not None and caption is None:
+        reject(block, "editorial_enrichment_diagram_caption_missing")
+        return None
+    if caption is None:
+        caption = title
+        warnings.append(f"editorial_enrichment_diagram_caption_missing:{block.block_id}")
     purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
     if purpose is None:
         return None
@@ -3223,6 +3276,7 @@ def _parse_enrichment_wire_diagram(
                     "target_node_id",
                     "label",
                     "relation_type",
+                    "direction",
                     "evidence_handles",
                 }
             ),
@@ -3256,6 +3310,26 @@ def _parse_enrichment_wire_diagram(
                     "editorial_enrichment_relation_type_normalized:"
                     f"{block.block_id}/{child.block_id}:{normalized_relation}->factual"
                 )
+        raw_edge_direction = _wire_scalar(child, "direction")
+        edge_direction = next(
+            (
+                item
+                for item in DiagramRelationDirection
+                if raw_edge_direction
+                and item.value.casefold() == raw_edge_direction.strip().casefold()
+            ),
+            None,
+        )
+        if raw_edge_direction is None and relation_type is not None:
+            edge_direction = (
+                DiagramRelationDirection.UNDIRECTED
+                if relation_type is DiagramRelationType.COMPARISON
+                else DiagramRelationDirection.DIRECTED
+            )
+            warnings.append(
+                f"editorial_enrichment_diagram_relation_direction_missing:"
+                f"{block.block_id}/{child.block_id}"
+            )
         handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
         if error is not None:
             reject(child, error)
@@ -3265,6 +3339,15 @@ def _parse_enrichment_wire_diagram(
             continue
         if relation_type is None:
             reject(child, "editorial_enrichment_diagram_relation_type_invalid")
+            continue
+        if edge_direction is None:
+            reject(child, "editorial_enrichment_diagram_relation_direction_invalid")
+            continue
+        if (
+            relation_type is DiagramRelationType.COMPARISON
+            and edge_direction is not DiagramRelationDirection.UNDIRECTED
+        ):
+            reject(child, "editorial_enrichment_comparison_direction_invalid")
             continue
         if source not in known_nodes or target not in known_nodes:
             reject(child, "editorial_enrichment_diagram_relation_unknown_node")
@@ -3286,6 +3369,7 @@ def _parse_enrichment_wire_diagram(
                     target_node_id=target,
                     label=relation_label,
                     relation_type=relation_type,
+                    direction=edge_direction,
                     evidence_handles=handles,
                 )
             )
@@ -3346,13 +3430,14 @@ def _parse_enrichment_wire_diagram(
             key=key,
             kind=kind,
             title=title,
-            caption=_wire_caption(block),
+            caption=caption,
             direction=direction,
             nodes=tuple(nodes),
             edges=tuple(edges),
             groups=tuple(groups),
             placement=placement,
             purpose=purpose,
+            profile=profile,
         )
     except (TypeError, ValueError, ValidationError):
         reject(block, "editorial_enrichment_diagram_invalid")
@@ -4133,7 +4218,9 @@ END TABLE
 DIAGRAM D001
 KEY: flux_bitcoin
 KIND: network_flow
+PROFILE: FLOW
 TITLE: Résolution via une adresse Bitcoin
+CAPTION: Le malware extrait une destination C2 d'un champ OP_RETURN.
 PURPOSE: Comment une graine mène-t-elle à une destination ?
 DATA: Les deux étapes documentées dans E001.
 GAIN: Deux étapes courtes rendent le flux visible.
@@ -4159,6 +4246,7 @@ RELATION L001
 FROM: seed
 TO: destination
 RELATION_TYPE: factual
+DIRECTION: directed
 LABEL: résout vers
 EVIDENCE: E001
 END RELATION
@@ -4345,6 +4433,31 @@ def build_editorial_enrichment_model_request(
             "jamais comme une séquence d'infection. infection_chain est uniquement une valeur de "
             "KIND pour un DIAGRAM. Dans ce diagramme, utilise RELATION_TYPE factual seulement si "
             "la preuve citée documente les deux endpoints et la séquence affirmée. Pour les "
+            "diagrammes : choisis PROFILE parmi FLOW, ARCHITECTURE et RELATIONSHIP. Ce profil "
+            "indique seulement la composition; le code local applique les formes et couleurs "
+            "sémantiques dans le même renderer D2. FLOW convient aux chaînes d'infection, "
+            "d'exploitation, d'exfiltration, au C2 et au chargement de malware. ARCHITECTURE "
+            "convient à une victime, un reverse proxy, des services backend, un C2 ou les "
+            "composants d'un framework. RELATIONSHIP convient aux graphes document→fichier, "
+            "fichier→URL, domaine→IP, échantillon→parent et pivots de hunting; prends comme "
+            "référence de composition la figure 21 du bulletin RU, qui relie documents, fichiers "
+            "déposés et URL. Cette référence n'ajoute aucune preuve au dossier courant. D2 sert "
+            "aux relations, séquences, architectures et flux; les séries temporelles vont dans "
+            "CHART et les correspondances exactes dans TABLE. Chaque diagramme fournit une "
+            "CAPTION qui porte le détail utile. Un nœud est un nom court et une relation une "
+            "action courte : bons nœuds « Malware », « OP_RETURN », « C2 », « Serveur de dépôt »; "
+            "bonnes relations « lit », « extrait », « résout vers ». Mauvais libellé de nœud : "
+            "« Serveur utilisé afin de récupérer dynamiquement "
+            "l'adresse de commande et contrôle »; "
+            "place ce détail dans la CAPTION et garde le nom du nœud court. Une comparaison "
+            "s'utilise pour des objets comparés, jamais pour affirmer une séquence. Pour chaque "
+            "RELATION, indique DIRECTION: directed uniquement si les preuves attestent le sens "
+            "FROM vers TO; sinon indique undirected. Les comparaisons sont toujours undirected. "
+            "Les relations factuelles sont pleines, les inférences pointillées. N'ajoute un GROUP "
+            "que s'il nomme un vrai périmètre fonctionnel (par exemple Victime, Blockchain "
+            "publique, Infrastructure opérateur ou Backend); aucun groupe décoratif. N'utilise "
+            "pas de pictogrammes. Le modèle ne fournit jamais shape, fill, stroke, coordonnées, "
+            "x, y, SVG ou D2; le code local décide la forme et les couleurs. "
             "graphes : limite-toi à 8 nœuds; chaque nœud exprime une seule idée, avec "
             "6 mots et environ 40 caractères au maximum; un libellé d'arête a au plus 5 mots. "
             "Choisis DIRECTION parmi left_to_right et top_to_bottom selon les seuils de "
@@ -4403,6 +4516,17 @@ def build_editorial_enrichment_model_request(
             "diagram_kinds": [item.value for item in EnrichmentDiagramKind],
             "diagram_directions": [item.value for item in EnrichmentDiagramDirection],
             "diagram_node_roles": [item.value for item in DiagramNodeRole],
+            "diagram_profiles": {
+                "flow": (
+                    "Documented infection, exploitation, exfiltration, C2, and malware-loading "
+                    "sequences."
+                ),
+                "architecture": "Victim, proxy, backend, C2, and framework components.",
+                "relationship": (
+                    "Document, file, URL, domain, IP, sample, parent, and hunting pivots; "
+                    "composition reference: figure 21 of the Russian bulletin."
+                ),
+            },
             "diagram_layout_budgets": {
                 "maximum_nodes": 8,
                 "maximum_node_words": 6,
@@ -4807,6 +4931,7 @@ def validate_editorial_enrichment_proposal(
                         label=edge.label,
                         evidence_refs=refs,
                         relation_type=edge.relation_type,
+                        direction=edge.direction,
                     )
                 )
             for group in diagram.groups:
@@ -4859,6 +4984,7 @@ def validate_editorial_enrichment_proposal(
                         knowledge_limits=diagram.purpose.knowledge_limits,
                         placement_reason=diagram.purpose.placement_reason,
                     ),
+                    profile=diagram.profile,
                 )
             )
         except ValueError as exc:

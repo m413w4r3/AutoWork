@@ -23,6 +23,8 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
+    DiagramProfile,
+    DiagramRelationDirection,
     DiagramSpecV1,
     EditorialAnalyticPurposeV1,
     EditorialEnrichmentV1,
@@ -176,8 +178,9 @@ def _populated_enrichment(
             DiagramSpecV1(
                 key="infection_chain",
                 kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+                profile=DiagramProfile.FLOW,
                 title="Infection chain",
-                caption=None,
+                caption="Documented path from loader to payload.",
                 direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
                 nodes=(
                     DiagramNodeV1("loader", "Loader", (ref,)),
@@ -231,7 +234,9 @@ def test_populated_contract_round_trips_canonically() -> None:
 
     payload = editorial_enrichment_to_json(enrichment)
     assert payload["tables"][0]["purpose"]["question"] == "Which command is documented?"
+    assert payload["diagrams"][0]["profile"] == "flow"
     assert payload["diagrams"][0]["edges"][0]["relation_type"] == "factual"
+    assert payload["diagrams"][0]["edges"][0]["direction"] == "directed"
     assert editorial_enrichment_from_json(payload) == enrichment
     assert editorial_enrichment_to_json(editorial_enrichment_from_json(payload)) == payload
 
@@ -248,8 +253,10 @@ def test_v3_enrichment_payload_remains_readable_without_v4_analytic_fields() -> 
         table.pop("purpose")
     for diagram in payload["diagrams"]:
         diagram.pop("purpose")
+        diagram.pop("profile")
         for edge in diagram["edges"]:
             edge.pop("relation_type")
+            edge.pop("direction")
         for node in diagram["nodes"]:
             node.pop("role")
 
@@ -259,6 +266,25 @@ def test_v3_enrichment_payload_remains_readable_without_v4_analytic_fields() -> 
     assert decoded.tables[0].purpose is None
     assert decoded.diagrams[0].purpose is None
     assert decoded.diagrams[0].edges[0].relation_type.value == "factual"
+    assert editorial_enrichment_to_json(decoded) == payload
+
+
+def test_v7_diagram_artifact_remains_readable_without_profile_or_edge_direction() -> None:
+    extraction = _extraction()
+    enrichment = _populated_enrichment(extraction, _synthesis(extraction))
+    payload = editorial_enrichment_to_json(enrichment)
+    payload["schema_version"] = 7
+    payload["enrichment_policy_version"] = "editorial-enrichment-v8-timeline-charts"
+    for diagram in payload["diagrams"]:
+        diagram.pop("profile")
+        for edge in diagram["edges"]:
+            edge.pop("direction")
+
+    decoded = editorial_enrichment_from_json(payload)
+
+    assert decoded.schema_version == 7
+    assert decoded.diagrams[0].profile is None
+    assert decoded.diagrams[0].edges[0].direction is DiagramRelationDirection.DIRECTED
     assert editorial_enrichment_to_json(decoded) == payload
 
 
