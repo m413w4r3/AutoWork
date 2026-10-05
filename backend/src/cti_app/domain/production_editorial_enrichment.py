@@ -25,13 +25,14 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 5
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 6
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
 EDITORIAL_ENRICHMENT_V4_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-roles"
-EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v2-visual-review"
+EDITORIAL_ENRICHMENT_V5_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-roles"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
+EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
 
@@ -688,7 +689,7 @@ class EditorialEnrichmentV1:
     resource_proposals: tuple[EditorialResourceProposalV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4, 5}:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4, 5, 6}:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -706,6 +707,8 @@ class EditorialEnrichmentV1:
             if self.schema_version == 3
             else EDITORIAL_ENRICHMENT_V4_POLICY_VERSION
             if self.schema_version == 4
+            else EDITORIAL_ENRICHMENT_V5_POLICY_VERSION
+            if self.schema_version == 5
             else EDITORIAL_ENRICHMENT_POLICY_VERSION
         )
         if self.enrichment_policy_version != expected_policy:
@@ -1056,6 +1059,7 @@ _ROOT_KEYS_V2 = _ROOT_KEYS_V1 | {"annotations"}
 _ROOT_KEYS_V3 = _ROOT_KEYS_V2 | {"figure_decisions", "resource_needs", "resource_proposals"}
 _ROOT_KEYS_V4 = _ROOT_KEYS_V3
 _ROOT_KEYS_V5 = _ROOT_KEYS_V4
+_ROOT_KEYS_V6 = _ROOT_KEYS_V5
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
@@ -1500,6 +1504,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         3: _ROOT_KEYS_V3,
         4: _ROOT_KEYS_V4,
         5: _ROOT_KEYS_V5,
+        6: _ROOT_KEYS_V6,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")

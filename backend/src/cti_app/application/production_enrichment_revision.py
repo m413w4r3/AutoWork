@@ -13,6 +13,7 @@ from cti_app.application.media_assets import compile_and_store_diagrams
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+    SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
     EditorialEnrichmentEvidencePackV1,
     EditorialEnrichmentProposalControlError,
     EditorialEnrichmentRevisionConflictError,
@@ -20,6 +21,7 @@ from cti_app.application.production_editorial_enrichment import (
     ProductionEditorialEnrichmentService,
     build_editorial_enrichment_evidence_pack,
     build_editorial_figure_catalog,
+    build_source_figure_provenance_diagnostics,
     compute_editorial_enrichment_input_hash,
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_output_contract_example,
@@ -437,6 +439,14 @@ class ProductionEditorialEnrichmentRevisionService:
             ),
             "resource_need": resource_need,
         }
+        revision_data["source_figure_provenance_version"] = (
+            SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+        )
+        revision_data["source_figure_provenance_diagnostics"] = (
+            build_source_figure_provenance_diagnostics(
+                inventory, figure_catalog, revised_enrichment
+            )
+        )
         artifact = await self._persistence.store_editorial_enrichment_result(
             run_id=run.id,
             subject_id=subject_id,
@@ -666,7 +676,11 @@ class ProductionEditorialEnrichmentRevisionService:
             resolved_id = resolved.get("figure_id") if isinstance(resolved, dict) else None
             catalog_record: dict[str, Any] = next(
                 (
-                    entry.prompt_record()
+                    entry.prompt_record(
+                        evidence_handles=evidence_pack.evidence_handles_for_source(
+                            entry.figure.source_document_id
+                        )
+                    )
                     for entry in figure_catalog
                     if str(entry.figure.figure_id) == resolved_id
                 ),
@@ -699,7 +713,16 @@ class ProductionEditorialEnrichmentRevisionService:
                 "émets uniquement un bloc NEEDS avec un motif et un query_hint, sans proposer "
                 "l'élément révisé. Retourne un seul bloc TABLE, DIAGRAM ou FIGURE selon le "
                 "type ciblé, en conservant sa clé pour TABLE/DIAGRAM. Respecte strictement "
-                "les handles et règles de validation fournis."
+                "les handles et règles de validation fournis. Pour une FIGURE, sélectionne "
+                "uniquement un FIGURE_HANDLE accepté du catalogue, avec des evidence handles "
+                "de la même source. Une architecture, chaîne d'exploitation ou chaîne malware, "
+                "infrastructure, capture réseau, capture de code informative, screenshot de "
+                "leurre, visualisation d'analyse ou graphique source peut être utile. Rejette "
+                "logo, header/footer, bannière, hero décoratif, illustration marketing, portrait "
+                "sans valeur analytique, image d'article adjacent ou figure sans lien direct aux "
+                "preuves. Une URL ou une image ne remplace jamais le handle. La caption doit "
+                "être courte et descriptive; si elle manque, le code préfère la caption source, "
+                "puis un alt exploitable, et refuse de publier sans l'un de ces textes."
             ),
             "action": action.value,
             "instruction": instruction,
@@ -722,7 +745,14 @@ class ProductionEditorialEnrichmentRevisionService:
                     dict(value) for value in evidence_pack.source_pair_relations
                 ],
             },
-            "figure_catalog": [value.prompt_record() for value in figure_catalog],
+            "figure_catalog": [
+                value.prompt_record(
+                    evidence_handles=evidence_pack.evidence_handles_for_source(
+                        value.figure.source_document_id
+                    )
+                )
+                for value in figure_catalog
+            ],
             "output_contract": editorial_enrichment_output_contract_example(),
             "output_contract_version": (EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION),
         }

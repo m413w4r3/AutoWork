@@ -168,11 +168,11 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v12-readable-diagrams"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v13-source-figure-selection"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v7-diagram-node-roles"
+    "editorial-enrichment-block-contract-v8-source-figure-captions"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v7-node-roles"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v8-source-figure-captions"
 EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v1-targeted"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = "editorial-enrichment-repair-contract-v1"
 SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v2-no-title"
@@ -181,8 +181,12 @@ SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v3-no-title"
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
-EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v1"
-EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = "editorial-enrichment-revision-contract-v1"
+EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
+    "editorial-enrichment-revision-v2-source-figure-selection"
+)
+EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
+    "editorial-enrichment-revision-contract-v2-source-figure-captions"
+)
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v3-counter-analysis"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v2-reason-pairs"
 RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v3-repair-reserves"

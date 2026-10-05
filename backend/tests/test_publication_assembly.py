@@ -668,14 +668,15 @@ def _enrichment_citing(
     )
 
 
-def test_publication_v5_review_projection_retains_figure_provenance_and_origin() -> None:
+@pytest.mark.asyncio
+async def test_publication_v5_review_projection_retains_figure_provenance_and_origin() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     source = extraction.sources[0]
     locator = SourceFigureLocatorV1(
         page=2,
         section="Network overview",
-        figure_label="Execution architecture",
-        original_asset_url="https://cdn.example.com/execution.png",
+        figure_label="BlueMoon exploitation chain",
+        original_asset_url="https://cdn.example.com/bluemoon-chain.png",
     )
     figure_id = source_figure_id(
         source_document_id=source.source_document_id,
@@ -700,7 +701,7 @@ def test_publication_v5_review_projection_retains_figure_provenance_and_origin()
         key=f"source_figure_{figure_id.hex}",
         source_document_id=source.source_document_id,
         source_url=source.canonical_url,
-        caption="Execution architecture",
+        caption="BlueMoon exploitation chain from lure to payloads",
         provenance=resolved.provenance,
         locator=locator,
         inclusion_status=SourceFigureInclusionStatus.INCLUDED,
@@ -724,9 +725,34 @@ def test_publication_v5_review_projection_retains_figure_provenance_and_origin()
 
     assert published_figure["source_url"] == source.canonical_url
     assert published_figure["locator"]["original_asset_url"] == (
-        "https://cdn.example.com/execution.png"
+        "https://cdn.example.com/bluemoon-chain.png"
     )
+    assert published_figure["sha256"] == "f" * 64
     assert published_figure["provenance"] == "Archived figure from the primary source, page 2"
+
+    service, _catalog, _artifacts = _service()
+    artifact = await service.assemble_publication(
+        run=_run(snapshot),
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    (diagnostic,) = artifact.metadata["source_figure_provenance_diagnostics"]
+    assert diagnostic["stage"] == "published"
+    assert diagnostic["figure_id"] == str(figure_id)
+    assert diagnostic["blob_id"] == str(UUID(int=21))
+    assert diagnostic["sha256"] == published_figure["sha256"]
+    assert set(diagnostic) == {
+        "stage",
+        "source_document_id",
+        "figure_id",
+        "figure_handle",
+        "blob_id",
+        "sha256",
+        "reason_code",
+    }
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,7 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-SOURCE_MEDIA_POLICY_VERSION = "source-media-exclusion-v3-related-media"
+SOURCE_MEDIA_POLICY_VERSION = "source-media-collection-v4-aspect-ratio-warning"
 SOURCE_MEDIA_MAX_BYTES = 5 * 1024 * 1024
 SOURCE_MEDIA_MAX_PIXELS = 40_000_000
 SOURCE_MEDIA_MAX_SIDE_LENGTH = 10_000
@@ -272,6 +272,16 @@ class SourceMediaArchiveService:
             digest = hashlib.sha256(content).hexdigest()
             mime_type = _sniff_image_mime(content)
             width, height = image_dimensions(content, mime_type)
+            aspect_ratio_warning = (
+                width is not None
+                and height is not None
+                and max(width / height, height / width) > self.policy.maximum_aspect_ratio
+            )
+            if aspect_ratio_warning:
+                response_metadata = {
+                    **response_metadata,
+                    "aspect_ratio_warning": SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value,
+                }
             shared_fields: _SharedRecordFields = dict(
                 sha256=digest,
                 mime_type=mime_type,
@@ -333,22 +343,6 @@ class SourceMediaArchiveService:
                         candidate_id,
                         status=SourceMediaStatus.EXCLUDED_BY_RULE,
                         reason=SourceMediaReasonCode.TRACKING_PIXEL,
-                        **shared_fields,
-                    )
-                )
-                continue
-            if (
-                width is not None
-                and height is not None
-                and max(width / height, height / width) > self.policy.maximum_aspect_ratio
-            ):
-                resolved.append(
-                    self._base_record(
-                        subject_id,
-                        observation,
-                        candidate_id,
-                        status=SourceMediaStatus.EXCLUDED_BY_RULE,
-                        reason=SourceMediaReasonCode.EXTREME_ASPECT_RATIO,
                         **shared_fields,
                     )
                 )

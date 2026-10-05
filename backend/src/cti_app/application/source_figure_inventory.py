@@ -38,11 +38,14 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_extraction import ProductionSourceExtractionV1
 from cti_app.domain.source_media import (
+    SourceFigureProvenanceDiagnostic,
+    SourceFigureProvenanceStage,
     SourceMediaReasonCode,
     SourceMediaRecord,
     SourceMediaStatus,
 )
 
+SOURCE_FIGURE_INVENTORY_POLICY_VERSION = "source-figure-inventory-v2-provenance"
 MAX_SOURCE_FIGURES = 128
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
@@ -90,6 +93,7 @@ class SourceFigureCatalogMetadata:
     anchor: str | None = None
     width: int | None = None
     height: int | None = None
+    aspect_ratio_warning: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +103,7 @@ class SourceFigureInventoryResult:
     warnings: tuple[str, ...] = ()
     policy_sha256: str | None = None
     catalog_metadata: Mapping[UUID, SourceFigureCatalogMetadata] = field(default_factory=dict)
+    provenance_diagnostics: tuple[SourceFigureProvenanceDiagnostic, ...] = ()
 
     @property
     def accepted(self) -> tuple[ResolvedSourceFigureV1, ...]:
@@ -121,12 +126,15 @@ class SourceFigureInventoryResult:
                 "anchor": metadata.anchor,
                 "width": metadata.width,
                 "height": metadata.height,
+                "aspect_ratio_warning": metadata.aspect_ratio_warning,
             }
 
         payload = {
+            "inventory_policy_version": SOURCE_FIGURE_INVENTORY_POLICY_VERSION,
             "truncated": self.truncated,
             "warnings": list(self.warnings),
             "policy_sha256": self.policy_sha256,
+            "provenance_diagnostics": [item.to_json() for item in self.provenance_diagnostics],
             "figures": [
                 {
                     "figure_id": str(figure.figure_id),
@@ -273,6 +281,11 @@ class SourceFigureInventory:
                     observed_width = media_record.width
                 if observed_height is None:
                     observed_height = media_record.height
+            if blob is not None:
+                if observed_width is None:
+                    observed_width = blob.width
+                if observed_height is None:
+                    observed_height = blob.height
             if image_dimensions_exceed_limits(
                 observed_width,
                 observed_height,
@@ -281,10 +294,6 @@ class SourceFigureInventory:
             ):
                 decision = SourceFigureDecision.REJECTED
                 reason = SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
-                blob = None
-            elif _is_extreme_aspect_ratio(observed_width, observed_height):
-                decision = SourceFigureDecision.REJECTED
-                reason = SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
                 blob = None
             elif _is_below_minimum_dimensions(observed_width, observed_height):
                 decision = SourceFigureDecision.REJECTED
@@ -367,6 +376,7 @@ class SourceFigureInventory:
                 anchor=(media_record.anchor if media_record is not None else None) or anchor,
                 width=observed_width,
                 height=observed_height,
+                aspect_ratio_warning=_is_extreme_aspect_ratio(observed_width, observed_height),
             )
             if sha256 is not None:
                 if duplicate:
@@ -435,7 +445,6 @@ class SourceFigureInventory:
                         SourceMediaReasonCode.DUPLICATE_PERCEPTUAL_HASH,
                         SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS,
                         SourceMediaReasonCode.BELOW_MINIMUM_BYTES,
-                        SourceMediaReasonCode.EXTREME_ASPECT_RATIO,
                     }
                 )
             )
@@ -682,12 +691,65 @@ class SourceFigureInventory:
                 ),
             )
         )
+        provenance_diagnostics: list[SourceFigureProvenanceDiagnostic] = []
+        for figure in ordered:
+            provenance_diagnostics.append(
+                SourceFigureProvenanceDiagnostic(
+                    stage=SourceFigureProvenanceStage.DISCOVERED,
+                    source_document_id=figure.source_document_id,
+                    figure_id=figure.figure_id,
+                )
+            )
+            if figure.decision is SourceFigureDecision.ACCEPTED:
+                if figure.blob_id is not None and figure.sha256 is not None:
+                    provenance_diagnostics.append(
+                        SourceFigureProvenanceDiagnostic(
+                            stage=SourceFigureProvenanceStage.ARCHIVED,
+                            source_document_id=figure.source_document_id,
+                            figure_id=figure.figure_id,
+                            blob_id=figure.blob_id,
+                            sha256=figure.sha256,
+                        )
+                    )
+            elif figure.decision is SourceFigureDecision.PENDING:
+                rejection_stage = _provenance_rejection_stage(figure.decision_reason)
+                if rejection_stage in {
+                    SourceFigureProvenanceStage.REJECTED_SECURITY,
+                    SourceFigureProvenanceStage.REJECTED_FORMAT,
+                }:
+                    provenance_diagnostics.append(
+                        SourceFigureProvenanceDiagnostic(
+                            stage=rejection_stage,
+                            source_document_id=figure.source_document_id,
+                            figure_id=figure.figure_id,
+                            reason_code=figure.decision_reason,
+                        )
+                    )
+                elif _is_download_failure_reason(figure.decision_reason):
+                    provenance_diagnostics.append(
+                        SourceFigureProvenanceDiagnostic(
+                            stage=SourceFigureProvenanceStage.DOWNLOAD_FAILED,
+                            source_document_id=figure.source_document_id,
+                            figure_id=figure.figure_id,
+                            reason_code=figure.decision_reason,
+                        )
+                    )
+            else:
+                provenance_diagnostics.append(
+                    SourceFigureProvenanceDiagnostic(
+                        stage=_provenance_rejection_stage(figure.decision_reason),
+                        source_document_id=figure.source_document_id,
+                        figure_id=figure.figure_id,
+                        reason_code=figure.decision_reason,
+                    )
+                )
         return SourceFigureInventoryResult(
             figures=ordered,
             truncated=truncated,
             warnings=tuple(sorted(warnings)),
             policy_sha256=policy_sha256,
             catalog_metadata=catalog_metadata,
+            provenance_diagnostics=tuple(provenance_diagnostics),
         )
 
 
@@ -765,8 +827,6 @@ def _resolve_observed_bytes(
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
     width = observed.width if observed.width is not None else (asset.width if asset else None)
     height = observed.height if observed.height is not None else (asset.height if asset else None)
-    if _is_extreme_aspect_ratio(width, height):
-        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
     if _is_below_minimum_dimensions(width, height):
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS.value
     if observed.mime_type not in SUPPORTED_MEDIA_MIME_TYPES:
@@ -812,8 +872,6 @@ def _resolve_archived_asset(
         maximum_side_length=max_figure_side_length,
     ):
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
-    if _is_extreme_aspect_ratio(asset.width, asset.height):
-        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
     if _is_below_minimum_dimensions(asset.width, asset.height):
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS.value
     return SourceFigureDecision.ACCEPTED, "matched_archived_blob"
@@ -831,6 +889,36 @@ def _is_extreme_aspect_ratio(width: int | None, height: int | None) -> bool:
 
 def _is_below_minimum_dimensions(width: int | None, height: int | None) -> bool:
     return (width is not None and width < 160) or (height is not None and height < 100)
+
+
+def _is_download_failure_reason(reason: str) -> bool:
+    return reason in {
+        SourceMediaReasonCode.COLLECTION_UNAVAILABLE.value,
+        SourceMediaReasonCode.COLLECTION_FAILED.value,
+        SourceMediaReasonCode.PDF_IMAGE_EXTRACTION_FAILED.value,
+    }
+
+
+def _provenance_rejection_stage(reason: str) -> SourceFigureProvenanceStage:
+    if reason in {
+        SourceMediaReasonCode.INVALID_SOURCE_URL.value,
+        SourceMediaReasonCode.UNSAFE_DESTINATION.value,
+        SourceMediaReasonCode.COLLECTION_SIZE_LIMIT.value,
+        SourceMediaReasonCode.EXCEEDS_MAXIMUM_BYTES.value,
+        SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value,
+        "invalid_image_source_url",
+        "figure_exceeds_byte_limit",
+        "inventory_exceeds_total_byte_limit",
+    }:
+        return SourceFigureProvenanceStage.REJECTED_SECURITY
+    if reason in {
+        SourceMediaReasonCode.NOT_AN_IMAGE.value,
+        SourceMediaReasonCode.UNSUPPORTED_IMAGE_TYPE.value,
+        "unsupported_image_mime_type",
+        "data_uri_mime_mismatch",
+    }:
+        return SourceFigureProvenanceStage.REJECTED_FORMAT
+    return SourceFigureProvenanceStage.REJECTED_EDITORIAL
 
 
 def _pdf_images(

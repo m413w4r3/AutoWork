@@ -71,7 +71,10 @@ from cti_app.application.production_synthesis import (
     synthesis_access_policy_hash,
 )
 from cti_app.application.source_figure_inventory import (
+    ArchivedFigureAsset,
+    ArchivedFigureSource,
     SourceFigureCatalogMetadata,
+    SourceFigureInventory,
     SourceFigureInventoryResult,
 )
 from cti_app.domain.classification import TLP
@@ -133,6 +136,10 @@ from cti_app.domain.production_synthesis import (
 )
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.semantic_annotation import SemanticRole
+from cti_app.domain.source_media import (
+    SourceFigureProvenanceDiagnostic,
+    SourceFigureProvenanceStage,
+)
 
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
 _DOCUMENT_ID = UUID("b8f83b7b-7088-409a-9667-4f93758c18e1")
@@ -277,12 +284,15 @@ def _figure_inventory(
     extraction: ProductionExtractionV1,
     *,
     decision: SourceFigureDecision = SourceFigureDecision.ACCEPTED,
+    figure_label: str = "ExampleRAT execution architecture",
+    source_caption: str | None = "ExampleRAT execution architecture",
+    alt_text: str | None = "ExampleRAT flow",
 ) -> SourceFigureInventoryResult:
     source = extraction.sources[0]
     locator = SourceFigureLocatorV1(
         page=2,
         section="Network overview",
-        figure_label="ExampleRAT execution architecture",
+        figure_label=figure_label,
         original_asset_url="https://cdn.example.test/example-rat.png",
     )
     digest = "f" * 64
@@ -313,14 +323,34 @@ def _figure_inventory(
         policy_sha256="d" * 64,
         catalog_metadata={
             figure.figure_id: SourceFigureCatalogMetadata(
-                alt_text="ExampleRAT flow",
-                caption_text="ExampleRAT execution architecture",
+                alt_text=alt_text,
+                caption_text=source_caption,
                 nearby_heading_text="Network overview",
                 anchor="figure:2:network-overview",
                 width=640,
                 height=400,
             )
         },
+        provenance_diagnostics=(
+            SourceFigureProvenanceDiagnostic(
+                stage=SourceFigureProvenanceStage.DISCOVERED,
+                source_document_id=source.source_document_id,
+                figure_id=figure.figure_id,
+            ),
+            *(
+                (
+                    SourceFigureProvenanceDiagnostic(
+                        stage=SourceFigureProvenanceStage.ARCHIVED,
+                        source_document_id=source.source_document_id,
+                        figure_id=figure.figure_id,
+                        blob_id=figure.blob_id,
+                        sha256=figure.sha256,
+                    ),
+                )
+                if decision is SourceFigureDecision.ACCEPTED and figure.blob_id is not None
+                else ()
+            ),
+        ),
     )
 
 
@@ -1048,8 +1078,9 @@ def test_figure_proposal_selects_local_asset_with_the_model_written_caption() ->
     pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
     inventory = _figure_inventory(extraction)
     catalog = build_editorial_figure_catalog(extraction, inventory)
+    model_caption = "Architecture diagram for ExampleRAT execution"
     parsed = parse_editorial_enrichment_proposal_wire(
-        _figure_wire(caption="Brand-new unsupported claim"), pack, figure_catalog=catalog
+        _figure_wire(caption=model_caption), pack, figure_catalog=catalog
     )
 
     assert parsed.proposal is not None
@@ -1059,7 +1090,7 @@ def test_figure_proposal_selects_local_asset_with_the_model_written_caption() ->
 
     selected = enrichment.source_figures[0]
     assert selected.inclusion_status.value == "included"
-    assert selected.caption == "Brand-new unsupported claim"
+    assert selected.caption == model_caption
     assert selected.resolved_figure is not None
     assert selected.resolved_figure.sha256 == "f" * 64
     assert selected.resolved_figure.blob_id == UUID(int=601)
@@ -1112,6 +1143,148 @@ def test_figure_wire_rejects_unknown_excluded_or_unplaced_candidates(
 
     assert parsed.proposal is None
     assert reason in {item.reason_code for item in parsed.rejections}
+
+
+def test_figure_evidence_from_another_source_is_rejected() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    original_ref = pack.resolve_handle("E001")
+    wrong_source_ref = replace(
+        original_ref,
+        source_document_id=UUID("90000000-0000-0000-0000-000000000009"),
+    )
+    wrong_source_pack = replace(
+        pack,
+        _handle_to_ref={**pack._handle_to_ref, "E002": wrong_source_ref},
+    )
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+
+    parsed = parse_editorial_enrichment_proposal_wire(
+        _figure_wire().replace("EVIDENCE: E001", "EVIDENCE: E002"),
+        wrong_source_pack,
+        figure_catalog=catalog,
+    )
+
+    assert parsed.proposal is None
+    assert "editorial_enrichment_figure_evidence_source_mismatch" in {
+        item.reason_code for item in parsed.rejections
+    }
+
+
+def test_figure_caption_falls_back_to_source_caption_then_alt_text() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    source_caption_inventory = _figure_inventory(
+        extraction,
+        source_caption="Original caption from the article",
+        alt_text="Useful alt description",
+    )
+    source_catalog = build_editorial_figure_catalog(extraction, source_caption_inventory)
+    no_model_caption = _figure_wire().replace("CAPTION: ExampleRAT execution architecture\n", "")
+
+    source_fallback = parse_editorial_enrichment_proposal_wire(
+        no_model_caption, pack, figure_catalog=source_catalog
+    )
+    assert source_fallback.proposal is not None
+    source_enrichment = validate_editorial_enrichment_proposal(
+        source_fallback.proposal,
+        pack,
+        extraction,
+        synthesis,
+        figure_catalog=source_catalog,
+    )
+    assert source_enrichment.source_figures[0].caption == "Original caption from the article"
+
+    alt_inventory = _figure_inventory(
+        extraction, source_caption=None, alt_text="Useful alt description"
+    )
+    alt_catalog = build_editorial_figure_catalog(extraction, alt_inventory)
+    alt_fallback = parse_editorial_enrichment_proposal_wire(
+        no_model_caption, pack, figure_catalog=alt_catalog
+    )
+    assert alt_fallback.proposal is not None
+    alt_enrichment = validate_editorial_enrichment_proposal(
+        alt_fallback.proposal, pack, extraction, synthesis, figure_catalog=alt_catalog
+    )
+    assert alt_enrichment.source_figures[0].caption == "Useful alt description"
+
+
+def test_figure_without_any_caption_fallback_is_not_published() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(
+        extraction,
+        _figure_inventory(extraction, source_caption=None, alt_text=None),
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(
+        _figure_wire().replace("CAPTION: ExampleRAT execution architecture\n", ""),
+        pack,
+        figure_catalog=catalog,
+    )
+
+    assert parsed.proposal is None
+    assert "editorial_enrichment_figure_caption_missing" in {
+        item.reason_code for item in parsed.rejections
+    }
+
+
+def test_model_cannot_replace_figure_handle_with_an_image_url() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+
+    parsed = parse_editorial_enrichment_proposal_wire(
+        _figure_wire(extra="IMAGE_URL: https://invented.example/image.png"),
+        pack,
+        figure_catalog=catalog,
+    )
+
+    assert parsed.proposal is None
+    assert "editorial_enrichment_unknown_field" in {item.reason_code for item in parsed.rejections}
+
+
+def test_two_catalog_figures_allow_only_the_relevant_one_to_be_selected() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    inventory = _figure_inventory(extraction, figure_label="BlueMoon exploitation chain")
+    first = inventory.accepted[0]
+    second = first.model_copy(
+        update={
+            "figure_id": UUID(int=702),
+            "locator": replace(first.locator, figure_label="Unrelated marketing banner"),
+        }
+    )
+    metadata = inventory.catalog_metadata[first.figure_id]
+    inventory = replace(
+        inventory,
+        figures=(first, second),
+        catalog_metadata={first.figure_id: metadata, second.figure_id: metadata},
+    )
+    catalog = build_editorial_figure_catalog(extraction, inventory)
+    wire = _figure_wire(
+        caption="Chaîne d'exploitation BlueMoon, du leurre aux charges post-exploitation."
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
+
+    assert parsed.proposal is not None
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal, pack, extraction, synthesis, figure_catalog=catalog
+    )
+    assert len(enrichment.source_figures) == 1
+    assert enrichment.source_figures[0].resolved_figure == first
+    assert enrichment.figure_decisions[1].decision.value == "not_selected_by_model"
 
 
 def test_empty_figure_response_is_valid_and_model_cannot_supply_hash_or_image() -> None:
@@ -1201,7 +1374,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 5
+    assert enrichment.schema_version == 6
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -1411,21 +1584,26 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     )
     assert str(source.id) not in request.text
     assert str(extraction.sources[0].source_document_id) not in request.text
-    assert "https://cdn.example.test/example-rat.png" not in request.text
-    # The article URL is exposed only as each figure's source_page_url, so the
-    # model can open the page and look at the images.
+    # Each prompt entry carries the page, safe asset path, context, dimensions,
+    # and only evidence handles belonging to that source.
     assert request.text.count(extraction.sources[0].canonical_url) == len(figure_catalog)
     assert "F001" in request.text
+    assert '"asset_url":"https://cdn.example.test/example-rat.png"' in request.text
+    assert '"source_caption":"ExampleRAT execution architecture"' in request.text
+    assert '"evidence":["E001"]' in request.text
+    assert '"width":640' in request.text and '"height":400' in request.text
     assert "ExampleRAT execution architecture" in request.text
-    assert "640" in request.text and "400" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v7-diagram-node-roles"
+        "editorial-enrichment-block-contract-v8-source-figure-captions"
     )
 
-    assert "sélectionne de zéro à trois images" in request.text
+    assert "sélectionne zéro ou une image" in request.text
+    assert "capture de code ou artefact directement informative" in request.text
+    assert "image d'un article adjacent" in request.text
+    assert "SOURCE_PAGE_URL" in request.text and "ASSET_URL" in request.text
 
     revision_request = ProductionEditorialEnrichmentRevisionService._model_request(
         request_identity="c" * 64,
@@ -1980,11 +2158,44 @@ async def _execute(world: SimpleNamespace) -> ProductionEditorialEnrichmentExecu
 
 
 @pytest.mark.asyncio
-async def test_service_includes_only_the_model_selected_catalog_figure(
+async def test_bluemoon_archived_chain_is_catalogued_selected_and_published_from_same_blob(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, _figure_wire())))
-    inventory = _figure_inventory(world.extraction)
+    chain_caption = "Chaîne d'exploitation BlueMoon, du leurre aux charges post-exploitation."
+    world = _world(
+        _RecordingGateway(
+            lambda request: _succeeded_text(request, _figure_wire(caption=chain_caption))
+        )
+    )
+    article_source = world.extraction.sources[0]
+    image_url = "https://cdn.example.test/bluemoon-exploitation-chain.png"
+    article_bytes = (
+        "<article><h2>BlueMoon exploitation chain</h2>"
+        "<p>The lure launches the loader.</p><figure>"
+        f'<img src="{image_url}" alt="BlueMoon exploitation chain">'
+        "<figcaption>From lure to post-exploitation payloads.</figcaption>"
+        "</figure><p>The loader deploys the final payload.</p></article>"
+    ).encode()
+    archived_source = ArchivedFigureSource(
+        source_document_id=article_source.source_document_id,
+        source_url=article_source.canonical_url,
+        mime_type="text/html",
+        blob_id=UUID(int=602),
+        sha256=hashlib.sha256(article_bytes).hexdigest(),
+        byte_size=len(article_bytes),
+        content=article_bytes,
+    )
+    archived_asset = ArchivedFigureAsset(
+        source_document_id=article_source.source_document_id,
+        source_url=image_url,
+        blob_id=UUID(int=601),
+        sha256="f" * 64,
+        mime_type="image/png",
+        byte_size=4096,
+        width=640,
+        height=400,
+    )
+    inventory = SourceFigureInventory().inventory((archived_source,), (archived_asset,))
 
     async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
         return inventory
@@ -2005,12 +2216,25 @@ async def test_service_includes_only_the_model_selected_catalog_figure(
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     request = world.gateway.calls[0][0]
     assert "F001" in request.text
+    assert request.web_search is True
+    assert "BlueMoon exploitation chain" in request.text
+    assert image_url in request.text
     assert str(world.extraction.sources[0].source_document_id) not in request.text
     assert result.source_figure_count == 1
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.source_figures) == 1  # type: ignore[attr-defined]
     assert enrichment.source_figures[0].inclusion_status.value == "included"  # type: ignore[attr-defined]
     assert enrichment.source_figures[0].resolved_figure.sha256 == "f" * 64  # type: ignore[attr-defined]
+    assert enrichment.source_figures[0].resolved_figure.blob_id == UUID(int=601)  # type: ignore[attr-defined]
+    metadata = world.writer.calls[0]["metadata_extra"]
+    assert metadata["source_figure_provenance_version"] == "source-figure-provenance-v1"  # type: ignore[index]
+    diagnostics = metadata["source_figure_provenance_diagnostics"]  # type: ignore[index]
+    stages = [item["stage"] for item in diagnostics]  # type: ignore[union-attr]
+    assert stages == ["discovered", "archived", "catalogued", "selected"]
+    selected = diagnostics[-1]  # type: ignore[index]
+    assert selected["blob_id"] == str(UUID(int=601))
+    assert selected["sha256"] == "f" * 64
+    assert "image_bytes" not in json.dumps(diagnostics)
 
 
 @pytest.mark.asyncio

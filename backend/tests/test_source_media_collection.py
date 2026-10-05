@@ -415,9 +415,9 @@ async def test_images_with_excessive_dimensions_are_excluded_before_archiving(
     assert not store.objects
 
 
-async def test_extreme_aspect_ratio_media_is_excluded_before_archiving() -> None:
+async def test_extreme_aspect_ratio_media_is_archived_with_a_warning() -> None:
     service, factory, store, _transport = _service(
-        {"https://site.example/wide.png": _response(_png_header(1200, 100))}
+        {"https://site.example/wide.png": _response(_png(1200, 100))}
     )
 
     (record,) = await service.collect(
@@ -425,11 +425,12 @@ async def test_extreme_aspect_ratio_media_is_excluded_before_archiving() -> None
         (_source('<img alt="Wide chart" src="/wide.png">'),),
     )
 
-    assert record.status is SourceMediaStatus.EXCLUDED_BY_RULE
-    assert record.reason_code is SourceMediaReasonCode.EXTREME_ASPECT_RATIO
+    assert record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
+    assert record.reason_code is SourceMediaReasonCode.ELIGIBLE_FOR_REVIEW
     assert (record.width, record.height) == (1200, 100)
-    assert not factory.state.blobs
-    assert not store.objects
+    assert record.collection_diagnostics["aspect_ratio_warning"] == "extreme_aspect_ratio"
+    assert len(factory.state.blobs) == 1
+    assert store.objects
 
 
 async def test_collector_wire_size_limit_is_recorded_as_collection_diagnostic() -> None:

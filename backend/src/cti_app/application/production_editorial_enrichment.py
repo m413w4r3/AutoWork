@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import (
@@ -167,6 +167,10 @@ from cti_app.domain.semantic_annotation import (
     section_paragraph_anchor,
     timeline_anchor,
 )
+from cti_app.domain.source_media import (
+    SourceFigureProvenanceDiagnostic,
+    SourceFigureProvenanceStage,
+)
 
 if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
@@ -182,7 +186,10 @@ EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v1-token-dice-0.80"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v2-figure-catalog"
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = (
+    "editorial-enrichment-model-policy-v3-source-figure-editorial-selection"
+)
+SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION = "source-figure-provenance-v1"
 EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
     "editorial-enrichment-routing-policy-v2-resource-search-off"
 )
@@ -504,39 +511,58 @@ class EditorialFigureCatalogEntry:
     metadata: SourceFigureCatalogMetadata
 
     @property
-    def source_caption(self) -> str:
-        return (
-            self.metadata.caption_text
-            or self.metadata.alt_text
-            or self.figure.locator.figure_label
-            or "Archived source figure"
-        )
+    def source_caption(self) -> str | None:
+        for value in (self.metadata.caption_text, self.metadata.alt_text):
+            if value is not None and value.strip():
+                return value.strip()
+        return None
 
-    def prompt_record(self, *, include_source_page: bool = False) -> dict[str, Any]:
+    def prompt_record(
+        self,
+        *,
+        include_source_page: bool = False,
+        include_asset_url: bool = False,
+        evidence_handles: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        context_before = _safe_figure_prompt_text(_tail(self.metadata.context_before, 400))
+        context_after = _safe_figure_prompt_text(_bounded_catalog_text(self.metadata.context_after))
+        source_caption = _safe_figure_prompt_text(self.metadata.caption_text)
+        alt_text = _safe_figure_prompt_text(self.metadata.alt_text)
+        nearby_heading = _safe_figure_prompt_text(
+            self.metadata.nearby_heading_text or self.figure.locator.section
+        )
         return {
             "handle": self.handle,
             "source_role": self.source_role,
             "editorial_role": self.editorial_role,
-            "caption": _safe_figure_prompt_text(self.metadata.caption_text),
-            "alt": _safe_figure_prompt_text(self.metadata.alt_text),
-            "nearby_heading": _safe_figure_prompt_text(
-                self.metadata.nearby_heading_text or self.figure.locator.section
-            ),
+            "source_caption": source_caption,
+            "caption": source_caption,
+            "alt": alt_text,
+            "nearby_heading": nearby_heading,
             "figure_label": _safe_figure_prompt_text(self.figure.locator.figure_label),
             "source_page_url": self.figure.source if include_source_page else None,
+            "asset_url": (
+                _safe_asset_prompt_url(self.figure.locator.original_asset_url)
+                if include_asset_url
+                else None
+            ),
             "image_file": _image_file_name(self.figure.locator.original_asset_url),
             # The model finds the image on the live page through the text around
             # it; the nearest words are the most discriminating.
-            "text_before_image": _safe_figure_prompt_text(_tail(self.metadata.context_before, 400)),
-            "text_after_image": _safe_figure_prompt_text(
-                _bounded_catalog_text(self.metadata.context_after)
-            ),
+            "context_before": context_before,
+            "context_after": context_after,
+            "text_before_image": context_before,
+            "text_after_image": context_after,
             "page": self.figure.locator.page,
             "anchor": _safe_figure_prompt_text(self.metadata.anchor),
+            "width": self.metadata.width,
+            "height": self.metadata.height,
             "dimensions": {
                 "width": self.metadata.width,
                 "height": self.metadata.height,
             },
+            "aspect_ratio_warning": self.metadata.aspect_ratio_warning,
+            "evidence": list(evidence_handles),
             "in_article_body": self.metadata.in_article_body,
             "mime_type": self.figure.mime_type,
             "provenance_summary": _bounded_catalog_text(
@@ -556,6 +582,23 @@ def _image_file_name(asset_url: str | None) -> str | None:
         return None
     name = urlsplit(asset_url).path.rsplit("/", 1)[-1]
     return name or None
+
+
+def _safe_asset_prompt_url(asset_url: str | None) -> str | None:
+    if not asset_url or asset_url.casefold().startswith("data:"):
+        return None
+    try:
+        parts = urlsplit(asset_url)
+    except ValueError:
+        return None
+    if (
+        parts.scheme.casefold() not in {"http", "https"}
+        or not parts.hostname
+        or parts.username is not None
+        or parts.password is not None
+    ):
+        return None
+    return urlunsplit((parts.scheme.casefold(), parts.netloc, parts.path, "", ""))
 
 
 def _bounded_catalog_text(value: str | None, limit: int = 400) -> str | None:
@@ -1404,6 +1447,9 @@ def _parse_figure_wire_block(
         return None
     if caption is None:
         caption = catalog_entry.source_caption
+    if caption is None or not caption.strip():
+        reject("editorial_enrichment_figure_caption_missing")
+        return None
     try:
         return FigureProposalV1(
             figure_handle=handle.strip(),
@@ -2938,6 +2984,15 @@ class EditorialEnrichmentEvidencePackV1:
                 EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
             ) from exc
 
+    def evidence_handles_for_source(self, source_document_id: UUID) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                handle
+                for handle, ref in self._handle_to_ref.items()
+                if ref.source_document_id == source_document_id
+            )
+        )
+
 
 class EditorialEnrichmentExecutionStatus(StrEnum):
     SUCCEEDED = "succeeded"
@@ -3050,6 +3105,65 @@ def build_editorial_figure_catalog(
             )
         )
     return tuple(entries)
+
+
+def build_source_figure_provenance_diagnostics(
+    inventory: SourceFigureInventoryResult,
+    figure_catalog: tuple[EditorialFigureCatalogEntry, ...],
+    enrichment: EditorialEnrichmentV1,
+) -> list[dict[str, str | None]]:
+    diagnostics = list(inventory.provenance_diagnostics)
+    catalog_by_id = {entry.figure.figure_id: entry for entry in figure_catalog}
+    for entry in figure_catalog:
+        diagnostics.append(
+            SourceFigureProvenanceDiagnostic(
+                stage=SourceFigureProvenanceStage.CATALOGUED,
+                source_document_id=entry.figure.source_document_id,
+                figure_id=entry.figure.figure_id,
+                figure_handle=entry.handle,
+                blob_id=(
+                    entry.figure.blob_id
+                    if entry.figure.decision is SourceFigureDecision.ACCEPTED
+                    else None
+                ),
+                sha256=(
+                    entry.figure.sha256
+                    if entry.figure.decision is SourceFigureDecision.ACCEPTED
+                    else None
+                ),
+                reason_code=(
+                    entry.figure.decision_reason
+                    if entry.figure.decision is not SourceFigureDecision.ACCEPTED
+                    else None
+                ),
+            )
+        )
+
+    for candidate in enrichment.source_figures:
+        if candidate.inclusion_status is not SourceFigureInclusionStatus.INCLUDED:
+            continue
+        resolved = candidate.resolved_figure
+        selected_entry = catalog_by_id.get(resolved.figure_id) if resolved is not None else None
+        if (
+            resolved is None
+            or selected_entry is None
+            or resolved.decision is not SourceFigureDecision.ACCEPTED
+            or resolved.source_document_id != selected_entry.figure.source_document_id
+            or resolved.blob_id != selected_entry.figure.blob_id
+            or resolved.sha256 != selected_entry.figure.sha256
+        ):
+            raise ValueError("source_figure_published_media_mismatch")
+        diagnostics.append(
+            SourceFigureProvenanceDiagnostic(
+                stage=SourceFigureProvenanceStage.SELECTED,
+                source_document_id=resolved.source_document_id,
+                figure_id=resolved.figure_id,
+                figure_handle=selected_entry.handle,
+                blob_id=resolved.blob_id,
+                sha256=resolved.sha256,
+            )
+        )
+    return [item.to_json() for item in diagnostics]
 
 
 def _source_figure_inventory_warnings(
@@ -3641,19 +3755,35 @@ REASON: what relevant media is missing
 QUERY_HINT: short query bounded to the current subject
 END NEEDS
 
-Figures : sélectionne de zéro à trois images qui ont une valeur analytique pour ce sujet :
-schémas d'infrastructure, flux, captures de maliciel, panneaux ou portefeuilles, et graphiques
-avec des chiffres utiles. N'inclus jamais un élément décoratif ni une image d'un autre acteur.
-Juge chaque image du figure_catalog d'après son contexte dans l'article : nearby_heading_text,
-text_before_image, text_after_image, figure_label, alt_text, caption et image_file (F001 est
-seulement la clé locale). Ouvre source_page_url pour confirmer ce que montre l'image quand tu
-le peux. Rédige CAPTION en français : décris ce que l'image illustre dans l'article sans ajouter
-de fait ni de détail visuel que tu n'as pas pu vérifier. Choisis son emplacement avec PLACEMENT
-(et SECTION_INDEX pour after_section). Utilise seulement les handles acceptés; n'utilise aucun
-média exclu ou non archivé. Chaque FIGURE requiert une preuve de la même source, une caption, un
-emplacement valide et une raison. NEEDS est facultatif seulement pour un
-specific missing media item or technical analysis. Zero figures is valid. Do not
-return resource URLs in this response."""
+Figures : sélectionne zéro ou une image seulement si elle améliore réellement la compréhension;
+plusieurs images ne sont permises que si chacune répond à un besoin analytique distinct. Quand
+la recherche Web est disponible, consulte SOURCE_PAGE_URL et identifie ce que montre réellement
+chaque figure. Évalue FIGURE_HANDLE avec SOURCE_PAGE_URL, ASSET_URL, ALT, SOURCE_CAPTION,
+NEARBY_HEADING, CONTEXT_BEFORE, CONTEXT_AFTER, WIDTH, HEIGHT et EVIDENCE. Les dimensions
+extrêmes sont une alerte de forme, pas une raison de rejet : une timeline ou une architecture
+panoramique peut être informative.
+
+Critères positifs : architecture, chaîne d'exploitation ou chaîne malware, infrastructure,
+capture réseau, capture de code ou artefact directement informative, screenshot de leurre,
+visualisation d'analyse et graphique source. La capture de journalisation BlueMoon est utile
+parce que le contenu technique de la capture constitue lui-même l'information.
+
+Critères négatifs : logo, header/footer, bannière, hero décoratif, illustration marketing,
+portrait sans valeur analytique, image d'un article adjacent ou figure sans lien direct avec les
+evidence handles. Une figure de la mauvaise source ne peut pas être rattachée à ce sujet.
+
+Sélectionne uniquement un FIGURE_HANDLE fourni par AutoWork, jamais une URL d'image. Une URL,
+un média ou une description inventés ne sont pas des preuves. Utilise uniquement les evidence
+handles listés pour cette figure et vérifie que chaque preuve vient du même article. La figure
+source est prioritaire sur une représentation reconstruite si elle répond déjà correctement à
+la même question. Zéro figure est une décision valide.
+
+Rédige une caption courte et descriptive, dans la langue de publication, qui dit ce que montre
+l'image sans renforcer une attribution ni ajouter de détail non vérifié. Si tu ne peux pas
+proposer de caption fiable, omets la figure; le code peut utiliser SOURCE_CAPTION puis ALT comme
+repli. Sans caption modèle, caption source ou alt exploitable, la figure ne sera pas publiée.
+Choisis un emplacement valide avec PLACEMENT et SECTION_INDEX. NEEDS est facultatif et ne doit
+décrire qu'un média analytique pertinent manquant. Ne renvoie aucune URL dans la réponse."""
 
 
 def build_editorial_enrichment_model_request(
@@ -3769,7 +3899,14 @@ def build_editorial_enrichment_model_request(
             },
         },
         "figure_catalog": [
-            entry.prompt_record(include_source_page=True) for entry in figure_catalog
+            entry.prompt_record(
+                include_source_page=True,
+                include_asset_url=True,
+                evidence_handles=evidence_pack.evidence_handles_for_source(
+                    entry.figure.source_document_id
+                ),
+            )
+            for entry in figure_catalog
         ],
         "editorial_guidance": {
             "table_kinds": [item.value for item in EnrichmentTableKind],
@@ -4254,7 +4391,12 @@ def validate_editorial_enrichment_proposal(
             # empty or non-plain one falls back to the archived source caption.
             caption = proposed.caption.strip()
             if not caption:
-                caption = catalog_entry.source_caption
+                source_caption = catalog_entry.source_caption
+                if source_caption is None:
+                    raise EditorialEnrichmentProposalControlError(
+                        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                    )
+                caption = source_caption
                 local_warnings.add(
                     f"editorial_enrichment_figure_caption_downgraded:{catalog_entry.handle}"
                 )
@@ -4878,6 +5020,10 @@ class ProductionEditorialEnrichmentService:
             metadata_extra={
                 "editorial_enrichment_wire_details": wire_details,
                 "repaired_block_count": repaired_block_count,
+                "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+                "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
+                    source_figure_inventory, figure_catalog, enrichment
+                ),
             },
         )
         return ProductionEditorialEnrichmentExecution(

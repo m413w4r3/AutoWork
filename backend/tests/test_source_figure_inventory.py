@@ -21,7 +21,12 @@ from cti_app.domain.production_editorial_enrichment import (
     SourceFigureLocatorV1,
     source_figure_id,
 )
-from cti_app.domain.source_media import SourceMediaReasonCode, SourceMediaRecord, SourceMediaStatus
+from cti_app.domain.source_media import (
+    SourceFigureProvenanceStage,
+    SourceMediaReasonCode,
+    SourceMediaRecord,
+    SourceMediaStatus,
+)
 
 _DOCUMENT_ID = UUID("10000000-0000-0000-0000-000000000001")
 _IMAGE_DOCUMENT_ID = UUID("20000000-0000-0000-0000-000000000002")
@@ -159,6 +164,10 @@ def test_collection_failure_remains_pending_in_the_figure_inventory() -> None:
     assert len(result.figures) == 1
     assert result.figures[0].decision is SourceFigureDecision.PENDING
     assert result.figures[0].decision_reason == "collection_unavailable"
+    assert any(
+        item.stage is SourceFigureProvenanceStage.DOWNLOAD_FAILED
+        for item in result.provenance_diagnostics
+    )
 
 
 def test_duplicate_image_bytes_are_deduplicated_by_sha256() -> None:
@@ -217,7 +226,7 @@ def test_inventory_applies_its_total_byte_limit() -> None:
     assert rejected.decision_reason == "inventory_exceeds_total_byte_limit"
 
 
-def test_inventory_rejects_extreme_aspect_ratio_images() -> None:
+def test_inventory_accepts_wide_archived_figure_and_marks_aspect_warning() -> None:
     image = _png_header(1200, 100)
     source = _source(_html('<img src="figures/wide.png" alt="Wide chart">'))
     asset = _asset(
@@ -229,8 +238,109 @@ def test_inventory_rejects_extreme_aspect_ratio_images() -> None:
 
     result = SourceFigureInventory().inventory((source,), (asset,))
 
-    assert result.figures[0].decision is SourceFigureDecision.REJECTED
-    assert result.figures[0].decision_reason == "extreme_aspect_ratio"
+    figure = result.figures[0]
+    assert figure.decision is SourceFigureDecision.ACCEPTED
+    assert figure.blob_id == _BLOB_ID
+    assert result.catalog_metadata[figure.figure_id].aspect_ratio_warning is True
+    assert tuple(item.stage for item in result.provenance_diagnostics) == (
+        SourceFigureProvenanceStage.DISCOVERED,
+        SourceFigureProvenanceStage.ARCHIVED,
+    )
+
+
+def test_bluemoon_exploitation_chain_is_collectable_with_article_provenance() -> None:
+    article_url = "https://publisher.test/reports/bluemoon.html"
+    asset_url = "https://cdn.publisher.test/bluemoon-exploitation-chain.png"
+    source = _source(
+        _html(
+            "<article><h2>BlueMoon exploitation chain</h2>"
+            "<p>The lure launches the loader.</p><figure>"
+            f'<img src="{asset_url}" alt="BlueMoon exploitation chain">'
+            "<figcaption>From lure to post-exploitation payloads.</figcaption>"
+            "</figure><p>The loader deploys the final payload.</p></article>"
+        ),
+        source_url=article_url,
+    )
+    archived_bytes = _png_header(1800, 800)
+    asset = _asset(source_url=asset_url, content=archived_bytes, width=1800, height=800)
+
+    result = SourceFigureInventory().inventory((source,), (asset,))
+
+    (figure,) = result.accepted
+    metadata = result.catalog_metadata[figure.figure_id]
+    assert figure.blob_id == _BLOB_ID
+    assert figure.source == article_url
+    assert figure.locator.original_asset_url == asset_url
+    assert metadata.alt_text == "BlueMoon exploitation chain"
+    assert metadata.caption_text == "From lure to post-exploitation payloads."
+    assert metadata.nearby_heading_text == "BlueMoon exploitation chain"
+    assert metadata.context_before == "The lure launches the loader."
+    assert metadata.context_after == "The loader deploys the final payload."
+    assert [item.stage for item in result.provenance_diagnostics] == [
+        SourceFigureProvenanceStage.DISCOVERED,
+        SourceFigureProvenanceStage.ARCHIVED,
+    ]
+
+
+def test_logo_is_rejected_as_editorial_and_kept_in_provenance_diagnostics() -> None:
+    source = _source(_html('<div><img class="logo" src="/logo.png" alt="Publisher logo"></div>'))
+
+    result = SourceFigureInventory().inventory((source,), ())
+
+    (figure,) = result.figures
+    assert figure.decision is SourceFigureDecision.REJECTED
+    assert figure.decision_reason == SourceMediaReasonCode.BOILERPLATE_PATTERN.value
+    assert tuple(item.stage for item in result.provenance_diagnostics) == (
+        SourceFigureProvenanceStage.DISCOVERED,
+        SourceFigureProvenanceStage.REJECTED_EDITORIAL,
+    )
+
+
+@pytest.mark.parametrize(
+    ("status", "reason_code", "expected_stage"),
+    (
+        (
+            SourceMediaStatus.EXCLUDED_BY_RULE,
+            SourceMediaReasonCode.UNSAFE_DESTINATION,
+            SourceFigureProvenanceStage.REJECTED_SECURITY,
+        ),
+        (
+            SourceMediaStatus.COLLECTION_FAILED,
+            SourceMediaReasonCode.UNSAFE_DESTINATION,
+            SourceFigureProvenanceStage.REJECTED_SECURITY,
+        ),
+        (
+            SourceMediaStatus.EXCLUDED_BY_RULE,
+            SourceMediaReasonCode.UNSUPPORTED_IMAGE_TYPE,
+            SourceFigureProvenanceStage.REJECTED_FORMAT,
+        ),
+    ),
+)
+def test_security_and_format_rejections_are_structured(
+    status: SourceMediaStatus,
+    reason_code: SourceMediaReasonCode,
+    expected_stage: SourceFigureProvenanceStage,
+) -> None:
+    source = _source(_html('<img src="https://cdn.publisher.test/asset.png" alt="Candidate">'))
+    (observation,) = extract_source_media_observations((source,))
+    rejected = SourceMediaRecord(
+        subject_id=_DOCUMENT_ID,
+        source_document_id=_DOCUMENT_ID,
+        policy_version="source-media-v1",
+        policy_sha256="b" * 64,
+        status=status,
+        reason_code=reason_code,
+        dom_locator=observation.dom_locator,
+    )
+
+    result = SourceFigureInventory().inventory((source,), (), media_candidates=(rejected,))
+
+    assert result.figures[0].decision is (
+        SourceFigureDecision.PENDING
+        if status is SourceMediaStatus.COLLECTION_FAILED
+        else SourceFigureDecision.REJECTED
+    )
+    assert any(item.stage is expected_stage for item in result.provenance_diagnostics)
 
 
 def test_inventory_order_is_stable_when_archived_inputs_are_reordered() -> None:

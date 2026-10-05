@@ -42,6 +42,76 @@ class SourceMediaReasonCode(StrEnum):
     PDF_PAGE_EXCERPT_NEEDED = "pdf_page_excerpt_needed"
 
 
+class SourceFigureProvenanceStage(StrEnum):
+    DISCOVERED = "discovered"
+    DOWNLOAD_FAILED = "download_failed"
+    REJECTED_SECURITY = "rejected_security"
+    REJECTED_FORMAT = "rejected_format"
+    REJECTED_EDITORIAL = "rejected_editorial"
+    ARCHIVED = "archived"
+    CATALOGUED = "catalogued"
+    SELECTED = "selected"
+    PUBLISHED = "published"
+
+
+@dataclass(frozen=True, slots=True)
+class SourceFigureProvenanceDiagnostic:
+    """A byte-free record of one source figure's progress through the pipeline."""
+
+    stage: SourceFigureProvenanceStage
+    source_document_id: UUID
+    figure_id: UUID | None = None
+    figure_handle: str | None = None
+    blob_id: UUID | None = None
+    sha256: str | None = None
+    reason_code: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.stage, SourceFigureProvenanceStage):
+            raise ValueError("Source figure provenance stage is invalid")
+        if not isinstance(self.source_document_id, UUID):
+            raise ValueError("Source figure provenance source identity is invalid")
+        if self.figure_id is not None and not isinstance(self.figure_id, UUID):
+            raise ValueError("Source figure provenance figure identity is invalid")
+        if self.figure_handle is not None and not self.figure_handle.strip():
+            raise ValueError("Source figure provenance handle must not be empty")
+        if self.sha256 is not None and (
+            len(self.sha256) != 64
+            or any(character not in "0123456789abcdef" for character in self.sha256)
+        ):
+            raise ValueError("Source figure provenance SHA-256 must be lowercase hexadecimal")
+        if (self.blob_id is None) != (self.sha256 is None):
+            raise ValueError("Archived source figure provenance requires blob and SHA-256")
+        if self.stage in {
+            SourceFigureProvenanceStage.ARCHIVED,
+            SourceFigureProvenanceStage.SELECTED,
+            SourceFigureProvenanceStage.PUBLISHED,
+        } and (self.blob_id is None or self.figure_id is None):
+            raise ValueError("Archived, selected, and published figures need archived identity")
+        if (
+            self.stage
+            in {
+                SourceFigureProvenanceStage.CATALOGUED,
+                SourceFigureProvenanceStage.SELECTED,
+            }
+            and self.figure_handle is None
+        ):
+            raise ValueError("Catalogued and selected figures need a handle")
+        if self.reason_code is not None and not self.reason_code.strip():
+            raise ValueError("Source figure provenance reason code must not be empty")
+
+    def to_json(self) -> dict[str, str | None]:
+        return {
+            "stage": self.stage.value,
+            "source_document_id": str(self.source_document_id),
+            "figure_id": str(self.figure_id) if self.figure_id is not None else None,
+            "figure_handle": self.figure_handle,
+            "blob_id": str(self.blob_id) if self.blob_id is not None else None,
+            "sha256": self.sha256,
+            "reason_code": self.reason_code,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class SourceMediaRecord:
     """Canonical metadata for one media occurrence in an archived source."""

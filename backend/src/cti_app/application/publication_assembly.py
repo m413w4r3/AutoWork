@@ -7,7 +7,10 @@ from typing import Any
 
 from cti_app.application.persistence import ProductionArtifactRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_editorial_enrichment import validate_editorial_enrichment
+from cti_app.application.production_editorial_enrichment import (
+    SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+    validate_editorial_enrichment,
+)
 from cti_app.application.publication_builder import (
     PublicationAssemblyValidationError,
     build_publication_document_v5,
@@ -28,6 +31,10 @@ from cti_app.domain.production_relevance import RelevanceProjectionV1
 from cti_app.domain.production_synthesis import ProductionSynthesisV1
 from cti_app.domain.publication import PublicationAssemblyErrorCode
 from cti_app.domain.publication_document import serialize_publication_document
+from cti_app.domain.source_media import (
+    SourceFigureProvenanceDiagnostic,
+    SourceFigureProvenanceStage,
+)
 
 
 class PublicationAssemblyService:
@@ -84,6 +91,42 @@ class PublicationAssemblyService:
             synthesis=synthesis,
             editorial_enrichment=editorial_enrichment,
         )
+        source_figures_by_key = {item.key: item for item in editorial_enrichment.source_figures}
+        figure_handles_by_id = {
+            item.figure_id: item.handle for item in editorial_enrichment.figure_decisions
+        }
+        published_figure_diagnostics: list[dict[str, str | None]] = []
+        for publication_figure in document.figures:
+            source_figure_candidate = source_figures_by_key.get(publication_figure.key)
+            resolved = (
+                source_figure_candidate.resolved_figure
+                if source_figure_candidate is not None
+                else None
+            )
+            if (
+                source_figure_candidate is None
+                or resolved is None
+                or resolved.blob_id is None
+                or resolved.sha256 != publication_figure.sha256
+                or resolved.mime_type != publication_figure.mime_type
+                or resolved.byte_size != publication_figure.byte_size
+                or source_figure_candidate.source_document_id
+                != publication_figure.source_document_id
+            ):
+                raise PublicationAssemblyValidationError(
+                    PublicationAssemblyErrorCode.SOURCE_FIGURE_INVALID,
+                    "Published source figure does not match its archived local media",
+                )
+            published_figure_diagnostics.append(
+                SourceFigureProvenanceDiagnostic(
+                    stage=SourceFigureProvenanceStage.PUBLISHED,
+                    source_document_id=resolved.source_document_id,
+                    figure_id=resolved.figure_id,
+                    figure_handle=figure_handles_by_id.get(resolved.figure_id),
+                    blob_id=resolved.blob_id,
+                    sha256=resolved.sha256,
+                ).to_json()
+            )
 
         input_hash = compute_assembly_input_hash(
             snapshot=snapshot,
@@ -96,6 +139,19 @@ class PublicationAssemblyService:
         canonical_document = serialize_publication_document(document)
         canonical_bytes = ProductionArtifactStore.canonical_json_bytes(canonical_document)
         metadata = dict(metadata_extra or {})
+        if published_figure_diagnostics:
+            existing_figure_diagnostics = metadata.get("source_figure_provenance_diagnostics")
+            metadata["source_figure_provenance_version"] = (
+                SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+            )
+            metadata["source_figure_provenance_diagnostics"] = [
+                *(
+                    existing_figure_diagnostics
+                    if isinstance(existing_figure_diagnostics, list)
+                    else []
+                ),
+                *published_figure_diagnostics,
+            ]
         upstream_diagnostics = metadata.pop("diagnostics", {})
         metadata["diagnostics"] = {
             "warnings_by_stage": {
