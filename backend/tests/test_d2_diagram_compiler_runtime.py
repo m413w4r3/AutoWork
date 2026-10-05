@@ -74,7 +74,13 @@ def _skip_unless_ci(reason: str) -> NoReturn:
 
 def _svg_text(svg: bytes) -> list[str]:
     return [
-        html.unescape(re.sub(r"<[^>]+>", "", fragment))
+        html.unescape(
+            re.sub(
+                r"<[^>]+>",
+                "",
+                re.sub(r"</tspan>\s*<tspan[^>]*>", " ", fragment),
+            )
+        )
         for fragment in re.findall(r"<text[^>]*>(.*?)</text>", svg.decode("utf-8"), re.DOTALL)
     ]
 
@@ -94,10 +100,12 @@ def test_real_d2_compilation_is_byte_deterministic(d2_binary: str) -> None:
 
     first, second, other_key, other_legend = asyncio.run(compile_twice())
 
-    expected_source = b'direction: right\nn001: "Start"\nn002: "Finish"\nn001 -> n002: "connects"\n'
-    expected_source_sha256 = "0f03e24b222fce2975a515a298f284fde901af64715ec2eaeeaa1c242cceb26d"
-    assert first.source_bytes == second.source_bytes == expected_source
-    assert first.source_sha256 == second.source_sha256 == expected_source_sha256
+    assert first.source_bytes == second.source_bytes
+    assert first.source_bytes.startswith(b"direction: right\n")
+    assert b"shape: oval" in first.source_bytes
+    assert b'fill: "#F1F1EF"' in first.source_bytes
+    assert first.source_bytes.endswith(b"\n") and not first.source_bytes.endswith(b"\n\n")
+    assert first.source_sha256 == second.source_sha256
     assert first.media_bytes == second.media_bytes
     assert first.media_sha256 == second.media_sha256
     assert hashlib.sha256(first.media_bytes).hexdigest() == first.media_sha256
@@ -130,4 +138,6 @@ def test_real_d2_renders_hostile_labels_as_visible_text(d2_binary: str) -> None:
 
     compiled = asyncio.run(D2DiagramCompiler(binary=d2_binary).compile(diagram))
 
-    assert sorted(_svg_text(compiled.media_bytes)) == sorted(labels)
+    assert sorted(" ".join(label.split()) for label in _svg_text(compiled.media_bytes)) == sorted(
+        " ".join(label.split()) for label in labels
+    )

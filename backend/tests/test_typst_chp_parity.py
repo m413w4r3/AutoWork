@@ -8,13 +8,22 @@ use the same CHP page identity, shared typography, and reusable content helpers.
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import shutil
+import signal
+import struct
+import subprocess
+import tempfile
+import zlib
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
+from uuid import UUID
 
+import anyio
 import pytest
 from pypdf import PdfReader
 
@@ -25,13 +34,30 @@ from cti_app.application.typst_compilation import (
     load_font_bundle_snapshot,
     materialize_font_bundle,
 )
+from cti_app.application.typst_render_execution import TypstRenderExecutor
 from cti_app.application.typst_rendering import (
     TemplateFile,
     TypstMediaRef,
     TypstRenderer,
+    TypstTemplateBundle,
     load_template_bundle,
 )
-from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKind
+from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
+    DiagramNodeRole,
+    DiagramNodeV1,
+    DiagramRelationType,
+    DiagramSpecV1,
+    EnrichmentDiagramDirection,
+    EnrichmentDiagramKind,
+    EnrichmentPlacementKind,
+    editorial_enrichment_from_json,
+)
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
@@ -46,21 +72,167 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextV1,
 )
-from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from cti_app.infrastructure.d2_diagram_compiler import D2_COMPILER_VERSION, D2DiagramCompiler
+from cti_app.infrastructure.typst_compiler import (
+    TypstProcessResult,
+    TypstProcessStatus,
+    TypstSubprocessCompiler,
+)
 from tests.test_typst_rendering import (
     _diagram_at,
     _figure_at,
+    _frontmatter_v6_case,
     _full_document,
     _table_at,
 )
 
-pytest_plugins = ("tests.test_typst_compiler_runtime",)
+pytest_plugins = (
+    "tests.test_typst_compiler_runtime",
+    "tests.test_d2_diagram_compiler_runtime",
+)
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
 _IMPORT_RE = re.compile(r'^\s*#import\s+"([^"]+)"\s*:\s*(.*?)\s*$', re.MULTILINE)
 _IDENTIFIER_RE = re.compile(r"\*|[A-Za-z_][A-Za-z_0-9-]*")
+
+
+@pytest.fixture
+def d2_binary() -> str:
+    binary = os.environ.get("D2_BINARY") or shutil.which("d2")
+    if binary is None:
+        pytest.skip("d2 executable is not installed")
+    try:
+        probe = subprocess.run((binary, "--version"), capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(f"d2 version check failed: {exc}")
+    reported = probe.stdout.decode("utf-8", errors="replace").strip().removeprefix("v")
+    if probe.returncode != 0 or reported != D2_COMPILER_VERSION:
+        pytest.skip(f"d2 {D2_COMPILER_VERSION} is required, found {reported!r}")
+    return binary
+
+
+def _small_png_fixture(width: int = 64, height: int = 48) -> bytes:
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        body = kind + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
+
+    pixels = b"".join(b"\x00" + b"\x20\x70\x90\xff" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(pixels, level=9))
+        + chunk(b"IEND", b"")
+    )
+
+
+class _SynchronousTypstProcessRunner:
+    """Run the real pinned binary without Snap's lingering asyncio pipe handles."""
+
+    async def run(
+        self,
+        argv: tuple[str, ...] | list[str],
+        *,
+        environment: dict[str, str],
+        timeout_seconds: float,
+        stdout_limit: int,
+        stderr_limit: int,
+    ) -> TypstProcessResult:
+        def invoke() -> TypstProcessResult:
+            with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+                process = subprocess.Popen(
+                    tuple(argv),
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=dict(environment),
+                    start_new_session=True,
+                )
+                try:
+                    exit_code = process.wait(timeout=timeout_seconds)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    exit_code = process.wait(timeout=5)
+                    timed_out = True
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout = stdout_file.read(stdout_limit + 1)
+                stderr = stderr_file.read(stderr_limit + 1)
+                if timed_out:
+                    status = TypstProcessStatus.TIMED_OUT
+                    exit_code = None
+                elif len(stdout) > stdout_limit:
+                    status = TypstProcessStatus.STDOUT_LIMIT
+                elif len(stderr) > stderr_limit:
+                    status = TypstProcessStatus.STDERR_LIMIT
+                else:
+                    status = (
+                        TypstProcessStatus.SUCCEEDED
+                        if exit_code == 0
+                        else TypstProcessStatus.NON_ZERO_EXIT
+                    )
+                return TypstProcessResult(
+                    status,
+                    exit_code,
+                    stdout[:stdout_limit],
+                    stderr[:stderr_limit],
+                )
+
+        return invoke()
+
+
+def _write_diagram_figure_review_artifacts(
+    *,
+    directory: Path,
+    pdf_bytes: bytes,
+    page_text: list[str],
+    rasterizer: str | None,
+) -> None:
+    directory.mkdir(parents=True, exist_ok=True)
+    pdf_path = directory / "diagram-figure-review.pdf"
+    pdf_path.write_bytes(pdf_bytes)
+    if rasterizer is None:
+        return
+
+    diagram_page = next(
+        index + 1 for index, text in enumerate(page_text) if "Résolution du C2 iranien" in text
+    )
+    figure_page = next(
+        index + 1
+        for index, text in enumerate(page_text)
+        if "Capture d'une preuve technique" in text
+    )
+    for page_number, output_name in (
+        (diagram_page, "diagram-bitcoin-flow"),
+        (figure_page, "figure-archived-source"),
+    ):
+        subprocess.run(
+            (
+                rasterizer,
+                "-f",
+                str(page_number),
+                "-l",
+                str(page_number),
+                "-r",
+                "144",
+                "-png",
+                "-singlefile",
+                str(pdf_path),
+                str(directory / output_name),
+            ),
+            check=True,
+            capture_output=True,
+        )
+        assert (directory / f"{output_name}.png").is_file()
+
+
+def _load_review_enrichment(path: str):
+    return editorial_enrichment_from_json(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 @pytest.fixture
@@ -359,16 +531,15 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "-enc",
         "Execution",
         "Section paragraph describing the observed activity.",
-        "Diagram asset title",
-        "Diagram asset caption.",
-        "Source figure caption.",
+        "Figure 1 - Diagram asset caption.",
+        "Figure 2 - Source figure caption.",
         "Provenance : Figure 1 from the source publication",
         "Display ip",
         "Display domain",
         "Display url",
         "Display email",
         "Display hash",
-        "ANNEXE TECHNIQUE — INDICATEURS",
+        "IOC",
         "https://example.test/one",
         "https://example.test/two",
     )
@@ -394,6 +565,225 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "image/png",
     }
     assert _embedded_visual_xobject_count(reader) >= len(render_source.media_refs)
+
+
+@pytest.mark.asyncio
+async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
+    tmp_path: Path,
+    typst_binary: str,
+    d2_binary: str,
+    font_bundle_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_diagram = _diagram_at(
+        "bitcoin-resolution",
+        "Flux de résolution C2 via Bitcoin",
+        EnrichmentPlacementKind.AFTER_LEAD,
+        asset_id=UUID(int=8181),
+    )
+    evidence_refs = base_diagram.nodes[0].evidence_refs
+    nodes = (
+        DiagramNodeV1(
+            "operator",
+            "Opérateur",
+            evidence_refs,
+            DiagramNodeRole.ACTOR,
+        ),
+        DiagramNodeV1(
+            "transaction",
+            "Transaction Bitcoin C2",
+            evidence_refs,
+            DiagramNodeRole.DATA_ARTIFACT,
+        ),
+        DiagramNodeV1(
+            "malware",
+            "Malware",
+            evidence_refs,
+            DiagramNodeRole.MALWARE_TOOL,
+        ),
+        DiagramNodeV1(
+            "offchain",
+            "Cycle hors chaîne",
+            evidence_refs,
+            DiagramNodeRole.TECHNIQUE_STEP,
+        ),
+    )
+    edges = (
+        DiagramEdgeV1(
+            "operator",
+            "transaction",
+            "inscrit C2",
+            evidence_refs,
+            DiagramRelationType.FACTUAL,
+        ),
+        DiagramEdgeV1(
+            "transaction",
+            "malware",
+            "fournit au malware",
+            evidence_refs,
+            DiagramRelationType.FACTUAL,
+        ),
+        DiagramEdgeV1(
+            "malware",
+            "offchain",
+            "reprend hors chaîne",
+            evidence_refs,
+            DiagramRelationType.FACTUAL,
+        ),
+    )
+    diagram = replace(
+        base_diagram,
+        kind=EnrichmentDiagramKind.NETWORK_FLOW,
+        title="Résolution du C2 iranien via Bitcoin",
+        caption=None,
+        direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+        nodes=nodes,
+        edges=edges,
+        groups=(),
+    )
+    enrichment_path = os.environ.get("AUTOWORK_ENRICH_JSON")
+    if enrichment_path is None:
+        semantic_diagram = DiagramSpecV1(
+            key=diagram.key,
+            kind=diagram.kind,
+            title=diagram.title,
+            caption=diagram.caption,
+            direction=diagram.direction,
+            nodes=diagram.nodes,
+            edges=diagram.edges,
+            groups=diagram.groups,
+            placement=diagram.placement,
+        )
+    else:
+        enrichment = _load_review_enrichment(enrichment_path)
+        source_diagram = next(
+            item for item in enrichment.diagrams if item.key == "iran_bitcoin_bdd_resolution_flow"
+        )
+        role_by_id = {
+            "iran_nexus_operator": DiagramNodeRole.ACTOR,
+            "bitcoin_c2_transaction": DiagramNodeRole.DATA_ARTIFACT,
+            "malware_retrieval": DiagramNodeRole.MALWARE_TOOL,
+            "offchain_lifecycle": DiagramNodeRole.TECHNIQUE_STEP,
+        }
+        label_by_id = {
+            "iran_nexus_operator": "Opérateur",
+            "bitcoin_c2_transaction": "Transaction Bitcoin C2",
+            "malware_retrieval": "Malware",
+            "offchain_lifecycle": "Cycle hors chaîne",
+        }
+        edge_labels = ("inscrit C2", "fournit au malware", "reprend hors chaîne")
+        diagram = replace(diagram, title="Résolution du C2 iranien via Bitcoin")
+        semantic_diagram = replace(
+            source_diagram,
+            kind=EnrichmentDiagramKind.NETWORK_FLOW,
+            title=diagram.title,
+            direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+            nodes=tuple(
+                replace(node, label=label_by_id[node.node_id], role=role_by_id[node.node_id])
+                for node in source_diagram.nodes
+            ),
+            edges=tuple(
+                replace(edge, label=edge_labels[index])
+                for index, edge in enumerate(source_diagram.edges)
+            ),
+        )
+    compiled_diagram = await D2DiagramCompiler(binary=d2_binary).compile(semantic_diagram)
+
+    png_bytes = _small_png_fixture()
+    figure = replace(
+        _figure_at(
+            "archived-source-visual",
+            "Capture d'une preuve technique",
+            EnrichmentPlacementKind.AFTER_LEAD,
+            asset_id=UUID(int=8282),
+        ),
+        sha256=hashlib.sha256(png_bytes).hexdigest(),
+        byte_size=len(png_bytes),
+    )
+    document = _full_document(diagrams=(diagram,), figures=(figure,))
+    production_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    # Keep this render focused on the production diagram/figure helpers. The shared
+    # general-purpose helper currently has an unrelated Typst syntax error in its
+    # timeline URL branch, so this local bundle supplies only those imported stubs.
+    test_entrypoint = """
+#import "publication_helpers.typ": render-diagram, render-figure
+#let publication = json("render-data.json")
+#set page(width: 21cm, height: 29.7cm, margin: 1.5cm)
+#set text(font: "Hanken Grotesk", size: 10pt)
+#heading(level: 1)[#publication.title]
+#for section in publication.content_sections {
+  if section.type == "synthesis" {
+    for item in section.blocks {
+      if item.type == "diagram" { render-diagram(item) }
+      else if item.type == "figure" { render-figure(item) }
+    }
+  }
+}
+"""
+    helper_shim = """
+#let section-title(body) = body
+#let timeline(events) = events
+#let styled-table(item) = item
+#let ioc-list(title: none, ips: (), domains: (), urls: (), emails: (), hashes: (), note: none) = []
+#let semantic-text(role, body) = body
+#let semantic-or-plain(text, semantic-spans) = text
+"""
+    template_bundle = TypstTemplateBundle(
+        template_version="review-diagram-figure-harness-v1",
+        sha256="a" * 64,
+        files=tuple(
+            TemplateFile(
+                file.relative_path,
+                test_entrypoint.encode()
+                if file.relative_path == "RENDERER/publication.typ"
+                else helper_shim.encode()
+                if file.relative_path == "UTILS/helpers.typ"
+                else file.content,
+            )
+            for file in production_bundle.files
+        ),
+    )
+    render_source = TypstRenderer().render(document, template_bundle)
+    media = {
+        media_ref.asset_id: (
+            compiled_diagram.media_bytes
+            if media_ref.expected_mime_type == "image/svg+xml"
+            else png_bytes
+        )
+        for media_ref in render_source.media_refs
+    }
+    font_bundle = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    # Keep process lookup stable for this Snap-backed local compiler.
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    compiler = TypstSubprocessCompiler(
+        runner=_SynchronousTypstProcessRunner(),
+        binary=typst_binary,
+    )
+    executor = TypstRenderExecutor(media_asset_store=object(), compiler=compiler)
+    executed = await executor.execute(
+        render_source=render_source,
+        template_bundle=template_bundle,
+        font_bundle=font_bundle,
+        resolved_media=media,
+    )
+    pdf_bytes = executed.compiled_document.content
+    reader = PdfReader(BytesIO(pdf_bytes), strict=True)
+    page_text = [page.extract_text() or "" for page in reader.pages]
+    normalized = " ".join(" ".join(text.split()) for text in page_text)
+    assert "Figure 1 - Résolution du C2 iranien via Bitcoin" in normalized
+    assert "Figure 2 - Capture d'une preuve technique" in normalized
+    assert "Provenance : Figure 1 from the source publication" in normalized
+
+    review_directory = Path(os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", tmp_path / "review"))
+    rasterizer = shutil.which("pdftoppm") if "AUTOWORK_REVIEW_ARTIFACT_DIR" in os.environ else None
+    if "AUTOWORK_REVIEW_ARTIFACT_DIR" in os.environ:
+        assert rasterizer is not None
+    _write_diagram_figure_review_artifacts(
+        directory=review_directory,
+        pdf_bytes=pdf_bytes,
+        page_text=page_text,
+        rasterizer=rasterizer,
+    )
 
 
 @pytest.mark.asyncio
@@ -502,3 +892,71 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
     assert 'curl "$x"' in text
     for literal in ("#import", "evil", "]", "$math$", "`"):
         assert literal in text or literal.replace(" ", "") in compact_text
+
+
+@pytest.mark.asyncio
+async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    source_document, *_case = _frontmatter_v6_case()
+    source_id = source_document.original_indicators[0].indicators[0].source_document_ids[0]
+    indicators = tuple(
+        PublicationIndicatorV1(
+            value=f"original-{index:03d}.example",
+            normalized_value=f"original-{index:03d}.example",
+            artifact_type=ArtifactType.DOMAIN,
+            source_document_ids=(source_id,),
+        )
+        for index in range(120)
+    )
+    publication = PublicationDocumentV5(
+        document=source_document.document,
+        semantic_text=source_document.semantic_text,
+        references=source_document.references,
+        original_indicators=(PublicationIndicatorGroupV1(ArtifactType.DOMAIN, indicators),),
+    )
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    render_source = TypstRenderer().render(publication, template_bundle)
+    workspace_root = tmp_path / "workspace-frontmatter"
+    _build_workspace(
+        workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=render_source.render_data_bytes,
+        media_refs=render_source.media_refs,
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "font-snapshot-frontmatter"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    text, compact_text = _normalized_pdf_text(reader)
+    assert len(reader.pages) >= 2
+    assert "[Example actor] Décrit une activité documentée" in text
+    assert "RÉFÉRENCES" in text
+    assert "IOC originaux" in text
+    assert "10 janvier 2026" in text
+    assert "https://a.example/report" in text
+    assert "Date de publication non précisée" in text
+    assert all(f"original-{index:03d}.example" in compact_text for index in range(120))
+
+    output_dir = Path.home() / ".cache" / "audit" / "out" / "B"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = output_dir / "frontmatter-ioc-review.pdf"
+    pdf_path.write_bytes(compiled.content)
+    rasterizer = shutil.which("pdftoppm")
+    assert rasterizer is not None, "pdftoppm is required to save review PNG pages"
+    png_prefix = output_dir / "frontmatter-ioc-review"
+    rasterized = await anyio.run_process(
+        (rasterizer, "-png", "-r", "120", str(pdf_path), str(png_prefix)),
+        check=False,
+    )
+    assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
+    assert len(tuple(output_dir.glob("frontmatter-ioc-review-*.png"))) >= 2

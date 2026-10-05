@@ -2723,6 +2723,41 @@ async def test_declare_lost_returns_resumed_without_releasing_when_probe_finds_a
     assert uow.production_runs.items[run.id].requires_reconciliation is True
 
 
+async def test_reconciliation_probe_dispatches_the_resume_when_it_adopts_the_answer(
+    api: AsyncClient, uow: _Uow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = _reconciliation_run(uuid4(), uuid4())
+    await uow.production_runs.add(run)
+    job_id = uuid4()
+
+    class _ResumedProbe:
+        _last_bridge_status = "completed"
+
+        async def resolve(self, run_id: UUID) -> ReconciliationOutcome:
+            return ReconciliationOutcome.RESUMED
+
+    class _Service:
+        async def schedule_resume_after_automatic_adoption(self, run_id: UUID) -> UUID:
+            assert run_id == run.id
+            return job_id
+
+    monkeypatch.setattr(
+        production_api, "_production_reconciliation_resolver", lambda request: _ResumedProbe()
+    )
+    monkeypatch.setattr(
+        production_api, "_production_reconciliation_service", lambda request: _Service()
+    )
+
+    response = await api.post(f"/api/production/runs/{run.id}/reconciliation/probe")
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "outcome": "resumed",
+        "bridge_status": "completed",
+        "job_id": str(job_id),
+    }
+
+
 async def test_declare_lost_requires_explicit_confirmation(api: AsyncClient) -> None:
     response = await api.post(
         f"/api/production/runs/{uuid4()}/reconciliation/declare-lost",

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import struct
 import zlib
@@ -31,7 +32,7 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-SOURCE_MEDIA_POLICY_VERSION = "source-media-exclusion-v2"
+SOURCE_MEDIA_POLICY_VERSION = "source-media-exclusion-v3-related-media"
 SOURCE_MEDIA_MAX_BYTES = 5 * 1024 * 1024
 SOURCE_MEDIA_MAX_PIXELS = 40_000_000
 SOURCE_MEDIA_MAX_SIDE_LENGTH = 10_000
@@ -60,11 +61,19 @@ class SourceMediaPolicy:
     maximum_side_length: int = SOURCE_MEDIA_MAX_SIDE_LENGTH
     perceptual_hamming_distance: int = 4
     boilerplate_pattern: str = (
-        r"(?:logo|favicon|brand|avatar|social|menu|navbar|navigation|breadcrumb|"
-        r"search|subscribe|header|footer|banner|icon|pixel|beacon|tracking|spacer)"
+        r"(?:logo|favicon|brand|avatar|social|share|modal|close|profile|author-photo|"
+        r"menu|navbar|navigation|breadcrumb|search|subscribe|header|footer|banner|"
+        r"icon|pixel|beacon|tracking|spacer)"
     )
-    landmark_pattern: str = r"(?:nav|menu|header|footer|sidebar|social)"
+    landmark_pattern: str = (
+        r"(?:nav|menu|header|footer|sidebar|social|related|recent|popular|recommended)"
+    )
     tracking_pattern: str = r"(?:pixel|tracking|beacon|spacer|1x1)(?:[._/?=-]|$)"
+    related_content_heading_pattern: str = (
+        r"(?:related|recent|popular|recommended|you\s+may\s+also\s+like|read\s+more|"
+        r"more\s+stories|latest\s+articles)"
+    )
+    maximum_aspect_ratio: float = 4.0
 
     def __post_init__(self) -> None:
         if not self.version.strip():
@@ -82,9 +91,12 @@ class SourceMediaPolicy:
                 raise ValueError(f"{name} must be a positive integer")
         if self.perceptual_hamming_distance < 0:
             raise ValueError("perceptual_hamming_distance must not be negative")
+        if not math.isfinite(self.maximum_aspect_ratio) or self.maximum_aspect_ratio <= 1:
+            raise ValueError("maximum_aspect_ratio must be greater than one")
         re.compile(self.boilerplate_pattern)
         re.compile(self.landmark_pattern)
         re.compile(self.tracking_pattern)
+        re.compile(self.related_content_heading_pattern)
 
     @property
     def sha256(self) -> str:
@@ -122,6 +134,7 @@ class SourceMediaArchiveService:
             boilerplate_pattern=self.policy.boilerplate_pattern,
             landmark_pattern=self.policy.landmark_pattern,
             tracking_pattern=self.policy.tracking_pattern,
+            related_content_heading_pattern=self.policy.related_content_heading_pattern,
         )
         async with self._uow_factory() as uow:
             existing = tuple(
@@ -320,6 +333,22 @@ class SourceMediaArchiveService:
                         candidate_id,
                         status=SourceMediaStatus.EXCLUDED_BY_RULE,
                         reason=SourceMediaReasonCode.TRACKING_PIXEL,
+                        **shared_fields,
+                    )
+                )
+                continue
+            if (
+                width is not None
+                and height is not None
+                and max(width / height, height / width) > self.policy.maximum_aspect_ratio
+            ):
+                resolved.append(
+                    self._base_record(
+                        subject_id,
+                        observation,
+                        candidate_id,
+                        status=SourceMediaStatus.EXCLUDED_BY_RULE,
+                        reason=SourceMediaReasonCode.EXTREME_ASPECT_RATIO,
                         **shared_fields,
                     )
                 )

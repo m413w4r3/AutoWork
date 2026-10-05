@@ -16,9 +16,9 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v6-counter-analysis-reserve"
-SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v2-headingless"
-SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v2-headingless-diagnostics"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v8-editorial-title-source-notes"
+SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v3-title-source-notes"
+SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v3-title-source-notes"
 
 SYNTHESIS_EDITORIAL_CONTRACT_V4 = """EDITORIAL CONTRACT
 
@@ -63,6 +63,14 @@ an adverse claim, independent corroboration, a hypothesis, and an analytical
 inference. A reserve that qualifies attribution or causality must qualify the
 same passage it concerns, not only the conclusion.
 
+The subject is treated from the angle of the core publication, the evidence
+whose editorial_role is primary: the lead, the scope and the order of the
+narrative follow it. Evidence from a corroboration source reinforces, dates,
+specifies or qualifies what the core publication states; it never widens the
+subject to another actor, campaign or period that the core publication does not
+carry, and it is not presented as a second main subject. Attribute each
+reinforcement to its source.
+
 Use reserve and source-pair context to qualify the exact claim it bears on.
 Weave counter-analysis into the prose as an analytic limit, name the source
 that supplies the limit, and cite its R handle in that passage. R handles are
@@ -81,9 +89,32 @@ or pad the prose; report the coverage gap only in the optional diagnostics
 block.
 
 Do not duplicate recommendations or add vague defensive advice. Do not repeat
-the reference timeline merely to restate it. Mention dates in the synthesis
-only when they explain technical evolution, scope, attribution, or a material
+the references merely to restate them. Mention dates in the synthesis only
+when they explain technical evolution, scope, attribution, or a material
 analytical limit. Preserve the source's exact date precision.
+
+EDITORIAL TITLE
+Write one French editorial title in exactly this format: [Groupe] Titre.
+Groupe is the principal actor/group named by the core publication; join
+documented aliases with " / ". If no actor is named, use a precise generic
+attribution such as "Acteurs présumés liés à l\u2019Iran". For an item about a tool
+or publication rather than an actor, use that tool or publication's name.
+Titre is one French sentence in sentence case describing what happened,
+including a campaign, tool or technique. Keep the complete title to 110
+characters or fewer. Do not repeat the group in Titre, add a final period,
+wrap the title in quotes, use Markdown, style actor/tool names, or include
+evidence handles.
+
+SOURCE NOTES
+For each publication alias listed after the evidence pack, write one note of
+one or two French sentences and no more than 260 characters. Explain the
+publication's relevant contribution in the tone of a dated source note, for
+example: "SafeBreach Labs publie une rétro-ingénierie de l\u2019implant Tornado
+v51, qui décrit son protocole de commande et ses fonctions d\u2019exfiltration."
+The note must be supported only by E handles listed for that source. Cite at
+least one of those handles, and never cite another source's handle. Do not
+write a date; the article release date is added by the renderer. Use plain
+text without Markdown or evidence handles in the note itself.
 
 Neutral precision examples (generic placeholders only; never reuse their facts
 or handles in the subject's synthesis):
@@ -107,8 +138,12 @@ signal établit le comportement observé, pas l'identité de l'opérateur.
 
 OUTPUT FORMAT
 Use only the text-block wire format below. Do not return JSON. Do not write any
-text outside these blocks. Do not emit a HEADING field. Sections are optional;
-their kind is only a stable internal placement anchor.
+text outside these blocks. Do not emit a HEADING field. Sections and source
+notes are optional; section kinds are only stable internal placement anchors.
+
+@@TITLE@@
+[Groupe principal] Titre français sans point final
+@@END TITLE@@
 
 @@LEAD@@
 @@CLAIM L001@@
@@ -121,6 +156,11 @@ EVIDENCE: E003
 TEXT: one plain-text synthesis paragraph in the publication language
 @@END SECTION@@
 
+@@SOURCE_NOTE S001@@
+EVIDENCE: E004, E005
+TEXT: <one or two short French sentences supported only by this source>
+@@END SOURCE NOTE@@
+
 An optional diagnostic block may appear after all synthesis blocks. Use it
 only for concrete missing-coverage observations, never for publication prose:
 
@@ -128,16 +168,16 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v9-table-diagram-only"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v11-readable-diagrams"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v6-table-diagram-only"
+    "editorial-enrichment-block-contract-v7-diagram-node-roles"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v6-legacy-annotation-blocks"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v7-node-roles"
 EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v1-targeted"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = "editorial-enrichment-repair-contract-v1"
-SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v1"
-SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v1"
-SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v1-exact-anchors"
+SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v2-no-title"
+SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v2-no-title"
+SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v3-no-title"
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"

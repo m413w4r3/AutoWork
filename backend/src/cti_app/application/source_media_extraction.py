@@ -52,6 +52,9 @@ class SourceMediaObservation:
     alt_text: str | None = None
     caption_text: str | None = None
     nearby_heading_text: str | None = None
+    context_before: str | None = None
+    context_after: str | None = None
+    in_article_body: bool = False
     image_bytes: bytes | None = None
     pre_exclusion_reason: SourceMediaReasonCode | None = None
     is_page_excerpt: bool = False
@@ -61,10 +64,20 @@ class SourceMediaObservation:
 _BOILERPLATE = re.compile(
     r"(?:^|[\W_])(?:logo|favicon|brand|avatar|social|facebook|twitter|linkedin|"
     r"youtube|instagram|menu|navbar|navigation|breadcrumb|search|subscribe|"
-    r"header|footer|banner|icon|pixel|beacon|tracking|spacer)(?:$|[\W_])",
+    r"header|footer|banner|icon|pixel|beacon|tracking|spacer|modal|close|share|"
+    r"profile|author-photo)(?:$|[\W_])",
     re.IGNORECASE,
 )
 _TRACKING = re.compile(r"(?:pixel|tracking|beacon|spacer|1x1)(?:[._/?=-]|$)", re.IGNORECASE)
+_RELATED_CONTENT = re.compile(
+    r"(?:related|recent|popular|recommended|you\s+may\s+also\s+like|read\s+more|"
+    r"more\s+stories|latest\s+articles)",
+    re.IGNORECASE,
+)
+_DECORATIVE_ASSET = re.compile(
+    r"(?:modal|close|share|profile|author-photo)",
+    re.IGNORECASE,
+)
 _LAZY_URL_ATTRIBUTES = (
     "data-src",
     "data-lazy-src",
@@ -106,6 +119,7 @@ class _CandidateParser(HTMLParser):
         boilerplate_pattern: str = _BOILERPLATE.pattern,
         landmark_pattern: str = _LANDMARK.pattern,
         tracking_pattern: str = _TRACKING.pattern,
+        related_content_heading_pattern: str = _RELATED_CONTENT.pattern,
     ) -> None:
         super().__init__(convert_charrefs=True)
         self.source = source
@@ -117,9 +131,14 @@ class _CandidateParser(HTMLParser):
         self._figure_for_candidate: list[_FigureFrame | None] = []
         self._heading: list[str] = []
         self._active_heading: list[str] | None = None
+        self._active_block: list[str] | None = None
+        self._active_block_tag: str | None = None
+        self._last_block: str | None = None
+        self._awaiting_after: list[int] = []
         self._boilerplate = re.compile(boilerplate_pattern, re.I)
         self._landmark = re.compile(landmark_pattern, re.I)
         self._tracking = re.compile(tracking_pattern, re.I)
+        self._related_content_heading = re.compile(related_content_heading_pattern, re.I)
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         folded = tag.casefold()
@@ -146,6 +165,9 @@ class _CandidateParser(HTMLParser):
                 self.pictures[-1].srcsets.append(srcset)
         if folded in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             self._active_heading = []
+        if folded in _TEXT_BLOCK_TAGS and self._active_block is None:
+            self._active_block = []
+            self._active_block_tag = folded
         if folded == "img":
             self._record_image(frame)
         if folded not in _VOID_TAGS:
@@ -166,6 +188,17 @@ class _CandidateParser(HTMLParser):
                     self.candidates[index] = _replace_observation(
                         self.candidates[index], caption_text=caption
                     )
+        if folded == self._active_block_tag and self._active_block is not None:
+            block = _clean_text(" ".join(self._active_block))
+            self._active_block = None
+            self._active_block_tag = None
+            if block:
+                self._last_block = block
+                for index in self._awaiting_after:
+                    self.candidates[index] = _replace_observation(
+                        self.candidates[index], context_after=block
+                    )
+                self._awaiting_after.clear()
         if folded in {"h1", "h2", "h3", "h4", "h5", "h6"} and self._active_heading is not None:
             heading = _clean_text(" ".join(self._active_heading))
             if heading:
@@ -183,6 +216,8 @@ class _CandidateParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._active_heading is not None:
             self._active_heading.append(data)
+        if self._active_block is not None:
+            self._active_block.append(data)
         if self.figures and any(frame.tag == "figcaption" for frame in self.frames):
             self.figures[-1].caption.append(data)
 
@@ -216,13 +251,21 @@ class _CandidateParser(HTMLParser):
             )
         )
         reason: SourceMediaReasonCode | None = None
-        if any(tag in _LANDMARK_TAGS for tag in landmarks) or any(
+        nearby_heading = self._heading[-1] if self._heading else ""
+        region = " ".join(landmarks)
+        if _DECORATIVE_ASSET.search(label_fields) or _DECORATIVE_ASSET.search(region):
+            reason = SourceMediaReasonCode.DECORATIVE_ASSET
+        elif self._related_content_heading.search(
+            nearby_heading
+        ) or self._related_content_heading.search(region):
+            reason = SourceMediaReasonCode.RELATED_CONTENT_CARD
+        elif any(tag in _LANDMARK_TAGS for tag in landmarks) or any(
             self._landmark.search(value) for value in landmarks
         ):
             reason = SourceMediaReasonCode.NAVIGATION_LANDMARK
         elif self._tracking.search(label_fields):
             reason = SourceMediaReasonCode.TRACKING_PIXEL
-        elif self._boilerplate.search(label_fields):
+        elif self._boilerplate.search(label_fields) or self._boilerplate.search(region):
             reason = SourceMediaReasonCode.BOILERPLATE_PATTERN
         elif original_url is None:
             reason = SourceMediaReasonCode.MISSING_SOURCE_URL
@@ -253,9 +296,12 @@ class _CandidateParser(HTMLParser):
             requested_url=requested_url,
             anchor=_clean_text(anchor or "") or None,
             alt_text=alt,
-            nearby_heading_text=self._heading[-1] if self._heading else None,
+            nearby_heading_text=nearby_heading or None,
+            context_before=self._last_block,
+            in_article_body=any(ancestor.tag in {"article", "main"} for ancestor in self.frames),
             pre_exclusion_reason=reason,
         )
+        self._awaiting_after.append(len(self.candidates))
         self.candidates.append(observation)
         self._figure_for_candidate.append(self.figures[-1] if self.figures else None)
         if self.figures:
@@ -266,6 +312,8 @@ class _CandidateParser(HTMLParser):
         match = re.search(r"\[(\d+)\]$", path)
         return int(match.group(1)) if match else 1
 
+
+_TEXT_BLOCK_TAGS = frozenset({"p", "li", "blockquote"})
 
 _VOID_TAGS = {
     "area",
@@ -291,6 +339,7 @@ def extract_source_media_observations(
     boilerplate_pattern: str = _BOILERPLATE.pattern,
     landmark_pattern: str = _LANDMARK.pattern,
     tracking_pattern: str = _TRACKING.pattern,
+    related_content_heading_pattern: str = _RELATED_CONTENT.pattern,
 ) -> tuple[SourceMediaObservation, ...]:
     observations: list[SourceMediaObservation] = []
     for source in sorted(sources, key=lambda item: (item.source_url, item.source_document_id.hex)):
@@ -301,6 +350,7 @@ def extract_source_media_observations(
                 boilerplate_pattern=boilerplate_pattern,
                 landmark_pattern=landmark_pattern,
                 tracking_pattern=tracking_pattern,
+                related_content_heading_pattern=related_content_heading_pattern,
             )
             try:
                 parser.feed(source.content.decode("utf-8", errors="replace"))
@@ -555,6 +605,7 @@ def _replace_observation(
     *,
     image_bytes: bytes | None = None,
     caption_text: str | None = None,
+    context_after: str | None = None,
 ) -> SourceMediaObservation:
     values = {
         field: getattr(observation, field) for field in SourceMediaObservation.__dataclass_fields__
@@ -563,6 +614,8 @@ def _replace_observation(
         values["image_bytes"] = image_bytes
     if caption_text is not None:
         values["caption_text"] = caption_text
+    if context_after is not None:
+        values["context_after"] = context_after
     return SourceMediaObservation(**values)
 
 

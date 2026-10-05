@@ -162,12 +162,7 @@ from tests.integration.production.support import (
     synthesis_proposal_wire,
 )
 
-# This suite verifies durable artifact reuse and invalidation with deliberately
-# small fake extractions; the dedicated production gate suite covers sufficiency.
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.usefixtures("production_evidence_gate_disabled"),
-]
+pytestmark = pytest.mark.integration
 
 
 def _source_identity(extraction: SourceExtraction) -> dict[str, str]:

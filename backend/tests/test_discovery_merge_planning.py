@@ -22,6 +22,7 @@ from cti_app.application.discovery.cumulative.planners import (
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
+    ModelGatewayError,
     ModelRequest,
 )
 from cti_app.domain.discovery import CandidateTopic
@@ -64,6 +65,23 @@ class RecordingBridgeCapabilitiesProvider:
     async def release_visible_recovery(self, bridge_run_id: str) -> dict[str, object]:
         self.released.append(bridge_run_id)
         return {"released": True}
+
+
+def _wire(plan: DiscoveryMergePlanV1) -> str:
+    blocks = []
+    for group in plan.groups:
+        blocks.append(
+            "GROUP\n"
+            f"EXISTING: {', '.join(group.existing_subject_handles) or 'aucun'}\n"
+            f"INCOMING: {', '.join(group.incoming_candidate_handles)}\n"
+            f"CONFIDENCE: {group.confidence.value}\n"
+            f"DISPOSITION: {group.disposition.value}\n"
+            f"RATIONALE: {group.rationale}\n"
+            f"CAMPAIGNS: {' ; '.join(group.evidence.shared_campaigns)}\n"
+            f"BASIS: {' ; '.join(group.evidence.semantic_basis)}\n"
+            "END"
+        )
+    return "\n".join(blocks)
 
 
 class RecordingDraftingModel:
@@ -119,7 +137,7 @@ async def test_chatgpt_merge_uses_fresh_non_web_request_and_opaque_handles() -> 
             )
         ]
     )
-    model = RecordingDraftingModel([plan.model_dump_json()])
+    model = RecordingDraftingModel([_wire(plan)])
 
     outcome = await ChatGptMergePlanner(model).plan(
         parent,
@@ -137,6 +155,8 @@ async def test_chatgpt_merge_uses_fresh_non_web_request_and_opaque_handles() -> 
     assert str(parent.subjects[0].subject_id) not in request.text
     assert str(delta.candidates[0].candidate_id) not in request.text
     assert "web_search" not in request.text
+    assert "JSON" not in request.text
+    assert "{" not in request.text
 
 
 @pytest.mark.asyncio
@@ -161,7 +181,7 @@ async def test_chatgpt_merge_repairs_structure_once_and_preserves_distinct_subje
             )
         ]
     )
-    model = RecordingDraftingModel(["{}", distinct.model_dump_json()])
+    model = RecordingDraftingModel(["{}", _wire(distinct)])
 
     outcome = await ChatGptMergePlanner(model).plan(
         parent,
@@ -202,7 +222,7 @@ async def test_chatgpt_merge_releases_its_target_on_direct_success() -> None:
             )
         ]
     )
-    model = RecordingDraftingModel([plan.model_dump_json()])
+    model = RecordingDraftingModel([_wire(plan)])
     bridge = RecordingBridgeCapabilitiesProvider()
 
     await ChatGptMergePlanner(model, bridge_capabilities_provider=bridge).plan(
@@ -241,7 +261,7 @@ async def test_chatgpt_merge_releases_both_targets_after_repair() -> None:
             )
         ]
     )
-    model = RecordingDraftingModel(["{}", distinct.model_dump_json()])
+    model = RecordingDraftingModel(["{}", _wire(distinct)])
     bridge = RecordingBridgeCapabilitiesProvider()
 
     await ChatGptMergePlanner(model, bridge_capabilities_provider=bridge).plan(
@@ -358,6 +378,44 @@ async def test_a_stalled_merge_model_is_not_reported_as_an_invalid_plan() -> Non
     assert raised.value.code == "active_signal_stalled"
     # No repair attempt: there was no answer to repair.
     assert model.calls == 1
+
+
+class ComposerNotReadyModel:
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    async def draft(self, request: ModelRequest, output_schema: object = None) -> ModelExecution:
+        self.requests.append(request)
+        raise _ComposerNotReadyError("payload du composer non prêt avant soumission")
+
+
+class _ComposerNotReadyError(ModelGatewayError):
+    code = "bridge_server_error"
+    retryable = True
+
+
+@pytest.mark.asyncio
+async def test_a_retryable_bridge_failure_is_reported_as_model_unavailable() -> None:
+    """A bridge that raises before submitting must be retried, not crash the job."""
+    edition_id = uuid4()
+    batch = _batch(edition_id, [_candidate("A", "https://example.test/a")])
+    intake = _intake(batch)
+    delta = build_discovery_delta(intake, batch)
+    model = ComposerNotReadyModel()
+
+    with pytest.raises(MergeModelUnavailableError) as raised:
+        await ChatGptMergePlanner(model).plan(  # type: ignore[arg-type]
+            None,
+            delta,
+            build_merge_handles(None, delta),
+            edition_id=edition_id,
+            external_llm_allowed=True,
+            sensitivity="internal",
+        )
+
+    assert raised.value.code == "bridge_server_error"
+    # A failed pre-submission run must be allowed to restart on the job retry.
+    assert model.requests[0].allow_failed_resubmit is True
 
 
 def test_merge_projection_is_an_explicit_allowlist_without_internal_fields() -> None:
@@ -612,3 +670,42 @@ async def _bootstrap(edition_id: UUID, candidates: list[CandidateTopic]) -> Disc
         intake_id=intake.id,
         merge_run_id=run.id,
     ).snapshot
+
+
+def test_merge_wire_format_is_tolerant_of_bridge_noise() -> None:
+    from cti_app.application.discovery.cumulative.merge_wire_format import parse_merge_plan
+
+    plan = parse_merge_plan(
+        "```text\n"
+        "GROUP\n"
+        "EXISTING: aucun\n"
+        "INCOMING: C1, c2\n"
+        "CONFIDENCE: High\n"
+        "DISPOSITION: apply\n"
+        'RATIONALE: même campagne :chatgpt-content-reference{index="0"}\n'
+        "URLS: [https://example.test/a?x=1,2](https://example.test/a?x=1,2) ;"
+        " https://example.test/b\n"
+        "BANANA: ignoré\n"
+        "END\n"
+        "WARNING: un avertissement\n"
+        "```"
+    )
+
+    group = plan.groups[0]
+    assert group.existing_subject_handles == []
+    assert group.incoming_candidate_handles == ["C1", "C2"]
+    assert group.rationale == "même campagne"
+    assert group.evidence.shared_publication_urls == [
+        "https://example.test/a?x=1,2",
+        "https://example.test/b",
+    ]
+    assert plan.warnings == ["un avertissement"]
+
+
+def test_merge_wire_format_rejects_an_unreadable_answer() -> None:
+    from cti_app.application.discovery.cumulative.merge_wire_format import parse_merge_plan
+
+    with pytest.raises(ValueError):
+        parse_merge_plan("{}")
+    with pytest.raises(ValueError):
+        parse_merge_plan("GROUP\nINCOMING: C1\nCONFIDENCE: sure\nDISPOSITION: apply\nEND")

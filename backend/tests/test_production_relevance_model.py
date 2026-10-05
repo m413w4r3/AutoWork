@@ -31,7 +31,6 @@ from cti_app.application.production_relevance import (
     ProductionRelevanceProjectionService,
     RelevanceProjectionExecutionStatus,
     build_relevance_projection,
-    production_evidence_gate_details,
     relevance_projection_input_hash,
     subject_relevance_evidence_counts,
 )
@@ -60,7 +59,6 @@ from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
 from cti_app.domain.production import (
-    PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -905,7 +903,7 @@ def test_reserve_and_contradiction_context_is_handle_addressed_and_leak_guard_cl
         SynthesisMode.FRESH,
     )
     synthesis = ProductionSynthesisV1(
-        schema_version=1,
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         subject_id=snapshot.subject_id,
         production_input_hash=snapshot.input_hash,
         extraction_hash=canonical_extraction_hash(extraction),
@@ -1240,78 +1238,6 @@ async def test_saved_fixture_repairs_reasons_and_publishes_counter_reserve() -> 
     )
     assert {item.source_document_id for item in publication_sources} == set(source_ids[:2])
     assert any(item.publisher == "Bitquery" for item in publication_sources)
-
-
-@pytest.mark.parametrize(
-    ("direct_count", "minimum", "blocked"),
-    ((3, 4, True), (4, 4, False), (5, 4, False), (0, 0, False)),
-)
-def test_insufficient_subject_evidence_gate_thresholds(
-    direct_count: int, minimum: int, blocked: bool
-) -> None:
-    counts = {"direct_count": direct_count, "context_count": 6, "out_of_scope_count": 7}
-    details = production_evidence_gate_details(
-        counts,
-        minimum=minimum,
-        projection_artifact_id=UUID(int=42),
-        override_active=False,
-    )
-    assert (details is not None) is blocked
-    if details is not None:
-        assert details == {
-            "direct_count": direct_count,
-            "minimum": minimum,
-            "context_count": 6,
-            "out_of_scope_count": 7,
-            "projection_artifact_id": str(UUID(int=42)),
-        }
-
-
-def test_insufficient_subject_evidence_override_is_audited_idempotent_and_bypasses_gate() -> None:
-    snapshot = _snapshot()
-    run = ProductionRun(
-        id=snapshot.production_run_id,
-        subject_id=snapshot.subject_id,
-        edition_id=snapshot.edition_id,
-    )
-    projection_artifact_id = UUID(int=42)
-    decision = run.record_insufficient_subject_evidence_override(
-        projection_artifact_id=projection_artifact_id,
-        minimum=4,
-        direct_count=2,
-        context_count=8,
-        out_of_scope_count=3,
-        actor_id="analyst-7",
-        reason="Review confirmed sufficient qualitative context.",
-    )
-    repeated = run.record_insufficient_subject_evidence_override(
-        projection_artifact_id=projection_artifact_id,
-        minimum=4,
-        direct_count=2,
-        context_count=8,
-        out_of_scope_count=3,
-        actor_id="analyst-7",
-        reason="Review confirmed sufficient qualitative context.",
-    )
-
-    assert repeated == decision
-    assert len(run.review_overrides) == 1
-    assert decision["actor_id"] == "analyst-7"
-    assert decision["code"] == PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE
-    assert run.has_insufficient_subject_evidence_override(
-        projection_artifact_id=projection_artifact_id, minimum=4
-    )
-    assert (
-        production_evidence_gate_details(
-            {"direct_count": 2, "context_count": 8, "out_of_scope_count": 3},
-            minimum=4,
-            projection_artifact_id=projection_artifact_id,
-            override_active=run.has_insufficient_subject_evidence_override(
-                projection_artifact_id=projection_artifact_id, minimum=4
-            ),
-        )
-        is None
-    )
 
 
 def test_relevance_contract_versions_invalidate_old_classifier_reuse() -> None:

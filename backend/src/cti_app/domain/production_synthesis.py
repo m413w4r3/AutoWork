@@ -19,9 +19,36 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 
-PRODUCTION_SYNTHESIS_SCHEMA_VERSION = 1
+PRODUCTION_SYNTHESIS_SCHEMA_VERSION = 2
 SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION = "sha256-canonical-extraction-element-v1"
-SYNTHESIS_POLICY_VERSION = "production-synthesis-v1"
+SYNTHESIS_POLICY_VERSION = "production-synthesis-v2-editorial-title-source-notes"
+
+EDITORIAL_TITLE_MAX_LENGTH = 110
+EDITORIAL_TITLE_PATTERN = re.compile(r"\[(?P<group>[^\[\]\r\n]+)\] (?P<title>[^\[\]\r\n]+)")
+# Markdown, HTML, evidence handles ("E012") and quotes wrapping the whole title.
+_EDITORIAL_TITLE_FORBIDDEN = re.compile(
+    r"`|\*|__|~~|\[[^\]]+\]\([^)]*\)|<\s*/?\s*[A-Za-z]|\b[ER]\d{3,}\b"
+)
+_EDITORIAL_TITLE_QUOTES = {('"', '"'), ("'", "'"), ("«", "»"), ("“", "”")}
+
+
+def is_valid_editorial_title(value: object) -> bool:
+    """Check the publication's plain ``[Groupe] Titre`` title contract."""
+    if not isinstance(value, str) or len(value) > EDITORIAL_TITLE_MAX_LENGTH:
+        return False
+    match = EDITORIAL_TITLE_PATTERN.fullmatch(value)
+    if match is None or value != value.strip():
+        return False
+    group, title = match["group"], match["title"]
+    return (
+        group == group.strip()
+        and bool(group)
+        and bool(title.strip())
+        and not title.endswith(".")
+        and _EDITORIAL_TITLE_FORBIDDEN.search(value) is None
+        and (title[0], title[-1]) not in _EDITORIAL_TITLE_QUOTES
+    )
+
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -131,6 +158,24 @@ class SynthesisTimelineEntryV1:
             "evidence_refs",
             _normalize_evidence_refs(self.evidence_refs, "Timeline entry"),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisSourceNoteV1:
+    """A source-local publication note with its exact extraction lineage."""
+
+    source_document_id: UUID
+    text: str
+    evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_document_id, UUID):
+            raise ValueError("Source note source identity must be a UUID")
+        _require_semantic_text(self.text, "Source note text")
+        refs = _normalize_evidence_refs(self.evidence_refs, "Source note")
+        if any(ref.source_document_id != self.source_document_id for ref in refs):
+            raise ValueError("Source note evidence must belong to its source")
+        object.__setattr__(self, "evidence_refs", refs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -375,6 +420,7 @@ class ProductionSynthesisV1:
     timeline: tuple[SynthesisTimelineEntryV1, ...]
     uncertainties: tuple[SynthesisUncertaintyV1, ...]
     warnings: tuple[str, ...]
+    source_notes: tuple[SynthesisSourceNoteV1, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.schema_version) is not int or (
@@ -395,6 +441,7 @@ class ProductionSynthesisV1:
             ("lead", self.lead, SynthesisParagraphV1),
             ("sections", self.sections, SynthesisSectionV1),
             ("timeline", self.timeline, SynthesisTimelineEntryV1),
+            ("source_notes", self.source_notes, SynthesisSourceNoteV1),
             ("uncertainties", self.uncertainties, SynthesisUncertaintyV1),
         ):
             if not isinstance(values, tuple) or any(
@@ -411,6 +458,14 @@ class ProductionSynthesisV1:
             "timeline",
             tuple(sorted(set(self.timeline), key=timeline_sort_key)),
         )
+        source_note_ids = tuple(note.source_document_id for note in self.source_notes)
+        if len(source_note_ids) != len(set(source_note_ids)):
+            raise ValueError("Synthesis source notes must not repeat source identities")
+        object.__setattr__(
+            self,
+            "source_notes",
+            tuple(sorted(self.source_notes, key=lambda item: str(item.source_document_id))),
+        )
         normalized_uncertainties = tuple(
             sorted(
                 set(self.uncertainties),
@@ -424,7 +479,7 @@ class ProductionSynthesisV1:
 def synthesis_evidence_refs(
     synthesis: ProductionSynthesisV1,
 ) -> frozenset[ExtractionEvidenceRefV1]:
-    """Return every evidence ref cited by the lead, the sections and the timeline."""
+    """Return every evidence ref cited by narrative, timeline and source notes."""
     paragraphs = (
         *synthesis.lead,
         *(paragraph for section in synthesis.sections for paragraph in section.paragraphs),
@@ -433,6 +488,7 @@ def synthesis_evidence_refs(
         (
             *(ref for paragraph in paragraphs for ref in paragraph.evidence_refs),
             *(ref for entry in synthesis.timeline for ref in entry.evidence_refs),
+            *(ref for note in synthesis.source_notes for ref in note.evidence_refs),
         )
     )
 
@@ -539,6 +595,14 @@ def _uncertainty_to_json(uncertainty: SynthesisUncertaintyV1) -> dict[str, Any]:
     }
 
 
+def _source_note_to_json(note: SynthesisSourceNoteV1) -> dict[str, Any]:
+    return {
+        "source_document_id": str(note.source_document_id),
+        "text": note.text,
+        "evidence_refs": [_ref_to_json(ref) for ref in note.evidence_refs],
+    }
+
+
 def production_synthesis_to_json(synthesis: ProductionSynthesisV1) -> dict[str, Any]:
     """Return the strict JSON-compatible canonical representation."""
     if not isinstance(synthesis, ProductionSynthesisV1):
@@ -554,6 +618,7 @@ def production_synthesis_to_json(synthesis: ProductionSynthesisV1) -> dict[str, 
         "lead": [_paragraph_to_json(paragraph) for paragraph in synthesis.lead],
         "sections": [_section_to_json(section) for section in synthesis.sections],
         "timeline": [_timeline_to_json(entry) for entry in synthesis.timeline],
+        "source_notes": [_source_note_to_json(item) for item in synthesis.source_notes],
         "uncertainties": [_uncertainty_to_json(item) for item in synthesis.uncertainties],
         "warnings": list(synthesis.warnings),
     }
@@ -571,6 +636,7 @@ _SYNTHESIS_KEYS = frozenset(
         "lead",
         "sections",
         "timeline",
+        "source_notes",
         "uncertainties",
         "warnings",
     }
@@ -579,6 +645,7 @@ _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PARAGRAPH_KEYS = frozenset({"text", "evidence_refs"})
 _SECTION_KEYS = frozenset({"kind", "heading", "paragraphs"})
 _TIMELINE_KEYS = frozenset({"event_date", "date_text", "text", "evidence_refs"})
+_SOURCE_NOTE_KEYS = frozenset({"source_document_id", "text", "evidence_refs"})
 _UNCERTAINTY_KEYS = frozenset({"text", "source_document_ids"})
 
 
@@ -690,6 +757,15 @@ def _timeline_from_json(raw: Any) -> SynthesisTimelineEntryV1:
     )
 
 
+def _source_note_from_json(raw: Any) -> SynthesisSourceNoteV1:
+    payload = _object(raw, _SOURCE_NOTE_KEYS, "Synthesis source note")
+    return SynthesisSourceNoteV1(
+        source_document_id=_uuid(payload["source_document_id"], "Source note source ID"),
+        text=_text(payload["text"], "Source note text", semantic=True),
+        evidence_refs=_refs_from_json(payload["evidence_refs"], "Source note evidence refs"),
+    )
+
+
 def _uncertainty_from_json(raw: Any) -> SynthesisUncertaintyV1:
     payload = _object(raw, _UNCERTAINTY_KEYS, "Synthesis uncertainty")
     source_ids = tuple(
@@ -711,6 +787,10 @@ def production_synthesis_from_json(raw: Mapping[str, Any]) -> ProductionSynthesi
     )
     timeline = tuple(
         _timeline_from_json(value) for value in _array(payload["timeline"], "Synthesis timeline")
+    )
+    source_notes = tuple(
+        _source_note_from_json(value)
+        for value in _array(payload["source_notes"], "Synthesis source notes")
     )
     uncertainties = tuple(
         _uncertainty_from_json(value)
@@ -740,6 +820,7 @@ def production_synthesis_from_json(raw: Mapping[str, Any]) -> ProductionSynthesi
         timeline=timeline,
         uncertainties=uncertainties,
         warnings=warnings,
+        source_notes=source_notes,
     )
 
 
@@ -758,7 +839,6 @@ def validate_synthesis_lineage(
         "subject_id": snapshot.subject_id,
         "production_input_hash": snapshot.input_hash,
         "publication_language": snapshot.publication_language,
-        "title": snapshot.subject_title,
         "extraction_hash": expected_extraction_hash,
     }
     for field_name, expected_value in expected.items():

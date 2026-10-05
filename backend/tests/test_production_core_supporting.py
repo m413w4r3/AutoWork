@@ -413,7 +413,7 @@ def test_production_reference_proposal_accepts_bridge_markdown_links() -> None:
     parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
 
     assert parsed.value is not None
-    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v3"
+    assert PRODUCTION_REFERENCE_PARSER_VERSION == "production-reference-proposal-v4"
     assert raw.count("## SOURCE ") == 3
     assert [proposal.canonical_url for proposal in parsed.value] == [
         "https://example.test/blog/report"
@@ -493,3 +493,34 @@ text: Unbacked after filtering
     assert projected.editorial_title == "Legacy title"
     # Historical V4 data stays legacy; no V1 facts are fabricated.
     assert len(imported.sources) == 2
+
+
+def test_production_reference_proposal_recovers_empty_url_from_publisher_link() -> None:
+    raw = (
+        "# REFERENCES\n\n"
+        "## SOURCE S1\n"
+        "title: Chainalysis report\n"
+        "url:   \n"
+        "publisher: Chainalysis\n"
+        "published-at: 2026-07-01\n"
+        "role: primary\n"
+        "kind: publication\n"
+        "reason: Core publication. [Chainalysis](https://www.chainalysis.com/blog/x/)\n\n"
+        "## SOURCE S2\n"
+        "title: VirusTotal report\n"
+        "url:   \n"
+        "publisher: VirusTotal\n"
+        "kind: technical_resource\n"
+        "reason: Linked by [SafeBreach](https://www.safebreach.com/blog/y/)\n\n"
+        "## SOURCE S3\n"
+        "title: No publisher\n"
+        "url:\n"
+        "kind: publication\n"
+        "reason: See [x](https://example.test/z)\n"
+    )
+    parsed = parse_production_reference_proposals(raw, date(2026, 8, 1))
+
+    assert parsed.value is not None
+    assert [p.canonical_url for p in parsed.value] == ["https://www.chainalysis.com/blog/x"]
+    assert "reference_url_recovered_from_reason" in parsed.warnings
+    assert parsed.warnings.count("reference_invalid_url") == 2

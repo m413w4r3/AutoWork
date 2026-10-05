@@ -364,11 +364,17 @@ reste publié sur loopback côté hôte ; `OPENAI_BRIDGE_API_KEY` doit égaler l
 de la stack. Configuration effective :
 `docker compose -f compose.yaml -f compose.models.yaml config`.
 
+`make up`, `make dev`, `make down`, `make status` et `make logs` appliquent cet override
+automatiquement quand le réseau `metaharness-models` existe (`COMPOSE_MODELS=auto`, défaut) :
+un `make up` qui recrée les conteneurs ne coupe donc pas la connexion au Bridge.
+`COMPOSE_MODELS=on` l'exige, `COMPOSE_MODELS=off` force le compose autonome.
+
 Chaque POST au Bridge est une seule tentative HTTP : une relance éventuelle relève du
 `ModelGateway`, à partir de l'erreur typée, de l'identifiant exact et du signal explicite
 `verified_no_answer`. `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` borne l'attente HTTP synchrone
-(5 minutes par défaut) ; `OPENAI_BRIDGE_WAIT_TIMEOUT_RESEARCH_SECONDS` garde 15 minutes pour le
-rôle recherche. Les routes Qwen/WebAI utilisent `MODEL_REQUEST_TIMEOUT_SECONDS` (5 minutes) et
+(1 heure par défaut, le Bridge pouvant être lent à répondre) ;
+`OPENAI_BRIDGE_WAIT_TIMEOUT_RESEARCH_SECONDS` garde 2 heures pour le rôle recherche (plafond
+24 heures). Les routes Qwen/WebAI utilisent `MODEL_REQUEST_TIMEOUT_SECONDS` (5 minutes) et
 `MODEL_REQUEST_TIMEOUT_RESEARCH_SECONDS` (15 minutes). Ces budgets sont configurables par rôle.
 Les anciens noms `OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS` et `MODEL_REQUEST_TIMEOUT_SECONDS` restent
 acceptés. Une expiration après le POST signifie « état externe inconnu » et ne prétend pas annuler

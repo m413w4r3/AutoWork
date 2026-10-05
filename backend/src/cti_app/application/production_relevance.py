@@ -474,14 +474,14 @@ def _counter_analysis_overlap_fallback(
 def subject_relevance_evidence_counts(
     projection: RelevanceProjectionV1,
 ) -> dict[str, int]:
-    """Count narrative facts/events for the production substance gate."""
+    """Count narrative facts/events by relevance, recorded as artifact metadata."""
     narrative = tuple(
         item
         for item in projection.classifications
         if item.evidence_ref.kind in {EvidenceKind.FACT, EvidenceKind.EVENT}
     )
     return {
-        # Corroboration is independently supported subject evidence for this gate.
+        # Corroboration is independently supported subject evidence.
         "direct_count": sum(
             item.classification
             in {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
@@ -493,28 +493,6 @@ def subject_relevance_evidence_counts(
         "out_of_scope_count": sum(
             item.classification is RelevanceClassification.OUT_OF_SCOPE for item in narrative
         ),
-    }
-
-
-def production_evidence_gate_details(
-    counts: Mapping[str, int],
-    *,
-    minimum: int,
-    projection_artifact_id: UUID,
-    override_active: bool,
-) -> dict[str, Any] | None:
-    """Return a review payload only when current evidence is below the gate."""
-    if minimum < 0:
-        raise ValueError("Production evidence minimum cannot be negative")
-    direct_count = counts["direct_count"]
-    if minimum == 0 or direct_count >= minimum or override_active:
-        return None
-    return {
-        "direct_count": direct_count,
-        "minimum": minimum,
-        "context_count": counts["context_count"],
-        "out_of_scope_count": counts["out_of_scope_count"],
-        "projection_artifact_id": str(projection_artifact_id),
     }
 
 

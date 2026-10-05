@@ -696,7 +696,7 @@ def test_plan_profile_follows_tier_and_never_role() -> None:
     assert profiles["https://example.test/other-1"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-2"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-3"] is ExtractionProfile.IOC_RULES
-    assert plan.profile_policy_version == "production-reference-tier-core-only-v3"
+    assert plan.profile_policy_version == "production-reference-tier-core-first-v4"
 
 
 def test_plan_and_hashes_are_stable_when_corpus_order_changes() -> None:

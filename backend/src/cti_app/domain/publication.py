@@ -213,6 +213,39 @@ class PublicationTimelineEntryV1:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationReferenceEntryV1:
+    """A dated source publication note linked to its canonical source record."""
+
+    source_document_id: UUID
+    text: str
+    evidence_refs: tuple[PublicationEvidenceRefV1, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source_document_id, UUID):
+            raise ValueError("Publication reference source identity must be a UUID")
+        if not isinstance(self.text, str) or not self.text.strip():
+            raise ValueError("Publication reference text must be non-empty text")
+        if not isinstance(self.evidence_refs, tuple) or any(
+            not isinstance(ref, PublicationEvidenceRefV1) for ref in self.evidence_refs
+        ):
+            raise ValueError("Publication reference evidence refs have an invalid type")
+        if len(set(self.evidence_refs)) != len(self.evidence_refs):
+            raise ValueError("Publication reference must not repeat evidence refs")
+        if any(ref.source_document_id != self.source_document_id for ref in self.evidence_refs):
+            raise ValueError("Publication reference evidence must belong to its source")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            tuple(
+                sorted(
+                    self.evidence_refs,
+                    key=lambda ref: (ref.kind.value, ref.evidence_key),
+                )
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationIndicatorV1:
     value: str
     normalized_value: str
@@ -270,6 +303,16 @@ class PublicationIndicatorGroupV1:
                 )
             ),
         )
+
+
+def indicator_source_ids(groups: tuple[PublicationIndicatorGroupV1, ...]) -> frozenset[UUID]:
+    """Every source document that supplied one of the given IOC groups' values."""
+    return frozenset(
+        source_id
+        for group in groups
+        for indicator in group.indicators
+        for source_id in indicator.source_document_ids
+    )
 
 
 @dataclass(frozen=True, slots=True)

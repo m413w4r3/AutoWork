@@ -147,6 +147,14 @@ def test_only_core_sources_receive_full_extraction(
             document_id=uuid4(),
             sha256="c" * 64,
         ),
+        # Two CORE articles: the lone-CORE complement rule does not apply.
+        _record(
+            "https://example.test/second-core",
+            tier=ProductionReferenceTier.CORE,
+            role=SourceRole.PRIMARY,
+            document_id=uuid4(),
+            sha256="e" * 64,
+        ),
         _record(
             f"https://example.test/{tier.value}-{role.value}",
             tier=tier,
@@ -167,6 +175,160 @@ def test_only_core_sources_receive_full_extraction(
     assert planned.profile is expected
     assert planned.profile_reason_code is reason_code
     assert planned.editorial_role is editorial_role
+
+
+def _lone_core_corpus(
+    *candidates: ProductionReferenceSourceV1,
+) -> ProductionReferenceCorpusV1:
+    return _corpus(
+        _record(
+            "https://example.test/only-core",
+            tier=ProductionReferenceTier.CORE,
+            role=SourceRole.PRIMARY,
+            document_id=uuid4(),
+            sha256="c" * 64,
+            editorial_role=ProductionEditorialRole.PRIMARY,
+        ),
+        *candidates,
+    )
+
+
+def _supporting(
+    name: str,
+    editorial_role: ProductionEditorialRole,
+    *,
+    kind: ProductionReferenceKind = ProductionReferenceKind.PUBLICATION,
+    tier: ProductionReferenceTier = ProductionReferenceTier.SUPPORTING,
+    state: CollectionState = CollectionState.ARCHIVED,
+) -> ProductionReferenceSourceV1:
+    archived = state is CollectionState.ARCHIVED
+    return _record(
+        f"https://example.test/{name}",
+        tier=tier,
+        role=SourceRole.INDEPENDENT,
+        document_id=uuid4() if archived else None,
+        sha256="b" * 64 if archived else None,
+        kind=kind,
+        editorial_role=editorial_role,
+        state=state,
+    )
+
+
+def _profiles(plan: production_extraction.ExtractionPlan) -> dict[str, ExtractionProfile]:
+    return {source.canonical_url.rsplit("/", 1)[1]: source.profile for source in plan.sources}
+
+
+def test_lone_core_gets_one_complementary_full_source() -> None:
+    plan = build_extraction_plan(
+        _lone_core_corpus(
+            _supporting("zeta-corroboration", ProductionEditorialRole.CORROBORATION),
+            _supporting("alpha-corroboration", ProductionEditorialRole.CORROBORATION),
+            _supporting("counter", ProductionEditorialRole.COUNTER_ANALYSIS),
+            _supporting("context", ProductionEditorialRole.CONTEXT),
+        )
+    )
+
+    assert _profiles(plan) == {
+        "only-core": ExtractionProfile.FULL,
+        "alpha-corroboration": ExtractionProfile.FULL,
+        "zeta-corroboration": ExtractionProfile.IOC_RULES,
+        "counter": ExtractionProfile.IOC_RULES,
+        "context": ExtractionProfile.IOC_RULES,
+    }
+    complementary = next(
+        source for source in plan.sources if source.canonical_url.endswith("alpha-corroboration")
+    )
+    assert (
+        complementary.profile_reason_code is ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE
+    )
+    # The tier, not the profile, still marks it as a reference: it never becomes CORE.
+    assert complementary.tier is ProductionReferenceTier.SUPPORTING
+    assert complementary.editorial_role is ProductionEditorialRole.CORROBORATION
+
+
+def test_complementary_source_prefers_a_primary_editorial_role() -> None:
+    plan = build_extraction_plan(
+        _lone_core_corpus(
+            _supporting("a-corroboration", ProductionEditorialRole.CORROBORATION),
+            _supporting("z-primary", ProductionEditorialRole.PRIMARY),
+        )
+    )
+
+    assert _profiles(plan)["z-primary"] is ExtractionProfile.FULL
+    assert _profiles(plan)["a-corroboration"] is ExtractionProfile.IOC_RULES
+
+
+def test_counter_analysis_is_promoted_only_when_it_is_the_best_candidate() -> None:
+    plan = build_extraction_plan(
+        _lone_core_corpus(
+            _supporting("counter", ProductionEditorialRole.COUNTER_ANALYSIS),
+            _supporting("context", ProductionEditorialRole.CONTEXT),
+        )
+    )
+
+    assert _profiles(plan)["counter"] is ExtractionProfile.FULL
+    assert _profiles(plan)["context"] is ExtractionProfile.IOC_RULES
+
+
+@pytest.mark.parametrize(
+    "candidates",
+    [
+        pytest.param(
+            (_supporting("only-context", ProductionEditorialRole.CONTEXT),),
+            id="context-only",
+        ),
+        pytest.param(
+            (
+                _supporting(
+                    "annex",
+                    ProductionEditorialRole.CORROBORATION,
+                    kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+                    tier=ProductionReferenceTier.TECHNICAL,
+                ),
+            ),
+            id="technical-resource",
+        ),
+        pytest.param(
+            (
+                _supporting(
+                    "blocked",
+                    ProductionEditorialRole.CORROBORATION,
+                    state=CollectionState.BLOCKED,
+                ),
+            ),
+            id="unarchived-candidate",
+        ),
+    ],
+)
+def test_lone_core_without_a_publication_candidate_gets_no_complement(
+    candidates: tuple[ProductionReferenceSourceV1, ...],
+) -> None:
+    plan = build_extraction_plan(_lone_core_corpus(*candidates))
+
+    assert all(
+        source.profile is ExtractionProfile.IOC_RULES
+        for source in plan.sources
+        if source.tier is not ProductionReferenceTier.CORE
+    )
+    assert all(
+        source.profile_reason_code is not ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE
+        for source in plan.sources
+    )
+
+
+def test_complement_is_chosen_among_extractable_sources_only() -> None:
+    plan = build_extraction_plan(
+        _lone_core_corpus(
+            _supporting(
+                "a-blocked",
+                ProductionEditorialRole.PRIMARY,
+                state=CollectionState.BLOCKED,
+            ),
+            _supporting("b-archived", ProductionEditorialRole.CORROBORATION),
+        )
+    )
+
+    assert _profiles(plan)["b-archived"] is ExtractionProfile.FULL
 
 
 def test_policy_version_participates_in_the_plan() -> None:

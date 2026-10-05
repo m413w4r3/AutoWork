@@ -19,6 +19,7 @@ from cti_app.application.production_editorial_enrichment import (
     editorial_enrichment_evidence_pack_hash,
 )
 from cti_app.application.production_extraction import references_corpus_hash
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import (
     build_synthesis_evidence_pack,
     canonical_extraction_hash,
@@ -69,16 +70,22 @@ from cti_app.domain.production_extraction import (
     ExtractionFactV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
+    ExtractionProfileReasonCode,
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+)
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceReasonCode,
 )
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
@@ -89,8 +96,10 @@ from cti_app.domain.production_synthesis import (
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
+    SynthesisSourceNoteV1,
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
+    extraction_evidence_elements,
     extraction_evidence_refs_v1,
     production_synthesis_to_json,
 )
@@ -658,7 +667,7 @@ def _canonical_inputs() -> tuple[
         extraction_hash=canonical_extraction_hash(extraction),
         publication_language="en",
         synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
-        title="Example synthesis",
+        title="[Example actor] Example synthesis",
         lead=(SynthesisParagraphV1("Example finding.", (evidence,)),),
         sections=(),
         timeline=(),
@@ -785,7 +794,7 @@ def test_assembly_input_hash_changes_with_each_functional_component(
         != original
     )
 
-    changed_synthesis = replace(synthesis, title="Changed synthesis")
+    changed_synthesis = replace(synthesis, title="[Example actor] Changed synthesis")
     assert (
         compute_assembly_input_hash(
             snapshot=snapshot,
@@ -1304,7 +1313,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
             ArtifactType.DOMAIN,
             (
                 PublicationIndicatorV1(
-                    "Example[.]COM.",
+                    "example.com",
                     "example.com",
                     ArtifactType.DOMAIN,
                     (source_a.source_document_id, source_b_id),
@@ -1315,7 +1324,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
             ArtifactType.EMAIL,
             (
                 PublicationIndicatorV1(
-                    "Analyst[at]Example[.]COM",
+                    "Analyst@example.com",
                     "Analyst@example.com",
                     ArtifactType.EMAIL,
                     (source_a.source_document_id,),
@@ -1326,7 +1335,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
             ArtifactType.HASH,
             (
                 PublicationIndicatorV1(
-                    "A" * 64,
+                    "a" * 64,
                     "a" * 64,
                     ArtifactType.HASH,
                     (source_a.source_document_id,),
@@ -1337,7 +1346,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
             ArtifactType.IP,
             (
                 PublicationIndicatorV1(
-                    "2001:DB8::1",
+                    "2001:db8::1",
                     "2001:db8::1",
                     ArtifactType.IP,
                     (source_a.source_document_id,),
@@ -1348,7 +1357,7 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
             ArtifactType.URL,
             (
                 PublicationIndicatorV1(
-                    "HXXPS://Example[.]COM/Path",
+                    "https://example.com/Path",
                     "https://example.com/Path",
                     ArtifactType.URL,
                     (source_a.source_document_id,),
@@ -1644,3 +1653,371 @@ def test_publication_builder_removes_internal_headings_but_keeps_section_anchors
     assert document.sections[0].heading == ""
     assert document.lead[0].text == "Lead first paragraph."
     assert document.sections[0].paragraphs[0].text == "Technical continuation."
+
+
+def _frontmatter_v6_case():
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    core = extraction.sources[0]
+    core_id = core.source_document_id
+
+    def indicator(
+        value: str,
+        artifact_type: ArtifactType,
+        source_document_id: UUID,
+        status: ExtractionIndicatorStatus = ExtractionIndicatorStatus.CONFIRMED_IOC,
+    ) -> ExtractionIndicatorV1:
+        return ExtractionIndicatorV1(
+            value=value,
+            artifact_type=artifact_type,
+            indicator_status=status,
+            context="Observed in the source.",
+            evidence_quote=f"The source records {value}.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source_document_id,),
+        )
+
+    core_indicators = (
+        indicator("core.example", ArtifactType.DOMAIN, core_id),
+        indicator("shared.example", ArtifactType.DOMAIN, core_id),
+        indicator("A" * 64, ArtifactType.HASH, core_id),
+        indicator("sample.exe", ArtifactType.FILENAME, core_id),
+    )
+    core = replace(core, indicators=core_indicators)
+
+    def publication_source(
+        source_id: UUID,
+        url: str,
+        *,
+        title: str | None,
+        publisher: str | None,
+        published_at: date | None,
+        profile: ExtractionProfile = ExtractionProfile.FULL,
+        indicators: tuple[ExtractionIndicatorV1, ...] = (),
+    ) -> tuple[ProductionSourceExtractionV1, ProductionReferenceSourceV1]:
+        facts = (
+            tuple(replace(fact, source_document_ids=(source_id,)) for fact in core.facts)
+            if profile is ExtractionProfile.FULL
+            else ()
+        )
+        source = replace(
+            core,
+            source_document_id=source_id,
+            canonical_url=url,
+            content_sha256=hashlib.sha256(str(source_id).encode()).hexdigest(),
+            tier=ProductionReferenceTier.SUPPORTING,
+            role=SourceRole.INDEPENDENT,
+            profile=profile,
+            editorial_role=ProductionEditorialRole.CORROBORATION,
+            profile_reason_code=(
+                ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE
+                if profile is ExtractionProfile.FULL
+                else None
+            ),
+            facts=facts,
+            events=(),
+            indicators=indicators,
+            rules=(),
+            uncertainties=(),
+        )
+        reference = replace(
+            references.sources[0],
+            canonical_url=url,
+            tier=ProductionReferenceTier.SUPPORTING,
+            kind=ProductionReferenceKind.PUBLICATION,
+            role=SourceRole.INDEPENDENT,
+            title=title,
+            publisher=publisher,
+            published_at=published_at,
+            source_collection_id=UUID(int=100 + source_id.int),
+            source_document_id=source_id,
+            collection_state=CollectionState.ARCHIVED,
+            content_sha256=source.content_sha256,
+            relevance_reason="Supporting source",
+            proposed_by_model=False,
+            eligible_for_extraction=True,
+            editorial_role=ProductionEditorialRole.CORROBORATION,
+        )
+        return source, reference
+
+    support_a_id, support_b_id, missing_date_id = UUID(int=20), UUID(int=21), UUID(int=22)
+    core_reference = replace(
+        references.sources[0],
+        publisher="Core Press",
+        published_at=date(2026, 1, 10),
+    )
+    support_a_indicators = (
+        indicator("relay.example", ArtifactType.DOMAIN, support_a_id),
+        indicator("shared.example", ArtifactType.DOMAIN, support_a_id),
+        indicator("original.example", ArtifactType.DOMAIN, support_a_id),
+        indicator("context.example", ArtifactType.DOMAIN, support_a_id),
+        indicator("out.example", ArtifactType.DOMAIN, support_a_id),
+        indicator(
+            "contextual.example",
+            ArtifactType.DOMAIN,
+            support_a_id,
+            ExtractionIndicatorStatus.CONTEXTUAL,
+        ),
+        indicator("a" * 63, ArtifactType.HASH, support_a_id),
+        indicator("source.exe", ArtifactType.FILENAME, support_a_id),
+    )
+    supporting_a, supporting_a_reference = publication_source(
+        support_a_id,
+        "https://a.example/report",
+        title="Alpha report",
+        publisher="Support A",
+        published_at=date(2026, 1, 10),
+        indicators=support_a_indicators,
+    )
+    supporting_b_indicators = (
+        indicator("corroborated.example", ArtifactType.DOMAIN, support_b_id),
+    )
+    supporting_b, supporting_b_reference = publication_source(
+        support_b_id,
+        "https://z.example/report",
+        title="Zulu report",
+        publisher="Support B",
+        published_at=date(2026, 1, 10),
+        profile=ExtractionProfile.IOC_RULES,
+        indicators=supporting_b_indicators,
+    )
+    missing_date, missing_date_reference = publication_source(
+        missing_date_id,
+        "https://missing.example/article",
+        title=None,
+        publisher=None,
+        published_at=None,
+        profile=ExtractionProfile.IOC_RULES,
+        indicators=(indicator("undated.example", ArtifactType.DOMAIN, missing_date_id),),
+    )
+
+    technical_id = UUID(int=23)
+    technical_indicator = indicator("technical.example", ArtifactType.DOMAIN, technical_id)
+    technical_source = replace(
+        core,
+        source_document_id=technical_id,
+        canonical_url="https://technical.example/iocs",
+        content_sha256="d" * 64,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        profile=ExtractionProfile.IOC_RULES,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        profile_reason_code=None,
+        facts=(),
+        events=(),
+        indicators=(technical_indicator,),
+        rules=(),
+        uncertainties=(),
+    )
+    technical_reference = replace(
+        references.sources[0],
+        canonical_url=technical_source.canonical_url,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        role=SourceRole.PRIMARY,
+        title="Technical IOC feed",
+        publisher="Technical Feed",
+        published_at=date(2025, 1, 1),
+        source_collection_id=UUID(int=123),
+        source_document_id=technical_id,
+        content_sha256=technical_source.content_sha256,
+        relevance_reason="Technical source",
+        eligible_for_extraction=True,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+    )
+    blocked_reference = replace(
+        references.sources[0],
+        canonical_url="https://blocked.example/report",
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        title="Blocked report",
+        publisher="Blocked Press",
+        published_at=date(2024, 1, 1),
+        source_collection_id=UUID(int=124),
+        source_document_id=None,
+        collection_state=CollectionState.BLOCKED,
+        content_sha256=None,
+        relevance_reason="The source is blocked.",
+        eligible_for_extraction=False,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+    )
+
+    references = replace(
+        references,
+        sources=(
+            core_reference,
+            supporting_a_reference,
+            supporting_b_reference,
+            missing_date_reference,
+            technical_reference,
+            blocked_reference,
+        ),
+    )
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(core, supporting_a, supporting_b, missing_date, technical_source),
+    )
+    support_b_note_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.source_document_id == support_b_id and ref.kind is EvidenceKind.INDICATOR
+    )
+    missing_date_note_ref = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.source_document_id == missing_date_id and ref.kind is EvidenceKind.INDICATOR
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        title="[Example actor] Décrit une activité documentée",
+        source_notes=(
+            SynthesisSourceNoteV1(
+                source_document_id=support_b_id,
+                text="Research Unit confirme la chronologie de l\u2019activité.",
+                evidence_refs=(support_b_note_ref,),
+            ),
+            SynthesisSourceNoteV1(
+                source_document_id=missing_date_id,
+                text="Missing Date Lab signale un échantillon associé à l\u2019activité.",
+                evidence_refs=(missing_date_note_ref,),
+            ),
+        ),
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    evidence_by_value = {
+        (ref.source_document_id, str(payload["value"])): ref
+        for ref, payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.INDICATOR
+    }
+    desired_decisions = {
+        (support_a_id, "relay.example"): (
+            RelevanceClassification.DIRECT,
+            RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+        ),
+        (support_a_id, "shared.example"): (
+            RelevanceClassification.INDETERMINATE,
+            RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        ),
+        (support_a_id, "original.example"): (
+            RelevanceClassification.INDETERMINATE,
+            RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        ),
+        (support_a_id, "context.example"): (
+            RelevanceClassification.CONTEXT,
+            RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
+        ),
+        (support_a_id, "out.example"): (
+            RelevanceClassification.OUT_OF_SCOPE,
+            RelevanceReasonCode.EXPLICIT_OTHER_ACTOR,
+        ),
+        (support_a_id, "a" * 63): (
+            RelevanceClassification.INDETERMINATE,
+            RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        ),
+        (technical_id, "technical.example"): (
+            RelevanceClassification.INDETERMINATE,
+            RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        ),
+        (support_b_id, "corroborated.example"): (
+            RelevanceClassification.CORROBORATION,
+            RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
+        ),
+        (missing_date_id, "undated.example"): (
+            RelevanceClassification.INDETERMINATE,
+            RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        ),
+    }
+    classes = []
+    for item in projection.classifications:
+        match = next(
+            (
+                decision
+                for (source_id, value), decision in desired_decisions.items()
+                if evidence_by_value.get((source_id, value)) == item.evidence_ref
+            ),
+            None,
+        )
+        classes.append(
+            replace(item, classification=match[0], reason_code=match[1])
+            if match is not None
+            else item
+        )
+    projection = replace(projection, classifications=tuple(classes))
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    return (
+        publication,
+        {
+            "snapshot": snapshot,
+            "references": references,
+            "extraction": extraction,
+            "relevance_projection": projection,
+            "synthesis": synthesis,
+            "editorial_enrichment": enrichment,
+        },
+        core_id,
+        support_a_id,
+        support_b_id,
+        missing_date_id,
+        technical_id,
+    )
+
+
+def test_v6_references_use_release_dates_model_notes_fallback_and_source_scope() -> None:
+    publication, _, core_id, support_a_id, support_b_id, missing_date_id, technical_id = (
+        _frontmatter_v6_case()
+    )
+
+    assert [item.source_document_id for item in publication.references] == [
+        support_a_id,
+        support_b_id,
+        core_id,
+        missing_date_id,
+    ]
+    assert publication.references[0].text == "Support A publie « Alpha report »."
+    assert (
+        publication.references[1].text
+        == "Research Unit confirme la chronologie de l\u2019activité."
+    )
+    assert publication.references[2].text == "Core Press publie « Example report »."
+    assert publication.references[3].text == (
+        "Missing Date Lab signale un échantillon associé à l\u2019activité."
+    )
+    assert all(item.source_document_id != technical_id for item in publication.references)
+
+
+def test_v6_ioc_projection_separates_core_supported_and_original_values() -> None:
+    publication, _, core_id, support_a_id, _support_b_id, _missing_date_id, technical_id = (
+        _frontmatter_v6_case()
+    )
+    main = {group.artifact_type: group.indicators for group in publication.indicators}
+    originals = {group.artifact_type: group.indicators for group in publication.original_indicators}
+    main_domains = {item.normalized_value: item for item in main[ArtifactType.DOMAIN]}
+    original_domains = {item.normalized_value: item for item in originals[ArtifactType.DOMAIN]}
+
+    assert set(main_domains) == {
+        "core.example",
+        "shared.example",
+        "relay.example",
+        "corroborated.example",
+    }
+    assert main[ArtifactType.HASH][0].normalized_value == "a" * 64
+    assert set(original_domains) == {"original.example", "context.example"}
+    assert main_domains["shared.example"].source_document_ids == (core_id,)
+    assert set(original_domains["original.example"].source_document_ids) == {support_a_id}
+    assert all(technical_id not in item.source_document_ids for item in main_domains.values())
+    assert "sample.exe" not in str(publication.indicators)
+    assert "source.exe" not in str(publication.original_indicators)
+    assert "contextual.example" not in str(publication.original_indicators)
+    assert "out.example" not in str(publication.original_indicators)
+    assert "technical.example" not in str(publication.original_indicators)
+    assert "a" * 63 not in str(publication.original_indicators)

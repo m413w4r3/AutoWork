@@ -22,7 +22,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
   const iocsDocumentId = "56565656-5656-4565-8565-565656565656";
   const vendorUrl = "https://vendor.example/iranian-proxy";
   const iocsUrl = "https://research.example/iranian-proxy-iocs";
-  const synthesisTitle = "Campagne Iranian Proxy — synthèse vérifiée";
+  const synthesisTitle = "[Iranian Proxy] Campagne documentée par les sources";
   const leadText =
     "La campagne Iranian Proxy vise des infrastructures stratégiques.";
   const evidenceFactKey = "d".repeat(64);
@@ -406,7 +406,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
           metadata: {},
           rendered_content: null,
           canonical_content: {
-            schema_version: 1,
+            schema_version: 2,
             subject_id: subjectId,
             production_input_hash: hash,
             references_corpus_hash: "b".repeat(64),
@@ -520,7 +520,8 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
             production_input_hash: hash,
             extraction_hash: "9".repeat(64),
             publication_language: "fr",
-            synthesis_policy_version: "production-synthesis-v1",
+            synthesis_policy_version:
+              "production-synthesis-v2-editorial-title-source-notes",
             title: synthesisTitle,
             lead: [
               {
@@ -583,6 +584,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
                 ],
               },
             ],
+            source_notes: [],
             uncertainties: [
               {
                 text: "L’attribution de la campagne reste provisoire.",

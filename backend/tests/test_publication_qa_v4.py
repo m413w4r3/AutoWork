@@ -8,21 +8,24 @@ import pytest
 
 from cti_app.application import publication_qa
 from cti_app.application.publication_builder import build_publication_document_v4
-from cti_app.application.publication_qa import qa_publication_v4
+from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
 from cti_app.application.typst_rendering import project_publication_to_typst_model
 from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
 from cti_app.domain.publication import PublicationSectionKind, PublicationSectionV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
+    PublicationDocumentV5,
     PublicationUncertaintyV1,
     parse_publication_document,
     serialize_publication_document,
 )
+from cti_app.domain.semantic_annotation import SemanticParagraphV1, SemanticRole, SemanticTextSpanV1
 from tests.test_publication_builder_v4 import (
     _canonical_inputs,
     _diagram,
     _enrichment_with,
     _figure,
+    _frontmatter_v6_case,
     _resolved_figure,
     _table,
     _with_extra_source,
@@ -253,3 +256,34 @@ def test_injected_evidence_ref_fails_exact_projection() -> None:
     payload["lead"][0]["evidence_refs"].append(existing)
     tampered = parse_publication_document(payload)
     _assert_failed(inputs, tampered)
+
+
+def test_v6_qa_requires_editorial_title_format() -> None:
+    publication, inputs, *_ids = _frontmatter_v6_case()
+
+    valid = qa_publication_v5(publication=publication, **inputs)
+
+    assert valid["checks"]["title_format"] is True
+    base = replace(publication.document, title="Title without an editorial group")
+    semantic_text = replace(
+        publication.semantic_text,
+        paragraphs=tuple(
+            SemanticParagraphV1(
+                paragraph.anchor,
+                (SemanticTextSpanV1(SemanticRole.TEXT, base.title),),
+            )
+            if paragraph.anchor == "title"
+            else paragraph
+            for paragraph in publication.semantic_text.paragraphs
+        ),
+    )
+    invalid = PublicationDocumentV5(
+        document=base,
+        semantic_text=semantic_text,
+        references=publication.references,
+        original_indicators=publication.original_indicators,
+    )
+    rejected = qa_publication_v5(publication=invalid, **inputs)
+
+    assert rejected["checks"]["title_format"] is False
+    assert rejected["passed"] is False

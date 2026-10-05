@@ -62,6 +62,7 @@ from cti_app.domain.production_relevance import (
     RelevanceReasonCode,
 )
 from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -611,7 +612,7 @@ def test_projection_hash_invalidates_synthesis_and_enrichment_input_hashes() -> 
     changed_hash = synthesis_input_hash(snapshot, extraction, changed_pack, "c" * 64)
 
     synthesis = ProductionSynthesisV1(
-        schema_version=1,
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
         subject_id=snapshot.subject_id,
         production_input_hash=snapshot.input_hash,
         extraction_hash=canonical_extraction_hash(extraction),

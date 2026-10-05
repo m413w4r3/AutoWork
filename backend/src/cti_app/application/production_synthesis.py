@@ -69,7 +69,11 @@ from cti_app.domain.production_extraction import (
     production_extraction_from_json,
     production_extraction_to_json,
 )
-from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
+from cti_app.domain.production_references import (
+    ProductionEditorialRole,
+    ProductionReferenceKind,
+    ProductionReferenceTier,
+)
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
     RelevanceProjectionV1,
@@ -78,6 +82,7 @@ from cti_app.domain.production_relevance import (
 )
 from cti_app.domain.production_synthesis import (
     _MONTH_NUMBERS,
+    EDITORIAL_TITLE_MAX_LENGTH,
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION,
     SYNTHESIS_POLICY_VERSION,
@@ -87,11 +92,13 @@ from cti_app.domain.production_synthesis import (
     SynthesisParagraphV1,
     SynthesisSectionKind,
     SynthesisSectionV1,
+    SynthesisSourceNoteV1,
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
     evidence_ref_sort_key,
     extraction_evidence_elements,
     extraction_evidence_refs_v1,
+    is_valid_editorial_title,
     production_synthesis_from_json,
     resolve_timeline_date_text,
     synthesis_evidence_refs,
@@ -103,9 +110,9 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import SynthesisService
 
-SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v7-counter-reserve"
+SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v9-source-publication-notes"
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
-SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 2
+SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
 SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v2-headingless-reserve-handles"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
@@ -124,9 +131,10 @@ class SynthesisProposalErrorCode(StrEnum):
 class SynthesisProposalControlError(RuntimeError):
     """A structured proposal failed a deterministic Synthesis control."""
 
-    def __init__(self, code: SynthesisProposalErrorCode) -> None:
+    def __init__(self, code: SynthesisProposalErrorCode, reason: str | None = None) -> None:
         self.code = code
-        super().__init__(code.value)
+        self.reason = reason
+        super().__init__(code.value if reason is None else f"{code.value}:{reason}")
 
 
 class _StrictProposalModel(BaseModel):
@@ -147,9 +155,10 @@ class SynthesisClaimProposalV1(_StrictProposalModel):
     @field_validator("evidence_handles")
     @classmethod
     def _unique_handles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if not value or any(not handle for handle in value) or len(set(value)) != len(value):
-            raise ValueError("Claim evidence handles must be a non-empty unique tuple")
-        return value
+        if not value or any(not handle for handle in value):
+            raise ValueError("Claim evidence handles must be a non-empty tuple")
+        # Citing a handle twice does not weaken the grounding: keep one.
+        return tuple(dict.fromkeys(value))
 
 
 class SynthesisSectionProposalV1(_StrictProposalModel):
@@ -167,11 +176,33 @@ class SynthesisSectionProposalV1(_StrictProposalModel):
         return value
 
 
+class SynthesisSourceNoteProposalV1(_StrictProposalModel):
+    source_alias: StrictStr
+    evidence_handles: tuple[StrictStr, ...]
+    text: StrictStr
+
+    @field_validator("evidence_handles")
+    @classmethod
+    def _unique_handles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value or any(not handle for handle in value):
+            raise ValueError("Source note evidence handles must be a non-empty tuple")
+        return tuple(dict.fromkeys(value))
+
+    @field_validator("text")
+    @classmethod
+    def _nonempty_text(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("Source note text must be non-empty text")
+        return value
+
+
 class SynthesisProposalV1(_StrictProposalModel):
     """Strict internal proposal created from the tolerant text wire format."""
 
     lead: tuple[SynthesisClaimProposalV1, ...]
     sections: tuple[SynthesisSectionProposalV1, ...]
+    title: StrictStr | None = None
+    source_notes: tuple[SynthesisSourceNoteProposalV1, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -220,6 +251,16 @@ class _WireClaim:
     error_code: str | None = None
 
 
+@dataclass(slots=True)
+class _WireSourceNote:
+    block_id: str
+    raw_lines: list[str] = field(default_factory=list)
+    evidence_handles: tuple[str, ...] | None = None
+    text_lines: list[str] = field(default_factory=list)
+    text_started: bool = False
+    error_code: str | None = None
+
+
 _SYNTHESIS_FENCE = re.compile(r"^\s*```(?:[A-Za-z0-9_-]+)?\s*$")
 _SYNTHESIS_BLOCK_WRAPPERS = re.compile(r"^@@\s*(.*?)\s*@@$")
 _SYNTHESIS_SECTION_HEADER = re.compile(
@@ -227,6 +268,8 @@ _SYNTHESIS_SECTION_HEADER = re.compile(
     re.IGNORECASE,
 )
 _SYNTHESIS_CLAIM_HEADER = re.compile(r"^CLAIM(?:\s+([A-Za-z0-9._-]+))?\s*:?$", re.IGNORECASE)
+_SYNTHESIS_SOURCE_NOTE_HEADER = re.compile(r"^SOURCE_NOTE\s+([A-Za-z0-9._-]+)\s*:?$", re.IGNORECASE)
+_SYNTHESIS_TITLE_INLINE = re.compile(r"^TITLE\s*:\s*(.*)$", re.IGNORECASE)
 _SYNTHESIS_FIELD = re.compile(
     r"^(EVIDENCE(?:\s+HANDLES?)?|HANDLES|TEXT|HEADING)\s*:\s*(.*)$",
     re.IGNORECASE,
@@ -288,9 +331,14 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
     diagnostics: list[str] = []
     lead: list[SynthesisClaimProposalV1] = []
     sections: list[SynthesisSectionProposalV1] = []
+    source_notes: list[SynthesisSourceNoteProposalV1] = []
     current_group: str | None = None
     current_section: _WireSection | None = None
     current_claim: _WireClaim | None = None
+    current_source_note: _WireSourceNote | None = None
+    title: str | None = None
+    title_lines: list[str] = []
+    title_started = False
     explicit_empty = False
     recognized = False
     sequence = 0
@@ -318,9 +366,6 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             return
         if not claim.text_started or not "\n".join(claim.text_lines).strip():
             reject(claim.block_id, "synthesis_claim_missing_text", claim.raw_lines)
-            return
-        if len(set(claim.evidence_handles)) != len(claim.evidence_handles):
-            reject(claim.block_id, "synthesis_claim_duplicate_evidence_handle", claim.raw_lines)
             return
         try:
             parsed = SynthesisClaimProposalV1(
@@ -365,6 +410,49 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         except ValueError:
             reject(section.block_id, "synthesis_section_schema_invalid", section.raw_lines)
 
+    def finish_source_note() -> None:
+        nonlocal current_source_note
+        note = current_source_note
+        current_source_note = None
+        if note is None:
+            return
+        if note.error_code is not None:
+            reject(note.block_id, note.error_code, note.raw_lines)
+            warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
+            return
+        if note.evidence_handles is None:
+            reject(note.block_id, "synthesis_source_note_missing_evidence_handles", note.raw_lines)
+            warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
+            return
+        text = "\n".join(note.text_lines).strip()
+        if not text:
+            reject(note.block_id, "synthesis_source_note_missing_text", note.raw_lines)
+            warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
+            return
+        try:
+            source_notes.append(
+                SynthesisSourceNoteProposalV1(
+                    source_alias=note.block_id,
+                    evidence_handles=note.evidence_handles,
+                    text=text,
+                )
+            )
+        except ValueError:
+            reject(note.block_id, "synthesis_source_note_schema_invalid", note.raw_lines)
+            warnings.append(SynthesisWireWarning(note.block_id, "synthesis_source_note_invalid"))
+
+    def finish_title() -> None:
+        nonlocal title_started, title
+        if not title_started:
+            return
+        title_started = False
+        candidate = "\n".join(title_lines).strip()
+        title_lines.clear()
+        if title is None:
+            title = candidate
+        else:
+            warnings.append(SynthesisWireWarning("TITLE", "synthesis_title_duplicate"))
+
     for index, raw_line in enumerate(lines, start=1):
         if _SYNTHESIS_FENCE.fullmatch(raw_line):
             continue
@@ -372,9 +460,63 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if not line or line in {"---", "***"}:
             continue
 
+        header_value = line.rstrip(":").strip()
+        if title_started:
+            if header_value.casefold() in {"end title", "end editorial title"}:
+                finish_title()
+            else:
+                title_lines.append(raw_line.strip())
+            recognized = True
+            continue
+
+        inline_title = _SYNTHESIS_TITLE_INLINE.fullmatch(line)
+        if header_value.casefold() in {"title", "editorial title"}:
+            finish_claim()
+            finish_section()
+            finish_source_note()
+            title_started = True
+            title_lines.clear()
+            current_group = None
+            recognized = True
+            continue
+        if inline_title is not None:
+            finish_claim()
+            finish_section()
+            finish_source_note()
+            if title is None:
+                title = inline_title.group(1).strip()
+            else:
+                warnings.append(SynthesisWireWarning("TITLE", "synthesis_title_duplicate"))
+            recognized = True
+            continue
+
+        source_note_match = _SYNTHESIS_SOURCE_NOTE_HEADER.fullmatch(header_value)
+        if source_note_match is not None:
+            finish_claim()
+            finish_section()
+            finish_source_note()
+            source_alias = source_note_match.group(1).upper()
+            current_source_note = _WireSourceNote(
+                block_id=source_alias,
+                raw_lines=[raw_line],
+            )
+            current_group = "source_note"
+            recognized = True
+            continue
+
+        if header_value.casefold() in {"end source note", "end source_note"}:
+            if current_source_note is not None:
+                current_source_note.raw_lines.append(raw_line)
+            finish_source_note()
+            current_group = None
+            recognized = True
+            continue
+
         if line.casefold() in {"empty", "no claims", "no supported claims"}:
             finish_claim()
             finish_section()
+            finish_source_note()
+            finish_title()
             recognized = True
             if explicit_empty or lead or sections or current_group is not None:
                 reject(f"EMPTY-{index}", "synthesis_empty_marker_conflict", (raw_line,))
@@ -386,10 +528,10 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             reject(f"EMPTY-{index}", "synthesis_empty_marker_conflict", (raw_line,))
             explicit_empty = False
 
-        header_value = line.rstrip(":").strip()
         if header_value.casefold() in {"lead", "synthesis lead", "synthesis output"}:
             finish_claim()
             finish_section()
+            finish_source_note()
             current_group = "lead" if header_value.casefold() != "synthesis output" else None
             recognized = True
             continue
@@ -397,6 +539,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if header_value.casefold() in {"diagnostics", "synthesis diagnostics"}:
             finish_claim()
             finish_section()
+            finish_source_note()
             current_group = "diagnostics"
             recognized = True
             continue
@@ -404,6 +547,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if header_value.casefold() in {"end diagnostics", "end synthesis diagnostics"}:
             finish_claim()
             finish_section()
+            finish_source_note()
             current_group = None
             recognized = True
             continue
@@ -412,6 +556,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if section_match is not None:
             finish_claim()
             finish_section()
+            finish_source_note()
             kind_text, local_id = section_match.groups()
             sequence += 1
             section_id = local_id or f"S{sequence:03d}"
@@ -451,6 +596,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         claim_match = _SYNTHESIS_CLAIM_HEADER.fullmatch(header_value)
         if claim_match is not None:
             finish_claim()
+            finish_source_note()
             sequence += 1
             block_id = claim_match.group(1) or f"C{sequence:03d}"
             raw_claim = [raw_line]
@@ -476,6 +622,31 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if field_match is not None:
             field_name = re.sub(r"\s+", " ", field_match.group(1).casefold()).strip()
             value = field_match.group(2)
+            if current_source_note is not None:
+                current_source_note.raw_lines.append(raw_line)
+                if field_name.startswith("evidence") or field_name == "handles":
+                    if current_source_note.evidence_handles is not None:
+                        current_source_note.error_code = (
+                            "synthesis_source_note_duplicate_evidence_field"
+                        )
+                    else:
+                        current_source_note.evidence_handles = _wire_evidence_handles(value)
+                        if current_source_note.evidence_handles is None:
+                            current_source_note.error_code = (
+                                "synthesis_source_note_invalid_evidence_handles"
+                            )
+                elif field_name == "text":
+                    if current_source_note.text_started:
+                        current_source_note.error_code = (
+                            "synthesis_source_note_duplicate_text_field"
+                        )
+                    else:
+                        current_source_note.text_started = True
+                        current_source_note.text_lines.append(value)
+                else:
+                    current_source_note.error_code = "synthesis_source_note_unknown_field"
+                recognized = True
+                continue
             if current_claim is not None:
                 current_claim.raw_lines.append(raw_line)
                 if field_name.startswith("evidence") or field_name == "handles":
@@ -527,6 +698,14 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                 )
         elif current_section is not None:
             current_section.raw_lines.append(raw_line)
+        elif current_source_note is not None:
+            current_source_note.raw_lines.append(raw_line)
+            if current_source_note.text_started:
+                current_source_note.text_lines.append(raw_line.strip())
+            else:
+                current_source_note.error_code = (
+                    current_source_note.error_code or "synthesis_source_note_unknown_field"
+                )
         elif current_group == "diagnostics":
             diagnostic = re.fullmatch(
                 r"(?:MISSING\s+COVERAGE|DIAGNOSTIC)\s*:\s*(.+)",
@@ -539,12 +718,16 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                     diagnostics.append(text)
             recognized = True
 
+    finish_title()
     finish_claim()
     finish_section()
+    finish_source_note()
 
     if explicit_empty and not lead and not sections and not rejected:
         return SynthesisWireParseResult(
-            proposal=SynthesisProposalV1(lead=(), sections=()),
+            proposal=SynthesisProposalV1(
+                lead=(), sections=(), title=title, source_notes=tuple(source_notes)
+            ),
             explicit_empty=True,
             transformations=transformations,
             warnings=tuple(warnings),
@@ -570,7 +753,12 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             diagnostics=tuple(diagnostics),
         )
     try:
-        proposal = SynthesisProposalV1(lead=tuple(lead), sections=tuple(sections))
+        proposal = SynthesisProposalV1(
+            lead=tuple(lead),
+            sections=tuple(sections),
+            title=title,
+            source_notes=tuple(source_notes),
+        )
     except ValueError:
         return SynthesisWireParseResult(
             None,
@@ -663,9 +851,11 @@ class SynthesisAccessPolicyV1:
         object.__setattr__(self, "synthesis_access_policy_hash", expected_hash)
 
 
-_PROPOSAL_KEYS = frozenset({"lead", "sections"})
+_PROPOSAL_REQUIRED_KEYS = frozenset({"lead", "sections"})
+_PROPOSAL_OPTIONAL_KEYS = frozenset({"title", "source_notes"})
 _CLAIM_PROPOSAL_KEYS = frozenset({"text", "evidence_handles"})
 _SECTION_PROPOSAL_KEYS = frozenset({"kind", "heading", "claims"})
+_SOURCE_NOTE_PROPOSAL_KEYS = frozenset({"source_alias", "evidence_handles", "text"})
 _TECHNICAL_SECTION_KINDS = frozenset(
     {
         SynthesisSectionKind.TECHNICAL,
@@ -1059,6 +1249,7 @@ class SynthesisEvidencePackV1:
     narrative_evidence: tuple[Mapping[str, Any], ...]
     technical_evidence: tuple[Mapping[str, Any], ...]
     reserve_evidence: tuple[Mapping[str, Any], ...]
+    source_note_sources: tuple[Mapping[str, Any], ...]
     source_pair_relations: tuple[Mapping[str, Any], ...]
     uncertainties: tuple[str, ...]
     projection_hash: str | None = None
@@ -1069,6 +1260,17 @@ class SynthesisEvidencePackV1:
     _handle_for_ref: Mapping[ExtractionEvidenceRefV1, str] = field(
         default_factory=dict, repr=False, compare=False
     )
+    _source_alias_to_id: Mapping[str, UUID] = field(default_factory=dict, repr=False, compare=False)
+    _source_alias_handles: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
+    def source_for_alias(self, alias: str) -> tuple[UUID, frozenset[str]] | None:
+        """Resolve a transport source alias to its source and the handles it may cite."""
+        source_id = self._source_alias_to_id.get(alias.upper())
+        if source_id is None:
+            return None
+        return source_id, frozenset(self._source_alias_handles[alias.upper()])
 
     def resolve_handle(self, handle: str) -> ExtractionEvidenceRefV1:
         """Resolve only an exact prompt handle; no fuzzy or prefix matching."""
@@ -1198,14 +1400,62 @@ def build_synthesis_evidence_pack(
     )
     handle_to_ref = {f"E{index:03d}": ref for index, ref in enumerate(catalogue_refs, start=1)}
     handle_for_ref = {ref: handle for handle, ref in handle_to_ref.items()}
+    # One evidence, one handle: a reserve ref already in the catalogue (a
+    # supporting fact of a source-pair relation) keeps its E handle, so the
+    # model never sees the same evidence twice under two names.
     reserve_catalogue_refs = sorted(
-        reserve_refs,
+        reserve_refs - set(handle_for_ref),
         key=lambda ref: (authority_key(ref), evidence_ref_sort_key(ref)),
     )
     reserve_handle_for_ref = {
         ref: f"R{index:03d}" for index, ref in enumerate(reserve_catalogue_refs, start=1)
     }
     handle_to_ref.update({handle: ref for ref, handle in reserve_handle_for_ref.items()})
+
+    source_note_candidates = sorted(
+        (
+            source
+            for source in extraction.sources
+            if source.kind is ProductionReferenceKind.PUBLICATION
+            and source.tier in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
+        ),
+        key=lambda source: (
+            0 if source.tier is ProductionReferenceTier.CORE else 1,
+            source.canonical_url,
+            str(source.source_document_id),
+        ),
+    )
+    core_publishers = {
+        source.canonical_url: source.publisher
+        for source in snapshot.core_sources
+        if source.publisher.strip()
+    }
+    source_note_sources: list[Mapping[str, Any]] = []
+    source_alias_to_id: dict[str, UUID] = {}
+    source_alias_handles: dict[str, tuple[str, ...]] = {}
+    for index, source in enumerate(source_note_candidates, start=1):
+        alias = f"S{index:03d}"
+        hostname = (urlsplit(source.canonical_url).hostname or "source").removeprefix("www.")
+        label = core_publishers.get(source.canonical_url) or hostname
+        handles = tuple(
+            sorted(
+                handle
+                for handle, ref in handle_to_ref.items()
+                if ref.source_document_id == source.source_document_id
+            )
+        )
+        source_note_sources.append(
+            MappingProxyType(
+                {
+                    "alias": alias,
+                    "publisher": label,
+                    "tier": source.tier.value,
+                    "evidence_handles": handles,
+                }
+            )
+        )
+        source_alias_to_id[alias] = source.source_document_id
+        source_alias_handles[alias] = handles
 
     narrative_evidence = tuple(
         _prompt_evidence_record(
@@ -1245,7 +1495,8 @@ def build_synthesis_evidence_pack(
                 "reason": relation.reason,
                 "provenance": relation.provenance.value,
                 "supporting_handles": tuple(
-                    reserve_handle_for_ref[ref] for ref in relation.supporting_evidence_refs
+                    handle_for_ref[ref] if ref in handle_for_ref else reserve_handle_for_ref[ref]
+                    for ref in relation.supporting_evidence_refs
                 ),
             }
         )
@@ -1261,11 +1512,14 @@ def build_synthesis_evidence_pack(
         narrative_evidence=narrative_evidence,
         technical_evidence=technical_evidence,
         reserve_evidence=reserve_evidence,
+        source_note_sources=tuple(source_note_sources),
         source_pair_relations=source_pair_relations,
         uncertainties=tuple(item.text for item in uncertainties),
         projection_hash=projection.projection_hash if projection is not None else None,
         _handle_to_ref=MappingProxyType(handle_to_ref),
         _handle_for_ref=MappingProxyType(dict(handle_for_ref)),
+        _source_alias_to_id=MappingProxyType(source_alias_to_id),
+        _source_alias_handles=MappingProxyType(source_alias_handles),
     )
 
 
@@ -1285,6 +1539,13 @@ def synthesis_evidence_pack_hash(evidence_pack: SynthesisEvidencePackV1) -> str:
         "narrative_evidence": [dict(record) for record in evidence_pack.narrative_evidence],
         "technical_evidence": [dict(record) for record in evidence_pack.technical_evidence],
         "reserve_evidence": [dict(record) for record in evidence_pack.reserve_evidence],
+        "source_note_sources": [
+            {
+                **dict(record),
+                "evidence_handles": list(record["evidence_handles"]),
+            }
+            for record in evidence_pack.source_note_sources
+        ],
         "source_pair_relations": [dict(record) for record in evidence_pack.source_pair_relations],
         "uncertainties": list(evidence_pack.uncertainties),
         "relevance_projection_hash": evidence_pack.projection_hash,
@@ -1467,6 +1728,28 @@ def build_synthesis_model_request(
             continue
         prompt_lines.extend(_render_evidence_record(record))
         prompt_lines.append("")
+    prompt_lines.extend(
+        (
+            "PUBLICATION SOURCES FOR REFERENCE NOTES",
+            "For each listed publication source, write one short French note "
+            "grounded only in its E handles.",
+            "The source alias is transport-only; do not include it in the note text.",
+        )
+    )
+    for source_record in evidence_pack.source_note_sources:
+        handles = source_record["evidence_handles"]
+        prompt_lines.append(
+            f"{source_record['alias']} | publisher: {source_record['publisher']} | "
+            f"tier: {source_record['tier']} | evidence handles: "
+            f"{', '.join(handles) if handles else 'none available'}"
+        )
+    prompt_lines.extend(
+        (
+            "If a source has no evidence handles, omit its note; the publication stage "
+            "will use a deterministic fallback.",
+            "",
+        )
+    )
     if evidence_pack.reserve_evidence or evidence_pack.source_pair_relations:
         prompt_lines.extend(
             (
@@ -1554,8 +1837,8 @@ async def draft_synthesis_proposal(
     return await model_gateway.draft(request)
 
 
-def _invalid_proposal() -> None:
-    raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID)
+def _invalid_proposal(reason: str) -> None:
+    raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID, reason)
 
 
 def _strict_mapping(value: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
@@ -1597,14 +1880,40 @@ def _section_proposal_from_payload(value: Any) -> SynthesisSectionProposalV1:
 def _proposal_from_payload(value: Any) -> SynthesisProposalV1:
     if isinstance(value, SynthesisProposalV1):
         return value
-    payload = _strict_mapping(value, _PROPOSAL_KEYS, "Synthesis proposal")
+    if (
+        not isinstance(value, Mapping)
+        or not _PROPOSAL_REQUIRED_KEYS <= set(value)
+        or set(value) - (_PROPOSAL_REQUIRED_KEYS | _PROPOSAL_OPTIONAL_KEYS)
+    ):
+        raise ValueError("Synthesis proposal fields do not match the strict schema")
+    payload = value
     lead = payload["lead"]
     sections = payload["sections"]
     if not isinstance(lead, list) or not isinstance(sections, list):
         raise ValueError("Proposal lead and sections must be arrays")
+    raw_source_notes = payload.get("source_notes", [])
+    if not isinstance(raw_source_notes, list):
+        raise ValueError("Proposal source notes must be an array")
+    source_notes: list[SynthesisSourceNoteProposalV1] = []
+    for raw_note in raw_source_notes:
+        note = _strict_mapping(raw_note, _SOURCE_NOTE_PROPOSAL_KEYS, "Source note proposal")
+        handles = note["evidence_handles"]
+        if not isinstance(handles, list):
+            raise ValueError("Source note evidence handles must be an array")
+        source_notes.append(
+            SynthesisSourceNoteProposalV1(
+                source_alias=note["source_alias"],
+                evidence_handles=tuple(handles),
+                text=note["text"],
+            )
+        )
+    if len({note.source_alias for note in source_notes}) != len(source_notes):
+        raise ValueError("Proposal source notes must not repeat source aliases")
     return SynthesisProposalV1(
         lead=tuple(_claim_proposal_from_payload(claim) for claim in lead),
         sections=tuple(_section_proposal_from_payload(section) for section in sections),
+        title=payload.get("title"),
+        source_notes=tuple(source_notes),
     )
 
 
@@ -1617,7 +1926,7 @@ def _validate_plain_text(value: str) -> None:
         or _MARKDOWN_TABLE_ROW.search(value)
         or _SOURCE_MARKER.search(value)
     ):
-        _invalid_proposal()
+        _invalid_proposal("plain_text_violation")
 
 
 def _trim_literal(value: str) -> str:
@@ -1760,9 +2069,8 @@ def _resolve_claim_refs(
         if ref not in current_refs or ref in removed_refs:
             raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_EVIDENCE)
         refs.append(ref)
-    if len(refs) != len(set(refs)):
-        _invalid_proposal()
-    return tuple(refs)
+    # Citing the same evidence twice does not weaken the grounding: keep one.
+    return tuple(dict.fromkeys(refs))
 
 
 def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> bool:
@@ -1881,7 +2189,7 @@ def validate_synthesis_proposal(
             )
             for ref in refs:
                 if ref not in narrative_refs and not (allow_technical and ref in technical_refs):
-                    _invalid_proposal()
+                    _invalid_proposal("evidence_kind_not_allowed_in_section")
             _validate_grounded_text(
                 claim.text,
                 refs,
@@ -1909,7 +2217,86 @@ def validate_synthesis_proposal(
     except SynthesisProposalControlError:
         raise
     except (KeyError, TypeError, ValueError) as exc:
-        raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID) from exc
+        raise SynthesisProposalControlError(
+            SynthesisProposalErrorCode.OUTPUT_INVALID, "malformed_proposal"
+        ) from exc
+
+
+def validate_synthesis_source_notes(
+    proposal: SynthesisProposalV1,
+    evidence_pack: SynthesisEvidencePackV1,
+) -> tuple[tuple[SynthesisSourceNoteV1, ...], tuple[str, ...]]:
+    """Keep only plain notes whose temporary handles belong to that source."""
+    valid_notes: list[SynthesisSourceNoteV1] = []
+    warnings: list[str] = []
+    seen_source_ids: set[UUID] = set()
+    for candidate in proposal.source_notes:
+        source_id, allowed_handles = evidence_pack.source_for_alias(candidate.source_alias) or (
+            None,
+            frozenset[str](),
+        )
+        text = " ".join(candidate.text.split())
+        sentence_count = len(re.findall(r"[.!?](?:\s|$)", text))
+        if (
+            source_id is None
+            or source_id in seen_source_ids
+            or not candidate.evidence_handles
+            or any(handle not in allowed_handles for handle in candidate.evidence_handles)
+            or not text
+            or len(text) > 260
+            or not 1 <= sentence_count <= 2
+            or _MARKDOWN_OR_HTML.search(text)
+            or _MARKDOWN_TABLE_ROW.search(text)
+            or _SOURCE_MARKER.search(text)
+        ):
+            warnings.append("synthesis_source_note_invalid")
+            continue
+        refs = tuple(
+            dict.fromkeys(
+                evidence_pack.resolve_handle(handle) for handle in candidate.evidence_handles
+            )
+        )
+        if not refs or any(ref.source_document_id != source_id for ref in refs):
+            warnings.append("synthesis_source_note_invalid")
+            continue
+        valid_notes.append(
+            SynthesisSourceNoteV1(
+                source_document_id=source_id,
+                text=text,
+                evidence_refs=refs,
+            )
+        )
+        seen_source_ids.add(source_id)
+    return tuple(valid_notes), tuple(dict.fromkeys(warnings))
+
+
+def _fallback_editorial_title(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> str:
+    """Build a ``[Publisher] Subject`` title when the model omits or misformats its own."""
+
+    def plain(value: str) -> str:
+        return " ".join(re.sub(r"[\[\]`*_~<>]", " ", value).split())
+
+    publisher = next(
+        (plain(source.publisher) for source in snapshot.core_sources if plain(source.publisher)),
+        None,
+    ) or next(
+        (
+            (urlsplit(source.canonical_url).hostname or "").removeprefix("www.")
+            for source in extraction.sources
+            if source.tier is ProductionReferenceTier.CORE
+        ),
+        "",
+    )
+    group = publisher or "Publication"
+    budget = EDITORIAL_TITLE_MAX_LENGTH - len(group) - len("[] ")
+    title = plain(snapshot.subject_title).rstrip(".") or "Sujet CTI"
+    if len(title) > budget:
+        title = title[: max(budget - 1, 1)].rstrip() + "…"
+    fallback = f"[{group}] {title}"
+    return fallback if is_valid_editorial_title(fallback) else "[Publication] Sujet CTI"
 
 
 def _date_text_has_day_precision(value: str | None) -> bool:
@@ -3183,17 +3570,31 @@ class ProductionSynthesisService:
             )
             return reviewed(
                 exc.code.value,
-                f"The synthesis proposal failed {exc.code.value}.",
+                (
+                    f"The synthesis proposal failed {exc.code.value}: {exc.reason}."
+                    if exc.reason is not None
+                    else f"The synthesis proposal failed {exc.code.value}."
+                ),
                 run_id=model_run.id,
                 details={
                     **self._model_evidence(model_run),
                     "parse_identity": parse_identity,
+                    **({"validation_reason": exc.reason} if exc.reason is not None else {}),
                     "rejections": rejection_details,
                     "diagnostics": wire_diagnostics,
                 },
             )
         await self._record_wire_parse(model_run, evidence_pack, parsed)
 
+        title_is_valid = is_valid_editorial_title(parsed.proposal.title)
+        editorial_title = (
+            parsed.proposal.title
+            if title_is_valid and parsed.proposal.title is not None
+            else _fallback_editorial_title(snapshot, extraction)
+        )
+        source_notes, source_note_warnings = validate_synthesis_source_notes(
+            parsed.proposal, evidence_pack
+        )
         timeline_warnings: list[str] = []
         timeline = build_synthesis_timeline(
             extraction, projection=projection, warnings=timeline_warnings
@@ -3205,15 +3606,18 @@ class ProductionSynthesisService:
             extraction_hash=extraction_hash,
             publication_language=snapshot.publication_language,
             synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
-            title=snapshot.subject_title,
+            title=editorial_title,
             lead=lead,
             sections=sections,
             timeline=timeline,
+            source_notes=source_notes,
             uncertainties=build_synthesis_uncertainties(extraction, projection=projection),
             warnings=_bounded_synthesis_warnings(
                 extraction,
                 additional_warnings=(
                     *timeline_warnings,
+                    *(("synthesis_title_invalid",) if not title_is_valid else ()),
+                    *source_note_warnings,
                     *(f"{item.warning_code}:{item.block_id}" for item in parsed.warnings),
                 ),
             ),

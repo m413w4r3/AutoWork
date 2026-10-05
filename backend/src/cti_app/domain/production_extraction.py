@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
-from typing import Any
+from typing import Any, Protocol
 from uuid import UUID
 
 from cti_app.domain.collection import CollectionState
@@ -103,6 +103,9 @@ class ExtractionProfileReasonCode(StrEnum):
     SUPPORTING_CONTEXT = "supporting_context"
     #: A TECHNICAL resource contributes IOCs/rules with their context only.
     TECHNICAL_ANNEX = "technical_annex"
+    #: The only CORE article is complemented by one SUPPORTING publication read in full.
+    #: Its evidence reinforces the CORE angle; it never becomes the subject's angle.
+    COMPLEMENTARY_FULL_SOURCE = "complementary_full_source"
     # Reason codes of the superseded role/depth policy (v2). They stay decodable so
     # persisted artifacts keep loading; the current policy never selects them.
     INDEPENDENT_CORROBORATION = "independent_corroboration"
@@ -131,6 +134,63 @@ def extraction_profile_decision(
     if kind is ProductionReferenceKind.TECHNICAL_RESOURCE:
         return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.TECHNICAL_ANNEX
     return ExtractionProfile.IOC_RULES, ExtractionProfileReasonCode.SUPPORTING_CONTEXT
+
+
+_COMPLEMENTARY_ROLE_ORDER: dict[ProductionEditorialRole, int] = {
+    ProductionEditorialRole.PRIMARY: 0,
+    ProductionEditorialRole.CORROBORATION: 1,
+    ProductionEditorialRole.COUNTER_ANALYSIS: 2,
+}
+
+
+class _ComplementaryCandidate(Protocol):
+    @property
+    def tier(self) -> ProductionReferenceTier: ...
+
+    @property
+    def kind(self) -> ProductionReferenceKind: ...
+
+    @property
+    def editorial_role(self) -> ProductionEditorialRole | None: ...
+
+    @property
+    def canonical_url(self) -> str: ...
+
+    @property
+    def source_document_id(self) -> UUID | None: ...
+
+
+def select_complementary_full_source[SourceT: _ComplementaryCandidate](
+    sources: Sequence[SourceT],
+) -> SourceT | None:
+    """Pick the one SUPPORTING publication to read in full next to a lone CORE article.
+
+    Applies only when exactly one CORE source is extractable: a subject carried
+    by a single article gets one second full reading so its synthesis is not
+    limited to that article. The candidate is a SUPPORTING publication whose
+    editorial role is primary, corroboration or counter-analysis, in that order;
+    ties break on canonical URL then document identity. Context-only sources and
+    technical resources are never promoted.
+    """
+    if sum(source.tier is ProductionReferenceTier.CORE for source in sources) != 1:
+        return None
+    candidates = [
+        source
+        for source in sources
+        if source.tier is ProductionReferenceTier.SUPPORTING
+        and source.kind is ProductionReferenceKind.PUBLICATION
+        and source.editorial_role in _COMPLEMENTARY_ROLE_ORDER
+    ]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda source: (
+            _COMPLEMENTARY_ROLE_ORDER[source.editorial_role],  # type: ignore[index]
+            source.canonical_url,
+            str(source.source_document_id),
+        ),
+    )
 
 
 def _require_text(value: Any, *, label: str) -> str:
@@ -460,7 +520,27 @@ class ProductionExtractionV1:
         ):
             raise ValueError("Production extraction sources must be a tuple of V1 sources")
         if self.profile_policy_version == EXTRACTION_PROFILE_POLICY_VERSION:
+            core_count = sum(source.tier is ProductionReferenceTier.CORE for source in self.sources)
+            complementary = [
+                source
+                for source in self.sources
+                if source.profile_reason_code
+                is ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE
+            ]
+            if complementary and (
+                core_count != 1
+                or len(complementary) > 1
+                or complementary[0].tier is not ProductionReferenceTier.SUPPORTING
+                or complementary[0].kind is not ProductionReferenceKind.PUBLICATION
+                or complementary[0].profile is not ExtractionProfile.FULL
+            ):
+                raise ValueError(
+                    "A complementary full source requires exactly one CORE source and "
+                    "a single SUPPORTING publication"
+                )
             for source in self.sources:
+                if source in complementary:
+                    continue
                 assert source.editorial_role is not None
                 expected_profile, _ = extraction_profile_decision(
                     tier=source.tier,

@@ -33,6 +33,7 @@ from cti_app.application.production_resume import plan_production_resume
 from cti_app.application.subject_production import SubjectProductionService
 from cti_app.domain.classification import TLP
 from cti_app.domain.editions import Edition, EditionStatus
+from cti_app.domain.model_runs import ModelSubmissionState
 from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
@@ -41,9 +42,11 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionBatchStatus,
+    ProductionReconciliationRequiredError,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    ProductionSubmissionReconciliation,
 )
 
 pytestmark = pytest.mark.asyncio
@@ -539,6 +542,47 @@ async def test_only_a_cancelled_run_is_resumable(status: ProductionRunStatus) ->
 
     with pytest.raises(ValueError, match="production_run_not_resumable"):
         run.resume_after_cancellation(ProductionStage.SYNTHESIS)
+
+
+def _cancelled_with_reconciliation(output_sha256: str | None) -> ProductionRun:
+    run = ProductionRun(subject_id=uuid4(), edition_id=uuid4())
+    run.start_running()
+    run.current_stage = ProductionStage.RELEVANCE_PROJECTION
+    run.reconciliation = ProductionSubmissionReconciliation(
+        production_run_id=run.id,
+        model_run_id=uuid4(),
+        stage=ProductionStage.RELEVANCE_PROJECTION,
+        bridge_response_id=None,
+        submission_state=ModelSubmissionState.EXTERNAL_STATE_UNKNOWN,
+        phase="reconciliation",
+        output_sha256=output_sha256,
+        provenance="automatic_bridge_retrieval" if output_sha256 else None,
+    )
+    run.mark_cancelled()
+    return run
+
+
+async def test_a_cancelled_run_with_an_unresolved_submission_is_not_resumable() -> None:
+    run = _cancelled_with_reconciliation(None)
+
+    with pytest.raises(ProductionReconciliationRequiredError):
+        run.resume_after_cancellation(ProductionStage.RELEVANCE_PROJECTION)
+
+    assert run.status is ProductionRunStatus.CANCELLED
+    assert run.reconciliation is not None
+
+
+async def test_a_cancelled_run_with_an_adopted_answer_resumes_and_drops_the_spent_identity() -> (
+    None
+):
+    run = _cancelled_with_reconciliation("c" * 64)
+
+    run.resume_after_cancellation(ProductionStage.RELEVANCE_PROJECTION)
+
+    assert run.status is ProductionRunStatus.RUNNING
+    assert run.current_stage is ProductionStage.RELEVANCE_PROJECTION
+    assert run.reconciliation is None
+    assert run.pipeline_generation == 1
 
 
 # --- The four cancellation points ------------------------------------------

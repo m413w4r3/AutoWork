@@ -34,7 +34,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v4-table-layout"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v5-dated-references-ioc-groups"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -104,7 +104,6 @@ class TypstPublicationModelV2:
     title: str
     content_sections: list[dict[str, Any]]
     media_refs: tuple[TypstMediaRef, ...]
-    semantic_title: list[dict[str, str]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,8 +146,6 @@ class TypstRenderer:
             "title": model.title,
             "content_sections": model.content_sections,
         }
-        if model.semantic_title is not None:
-            render_data["title_spans"] = model.semantic_title
         render_data_bytes = json.dumps(
             render_data,
             ensure_ascii=False,
@@ -171,9 +168,13 @@ def project_publication_to_typst_model(
     if isinstance(value, PublicationDocumentV5):
         document = value.document
         semantic_by_anchor = {item.anchor: item for item in value.semantic_text.paragraphs}
+        reference_entries = value.references
+        original_indicator_groups = value.original_indicators
     elif isinstance(value, PublicationDocumentV4):
         document = value
         semantic_by_anchor = {}
+        reference_entries = ()
+        original_indicator_groups = ()
     else:
         raise ValueError("Unsupported canonical publication document")
 
@@ -334,6 +335,12 @@ def project_publication_to_typst_model(
         )
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.END, None), ()))
 
+    figure_number = 0
+    for block in (*reference_blocks, *body_blocks):
+        if block.get("type") in {"diagram", "figure"}:
+            figure_number += 1
+            block["figure_number"] = figure_number
+
     sources_by_id = {source.source_document_id: source for source in document.sources}
     timeline = []
     for index, entry in enumerate(document.timeline, start=1):
@@ -346,6 +353,27 @@ def project_publication_to_typst_model(
         if spans is not None:
             item["semantic_spans"] = spans
         timeline.append(item)
+    source_references = []
+    for index, reference in enumerate(reference_entries, start=1):
+        source = sources_by_id.get(reference.source_document_id)
+        if source is None:
+            raise ValueError(
+                "Publication reference identifies an unknown source document: "
+                f"{reference.source_document_id}"
+            )
+        item = {
+            "display_date": (
+                _display_date(None, source.published_at)
+                if source.published_at is not None
+                else "Date de publication non précisée"
+            ),
+            "text": reference.text,
+            "source_urls": [source.canonical_url],
+        }
+        spans = semantic_spans(f"reference:{index:04d}", reference.text)
+        if spans is not None:
+            item["semantic_spans"] = spans
+        source_references.append(item)
     sources = [
         {
             "title": source.title,
@@ -356,31 +384,59 @@ def project_publication_to_typst_model(
         for source in document.sources
     ]
 
-    indicators: dict[str, list[str]] = {
-        key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
-    }
-    for group in document.indicators:
-        indicators[_INDICATOR_KEYS[group.artifact_type]] = [
-            _breakable_typst_display_text(item.value) for item in group.indicators
-        ]
+    def indicator_values(groups: tuple[Any, ...]) -> dict[str, list[str]]:
+        result: dict[str, list[str]] = {
+            key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
+        }
+        for group in groups:
+            result[_INDICATOR_KEYS[group.artifact_type]] = [
+                _breakable_typst_display_text(item.value) for item in group.indicators
+            ]
+        return result
+
+    indicators = indicator_values(document.indicators)
+    original_indicators = indicator_values(original_indicator_groups)
+    original_publishers = sorted(
+        {
+            (sources_by_id[source_id].publisher or "").strip()
+            or (sources_by_id[source_id].canonical_url.partition("://")[2].split("/", 1)[0])
+            for group in original_indicator_groups
+            for indicator in group.indicators
+            for source_id in indicator.source_document_ids
+            if source_id in sources_by_id
+        },
+        key=str.casefold,
+    )
+    original_indicator_note = (
+        "Le lien avec le sujet n\u2019est pas démontré. Sources : "
+        f"{' ; '.join(original_publishers)}."
+        if original_publishers
+        else "Le lien avec le sujet n\u2019est pas démontré."
+    )
 
     content_sections: list[dict[str, Any]] = [
         {
             "type": "references",
-            "timeline": timeline,
+            "timeline": source_references if isinstance(value, PublicationDocumentV5) else timeline,
             "blocks": reference_blocks,
             "sources": sources,
         },
         {"type": "synthesis", "blocks": body_blocks},
     ]
-    if any(indicators.values()):
-        content_sections.append({"type": "technical_annex", "indicators": indicators})
+    if any(indicators.values()) or any(original_indicators.values()):
+        content_sections.append(
+            {
+                "type": "technical_annex",
+                "indicators": indicators,
+                "original_indicators": original_indicators,
+                "original_indicator_note": original_indicator_note,
+            }
+        )
 
     return TypstPublicationModelV2(
         title=document.title,
         content_sections=content_sections,
         media_refs=tuple(media_refs_by_id.values()),
-        semantic_title=semantic_spans("title", document.title),
     )
 
 
@@ -473,7 +529,8 @@ def _display_date(date_text: str | None, event_date: date | None) -> str:
     if date_text:
         return date_text
     if event_date is not None:
-        return f"{event_date.day} {_FRENCH_MONTH_NAMES[event_date.month - 1]} {event_date.year}"
+        day = "1er" if event_date.day == 1 else str(event_date.day)
+        return f"{day} {_FRENCH_MONTH_NAMES[event_date.month - 1]} {event_date.year}"
     # The render-data contract requires text, and blank preserves the absence
     # of a date instead of inventing one.
     return ""

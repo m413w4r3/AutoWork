@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Final
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cti_app.application.production_artifact_store import ProductionArtifactStore
@@ -23,7 +25,7 @@ from cti_app.application.semantic_annotation import (
     semantic_entities_from_extraction,
 )
 from cti_app.domain.media_assets import media_asset_id
-from cti_app.domain.production import ProductionInputSnapshot
+from cti_app.domain.production import ExtractionProfile, ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import (
     DiagramSpecV1,
     EditorialEnrichmentV1,
@@ -39,7 +41,9 @@ from cti_app.domain.production_extraction import (
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
+    ProductionReferenceKind,
     ProductionReferenceSourceV1,
+    ProductionReferenceTier,
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
@@ -65,11 +69,13 @@ from cti_app.domain.publication import (
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
     PublicationParagraphV1,
+    PublicationReferenceEntryV1,
     PublicationSectionKind,
     PublicationSectionV1,
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
+    indicator_source_ids,
 )
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
@@ -81,6 +87,7 @@ from cti_app.domain.publication_document import (
     PublicationTableColumnV1,
     PublicationTableRowV1,
     PublicationTableV1,
+    order_publication_references,
     publication_document_text_anchors,
 )
 from cti_app.domain.semantic_annotation import (
@@ -112,11 +119,15 @@ class _PublicationContentProjection:
     timeline: tuple[PublicationTimelineEntryV1, ...]
     uncertainties: tuple[PublicationUncertaintyV1, ...]
     indicators: tuple[PublicationIndicatorGroupV1, ...]
+    original_indicators: tuple[PublicationIndicatorGroupV1, ...]
     used_source_document_ids: frozenset[UUID]
 
 
 def _project_synthesis_publication(
-    *, extraction: ProductionExtractionV1, synthesis: ProductionSynthesisV1
+    *,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    include_timeline: bool = True,
 ) -> _PublicationNarrativeProjection:
     """Project validated canonical synthesis narrative without changing editorial order."""
     _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
@@ -154,14 +165,18 @@ def _project_synthesis_publication(
         )
         for section in synthesis.sections
     )
-    timeline = tuple(
-        PublicationTimelineEntryV1(
-            event_date=entry.event_date,
-            date_text=entry.date_text,
-            text=entry.text,
-            evidence_refs=evidence_refs(entry.evidence_refs),
+    timeline = (
+        tuple(
+            PublicationTimelineEntryV1(
+                event_date=entry.event_date,
+                date_text=entry.date_text,
+                text=entry.text,
+                evidence_refs=evidence_refs(entry.evidence_refs),
+            )
+            for entry in synthesis.timeline
         )
-        for entry in synthesis.timeline
+        if include_timeline
+        else ()
     )
     # Projected uncertainties inform the synthesis conclusion and review
     # diagnostics; publishing their source list separately would duplicate the
@@ -176,13 +191,63 @@ def _project_synthesis_publication(
     )
 
 
+_MAIN_IOC_REASONS = frozenset(
+    {
+        RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+        RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
+    }
+)
+_UNDEMONSTRATED_IOC_REASONS = frozenset(
+    {
+        RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+        RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
+    }
+)
+_MAIN_IOC_CLASSIFICATIONS = frozenset(
+    {RelevanceClassification.DIRECT, RelevanceClassification.CORROBORATION}
+)
+_UNDEMONSTRATED_IOC_CLASSIFICATIONS = frozenset(
+    {RelevanceClassification.INDETERMINATE, RelevanceClassification.CONTEXT}
+)
+
+# MD5, SHA-1 and SHA-256 digests; any other hash-typed value is noise.
+_HASH_VALUE = re.compile(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}")
+
+type _IocOccurrences = dict[tuple[ArtifactType, str], set[UUID]]
+
+
+def _indicator_groups(occurrences: _IocOccurrences) -> tuple[PublicationIndicatorGroupV1, ...]:
+    grouped: dict[ArtifactType, list[PublicationIndicatorV1]] = defaultdict(list)
+    for (artifact_type, value), source_ids in sorted(
+        occurrences.items(), key=lambda item: (item[0][0].value, item[0][1])
+    ):
+        grouped[artifact_type].append(
+            PublicationIndicatorV1(
+                value=value,
+                normalized_value=value,
+                artifact_type=artifact_type,
+                source_document_ids=tuple(sorted(source_ids, key=str)),
+            )
+        )
+    return tuple(
+        PublicationIndicatorGroupV1(artifact_type, tuple(items))
+        for artifact_type, items in sorted(grouped.items(), key=lambda item: item[0].value)
+    )
+
+
 def _project_publication_iocs(
     *,
     extraction: ProductionExtractionV1,
     narrative: _PublicationNarrativeProjection,
     relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> _PublicationContentProjection:
-    """Add confirmed canonical IOCs to the narrative projection."""
+    """Split confirmed IOCs into the subject's IOCs and the original sources' IOCs.
+
+    IOCs that the relevance projection ties to the subject are the subject's IOCs.
+    Confirmed IOCs of non-core sources read in full, whose link with the subject is not
+    demonstrated, are published apart as original IOCs. A value present in both groups
+    is published once, in the subject's.
+    """
     indicator_ref_by_identity = {
         (
             ref.source_document_id,
@@ -194,7 +259,8 @@ def _project_publication_iocs(
         for ref, payload in extraction_evidence_elements(extraction)
         if ref.kind is EvidenceKind.INDICATOR
     }
-    occurrences: dict[tuple[ArtifactType, str], tuple[set[str], set[UUID]]] = {}
+    main: _IocOccurrences = defaultdict(set)
+    original: _IocOccurrences = defaultdict(set)
     for source in extraction.sources:
         for item in source.indicators:
             if (
@@ -202,58 +268,53 @@ def _project_publication_iocs(
                 or item.artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES
             ):
                 continue
+            destination: _IocOccurrences | None = main
             if relevance_projection is not None:
-                ref = indicator_ref_by_identity[
-                    (
-                        source.source_document_id,
-                        item.value,
-                        item.artifact_type.value,
-                        item.context,
-                        item.evidence_quote,
-                    )
-                ]
-                decision = relevance_projection.classification_for(ref)
-                if decision.classification not in {
-                    RelevanceClassification.DIRECT,
-                    RelevanceClassification.CORROBORATION,
-                } or decision.reason_code not in {
-                    RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
-                    RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
-                }:
-                    continue
+                decision = relevance_projection.classification_for(
+                    indicator_ref_by_identity[
+                        (
+                            source.source_document_id,
+                            item.value,
+                            item.artifact_type.value,
+                            item.context,
+                            item.evidence_quote,
+                        )
+                    ]
+                )
+                if (
+                    decision.classification in _MAIN_IOC_CLASSIFICATIONS
+                    and decision.reason_code in _MAIN_IOC_REASONS
+                ):
+                    destination = main
+                elif (
+                    source.tier is not ProductionReferenceTier.CORE
+                    and source.profile is ExtractionProfile.FULL
+                    and decision.classification in _UNDEMONSTRATED_IOC_CLASSIFICATIONS
+                    and decision.reason_code in _UNDEMONSTRATED_IOC_REASONS
+                ):
+                    destination = original
+                else:
+                    destination = None
+            if destination is None:
+                continue
             try:
-                normalized_value = normalize_indicator_value(item.value, item.artifact_type)
+                value = normalize_indicator_value(item.value, item.artifact_type)
             except ValueError as exc:
                 raise PublicationAssemblyValidationError(
                     PublicationAssemblyErrorCode.VALIDATION_FAILED,
                     "Confirmed IOC cannot be normalized for publication: "
                     f"{item.artifact_type.value} from {source.source_document_id}",
                 ) from exc
-            identity = (item.artifact_type, normalized_value)
-            values, source_document_ids = occurrences.setdefault(identity, (set(), set()))
-            values.add(item.value)
-            source_document_ids.update(item.source_document_ids)
+            if item.artifact_type is ArtifactType.HASH and not _HASH_VALUE.fullmatch(value):
+                continue
+            destination[(item.artifact_type, value)].update(item.source_document_ids)
+    for identity in main:
+        original.pop(identity, None)
 
-    grouped: dict[ArtifactType, list[PublicationIndicatorV1]] = defaultdict(list)
-    used_source_document_ids = set(narrative.used_source_document_ids)
-    for (artifact_type, normalized_value), (values, source_document_ids) in sorted(
-        occurrences.items(),
-        key=lambda item: (item[0][0].value, item[0][1]),
-    ):
-        ordered_source_ids = tuple(sorted(source_document_ids, key=str))
-        used_source_document_ids.update(ordered_source_ids)
-        grouped[artifact_type].append(
-            PublicationIndicatorV1(
-                value=min(values),
-                normalized_value=normalized_value,
-                artifact_type=artifact_type,
-                source_document_ids=ordered_source_ids,
-            )
-        )
-
-    indicators = tuple(
-        PublicationIndicatorGroupV1(artifact_type, tuple(grouped[artifact_type]))
-        for artifact_type in sorted(grouped, key=lambda value: value.value)
+    indicators = _indicator_groups(main)
+    original_indicators = _indicator_groups(original)
+    used_source_document_ids = narrative.used_source_document_ids | indicator_source_ids(
+        indicators + original_indicators
     )
     return _PublicationContentProjection(
         lead=narrative.lead,
@@ -261,7 +322,8 @@ def _project_publication_iocs(
         timeline=narrative.timeline,
         uncertainties=narrative.uncertainties,
         indicators=indicators,
-        used_source_document_ids=frozenset(used_source_document_ids),
+        original_indicators=original_indicators,
+        used_source_document_ids=used_source_document_ids,
     )
 
 
@@ -328,7 +390,7 @@ def _validate_publication_lineage(
             )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "5-semantic-annotations-4-references-synthesis-layout"
+ASSEMBLY_POLICY_VERSION: Final[str] = "6-dated-source-references-original-iocs"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -418,6 +480,65 @@ def _project_publication_sources(
             )
         )
     return tuple(publication_sources)
+
+
+def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
+    """Deterministic note for a source whose synthesis note is missing."""
+    publisher = (source.publisher or "").strip() or (
+        urlsplit(source.canonical_url).hostname or "Publication"
+    ).removeprefix("www.")
+    return f"{publisher} publie « {(source.title or '').strip() or source.canonical_url} »."
+
+
+def _project_publication_references(
+    *,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> tuple[PublicationReferenceEntryV1, ...]:
+    """One entry per core/supporting publication cited by the synthesis or read in full.
+
+    The note comes from the synthesis; a source without one keeps a deterministic note so
+    it is never dropped from the references.
+    """
+    corpus_by_id = {
+        source.source_document_id: source
+        for source in references.sources
+        if source.source_document_id is not None
+    }
+    candidate_ids = {ref.source_document_id for ref in synthesis_evidence_refs(synthesis)}
+    candidate_ids |= {
+        source.source_document_id
+        for source in extraction.sources
+        if source.profile is ExtractionProfile.FULL
+    }
+    candidate_ids &= {source.source_document_id for source in extraction.sources}
+    notes = {note.source_document_id: note for note in synthesis.source_notes}
+    entries: list[PublicationReferenceEntryV1] = []
+    for source_id in candidate_ids:
+        source = corpus_by_id.get(source_id)
+        if (
+            source is None
+            or source.kind is not ProductionReferenceKind.PUBLICATION
+            or source.tier not in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
+        ):
+            continue
+        note = notes.get(source_id)
+        entries.append(
+            PublicationReferenceEntryV1(
+                source_document_id=source_id,
+                text=note.text if note else _reference_fallback_text(source),
+                evidence_refs=tuple(
+                    PublicationEvidenceRefV1(
+                        source_document_id=ref.source_document_id,
+                        kind=PublicationEvidenceKind(ref.kind.value),
+                        evidence_key=ref.evidence_key,
+                    )
+                    for ref in (note.evidence_refs if note else ())
+                ),
+            )
+        )
+    return tuple(entries)
 
 
 def _validate_publication_enrichment(
@@ -621,29 +742,86 @@ def build_publication_document_v5(
     editorial_enrichment: EditorialEnrichmentV1,
     relevance_projection: RelevanceProjectionV1 | None = None,
 ) -> PublicationDocumentV5:
-    """Build V4 article data plus a versioned semantic text representation."""
-    document = build_publication_document_v4(
+    """Build the publication: dated source references and two labelled IOC groups."""
+    _validate_publication_lineage(
         snapshot=snapshot,
         references=references,
         extraction=extraction,
         synthesis=synthesis,
-        editorial_enrichment=editorial_enrichment,
         relevance_projection=relevance_projection,
     )
-    entities = semantic_entities_from_extraction(extraction)
-    annotator = SemanticAnnotator()
-    semantic_paragraphs = tuple(
-        annotator.annotate_paragraph(
-            anchor=anchor,
-            text=text,
-            entities=entities,
-            proposals=editorial_enrichment.annotations,
-        )
-        for anchor, text in publication_document_text_anchors(document).items()
+    _validate_publication_enrichment(
+        editorial_enrichment=editorial_enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
     )
+    narrative = _project_synthesis_publication(
+        extraction=extraction, synthesis=synthesis, include_timeline=False
+    )
+    projection = _project_publication_iocs(
+        extraction=extraction,
+        narrative=narrative,
+        relevance_projection=relevance_projection,
+    )
+    reference_entries = _project_publication_references(
+        references=references, extraction=extraction, synthesis=synthesis
+    )
+    tables = _project_publication_tables(editorial_enrichment.tables)
+    diagrams = _project_publication_diagrams(editorial_enrichment.diagrams)
+    figures = _project_publication_figures(editorial_enrichment.source_figures)
+    additional_source_ids = {item.source_document_id for item in reference_entries}
+    additional_source_ids.update(
+        source_id
+        for group in projection.original_indicators
+        for indicator in group.indicators
+        for source_id in indicator.source_document_ids
+    )
+    used_source_document_ids = projection.used_source_document_ids | additional_source_ids
+    used_source_document_ids |= {
+        ref.source_document_id for ref in editorial_enrichment_evidence_refs(editorial_enrichment)
+    }
+    used_source_document_ids |= {figure.source_document_id for figure in figures}
+
+    sources = _project_publication_sources(
+        references=references, used_source_document_ids=used_source_document_ids
+    )
+    reference_entries = order_publication_references(reference_entries, sources)
+    document = PublicationDocumentV4(
+        schema_version=PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
+        subject_id=snapshot.subject_id,
+        publication_language=synthesis.publication_language,
+        title=synthesis.title,
+        lead=projection.lead,
+        sections=projection.sections,
+        timeline=(),
+        indicators=projection.indicators,
+        sources=sources,
+        uncertainties=projection.uncertainties,
+        tables=tables,
+        diagrams=diagrams,
+        figures=figures,
+        additional_source_ids=frozenset(additional_source_ids),
+    )
+    annotator = SemanticAnnotator()
+    entities = semantic_entities_from_extraction(extraction)
     semantic_text = SemanticTextV1(
         schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
         policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
-        paragraphs=semantic_paragraphs,
+        paragraphs=tuple(
+            annotator.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=entities,
+                proposals=editorial_enrichment.annotations,
+            )
+            for anchor, text in publication_document_text_anchors(
+                document, references=reference_entries
+            ).items()
+        ),
     )
-    return PublicationDocumentV5(document=document, semantic_text=semantic_text)
+    return PublicationDocumentV5(
+        document=document,
+        semantic_text=semantic_text,
+        references=reference_entries,
+        original_indicators=projection.original_indicators,
+    )

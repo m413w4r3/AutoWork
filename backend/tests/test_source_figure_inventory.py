@@ -51,6 +51,8 @@ def _asset(
     *,
     source_url: str | None = "https://publisher.test/reports/figures/diagram.png",
     content: bytes = _PNG,
+    width: int | None = None,
+    height: int | None = None,
 ) -> ArchivedFigureAsset:
     return ArchivedFigureAsset(
         source_document_id=_IMAGE_DOCUMENT_ID,
@@ -59,6 +61,8 @@ def _asset(
         sha256=hashlib.sha256(content).hexdigest(),
         mime_type="image/png",
         byte_size=len(content),
+        width=width,
+        height=height,
     )
 
 
@@ -213,6 +217,22 @@ def test_inventory_applies_its_total_byte_limit() -> None:
     assert rejected.decision_reason == "inventory_exceeds_total_byte_limit"
 
 
+def test_inventory_rejects_extreme_aspect_ratio_images() -> None:
+    image = _png_header(1200, 100)
+    source = _source(_html('<img src="figures/wide.png" alt="Wide chart">'))
+    asset = _asset(
+        source_url="https://publisher.test/reports/figures/wide.png",
+        content=image,
+        width=1200,
+        height=100,
+    )
+
+    result = SourceFigureInventory().inventory((source,), (asset,))
+
+    assert result.figures[0].decision is SourceFigureDecision.REJECTED
+    assert result.figures[0].decision_reason == "extreme_aspect_ratio"
+
+
 def test_inventory_order_is_stable_when_archived_inputs_are_reordered() -> None:
     first = _source(
         _html('<img src="figures/a.png">'),
@@ -267,3 +287,68 @@ def test_resolved_source_figure_requires_strict_complete_accepted_metadata() -> 
     with pytest.raises(ValidationError):
         mutable_figure: Any = figure
         mutable_figure.decision = SourceFigureDecision.PENDING
+
+
+def test_alt_less_image_keeps_the_text_around_it_for_the_model_to_recognise_it() -> None:
+    source = _source(
+        _html(
+            "<p>Before words.</p><p>The attacker rotates infrastructure.</p>"
+            '<p><img src="https://cdn.publisher.test/shot-1.png"></p>'
+            "<p>After words.</p>"
+        )
+    )
+
+    result = SourceFigureInventory().inventory((source,), ())
+
+    (metadata,) = result.catalog_metadata.values()
+    assert metadata.context_before == "The attacker rotates infrastructure."
+    assert metadata.context_after == "After words."
+
+
+def test_inventory_prefers_article_figure_and_excludes_recent_cards_and_modal_icons() -> None:
+    article_url = "https://cdn.publisher.test/article-flow.png"
+    html = _html(
+        "<article><h1>Bitcoin dead drop resolution</h1><figure>"
+        f'<img src="{article_url}"></figure><p>The article explains the flow.</p></article>'
+        '<section><h2>Recent posts</h2><div class="recent-posts-grid">'
+        '<img alt="Unrelated report A" width="1200" height="630" src="/recent-a.jpg">'
+        '<img alt="Unrelated report B" width="1200" height="630" src="/recent-b.jpg">'
+        "</div></section>"
+        '<div role="dialog"><button><img class="modal-close" '
+        'alt="Close this modal" src="/close-icon.svg"></button></div>'
+    )
+    source = _source(html)
+    article_asset = _asset(source_url=article_url)
+
+    result = SourceFigureInventory().inventory((source,), (article_asset,))
+
+    assert len(result.accepted) == 1
+    article = result.accepted[0]
+    assert result.catalog_metadata[article.figure_id].in_article_body is True
+    recent = [item for item in result.figures if item.decision_reason == "related_content_card"]
+    assert len(recent) == 2
+    assert all(item.decision is SourceFigureDecision.REJECTED for item in recent)
+    modal = next(item for item in result.figures if item.locator.figure_label == "Close this modal")
+    assert modal.decision is SourceFigureDecision.REJECTED
+    assert modal.decision_reason == "decorative_asset"
+
+
+def test_inventory_cap_keeps_article_body_images_before_page_chrome() -> None:
+    first_url = "https://cdn.publisher.test/article-one.png"
+    second_url = "https://cdn.publisher.test/article-two.png"
+    source = _source(
+        _html(
+            '<header><img src="/logo.png" alt="Publisher logo"></header>'
+            f'<article><img src="{first_url}"><img src="{second_url}"></article>'
+        )
+    )
+    assets = (
+        _asset(source_url=first_url, content=_PNG + b"first"),
+        _asset(source_url=second_url, content=_PNG + b"second"),
+    )
+
+    result = SourceFigureInventory(max_figures=2).inventory((source,), assets)
+
+    assert result.truncated is True
+    assert len(result.accepted) == 2
+    assert all(result.catalog_metadata[item.figure_id].in_article_body for item in result.accepted)

@@ -26,6 +26,7 @@ from cti_app.application.diagram_compilation import (
     DiagramCompilerVersionError,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramNodeRole,
     DiagramRelationType,
     DiagramSpecV1,
     EnrichmentDiagramDirection,
@@ -81,6 +82,24 @@ _D2_DIRECTION_BY_V1 = {
     EnrichmentDiagramDirection.LEFT_TO_RIGHT: "right",
     EnrichmentDiagramDirection.TOP_TO_BOTTOM: "down",
 }
+# One print-safe hue per role (light fill, dark stroke) so a reader tells actors, tooling,
+# infrastructure and data apart at a glance; the shape is a second, colour-blind-safe cue.
+_NODE_STYLE_BY_ROLE = {
+    DiagramNodeRole.ACTOR: ("person", "#FBE3E6", "#B3243B"),
+    DiagramNodeRole.VICTIM: ("rectangle", "#FFF1C9", "#9A6B00"),
+    DiagramNodeRole.MALWARE_TOOL: ("hexagon", "#FFE4D1", "#C2410C"),
+    DiagramNodeRole.INFRASTRUCTURE: ("cloud", "#DCEAF9", "#1D4E89"),
+    DiagramNodeRole.DATA_ARTIFACT: ("cylinder", "#DFF3E1", "#2E7D32"),
+    DiagramNodeRole.TECHNIQUE_STEP: ("rectangle", "#EAE3F6", "#5B3E96"),
+    DiagramNodeRole.UNKNOWN: ("rectangle", "#F1F1EF", "#667085"),
+}
+_EDGE_COLOR_BY_RELATION = {
+    DiagramRelationType.FACTUAL: "#2F3B3C",
+    DiagramRelationType.INFERENCE: "#5B3E96",
+    DiagramRelationType.COMPARISON: "#667085",
+}
+_NODE_FONT_SIZE = 30
+_EDGE_FONT_SIZE = 24
 # D2 double-quoted strings decode these escapes; ``$`` must be escaped so that
 # ``${...}`` in canonical content is never resolved as a D2 variable.
 _LABEL_ESCAPES = {
@@ -112,6 +131,7 @@ def _semantic_projection(diagram: DiagramSpecV1) -> dict[str, Any]:
             {
                 "node_id": node.node_id,
                 "label": node.label,
+                "role": node.role.value,
                 "evidence_refs": [_ref_projection(ref) for ref in node.evidence_refs],
             }
             for node in diagram.nodes
@@ -170,31 +190,88 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
     node_references = _node_references(diagram)
-    lines = [f"direction: {_D2_DIRECTION_BY_V1[diagram.direction]}"]
+    # Keep graphs vertical when node count or long labels make horizontal layout
+    # hard to read. Otherwise preserve the model's direction.
+    graph_labels = [node.label for node in diagram.nodes]
+    graph_labels.extend(edge.label or "" for edge in diagram.edges)
+    graph_labels.extend(group.label for group in diagram.groups)
+    force_vertical = len(diagram.nodes) > 4 or any(len(label) > 30 for label in graph_labels)
+    direction = "down" if force_vertical else _D2_DIRECTION_BY_V1[diagram.direction]
+    lines = [f"direction: {direction}"]
 
     for group_index, group in enumerate(diagram.groups, 1):
-        lines.append(f"g{group_index:03d}: {_escape_d2_label(group.label)} {{}}")
+        lines.extend(
+            (
+                f"g{group_index:03d}: {_escape_d2_label(_wrap_d2_label(group.label))} {{",
+                "  style: {",
+                '    fill: "#E8F0F0"',
+                '    stroke: "#93AFB0"',
+                "    stroke-width: 1",
+                "  }",
+                "}",
+            )
+        )
 
     for node in diagram.nodes:
-        lines.append(f"{node_references[node.node_id]}: {_escape_d2_label(node.label)}")
+        shape, fill, stroke = _NODE_STYLE_BY_ROLE[node.role]
+        lines.extend(
+            (
+                f"{node_references[node.node_id]}: "
+                f"{_escape_d2_label(_wrap_d2_label(node.label))} {{",
+                f"  shape: {shape}",
+                "  style: {",
+                f'    fill: "{fill}"',
+                f'    stroke: "{stroke}"',
+                '    font-color: "#17202A"',
+                "    stroke-width: 2",
+                "    border-radius: 8",
+                f"    font-size: {_NODE_FONT_SIZE}",
+                "  }",
+                "}",
+            )
+        )
 
     for edge in diagram.edges:
-        line = f"{node_references[edge.source_node_id]} -> {node_references[edge.target_node_id]}"
-        label = edge.label or ""
-        if edge.relation_type is DiagramRelationType.INFERENCE and not label.casefold().startswith(
-            "inference"
-        ):
-            label = f"inference: {label}".rstrip()
-        elif (
-            edge.relation_type is DiagramRelationType.COMPARISON
-            and not label.casefold().startswith("comparison")
-        ):
-            label = f"comparison: {label}".rstrip()
+        connector = "<->" if edge.relation_type is DiagramRelationType.COMPARISON else "->"
+        line = (
+            f"{node_references[edge.source_node_id]} {connector} "
+            f"{node_references[edge.target_node_id]}"
+        )
+        label = _wrap_d2_label(edge.label or "")
         if label:
             line += f": {_escape_d2_label(label)}"
-        lines.append(line)
+        edge_lines = [
+            line + " {",
+            "  style: {",
+            f'    stroke: "{_EDGE_COLOR_BY_RELATION[edge.relation_type]}"',
+            "    stroke-width: 2",
+            f"    font-size: {_EDGE_FONT_SIZE}",
+        ]
+        if edge.relation_type is not DiagramRelationType.FACTUAL:
+            edge_lines.append("    stroke-dash: 5")
+        edge_lines.extend(("  }", "}"))
+        lines.extend(edge_lines)
 
     return ("\n".join(lines) + "\n").encode(D2_SOURCE_ENCODING)
+
+
+def _wrap_d2_label(value: str, width: int = 24) -> str:
+    """Wrap labels between words while leaving long technical literals intact."""
+    words = value.split()
+    if not words:
+        return value
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else word
+        if current and len(candidate) > width:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return "\n".join(lines)
 
 
 class D2ProcessStatus(StrEnum):

@@ -111,12 +111,6 @@ class ProductionRunRow(Base):
     error_code: Mapped[str | None] = mapped_column(String(64))
     error_message: Mapped[str | None] = mapped_column(String(500))
     error_details: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
-    review_overrides: Mapped[dict[str, dict[str, Any]]] = mapped_column(
-        JSONB,
-        nullable=False,
-        default=dict,
-        server_default=text("'{}'::jsonb"),
-    )
     # Explicit identity for a provider submission that stopped production.
     # These columns are intentionally not hidden in error_details: operators
     # and the API must be able to address the exact ModelRun safely.

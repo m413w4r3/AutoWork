@@ -7,6 +7,8 @@ import pytest
 
 from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentValidationError,
+    _record_covers,
+    _record_is_foreign_to,
     canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
@@ -247,6 +249,8 @@ def test_v3_enrichment_payload_remains_readable_without_v4_analytic_fields() -> 
         diagram.pop("purpose")
         for edge in diagram["edges"]:
             edge.pop("relation_type")
+        for node in diagram["nodes"]:
+            node.pop("role")
 
     decoded = editorial_enrichment_from_json(payload)
 
@@ -569,3 +573,41 @@ def test_builder_and_stage_hash_are_deterministic_and_bind_both_inputs() -> None
     assert first != compute_editorial_enrichment_input_hash(
         extraction=extraction, synthesis=changed_synthesis, **hashes
     )
+
+
+def test_foreign_quote_is_deduced_from_the_record_not_from_an_english_word_list():
+    german = {
+        "kind": "fact",
+        "value": "Le malware récupère les données de routage puis poursuit hors chaîne.",
+        "context": "",
+        "evidence": "Die Schadsoftware ruft die Routingdaten ab und setzt den Angriff fort.",
+    }
+    same_language = {
+        "kind": "fact",
+        "value": "Le malware récupère les données de routage encodées.",
+        "context": "",
+        "evidence": "Le malware récupère les données de routage encodées dans la transaction.",
+    }
+    short_english = {
+        "kind": "fact",
+        "value": "Le malware poursuit le cycle hors chaîne.",
+        "context": "",
+        "evidence": "Once the malware retrieves what it needs, the operation moves off-chain.",
+    }
+
+    assert _record_is_foreign_to(german, "fr")
+    assert _record_is_foreign_to(short_english, "fr")
+    assert not _record_is_foreign_to(same_language, "fr")
+    assert not _record_is_foreign_to(german, "en")
+
+
+def test_label_coverage_tolerates_accents_inflection_and_partial_wording():
+    record = {
+        "value": "Le malware récupère les données puis poursuit hors chaîne.",
+        "evidence": "The malware retrieves the data; the operation continues off-chain.",
+    }
+
+    assert _record_covers(record, "Après récupération, le malware poursuit hors chaîne")
+    assert _record_covers(record, "Malware qui récupérait des donnees")
+    assert not _record_covers(record, "Compromission du portefeuille crypto")
+    assert not _record_covers(record, "")

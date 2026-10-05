@@ -126,6 +126,7 @@ from cti_app.domain.production_extraction import (
     ProductionSourceExtractionV1,
     extraction_profile_decision,
     production_extraction_from_json,
+    select_complementary_full_source,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -332,6 +333,15 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
     planned: list[PlannedExtractionSource] = []
     omitted: list[ProductionExtractionOmissionV1] = []
     warnings: list[str] = list(corpus.warnings)
+    complementary = select_complementary_full_source(
+        [
+            source
+            for source in corpus.sources
+            if source.eligible_for_extraction
+            and source.source_document_id is not None
+            and source.content_sha256 is not None
+        ]
+    )
     for source in corpus.sources:
         if (
             not source.eligible_for_extraction
@@ -350,10 +360,14 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
             warnings.append(f"reference_not_eligible:{source.tier.value}:{source.canonical_url}")
             continue
         assert source.editorial_role is not None
-        profile, profile_reason_code = extraction_profile_decision(
-            tier=source.tier,
-            kind=source.kind,
-            editorial_role=source.editorial_role,
+        profile, profile_reason_code = (
+            (ExtractionProfile.FULL, ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE)
+            if source is complementary
+            else extraction_profile_decision(
+                tier=source.tier,
+                kind=source.kind,
+                editorial_role=source.editorial_role,
+            )
         )
         planned.append(
             PlannedExtractionSource(

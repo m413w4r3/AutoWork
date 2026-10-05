@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v2-reference-identity",
+  "template_version": "chp-edition-v3-dated-references-ioc-groups",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

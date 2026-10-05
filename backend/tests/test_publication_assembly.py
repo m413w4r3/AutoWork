@@ -187,7 +187,7 @@ def _canonical_inputs() -> tuple[
         extraction_hash=canonical_extraction_hash(extraction),
         publication_language="en",
         synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
-        title="Example synthesis",
+        title="[Example actor] Example synthesis",
         lead=(
             SynthesisParagraphV1("Example finding.", (extraction_evidence_refs_v1(extraction)[0],)),
         ),
@@ -362,6 +362,8 @@ async def test_assembly_persists_exact_v4_body_and_one_publication_artifact() ->
         "tables",
         "diagrams",
         "figures",
+        "references",
+        "original_indicators",
         "rich_text",
     }
 
@@ -546,7 +548,7 @@ async def test_changed_inputs_persist_a_fresh_body_as_the_next_revision() -> Non
             extraction=extraction, synthesis=synthesis
         ),
     )
-    changed_synthesis = replace(synthesis, title="Revised synthesis")
+    changed_synthesis = replace(synthesis, title="[Example actor] Revised synthesis")
 
     second = await service.assemble_publication(
         run=run,

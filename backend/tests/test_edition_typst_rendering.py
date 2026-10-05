@@ -37,6 +37,7 @@ from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV4,
 )
+from tests.test_publication_builder_v4 import _frontmatter_v6_case
 from tests.test_typst_rendering import (
     _INJECTION_TEXT,
     _diagram_at,
@@ -121,7 +122,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v4-edition-identity"
+    assert data["schema_version"] == "typst-edition-model-v5-dated-references-ioc-groups"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -135,6 +136,24 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
         "bulletin_period": "septembre 2026",
     }
     assert [item["title"] for item in data["publications"]] == ["Single article"]
+
+
+def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) -> None:
+    publication, *_case = _frontmatter_v6_case()
+    edition = _edition_document(((1, publication),))
+
+    _, data = _render_data(tmp_path, edition)
+
+    embedded = data["publications"][0]
+    references, synthesis, annex = embedded["content_sections"]
+    assert embedded["title"] == "[Example actor] Décrit une activité documentée"
+    assert references["timeline"][0]["display_date"] == "10 janvier 2026"
+    assert references["timeline"][0]["source_urls"] == ["https://a.example/report"]
+    assert synthesis["type"] == "synthesis"
+    assert annex["original_indicators"]["domains"] == [
+        "context.example",
+        "original.example",
+    ]
 
 
 def test_orders_two_and_three_articles_by_position_not_title_or_input_order(
@@ -436,7 +455,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v2-reference-identity"
+    assert bundle.template_version == "chp-edition-v3-dated-references-ioc-groups"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

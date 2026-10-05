@@ -19,6 +19,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionV1,
     SynthesisTimelineEntryV1,
     SynthesisUncertaintyV1,
+    is_valid_editorial_title,
     production_synthesis_from_json,
     production_synthesis_to_json,
     validate_synthesis_lineage,
@@ -183,6 +184,22 @@ def test_evidence_reference_rejects_invalid_key() -> None:
         _ref(key="g" * 64)
 
 
+def test_editorial_title_contract_accepts_plain_titles_and_rejects_invalid_forms() -> None:
+    assert is_valid_editorial_title("[Seedworm / MuddyWater] Adoption de ChainShell et CastleRAT")
+    assert is_valid_editorial_title("[Publication] Analyse d\u2019un implant de commande")
+    for value in (
+        "Frozen subject title",
+        "[] Titre sans groupe",
+        "[Groupe] Une campagne documentée.",
+        "[Groupe] **Une campagne documentée**",
+        "[Groupe] *Une campagne documentée*",
+        "[Groupe] <em>Campagne</em>",
+        "[Groupe] Une campagne E001 documentée",
+        "[Groupe] " + "x" * 105,
+    ):
+        assert not is_valid_editorial_title(value)
+
+
 @pytest.mark.parametrize(
     "change",
     [
@@ -209,7 +226,8 @@ def test_lineage_matches_frozen_snapshot_and_canonical_extraction_hash() -> None
         )
     with pytest.raises(ValueError, match="publication_language"):
         validate_synthesis_lineage(replace(synthesis, publication_language="en"), snapshot, _HASH_B)
-    with pytest.raises(ValueError, match="title"):
-        validate_synthesis_lineage(replace(synthesis, title="Other title"), snapshot, _HASH_B)
+    validate_synthesis_lineage(
+        replace(synthesis, title="[Core publisher] Editorial title"), snapshot, _HASH_B
+    )
     with pytest.raises(ValueError, match="extraction_hash"):
         validate_synthesis_lineage(synthesis, snapshot, _HASH_A)

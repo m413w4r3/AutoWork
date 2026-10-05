@@ -258,7 +258,7 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
     assert progress["confirmed_iocs"] == 1
     assert progress["rules_total"] == 1
     assert progress["yara_rules"] == 1
-    assert progress["profile_policy_version"] == "production-reference-tier-core-only-v3"
+    assert progress["profile_policy_version"] == "production-reference-tier-core-first-v4"
 
 
 def test_a_blocking_source_is_failed_and_the_others_stay_pending() -> None:

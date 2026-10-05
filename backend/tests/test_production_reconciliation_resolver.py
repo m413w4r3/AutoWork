@@ -16,6 +16,7 @@ from cti_app.application.production_jobs import (
     ProductionReconciliationProbeParameters,
     ProductionStageChain,
     production_reconciliation_probe_job_kind,
+    production_reconciliation_resume_job_kind,
     register_production_jobs,
     stage_job_kind,
 )
@@ -537,6 +538,43 @@ async def test_probe_verified_failure_reemits_the_same_stateless_stage() -> None
     assert run.pipeline_generation == 1
     assert [job.kind for job in jobs.submitted] == [stage_job_kind(ProductionStage.SYNTHESIS)]
     assert bridge.calls == ["bridge-request:a1"]
+
+
+@pytest.mark.asyncio
+async def test_probe_resumes_a_run_adopted_by_an_api_probe_without_a_stage_job() -> None:
+    """The API probe adopts and reopens the run; the delayed job must not drop it."""
+    resolver, run, _, bridge, gateway = _fixture(
+        BridgeTransportError("bridge_timeout", "timeout", retryable=True),
+        with_edition=True,
+        with_batch_item=True,
+    )
+    run.adopt_reconciliation_output(
+        output_sha256="c" * 64, provenance="automatic_bridge_retrieval", bridge_response_id="r"
+    )
+    run.resume_reconciled(expected_stage=run.current_stage)
+    assert run.status is ProductionRunStatus.RUNNING
+    jobs = _Jobs()
+    dispatcher = _Dispatcher()
+    chain = ProductionStageChain()
+    chain.bind(cast(Any, jobs), cast(Any, dispatcher))
+    registry = JobRegistry()
+    register_production_jobs(
+        registry,
+        cast(Any, resolver._uow_factory),
+        chain=chain,
+        bridge_transport=bridge,
+        model_gateway=cast(Any, gateway),
+    )
+
+    handler = registry.handler(production_reconciliation_probe_job_kind())
+    result = await handler(
+        ProductionReconciliationProbeParameters(run_id=run.id, attempt=0),
+        _ProbeContext(),  # type: ignore[arg-type]
+    )
+
+    assert result.endswith("#resumed")
+    assert [job.kind for job in jobs.submitted] == [production_reconciliation_resume_job_kind()]
+    assert bridge.calls == []
 
 
 @pytest.mark.asyncio

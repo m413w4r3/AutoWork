@@ -7,7 +7,7 @@ import json
 import re
 import unicodedata
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from types import MappingProxyType
@@ -84,7 +84,9 @@ from cti_app.application.source_figure_inventory import (
     SourceFigureInventoryResult,
     load_archived_source_figure_inventory,
 )
-from cti_app.application.source_media_collection import SourceMediaArchiveService
+from cti_app.application.source_media_collection import (
+    SourceMediaArchiveService,
+)
 from cti_app.domain.model_runs import ModelRun, ModelRunStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
@@ -102,6 +104,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
     DiagramEdgeV1,
     DiagramGroupV1,
+    DiagramNodeRole,
     DiagramNodeV1,
     DiagramRelationType,
     DiagramSpecV1,
@@ -183,7 +186,7 @@ EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1-bounded"
 
 MAX_EDITORIAL_ENRICHMENT_TECHNICAL_EVIDENCE = 128
-MAX_ENRICHMENT_FIGURE_PROPOSALS = 16
+MAX_ENRICHMENT_FIGURE_PROPOSALS = 3
 MAX_ENRICHMENT_RESOURCE_NEEDS = 4
 MAX_ENRICHMENT_RESOURCE_PROPOSALS = 12
 
@@ -309,6 +312,7 @@ class DiagramNodeProposalV1(_StrictEnrichmentProposalModel):
     node_id: StrictStr
     label: StrictStr
     evidence_handles: tuple[StrictStr, ...]
+    role: DiagramNodeRole = DiagramNodeRole.UNKNOWN
 
     @field_validator("node_id", "label")
     @classmethod
@@ -505,7 +509,7 @@ class EditorialFigureCatalogEntry:
             or "Archived source figure"
         )
 
-    def prompt_record(self) -> dict[str, Any]:
+    def prompt_record(self, *, include_source_page: bool = False) -> dict[str, Any]:
         return {
             "handle": self.handle,
             "source_role": self.source_role,
@@ -516,12 +520,21 @@ class EditorialFigureCatalogEntry:
                 self.metadata.nearby_heading_text or self.figure.locator.section
             ),
             "figure_label": _safe_figure_prompt_text(self.figure.locator.figure_label),
+            "source_page_url": self.figure.source if include_source_page else None,
+            "image_file": _image_file_name(self.figure.locator.original_asset_url),
+            # The model finds the image on the live page through the text around
+            # it; the nearest words are the most discriminating.
+            "text_before_image": _safe_figure_prompt_text(_tail(self.metadata.context_before, 400)),
+            "text_after_image": _safe_figure_prompt_text(
+                _bounded_catalog_text(self.metadata.context_after)
+            ),
             "page": self.figure.locator.page,
             "anchor": _safe_figure_prompt_text(self.metadata.anchor),
             "dimensions": {
                 "width": self.metadata.width,
                 "height": self.metadata.height,
             },
+            "in_article_body": self.metadata.in_article_body,
             "mime_type": self.figure.mime_type,
             "provenance_summary": _bounded_catalog_text(
                 f"Archived source media; role={self.source_role}"
@@ -529,6 +542,17 @@ class EditorialFigureCatalogEntry:
             "decision": self.figure.decision.value,
             "decision_reason": _safe_figure_prompt_text(self.figure.decision_reason),
         }
+
+
+def _tail(value: str | None, limit: int) -> str | None:
+    return value[-limit:] if value else None
+
+
+def _image_file_name(asset_url: str | None) -> str | None:
+    if not asset_url or asset_url.casefold().startswith("data:"):
+        return None
+    name = urlsplit(asset_url).path.rsplit("/", 1)[-1]
+    return name or None
 
 
 def _bounded_catalog_text(value: str | None, limit: int = 400) -> str | None:
@@ -989,7 +1013,7 @@ def semantic_annotation_anchor_texts(
     enrichment: EditorialEnrichmentV1 | None = None,
 ) -> dict[str, str]:
     """Mirror the text-bearing V5 publication anchors from its canonical inputs."""
-    result: dict[str, str] = {"title": synthesis.title}
+    result: dict[str, str] = {}
     result.update(
         {
             lead_paragraph_anchor(index): paragraph.text
@@ -1026,6 +1050,9 @@ def semantic_annotation_anchor_texts(
     return result
 
 
+# The prompt frames each anchor as `@@ANCHOR <id>@@`; models copy the frame.
+_ANCHOR_MARKER = re.compile(r"^@@\s*ANCHOR\s+(.+?)\s*@@$", re.IGNORECASE)
+
 _SEMANTIC_ANNOTATION_BLOCK = re.compile(
     r"^(?:TERM|ANNOTATION)\s+([A-Za-z0-9][A-Za-z0-9._-]*)\s*:?$",
     re.IGNORECASE,
@@ -1057,7 +1084,7 @@ def parse_semantic_annotation_wire(
         item_id = current.get("id", f"A{item_number:03d}")
         text = current.get("term", "").strip()
         role_text = current.get("role", "").strip().casefold()
-        anchor = current.get("anchor", "").strip()
+        anchor = _ANCHOR_MARKER.sub(r"\1", current.get("anchor", "").strip()).strip()
         if not text or not role_text or not anchor:
             rejections.append((item_id, "semantic_annotation_missing_field"))
             current = None
@@ -1466,6 +1493,67 @@ def _record_mentions(record: Mapping[str, Any], label: str) -> bool:
     return bool(terms) and terms <= _analytic_tokens(" ".join(_string_values(record)))
 
 
+# Soft lexical grounding. A diagram label is written by the model in its own words, in
+# the publication language, while a record mixes translated fields and a verbatim
+# source-language quote. Matching is therefore tolerant: accents are ignored, long words
+# compare by stem, and a label is covered when enough of its words are, not all of them.
+_SOFT_STOP_WORDS = frozenset(
+    "se par que qui dans pour sur avec est sont ses "
+    "is by are with that from this its as at it".split()
+)
+_SOFT_STEM_LENGTH = 5
+_SOFT_COVERAGE_THRESHOLD = 0.5
+
+
+def _soft_tokens(value: str) -> frozenset[str]:
+    folded = unicodedata.normalize("NFKD", value.casefold())
+    plain = "".join(char for char in folded if not unicodedata.combining(char))
+    return frozenset(
+        token[:_SOFT_STEM_LENGTH]
+        for token in _ANALYTIC_TOKEN.findall(plain)
+        if token not in _SOFT_STOP_WORDS
+        and token not in _ANALYTIC_STOP_WORDS
+        and (len(token) > 2 or any(char.isdigit() for char in token))
+    )
+
+
+def _record_covers(record: Mapping[str, Any], label: str) -> bool:
+    """True when most of a label's words (by stem) appear in a record, in any language."""
+    terms = _soft_tokens(label)
+    if not terms:
+        return False
+    present = _soft_tokens(" ".join(_string_values(record)))
+    return len(terms & present) / len(terms) >= _SOFT_COVERAGE_THRESHOLD
+
+
+# Fallback only, for records with no translated field to compare their quote against.
+_ENGLISH_FUNCTION_WORDS = frozenset(
+    "the of and to is are that with from by which this was it its into what for in their "
+    "has have been be other once not can will an".split()
+)
+
+
+def _record_is_foreign_to(record: Mapping[str, Any], publication_language: str) -> bool:
+    """True when a record is written in a language other than the publication's.
+
+    Extraction writes ``value``, ``text`` and ``context`` in the publication language and
+    keeps ``evidence`` verbatim, so a quote sharing almost no stem with them is in another
+    language: deduced from the data, whatever the language pair. Only a record lacking
+    that split falls back on an English function-word profile.
+    """
+    if publication_language.casefold().startswith("en"):
+        return False
+    quote = _soft_tokens(str(record.get("evidence") or ""))
+    translated_fields = (
+        ("value", "context") if record.get("kind") == "fact" else ("text", "context")
+    )
+    translated = _soft_tokens(" ".join(str(record.get(key) or "") for key in translated_fields))
+    if quote and translated:
+        return len(translated & quote) / len(translated) < _SOFT_COVERAGE_THRESHOLD
+    tokens = _analytic_tokens(" ".join(_string_values(record)))
+    return len(tokens & _ENGLISH_FUNCTION_WORDS) >= 3
+
+
 def _synthesis_sentences(pack: EditorialEnrichmentEvidencePackV1) -> tuple[str, ...]:
     current = pack.current_synthesis
     paragraphs: list[Mapping[str, Any]] = []
@@ -1568,18 +1656,38 @@ def _edge_projection_rejection(
     edge_records = [
         records_by_handle[handle] for handle in edge.evidence_handles if handle in records_by_handle
     ]
-    source_supported = any(_record_mentions(item, source_label) for item in edge_records)
-    target_supported = any(_record_mentions(item, target_label) for item in edge_records)
-    same_record_support = any(
-        _record_mentions(item, source_label) and _record_mentions(item, target_label)
+    # Evidence is quoted in the source language while labels are written in the
+    # publication language, so a lexical match alone rejects translated diagrams. For
+    # such a foreign record an endpoint or relation is also supported when its
+    # node cites a handle the edge cites too: the model attests the grounding explicitly.
+    foreign = {
+        handle
+        for handle, item in records_by_handle.items()
+        if _record_is_foreign_to(item, evidence_pack.publication_language)
+    }
+    edge_handles = set(edge.evidence_handles) & foreign
+    source_cited = edge_handles & set(node_by_id[edge.source_node_id].evidence_handles)
+    target_cited = edge_handles & set(node_by_id[edge.target_node_id].evidence_handles)
+    source_supported = bool(source_cited) or any(
+        _record_covers(item, source_label) for item in edge_records
+    )
+    target_supported = bool(target_cited) or any(
+        _record_covers(item, target_label) for item in edge_records
+    )
+    shared_cited = source_cited & target_cited
+    same_record_support = bool(shared_cited) or any(
+        _record_covers(item, source_label) and _record_covers(item, target_label)
         for item in edge_records
     )
     label = edge.label or ""
-    relation_text_support = bool(_endpoint_tokens(label)) and any(
-        _record_mentions(item, source_label)
-        and _record_mentions(item, target_label)
-        and _endpoint_tokens(label) <= _analytic_tokens(" ".join(_string_values(item)))
-        for item in edge_records
+    relation_text_support = bool(_soft_tokens(label)) and (
+        bool(shared_cited)
+        or any(
+            _record_covers(item, source_label)
+            and _record_covers(item, target_label)
+            and _record_covers(item, label)
+            for item in edge_records
+        )
     )
     if not source_supported or not target_supported:
         return "editorial_enrichment_diagram_relation_endpoint_unsupported"
@@ -1945,7 +2053,7 @@ def parse_editorial_enrichment_proposal_wire(
             },
             "COLUMN": {"key", "label"},
             "ROW": {"cell", "evidence_handles"},
-            "NODE": {"node_id", "id", "label", "evidence_handles"},
+            "NODE": {"node_id", "id", "label", "role", "evidence_handles"},
             "RELATION": {
                 "source_node_id",
                 "target_node_id",
@@ -2595,15 +2703,37 @@ def _parse_enrichment_wire_diagram(
     for child in block.children:
         if child.kind != "NODE":
             continue
-        error = _block_child_error(child, frozenset({"id", "node_id", "label", "evidence_handles"}))
+        error = _block_child_error(
+            child, frozenset({"id", "node_id", "label", "role", "evidence_handles"})
+        )
         node_id = _wire_scalar(child, "node_id") or _wire_scalar(child, "id")
         label = _wire_scalar(child, "label")
+        raw_role = _wire_scalar(child, "role")
+        role = next(
+            (
+                item
+                for item in DiagramNodeRole
+                if raw_role and item.value.casefold() == raw_role.strip().casefold()
+            ),
+            None,
+        )
         handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
         if error is not None:
             reject(child, error)
             continue
         if not node_id or not label:
             reject(child, "editorial_enrichment_diagram_node_missing_field")
+            continue
+        if len(label.split()) > 6 or len(label) > 40:
+            reject(child, "editorial_enrichment_diagram_node_label_over_budget")
+            continue
+        if raw_role is None:
+            role = DiagramNodeRole.UNKNOWN
+            warnings.append(
+                f"editorial_enrichment_diagram_node_role_missing:{block.block_id}/{child.block_id}"
+            )
+        elif role is None:
+            reject(child, "editorial_enrichment_diagram_node_role_invalid")
             continue
         if handles is None:
             reject(child, "editorial_enrichment_diagram_node_evidence_handles_invalid")
@@ -2616,10 +2746,18 @@ def _parse_enrichment_wire_diagram(
             continue
         try:
             nodes.append(
-                DiagramNodeProposalV1(node_id=node_id, label=label, evidence_handles=handles)
+                DiagramNodeProposalV1(
+                    node_id=node_id,
+                    label=label,
+                    evidence_handles=handles,
+                    role=role,
+                )
             )
         except (TypeError, ValueError, ValidationError):
             reject(child, "editorial_enrichment_diagram_node_invalid")
+    if len(nodes) > 8:
+        reject(block, "editorial_enrichment_diagram_node_count_over_budget")
+        return None
     known_nodes = {item.node_id for item in nodes}
 
     edges: list[DiagramEdgeProposalV1] = []
@@ -2686,12 +2824,16 @@ def _parse_enrichment_wire_diagram(
         if any(handle not in evidence_pack._handle_to_ref for handle in handles):
             reject(child, "editorial_enrichment_unknown_evidence_handle")
             continue
+        relation_label = _wire_scalar(child, "label")
+        if relation_label and len(relation_label.split()) > 5:
+            reject(child, "editorial_enrichment_diagram_relation_label_over_budget")
+            continue
         try:
             edges.append(
                 DiagramEdgeProposalV1(
                     source_node_id=source,
                     target_node_id=target,
-                    label=_wire_scalar(child, "label"),
+                    label=relation_label,
                     relation_type=relation_type,
                     evidence_handles=handles,
                 )
@@ -2731,6 +2873,14 @@ def _parse_enrichment_wire_diagram(
             continue
         group_ids.add(group_id)
         grouped_nodes.update(node_ids)
+    layout_labels = [item.label for item in nodes]
+    layout_labels.extend(item.label for item in edges if item.label is not None)
+    layout_labels.extend(item.label for item in groups)
+    if (
+        len(nodes) > 4 or any(len(label) > 30 for label in layout_labels)
+    ) and direction is not EnrichmentDiagramDirection.TOP_TO_BOTTOM:
+        reject(block, "editorial_enrichment_diagram_direction_requires_top_to_bottom")
+        return None
     if len(nodes) < 2 or not edges:
         reject(block, "editorial_enrichment_diagram_incomplete_after_rejections")
         return None
@@ -2980,6 +3130,12 @@ def _synthesis_prompt_projection(
     synthesis: ProductionSynthesisV1,
     handle_for_ref: Mapping[ExtractionEvidenceRefV1, str],
 ) -> dict[str, Any]:
+    def _catalogue_handles(refs: Iterable[ExtractionEvidenceRefV1]) -> list[str]:
+        # The synthesis may cite reserve-only evidence (e.g. a fact supporting a
+        # link_not_demonstrated relation, possibly classified out of scope); it has no E
+        # handle and must not become citable by the enrichment model.
+        return [handle_for_ref[ref] for ref in refs if ref in handle_for_ref]
+
     def paragraph(item: Any, anchor: str) -> dict[str, Any] | None:
         if any(
             ref.kind is EvidenceKind.UNCERTAINTY and ref not in handle_for_ref
@@ -2989,7 +3145,7 @@ def _synthesis_prompt_projection(
         return {
             "anchor": anchor,
             "text": item.text,
-            "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
+            "evidence_handles": _catalogue_handles(item.evidence_refs),
         }
 
     lead = [
@@ -3026,7 +3182,7 @@ def _synthesis_prompt_projection(
                 "event_date": item.event_date.isoformat() if item.event_date else None,
                 "date_text": item.date_text,
                 "text": item.text,
-                "evidence_handles": [handle_for_ref[ref] for ref in item.evidence_refs],
+                "evidence_handles": _catalogue_handles(item.evidence_refs),
             }
             for index, item in enumerate(synthesis.timeline, start=1)
             if not any(
@@ -3399,34 +3555,36 @@ END ROW
 END TABLE
 
 DIAGRAM D001
-KEY: mechanism_comparison
-KIND: custom
-TITLE: Comparison of reported mechanisms
-PURPOSE: How do the two reported mechanisms differ?
-DATA: Their separately documented roles in E001 and E002.
-GAIN: A labelled comparison keeps distinct observations visually separate.
-SCOPE: The two named mechanisms only.
-PURPOSE_EVIDENCE: E001, E002
-LIMITS: No infection sequence or cross-source link is established.
-DIRECTION: left_to_right
+KEY: flux_bitcoin
+KIND: network_flow
+TITLE: Résolution via une adresse Bitcoin
+PURPOSE: Comment une graine mène-t-elle à une destination ?
+DATA: Les deux étapes documentées dans E001.
+GAIN: Deux étapes courtes rendent le flux visible.
+SCOPE: Les deux étapes citées dans E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: Le schéma ne montre que les étapes documentées.
+DIRECTION: top_to_bottom
 PLACEMENT: after_lead
-PLACEMENT_REASON: Place after the paragraph that introduces both observations.
+PLACEMENT_REASON: Après le paragraphe qui présente le flux.
 NODE N001
-ID: mechanism_a
-LABEL: Mechanism A
+ID: seed
+ROLE: infrastructure
+LABEL: Graine de résolution
 EVIDENCE: E001
 END NODE
 NODE N002
-ID: mechanism_b
-LABEL: Mechanism B
-EVIDENCE: E002
+ID: destination
+ROLE: data_artifact
+LABEL: Destination Bitcoin
+EVIDENCE: E001
 END NODE
 RELATION L001
-FROM: mechanism_a
-TO: mechanism_b
-RELATION_TYPE: comparison
-LABEL: comparison of reported mechanisms
-EVIDENCE: E001, E002
+FROM: seed
+TO: destination
+RELATION_TYPE: factual
+LABEL: résout vers
+EVIDENCE: E001
 END RELATION
 END DIAGRAM
 
@@ -3452,8 +3610,10 @@ in the supplied text and evidence handles.
 Each column is a COLUMN block; each row is a ROW block with one CELL per column.
 Each diagram uses NODE, RELATION, and optional GROUP blocks. Every row, node,
 and relation needs existing evidence handles. Each cell must be grounded by its
-row's handles. Use RELATION_TYPE: factual | inference | comparison (choose exactly
-one value). A factual relation needs a cited evidence item
+row's handles. Each NODE requires ROLE: actor | victim | malware_tool |
+infrastructure | data_artifact | technique_step | unknown. RELATION_TYPE is required;
+choose one value from factual | inference | comparison. A factual relation needs a cited
+evidence item
 whose text/context mentions both endpoints and supports the relation label. If
 evidence supports endpoints separately but the relationship is analysis, type it
 as inference and cite supporting handles. Type and label comparisons as
@@ -3465,10 +3625,11 @@ Preserve supplied placement anchors and section indexes.
 
 FIGURE P001
 FIGURE_HANDLE: F001
-CAPTION: exact source caption or alt text, without new claims
+CAPTION: legende que tu rediges, dans la langue de publication, de ce que montre l'image
 EVIDENCE: E001
-PLACEMENT: after_lead
-REASON: why this archived figure helps this subject
+PLACEMENT: after_section
+SECTION_INDEX: 2
+REASON: pourquoi cette image aide ce sujet et pourquoi ici
 END FIGURE
 
 NEEDS N001
@@ -3477,9 +3638,17 @@ REASON: what relevant media is missing
 QUERY_HINT: short query bounded to the current subject
 END NEEDS
 
-Select only accepted catalog handles. Never select an item excluded by rule or
-pending archive. Each FIGURE needs same-source evidence handles, a source-grounded
-caption, an existing placement, and a reason. NEEDS is optional only for a
+Figures : sélectionne de zéro à trois images qui ont une valeur analytique pour ce sujet :
+schémas d'infrastructure, flux, captures de maliciel, panneaux ou portefeuilles, et graphiques
+avec des chiffres utiles. N'inclus jamais un élément décoratif ni une image d'un autre acteur.
+Juge chaque image du figure_catalog d'après son contexte dans l'article : nearby_heading_text,
+text_before_image, text_after_image, figure_label, alt_text, caption et image_file (F001 est
+seulement la clé locale). Ouvre source_page_url pour confirmer ce que montre l'image quand tu
+le peux. Rédige CAPTION en français : décris ce que l'image illustre dans l'article sans ajouter
+de fait ni de détail visuel que tu n'as pas pu vérifier. Choisis son emplacement avec PLACEMENT
+(et SECTION_INDEX pour after_section). Utilise seulement les handles acceptés; n'utilise aucun
+média exclu ou non archivé. Chaque FIGURE requiert une preuve de la même source, une caption, un
+emplacement valide et une raison. NEEDS est facultatif seulement pour un
 specific missing media item or technical analysis. Zero figures is valid. Do not
 return resource URLs in this response."""
 
@@ -3552,8 +3721,17 @@ def build_editorial_enrichment_model_request(
             "de support. Une comparaison doit être typée et étiquetée comparison; ne la présente "
             "jamais comme une séquence d'infection. infection_chain est uniquement une valeur de "
             "KIND pour un DIAGRAM. Dans ce diagramme, utilise RELATION_TYPE factual seulement si "
-            "la preuve citée documente les deux endpoints et la séquence affirmée. Respecte les "
-            "réserves counter_indicated et "
+            "la preuve citée documente les deux endpoints et la séquence affirmée. Pour les "
+            "graphes : limite-toi à 8 nœuds; chaque nœud exprime une seule idée, avec "
+            "6 mots et environ 40 caractères au maximum; un libellé d'arête a au plus 5 mots. "
+            "Choisis DIRECTION: top_to_bottom dès qu'il y a plus de 4 nœuds ou qu'un libellé "
+            "dépasse 30 caractères. Choisis le rôle parmi actor, victim, malware_tool, "
+            "infrastructure, data_artifact, technique_step et unknown. Utilise network_flow pour "
+            "un flux de résolution, de données ou de paiement; infrastructure pour les hôtes, "
+            "services et connexions; component_relationship pour les liens entre composants. "
+            "Réserve infection_chain aux étapes ordonnées d'une intrusion explicitement "
+            "documentées. Écris le TITLE comme une courte légende descriptive en français, sans "
+            "préfixe « Figure » ni point final. Respecte les réserves counter_indicated et "
             "LINK_NOT_DEMONSTRATED; elles ne prouvent aucun lien. Conserve chaque commande, "
             "chemin, nom, date, adresse, hash et autre littéral exactement comme dans la preuve. "
             "Si aucune représentation n'améliore la compréhension, renvoie le marqueur explicite "
@@ -3561,10 +3739,14 @@ def build_editorial_enrichment_model_request(
             "SVG, image source, ni corps de règle. Les diagrammes décrivent seulement une "
             "spécification sémantique en blocs. Titres et captions restent descriptifs. Le "
             "catalogue figure_catalog contient des médias archivés : propose uniquement un "
-            "handle accepté, avec une caption copiée du contexte source, des evidence handles de "
-            "la même source, un placement et une raison. N'inclus pas un média rejeté ou en "
-            "attente d'archivage. Zéro figure est valide. Si une figure ou une analyse manque, tu "
-            "peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; indique une raison et un "
+            "handle accepté, avec une caption que tu rédiges toi-même dans la langue de "
+            "publication, des evidence handles de la même source, un placement et une raison. "
+            "Juge chaque figure du catalogue d'après son contexte dans l'article (titre de "
+            "section, texte avant et après l'image, nom de fichier) et ouvre source_page_url "
+            "pour la confirmer; ne retiens que celles qui illustrent ce sujet précis. N'inclus "
+            "pas un média rejeté ou en attente d'archivage. Zéro figure est valide. Si une figure "
+            "ou une analyse manque, tu peux émettre un bloc NEEDS MEDIA ou TECHNICAL_ANALYSIS; "
+            "indique une raison et un "
             "query_hint borné au sujet. N'inclus aucune URL dans NEEDS."
         ),
         "publication_language": evidence_pack.publication_language,
@@ -3582,11 +3764,22 @@ def build_editorial_enrichment_model_request(
                 ],
             },
         },
-        "figure_catalog": [entry.prompt_record() for entry in figure_catalog],
+        "figure_catalog": [
+            entry.prompt_record(include_source_page=True) for entry in figure_catalog
+        ],
         "editorial_guidance": {
             "table_kinds": [item.value for item in EnrichmentTableKind],
             "diagram_kinds": [item.value for item in EnrichmentDiagramKind],
             "diagram_directions": [item.value for item in EnrichmentDiagramDirection],
+            "diagram_node_roles": [item.value for item in DiagramNodeRole],
+            "diagram_layout_budgets": {
+                "maximum_nodes": 8,
+                "maximum_node_words": 6,
+                "maximum_node_characters": 40,
+                "maximum_edge_label_words": 5,
+                "vertical_when_nodes_over": 4,
+                "vertical_when_label_characters_over": 30,
+            },
             "placements": [item.value for item in EnrichmentPlacementKind],
             "section_indexes": [
                 int(item["section_index"]) for item in evidence_pack.current_synthesis["sections"]
@@ -3622,7 +3815,10 @@ def build_editorial_enrichment_model_request(
         external_llm_allowed=access_policy.external_llm_allowed and not access_policy.do_not_submit,
         routing_hint=ModelRoutingHint.EDITORIAL_ENRICHMENT,
         sensitivity=access_policy.effective_tlp.value,
-        web_search=False,
+        # The model must look at the live article's images to pick figures.
+        web_search=any(
+            entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog
+        ),
         background=False,
         conversation=None,
         run_id=editorial_enrichment_model_run_id(run, invocation_hash),
@@ -3724,7 +3920,7 @@ def build_editorial_enrichment_repair_request(
             "contract_version": EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION,
             "parser_version": EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION,
         },
-        web_search=False,
+        web_search=base_request.web_search,
         background=False,
         conversation=None,
         run_id=repair_run_id,
@@ -3941,7 +4137,12 @@ def validate_editorial_enrichment_proposal(
                 diagram_refs.update(refs)
                 _validate_grounded_editorial_text(node.label, refs, entries, technical_support)
                 nodes.append(
-                    DiagramNodeV1(node_id=node.node_id, label=node.label, evidence_refs=refs)
+                    DiagramNodeV1(
+                        node_id=node.node_id,
+                        label=node.label,
+                        evidence_refs=refs,
+                        role=node.role,
+                    )
                 )
             for edge in diagram.edges:
                 refs = _all_refs_for_handles(edge.evidence_handles, evidence_pack)
@@ -4025,6 +4226,10 @@ def validate_editorial_enrichment_proposal(
     figure_decisions: list[EditorialFigureDecisionTraceV1] = []
     selected_source_figures = list(source_figures)
     local_warnings = set(warnings)
+    if not parsed.figures and any(
+        entry.figure.decision is SourceFigureDecision.ACCEPTED for entry in figure_catalog
+    ):
+        local_warnings.add("editorial_enrichment_no_figure_selected")
     for catalog_entry in figure_catalog:
         proposed = proposed_by_handle.get(catalog_entry.handle)
         figure = catalog_entry.figure
@@ -4041,23 +4246,10 @@ def validate_editorial_enrichment_proposal(
                 raise EditorialEnrichmentProposalControlError(
                     EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
                 )
-            evidence_context = [
-                value for ref in evidence_refs for value in _string_values(entries[ref])
-            ]
-            source_context = [
-                catalog_entry.metadata.caption_text,
-                catalog_entry.metadata.alt_text,
-                catalog_entry.metadata.nearby_heading_text,
-                figure.locator.figure_label,
-                figure.locator.section,
-                *evidence_context,
-            ]
-            normalized_caption = " ".join(proposed.caption.casefold().split())
-            grounded_context = "\n".join(
-                " ".join(value.casefold().split()) for value in source_context if value
-            )
-            caption = proposed.caption
-            if not normalized_caption or normalized_caption not in grounded_context:
+            # The model writes the caption after looking at the image; only an
+            # empty or non-plain one falls back to the archived source caption.
+            caption = proposed.caption.strip()
+            if not caption:
                 caption = catalog_entry.source_caption
                 local_warnings.add(
                     f"editorial_enrichment_figure_caption_downgraded:{catalog_entry.handle}"

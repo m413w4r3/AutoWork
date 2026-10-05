@@ -68,7 +68,7 @@ def typst_binary() -> str:
 
 def _runtime_render_data() -> dict[str, Any]:
     return {
-        "schema_version": "typst-publication-model-v4-table-layout",
+        "schema_version": "typst-publication-model-v5-dated-references-ioc-groups",
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
         "content_sections": [
@@ -111,6 +111,7 @@ def _runtime_render_data() -> dict[str, Any]:
                     {"type": "paragraph", "text": "First section content."},
                     {
                         "type": "figure",
+                        "figure_number": 1,
                         "key": "runtime-figure",
                         "caption": "Vendored CHP image used as a figure.",
                         "provenance": "AW-019 runtime fixture",

@@ -52,11 +52,13 @@ from cti_app.domain.publication import (
     PublicationIndicatorGroupV1,
     PublicationIndicatorV1,
     PublicationParagraphV1,
+    PublicationReferenceEntryV1,
     PublicationSectionKind,
     PublicationSectionV1,
     PublicationSourceV1,
     PublicationTimelineEntryV1,
     PublicationUncertaintyV1,
+    indicator_source_ids,
 )
 from cti_app.domain.semantic_annotation import (
     SemanticTextV1,
@@ -329,14 +331,18 @@ def _table_from_json(raw: Any) -> PublicationTableV1:
     )
 
 
-def _diagram_to_json(diagram: PublicationDiagramV1) -> dict[str, Any]:
+def _diagram_to_json(
+    diagram: PublicationDiagramV1, *, include_node_roles: bool = False
+) -> dict[str, Any]:
     return {
         "key": diagram.key,
         "kind": diagram.kind.value,
         "title": diagram.title,
         "caption": diagram.caption,
         "direction": diagram.direction.value,
-        "nodes": [diagram_node_to_json(node) for node in diagram.nodes],
+        "nodes": [
+            diagram_node_to_json(node, include_role=include_node_roles) for node in diagram.nodes
+        ],
         "edges": [diagram_edge_to_json(edge) for edge in diagram.edges],
         "groups": [diagram_group_to_json(group) for group in diagram.groups],
         "placement": placement_to_json(diagram.placement),
@@ -344,7 +350,7 @@ def _diagram_to_json(diagram: PublicationDiagramV1) -> dict[str, Any]:
     }
 
 
-def _diagram_from_json(raw: Any) -> PublicationDiagramV1:
+def _diagram_from_json(raw: Any, *, require_node_roles: bool = False) -> PublicationDiagramV1:
     item = json_object(
         raw,
         frozenset(
@@ -373,7 +379,8 @@ def _diagram_from_json(raw: Any) -> PublicationDiagramV1:
         caption=caption,
         direction=json_enum(EnrichmentDiagramDirection, item["direction"], "Diagram direction"),
         nodes=tuple(
-            diagram_node_from_json(value) for value in json_array(item["nodes"], "Diagram nodes")
+            diagram_node_from_json(value, require_role=require_node_roles)
+            for value in json_array(item["nodes"], "Diagram nodes")
         ),
         edges=tuple(
             diagram_edge_from_json(value) for value in json_array(item["edges"], "Diagram edges")
@@ -510,6 +517,103 @@ def _validate_publication_core(
         )
 
 
+def _indicator_group_to_json(group: PublicationIndicatorGroupV1) -> dict[str, Any]:
+    return {
+        "artifact_type": group.artifact_type.value,
+        "indicators": [
+            {
+                "value": indicator.value,
+                "normalized_value": indicator.normalized_value,
+                "artifact_type": indicator.artifact_type.value,
+                "source_document_ids": [
+                    str(source_id) for source_id in indicator.source_document_ids
+                ],
+            }
+            for indicator in group.indicators
+        ],
+    }
+
+
+def _indicator_group_from_json(raw: Any, label: str) -> PublicationIndicatorGroupV1:
+    item = json_object(raw, frozenset({"artifact_type", "indicators"}), label)
+    return PublicationIndicatorGroupV1(
+        artifact_type=json_enum(ArtifactType, item["artifact_type"], "Indicator group type"),
+        indicators=tuple(
+            PublicationIndicatorV1(
+                value=json_text(nested["value"], "Indicator value"),
+                normalized_value=json_text(
+                    nested["normalized_value"], "Indicator normalized_value"
+                ),
+                artifact_type=json_enum(
+                    ArtifactType, nested["artifact_type"], "Indicator artifact_type"
+                ),
+                source_document_ids=_source_ids_from_json(
+                    nested["source_document_ids"], "Indicator source_document_ids"
+                ),
+            )
+            for nested in (
+                json_object(
+                    raw_indicator,
+                    frozenset(
+                        {
+                            "value",
+                            "normalized_value",
+                            "artifact_type",
+                            "source_document_ids",
+                        }
+                    ),
+                    "Publication indicator",
+                )
+                for raw_indicator in json_array(item["indicators"], "Indicators in group")
+            )
+        ),
+    )
+
+
+def _publication_reference_to_json(item: PublicationReferenceEntryV1) -> dict[str, Any]:
+    return {
+        "source_document_id": str(item.source_document_id),
+        "text": item.text,
+        "evidence_refs": [
+            {
+                "source_document_id": str(ref.source_document_id),
+                "kind": ref.kind.value,
+                "evidence_key": ref.evidence_key,
+            }
+            for ref in item.evidence_refs
+        ],
+    }
+
+
+def _publication_reference_from_json(raw: Any) -> PublicationReferenceEntryV1:
+    item = json_object(
+        raw,
+        frozenset({"source_document_id", "text", "evidence_refs"}),
+        "Publication reference entry",
+    )
+    refs_raw = json_array(item["evidence_refs"], "Publication reference evidence refs")
+    refs = tuple(
+        PublicationEvidenceRefV1(
+            source_document_id=json_uuid(ref["source_document_id"], "Reference evidence source ID"),
+            kind=json_enum(PublicationEvidenceKind, ref["kind"], "Reference evidence kind"),
+            evidence_key=json_sha256(ref["evidence_key"], "Reference evidence key"),
+        )
+        for ref in (
+            json_object(
+                value,
+                frozenset({"source_document_id", "kind", "evidence_key"}),
+                "Reference evidence ref",
+            )
+            for value in refs_raw
+        )
+    )
+    return PublicationReferenceEntryV1(
+        source_document_id=json_uuid(item["source_document_id"], "Reference source ID"),
+        text=json_text(item["text"], "Reference text"),
+        evidence_refs=refs,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationDocumentV4:
     schema_version: str
@@ -525,6 +629,7 @@ class PublicationDocumentV4:
     tables: tuple[PublicationTableV1, ...]
     diagrams: tuple[PublicationDiagramV1, ...]
     figures: tuple[PublicationSourceFigureV1, ...]
+    additional_source_ids: frozenset[UUID] = frozenset()
 
     def __post_init__(self) -> None:
         if self.schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -574,6 +679,11 @@ class PublicationDocumentV4:
             for ref in edge.evidence_refs
         )
         enrichment_source_ids.update(figure.source_document_id for figure in self.figures)
+        if not isinstance(self.additional_source_ids, frozenset) or any(
+            not isinstance(source_id, UUID) for source_id in self.additional_source_ids
+        ):
+            raise ValueError("Publication additional source identities are invalid")
+        enrichment_source_ids.update(self.additional_source_ids)
         _validate_publication_core(
             subject_id=self.subject_id,
             publication_language=self.publication_language,
@@ -702,7 +812,13 @@ class PublicationDocumentV4:
         }
 
     @classmethod
-    def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV4:
+    def _from_json(
+        cls,
+        payload: Mapping[str, Any],
+        *,
+        additional_source_ids: frozenset[UUID] = frozenset(),
+        require_node_roles: bool = False,
+    ) -> PublicationDocumentV4:
         document = json_object(
             payload,
             frozenset(
@@ -872,16 +988,20 @@ class PublicationDocumentV4:
             uncertainties=uncertainties,
             tables=tuple(_table_from_json(raw) for raw in json_array(document["tables"], "Tables")),
             diagrams=tuple(
-                _diagram_from_json(raw) for raw in json_array(document["diagrams"], "Diagrams")
+                _diagram_from_json(raw, require_node_roles=require_node_roles)
+                for raw in json_array(document["diagrams"], "Diagrams")
             ),
             figures=tuple(
                 _figure_from_json(raw) for raw in json_array(document["figures"], "Figures")
             ),
+            additional_source_ids=additional_source_ids,
         )
 
 
 def publication_document_text_anchors(
     document: PublicationDocumentV4,
+    *,
+    references: tuple[PublicationReferenceEntryV1, ...] = (),
 ) -> dict[str, str]:
     """Return every text-bearing article field rendered with semantic spans."""
     result: dict[str, str] = {"title": document.title}
@@ -893,6 +1013,8 @@ def publication_document_text_anchors(
             result[f"section:{section_index}:paragraph:{paragraph_index:04d}"] = paragraph.text
     for index, item in enumerate(document.timeline, start=1):
         result[f"timeline:{index:04d}"] = item.text
+    for index, reference in enumerate(references, start=1):
+        result[f"reference:{index:04d}"] = reference.text
     for table in document.tables:
         result[f"table:{table.key}:title"] = table.title
         if table.caption is not None:
@@ -912,20 +1034,39 @@ def publication_document_text_anchors(
     return result
 
 
+def order_publication_references(
+    references: tuple[PublicationReferenceEntryV1, ...],
+    sources: tuple[PublicationSourceV1, ...],
+) -> tuple[PublicationReferenceEntryV1, ...]:
+    """Order references by article release date; undated ones last, core after supporting."""
+    sources_by_id = {source.source_document_id: source for source in sources}
+
+    def order(item: PublicationReferenceEntryV1) -> tuple[Any, ...]:
+        source = sources_by_id[item.source_document_id]
+        return (
+            source.published_at is None,
+            source.published_at or date.max,
+            source.tier is ProductionReferenceTier.CORE,
+            source.canonical_url,
+        )
+
+    return tuple(sorted(references, key=order))
+
+
 @dataclass(frozen=True, slots=True)
 class PublicationDocumentV5:
-    """V4 article data plus an explicit, versioned semantic text projection."""
+    """V4 content plus semantic text, dated source notes and original IOC groups."""
 
     document: PublicationDocumentV4
     semantic_text: SemanticTextV1
+    references: tuple[PublicationReferenceEntryV1, ...] = ()
+    original_indicators: tuple[PublicationIndicatorGroupV1, ...] = ()
 
     @property
     def schema_version(self) -> str:
         return PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION
 
     def __getattr__(self, name: str) -> Any:
-        # Keep existing read-only publication consumers source-compatible while
-        # making the changed serialized contract an explicit V5 type.
         return getattr(self.document, name)
 
     def __post_init__(self) -> None:
@@ -933,14 +1074,77 @@ class PublicationDocumentV5:
             raise ValueError("PublicationDocumentV5 requires a validated V4 base document")
         if not isinstance(self.semantic_text, SemanticTextV1):
             raise ValueError("PublicationDocumentV5 requires versioned semantic text")
-        expected = publication_document_text_anchors(self.document)
+        if not isinstance(self.references, tuple) or any(
+            not isinstance(item, PublicationReferenceEntryV1) for item in self.references
+        ):
+            raise ValueError("Publication source references have an invalid type")
+        if not isinstance(self.original_indicators, tuple) or any(
+            not isinstance(item, PublicationIndicatorGroupV1) for item in self.original_indicators
+        ):
+            raise ValueError("Original IOC groups have an invalid type")
+        sources_by_id = {source.source_document_id: source for source in self.document.sources}
+        if len(sources_by_id) != len(self.document.sources):
+            raise ValueError("Publication sources must not repeat source identities")
+        reference_source_ids = {item.source_document_id for item in self.references}
+        if len(reference_source_ids) != len(self.references):
+            raise ValueError("Publication source references must not repeat sources")
+        for source_id in reference_source_ids:
+            source = sources_by_id.get(source_id)
+            if (
+                source is None
+                or source.kind is not ProductionReferenceKind.PUBLICATION
+                or source.tier
+                not in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
+            ):
+                raise ValueError(
+                    "Publication reference must identify a core/supporting publication"
+                )
+        original_types = [group.artifact_type for group in self.original_indicators]
+        if len(original_types) != len(set(original_types)):
+            raise ValueError("Original IOC groups must not repeat artifact types")
+        main_values = {
+            indicator.normalized_value
+            for group in self.document.indicators
+            for indicator in group.indicators
+        }
+        original_values = [
+            indicator.normalized_value
+            for group in self.original_indicators
+            for indicator in group.indicators
+        ]
+        if len(original_values) != len(set(original_values)) or main_values.intersection(
+            original_values
+        ):
+            raise ValueError("Publication IOCs must be deduplicated across both groups")
+        if self.document.additional_source_ids != reference_source_ids | indicator_source_ids(
+            self.original_indicators
+        ):
+            raise ValueError(
+                "Publication source identities do not match references and original IOCs"
+            )
+
+        references = order_publication_references(self.references, self.document.sources)
+        object.__setattr__(self, "references", references)
+        object.__setattr__(
+            self,
+            "original_indicators",
+            tuple(sorted(self.original_indicators, key=lambda group: group.artifact_type.value)),
+        )
+        expected = publication_document_text_anchors(self.document, references=references)
         actual = {item.anchor: item.text for item in self.semantic_text.paragraphs}
         if actual != expected:
-            raise ValueError("PublicationDocumentV5 semantic spans must preserve every text field")
+            raise ValueError("PublicationDocumentV5 semantic text must preserve every text field")
 
     def _to_json(self) -> dict[str, Any]:
         payload = self.document._to_json()
         payload["schema_version"] = self.schema_version
+        payload["diagrams"] = [
+            _diagram_to_json(diagram, include_node_roles=True) for diagram in self.document.diagrams
+        ]
+        payload["references"] = [_publication_reference_to_json(item) for item in self.references]
+        payload["original_indicators"] = [
+            _indicator_group_to_json(group) for group in self.original_indicators
+        ]
         payload["rich_text"] = semantic_text_to_json(self.semantic_text)
         return payload
 
@@ -963,6 +1167,8 @@ class PublicationDocumentV5:
                     "tables",
                     "diagrams",
                     "figures",
+                    "references",
+                    "original_indicators",
                     "rich_text",
                 }
             ),
@@ -970,12 +1176,31 @@ class PublicationDocumentV5:
         )
         if document["schema_version"] != PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION:
             raise ValueError("PublicationDocumentV5 schema version is unsupported")
+        references = tuple(
+            _publication_reference_from_json(raw)
+            for raw in json_array(document["references"], "Publication references")
+        )
+        original_indicators = tuple(
+            _indicator_group_from_json(raw, "Original IOC group")
+            for raw in json_array(document["original_indicators"], "Original IOC groups")
+        )
+        additional_source_ids = {item.source_document_id for item in references}
+        additional_source_ids |= indicator_source_ids(original_indicators)
         base_payload = dict(document)
-        del base_payload["rich_text"]
+        for key in ("references", "original_indicators", "rich_text"):
+            del base_payload[key]
         base_payload["schema_version"] = PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION
-        base = PublicationDocumentV4._from_json(base_payload)
-        semantic_text = semantic_text_from_json(document["rich_text"])
-        return cls(document=base, semantic_text=semantic_text)
+        base = PublicationDocumentV4._from_json(
+            base_payload,
+            additional_source_ids=frozenset(additional_source_ids),
+            require_node_roles=True,
+        )
+        return cls(
+            document=base,
+            semantic_text=semantic_text_from_json(document["rich_text"]),
+            references=references,
+            original_indicators=original_indicators,
+        )
 
 
 type CanonicalPublicationDocument = PublicationDocumentV4 | PublicationDocumentV5
@@ -1054,6 +1279,7 @@ __all__ = [
     "PublicationTableColumnV1",
     "PublicationTableRowV1",
     "PublicationTableV1",
+    "order_publication_references",
     "parse_publication_document",
     "publication_document_from_json",
     "publication_document_text_anchors",

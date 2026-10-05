@@ -70,8 +70,8 @@ def test_discovery_bridge_poll_interval_is_configurable_and_bounded(
 
 def test_model_wait_budgets_are_configurable_and_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
     defaults = Settings(_env_file=None)
-    assert defaults.openai_bridge_wait_timeout_seconds == 300
-    assert defaults.openai_bridge_wait_timeout_research_seconds == 900
+    assert defaults.openai_bridge_wait_timeout_seconds == 3600
+    assert defaults.openai_bridge_wait_timeout_research_seconds == 7200
     assert defaults.model_request_timeout_seconds == 300
     assert defaults.model_request_timeout_research_seconds == 900
     assert defaults.model_background_wait_timeout_seconds == 5400
@@ -102,7 +102,7 @@ def test_model_wait_budgets_are_configurable_and_bounded(monkeypatch: pytest.Mon
     assert settings.model_background_idle_timeout_research_seconds == 1800
     assert settings.job_bridge_ui_retry_base_seconds == 420
 
-    monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "3601")
+    monkeypatch.setenv("OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS", "86401")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 

@@ -228,6 +228,14 @@ Comparer explicitement les cas Chainalysis/Bitquery ; ne pas identifier leurs mo
 > (profil IOC_RULES, politique `production-reference-tier-core-only-v3`). Le rôle éditorial reste un critère
 > d'ordre et de revue. Conséquence : une contre-analyse complémentaire (cas Bitquery) ne contribue ni faits ni
 > relation inter-sources au récit, sauf si REFERENCES la classe CORE.
+>
+> **Amendement (2026-10-05) — un seul article CORE.** Quand le corpus ne contient qu'un seul article CORE
+> extractible, une unique publication SUPPORTING (rôle éditorial primary, puis corroboration, puis
+> counter_analysis ; jamais context ni ressource technique) est lue en FULL (politique
+> `production-reference-tier-core-first-v4`, raison `complementary_full_source`). Elle reste de tier
+> SUPPORTING : ses éléments sont classés corroboration/contre-indication, jamais direct, et la synthèse traite
+> le sujet sous l'angle de l'article CORE. La gate de substance L14 (`PRODUCTION_MIN_DIRECT_EVIDENCE_ITEMS`) et
+> sa dérogation humaine sont supprimées.
 
 ### L4 — Regroupement Discovery dès le premier intake — P1
 

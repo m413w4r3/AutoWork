@@ -432,9 +432,11 @@ class SafeHttpCollector:
                 reason_code=CollectionFailureReason.DNS_ERROR,
                 transport_classification=CollectionTransportClassification.DNS,
             )
-        if set(first) != set(second):
-            raise UnsafeAddressError("DNS answers changed before connection")
-        for value in first:
+        # CDNs legitimately rotate their address set between two lookups, so a
+        # changed answer is not a rebinding signal on its own. The connection is
+        # pinned to one address, and every address either lookup returned must be
+        # public: a mixed public/private answer is still refused.
+        for value in dict.fromkeys((*first, *second)):
             _validate_ip(value)
         return first[0]
 

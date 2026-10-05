@@ -48,7 +48,6 @@ class Settings(BaseSettings):
     production_model_jitter_min_seconds: float = Field(default=8.0, ge=0)
     production_model_jitter_max_seconds: float = Field(default=20.0, ge=0)
     production_relevance_classifier_enabled: bool = True
-    production_min_direct_evidence_items: int = Field(default=4, ge=0)
     # External web search from Editorial Enrichment is an explicit operator opt-in.
     production_editorial_resource_search_enabled: bool = False
     # Palier de repos long inséré périodiquement pour laisser le bridge
@@ -62,8 +61,8 @@ class Settings(BaseSettings):
     openai_bridge_capabilities_timeout_seconds: float = Field(default=2.0, gt=0, le=2)
     # Legacy/default synchronous request budget. Research has a separate longer
     # role budget below; the old OPENAI_BRIDGE_WAIT_TIMEOUT_SECONDS name remains valid.
-    openai_bridge_wait_timeout_seconds: float = Field(default=300.0, gt=0, le=3600)
-    openai_bridge_wait_timeout_research_seconds: float = Field(default=900.0, gt=0, le=3600)
+    openai_bridge_wait_timeout_seconds: float = Field(default=3600.0, gt=0, le=86400)
+    openai_bridge_wait_timeout_research_seconds: float = Field(default=7200.0, gt=0, le=86400)
     # Fermer un onglet exige un aller-retour WebSocket vers l'extension Chrome.
     # Le budget doit couvrir BRIDGE_UI_TIMEOUT (30 s) plus la fenêtre de
     # reconnexion BRIDGE_RECONNECT_GRACE (20 s) du service worker MV3.

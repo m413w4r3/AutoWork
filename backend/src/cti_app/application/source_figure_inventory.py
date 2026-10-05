@@ -43,12 +43,13 @@ from cti_app.domain.source_media import (
     SourceMediaStatus,
 )
 
-MAX_SOURCE_FIGURES = 64
+MAX_SOURCE_FIGURES = 128
 MAX_SOURCE_DOCUMENT_BYTES = 25 * 1024 * 1024
 MAX_SOURCE_FIGURE_BYTES = 5 * 1024 * 1024
-MAX_SOURCE_FIGURE_TOTAL_BYTES = 20 * 1024 * 1024
+MAX_SOURCE_FIGURE_TOTAL_BYTES = 50 * 1024 * 1024
 MAX_SOURCE_FIGURE_PIXELS = SOURCE_MEDIA_MAX_PIXELS
 MAX_SOURCE_FIGURE_SIDE_LENGTH = SOURCE_MEDIA_MAX_SIDE_LENGTH
+MAX_SOURCE_FIGURE_ASPECT_RATIO = 4.0
 
 _DATA_URI_PREFIX = re.compile(r"^data:([^,]*?),(.*)$", re.IGNORECASE | re.DOTALL)
 
@@ -83,6 +84,9 @@ class SourceFigureCatalogMetadata:
     alt_text: str | None = None
     caption_text: str | None = None
     nearby_heading_text: str | None = None
+    context_before: str | None = None
+    context_after: str | None = None
+    in_article_body: bool = False
     anchor: str | None = None
     width: int | None = None
     height: int | None = None
@@ -103,12 +107,17 @@ class SourceFigureInventoryResult:
         )
 
     def content_hash(self) -> str:
-        def catalog_metadata_for(figure: ResolvedSourceFigureV1) -> dict[str, int | str | None]:
+        def catalog_metadata_for(
+            figure: ResolvedSourceFigureV1,
+        ) -> dict[str, bool | int | str | None]:
             metadata = self.catalog_metadata.get(figure.figure_id, SourceFigureCatalogMetadata())
             return {
                 "alt_text": metadata.alt_text,
                 "caption_text": metadata.caption_text,
                 "nearby_heading_text": metadata.nearby_heading_text,
+                "context_before": metadata.context_before,
+                "context_after": metadata.context_after,
+                "in_article_body": metadata.in_article_body,
                 "anchor": metadata.anchor,
                 "width": metadata.width,
                 "height": metadata.height,
@@ -251,6 +260,9 @@ class SourceFigureInventory:
             alt_text: str | None = None,
             caption_text: str | None = None,
             nearby_heading_text: str | None = None,
+            context_before: str | None = None,
+            context_after: str | None = None,
+            in_article_body: bool = False,
             anchor: str | None = None,
         ) -> bool:
             nonlocal total_figure_bytes, truncated
@@ -269,6 +281,14 @@ class SourceFigureInventory:
             ):
                 decision = SourceFigureDecision.REJECTED
                 reason = SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
+                blob = None
+            elif _is_extreme_aspect_ratio(observed_width, observed_height):
+                decision = SourceFigureDecision.REJECTED
+                reason = SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
+                blob = None
+            elif _is_below_minimum_dimensions(observed_width, observed_height):
+                decision = SourceFigureDecision.REJECTED
+                reason = SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS.value
                 blob = None
             if sha256 is not None:
                 duplicate_index = indices_by_hash.get(sha256)
@@ -341,6 +361,9 @@ class SourceFigureInventory:
                     media_record.nearby_heading_text if media_record is not None else None
                 )
                 or nearby_heading_text,
+                context_before=context_before,
+                context_after=context_after,
+                in_article_body=in_article_body,
                 anchor=(media_record.anchor if media_record is not None else None) or anchor,
                 width=observed_width,
                 height=observed_height,
@@ -369,6 +392,55 @@ class SourceFigureInventory:
             if record.dom_locator is not None
         }
 
+        def source_priority(source: ArchivedFigureSource) -> tuple[int, int, str, str]:
+            observations = observations_by_source.get(source.source_document_id, ())
+            usable_body_images = sum(
+                observation.in_article_body
+                and observation.pre_exclusion_reason is None
+                and (
+                    (
+                        record := media_by_location.get(
+                            (source.source_document_id, observation.dom_locator)
+                        )
+                    )
+                    is None
+                    or record.status is SourceMediaStatus.ACCEPTED_FOR_REVIEW
+                )
+                for observation in observations
+            )
+            body_images = sum(item.in_article_body for item in observations)
+            return (
+                -usable_body_images,
+                -body_images,
+                source.source_url,
+                source.source_document_id.hex,
+            )
+
+        ordered_sources = tuple(sorted(ordered_sources, key=source_priority))
+
+        def observation_priority(
+            source: ArchivedFigureSource, item: tuple[int, SourceMediaObservation]
+        ) -> tuple[bool, bool, int]:
+            index, observation = item
+            media_record = media_by_location.get(
+                (source.source_document_id, observation.dom_locator)
+            )
+            low_value = observation.pre_exclusion_reason is not None or (
+                media_record is not None
+                and (
+                    media_record.status is SourceMediaStatus.EXCLUDED_BY_RULE
+                    or media_record.reason_code
+                    in {
+                        SourceMediaReasonCode.DUPLICATE_EXACT_HASH,
+                        SourceMediaReasonCode.DUPLICATE_PERCEPTUAL_HASH,
+                        SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS,
+                        SourceMediaReasonCode.BELOW_MINIMUM_BYTES,
+                        SourceMediaReasonCode.EXTREME_ASPECT_RATIO,
+                    }
+                )
+            )
+            return (low_value, not observation.in_article_body, index)
+
         for source in ordered_sources:
             if (
                 len(source.content) > self._max_source_bytes
@@ -381,9 +453,16 @@ class SourceFigureInventory:
                 _pdf_extractions, pdf_warning = _pdf_images(source)
                 if pdf_warning is not None:
                     warnings.add(pdf_warning)
-            for index, observation in enumerate(
-                observations_by_source.get(source.source_document_id, ()), start=1
-            ):
+            indexed_observations = tuple(
+                enumerate(observations_by_source.get(source.source_document_id, ()), start=1)
+            )
+            indexed_observations = tuple(
+                sorted(
+                    indexed_observations,
+                    key=lambda item: observation_priority(source, item),
+                )
+            )
+            for index, observation in indexed_observations:
                 if observation.is_page_excerpt:
                     warnings.add("source_figure_pdf_page_excerpt_needed")
                     continue
@@ -425,6 +504,9 @@ class SourceFigureInventory:
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
                         nearby_heading_text=observation.nearby_heading_text,
+                        context_before=observation.context_before,
+                        context_after=observation.context_after,
+                        in_article_body=observation.in_article_body,
                         anchor=observation.anchor,
                     ):
                         break
@@ -447,6 +529,9 @@ class SourceFigureInventory:
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
                         nearby_heading_text=observation.nearby_heading_text,
+                        context_before=observation.context_before,
+                        context_after=observation.context_after,
+                        in_article_body=observation.in_article_body,
                         anchor=observation.anchor,
                     ):
                         break
@@ -469,6 +554,9 @@ class SourceFigureInventory:
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
                         nearby_heading_text=observation.nearby_heading_text,
+                        context_before=observation.context_before,
+                        context_after=observation.context_after,
+                        in_article_body=observation.in_article_body,
                         anchor=observation.anchor,
                     ):
                         break
@@ -510,6 +598,9 @@ class SourceFigureInventory:
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
                         nearby_heading_text=observation.nearby_heading_text,
+                        context_before=observation.context_before,
+                        context_after=observation.context_after,
+                        in_article_body=observation.in_article_body,
                         anchor=observation.anchor,
                     ):
                         break
@@ -526,6 +617,9 @@ class SourceFigureInventory:
                         alt_text=observation.alt_text,
                         caption_text=observation.caption_text,
                         nearby_heading_text=observation.nearby_heading_text,
+                        context_before=observation.context_before,
+                        context_after=observation.context_after,
+                        in_article_body=observation.in_article_body,
                         anchor=observation.anchor,
                     ):
                         break
@@ -567,6 +661,9 @@ class SourceFigureInventory:
                     alt_text=observation.alt_text,
                     caption_text=observation.caption_text,
                     nearby_heading_text=observation.nearby_heading_text,
+                    context_before=observation.context_before,
+                    context_after=observation.context_after,
+                    in_article_body=observation.in_article_body,
                     anchor=observation.anchor,
                 ):
                     break
@@ -666,6 +763,12 @@ def _resolve_observed_bytes(
         maximum_side_length=max_figure_side_length,
     ):
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
+    width = observed.width if observed.width is not None else (asset.width if asset else None)
+    height = observed.height if observed.height is not None else (asset.height if asset else None)
+    if _is_extreme_aspect_ratio(width, height):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
+    if _is_below_minimum_dimensions(width, height):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS.value
     if observed.mime_type not in SUPPORTED_MEDIA_MIME_TYPES:
         return SourceFigureDecision.REJECTED, "unsupported_image_mime_type"
     if asset is None:
@@ -709,7 +812,25 @@ def _resolve_archived_asset(
         maximum_side_length=max_figure_side_length,
     ):
         return SourceFigureDecision.REJECTED, SourceMediaReasonCode.IMAGE_TOO_LARGE_DIMENSIONS.value
+    if _is_extreme_aspect_ratio(asset.width, asset.height):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.EXTREME_ASPECT_RATIO.value
+    if _is_below_minimum_dimensions(asset.width, asset.height):
+        return SourceFigureDecision.REJECTED, SourceMediaReasonCode.BELOW_MINIMUM_DIMENSIONS.value
     return SourceFigureDecision.ACCEPTED, "matched_archived_blob"
+
+
+def _is_extreme_aspect_ratio(width: int | None, height: int | None) -> bool:
+    return (
+        width is not None
+        and height is not None
+        and width > 0
+        and height > 0
+        and max(width / height, height / width) > MAX_SOURCE_FIGURE_ASPECT_RATIO
+    )
+
+
+def _is_below_minimum_dimensions(width: int | None, height: int | None) -> bool:
+    return (width is not None and width < 160) or (height is not None and height < 100)
 
 
 def _pdf_images(

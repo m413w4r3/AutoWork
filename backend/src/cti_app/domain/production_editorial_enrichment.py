@@ -25,12 +25,13 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 4
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
-EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v1"
+EDITORIAL_ENRICHMENT_V4_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-roles"
+EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v2-visual-review"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
 
@@ -249,10 +250,33 @@ class EnrichmentDiagramDirection(StrEnum):
     TOP_TO_BOTTOM = "top_to_bottom"
 
 
+# A wide strip of boxes is scaled down to the page width and its text becomes unreadable:
+# beyond these budgets a diagram is laid out top to bottom whatever direction was asked.
+DIAGRAM_VERTICAL_AFTER_NODES = 3
+DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS = 30
+
+
+def diagram_requires_vertical_layout(node_count: int, labels: Iterable[str]) -> bool:
+    """True when node count or label length makes a horizontal layout unreadable in print."""
+    return node_count > DIAGRAM_VERTICAL_AFTER_NODES or any(
+        len(label) > DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS for label in labels
+    )
+
+
 class DiagramRelationType(StrEnum):
     FACTUAL = "factual"
     INFERENCE = "inference"
     COMPARISON = "comparison"
+
+
+class DiagramNodeRole(StrEnum):
+    ACTOR = "actor"
+    VICTIM = "victim"
+    MALWARE_TOOL = "malware_tool"
+    INFRASTRUCTURE = "infrastructure"
+    DATA_ARTIFACT = "data_artifact"
+    TECHNIQUE_STEP = "technique_step"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,10 +284,13 @@ class DiagramNodeV1:
     node_id: str
     label: str
     evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+    role: DiagramNodeRole = DiagramNodeRole.UNKNOWN
 
     def __post_init__(self) -> None:
         _text(self.node_id, "Diagram node ID", semantic=True)
         _diagram_label(self.label, "Diagram node label")
+        if not isinstance(self.role, DiagramNodeRole):
+            raise ValueError("Diagram node role is invalid")
         object.__setattr__(
             self,
             "evidence_refs",
@@ -661,7 +688,7 @@ class EditorialEnrichmentV1:
     resource_proposals: tuple[EditorialResourceProposalV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4}:
+        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4, 5}:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -677,6 +704,8 @@ class EditorialEnrichmentV1:
             if self.schema_version == 2
             else EDITORIAL_ENRICHMENT_V3_POLICY_VERSION
             if self.schema_version == 3
+            else EDITORIAL_ENRICHMENT_V4_POLICY_VERSION
+            if self.schema_version == 4
             else EDITORIAL_ENRICHMENT_POLICY_VERSION
         )
         if self.enrichment_policy_version != expected_policy:
@@ -834,14 +863,16 @@ def _table_to_json(table: TableSpecV1, *, include_analytic: bool = False) -> dic
     return payload
 
 
-def _diagram_to_json(diagram: DiagramSpecV1, *, include_analytic: bool = False) -> dict[str, Any]:
+def _diagram_to_json(
+    diagram: DiagramSpecV1, *, include_analytic: bool = False, include_roles: bool = True
+) -> dict[str, Any]:
     payload = {
         "key": diagram.key,
         "kind": diagram.kind.value,
         "title": diagram.title,
         "caption": diagram.caption,
         "direction": diagram.direction.value,
-        "nodes": [diagram_node_to_json(node) for node in diagram.nodes],
+        "nodes": [diagram_node_to_json(node, include_role=include_roles) for node in diagram.nodes],
         "edges": [
             diagram_edge_to_json(edge, include_relation_type=include_analytic)
             for edge in diagram.edges
@@ -858,12 +889,15 @@ def _diagram_to_json(diagram: DiagramSpecV1, *, include_analytic: bool = False) 
     return payload
 
 
-def diagram_node_to_json(node: DiagramNodeV1) -> dict[str, Any]:
-    return {
+def diagram_node_to_json(node: DiagramNodeV1, *, include_role: bool = True) -> dict[str, Any]:
+    payload = {
         "node_id": node.node_id,
         "label": node.label,
         "evidence_refs": [evidence_ref_to_json(ref) for ref in node.evidence_refs],
     }
+    if include_role:
+        payload["role"] = node.role.value
+    return payload
 
 
 def diagram_edge_to_json(
@@ -976,7 +1010,11 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
             for table in enrichment.tables
         ],
         "diagrams": [
-            _diagram_to_json(diagram, include_analytic=enrichment.schema_version >= 4)
+            _diagram_to_json(
+                diagram,
+                include_analytic=enrichment.schema_version >= 4,
+                include_roles=enrichment.schema_version >= 5,
+            )
             for diagram in enrichment.diagrams
         ],
         "source_figures": [_figure_to_json(figure) for figure in enrichment.source_figures],
@@ -1017,6 +1055,7 @@ _ROOT_KEYS_V1 = frozenset(
 _ROOT_KEYS_V2 = _ROOT_KEYS_V1 | {"annotations"}
 _ROOT_KEYS_V3 = _ROOT_KEYS_V2 | {"figure_decisions", "resource_needs", "resource_proposals"}
 _ROOT_KEYS_V4 = _ROOT_KEYS_V3
+_ROOT_KEYS_V5 = _ROOT_KEYS_V4
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
@@ -1034,7 +1073,8 @@ _PURPOSE_KEYS = frozenset(
         "placement_reason",
     }
 )
-_NODE_KEYS = frozenset({"node_id", "label", "evidence_refs"})
+_NODE_BASE_KEYS = frozenset({"node_id", "label", "evidence_refs"})
+_NODE_KEYS = _NODE_BASE_KEYS | {"role"}
 _EDGE_BASE_KEYS = frozenset({"source_node_id", "target_node_id", "label", "evidence_refs"})
 _EDGE_KEYS = _EDGE_BASE_KEYS | {"relation_type"}
 _GROUP_KEYS = frozenset({"group_id", "label", "node_ids"})
@@ -1209,12 +1249,20 @@ def _table_from_json(raw: Any, *, require_analytic: bool = False) -> TableSpecV1
     )
 
 
-def _node_from_json(raw: Any) -> DiagramNodeV1:
-    payload = _object(raw, _NODE_KEYS, "Diagram node")
+def _node_from_json(raw: Any, *, require_role: bool = False) -> DiagramNodeV1:
+    valid_keys = _NODE_KEYS if require_role else _NODE_BASE_KEYS
+    if not isinstance(raw, Mapping) or frozenset(raw) != valid_keys:
+        raise ValueError("Diagram node has missing or extra fields")
+    payload = raw
     return DiagramNodeV1(
         node_id=_text(payload["node_id"], "Diagram node ID", semantic=True),
         label=_text(payload["label"], "Diagram node label", semantic=True),
         evidence_refs=_refs_from_json(payload["evidence_refs"], "Diagram node evidence references"),
+        role=(
+            _enum(DiagramNodeRole, payload["role"], "Diagram node role")
+            if "role" in payload
+            else DiagramNodeRole.UNKNOWN
+        ),
     )
 
 
@@ -1253,7 +1301,9 @@ def _group_from_json(raw: Any) -> DiagramGroupV1:
     )
 
 
-def _diagram_from_json(raw: Any, *, require_analytic: bool = False) -> DiagramSpecV1:
+def _diagram_from_json(
+    raw: Any, *, require_analytic: bool = False, require_roles: bool = False
+) -> DiagramSpecV1:
     allowed_key_sets = (
         {_DIAGRAM_ANALYTIC_BASE_KEYS, _DIAGRAM_ANALYTIC_KEYS}
         if require_analytic
@@ -1271,7 +1321,10 @@ def _diagram_from_json(raw: Any, *, require_analytic: bool = False) -> DiagramSp
         title=_text(payload["title"], "Diagram title", semantic=True),
         caption=caption,
         direction=_enum(EnrichmentDiagramDirection, payload["direction"], "Diagram direction"),
-        nodes=tuple(_node_from_json(value) for value in _array(payload["nodes"], "Diagram nodes")),
+        nodes=tuple(
+            _node_from_json(value, require_role=require_roles)
+            for value in _array(payload["nodes"], "Diagram nodes")
+        ),
         edges=tuple(
             _edge_from_json(value, require_relation_type=require_analytic)
             for value in _array(payload["edges"], "Diagram edges")
@@ -1435,7 +1488,7 @@ def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1-V4 payloads; older artifacts retain empty review data."""
+    """Decode strict V1-V5 payloads; older artifacts retain empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
@@ -1446,6 +1499,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         2: _ROOT_KEYS_V2,
         3: _ROOT_KEYS_V3,
         4: _ROOT_KEYS_V4,
+        5: _ROOT_KEYS_V5,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")
@@ -1474,7 +1528,9 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
             for value in _array(body["tables"], "Editorial tables")
         ),
         diagrams=tuple(
-            _diagram_from_json(value, require_analytic=schema_version >= 4)
+            _diagram_from_json(
+                value, require_analytic=schema_version >= 4, require_roles=schema_version >= 5
+            )
             for value in _array(body["diagrams"], "Editorial diagrams")
         ),
         source_figures=tuple(

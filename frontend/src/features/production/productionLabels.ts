@@ -30,8 +30,6 @@ export const BLOCKING_REASON_LABELS: Record<string, string> = {
 
 /** Operator-facing messages for the production batch command refusals. */
 export const PRODUCTION_ERROR_LABELS: Record<string, string> = {
-  production_insufficient_subject_evidence:
-    "Le sujet n’est étayé que par quelques éléments directs. Vérifiez les sources avant de produire une synthèse.",
   production_edition_archived:
     "L’édition est archivée : aucune production ne peut être démarrée.",
   production_batch_active:

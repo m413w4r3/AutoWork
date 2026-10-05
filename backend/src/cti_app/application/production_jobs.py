@@ -491,6 +491,19 @@ def register_production_jobs(
                 )
             await dispatch_reconciled_stage(retry.run, context, resume=False)
             return f"production-reconciliation://{parameters.run_id}#released"
+        identity = run.reconciliation
+        if (
+            run.status is ProductionRunStatus.RUNNING
+            and run.error_code is None
+            and identity is not None
+            and identity.output_sha256 is not None
+            and identity.provenance == "automatic_bridge_retrieval"
+        ):
+            # An API probe already adopted the answer and reopened the run without
+            # dispatching its stage. The resume job key is deterministic, so this
+            # is a no-op when the stage was dispatched in the meantime.
+            await dispatch_reconciled_stage(run, context, resume=True)
+            return f"production-reconciliation://{parameters.run_id}#resumed"
         if run.requires_reconciliation and (
             parameters.attempt + 1 < PRODUCTION_RECONCILIATION_RESUME_MAX_ATTEMPTS
         ):

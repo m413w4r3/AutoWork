@@ -283,6 +283,7 @@ export interface ArtifactResponse {
   canonical_content:
     | PublicationDocumentV4
     | PublicationDocumentV5
+    | PublicationDocumentV6
     | ProductionExtractionV1
     | ProductionSynthesisV1
     | ExtractionDocumentV2
@@ -611,7 +612,7 @@ export type ProductionSynthesisSectionKindV1 =
   | "other";
 
 export const PRODUCTION_SYNTHESIS_POLICY_VERSION =
-  "production-synthesis-v1" as const;
+  "production-synthesis-v2-editorial-title-source-notes" as const;
 
 /**
  * Canonical identity of one piece of evidence. The ``evidence_key`` is an
@@ -646,9 +647,15 @@ export interface ProductionSynthesisUncertaintyV1 {
   source_document_ids: string[];
 }
 
+export interface ProductionSynthesisSourceNoteV1 {
+  source_document_id: string;
+  text: string;
+  evidence_refs: ProductionSynthesisEvidenceRefV1[];
+}
+
 /** Mirror of the backend ``ProductionSynthesisV1`` canonical payload. */
 export interface ProductionSynthesisV1 {
-  schema_version: 1;
+  schema_version: 2;
   subject_id: string;
   production_input_hash: string;
   extraction_hash: string;
@@ -658,6 +665,7 @@ export interface ProductionSynthesisV1 {
   lead: ProductionSynthesisParagraphV1[];
   sections: ProductionSynthesisSectionV1[];
   timeline: ProductionSynthesisTimelineEntryV1[];
+  source_notes: ProductionSynthesisSourceNoteV1[];
   uncertainties: ProductionSynthesisUncertaintyV1[];
   warnings: string[];
 }
@@ -768,27 +776,29 @@ function isSynthesisUncertainty(
   );
 }
 
-/** Decode only exact canonical V1 payloads; unknown fields are refused. */
+/** Decode only exact canonical synthesis V2 payloads; unknown fields are refused. */
 export function isProductionSynthesisV1(
   value: unknown,
 ): value is ProductionSynthesisV1 {
+  if (!isRecord(value)) return false;
+  const keys = [
+    "schema_version",
+    "subject_id",
+    "production_input_hash",
+    "extraction_hash",
+    "publication_language",
+    "synthesis_policy_version",
+    "title",
+    "lead",
+    "sections",
+    "timeline",
+    "source_notes",
+    "uncertainties",
+    "warnings",
+  ];
   return (
-    isRecord(value) &&
-    hasExactKeys(value, [
-      "schema_version",
-      "subject_id",
-      "production_input_hash",
-      "extraction_hash",
-      "publication_language",
-      "synthesis_policy_version",
-      "title",
-      "lead",
-      "sections",
-      "timeline",
-      "uncertainties",
-      "warnings",
-    ]) &&
-    value.schema_version === 1 &&
+    hasExactKeys(value, keys) &&
+    value.schema_version === 2 &&
     isUuid(value.subject_id) &&
     isSha256(value.production_input_hash) &&
     isSha256(value.extraction_hash) &&
@@ -801,6 +811,21 @@ export function isProductionSynthesisV1(
     value.sections.every(isSynthesisSection) &&
     Array.isArray(value.timeline) &&
     value.timeline.every(isSynthesisTimelineEntry) &&
+    Array.isArray(value.source_notes) &&
+    value.source_notes.every(
+      (note) =>
+        isRecord(note) &&
+        hasExactKeys(note, ["source_document_id", "text", "evidence_refs"]) &&
+        isUuid(note.source_document_id) &&
+        isNonEmptyString(note.text) &&
+        Array.isArray(note.evidence_refs) &&
+        note.evidence_refs.length > 0 &&
+        note.evidence_refs.every(
+          (ref) =>
+            isSynthesisEvidenceRef(ref) &&
+            ref.source_document_id === note.source_document_id,
+        ),
+    ) &&
     Array.isArray(value.uncertainties) &&
     value.uncertainties.every(isSynthesisUncertainty) &&
     isNonEmptyStringArray(value.warnings)
@@ -1071,7 +1096,34 @@ export interface PublicationDocumentV5 extends Omit<
   rich_text: PublicationSemanticTextV1;
 }
 
-export type PublicationDocument = PublicationDocumentV4 | PublicationDocumentV5;
+export interface PublicationReferenceEntryV1 {
+  source_document_id: string;
+  text: string;
+  evidence_refs: PublicationEvidenceRefV1[];
+}
+
+export interface PublicationIndicatorGroupV1 {
+  artifact_type: string;
+  indicators: Array<{
+    value: string;
+    normalized_value: string;
+    artifact_type: string;
+    source_document_ids: string[];
+  }>;
+}
+
+export interface PublicationDocumentV6 extends Omit<
+  PublicationDocumentV4,
+  "schema_version"
+> {
+  schema_version: "6";
+  references: PublicationReferenceEntryV1[];
+  original_indicators: PublicationIndicatorGroupV1[];
+  rich_text: PublicationSemanticTextV1;
+}
+
+export type PublicationDocument =
+  PublicationDocumentV4 | PublicationDocumentV5 | PublicationDocumentV6;
 
 export type PublicationPreviewStatus =
   "IN_PROGRESS" | "READY" | "FAILED" | "STALE";
@@ -1140,10 +1192,6 @@ export async function importProductionState(
 export async function retryProductionStage(
   subjectId: string,
   stage: ProductionStage,
-  options: {
-    overrideInsufficientSubjectEvidence?: boolean;
-    overrideReason?: string;
-  } = {},
 ): Promise<{
   run_id: string;
   status: string;
@@ -1153,15 +1201,7 @@ export async function retryProductionStage(
   return request(`/api/subjects/${subjectId}/production/retry`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      stage,
-      ...(options.overrideInsufficientSubjectEvidence
-        ? { override_insufficient_subject_evidence: true }
-        : {}),
-      ...(options.overrideReason
-        ? { override_reason: options.overrideReason }
-        : {}),
-    }),
+    body: JSON.stringify({ stage }),
   });
 }
 

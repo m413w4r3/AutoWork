@@ -90,10 +90,12 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramNodeRole,
     DiagramRelationType,
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
     EditorialEnrichmentRevisionOutcome,
+    EnrichmentDiagramDirection,
     EnrichmentPlacementKind,
     EnrichmentTableKind,
     ResolvedSourceFigureV1,
@@ -632,8 +634,11 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert isinstance(contract, str)
     assert "COLUMN C001" in contract and "ROW R001" in contract
     assert "NODE N001" in contract and "RELATION L001" in contract
-    assert "RELATION_TYPE: comparison" in contract and "NO USEFUL ENRICHMENT" in contract
-    assert "RELATION_TYPE: factual | inference | comparison" in contract
+    assert "ROLE: infrastructure" in contract
+    assert "TITLE: Résolution via une adresse Bitcoin" in contract
+    assert "RELATION_TYPE is required" in contract
+    assert "factual | inference | comparison" in contract
+    assert "NO USEFUL ENRICHMENT" in contract
     assert "FIGURE P001" in contract and "NEEDS N001" in contract
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
@@ -675,12 +680,15 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "diagram_nodes" not in request.text
     assert "row or node target exists" in request.text
     assert "control-plane and data-plane" in request.text
+    assert "diagram_node_roles" in prompt_payload["editorial_guidance"]
+    assert prompt_payload["editorial_guidance"]["diagram_layout_budgets"]["maximum_nodes"] == 8
+    assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
     assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
         enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
     )
 
 
-def test_parser_does_not_impose_table_row_or_diagram_node_targets() -> None:
+def test_parser_keeps_table_rows_unbounded_and_accepts_eight_diagram_nodes() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
@@ -704,17 +712,37 @@ def test_parser_does_not_impose_table_row_or_diagram_node_targets() -> None:
             diagram.nodes[0].model_copy(
                 update={"node_id": f"component_{index}", "label": f"Component {index}"}
             )
-            for index in range(3, 52)
+            for index in range(3, 9)
         ),
     )
-    diagram = diagram.model_copy(update={"nodes": nodes})
+    diagram = diagram.model_copy(
+        update={"nodes": nodes, "direction": EnrichmentDiagramDirection.TOP_TO_BOTTOM}
+    )
     proposal = proposal.model_copy(update={"tables": (table,), "diagrams": (diagram,)})
 
     result = parse_editorial_enrichment_proposal_wire(_proposal_to_wire(proposal), pack)
 
     assert result.proposal is not None
     assert len(result.proposal.tables[0].rows) == 51
-    assert len(result.proposal.diagrams[0].nodes) == 51
+    assert len(result.proposal.diagrams[0].nodes) == 8
+
+
+def test_diagram_with_long_labels_requires_top_to_bottom_direction() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001")).replace(
+        "LABEL: ExampleRAT", "LABEL: Résolution Bitcoin serveur C2 iranien", 1
+    )
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" in {
+        item.reason_code for item in result.rejections
+    }
 
 
 def test_purpose_is_required_and_duplicate_questions_reject_only_one_sibling() -> None:
@@ -833,8 +861,8 @@ def test_factual_relation_needs_both_endpoints_in_the_same_cited_evidence_item()
         "KIND: infection_chain", "KIND: component_relationship", 1
     )
     wire = wire.replace(
-        "ID: execution\nLABEL: Execution\nEVIDENCE: E001",
-        "ID: execution\nLABEL: OP_RETURN\nEVIDENCE: E002",
+        "ID: execution\nLABEL: Execution\nROLE: unknown\nEVIDENCE: E001",
+        "ID: execution\nLABEL: OP_RETURN\nROLE: unknown\nEVIDENCE: E002",
         1,
     )
     wire = wire.replace(
@@ -897,8 +925,8 @@ def test_link_not_demonstrated_projection_rejects_a_factual_cross_source_edge() 
         _reserve_handle_to_ref={"R001": first_ref, "R002": second_ref},
     )
     wire = _proposal_to_wire(_proposal("E001")).replace(
-        "ID: execution\nLABEL: Execution\nEVIDENCE: E001",
-        "ID: execution\nLABEL: Execution\nEVIDENCE: E002",
+        "ID: execution\nLABEL: Execution\nROLE: unknown\nEVIDENCE: E001",
+        "ID: execution\nLABEL: Execution\nROLE: unknown\nEVIDENCE: E002",
         1,
     )
 
@@ -978,7 +1006,7 @@ def _figure_wire(
     return "\n".join(line for line in lines if line)
 
 
-def test_figure_proposal_selects_local_asset_and_downgrades_ungrounded_caption() -> None:
+def test_figure_proposal_selects_local_asset_with_the_model_written_caption() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
@@ -996,12 +1024,12 @@ def test_figure_proposal_selects_local_asset_and_downgrades_ungrounded_caption()
 
     selected = enrichment.source_figures[0]
     assert selected.inclusion_status.value == "included"
-    assert selected.caption == "ExampleRAT execution architecture"
+    assert selected.caption == "Brand-new unsupported claim"
     assert selected.resolved_figure is not None
     assert selected.resolved_figure.sha256 == "f" * 64
     assert selected.resolved_figure.blob_id == UUID(int=601)
     assert selected.provenance == inventory.figures[0].provenance
-    assert "editorial_enrichment_figure_caption_downgraded:F001" in enrichment.warnings
+    assert "editorial_enrichment_figure_caption_downgraded:F001" not in enrichment.warnings
     trace = enrichment.figure_decisions[0]
     assert trace.decision.value == "included_by_model"
     assert trace.actor.value == "model_proposal"
@@ -1068,6 +1096,48 @@ def test_empty_figure_response_is_valid_and_model_cannot_supply_hash_or_image() 
     assert empty.proposal is not None and empty.proposal.figures == ()
     assert altered.proposal is None
     assert "editorial_enrichment_unknown_field" in {item.reason_code for item in altered.rejections}
+    enrichment = validate_editorial_enrichment_proposal(
+        empty.proposal, pack, extraction, synthesis, figure_catalog=catalog
+    )
+    assert "editorial_enrichment_no_figure_selected" in enrichment.warnings
+
+
+def test_figure_selection_accepts_at_most_three_figures() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    base_inventory = _figure_inventory(extraction)
+    template = base_inventory.accepted[0]
+    figures = tuple(
+        template.model_copy(
+            update={
+                "figure_id": UUID(int=700 + index),
+                "locator": replace(template.locator, figure_label=f"Candidate {index}"),
+            }
+        )
+        for index in range(9)
+    )
+    inventory = replace(
+        base_inventory,
+        figures=figures,
+        catalog_metadata={
+            figure.figure_id: base_inventory.catalog_metadata[template.figure_id]
+            for figure in figures
+        },
+    )
+    catalog = build_editorial_figure_catalog(extraction, inventory)
+
+    over_limit = "\n\n".join(
+        _figure_wire(handle=f"F{index:03d}").replace("FIGURE P001", f"FIGURE P{index:03d}")
+        for index in range(1, 5)
+    )
+    parsed = parse_editorial_enrichment_proposal_wire(over_limit, pack, figure_catalog=catalog)
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.figures) == 3
+    assert "editorial_enrichment_figure_limit_exceeded" in {
+        item.reason_code for item in parsed.rejections
+    }
 
 
 def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> None:
@@ -1096,7 +1166,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 4
+    assert enrichment.schema_version == 5
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -1281,7 +1351,8 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
 
     access_policy = asyncio.run(create_policy())
     pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
-    figure_catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+    inventory = _figure_inventory(extraction)
+    figure_catalog = build_editorial_figure_catalog(extraction, inventory)
     request = build_editorial_enrichment_model_request(
         run,
         snapshot,
@@ -1292,7 +1363,10 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
         figure_catalog=figure_catalog,
     )
 
-    assert request.web_search is False
+    # An accepted catalog figure makes the model look at the live article.
+    assert request.web_search is any(
+        entry.figure.decision.value == "accepted" for entry in figure_catalog
+    )
     assert request.background is False
     assert request.conversation is None
     assert request.routing_hint.value == "editorial_enrichment"
@@ -1303,7 +1377,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert str(source.id) not in request.text
     assert str(extraction.sources[0].source_document_id) not in request.text
     assert "https://cdn.example.test/example-rat.png" not in request.text
-    assert extraction.sources[0].canonical_url not in request.text
+    # The article URL is exposed only as each figure's source_page_url, so the
+    # model can open the page and look at the images.
+    assert request.text.count(extraction.sources[0].canonical_url) == len(figure_catalog)
     assert "F001" in request.text
     assert "ExampleRAT execution architecture" in request.text
     assert "640" in request.text and "400" in request.text
@@ -1311,8 +1387,10 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v6-table-diagram-only"
+        "editorial-enrichment-block-contract-v7-diagram-node-roles"
     )
+
+    assert "sélectionne de zéro à trois images" in request.text
 
     revision_request = ProductionEditorialEnrichmentRevisionService._model_request(
         request_identity="c" * 64,
@@ -1754,6 +1832,7 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
                     f"NODE N{index:03d}_{node_index:03d}",
                     f"ID: {node['node_id']}",
                     f"LABEL: {node['label']}",
+                    f"ROLE: {node['role']}",
                     f"EVIDENCE: {', '.join(node['evidence_handles'])}",
                     "END NODE",
                 ]
@@ -2992,6 +3071,13 @@ def test_real_run_wire_fixture_keeps_evidence_backed_enrichments_and_needs() -> 
     )
     assert [item.key for item in parsed.proposal.diagrams] == ["iran_bitcoin_bdd_flow"]
     diagram = parsed.proposal.diagrams[0]
+    assert diagram.kind.value == "network_flow"
+    assert [node.role.value for node in diagram.nodes] == [
+        "data_artifact",
+        "victim",
+        "data_artifact",
+        "infrastructure",
+    ]
     assert [edge.relation_type for edge in diagram.edges] == [
         DiagramRelationType.FACTUAL,
         DiagramRelationType.FACTUAL,
@@ -3001,10 +3087,9 @@ def test_real_run_wire_fixture_keeps_evidence_backed_enrichments_and_needs() -> 
         item.reason_code.startswith("editorial_enrichment_diagram_relation_")
         for item in parsed.rejections
     )
-    normalized_count = sum(
+    assert not any(
         "editorial_enrichment_relation_type_normalized:" in item for item in parsed.warnings
     )
-    assert normalized_count == 3
     assert [item.key for item in parsed.proposal.resource_needs] == ["N001"]
     assert len(parsed.proposal.annotations) == 7
     assert {item.paragraph_anchor for item in parsed.proposal.annotations} == {
@@ -3038,6 +3123,37 @@ def test_relation_type_synonyms_normalize_only_for_infection_chain() -> None:
     assert rejected.proposal.diagrams == ()
     assert "editorial_enrichment_diagram_relation_type_invalid" in {
         item.reason_code for item in rejected.rejections
+    }
+
+
+def test_diagram_node_role_defaults_with_warning_for_legacy_wire() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, _synthesis(extraction))
+    wire = _proposal_to_wire(_proposal("E001")).replace("ROLE: unknown\n", "", 1)
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.diagrams[0].nodes[0].role is DiagramNodeRole.UNKNOWN
+    assert any(
+        warning.startswith("editorial_enrichment_diagram_node_role_missing:")
+        for warning in parsed.warnings
+    )
+
+
+def test_diagram_node_rejects_role_outside_closed_vocabulary() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, _synthesis(extraction))
+    wire = _proposal_to_wire(_proposal("E001")).replace("ROLE: unknown", "ROLE: analyst", 1)
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_node_role_invalid" in {
+        item.reason_code for item in parsed.rejections
     }
 
 
@@ -3234,3 +3350,27 @@ def test_source_figure_inventory_warning_only_reports_pending_items() -> None:
     assert warning in enrichment_module._source_figure_inventory_warnings(pending)
     assert warning in enrichment_module._source_figure_inventory_warnings(page_excerpt)
     assert warning in enrichment_module._source_figure_inventory_warnings(oversized_source)
+
+
+def test_translated_diagram_labels_are_grounded_by_their_cited_english_evidence() -> None:
+    # Real 2026-10-05 output: French labels over English evidence were all rejected
+    # as endpoint_unsupported because no label token appeared in the record.
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    english = {
+        "handle": "E001",
+        "context": "The device sends an RPC request to the contract and then it is from "
+        "the contract that the malware reads the address of the C2 server.",
+    }
+    translated_pack = replace(pack, narrative_evidence=(english,), technical_evidence=())
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("LABEL: ExampleRAT", "LABEL: Machine compromise", 1)
+    wire = wire.replace("LABEL: Execution", "LABEL: Serveur hors chaîne", 1)
+    wire = wire.replace("LABEL: launches", "LABEL: interroge puis contacte", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, translated_pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.diagrams) == 1

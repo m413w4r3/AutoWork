@@ -108,10 +108,29 @@ async def test_dns_rebinding_is_blocked_when_answers_change_before_connection() 
     resolver = StaticResolver([(PUBLIC_IP,), ("127.0.0.1",)])
     transport = QueueTransport([])
 
-    with pytest.raises(UnsafeAddressError, match="changed"):
+    with pytest.raises(UnsafeAddressError, match="Non-public"):
         await SafeHttpCollector(transport, resolver).fetch("https://public.example/report")
 
     assert transport.requests == []
+
+
+async def test_mixed_public_and_private_answer_is_blocked() -> None:
+    resolver = StaticResolver([(PUBLIC_IP, "10.0.0.8"), (PUBLIC_IP,)])
+    transport = QueueTransport([])
+
+    with pytest.raises(UnsafeAddressError, match="Non-public"):
+        await SafeHttpCollector(transport, resolver).fetch("https://public.example/report")
+
+    assert transport.requests == []
+
+
+async def test_rotating_public_cdn_answers_are_accepted_and_pinned() -> None:
+    resolver = StaticResolver([("2.22.250.138",), ("2.22.250.149",)])
+    transport = QueueTransport([response()])
+
+    await SafeHttpCollector(transport, resolver).fetch("https://public.example/report")
+
+    assert [request.approved_ip for request in transport.requests] == ["2.22.250.138"]
 
 
 async def test_total_timeout_includes_dns_resolution() -> None:

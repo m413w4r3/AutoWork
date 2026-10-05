@@ -1,56 +1,60 @@
 DIAGRAM D001
 KEY: iran_bitcoin_bdd_flow
-KIND: infection_chain
-TITLE: Chaîne de résolution C2 via Bitcoin
+KIND: network_flow
+TITLE: Flux de résolution C2 via Bitcoin
 PURPOSE: Comment le malware récupère-t-il des données C2 depuis la blockchain avant de rejoindre l’infrastructure hors chaîne ?
 DATA: Les transactions Bitcoin stockent des données de routage C2 encodées ; les appareils compromis interrogent les emplacements blockchain par RPC, décodent les données puis se connectent à l’infrastructure hors chaîne.
 GAIN: Une séquence visuelle distingue clairement la fonction de stockage/résolution on-chain de la phase de communication hors chaîne.
 SCOPE: Uniquement le mécanisme de récupération BDD décrit pour le cas iranien et la séquence générique explicitement documentée pour les BDD.
 PURPOSE_EVIDENCE: E011, E023, E029
 LIMITS: E011 et E023 décrivent le fonctionnement général des BDD ; les éléments fournis n’établissent pas que chaque étape ou chaque type de charge mentionné dans E023 est spécifique au cas iranien.
-DIRECTION: left_to_right
+DIRECTION: top_to_bottom
 PLACEMENT: after_section
 SECTION_INDEX: 1
 PLACEMENT_REASON: Le diagramme complète le paragraphe décrivant la chaîne de récupération on-chain puis le passage hors chaîne.
 NODE N001
 ID: bitcoin_transaction
-LABEL: Transaction Bitcoin contenant des données de routage C2 encodées
+ROLE: data_artifact
+LABEL: Transaction Bitcoin
 EVIDENCE: E029
 END NODE
 NODE N002
 ID: compromised_device
-LABEL: Appareil compromis interrogeant l’emplacement blockchain
+ROLE: victim
+LABEL: Appareil compromis
 EVIDENCE: E011
 END NODE
 NODE N003
 ID: decoded_c2_data
+ROLE: data_artifact
 LABEL: Données C2 décodées
 EVIDENCE: E011
 END NODE
 NODE N004
 ID: offchain_infrastructure
+ROLE: infrastructure
 LABEL: Infrastructure hors chaîne
 EVIDENCE: E011, E023
 END NODE
 RELATION L001
 FROM: compromised_device
 TO: bitcoin_transaction
-RELATION_TYPE: infection_chain
-LABEL: récupère les données de routage C2
+RELATION_TYPE: factual
+LABEL: interroge
 EVIDENCE: E029
 END RELATION
 RELATION L002
 FROM: bitcoin_transaction
 TO: decoded_c2_data
-RELATION_TYPE: infection_chain
-LABEL: données récupérées puis décodées
+RELATION_TYPE: factual
+LABEL: décode
 EVIDENCE: E011, E029
 END RELATION
 RELATION L003
 FROM: decoded_c2_data
 TO: offchain_infrastructure
-RELATION_TYPE: infection_chain
-LABEL: permet la connexion à l’infrastructure récupérée
+RELATION_TYPE: factual
+LABEL: permet connexion
 EVIDENCE: E011
 END RELATION
 END DIAGRAM

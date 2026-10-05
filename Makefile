@@ -22,6 +22,27 @@ FRONTEND_DIR := frontend
 # Keep this in sync with compose.yaml "name:".
 COMPOSE_PROJECT ?= cti-bulletin
 
+# Application stack files. compose.models.yaml joins the external MetaHarness
+# network so the services reach the ChatGPT Bridge by its Docker name; without it
+# they fall back to host.docker.internal, which the loopback-only Bridge refuses.
+# A recreate (make up) must never silently drop that connection, so the override
+# follows the network:
+#   COMPOSE_MODELS=auto  (default) use it when the network exists
+#   COMPOSE_MODELS=on    require it (fails if the network is missing)
+#   COMPOSE_MODELS=off   standalone compose.yaml only
+MODEL_PROVIDERS_NETWORK ?= metaharness-models
+COMPOSE_MODELS ?= auto
+ifeq ($(COMPOSE_MODELS),auto)
+COMPOSE_MODELS_ACTIVE := $(shell $(DOCKER) network inspect $(MODEL_PROVIDERS_NETWORK) >/dev/null 2>&1 && echo on || echo off)
+else
+COMPOSE_MODELS_ACTIVE := $(COMPOSE_MODELS)
+endif
+ifeq ($(COMPOSE_MODELS_ACTIVE),on)
+STACK_COMPOSE = $(COMPOSE) -f compose.yaml -f compose.models.yaml
+else
+STACK_COMPOSE = $(COMPOSE) -f compose.yaml
+endif
+
 # PostgreSQL dedicated to integration tests.
 TEST_POSTGRES_PORT ?= 55432
 
@@ -209,21 +230,23 @@ reset-backend-env: ## Supprime et recrée complètement backend/.venv
 # ==============================================================================
 
 up: ## Démarre la stack applicative
-	$(COMPOSE) up -d --build --wait
+	@echo "Stack: compose.models.yaml override = $(COMPOSE_MODELS_ACTIVE)"
+	$(STACK_COMPOSE) up -d --build --wait
 
 down: ## Arrête la stack applicative
-	$(COMPOSE) down
+	$(STACK_COMPOSE) down
 
 dev: ## Démarre la stack au premier plan
-	$(COMPOSE) up --build
+	@echo "Stack: compose.models.yaml override = $(COMPOSE_MODELS_ACTIVE)"
+	$(STACK_COMPOSE) up --build
 
 stop: down ## Alias de make down
 
 status: ## Affiche l'état des conteneurs
-	$(COMPOSE) ps
+	$(STACK_COMPOSE) ps
 
 logs: ## Suit les logs principaux
-	$(COMPOSE) logs --tail=200 -f \
+	$(STACK_COMPOSE) logs --tail=200 -f \
 		backend \
 		worker \
 		job-recovery \
@@ -237,7 +260,7 @@ logs: ## Suit les logs principaux
 # WARNING:
 # This target deliberately removes application data.
 clean: ## ATTENTION: supprime les données applicatives locales
-	$(COMPOSE) down
+	$(STACK_COMPOSE) down
 	@for volume in $(CLEAN_VOLUMES); do \
 		$(DOCKER) volume rm -f \
 			"$(COMPOSE_PROJECT)_$$volume" \
@@ -397,7 +420,7 @@ model-run-diagnostics: ## Diagnostic d'un model run: RUN_ID=<uuid>
 		echo "Usage: make model-run-diagnostics RUN_ID=<uuid>" >&2; \
 		exit 2 \
 	)
-	$(COMPOSE) exec -T backend \
+	$(STACK_COMPOSE) exec -T backend \
 		python -m cti_app.model_run_diagnostics "$(RUN_ID)"
 
 # Timeline of var/diagnostics/events.jsonl.

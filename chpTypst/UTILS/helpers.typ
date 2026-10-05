@@ -369,10 +369,10 @@
 
 #let ioc-list(
   title: [IOC],
+  note: none,
   ips: [],
   domains: [],
   urls: [],
-  files: [],
   emails: [],
   hashes: [],
 ) = {
@@ -402,10 +402,13 @@
   let urls = parse-list(urls)
   let emails = parse-list(emails)
   let hashes = parse-list(hashes)
-  let files = parse-list(files)
 
   [
     #text(size: 13pt, fill:purple-dark)[*#title*]
+    #if note != none and note != "" [
+      #text(size: 9pt)[#note]
+      #linebreak()
+    ]
 
     #if ips.len() > 0 [
       Adresses IP : \
@@ -428,14 +431,10 @@
     ]
 
     #if hashes.len() > 0 [
-      Empreintes (hashes) : \
+      Fichiers : \
       #ioc-listt(hashes)
     ]
 
-    #if files.len() > 0 [
-      Fichiers : \
-      #ioc-listt(files)
-    ]
   ]
 }
 

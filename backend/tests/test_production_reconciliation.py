@@ -349,6 +349,41 @@ async def test_adoption_resumes_same_generation_and_repeats_idempotently(
 
 
 @pytest.mark.asyncio
+async def test_automatic_adoption_without_a_job_is_resumed_once(
+    fixture: ReconciliationFixture,
+) -> None:
+    """A probe from the API adopts and reopens the run but dispatches nothing."""
+    service, uow, gateway, _, jobs = fixture
+    run = next(iter(uow.production_runs.runs.values()))
+    content = b"# recovered\n\nanswer"
+    digest = hashlib.sha256(content).hexdigest()
+
+    # Still waiting on the provider: nothing to resume.
+    assert await service.schedule_resume_after_automatic_adoption(run.id) is None
+    assert jobs.submissions == 0
+
+    await gateway.adopt_recovery_output(
+        gateway.model.id,
+        content,
+        provenance="automatic_bridge_retrieval",
+        actor_id="system:production-reconciliation",
+    )
+    run.adopt_reconciliation_output(
+        output_sha256=digest, provenance="automatic_bridge_retrieval", bridge_response_id="bridge-1"
+    )
+    run.resume_reconciled(expected_stage=ProductionStage.EXTRACTION)
+    assert run.status is ProductionRunStatus.RUNNING
+
+    job_id = await service.schedule_resume_after_automatic_adoption(run.id)
+
+    assert job_id is not None
+    assert jobs.submissions == 1
+    assert run.pipeline_generation == 7
+    assert await service.schedule_resume_after_automatic_adoption(run.id) == job_id
+    assert jobs.submissions == 1
+
+
+@pytest.mark.asyncio
 async def test_manual_adoption_has_no_visible_preview_or_provider_call(
     fixture: ReconciliationFixture,
 ) -> None:

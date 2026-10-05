@@ -223,7 +223,6 @@ class SqlAlchemyProductionRunRepository:
             error_code=run.error_code,
             error_message=run.error_message,
             error_details=run.error_details,
-            review_overrides=run.review_overrides,
             reconciliation_model_run_id=(
                 run.reconciliation.model_run_id if run.reconciliation is not None else None
             ),
@@ -296,7 +295,6 @@ class SqlAlchemyProductionRunRepository:
                 error_code=run.error_code,
                 error_message=run.error_message,
                 error_details=run.error_details,
-                review_overrides=run.review_overrides,
                 reconciliation_model_run_id=(
                     run.reconciliation.model_run_id if run.reconciliation is not None else None
                 ),
@@ -1177,7 +1175,6 @@ def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
         error_code=row.error_code,
         error_message=row.error_message,
         error_details=row.error_details,
-        review_overrides=dict(row.review_overrides or {}),
         reconciliation=_reconciliation_from_values(
             production_run_id=row.id,
             model_run_id=row.reconciliation_model_run_id,

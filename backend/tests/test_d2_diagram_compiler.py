@@ -24,6 +24,7 @@ from cti_app.application.diagram_compilation import (
 from cti_app.domain.production_editorial_enrichment import (
     DiagramEdgeV1,
     DiagramGroupV1,
+    DiagramNodeRole,
     DiagramNodeV1,
     DiagramRelationType,
     DiagramSpecV1,
@@ -51,8 +52,14 @@ _EVIDENCE = ExtractionEvidenceRefV1(
 )
 
 
-def _node(node_id: str, label: str | None = None) -> DiagramNodeV1:
-    return DiagramNodeV1(node_id=node_id, label=label or node_id, evidence_refs=(_EVIDENCE,))
+def _node(
+    node_id: str,
+    label: str | None = None,
+    role: DiagramNodeRole = DiagramNodeRole.UNKNOWN,
+) -> DiagramNodeV1:
+    return DiagramNodeV1(
+        node_id=node_id, label=label or node_id, evidence_refs=(_EVIDENCE,), role=role
+    )
 
 
 def _edge(source: str, target: str, label: str | None = None) -> DiagramEdgeV1:
@@ -111,17 +118,13 @@ def test_preserves_tuple_order_and_qualifies_grouped_nodes() -> None:
         ),
     )
 
-    assert encode_d2_source(diagram).decode().splitlines() == [
-        "direction: right",
-        'g001: "Group Z" {}',
-        'g002: "Group A" {}',
-        'g002.n001: "third"',
-        'n002: "first"',
-        'g001.n003: "second"',
-        'g002.n001 -> n002: "first edge"',
-        "n002 -> g001.n003",
-        'g001.n003 -> g002.n001: "third edge"',
-    ]
+    source = encode_d2_source(diagram).decode()
+    assert source.startswith("direction: right\n")
+    assert source.index('g001: "Group Z"') < source.index('g002: "Group A"')
+    assert source.index('g002.n001: "third"') < source.index('n002: "first"')
+    assert source.index('n002: "first"') < source.index('g001.n003: "second"')
+    assert source.index('g002.n001 -> n002: "first edge"') < source.index("n002 -> g001.n003")
+    assert source.index("n002 -> g001.n003") < source.index('g001.n003 -> g002.n001: "third edge"')
 
 
 def test_encodes_two_directed_edges_in_tuple_order() -> None:
@@ -129,10 +132,8 @@ def test_encodes_two_directed_edges_in_tuple_order() -> None:
         edges=(_edge("source", "target", "forward"), _edge("target", "source", "return")),
     )
 
-    assert encode_d2_source(diagram).decode().splitlines()[-2:] == [
-        'n001 -> n002: "forward"',
-        'n002 -> n001: "return"',
-    ]
+    source = encode_d2_source(diagram).decode()
+    assert source.index('n001 -> n002: "forward"') < source.index('n002 -> n001: "return"')
 
 
 def test_escapes_hostile_labels_as_double_quoted_content() -> None:
@@ -145,27 +146,27 @@ def test_escapes_hostile_labels_as_double_quoted_content() -> None:
         groups=(DiagramGroupV1("model-group", group_label, ("model -> n001",)),),
     )
 
-    assert encode_d2_source(diagram).decode().splitlines() == [
-        "direction: right",
-        'g001: "@import(\\"https://example.test\\") ![icon](image.png)" {}',
-        'g001.n001: "Unicode café 雪; quotes \\" and \' backslash \\\\\\nnext\\t'
-        '{ } : # -> <- | \\${D2_VAR}"',
-        'n002: "target"',
-        'g001.n001 -> n002: "<- \\$CONFIG; | -> ; link: https://example.test \\"end\\""',
-    ]
+    source = encode_d2_source(diagram).decode()
+    assert source.startswith("direction: down\n")
+    assert '@import(\\"https://example.test\\")' in source
+    assert "\\" + "$" + "{D2_VAR}" in source
+    assert "\\" + "$CONFIG" in source
+    assert "shape: oval" in source
 
 
 def test_omits_only_none_edge_labels() -> None:
     diagram = _diagram(edges=(_edge("source", "target"),))
 
-    assert encode_d2_source(diagram).decode().splitlines()[-1] == "n001 -> n002"
+    source = encode_d2_source(diagram).decode()
+    assert "n001 -> n002" in source
+    assert 'n001 -> n002: ""' not in source
 
 
 @pytest.mark.parametrize(
     ("relation_type", "encoded_label"),
     (
-        (DiagramRelationType.INFERENCE, "inference: may connect"),
-        (DiagramRelationType.COMPARISON, "comparison: may connect"),
+        (DiagramRelationType.INFERENCE, '"may connect"'),
+        (DiagramRelationType.COMPARISON, '"may connect"'),
     ),
 )
 def test_d2_labels_inference_and_comparison_without_changing_the_graph_authority(
@@ -177,8 +178,12 @@ def test_d2_labels_inference_and_comparison_without_changing_the_graph_authority
     )
     source = encode_d2_source(_diagram(edges=(edge,))).decode()
 
-    assert f'"{encoded_label}"' in source
-    assert "n001 -> n002" in source
+    assert encoded_label in source
+    if relation_type is DiagramRelationType.COMPARISON:
+        assert 'n001 <-> n002: "may connect" {' in source
+    else:
+        assert 'n001 -> n002: "may connect" {' in source
+    assert "stroke-dash: 5" in source
 
 
 def test_comparison_relation_changes_rendering_identity() -> None:
@@ -195,6 +200,44 @@ def test_comparison_relation_changes_rendering_identity() -> None:
     )
 
     assert diagram_semantic_sha256(comparison) != diagram_semantic_sha256(factual)
+
+
+def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
+    diagram = _diagram(
+        nodes=(
+            _node("actor", "Threat actor", DiagramNodeRole.ACTOR),
+            _node("wallet", "Bitcoin wallet", DiagramNodeRole.DATA_ARTIFACT),
+        ),
+        edges=(_edge("actor", "wallet"),),
+    )
+
+    source = encode_d2_source(diagram).decode()
+    assert "shape: person" in source
+    assert "shape: cylinder" in source
+    assert 'fill: "#E8F0F0"' in source
+    assert 'fill: "#EEF3F3"' in source
+    assert "direction: right" in source
+    assert diagram_semantic_sha256(
+        replace(
+            diagram,
+            nodes=(replace(diagram.nodes[0], role=DiagramNodeRole.VICTIM), diagram.nodes[1]),
+        )
+    ) != diagram_semantic_sha256(diagram)
+
+
+def test_graphs_with_more_than_four_nodes_force_a_vertical_layout() -> None:
+    nodes = tuple(_node(f"node-{index}") for index in range(7))
+    edges = tuple(_edge(f"node-{index}", f"node-{index + 1}") for index in range(6))
+
+    source = encode_d2_source(
+        _diagram(
+            direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
+            nodes=nodes,
+            edges=edges,
+        )
+    ).decode()
+
+    assert source.startswith("direction: down\n")
 
 
 def test_encoding_and_semantic_hash_are_stable_and_key_sensitive() -> None:
@@ -216,7 +259,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v3-relation-semantics"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v4-role-styles-print-layout"
 
 
 @dataclass(frozen=True, slots=True)

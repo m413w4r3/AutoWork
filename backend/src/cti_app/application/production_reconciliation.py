@@ -273,6 +273,32 @@ class ProductionReconciliationService:
             release_visible=True,
         )
 
+    async def schedule_resume_after_automatic_adoption(self, run_id: UUID) -> UUID | None:
+        """Dispatch the resume job for a run the resolver already adopted and reopened.
+
+        The resolver adopts the exact bridge answer and sets the run back to
+        RUNNING, but only the probe job handler used to dispatch the stage
+        afterwards. A probe triggered from the API would leave the run RUNNING
+        with no job at all. The job key is deterministic, so repeating this is
+        safe.
+        """
+        async with self._uow_factory() as uow:
+            run = await uow.production_runs.get(run_id)
+        reconciliation = run.reconciliation if run is not None else None
+        if (
+            run is None
+            or reconciliation is None
+            or reconciliation.output_sha256 is None
+            or reconciliation.provenance != "automatic_bridge_retrieval"
+            or run.status is not ProductionRunStatus.RUNNING
+            or run.error_code is not None
+        ):
+            return None
+        job_id, _ = await self._resume_and_schedule(
+            run_id, reconciliation, reconciliation.output_sha256, reconciliation.provenance
+        )
+        return job_id
+
     async def abandon_visible(self, run_id: UUID) -> dict[str, Any]:
         _, reconciliation, model = await self._load_review(run_id)
         if model.backend is not ModelBackend.CHATGPT_BRIDGE:

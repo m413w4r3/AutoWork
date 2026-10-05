@@ -601,7 +601,7 @@ async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
     assert artifact.metadata["source_count"] == 3
     assert artifact.metadata["full_source_count"] == 2
     assert artifact.metadata["ioc_rules_source_count"] == 1
-    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-core-only-v3"
+    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-core-first-v4"
     assert artifact.metadata["contract_version"]
     assert "ExampleRAT" not in repr(artifact.metadata)
 

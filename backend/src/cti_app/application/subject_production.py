@@ -25,10 +25,8 @@ from cti_app.application.production_review_recovery import prepare_batch_for_rec
 from cti_app.application.subject_lineage import resolve_subject_discovery_lineage
 from cti_app.domain.editions import Edition, EditionStatus
 from cti_app.domain.production import (
-    PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE,
     EditionProductionBatch,
     EditionProductionBatchItem,
-    ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionBatchPhase,
     ProductionBatchStatus,
@@ -83,8 +81,6 @@ class SubjectProductionRetryResult:
     previous_status: ProductionRunStatus
     previous_stage: ProductionStage
     old_generation: int
-    review_override: dict[str, Any] | None = None
-    already_applied: bool = False
 
     def __iter__(self) -> Iterator[ProductionRun | list[str]]:
         """Keep the former ``run, staled`` unpacking contract for callers."""
@@ -279,13 +275,6 @@ async def capture_snapshot_for_new_run(
 
 
 _ACTIVE_RUN_STATUSES = frozenset({ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING})
-
-
-def _latest_insufficient_evidence_override(run: ProductionRun) -> dict[str, Any] | None:
-    for decision in reversed(tuple(run.review_overrides.values())):
-        if decision.get("code") == PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE:
-            return dict(decision)
-    return None
 
 
 async def _lock_subject_run_creation(
@@ -591,9 +580,6 @@ class SubjectProductionService:
         force_recompute: bool = True,
         automatic: bool = False,
         verified_no_answer: bool = False,
-        override_insufficient_subject_evidence: bool = False,
-        override_actor_id: str | None = None,
-        override_reason: str | None = None,
     ) -> SubjectProductionRetryResult:
         async with self._uow_factory() as uow:
             # A user retry must acquire locks in the same order as edition
@@ -602,32 +588,6 @@ class SubjectProductionService:
             initial_run = await uow.production_runs.get(run_id)
             if not initial_run:
                 raise ProductionRunNotFoundError(str(run_id))
-            previous_override = _latest_insufficient_evidence_override(initial_run)
-            if (
-                override_insufficient_subject_evidence
-                and previous_override is not None
-                and initial_run.status
-                in {
-                    ProductionRunStatus.QUEUED,
-                    ProductionRunStatus.RUNNING,
-                    ProductionRunStatus.READY,
-                }
-            ):
-                return SubjectProductionRetryResult(
-                    run=initial_run,
-                    staled_artifacts=[],
-                    previous_status=initial_run.status,
-                    previous_stage=initial_run.current_stage,
-                    old_generation=initial_run.pipeline_generation,
-                    review_override=previous_override,
-                    already_applied=True,
-                )
-            if override_insufficient_subject_evidence and (
-                stage is not ProductionStage.SYNTHESIS
-                or initial_run.status is not ProductionRunStatus.NEEDS_REVIEW
-                or initial_run.error_code != PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE
-            ):
-                raise ValueError("production_evidence_override_not_available")
 
             editions = getattr(uow, "editions", None)
             if editions is not None:
@@ -700,9 +660,6 @@ class SubjectProductionService:
                     stage,
                     expected_edition_id=initial_run.edition_id,
                     force_recompute=force_recompute,
-                    override_insufficient_subject_evidence=override_insufficient_subject_evidence,
-                    override_actor_id=override_actor_id,
-                    override_reason=override_reason,
                 )
                 if automatic and item is not None:
                     if verified_no_answer:
@@ -730,13 +687,7 @@ class SubjectProductionService:
                 # UoW always exposes ``editions`` and therefore takes the
                 # protected path above.
                 result = await self._retry_from_stage_in_uow(
-                    uow,
-                    run_id,
-                    stage,
-                    force_recompute=force_recompute,
-                    override_insufficient_subject_evidence=override_insufficient_subject_evidence,
-                    override_actor_id=override_actor_id,
-                    override_reason=override_reason,
+                    uow, run_id, stage, force_recompute=force_recompute
                 )
             await uow.commit()
             return result
@@ -749,9 +700,6 @@ class SubjectProductionService:
         *,
         expected_edition_id: UUID | None = None,
         force_recompute: bool = True,
-        override_insufficient_subject_evidence: bool = False,
-        override_actor_id: str | None = None,
-        override_reason: str | None = None,
     ) -> SubjectProductionRetryResult:
         """Shared transaction core for manual and automatic business retries."""
         run = await uow.production_runs.get_for_update(run_id)
@@ -763,17 +711,6 @@ class SubjectProductionService:
         if run.status is ProductionRunStatus.CANCELLED:
             raise ValueError("production_run_cancelled")
         if run.status in (ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING):
-            previous_override = _latest_insufficient_evidence_override(run)
-            if override_insufficient_subject_evidence and previous_override is not None:
-                return SubjectProductionRetryResult(
-                    run=run,
-                    staled_artifacts=[],
-                    previous_status=run.status,
-                    previous_stage=run.current_stage,
-                    old_generation=run.pipeline_generation,
-                    review_override=previous_override,
-                    already_applied=True,
-                )
             raise ValueError("retry_not_allowed_while_running")
         if stage not in production_stages():
             raise ValueError("retry_stage_not_in_pipeline")
@@ -815,39 +752,6 @@ class SubjectProductionService:
                     runnable_stage=resolve_retry_stage(live, current_stage=stage),
                 )
 
-        review_override = None
-        if override_insufficient_subject_evidence:
-            if stage is not ProductionStage.SYNTHESIS:
-                raise ValueError("production_evidence_override_requires_synthesis")
-            if (
-                run.status is not ProductionRunStatus.NEEDS_REVIEW
-                or run.error_code != PRODUCTION_INSUFFICIENT_SUBJECT_EVIDENCE_CODE
-            ):
-                raise ValueError("production_evidence_override_not_available")
-            details = run.error_details or {}
-            try:
-                projection_artifact_id = UUID(str(details["projection_artifact_id"]))
-                minimum = int(details["minimum"])
-                direct_count = int(details["direct_count"])
-                context_count = int(details["context_count"])
-                out_of_scope_count = int(details["out_of_scope_count"])
-            except (KeyError, TypeError, ValueError) as exc:
-                raise ValueError("production_evidence_override_details_invalid") from exc
-            current_projection = await uow.production_artifacts.get_current(
-                run.id, ProductionArtifactStage.RELEVANCE_PROJECTION.value
-            )
-            if current_projection is None or current_projection.id != projection_artifact_id:
-                raise ValueError("production_evidence_override_projection_changed")
-            review_override = run.record_insufficient_subject_evidence_override(
-                projection_artifact_id=projection_artifact_id,
-                minimum=minimum,
-                direct_count=direct_count,
-                context_count=context_count,
-                out_of_scope_count=out_of_scope_count,
-                actor_id=override_actor_id or "",
-                reason=override_reason,
-            )
-
         previous_status = run.status
         previous_stage = run.current_stage
         old_generation = run.pipeline_generation
@@ -870,7 +774,6 @@ class SubjectProductionService:
             previous_status=previous_status,
             previous_stage=previous_stage,
             old_generation=old_generation,
-            review_override=review_override,
         )
 
 

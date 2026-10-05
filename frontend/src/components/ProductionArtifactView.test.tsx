@@ -75,12 +75,13 @@ function synthesisArtifact(
     metadata: { mode: "fresh", language: "fr" },
     rendered_content: null,
     canonical_content: {
-      schema_version: 1,
+      schema_version: 2,
       subject_id: SYNTHESIS_SUBJECT_ID,
       production_input_hash: "a".repeat(64),
       extraction_hash: "b".repeat(64),
       publication_language: "fr",
-      synthesis_policy_version: "production-synthesis-v1",
+      synthesis_policy_version:
+        "production-synthesis-v2-editorial-title-source-notes",
       title: "Campagne Cavern Manticore",
       lead: [
         {
@@ -122,6 +123,7 @@ function synthesisArtifact(
           evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
         },
       ],
+      source_notes: [],
       uncertainties: [
         {
           text: "Le domaine C2 peut être partagé.",
@@ -1071,6 +1073,122 @@ it("applique les rôles typographiques sémantiques d’un document V5", async (
   expect(screen.getByText("beacon", { selector: "em" })).toBeInTheDocument();
 });
 
+it("affiche les références datées et les deux groupes IOC d’une publication V6", async () => {
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(
+      Response.json({
+        artifact_id: "publication-v6",
+        stage: "publication",
+        version: 6,
+        status: "verified",
+        metadata: {},
+        canonical_content: {
+          schema_version: "6",
+          subject_id: SYNTHESIS_SUBJECT_ID,
+          publication_language: "fr",
+          title: "[Groupe] Activité documentée",
+          lead: [
+            {
+              text: "Le groupe exploite un accès initial.",
+              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+            },
+          ],
+          sections: [],
+          timeline: [],
+          indicators: [
+            {
+              artifact_type: "domain",
+              indicators: [
+                {
+                  value: "c2.example",
+                  normalized_value: "c2.example",
+                  artifact_type: "domain",
+                  source_document_ids: [VENDOR_DOCUMENT_ID],
+                },
+              ],
+            },
+          ],
+          sources: [
+            {
+              source_document_id: VENDOR_DOCUMENT_ID,
+              canonical_url: VENDOR_URL,
+              title: "Rapport du fournisseur",
+              publisher: "Vendor Labs",
+              published_at: "2026-09-01T10:00:00Z",
+              tier: "core",
+              kind: "publication",
+              role: "primary",
+            },
+            {
+              source_document_id: IOC_DOCUMENT_ID,
+              canonical_url: IOC_URL,
+              title: "Flux de recherche",
+              publisher: "Research Labs",
+              published_at: null,
+              tier: "supporting",
+              kind: "publication",
+              role: "independent",
+            },
+          ],
+          uncertainties: [],
+          tables: [],
+          diagrams: [],
+          figures: [],
+          references: [
+            {
+              source_document_id: VENDOR_DOCUMENT_ID,
+              text: "Vendor Labs publie le rapport sur cette activité.",
+              evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+            },
+          ],
+          original_indicators: [
+            {
+              artifact_type: "domain",
+              indicators: [
+                {
+                  value: "observed.example",
+                  normalized_value: "observed.example",
+                  artifact_type: "domain",
+                  source_document_ids: [IOC_DOCUMENT_ID],
+                },
+              ],
+            },
+          ],
+          rich_text: {
+            schema_version: "1",
+            policy_version: "semantic-annotation-policy-v3",
+            paragraphs: [],
+          },
+        },
+      }),
+    ),
+  );
+
+  renderArtifact("publication");
+
+  expect(
+    await screen.findByRole("heading", {
+      name: "[Groupe] Activité documentée",
+    }),
+  ).toBeInTheDocument();
+  expect(screen.getByText(/1 septembre 2026/)).toBeInTheDocument();
+  expect(
+    within(screen.getByRole("region", { name: "RÉFÉRENCES" })).getByRole(
+      "link",
+      { name: "Rapport du fournisseur" },
+    ),
+  ).toHaveAttribute("href", VENDOR_URL);
+  expect(
+    screen.getByRole("heading", { name: "IOC originaux (1)" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Le lien avec le sujet n’est pas démontré/),
+  ).toHaveTextContent("Research Labs");
+  expect(screen.getByText("observed.example")).toBeInTheDocument();
+  expect(screen.getByText("c2.example")).toBeInTheDocument();
+});
+
 it("affiche une publication V4 sans enrichissement comme une publication narrative", async () => {
   vi.stubGlobal(
     "fetch",
@@ -1639,7 +1757,7 @@ it("rend la synthèse canonique même quand l’extraction n’est pas résolue"
   expect(screen.getByText("3 preuves")).toBeInTheDocument();
 });
 
-it("décode strictement la charge canonique de synthèse V1", () => {
+it("décode strictement la charge canonique de synthèse V2", () => {
   const canonical = synthesisArtifact().canonical_content;
   expect(isProductionSynthesisV1(canonical)).toBe(true);
   expect(
@@ -1672,6 +1790,29 @@ it("décode strictement la charge canonique de synthèse V1", () => {
           date_text: null,
           text: "Date invalide.",
           evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "event")],
+        },
+      ],
+    }),
+  ).toBe(false);
+
+  const current = {
+    ...canonical,
+    source_notes: [
+      {
+        source_document_id: VENDOR_DOCUMENT_ID,
+        text: "Vendor publie le rapport.",
+        evidence_refs: [evidenceRef(VENDOR_DOCUMENT_ID, "fact")],
+      },
+    ],
+  };
+  expect(isProductionSynthesisV1(current)).toBe(true);
+  expect(
+    isProductionSynthesisV1({
+      ...current,
+      source_notes: [
+        {
+          ...current.source_notes[0],
+          evidence_refs: [evidenceRef(IOC_DOCUMENT_ID, "fact")],
         },
       ],
     }),

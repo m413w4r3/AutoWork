@@ -25,6 +25,7 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import (
     MAX_SYNTHESIS_UNCERTAINTIES,
     MAX_TECHNICAL_EVIDENCE_V1,
@@ -39,6 +40,7 @@ from cti_app.application.production_synthesis import (
     SynthesisProposalErrorCode,
     SynthesisProposalV1,
     SynthesisSectionProposalV1,
+    SynthesisSourceNoteProposalV1,
     SynthesisStageErrorCode,
     _date_supported_by_payload,
     build_synthesis_access_policy,
@@ -58,7 +60,9 @@ from cti_app.application.production_synthesis import (
     synthesis_invocation_hash,
     synthesis_model_run_id,
     validate_synthesis_proposal,
+    validate_synthesis_source_notes,
 )
+from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import SourceCollection
 from cti_app.domain.discovery import SourceRole
@@ -82,6 +86,7 @@ from cti_app.domain.production_extraction import (
     ExtractionFactV1,
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
+    ExtractionProfileReasonCode,
     ExtractionReuseState,
     ExtractionRuleV1,
     ProductionExtractionV1,
@@ -92,6 +97,11 @@ from cti_app.domain.production_references import (
     ProductionEditorialRole,
     ProductionReferenceKind,
     ProductionReferenceTier,
+)
+from cti_app.domain.production_relevance import (
+    RelevanceClassification,
+    RelevanceSourcePairRelation,
+    RelevanceSourcePairRelationV1,
 )
 from cti_app.domain.production_synthesis import (
     SYNTHESIS_POLICY_VERSION,
@@ -847,6 +857,160 @@ def test_proposal_rejects_unknown_handle_and_malformed_schema():
         lambda: validate_synthesis_proposal(empty_refs, pack, extraction),
         "synthesis_output_invalid",
     )
+
+
+def _pack_with_cross_source_relation(
+    relation_type: RelevanceSourcePairRelation = RelevanceSourcePairRelation.LINK_NOT_DEMONSTRATED,
+    *,
+    counter_indicated: bool = False,
+):
+    subject_id = uuid4()
+    first_id, second_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(first_id, facts=(make_fact(first_id, "FooRAT"),), url_suffix="first"),
+        make_source(second_id, facts=(make_fact(second_id, "BarRAT"),), url_suffix="second"),
+    )
+    refs = {
+        ref.source_document_id: ref
+        for ref, _ in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.FACT
+    }
+    relation = RelevanceSourcePairRelationV1(
+        relation=relation_type,
+        reason="The sources describe distinct activity.",
+        supporting_evidence_refs=(refs[first_id], refs[second_id]),
+    )
+    projection = build_relevance_projection(snapshot, extraction, source_pair_relations=(relation,))
+    if counter_indicated:
+        projection = replace(
+            projection,
+            classifications=tuple(
+                replace(item, classification=RelevanceClassification.COUNTER_INDICATION)
+                if item.evidence_ref == refs[second_id]
+                else item
+                for item in projection.classifications
+            ),
+        )
+    pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    return pack, extraction, refs, first_id, second_id
+
+
+def test_relation_supporting_fact_has_a_single_handle_in_the_pack():
+    pack, _, refs, first_id, second_id = _pack_with_cross_source_relation()
+
+    assert pack.reserve_evidence == ()
+    assert len(set(pack._handle_to_ref.values())) == len(pack._handle_to_ref)
+    first_handle = pack.handle_for(refs[first_id])
+    second_handle = pack.handle_for(refs[second_id])
+    assert first_handle is not None and second_handle is not None
+    assert set(pack.source_pair_relations[0]["supporting_handles"]) == {first_handle, second_handle}
+
+
+def test_counter_indicated_fact_stays_reserve_only_while_relation_reuses_catalogue_handle():
+    pack, _, refs, first_id, second_id = _pack_with_cross_source_relation(counter_indicated=True)
+
+    assert pack.handle_for(refs[second_id]) is None
+    assert [record["handle"] for record in pack.reserve_evidence] == ["R001"]
+    assert pack.resolve_handle("R001") == refs[second_id]
+    assert set(pack.source_pair_relations[0]["supporting_handles"]) == {
+        pack.handle_for(refs[first_id]),
+        "R001",
+    }
+    assert len(set(pack._handle_to_ref.values())) == len(pack._handle_to_ref)
+
+
+def test_enrichment_pack_tolerates_synthesis_citing_out_of_scope_relation_fact():
+    subject_id = uuid4()
+    first_id, second_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(first_id, facts=(make_fact(first_id, "FooRAT"),), url_suffix="first"),
+        make_source(second_id, facts=(make_fact(second_id, "BarRAT"),), url_suffix="second"),
+    )
+    refs = {
+        ref.source_document_id: ref
+        for ref, _ in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.FACT
+    }
+    relation = RelevanceSourcePairRelationV1(
+        relation=RelevanceSourcePairRelation.LINK_NOT_DEMONSTRATED,
+        reason="The sources describe distinct activity.",
+        supporting_evidence_refs=(refs[first_id], refs[second_id]),
+    )
+    projection = build_relevance_projection(snapshot, extraction, source_pair_relations=(relation,))
+    projection = replace(
+        projection,
+        classifications=tuple(
+            replace(item, classification=RelevanceClassification.OUT_OF_SCOPE)
+            if item.evidence_ref == refs[second_id]
+            else item
+            for item in projection.classifications
+        ),
+    )
+    synthesis = replace(
+        _canonical_synthesis(snapshot, extraction),
+        lead=(
+            SynthesisParagraphV1(
+                "FooRAT was identified; BarRAT is not shown to be linked.",
+                (refs[first_id], refs[second_id]),
+            ),
+        ),
+    )
+
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)
+
+    assert refs[second_id] not in pack._handle_to_ref.values()
+    [paragraph] = pack.current_synthesis["lead"]
+    assert [pack.resolve_handle(handle) for handle in paragraph["evidence_handles"]] == [
+        refs[first_id]
+    ]
+
+
+def test_proposal_tolerates_the_same_evidence_cited_twice():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    proposal = {
+        "lead": [{"text": "FooRAT was identified.", "evidence_handles": [handle, handle]}],
+        "sections": [],
+    }
+
+    lead, _ = validate_synthesis_proposal(proposal, pack, extraction)
+
+    assert lead[0].evidence_refs == (pack.resolve_handle(handle),)
+    parsed = parse_synthesis_proposal_wire(
+        f"@@LEAD@@\n@@CLAIM L001@@\nEVIDENCE: {handle}, {handle}\nTEXT: FooRAT was identified.\n"
+    )
+    assert parsed.rejections == ()
+    assert parsed.proposal is not None
+    assert parsed.proposal.lead[0].evidence_handles == (handle,)
+
+
+def test_output_invalid_carries_a_diagnosable_reason():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+
+    with pytest.raises(SynthesisProposalControlError) as plain:
+        validate_synthesis_proposal(make_proposal("# Overview", handle), pack, extraction)
+    malformed = make_proposal("FooRAT was identified.", handle)
+    malformed["subject_id"] = str(subject_id)
+    with pytest.raises(SynthesisProposalControlError) as shape:
+        validate_synthesis_proposal(malformed, pack, extraction)
+
+    assert plain.value.reason == "plain_text_violation"
+    assert shape.value.reason == "malformed_proposal"
 
 
 @pytest.mark.parametrize(
@@ -1616,6 +1780,61 @@ def _fresh_setup() -> SimpleNamespace:
     return world
 
 
+def test_wire_parser_reads_editorial_title_and_source_local_notes() -> None:
+    world = _fresh_setup()
+    core = world.extraction.sources[0]
+    supporting_id = uuid4()
+    supporting = replace(
+        make_source(
+            supporting_id,
+            tier=ProductionReferenceTier.SUPPORTING,
+            profile=ExtractionProfile.FULL,
+            facts=(make_fact(supporting_id, "ExampleLoader"),),
+            url_suffix="supporting-note",
+        ),
+        profile_reason_code=ExtractionProfileReasonCode.COMPLEMENTARY_FULL_SOURCE,
+    )
+    extraction = make_extraction(world.snapshot.subject_id, (core, supporting))
+    pack = build_synthesis_evidence_pack(world.snapshot, extraction)
+    core_handle = pack.source_note_sources[0]["evidence_handles"][0]
+    supporting_handle = pack.source_note_sources[1]["evidence_handles"][0]
+    raw = f"""@@TITLE@@
+[Example actor] Déploie un chargeur documenté
+@@END TITLE@@
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {core_handle}
+TEXT: FooRAT est identifié dans le rapport.
+@@SOURCE_NOTE S001@@
+EVIDENCE: {core_handle}
+TEXT: Example Labs décrit FooRAT dans son rapport.
+@@END SOURCE NOTE@@"""
+
+    parsed = parse_synthesis_proposal_wire(raw)
+
+    assert parsed.rejections == ()
+    assert parsed.warnings == ()
+    assert parsed.proposal is not None
+    assert parsed.proposal.title == "[Example actor] Déploie un chargeur documenté"
+    notes, warnings = validate_synthesis_source_notes(parsed.proposal, pack)
+    assert warnings == ()
+    assert len(notes) == 1
+    assert notes[0].source_document_id == core.source_document_id
+    assert notes[0].evidence_refs == (pack.resolve_handle(core_handle),)
+
+    wrong_source_note = SynthesisSourceNoteProposalV1(
+        source_alias="S001",
+        evidence_handles=(supporting_handle,),
+        text="Example Labs décrit FooRAT dans son rapport.",
+    )
+    rejected_notes, note_warnings = validate_synthesis_source_notes(
+        parsed.proposal.model_copy(update={"source_notes": (wrong_source_note,)}),
+        pack,
+    )
+    assert rejected_notes == ()
+    assert note_warnings == ("synthesis_source_note_invalid",)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
@@ -1732,8 +1951,9 @@ async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     assert stored["model_policy_version"] == SYNTHESIS_MODEL_POLICY_VERSION
     assert stored["routing_policy_version"] == SYNTHESIS_ROUTING_POLICY_VERSION
 
-    # Title, timeline and uncertainties are deterministic, never model output.
-    assert synthesis.title == world.snapshot.subject_title
+    # Invalid or omitted model titles use the deterministic editorial fallback.
+    assert synthesis.title == "[example.com] Frozen subject title"
+    assert "synthesis_title_invalid" in synthesis.warnings
     assert synthesis.publication_language == world.snapshot.publication_language == "fr"
     assert synthesis.production_input_hash == world.snapshot.input_hash
     assert synthesis.extraction_hash == result.extraction_hash
@@ -1748,6 +1968,27 @@ async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     assert result.details["timeline_entry_count"] == 1
     assert "FooRAT was identified in the report." not in str(result.details)
     assert result.artifact_id is not None
+
+
+@pytest.mark.asyncio
+async def test_invalid_editorial_title_uses_fallback_and_stable_warning() -> None:
+    world = _fresh_setup()
+    raw = f"""@@TITLE@@
+[Example actor] Titre terminé par un point.
+@@END TITLE@@
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: FooRAT est identifié dans le rapport.
+"""
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert synthesis.title == "[example.com] Frozen subject title"
+    assert synthesis.warnings.count("synthesis_title_invalid") == 1
 
 
 @pytest.mark.asyncio
@@ -1859,6 +2100,28 @@ async def test_unintelligible_synthesis_text_needs_review_without_empty_success(
     assert result.model_calls == 1
     assert len(gateway.calls) == 1
     assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_validation_reason_reaches_review_error_and_stage_result() -> None:
+    world = _fresh_setup()
+    raw = f"""@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: # FooRAT est identifié dans le rapport.
+"""
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.OUTPUT_INVALID.value
+    assert result.details["validation_reason"] == "plain_text_violation"
+    assert "plain_text_violation" in result.error
+
+    stage_result = ProductionWorkflowOrchestrator._synthesis_execution_result(result)
+    assert stage_result["status"] == "needs_review"
+    assert "plain_text_violation" in stage_result["error"]
 
 
 @pytest.mark.asyncio
@@ -2287,7 +2550,7 @@ def _canonical_synthesis(
     pack = build_synthesis_evidence_pack(snapshot, extraction)
     ref = pack.resolve_handle(str(pack.narrative_evidence[0]["handle"]))
     return ProductionSynthesisV1(
-        schema_version=1,
+        schema_version=2,
         subject_id=snapshot.subject_id,
         production_input_hash=snapshot.input_hash,
         extraction_hash=canonical_extraction_hash(extraction),
@@ -2339,7 +2602,7 @@ def _prior_synthesis(
     paragraphs: tuple[SynthesisParagraphV1, ...],
 ) -> ProductionSynthesisV1:
     return ProductionSynthesisV1(
-        schema_version=1,
+        schema_version=2,
         subject_id=snapshot.subject_id,
         production_input_hash=production_input_hash,
         extraction_hash=canonical_extraction_hash(extraction),
@@ -2447,7 +2710,10 @@ async def test_reuse_candidate_with_wrong_lineage_needs_review_without_drafting(
     document = make_document(subject_id, source_id)
     expected_input_hash = await _expected_input_hash(snapshot, extraction, (document,))
     canonical_blob_id = uuid4()
-    stale = _canonical_synthesis(snapshot, extraction, title="An unfrozen editorial title")
+    stale = replace(
+        _canonical_synthesis(snapshot, extraction),
+        extraction_hash="f" * 64,
+    )
     reuse_artifact = ProductionArtifact(
         production_run_id=uuid4(),
         subject_id=subject_id,
@@ -2825,7 +3091,7 @@ async def test_language_mismatched_prior_cannot_be_accepted_as_exact_reuse():
     expected_input_hash = await _expected_input_hash(snapshot, extraction, (document,))
     canonical_blob_id = uuid4()
     previous = ProductionSynthesisV1(
-        schema_version=1,
+        schema_version=2,
         subject_id=subject_id,
         production_input_hash=snapshot.input_hash,
         extraction_hash=canonical_extraction_hash(extraction),

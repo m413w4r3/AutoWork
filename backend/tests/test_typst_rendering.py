@@ -13,6 +13,7 @@ from cti_app.application.semantic_annotation import EnglishTermDetector, Semanti
 from cti_app.application.typst_rendering import (
     TypstRenderer,
     TypstTemplateBundle,
+    _display_date,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
@@ -46,6 +47,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticRole,
     SemanticTextV1,
 )
+from tests.test_publication_builder_v4 import _frontmatter_v6_case
 from tests.test_publication_v4 import _SOURCE_ID, _diagram, _document, _figure, _source, _table
 
 _SECOND_SOURCE_ID = UUID("00000000-0000-0000-0000-000000000002")
@@ -229,7 +231,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v4-table-layout"
+    assert data["schema_version"] == "typst-publication-model-v5-dated-references-ioc-groups"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -246,6 +248,36 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
         "type": "synthesis",
         "blocks": [{"type": "paragraph", "text": "Initial assessment"}],
     }
+
+
+def test_french_publication_dates_use_first_day_typography() -> None:
+    assert _display_date(None, date(2026, 2, 1)) == "1er février 2026"
+    assert _display_date(None, date(2026, 2, 4)) == "4 février 2026"
+
+
+def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
+    tmp_path: Path,
+) -> None:
+    publication, *_ = _frontmatter_v6_case()
+    renderer, bundle = _renderer(tmp_path)
+
+    model = json.loads(renderer.render(publication, bundle).render_data_bytes)
+
+    assert model["title"] == "[Example actor] Décrit une activité documentée"
+    assert "title_spans" not in model
+    references, synthesis, annex = model["content_sections"]
+    assert references["type"] == "references"
+    assert references["timeline"][0]["display_date"] == "10 janvier 2026"
+    assert references["timeline"][0]["source_urls"] == ["https://a.example/report"]
+    assert references["timeline"][-1]["display_date"] == "Date de publication non précisée"
+    assert references["timeline"][-1]["source_urls"] == ["https://missing.example/article"]
+    assert synthesis["type"] == "synthesis"
+    assert annex["type"] == "technical_annex"
+    assert annex["indicators"]["domains"]
+    assert annex["original_indicators"]["domains"] == [
+        "context.example",
+        "original.example",
+    ]
 
 
 def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
@@ -380,7 +412,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v4-table-layout"
+    assert data["schema_version"] == "typst-publication-model-v5-dated-references-ioc-groups"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

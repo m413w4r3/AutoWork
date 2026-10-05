@@ -52,28 +52,40 @@
   ]
 }
 
+#let render-figure-caption(number, caption, semantic-spans) = block(
+  above: 0pt,
+  text(size: 9pt, fill: grey)[Figure #number - #semantic-or-plain(caption, semantic-spans)],
+)
+
 #let render-diagram(item) = {
-  if has-text(item.title) [
-    #text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]
-    #v(4pt)
-  ]
-  image(item.media_path, width: 100%)
+  let caption = if has-text(item.caption) { item.caption } else { item.title }
+  let semantic-caption = if has-text(item.caption) {
+    item.at("semantic_caption", default: none)
+  } else {
+    item.at("semantic_title", default: none)
+  }
+  image(item.media_path, width: 100%, height: 12cm, fit: "contain")
   v(4pt)
-  if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
+  if has-text(caption) [
+    #render-figure-caption(item.figure_number, caption, semantic-caption)
   ]
 }
 
 #let render-figure(item) = {
-  image(item.media_path, width: 90%)
+  image(item.media_path, width: 100%, height: 9cm, fit: "contain")
+  v(4pt)
   if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
+    #render-figure-caption(
+      item.figure_number,
+      item.caption,
+      item.at("semantic_caption", default: none),
+    )
   ]
   if has-text(item.provenance) [
-    #text(size: 8pt, fill: grey)[Provenance : #semantic-or-plain(item.provenance, item.at("semantic_provenance", default: none))]
+    #block(above: 2pt, text(size: 8pt, fill: grey)[Provenance : #semantic-or-plain(item.provenance, item.at("semantic_provenance", default: none))])
   ]
   if has-text(item.locator) [
-    #text(size: 8pt, fill: grey)[Repère : #item.locator]
+    #block(above: 2pt, text(size: 8pt, fill: grey)[Repère : #item.locator])
   ]
 }
 
@@ -109,15 +121,29 @@
         render-body-block(item)
       }
     ] else if content_section.type == "technical_annex" [
-      #section-title[ANNEXE TECHNIQUE — INDICATEURS]
-      #ioc-list(
-        title: [Indicateurs],
-        ips: content_section.indicators.ips,
-        domains: content_section.indicators.domains,
-        urls: content_section.indicators.urls,
-        emails: content_section.indicators.emails,
-        hashes: content_section.indicators.hashes,
-      )
+      #let indicators = content_section.indicators
+      #let originals = content_section.at("original_indicators", default: none)
+      #if indicators.ips.len() > 0 or indicators.domains.len() > 0 or indicators.urls.len() > 0 or indicators.emails.len() > 0 or indicators.hashes.len() > 0 [
+        #ioc-list(
+          title: [IOC],
+          ips: indicators.ips,
+          domains: indicators.domains,
+          urls: indicators.urls,
+          emails: indicators.emails,
+          hashes: indicators.hashes,
+        )
+      ]
+      #if originals != none and (originals.ips.len() > 0 or originals.domains.len() > 0 or originals.urls.len() > 0 or originals.emails.len() > 0 or originals.hashes.len() > 0) [
+        #ioc-list(
+          title: [IOC originaux],
+          note: content_section.at("original_indicator_note", default: ""),
+          ips: originals.ips,
+          domains: originals.domains,
+          urls: originals.urls,
+          emails: originals.emails,
+          hashes: originals.hashes,
+        )
+      ]
     ] else {
       panic("unsupported publication content section type: " + content_section.type)
     }
@@ -125,6 +151,6 @@
 }
 
 #let render-publication(publication) = {
-  heading(level: 1)[#semantic-or-plain(publication.title, publication.at("title_spans", default: none))]
+  heading(level: 1)[#publication.title]
   render-publication-body(publication)
 }

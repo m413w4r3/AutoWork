@@ -231,7 +231,7 @@ def test_l13_real_run_fixture_has_full_document_and_timeline_coverage() -> None:
     from cti_app.application.semantic_annotation import EnglishTermDetector, SemanticAnnotator
 
     fixture = _publication_fixture()
-    anchors: dict[str, str] = {"title": str(fixture["title"])}
+    anchors: dict[str, str] = {}
     lead = fixture["lead"]
     sections = fixture["sections"]
     timeline = fixture["timeline"]
@@ -380,9 +380,13 @@ def test_annotation_anchor_inventory_matches_publication_text_fields_and_caption
         editorial_enrichment=enrichment,
     )
 
-    assert semantic_annotation_anchor_texts(synthesis, enrichment) == (
-        publication_document_text_anchors(publication)
-    )
+    semantic_anchors = semantic_annotation_anchor_texts(synthesis, enrichment)
+    publication_anchors = publication_document_text_anchors(publication)
+    assert "title" not in semantic_anchors
+    assert semantic_anchors == {
+        anchor: text for anchor, text in publication_anchors.items() if anchor != "title"
+    }
+    assert "diagram:infection_chain:title" in semantic_anchors
 
 
 def _access_policy(snapshot, extraction) -> SynthesisAccessPolicyV1:
@@ -433,11 +437,16 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
     assert annotation_request.routing_hint is table_diagram_request.routing_hint
     assert "FINAL PUBLICATION TEXT ANCHORS" in annotation_request.text
     assert annotation_request.prompt_template_version == SEMANTIC_ANNOTATION_PROMPT_VERSION
-    assert SEMANTIC_ANNOTATION_CONTRACT_VERSION == "semantic-annotation-term-role-blocks-v1"
-    assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v1-exact-anchors"
-    assert EDITORIAL_ENRICHMENT_PROMPT_VERSION.endswith("table-diagram-only")
-    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("table-diagram-only")
-    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("legacy-annotation-blocks")
+    assert (
+        SEMANTIC_ANNOTATION_CONTRACT_VERSION == "semantic-annotation-term-role-blocks-v2-no-title"
+    )
+    assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v3-no-title"
+    assert EDITORIAL_ENRICHMENT_PROMPT_VERSION.endswith("readable-diagrams")
+    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("diagram-node-roles")
+    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("node-roles")
+    assert "@@ANCHOR title@@" not in annotation_request.text
+    assert "@@ANCHOR section:0:paragraph:0001@@" in annotation_request.text
+    assert "@@ANCHOR diagram:" not in annotation_request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION.endswith("dedicated-annotations")
     assert SEMANTIC_ANNOTATION_POLICY_VERSION.endswith("document-lexicon")
 
@@ -595,8 +604,9 @@ def test_publication_qa_fails_when_one_annotated_term_occurrence_is_unstyled() -
                 SemanticParagraphV1(
                     anchor,
                     (
+                        SemanticTextSpanV1(SemanticRole.TEXT, "["),
                         SemanticTextSpanV1(SemanticRole.ACTOR, "Example"),
-                        SemanticTextSpanV1(SemanticRole.TEXT, text[len("Example") :]),
+                        SemanticTextSpanV1(SemanticRole.TEXT, text[len("[Example") :]),
                     ),
                 )
             )
@@ -624,3 +634,18 @@ def test_publication_qa_fails_when_one_annotated_term_occurrence_is_unstyled() -
 
     assert result["checks"]["semantic_annotation_coverage"] is False
     assert any("semantic annotation" in error.lower() for error in result["errors"])
+
+
+def test_semantic_annotation_wire_accepts_anchors_copied_with_their_prompt_frame() -> None:
+    # Real 2026-10-05 output: the model copied `@@ANCHOR <id>@@` verbatim and every
+    # one of 30 items was rejected as anchor_unknown.
+    parsed = parse_semantic_annotation_wire(
+        "TERM A001\nTERM: OP_RETURN\nROLE: protocol_field\n"
+        "PARAGRAPH_ANCHOR: @@ANCHOR lead:0001@@\nEND TERM\n",
+        {"lead:0001": "Données OP_RETURN encodées."},
+    )
+
+    assert parsed.rejections == ()
+    assert [(item.paragraph_anchor, item.text) for item in parsed.proposals] == [
+        ("lead:0001", "OP_RETURN")
+    ]

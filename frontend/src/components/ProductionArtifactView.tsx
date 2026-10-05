@@ -144,7 +144,18 @@ function isPublicationDocument(value: unknown): value is PublicationDocument {
   if (!common) return false;
   return (
     value.schema_version === "4" ||
-    (value.schema_version === "5" && isSemanticText(value.rich_text))
+    ((value.schema_version === "5" || value.schema_version === "6") &&
+      isSemanticText(value.rich_text) &&
+      (value.schema_version !== "6" ||
+        (Array.isArray(value.references) &&
+          value.references.every(
+            (reference) =>
+              isRecord(reference) &&
+              typeof reference.source_document_id === "string" &&
+              typeof reference.text === "string" &&
+              Array.isArray(reference.evidence_refs),
+          ) &&
+          Array.isArray(value.original_indicators))))
   );
 }
 
@@ -233,6 +244,18 @@ function publicationTimelineDateLabel(entry: {
     );
   }
   return "";
+}
+
+function publicationReferenceDateLabel(publishedAt: string | null): string {
+  if (!publishedAt) return "Date de publication non précisée";
+  const day = publishedAt.slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) {
+    return "Date de publication non précisée";
+  }
+  const parsed = new Date(`${day}T00:00:00`);
+  return Number.isNaN(parsed.getTime())
+    ? "Date de publication non précisée"
+    : new Intl.DateTimeFormat("fr-FR", { dateStyle: "long" }).format(parsed);
 }
 
 function isProductionReferenceSource(
@@ -1097,7 +1120,12 @@ function semanticContent(
   text: string,
   anchor: string,
 ) {
-  if (document.schema_version !== "5") return text;
+  if (
+    document.schema_version === "4" ||
+    (document.schema_version === "6" && anchor === "title")
+  ) {
+    return text;
+  }
   const paragraph = document.rich_text.paragraphs.find(
     (item) => item.anchor === anchor,
   );
@@ -1184,7 +1212,14 @@ export function PublicationDocumentView({
     ...document.diagrams,
     ...document.figures,
   ].some((item) => item.placement.kind === "after_timeline");
-  const hasReferences = document.timeline.length > 0 || hasReferenceEnrichments;
+  const publicationReferences =
+    document.schema_version === "6" ? document.references : [];
+  const originalIndicators =
+    document.schema_version === "6" ? document.original_indicators : [];
+  const hasReferences =
+    publicationReferences.length > 0 ||
+    document.timeline.length > 0 ||
+    hasReferenceEnrichments;
   const provenance = (sourceIds: string[]) => (
     <span className="publication-preview__provenance">
       {Array.from(new Set(sourceIds)).map((sourceId, index) => {
@@ -1291,6 +1326,52 @@ export function PublicationDocumentView({
                 </div>
               );
             })}
+            {publicationReferences.map((item, index) => {
+              const anchor = `reference:${String(index + 1).padStart(4, "0")}`;
+              const source = sources.get(item.source_document_id);
+              const sourceName = source
+                ? source.title || source.publisher || source.canonical_url
+                : `Source ${item.source_document_id}`;
+              return (
+                <div
+                  className="publication-preview__passage"
+                  key={`reference-${item.source_document_id}`}
+                >
+                  <p>
+                    <strong>
+                      {publicationReferenceDateLabel(
+                        source?.published_at ?? null,
+                      )}{" "}
+                      :{" "}
+                    </strong>
+                    {semanticContent(document, item.text, anchor)}{" "}
+                    {source ? (
+                      <a
+                        href={source.canonical_url}
+                        rel="noreferrer"
+                        target="_blank"
+                      >
+                        {sourceName}
+                      </a>
+                    ) : null}
+                  </p>
+                  {item.evidence_refs.length > 0 ? (
+                    <button
+                      className="publication-preview__lineage-trigger"
+                      onClick={() =>
+                        setSelectedPassage({
+                          text: item.text,
+                          evidenceRefs: item.evidence_refs,
+                        })
+                      }
+                      type="button"
+                    >
+                      Voir les sources et preuves
+                    </button>
+                  ) : null}
+                </div>
+              );
+            })}
             {enrichmentsAt("after_timeline", null)}
           </section>
         ) : null}
@@ -1320,13 +1401,26 @@ export function PublicationDocumentView({
           ))}
           {enrichmentsAt("end", null)}
         </section>
-        {document.indicators.length > 0 && (
-          <section aria-label="ANNEXE TECHNIQUE — INDICATEURS">
-            <h4>ANNEXE TECHNIQUE — INDICATEURS</h4>
+        {(document.indicators.length > 0 || originalIndicators.length > 0) && (
+          <section
+            aria-label={
+              document.schema_version === "6"
+                ? `ANNEXE TECHNIQUE — IOC (${document.indicators.reduce((count, group) => count + group.indicators.length, 0)})`
+                : "ANNEXE TECHNIQUE — INDICATEURS"
+            }
+          >
+            <h4>
+              {document.schema_version === "6"
+                ? `ANNEXE TECHNIQUE — IOC (${document.indicators.reduce((count, group) => count + group.indicators.length, 0)})`
+                : "ANNEXE TECHNIQUE — INDICATEURS"}
+            </h4>
             {document.indicators.map((group) => (
               <div key={group.artifact_type}>
                 <h5>
                   {IOC_LABELS[group.artifact_type] || group.artifact_type}
+                  {document.schema_version === "6"
+                    ? ` (${group.indicators.length})`
+                    : ""}
                 </h5>
                 <ul>
                   {group.indicators.map((item) => (
@@ -1338,6 +1432,56 @@ export function PublicationDocumentView({
                 </ul>
               </div>
             ))}
+            {originalIndicators.length > 0 ? (
+              <div>
+                <h5>
+                  IOC originaux (
+                  {originalIndicators.reduce(
+                    (count, group) => count + group.indicators.length,
+                    0,
+                  )}
+                  )
+                </h5>
+                <p>
+                  Le lien avec le sujet n’est pas démontré. Sources :{" "}
+                  {Array.from(
+                    new Set(
+                      originalIndicators.flatMap((group) =>
+                        group.indicators.flatMap((item) =>
+                          item.source_document_ids.map((sourceId) => {
+                            const source = sources.get(sourceId);
+                            return source
+                              ? source.publisher ||
+                                  source.title ||
+                                  source.canonical_url
+                              : sourceId;
+                          }),
+                        ),
+                      ),
+                    ),
+                  ).join(", ")}
+                  .
+                </p>
+                {originalIndicators.map((group) => (
+                  <div key={`original-${group.artifact_type}`}>
+                    <h6>
+                      {IOC_LABELS[group.artifact_type] || group.artifact_type} (
+                      {group.indicators.length})
+                    </h6>
+                    <ul>
+                      {group.indicators.map((item) => (
+                        <li
+                          key={`${item.artifact_type}-${item.normalized_value}`}
+                        >
+                          <code>{item.normalized_value}</code>
+                          {provenance(item.source_document_ids)}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            ) : null}
           </section>
         )}
       </article>

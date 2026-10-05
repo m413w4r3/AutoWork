@@ -16,7 +16,7 @@ from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
-from cti_app.domain.production_synthesis import ProductionSynthesisV1
+from cti_app.domain.production_synthesis import ProductionSynthesisV1, is_valid_editorial_title
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV5,
@@ -51,7 +51,9 @@ def _fold_accents(value: str) -> str:
     return "".join(character for character in decomposed if not unicodedata.combining(character))
 
 
-def _semantic_annotation_has_full_occurrence_coverage(publication: PublicationDocumentV5) -> bool:
+def _semantic_annotation_has_full_occurrence_coverage(
+    publication: PublicationDocumentV5,
+) -> bool:
     """Every exact term styled once must remain styled at all exact occurrences."""
     paragraphs = publication.semantic_text.paragraphs
     terms = {
@@ -127,6 +129,11 @@ def qa_publication_v5(
     )
     if not checks["publication_language"]:
         errors.append("Publication language differs from the frozen snapshot")
+    checks["title_format"] = not isinstance(
+        publication, PublicationDocumentV5
+    ) or is_valid_editorial_title(publication.title)
+    if not checks["title_format"]:
+        errors.append("Publication title does not match the [Groupe] Titre format")
     if isinstance(publication, PublicationDocumentV5):
         checks["semantic_annotation_coverage"] = _semantic_annotation_has_full_occurrence_coverage(
             publication
@@ -176,12 +183,25 @@ def qa_publication_v5(
         if not checks["exact_projection"]:
             errors.append("Publication differs from canonical Assembly projection")
 
+    v5 = publication if isinstance(publication, PublicationDocumentV5) else None
+    reference_texts = tuple(item.text for item in v5.references) if v5 else ()
+    original_ioc_texts = (
+        tuple(
+            text
+            for group in v5.original_indicators
+            for indicator in group.indicators
+            for text in (indicator.value, indicator.normalized_value)
+        )
+        if v5
+        else ()
+    )
     editorial_text = (
         publication.title,
         *(item.text for item in publication.lead),
         *(section.heading for section in publication.sections),
         *(item.text for section in publication.sections for item in section.paragraphs),
         *(item.text for item in publication.timeline),
+        *reference_texts,
         *(item.text for item in publication.uncertainties),
         *(
             text
@@ -200,6 +220,7 @@ def qa_publication_v5(
             for indicator in group.indicators
             for text in (indicator.value, indicator.normalized_value)
         ),
+        *original_ioc_texts,
         *(
             text
             for table in publication.tables
@@ -257,7 +278,7 @@ def qa_publication_v5(
     else:
         section_types = [section["type"] for section in render_model.content_sections]
         expected_types = ["references", "synthesis"]
-        if any(group.indicators for group in publication.indicators):
+        if publication.indicators or (v5 and v5.original_indicators):
             expected_types.append("technical_annex")
         checks["references_then_synthesis"] = section_types == expected_types
         synthesis_section = next(
