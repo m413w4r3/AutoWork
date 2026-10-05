@@ -461,6 +461,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                 "relevance_projection_hash": projection_hash,
                 "table_count": len(enrichment.tables),
                 "diagram_count": len(enrichment.diagrams),
+                "chart_count": len(enrichment.charts),
                 "source_figure_count": len(enrichment.source_figures),
                 "warnings_count": len(enrichment.warnings),
                 "extraction_hash": enrichment.extraction_hash,

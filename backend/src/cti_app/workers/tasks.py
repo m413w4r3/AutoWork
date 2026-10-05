@@ -63,6 +63,7 @@ from cti_app.application.workspace import SubjectWorkspaceMaterializer
 from cti_app.config import get_settings
 from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production_pipeline import production_stages
+from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
@@ -319,6 +320,7 @@ async def _execute_job(job_id: UUID) -> int | None:
             job_dispatcher=job_dispatcher,
             bridge_transport=bridge_provider,
             production_diagram_compiler=D2DiagramCompiler(),
+            production_chart_compiler=AnalyticChartRenderer(),
             edition_release_rematerializer=edition_release_rematerializer,
         )
         job_service = JobService(uow_factory, registry)

@@ -674,7 +674,7 @@ def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> Non
     assert "EVIDENCE: E001" in contract
     assert "D2" in contract
     assert "CHART" in contract
-    assert "CHART est une branche conceptuelle" in contract
+    assert "CHART accepte uniquement le KIND timeline" in contract
     assert (
         "Une représentation existante de la source est prioritaire sur une représentation "
         "reconstruite, lorsque les deux répondent à la même question analytique."
@@ -726,7 +726,7 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "plus de 4 nœuds" not in request.text
     assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
     assert "Commence par identifier une question analytique" in request.text
-    assert "CHART est une branche conceptuelle" in request.text
+    assert "CHART accepte uniquement le KIND timeline" in request.text
     assert "Aucun quota minimal de médias ne s'applique" in request.text
     assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
         enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
@@ -851,7 +851,7 @@ def test_purpose_is_required_and_duplicate_questions_reject_only_one_sibling() -
     }
 
 
-def test_fixture_a_source_figure_wins_over_duplicate_diagram_and_table() -> None:
+def test_fixture_a_source_figure_wins_over_duplicate_analytic_media() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
@@ -865,7 +865,28 @@ def test_fixture_a_source_figure_wins_over_duplicate_diagram_and_table() -> None
     diagram_wire = _top_wire_block(proposal_wire, "DIAGRAM D001").replace(
         "PURPOSE: Does ExampleRAT launch an execution step?", f"PURPOSE: {question}", 1
     )
-    wire = "\n\n".join((_figure_wire(purpose_question=question), table_wire, diagram_wire))
+    chart_wire = f"""CHART C001
+KEY: execution_timeline
+KIND: timeline
+TITLE: ExampleRAT execution events
+PURPOSE: {question}
+DATA: E001 describes the execution event.
+GAIN: A time axis makes the recorded event easy to locate.
+SCOPE: The one event stated in E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: No other event is included.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the execution description.
+POINT P001
+DATE: 2026-01-03
+LABEL: ExampleRAT
+SERIES: ExampleRAT execution
+EVIDENCE: E001
+END POINT
+END CHART"""
+    wire = "\n\n".join(
+        (_figure_wire(purpose_question=question), table_wire, diagram_wire, chart_wire)
+    )
 
     parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
 
@@ -873,6 +894,7 @@ def test_fixture_a_source_figure_wins_over_duplicate_diagram_and_table() -> None
     assert len(parsed.proposal.figures) == 1
     assert parsed.proposal.tables == ()
     assert parsed.proposal.diagrams == ()
+    assert parsed.proposal.charts == ()
     assert {item.reason_code for item in parsed.rejections} == {
         "editorial_enrichment_source_figure_preferred_over_reconstruction"
     }
@@ -953,23 +975,84 @@ END DIAGRAM"""
     assert parsed.proposal.figures == ()
 
 
-def test_fixture_c_chart_branch_is_prompted_without_a_chart_wire_contract() -> None:
+def test_fixture_c_domain_registration_wire_produces_and_roundtrips_one_chart() -> None:
     snapshot = _snapshot()
-    extraction = _extraction(input_hash=snapshot.input_hash)
+    fact_text = (
+        "Registered domains alpha.example and beta.example were first registered on "
+        "2026-08-25 and 2026-08-27, respectively."
+    )
+    fact = ExtractionFactV1(
+        category="infrastructure",
+        value=fact_text,
+        attack_id=None,
+        context=fact_text,
+        evidence_quote=fact_text,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
     pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
     contract = editorial_enrichment_output_contract_example()
+    wire = """CHART C001
+KEY: domains_created_in_time
+KIND: timeline
+TITLE: Domain registrations over time
+CAPTION: Registration dates reported for two domains.
+PURPOSE: When were these domains first registered?
+DATA: The report gives two domain registration dates.
+GAIN: A time axis places the reported registrations in sequence.
+SCOPE: Only the two domain registration dates in the supplied evidence.
+PURPOSE_EVIDENCE: E001
+LIMITS: No activity between these dates is inferred.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the infrastructure analysis.
+POINT P001
+DATE: 2026-08-25
+LABEL: alpha.example
+SERIES: Registered domains
+EVIDENCE: E001
+END POINT
+POINT P002
+DATE: 2026-08-27
+LABEL: beta.example
+SERIES: Registered domains
+EVIDENCE: E001
+END POINT
+END CHART"""
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.charts) == 1
+    enrichment = validate_editorial_enrichment_proposal(
+        parsed.proposal, pack, extraction, synthesis
+    )
+    payload = editorial_enrichment_to_json(enrichment)
+    restored = editorial_enrichment_from_json(payload)
 
     assert EditorialMediaType.CHART.value == "chart"
     assert "les informations sont-elles principalement temporelles" in contract
     assert "OUI → CHART" in contract
-    assert "ce contrat n'accepte pas encore de bloc\nCHART" in contract
-    assert "CHART C001" not in contract
-    unsupported = parse_editorial_enrichment_proposal_wire(
-        "CHART C001\nPURPOSE: When were these domains created?\nEND CHART", pack
+    assert "ce contrat n'accepte pas encore" not in contract
+    assert "CHART C001" in contract and "POINT P001" in contract
+    assert enrichment.charts[0].key == "domains_created_in_time"
+    assert len(restored.charts) == 1
+    assert restored.charts[0].points == enrichment.charts[0].points
+
+    for invalid_wire in (
+        wire.replace("DATE: 2026-08-25", "DATE: 2026-08-24", 1),
+        wire.replace("LABEL: alpha.example", "LABEL: gamma.example", 1),
+        wire.replace("SERIES: Registered domains", "SERIES: Unrelated series", 1),
+    ):
+        invalid = parse_editorial_enrichment_proposal_wire(invalid_wire, pack)
+        assert invalid.proposal is not None
+        with pytest.raises(EditorialEnrichmentProposalControlError):
+            validate_editorial_enrichment_proposal(invalid.proposal, pack, extraction, synthesis)
+
+    missing_evidence = parse_editorial_enrichment_proposal_wire(
+        wire.replace("EVIDENCE: E001\nEND POINT", "END POINT", 1), pack
     )
-    assert unsupported.proposal is None
-    assert unsupported.error_code == "editorial_enrichment_unintelligible_response"
+    assert missing_evidence.proposal is None
+    assert missing_evidence.error_code == "editorial_enrichment_no_valid_blocks"
 
 
 def test_fixture_d_structured_exfiltration_mapping_keeps_one_table() -> None:
@@ -1598,7 +1681,7 @@ def test_annotation_wire_blocks_validate_anchor_and_segment_then_persist() -> No
         parsed.proposal, pack, extraction, synthesis
     )
     assert enrichment.annotations[0].text == "ExampleRAT"
-    assert enrichment.schema_version == 6
+    assert enrichment.schema_version == 7
     assert editorial_enrichment_from_json(editorial_enrichment_to_json(enrichment)) == enrichment
 
 
@@ -1821,7 +1904,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
     assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v9-analytic-media-arbitration"
+        "editorial-enrichment-block-contract-v10-timeline-charts"
     )
 
     assert "sélectionne zéro ou une image" in request.text

@@ -6,6 +6,8 @@ import re
 import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from datetime import date as Date
+from datetime import datetime as DateTime
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -25,14 +27,15 @@ from cti_app.domain.semantic_annotation import (
     semantic_annotation_proposal_to_json,
 )
 
-EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 6
+EDITORIAL_ENRICHMENT_SCHEMA_VERSION = 7
 EDITORIAL_ENRICHMENT_V1_POLICY_VERSION = "editorial-enrichment-v1"
 EDITORIAL_ENRICHMENT_V2_POLICY_VERSION = "editorial-enrichment-v2-semantic-annotations"
 EDITORIAL_ENRICHMENT_V3_POLICY_VERSION = "editorial-enrichment-v3-figures-resource-proposals"
 EDITORIAL_ENRICHMENT_V4_POLICY_VERSION = "editorial-enrichment-v4-analytic-purpose"
 EDITORIAL_ENRICHMENT_V5_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-roles"
 EDITORIAL_ENRICHMENT_V6_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v7-analytic-media-arbitration"
+EDITORIAL_ENRICHMENT_V7_POLICY_VERSION = "editorial-enrichment-v7-analytic-media-arbitration"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v8-timeline-charts"
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
@@ -132,6 +135,10 @@ class EnrichmentTableKind(StrEnum):
     CUSTOM = "custom"
 
 
+class ChartKind(StrEnum):
+    TIMELINE = "timeline"
+
+
 class EditorialMediaType(StrEnum):
     """Internal arbiter vocabulary; values do not define wire or render contracts."""
 
@@ -176,6 +183,83 @@ class EditorialAnalyticPurposeV1:
             "evidence_refs",
             _normalize_evidence_refs(self.evidence_refs, "Analytic purpose evidence references"),
         )
+
+
+_CHART_DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_CHART_DATE_TIME = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def validate_chart_date(value: Any) -> str:
+    """Accept only exact ISO calendar dates or timezone-qualified ISO timestamps."""
+    if not isinstance(value, str):
+        raise ValueError("Chart point date must be ISO text")
+    try:
+        if _CHART_DATE_ONLY.fullmatch(value):
+            if Date.fromisoformat(value).isoformat() != value:
+                raise ValueError("Chart point date is invalid")
+            return value
+        if _CHART_DATE_TIME.fullmatch(value):
+            parsed = DateTime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                raise ValueError("Chart point timestamp must include a timezone")
+            return value
+    except ValueError as exc:
+        raise ValueError("Chart point date must be an exact ISO date or timestamp") from exc
+    raise ValueError("Chart point date must be an exact ISO date or timestamp")
+
+
+@dataclass(frozen=True, slots=True)
+class ChartPointV1:
+    label: str
+    date: str
+    series: str
+    evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        _diagram_label(self.label, "Chart point label")
+        validate_chart_date(self.date)
+        _diagram_label(self.series, "Chart point series")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            _normalize_evidence_refs(self.evidence_refs, "Chart point evidence references"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ChartSpecV1:
+    key: str
+    kind: ChartKind
+    title: str
+    caption: str | None
+    placement: EnrichmentPlacementV1
+    purpose: EditorialAnalyticPurposeV1
+    points: tuple[ChartPointV1, ...]
+    compiled_asset_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        _key(self.key, "Chart key")
+        if self.kind is not ChartKind.TIMELINE:
+            raise ValueError("Editorial chart kind is invalid")
+        _diagram_label(self.title, "Chart title")
+        if self.caption is not None:
+            _diagram_label(self.caption, "Chart caption", semantic=False)
+            if not self.caption.strip():
+                object.__setattr__(self, "caption", None)
+        if not isinstance(self.placement, EnrichmentPlacementV1):
+            raise ValueError("Chart placement is invalid")
+        if not isinstance(self.purpose, EditorialAnalyticPurposeV1):
+            raise ValueError("Chart analytic purpose is invalid")
+        if not isinstance(self.points, tuple) or any(
+            not isinstance(point, ChartPointV1) for point in self.points
+        ):
+            raise ValueError("Chart points must be a tuple of ChartPointV1")
+        if not self.points:
+            raise ValueError("Editorial timeline charts require at least one point")
+        if self.compiled_asset_id is not None and not isinstance(self.compiled_asset_id, UUID):
+            raise ValueError("Compiled chart asset identity must be a UUID")
 
 
 @dataclass(frozen=True, slots=True)
@@ -701,9 +785,18 @@ class EditorialEnrichmentV1:
     figure_decisions: tuple[EditorialFigureDecisionTraceV1, ...] = ()
     resource_needs: tuple[EditorialResourceNeedV1, ...] = ()
     resource_proposals: tuple[EditorialResourceProposalV1, ...] = ()
+    charts: tuple[ChartSpecV1, ...] = ()
 
     def __post_init__(self) -> None:
-        if type(self.schema_version) is not int or self.schema_version not in {1, 2, 3, 4, 5, 6}:
+        if type(self.schema_version) is not int or self.schema_version not in {
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+        }:
             raise ValueError("Editorial enrichment schema version is unsupported")
         if not isinstance(self.subject_id, UUID):
             raise ValueError("Editorial enrichment subject identity must be a UUID")
@@ -726,16 +819,21 @@ class EditorialEnrichmentV1:
             else None
         )
         supported_policies = (
-            {EDITORIAL_ENRICHMENT_V6_POLICY_VERSION, EDITORIAL_ENRICHMENT_POLICY_VERSION}
+            {EDITORIAL_ENRICHMENT_V6_POLICY_VERSION, EDITORIAL_ENRICHMENT_V7_POLICY_VERSION}
             if self.schema_version == 6
+            else {EDITORIAL_ENRICHMENT_V7_POLICY_VERSION, EDITORIAL_ENRICHMENT_POLICY_VERSION}
+            if self.schema_version == 7
             else {expected_policy}
         )
         if self.enrichment_policy_version not in supported_policies:
             raise ValueError("Editorial enrichment policy version is unsupported")
+        if self.schema_version < 7 and self.charts:
+            raise ValueError("Legacy editorial enrichment cannot contain charts")
         for label, values, item_type in (
             ("tables", self.tables, TableSpecV1),
             ("diagrams", self.diagrams, DiagramSpecV1),
             ("source figures", self.source_figures, SourceFigureCandidateV1),
+            ("charts", self.charts, ChartSpecV1),
         ):
             if not isinstance(values, tuple) or any(
                 not isinstance(value, item_type) for value in values
@@ -781,6 +879,7 @@ class EditorialEnrichmentV1:
             *(table.key for table in self.tables),
             *(diagram.key for diagram in self.diagrams),
             *(figure.key for figure in self.source_figures),
+            *(chart.key for chart in self.charts),
         ]
         if len(keys) != len(set(keys)):
             raise ValueError("Editorial enrichment keys must be globally unique")
@@ -788,8 +887,10 @@ class EditorialEnrichmentV1:
             required_purposes = [table.purpose for table in self.tables] + [
                 diagram.purpose for diagram in self.diagrams
             ]
+            if self.schema_version >= 7:
+                required_purposes.extend(chart.purpose for chart in self.charts)
             if any(purpose is None for purpose in required_purposes):
-                raise ValueError("V4 tables and diagrams require analytic purposes")
+                raise ValueError("Analytic media require analytic purposes")
             typed_purposes = tuple(purpose for purpose in required_purposes if purpose is not None)
             typed_purposes += tuple(
                 figure.purpose for figure in self.source_figures if figure.purpose is not None
@@ -838,6 +939,10 @@ def editorial_enrichment_evidence_refs(
         if figure.purpose is not None
         for ref in figure.purpose.evidence_refs
     )
+    refs.update(
+        ref for chart in enrichment.charts for point in chart.points for ref in point.evidence_refs
+    )
+    refs.update(ref for chart in enrichment.charts for ref in chart.purpose.evidence_refs)
     refs.update(ref for decision in enrichment.figure_decisions for ref in decision.evidence_refs)
     return frozenset(refs)
 
@@ -917,6 +1022,29 @@ def _diagram_to_json(
         if diagram.purpose is None:
             raise ValueError("V4 editorial diagram is missing its analytic purpose")
         payload["purpose"] = _purpose_to_json(diagram.purpose)
+    return payload
+
+
+def _chart_to_json(chart: ChartSpecV1) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "key": chart.key,
+        "kind": chart.kind.value,
+        "title": chart.title,
+        "caption": chart.caption,
+        "placement": _placement_to_json(chart.placement),
+        "purpose": _purpose_to_json(chart.purpose),
+        "points": [
+            {
+                "label": point.label,
+                "date": point.date,
+                "series": point.series,
+                "evidence_refs": [_ref_to_json(ref) for ref in point.evidence_refs],
+            }
+            for point in chart.points
+        ],
+    }
+    if chart.compiled_asset_id is not None:
+        payload["compiled_asset_id"] = str(chart.compiled_asset_id)
     return payload
 
 
@@ -1067,6 +1195,8 @@ def editorial_enrichment_to_json(enrichment: EditorialEnrichmentV1) -> dict[str,
         payload["resource_proposals"] = [
             _resource_proposal_to_json(item) for item in enrichment.resource_proposals
         ]
+    if enrichment.schema_version >= 7:
+        payload["charts"] = [_chart_to_json(chart) for chart in enrichment.charts]
     return payload
 
 
@@ -1090,6 +1220,7 @@ _ROOT_KEYS_V3 = _ROOT_KEYS_V2 | {"figure_decisions", "resource_needs", "resource
 _ROOT_KEYS_V4 = _ROOT_KEYS_V3
 _ROOT_KEYS_V5 = _ROOT_KEYS_V4
 _ROOT_KEYS_V6 = _ROOT_KEYS_V5
+_ROOT_KEYS_V7 = _ROOT_KEYS_V6 | {"charts"}
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PLACEMENT_KEYS = frozenset({"kind", "section_index"})
 _COLUMN_KEYS = frozenset({"key", "label"})
@@ -1118,6 +1249,9 @@ _DIAGRAM_BASE_KEYS = frozenset(
 _DIAGRAM_KEYS = _DIAGRAM_BASE_KEYS | {"compiled_asset_id"}
 _DIAGRAM_ANALYTIC_BASE_KEYS = _DIAGRAM_BASE_KEYS | {"purpose"}
 _DIAGRAM_ANALYTIC_KEYS = _DIAGRAM_KEYS | {"purpose"}
+_CHART_POINT_KEYS = frozenset({"label", "date", "series", "evidence_refs"})
+_CHART_BASE_KEYS = frozenset({"key", "kind", "title", "caption", "placement", "purpose", "points"})
+_CHART_KEYS = _CHART_BASE_KEYS | {"compiled_asset_id"}
 _LOCATOR_KEYS = frozenset({"page", "section", "figure_label", "original_asset_url"})
 _FIGURE_KEYS = frozenset(
     {
@@ -1378,6 +1512,45 @@ def _diagram_from_json(
     )
 
 
+def _chart_from_json(raw: Any) -> ChartSpecV1:
+    if not isinstance(raw, Mapping) or frozenset(raw) not in {
+        _CHART_BASE_KEYS,
+        _CHART_KEYS,
+    }:
+        raise ValueError("Editorial chart has missing or extra fields")
+    payload = raw
+    caption = payload["caption"]
+    if caption is not None:
+        caption = _text(caption, "Chart caption")
+    return ChartSpecV1(
+        key=_text(payload["key"], "Chart key"),
+        kind=_enum(ChartKind, payload["kind"], "Chart kind"),
+        title=_text(payload["title"], "Chart title", semantic=True),
+        caption=caption,
+        placement=_placement_from_json(payload["placement"]),
+        purpose=_purpose_from_json(payload["purpose"]),
+        points=tuple(
+            ChartPointV1(
+                label=_text(point["label"], "Chart point label", semantic=True),
+                date=validate_chart_date(point["date"]),
+                series=_text(point["series"], "Chart point series", semantic=True),
+                evidence_refs=_refs_from_json(
+                    point["evidence_refs"], "Chart point evidence references"
+                ),
+            )
+            for point in (
+                _object(value, _CHART_POINT_KEYS, "Chart point")
+                for value in _array(payload["points"], "Chart points")
+            )
+        ),
+        compiled_asset_id=(
+            _uuid(payload["compiled_asset_id"], "Compiled chart asset ID")
+            if "compiled_asset_id" in payload
+            else None
+        ),
+    )
+
+
 def _locator_from_json(raw: Any) -> SourceFigureLocatorV1:
     payload = _object(raw, _LOCATOR_KEYS, "Source figure locator")
     page = payload["page"]
@@ -1530,7 +1703,7 @@ def _resource_proposal_from_json(raw: Any) -> EditorialResourceProposalV1:
 
 
 def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnrichmentV1:
-    """Decode strict V1-V5 payloads; older artifacts retain empty review data."""
+    """Decode strict V1-V7 payloads; older artifacts retain empty review data."""
     if not isinstance(payload, Mapping):
         raise ValueError("Editorial enrichment must be an object")
     raw_version = payload.get("schema_version")
@@ -1543,6 +1716,7 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
         4: _ROOT_KEYS_V4,
         5: _ROOT_KEYS_V5,
         6: _ROOT_KEYS_V6,
+        7: _ROOT_KEYS_V7,
     }.get(raw_version)
     if root_keys is None:
         raise ValueError("Editorial enrichment schema version is unsupported")
@@ -1610,6 +1784,11 @@ def editorial_enrichment_from_json(payload: Mapping[str, Any]) -> EditorialEnric
                 for value in _array(body["resource_proposals"], "Editorial resource proposals")
             )
             if schema_version >= 3
+            else ()
+        ),
+        charts=(
+            tuple(_chart_from_json(value) for value in _array(body["charts"], "Editorial charts"))
+            if schema_version >= 7
             else ()
         ),
     )

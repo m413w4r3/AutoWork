@@ -9,6 +9,11 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 from uuid import UUID
 
+from cti_app.application.analytic_chart_compilation import (
+    AnalyticChartCompilationError,
+    AnalyticChartCompiler,
+    CompiledChart,
+)
 from cti_app.application.diagram_compilation import (
     CompiledDiagram,
     DiagramCompilationError,
@@ -29,6 +34,7 @@ from cti_app.application.source_media_collection import (
 from cti_app.domain.errors import BlobIntegrityError, EntityNotFoundError
 from cti_app.domain.media_assets import MediaAssetKind, MediaAssetManifest, media_asset_id
 from cti_app.domain.production_editorial_enrichment import (
+    ChartSpecV1,
     DiagramSpecV1,
     ResolvedSourceFigureV1,
     SourceFigureDecision,
@@ -50,6 +56,18 @@ class DiagramCompilationRejection:
 class DiagramCompilationBatch:
     diagrams: tuple[DiagramSpecV1, ...]
     rejections: tuple[DiagramCompilationRejection, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ChartCompilationRejection:
+    chart_key: str
+    reason_code: str = "editorial_enrichment_chart_render_failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ChartCompilationBatch:
+    charts: tuple[ChartSpecV1, ...]
+    rejections: tuple[ChartCompilationRejection, ...] = ()
 
 
 _SVG_ROOT = re.compile(rb"(?:<\?xml[^>]*\?>\s*)?<svg(?:\s|>)", re.IGNORECASE)
@@ -144,6 +162,21 @@ class MediaAssetStore:
             policy_version=compiled.compiler_policy_version,
         )
 
+    async def store_chart(self, compiled: CompiledChart, *, source: str) -> MediaAssetManifest:
+        if compiled.media_type != "image/svg+xml":
+            raise ValueError("Compiled charts must use the SVG MIME type")
+        if hashlib.sha256(compiled.media_bytes).hexdigest() != compiled.media_sha256:
+            raise ValueError("Compiled chart SHA-256 does not match its SVG bytes")
+        return await self.put(
+            compiled.media_bytes,
+            kind=MediaAssetKind.CHART_SVG,
+            mime_type=compiled.media_type,
+            source=source,
+            compiler_name=compiled.compiler,
+            compiler_version=compiled.compiler_version,
+            policy_version=compiled.compiler_policy_version,
+        )
+
 
 class SourceFigureIngestor:
     """Validate local bytes for one accepted source figure before storing them."""
@@ -220,6 +253,32 @@ async def compile_and_store_diagrams(
         )
         compiled_diagrams.append(replace(diagram, compiled_asset_id=manifest.asset_id))
     return DiagramCompilationBatch(tuple(compiled_diagrams), tuple(rejections))
+
+
+async def compile_and_store_charts(
+    charts: Sequence[ChartSpecV1],
+    *,
+    compiler: AnalyticChartCompiler,
+    media_asset_store: MediaAssetStore,
+    production_run_id: UUID,
+) -> ChartCompilationBatch:
+    """Compile charts independently and retain typed failures for review."""
+    compiled_charts: list[ChartSpecV1] = []
+    rejections: list[ChartCompilationRejection] = []
+    for chart in charts:
+        try:
+            compiled = await compiler.compile(chart)
+        except AnalyticChartCompilationError as exc:
+            rejections.append(ChartCompilationRejection(chart.key, exc.code))
+            continue
+        if compiled.chart_key != chart.key:
+            raise ValueError("Chart compiler returned an asset for another chart")
+        manifest = await media_asset_store.store_chart(
+            compiled,
+            source=f"production_run:{production_run_id}:chart:{chart.key}",
+        )
+        compiled_charts.append(replace(chart, compiled_asset_id=manifest.asset_id))
+    return ChartCompilationBatch(tuple(compiled_charts), tuple(rejections))
 
 
 def _media_asset_bucket(mime_type: str) -> str:

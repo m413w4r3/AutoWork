@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from cti_app.application.analytic_chart_compilation import CompiledChart
 from cti_app.application.diagram_compilation import (
     CompiledDiagram,
     DiagramCompilerProcessError,
@@ -17,14 +18,19 @@ from cti_app.application.media_assets import (
     MAX_SOURCE_FIGURE_BYTES,
     MediaAssetStore,
     SourceFigureIngestor,
+    compile_and_store_charts,
     compile_and_store_diagrams,
 )
 from cti_app.domain.media_assets import MediaAssetKind, MediaAssetManifest, media_asset_id
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
+    ChartPointV1,
+    ChartSpecV1,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
     DiagramSpecV1,
+    EditorialAnalyticPurposeV1,
     EnrichmentDiagramDirection,
     EnrichmentDiagramKind,
     EnrichmentPlacementKind,
@@ -348,6 +354,65 @@ async def test_diagram_compilation_persists_svg_and_exposes_compiled_asset_id() 
     assert manifest.policy_version == "diagram-d2-svg-v3-relation-semantics"
     assert manifest.source == f"production_run:{run_id}:diagram:network_flow"
     assert await asset_store.read(manifest.asset_id) == compiler.svg
+
+
+@pytest.mark.asyncio
+async def test_chart_compilation_persists_svg_with_chart_kind_and_content_address() -> None:
+    blob_store = _MemoryBlobStore()
+    media_assets = _MemoryMediaAssets()
+    asset_store = MediaAssetStore(blob_store, lambda: _MemoryUow(media_assets))  # type: ignore[arg-type]
+    evidence = (ExtractionEvidenceRefV1(UUID(int=1), EvidenceKind.FACT, "b" * 64),)
+    chart = ChartSpecV1(
+        key="domain_registrations",
+        kind=ChartKind.TIMELINE,
+        title="Domain registrations",
+        caption=None,
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+        purpose=EditorialAnalyticPurposeV1(
+            question="When were domains registered?",
+            available_data="Exact dates from the source.",
+            comprehension_gain="A common axis makes ordering visible.",
+            scope="Only the cited domains.",
+            evidence_refs=evidence,
+            knowledge_limits="No other events are inferred.",
+            placement_reason="Place after the analysis.",
+        ),
+        points=(ChartPointV1("alpha.example", "2026-08-25", "Registered domains", evidence),),
+    )
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"></svg>'
+
+    class Compiler:
+        async def compile(self, value: ChartSpecV1) -> CompiledChart:
+            assert value is chart
+            return CompiledChart(
+                chart_key=value.key,
+                media_type="image/svg+xml",
+                media_bytes=svg,
+                media_sha256=hashlib.sha256(svg).hexdigest(),
+                compiler="test-timeline",
+                compiler_version="1.0",
+                compiler_policy_version="timeline-test-v1",
+            )
+
+    run_id = uuid4()
+    result = await compile_and_store_charts(
+        (chart,),
+        compiler=Compiler(),  # type: ignore[arg-type]
+        media_asset_store=asset_store,
+        production_run_id=run_id,
+    )
+
+    assert result.rejections == ()
+    projected_chart = result.charts[0]
+    assert projected_chart.compiled_asset_id == media_asset_id(
+        hashlib.sha256(svg).hexdigest(), "image/svg+xml"
+    )
+    manifest = await asset_store.get(projected_chart.compiled_asset_id)
+    assert manifest is not None
+    assert manifest.kind is MediaAssetKind.CHART_SVG
+    assert manifest.compiler_name == "test-timeline"
+    assert manifest.source == f"production_run:{run_id}:chart:domain_registrations"
+    assert await asset_store.read(manifest.asset_id) == svg
 
 
 @pytest.mark.asyncio

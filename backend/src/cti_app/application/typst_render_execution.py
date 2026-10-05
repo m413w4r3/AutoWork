@@ -126,6 +126,14 @@ class TypstRenderExecutor:
                     raise TypstRenderMediaKindMismatchError(
                         f"Diagram media asset {media_ref.asset_id} has an invalid kind or MIME type"
                     )
+            elif media_ref.expected_kind is MediaAssetKind.CHART_SVG:
+                if (
+                    manifest.kind is not MediaAssetKind.CHART_SVG
+                    or manifest.mime_type != "image/svg+xml"
+                ):
+                    raise TypstRenderMediaKindMismatchError(
+                        f"Chart media asset {media_ref.asset_id} has an invalid kind or MIME type"
+                    )
             elif media_ref.expected_kind is MediaAssetKind.SOURCE_FIGURE:
                 if (
                     manifest.asset_id != media_ref.asset_id

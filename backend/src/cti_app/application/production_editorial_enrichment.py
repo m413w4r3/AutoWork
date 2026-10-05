@@ -25,11 +25,15 @@ from pydantic import (
     model_validator,
 )
 
+from cti_app.application.analytic_chart_compilation import (
+    AnalyticChartCompiler,
+)
 from cti_app.application.diagram_compilation import DiagramCompiler
 from cti_app.application.media_assets import (
     MAX_SOURCE_FIGURE_BYTES,
     MediaAssetStore,
     SourceFigureIngestor,
+    compile_and_store_charts,
     compile_and_store_diagrams,
 )
 from cti_app.application.model_gateway import (
@@ -104,6 +108,9 @@ from cti_app.domain.production_editorial_enrichment import (
     EDITORIAL_ENRICHMENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
     EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
+    ChartKind,
+    ChartPointV1,
+    ChartSpecV1,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeRole,
@@ -136,6 +143,7 @@ from cti_app.domain.production_editorial_enrichment import (
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
     normalize_analytic_question,
+    validate_chart_date,
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
@@ -182,14 +190,12 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v7-analytic-media-purpose"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v8-timeline-charts"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v2-cross-media-normalized-question"
+    "editorial-enrichment-analytic-policy-v3-timeline-charts"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = (
-    "editorial-enrichment-model-policy-v4-analytic-media-arbitration"
-)
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v5-timeline-charts"
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -337,6 +343,57 @@ class TableProposalV1(_StrictEnrichmentProposalModel):
     @classmethod
     def _caption_text(cls, value: str | None) -> str | None:
         return _nonempty_proposal_text(value) if value is not None else None
+
+
+class ChartPointProposalV1(_StrictEnrichmentProposalModel):
+    label: StrictStr
+    date: StrictStr
+    series: StrictStr
+    evidence_handles: tuple[StrictStr, ...]
+
+    @field_validator("label", "series")
+    @classmethod
+    def _nonempty(cls, value: str) -> str:
+        return _nonempty_proposal_text(value)
+
+    @field_validator("date")
+    @classmethod
+    def _exact_iso_date(cls, value: str) -> str:
+        return validate_chart_date(value)
+
+    @field_validator("evidence_handles")
+    @classmethod
+    def _handles(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _nonempty_evidence_handles(value)
+
+
+class ChartProposalV1(_StrictEnrichmentProposalModel):
+    key: StrictStr
+    kind: ChartKind
+    title: StrictStr
+    caption: StrictStr | None = None
+    placement: EnrichmentPlacementProposalV1
+    purpose: AnalyticPurposeProposalV1
+    points: tuple[ChartPointProposalV1, ...]
+
+    @field_validator("key", "title")
+    @classmethod
+    def _nonempty(cls, value: str) -> str:
+        return _nonempty_proposal_text(value)
+
+    @field_validator("caption")
+    @classmethod
+    def _caption_text(cls, value: str | None) -> str | None:
+        return _nonempty_proposal_text(value) if value is not None else None
+
+    @field_validator("points")
+    @classmethod
+    def _points_required(
+        cls, value: tuple[ChartPointProposalV1, ...]
+    ) -> tuple[ChartPointProposalV1, ...]:
+        if not value:
+            raise ValueError("A timeline chart requires at least one point")
+        return value
 
 
 class DiagramNodeProposalV1(_StrictEnrichmentProposalModel):
@@ -655,6 +712,7 @@ def _proposal_annotation_to_domain(
 
 class EditorialEnrichmentProposalV1(_StrictEnrichmentProposalModel):
     tables: tuple[TableProposalV1, ...] = ()
+    charts: tuple[ChartProposalV1, ...] = ()
     diagrams: tuple[DiagramProposalV1, ...] = ()
     annotations: tuple[AnnotationProposalV1, ...] = ()
     figures: tuple[FigureProposalV1, ...] = ()
@@ -768,7 +826,7 @@ class _EditorialEnrichmentWireBlock:
 _ENRICHMENT_FENCE = re.compile(r"^\s*(?:```|~~~)")
 _ENRICHMENT_BLOCK_WRAPPER = re.compile(r"^@@\s*(.*?)\s*@@$")
 _ENRICHMENT_HEADER = re.compile(
-    r"^(TABLE|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|NODE|RELATION|EDGE|GROUP)"
+    r"^(TABLE|CHART|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|POINT|NODE|RELATION|EDGE|GROUP)"
     r"(?:(?:\s*:\s*|\s+)([A-Za-z0-9][A-Za-z0-9._-]*))?\s*:?$",
     re.IGNORECASE,
 )
@@ -799,6 +857,8 @@ _ENRICHMENT_FIELD_ALIASES = {
     "relation_type": "relation_type",
     "column key": "key",
     "label": "label",
+    "date": "date",
+    "series": "series",
     "cell": "cell",
     "evidence": "evidence_handles",
     "evidence handle": "evidence_handles",
@@ -839,10 +899,11 @@ _ENRICHMENT_FIELD_ALIASES = {
     "segment": "text",
     "text": "text",
 }
-_ENRICHMENT_CHILD_KINDS = frozenset({"COLUMN", "ROW", "NODE", "RELATION", "EDGE", "GROUP"})
+_ENRICHMENT_CHILD_KINDS = frozenset({"COLUMN", "ROW", "POINT", "NODE", "RELATION", "EDGE", "GROUP"})
 _ENRICHMENT_CHILD_PARENT = {
     "COLUMN": "TABLE",
     "ROW": "TABLE",
+    "POINT": "CHART",
     "NODE": "DIAGRAM",
     "RELATION": "DIAGRAM",
     "EDGE": "DIAGRAM",
@@ -1112,6 +1173,10 @@ def semantic_annotation_anchor_texts(
         result[f"diagram:{diagram.key}:title"] = diagram.title
         if diagram.caption is not None:
             result[f"diagram:{diagram.key}:caption"] = diagram.caption
+    for chart in enrichment.charts:
+        result[f"chart:{chart.key}:title"] = chart.title
+        if chart.caption is not None:
+            result[f"chart:{chart.key}:caption"] = chart.caption
     for figure in enrichment.source_figures:
         result[f"figure:{figure.key}:caption"] = figure.caption
         result[f"figure:{figure.key}:provenance"] = figure.provenance
@@ -1952,12 +2017,14 @@ def parse_editorial_enrichment_proposal_wire(
         nonlocal block_sequence
         prefix = {
             "TABLE": "T",
+            "CHART": "C",
             "DIAGRAM": "D",
             "ANNOTATION": "A",
             "FIGURE": "P",
             "NEEDS": "N",
             "COLUMN": "C",
             "ROW": "R",
+            "POINT": "P",
             "NODE": "N",
             "RELATION": "L",
             "EDGE": "L",
@@ -2024,7 +2091,7 @@ def parse_editorial_enrichment_proposal_wire(
                 )
                 reject(marker, "editorial_enrichment_empty_marker_conflict")
                 explicit_empty = False
-            if kind in {"TABLE", "DIAGRAM", "ANNOTATION", "FIGURE", "NEEDS"}:
+            if kind in {"TABLE", "CHART", "DIAGRAM", "ANNOTATION", "FIGURE", "NEEDS"}:
                 finish_top()
                 current_top = new_block(kind, local_id, raw_line)
             else:
@@ -2040,7 +2107,7 @@ def parse_editorial_enrichment_proposal_wire(
             continue
 
         end_match = re.fullmatch(
-            r"END(?:\s+(TABLE|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|NODE|RELATION|EDGE|GROUP|ITEM))?",
+            r"END(?:\s+(TABLE|CHART|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|POINT|NODE|RELATION|EDGE|GROUP|ITEM))?",
             line,
             re.I,
         )
@@ -2065,6 +2132,7 @@ def parse_editorial_enrichment_proposal_wire(
                 r"^(EVIDENCE\s+HANDLES?|SECTION\s+INDEX|NODE\s+IDS|SOURCE\s+NODE\s+ID|"
                 r"TARGET\s+NODE\s+ID|GROUP\s+ID|NODE\s+ID|COLUMN\s+KEY|"
                 r"PARAGRAPH\s+ANCHOR|EXACT\s+TEXT|FIGURE\s+HANDLE|NEED\s+KEY|QUERY\s+HINT|"
+                r"DATE|SERIES|"
                 r"CATEGORY|ROLE|ANCHOR|SEGMENT|TEXT|"
                 r"KEY|KIND|TITLE|CAPTION|PLACEMENT|LABEL|CELL|HANDLES|DIRECTION|ID|"
                 r"FROM|TO|SOURCE|TARGET|NODES)\s+(.+)$",
@@ -2116,6 +2184,21 @@ def parse_editorial_enrichment_proposal_wire(
                 "knowledge_limits",
                 "placement_reason",
             },
+            "CHART": {
+                "key",
+                "kind",
+                "title",
+                "caption",
+                "placement",
+                "section_index",
+                "purpose",
+                "available_data",
+                "comprehension_gain",
+                "scope",
+                "purpose_evidence_handles",
+                "knowledge_limits",
+                "placement_reason",
+            },
             "DIAGRAM": {
                 "key",
                 "kind",
@@ -2134,6 +2217,7 @@ def parse_editorial_enrichment_proposal_wire(
             },
             "COLUMN": {"key", "label"},
             "ROW": {"cell", "evidence_handles"},
+            "POINT": {"date", "label", "series", "evidence_handles"},
             "NODE": {"node_id", "id", "label", "role", "evidence_handles"},
             "RELATION": {
                 "source_node_id",
@@ -2195,6 +2279,7 @@ def parse_editorial_enrichment_proposal_wire(
         )
 
     tables: list[TableProposalV1] = []
+    charts: list[ChartProposalV1] = []
     diagrams: list[DiagramProposalV1] = []
     annotations: list[AnnotationProposalV1] = []
     figures: list[FigureProposalV1] = []
@@ -2241,6 +2326,27 @@ def parse_editorial_enrichment_proposal_wire(
                     tables.append(table)
                     accepted = True
                     proposal_key = table.key
+        elif top.kind == "CHART":
+            chart = _parse_enrichment_wire_chart(top, evidence_pack, rejections, warnings)
+            if chart is not None:
+                question_key = normalize_analytic_question(chart.purpose.question)
+                preferred_figure = source_figure_questions.get(question_key)
+                if preferred_figure is not None:
+                    reject(top, "editorial_enrichment_source_figure_preferred_over_reconstruction")
+                    warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{preferred_figure}:{top.kind}:{top.block_id}"
+                    )
+                elif not question_key or question_key in analytic_questions:
+                    reject(top, "editorial_enrichment_duplicate_analytic_purpose")
+                elif chart.key in canonical_keys:
+                    reject(top, "editorial_enrichment_duplicate_key")
+                else:
+                    canonical_keys.add(chart.key)
+                    analytic_questions.add(question_key)
+                    charts.append(chart)
+                    accepted = True
+                    proposal_key = chart.key
         elif top.kind == "ANNOTATION":
             annotation = _parse_annotation_wire_block(top, evidence_pack, rejections)
             if annotation is not None:
@@ -2307,7 +2413,7 @@ def parse_editorial_enrichment_proposal_wire(
             accepted_blocks.append(
                 EditorialEnrichmentAcceptedBlock(top.kind, top.block_id, top.scope_id, proposal_key)
             )
-        elif top.kind in {"TABLE", "DIAGRAM", "FIGURE"}:
+        elif top.kind in {"TABLE", "CHART", "DIAGRAM", "FIGURE"}:
             block_rejections = tuple(
                 dict.fromkeys(
                     item.reason_code
@@ -2325,7 +2431,7 @@ def parse_editorial_enrichment_proposal_wire(
                     reason_codes=block_rejections,
                 )
             )
-    if not tables and not diagrams and not annotations and not figures and not resource_needs:
+    if not (tables or charts or diagrams or annotations or figures or resource_needs):
         return EditorialEnrichmentWireParseResult(
             None,
             tuple(rejections),
@@ -2338,6 +2444,7 @@ def parse_editorial_enrichment_proposal_wire(
     return EditorialEnrichmentWireParseResult(
         proposal=EditorialEnrichmentProposalV1(
             tables=tuple(tables),
+            charts=tuple(charts),
             diagrams=tuple(diagrams),
             annotations=tuple(annotations),
             figures=tuple(figures),
@@ -2374,6 +2481,7 @@ def _merge_repaired_editorial_enrichment_proposal(
 
     proposal_values: dict[str, dict[str, Any]] = {
         "TABLE": {item.key: item for item in repaired.tables},
+        "CHART": {item.key: item for item in repaired.charts},
         "DIAGRAM": {item.key: item for item in repaired.diagrams},
         "FIGURE": {item.figure_handle: item for item in repaired.figures},
     }
@@ -2389,12 +2497,19 @@ def _merge_repaired_editorial_enrichment_proposal(
         repaired_by_identity[identity] = candidate
 
     tables = list(original.tables)
+    charts = list(original.charts)
     diagrams = list(original.diagrams)
     figures = list(original.figures)
-    keys = {item.key for item in tables} | {item.key for item in diagrams}
-    questions = {normalize_analytic_question(item.purpose.question) for item in tables} | {
-        normalize_analytic_question(item.purpose.question) for item in diagrams
-    }
+    keys = (
+        {item.key for item in tables}
+        | {item.key for item in charts}
+        | {item.key for item in diagrams}
+    )
+    questions = (
+        {normalize_analytic_question(item.purpose.question) for item in tables}
+        | {normalize_analytic_question(item.purpose.question) for item in diagrams}
+        | {normalize_analytic_question(item.purpose.question) for item in charts}
+    )
     source_figure_questions = {
         normalize_analytic_question(item.purpose.question): item.figure_handle for item in figures
     }
@@ -2453,6 +2568,25 @@ def _merge_repaired_editorial_enrichment_proposal(
                 diagrams.append(candidate)
                 keys.add(candidate.key)
                 questions.add(question)
+        elif target.kind == "CHART":
+            assert isinstance(candidate, ChartProposalV1)
+            question = normalize_analytic_question(candidate.purpose.question)
+            if reason is not None:
+                pass
+            elif candidate.key in keys:
+                reason = "editorial_enrichment_duplicate_key"
+            elif question in source_figure_questions:
+                reason = "editorial_enrichment_source_figure_preferred_over_reconstruction"
+                new_warnings.append(
+                    "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                    f"{source_figure_questions[question]}:CHART:{candidate.key}"
+                )
+            elif not question or question in questions:
+                reason = "editorial_enrichment_duplicate_analytic_purpose"
+            else:
+                charts.append(candidate)
+                keys.add(candidate.key)
+                questions.add(question)
         elif target.kind == "FIGURE":
             assert isinstance(candidate, FigureProposalV1)
             question = normalize_analytic_question(candidate.purpose.question)
@@ -2477,6 +2611,11 @@ def _merge_repaired_editorial_enrichment_proposal(
                     for diagram_item in diagrams
                     if normalize_analytic_question(diagram_item.purpose.question) == question
                 ]
+                colliding_charts = [
+                    chart_item
+                    for chart_item in charts
+                    if normalize_analytic_question(chart_item.purpose.question) == question
+                ]
                 for table_item in colliding_tables:
                     keys.discard(table_item.key)
                     new_warnings.append(
@@ -2494,12 +2633,23 @@ def _merge_repaired_editorial_enrichment_proposal(
                         "editorial_enrichment_source_figure_preferred_over_reconstruction:"
                         f"{candidate.figure_handle}:DIAGRAM:{diagram_item.key}"
                     )
+                for chart_item in colliding_charts:
+                    keys.discard(chart_item.key)
+                    new_warnings.append(
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction:"
+                        f"{candidate.figure_handle}:CHART:{chart_item.key}"
+                    )
+                    discarded_accepted_blocks.update(
+                        (block.kind, block.block_id)
+                        for block in first_pass.accepted_blocks
+                        if block.kind == "CHART" and block.proposal_key == chart_item.key
+                    )
                     discarded_accepted_blocks.update(
                         (block.kind, block.block_id)
                         for block in first_pass.accepted_blocks
                         if block.kind == "DIAGRAM" and block.proposal_key == diagram_item.key
                     )
-                if colliding_tables or colliding_diagrams:
+                if colliding_tables or colliding_diagrams or colliding_charts:
                     tables = [
                         table_item for table_item in tables if table_item not in colliding_tables
                     ]
@@ -2507,6 +2657,9 @@ def _merge_repaired_editorial_enrichment_proposal(
                         diagram_item
                         for diagram_item in diagrams
                         if diagram_item not in colliding_diagrams
+                    ]
+                    charts = [
+                        chart_item for chart_item in charts if chart_item not in colliding_charts
                     ]
                     questions.discard(question)
                 figures.append(candidate)
@@ -2544,6 +2697,7 @@ def _merge_repaired_editorial_enrichment_proposal(
     )
     proposal = EditorialEnrichmentProposalV1(
         tables=tuple(tables),
+        charts=tuple(charts),
         diagrams=tuple(diagrams),
         annotations=original.annotations,
         figures=tuple(figures),
@@ -2552,6 +2706,7 @@ def _merge_repaired_editorial_enrichment_proposal(
     has_content = any(
         (
             proposal.tables,
+            proposal.charts,
             proposal.diagrams,
             proposal.annotations,
             proposal.figures,
@@ -2831,6 +2986,111 @@ def _parse_enrichment_wire_table(
         )
     except (TypeError, ValueError, ValidationError):
         reject(block, "editorial_enrichment_table_invalid")
+        return None
+
+
+def _parse_enrichment_wire_chart(
+    block: _EditorialEnrichmentWireBlock,
+    evidence_pack: EditorialEnrichmentEvidencePackV1,
+    rejections: list[EditorialEnrichmentWireRejection],
+    warnings: list[str],
+) -> ChartProposalV1 | None:
+    def reject(item: _EditorialEnrichmentWireBlock, code: str) -> None:
+        rejections.append(_enrichment_wire_rejection(item, item.block_id, code, item.raw_lines))
+
+    allowed_top_fields = {
+        "key",
+        "kind",
+        "title",
+        "caption",
+        "placement",
+        "section_index",
+        "purpose",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "purpose_evidence_handles",
+        "knowledge_limits",
+        "placement_reason",
+    }
+    if set(block.fields) - allowed_top_fields:
+        reject(block, "editorial_enrichment_unknown_field")
+        return None
+    raw_kind = _wire_scalar(block, "kind")
+    kind = next(
+        (
+            item
+            for item in ChartKind
+            if raw_kind and item.value.casefold() == raw_kind.strip().casefold()
+        ),
+        None,
+    )
+    placement = _wire_placement(block)
+    key = _wire_scalar(block, "key")
+    title = _wire_scalar(block, "title")
+    if not key or not title or kind is None or placement is None:
+        reject(block, "editorial_enrichment_chart_missing_or_invalid_field")
+        return None
+    purpose = _parse_analytic_purpose(block, evidence_pack, rejections)
+    if purpose is None:
+        return None
+
+    points: list[ChartPointProposalV1] = []
+    point_handles: set[str] = set()
+    invalid_point = False
+    for child in block.children:
+        if child.kind != "POINT":
+            continue
+        error = _block_child_error(
+            child, frozenset({"date", "label", "series", "evidence_handles"})
+        )
+        raw_date = _wire_scalar(child, "date")
+        label = _wire_scalar(child, "label")
+        series = _wire_scalar(child, "series")
+        handles = _wire_handles(_wire_scalar(child, "evidence_handles"))
+        if error is not None or not raw_date or not label or not series or handles is None:
+            reject(child, error or "editorial_enrichment_chart_point_missing_or_invalid_field")
+            invalid_point = True
+            continue
+        if any(handle not in evidence_pack._handle_to_ref for handle in handles):
+            reject(child, "editorial_enrichment_unknown_evidence_handle")
+            invalid_point = True
+            continue
+        try:
+            points.append(
+                ChartPointProposalV1(
+                    date=raw_date,
+                    label=label,
+                    series=series,
+                    evidence_handles=handles,
+                )
+            )
+        except (TypeError, ValueError, ValidationError):
+            reject(child, "editorial_enrichment_chart_point_invalid")
+            invalid_point = True
+            continue
+        point_handles.update(handles)
+    if invalid_point:
+        reject(block, "editorial_enrichment_chart_has_invalid_points")
+        return None
+    if not points:
+        reject(block, "editorial_enrichment_chart_has_no_points")
+        return None
+    purpose = _trim_analytic_purpose_evidence(block, purpose, point_handles, rejections, warnings)
+    if purpose is None:
+        return None
+    try:
+        return ChartProposalV1(
+            key=key,
+            kind=kind,
+            title=title,
+            caption=_wire_caption(block),
+            placement=placement,
+            purpose=purpose,
+            points=tuple(points),
+        )
+    except (TypeError, ValueError, ValidationError):
+        reject(block, "editorial_enrichment_chart_invalid")
         return None
 
 
@@ -3176,6 +3436,7 @@ class ProductionEditorialEnrichmentExecution:
     table_count: int = 0
     diagram_count: int = 0
     source_figure_count: int = 0
+    chart_count: int = 0
     warnings: tuple[str, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
@@ -3793,19 +4054,48 @@ Pour chaque question analytique :
       OUI → TABLE
 5. Sinon → aucun enrichissement.
 
-CHART est une branche conceptuelle; ce contrat n'accepte pas encore de bloc
-CHART. Si cette branche répond à la question, n'émets pas de bloc pour ce besoin
-et ne le convertis pas en DIAGRAM ou TABLE.
+CHART accepte uniquement le KIND timeline. Chaque POINT doit citer une date ISO
+exacte, un LABEL et une SERIES présents dans ses preuves, plus au moins un
+EVIDENCE handle. N'invente pas de dates, n'utilise pas de dates relatives et
+n'interpole aucun point. Le renderer choisit les couleurs.
 """
         + "Une représentation existante de la source est prioritaire sur une représentation "
         + "reconstruite, lorsque les deux répondent à la même question analytique.\n"
         + """Deux enrichissements ne doivent pas répondre à la même question analytique.
 Aucun quota minimal de médias ne s'applique; RIEN est une décision valide.
 
-For each FIGURE, TABLE, and DIAGRAM, fill every typed analytic-purpose field:
+For each FIGURE, CHART, TABLE, and DIAGRAM, fill every typed analytic-purpose field:
 PURPOSE (the reader's question), DATA (what the evidence contains), GAIN (why
 this form is clearer than prose), SCOPE, PURPOSE_EVIDENCE, LIMITS, PLACEMENT,
 and PLACEMENT_REASON. Values and handles must be non-empty.
+
+CHART C001
+KEY: domains_created_over_time
+KIND: timeline
+TITLE: Domain registrations by actor
+CAPTION: Exact documented registration dates for observed actors.
+PURPOSE: When were the documented domains registered, and which actors show bursts?
+DATA: The exact dates, domain labels and actors stated in E014 and E021.
+GAIN: A shared time axis makes bursts and differences between actors visible.
+SCOPE: Only registrations with exact dates in the cited evidence.
+PURPOSE_EVIDENCE: E014, E021
+LIMITS: The chart does not imply connections between domains or actors.
+PLACEMENT: after_section
+SECTION_INDEX: 2
+PLACEMENT_REASON: Place beside the section discussing domain registrations.
+POINT P001
+DATE: 2026-06-22
+LABEL: msbenefit.com
+SERIES: APT31
+EVIDENCE: E014
+END POINT
+POINT P002
+DATE: 2026-07-27T10:13:40+02:00
+LABEL: example-domain.test
+SERIES: UTA0560
+EVIDENCE: E021
+END POINT
+END CHART
 
 TABLE T001
 KEY: mechanism_comparison
@@ -3890,8 +4180,14 @@ Neutral intent examples (bracketed details are placeholders, not facts):
   roles, dates, endpoints, and relations are documented in cited evidence.
 
 Do not use JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or
-generated render syntax. Keep every table, diagram, and figure label grounded
-in the supplied text and evidence handles.
+generated render syntax. Keep every chart point, table cell, diagram element,
+and figure label grounded in the supplied text and evidence handles.
+
+A CHART has only KIND: timeline. Use one POINT block per documented observation.
+DATE must be an exact ISO date or timezone-qualified ISO timestamp; LABEL and
+SERIES must occur in that point's evidence. Every point needs EVIDENCE handles.
+Do not estimate dates, turn relative wording into exact dates, interpolate
+between observations, or provide colors.
 
 Each column is a COLUMN block; each row is a ROW block with one CELL per column.
 Each diagram uses NODE, RELATION, and optional GROUP blocks. Every row, node,
@@ -4021,17 +4317,17 @@ def build_editorial_enrichment_model_request(
             "ou un flux ? "
             "OUI → DIAGRAM. "
             "4. Sinon, faut-il comparer plusieurs objets selon les mêmes champs ou représenter une "
-            "correspondance structurée ? OUI → TABLE. 5. Sinon → aucun enrichissement. CHART est "
-            "une branche conceptuelle sans bloc pris en charge dans ce contrat; "
-            "si elle répond à la question, n'émets pas de bloc pour ce besoin "
-            "et ne le convertis pas "
-            "en DIAGRAM ou TABLE. "
+            "correspondance structurée ? OUI → TABLE. 5. Sinon → aucun enrichissement. CHART "
+            "accepte uniquement KIND: timeline, avec des POINT blocks; chaque date ISO exacte, "
+            "label et série doit être présente dans les preuves du point, chaque point cite au "
+            "moins un evidence handle, et aucune date relative ou interpolation n'est permise. "
+            "Les couleurs sont choisies par le renderer. "
             "Une représentation existante de la source est prioritaire sur une représentation "
             "reconstruite, lorsque les deux répondent à la même question analytique. Deux "
             "enrichissements ne doivent pas répondre à la même question analytique. Aucun quota "
             "minimal de médias ne s'applique; RIEN est une décision valide. Choisis une "
             "représentation uniquement quand elle clarifie les preuves mieux que la prose. Chaque "
-            "FIGURE, table et "
+            "FIGURE, chart, table et "
             "diagramme doit renseigner PURPOSE (question du lecteur), DATA, GAIN "
             "(comprehension gain : avantage sur le paragraphe), SCOPE, "
             "PURPOSE_EVIDENCE, LIMITS, PLACEMENT et "
@@ -4040,7 +4336,7 @@ def build_editorial_enrichment_model_request(
             "nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro diagramme sont "
             "valides lorsque la prose suffit. N'ajoute aucun fait, "
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
-            "fournies. Chaque ligne, nœud et arête cite des evidence handles existants et "
+            "fournies. Chaque point, ligne, nœud et arête cite des evidence handles existants et "
             "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
             "les deux endpoints et soutient le libellé de la relation. RELATION_TYPE est "
             "obligatoire : RELATION_TYPE: factual | inference | comparison, avec une seule "
@@ -4208,7 +4504,7 @@ def build_editorial_enrichment_repair_request(
     repair_run_id = uuid5(NAMESPACE_URL, f"production-editorial-enrichment-repair:{identity}")
     prompt_payload = {
         "instructions": (
-            "Repair only the rejected TABLE, DIAGRAM, or FIGURE blocks listed below. Return "
+            "Repair only the rejected TABLE, CHART, DIAGRAM, or FIGURE blocks listed below. Return "
             "corrected replacements in the same plain-text block format and preserve each exact "
             "analytic question and all required purpose fields, including for FIGURE blocks. "
             "Respect the source-figure priority and never make two repaired or existing blocks "
@@ -4315,6 +4611,22 @@ def _validate_grounded_editorial_text(
             )
 
 
+def _validate_exact_evidence_text(
+    value: str,
+    refs: tuple[ExtractionEvidenceRefV1, ...],
+    entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+) -> None:
+    needle = " ".join(value.split()).casefold()
+    if not needle or not any(
+        needle in " ".join(text.split()).casefold()
+        for ref in refs
+        for text in _string_values(entries[ref])
+    ):
+        raise EditorialEnrichmentProposalControlError(
+            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+        )
+
+
 def validate_editorial_enrichment_proposal(
     proposal: EditorialEnrichmentProposalV1 | Mapping[str, Any],
     evidence_pack: EditorialEnrichmentEvidencePackV1,
@@ -4390,6 +4702,7 @@ def validate_editorial_enrichment_proposal(
         return EnrichmentPlacementV1(kind=value.kind, section_index=value.section_index)
 
     tables: list[TableSpecV1] = []
+    charts: list[ChartSpecV1] = []
     diagrams: list[DiagramSpecV1] = []
     for table in parsed.tables:
         if len(table.columns) < 2 or not table.rows:
@@ -4546,6 +4859,81 @@ def validate_editorial_enrichment_proposal(
                         knowledge_limits=diagram.purpose.knowledge_limits,
                         placement_reason=diagram.purpose.placement_reason,
                     ),
+                )
+            )
+        except ValueError as exc:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            ) from exc
+
+    for chart in parsed.charts:
+        if not chart.points:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        points: list[ChartPointV1] = []
+        chart_refs: set[ExtractionEvidenceRefV1] = set()
+        for point in chart.points:
+            refs = _all_refs_for_handles(point.evidence_handles, evidence_pack)
+            if not refs:
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+                )
+            _validate_grounded_editorial_text(point.date, refs, entries, technical_support)
+            _validate_exact_evidence_text(point.date, refs, entries)
+            _validate_grounded_editorial_text(point.label, refs, entries, technical_support)
+            _validate_exact_evidence_text(point.label, refs, entries)
+            _validate_grounded_editorial_text(point.series, refs, entries, technical_support)
+            _validate_exact_evidence_text(point.series, refs, entries)
+            chart_refs.update(refs)
+            points.append(
+                ChartPointV1(
+                    label=point.label,
+                    date=point.date,
+                    series=point.series,
+                    evidence_refs=refs,
+                )
+            )
+        ordered_chart_refs = tuple(sorted(chart_refs, key=evidence_ref_sort_key))
+        _validate_grounded_editorial_text(
+            chart.title, ordered_chart_refs, entries, technical_support
+        )
+        if chart.caption is not None:
+            _validate_grounded_editorial_text(
+                chart.caption, ordered_chart_refs, entries, technical_support
+            )
+        purpose_refs = _all_refs_for_handles(chart.purpose.evidence_handles, evidence_pack)
+        if not purpose_refs or not set(purpose_refs) <= chart_refs:
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            )
+        for value in (
+            chart.purpose.question,
+            chart.purpose.available_data,
+            chart.purpose.comprehension_gain,
+            chart.purpose.scope,
+            chart.purpose.knowledge_limits,
+            chart.purpose.placement_reason,
+        ):
+            _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+        try:
+            charts.append(
+                ChartSpecV1(
+                    key=chart.key,
+                    kind=chart.kind,
+                    title=chart.title,
+                    caption=chart.caption,
+                    placement=placement(chart.placement),
+                    purpose=EditorialAnalyticPurposeV1(
+                        question=chart.purpose.question,
+                        available_data=chart.purpose.available_data,
+                        comprehension_gain=chart.purpose.comprehension_gain,
+                        scope=chart.purpose.scope,
+                        evidence_refs=purpose_refs,
+                        knowledge_limits=chart.purpose.knowledge_limits,
+                        placement_reason=chart.purpose.placement_reason,
+                    ),
+                    points=tuple(points),
                 )
             )
         except ValueError as exc:
@@ -4721,6 +5109,7 @@ def validate_editorial_enrichment_proposal(
             publication_language=synthesis.publication_language,
             enrichment_policy_version=EDITORIAL_ENRICHMENT_POLICY_VERSION,
             tables=tuple(tables),
+            charts=tuple(charts),
             diagrams=tuple(diagrams),
             source_figures=tuple(selected_source_figures),
             warnings=tuple(local_warnings),
@@ -4776,6 +5165,7 @@ class ProductionEditorialEnrichmentService:
         artifact_reuse: ProductionArtifactReuseService | None = None,
         media_asset_store: MediaAssetStore | None = None,
         diagram_compiler: DiagramCompiler | None = None,
+        chart_compiler: AnalyticChartCompiler | None = None,
         source_media_archiver: SourceMediaArchiveService | None = None,
         resource_search_enabled: bool = False,
     ) -> None:
@@ -4789,6 +5179,7 @@ class ProductionEditorialEnrichmentService:
             SourceFigureIngestor(media_asset_store) if media_asset_store is not None else None
         )
         self._diagram_compiler = diagram_compiler
+        self._chart_compiler = chart_compiler
         self._source_media_archiver = source_media_archiver
         self._resource_search_enabled = resource_search_enabled
 
@@ -5028,7 +5419,7 @@ class ProductionEditorialEnrichmentService:
             wire_details["warnings"] = list(parsed.warnings)
             wire_details["transformations"] = list(parsed.transformations)
 
-        target_kinds = {"TABLE", "DIAGRAM", "FIGURE"}
+        target_kinds = {"TABLE", "CHART", "DIAGRAM", "FIGURE"}
         initially_proposed_targets = tuple(
             item for item in first_pass.accepted_blocks if item.kind in target_kinds
         ) + tuple(item for item in first_pass.rejected_blocks if item.kind in target_kinds)
@@ -5041,7 +5432,7 @@ class ProductionEditorialEnrichmentService:
                 model_run_id=model_run.id,
                 error_code=EditorialEnrichmentStageErrorCode.EMPTY_AFTER_REJECTIONS,
                 error_message=(
-                    "Every proposed table, diagram, or figure was rejected after the bounded "
+                    "Every proposed table, chart, diagram, or figure was rejected after the "
                     "repair attempt."
                 ),
                 details=wire_details,
@@ -5198,6 +5589,36 @@ class ProductionEditorialEnrichmentService:
                     for item in compilation.rejections
                 ]
             validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+        if enrichment.charts:
+            if self._chart_compiler is None or self._media_asset_store is None:
+                raise RuntimeError("Chart compilation requires a compiler and media asset store")
+            chart_compilation = await compile_and_store_charts(
+                enrichment.charts,
+                compiler=self._chart_compiler,
+                media_asset_store=self._media_asset_store,
+                production_run_id=run.id,
+            )
+            enrichment = replace(
+                enrichment,
+                charts=chart_compilation.charts,
+                warnings=(
+                    *enrichment.warnings,
+                    *(
+                        f"editorial_enrichment_chart_render_failed:{item.chart_key}:"
+                        f"{item.reason_code}"
+                        for item in chart_compilation.rejections
+                    ),
+                ),
+            )
+            if chart_compilation.rejections:
+                wire_details["chart_rejections"] = [
+                    {
+                        "chart_key": item.chart_key,
+                        "reason_code": item.reason_code,
+                    }
+                    for item in chart_compilation.rejections
+                ]
+            validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
         (
             annotation_proposals,
             annotation_calls,
@@ -5256,6 +5677,7 @@ class ProductionEditorialEnrichmentService:
             table_count=len(enrichment.tables),
             diagram_count=len(enrichment.diagrams),
             source_figure_count=len(enrichment.source_figures),
+            chart_count=len(enrichment.charts),
             warnings=enrichment.warnings,
             details=(
                 wire_details
@@ -5264,6 +5686,7 @@ class ProductionEditorialEnrichmentService:
                 or parsed.proposal.resource_needs
                 or wire_details.get("repair")
                 or wire_details.get("diagram_rejections")
+                or wire_details.get("chart_rejections")
                 or annotation_details["warnings"]
                 or annotation_details["proposal_count"]
                 else None
@@ -5967,6 +6390,7 @@ class ProductionEditorialEnrichmentService:
             table_count=len(enrichment.tables),
             diagram_count=len(enrichment.diagrams),
             source_figure_count=len(enrichment.source_figures),
+            chart_count=len(enrichment.charts),
             warnings=enrichment.warnings,
             details={"reused": reuse.reused},
         )
@@ -6239,6 +6663,7 @@ def validate_editorial_enrichment(
 
     placements = (
         *(table.placement for table in enrichment.tables),
+        *(chart.placement for chart in enrichment.charts),
         *(diagram.placement for diagram in enrichment.diagrams),
         *(figure.placement for figure in enrichment.source_figures),
     )

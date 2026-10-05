@@ -89,6 +89,20 @@
   ]
 }
 
+#let render-chart(item) = {
+  let caption = if has-text(item.caption) { item.caption } else { item.title }
+  let semantic-caption = if has-text(item.caption) {
+    item.at("semantic_caption", default: none)
+  } else {
+    item.at("semantic_title", default: none)
+  }
+  image(item.media_path, width: 100%, height: 9cm, fit: "contain")
+  v(4pt)
+  if has-text(caption) [
+    #render-figure-caption(item.figure_number, caption, semantic-caption)
+  ]
+}
+
 #let render-body-block(item) = {
   if item.type == "paragraph" {
     [#semantic-or-plain(item.text, item.at("semantic_spans", default: none)) #parbreak()]
@@ -98,6 +112,8 @@
     render-diagram(item)
   } else if item.type == "figure" {
     render-figure(item)
+  } else if item.type == "chart" {
+    render-chart(item)
   } else {
     panic("unsupported publication body block type: " + item.type)
   }

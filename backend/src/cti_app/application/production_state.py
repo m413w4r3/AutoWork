@@ -725,6 +725,7 @@ class ProductionStateService:
             "policy_version": parsed_enrichment.enrichment_policy_version,
             "table_count": len(parsed_enrichment.tables),
             "diagram_count": len(parsed_enrichment.diagrams),
+            "chart_count": len(parsed_enrichment.charts),
             "source_figure_count": len(parsed_enrichment.source_figures),
             "warnings_count": len(parsed_enrichment.warnings),
             "extraction_hash": parsed_enrichment.extraction_hash,

@@ -122,7 +122,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v5-dated-references-ioc-groups"
+    assert data["schema_version"] == "typst-edition-model-v6-timeline-charts"
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -455,7 +455,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v3-dated-references-ioc-groups"
+    assert bundle.template_version == "chp-edition-v4-timeline-charts"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import ConfigDict, Field
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
+from cti_app.application.analytic_chart_compilation import AnalyticChartCompiler
 from cti_app.application.collection import SubjectCollectionService
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.diagram_compilation import DiagramCompiler
@@ -358,6 +359,7 @@ def register_production_jobs(
     bridge_transport: ReconciliationTransport | None = None,
     reconciliation_resolver: ProductionReconciliationResolver | None = None,
     diagram_compiler: DiagramCompiler | None = None,
+    chart_compiler: AnalyticChartCompiler | None = None,
 ) -> None:
     """Register the five production stage jobs."""
     stage_chain = chain or ProductionStageChain()
@@ -366,6 +368,7 @@ def register_production_jobs(
         MediaAssetStore(artifact_store, uow_factory) if artifact_store is not None else None
     )
     configured_diagram_compiler = diagram_compiler if artifact_store is not None else None
+    configured_chart_compiler = chart_compiler if artifact_store is not None else None
     resolver = reconciliation_resolver or ProductionReconciliationResolver(
         uow_factory,
         transport=bridge_transport,
@@ -668,6 +671,7 @@ def register_production_jobs(
             pacing=production_pacing,
             media_asset_store=media_asset_store,
             diagram_compiler=configured_diagram_compiler,
+            chart_compiler=configured_chart_compiler,
         )
 
         correlation_id = await context.correlation_id()

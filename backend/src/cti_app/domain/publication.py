@@ -86,6 +86,7 @@ class PublicationAssemblyErrorCode(StrEnum):
     SOURCE_MISSING = "assembly_source_missing"
     VALIDATION_FAILED = "assembly_validation_failed"
     DIAGRAM_ASSET_MISSING = "publication_diagram_asset_missing"
+    CHART_ASSET_MISSING = "publication_chart_asset_missing"
     SOURCE_FIGURE_UNRESOLVED = "publication_source_figure_unresolved"
     SOURCE_FIGURE_INVALID = "publication_source_figure_invalid"
     SOURCE_FIGURE_METADATA_MISSING = "publication_source_figure_metadata_missing"

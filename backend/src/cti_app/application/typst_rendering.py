@@ -21,6 +21,7 @@ from cti_app.domain.publication import (
 )
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
+    PublicationChartV1,
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
@@ -34,7 +35,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v5-dated-references-ioc-groups"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v6-timeline-charts"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -277,6 +278,16 @@ def project_publication_to_typst_model(
             diagram.placement.section_index,
             block,
         )
+    for chart in document.charts:
+        block = _chart_block(chart, media_ref)
+        rich_block(block, "semantic_title", f"chart:{chart.key}:title", chart.title)
+        if chart.caption is not None:
+            rich_block(block, "semantic_caption", f"chart:{chart.key}:caption", chart.caption)
+        add_rich(
+            chart.placement.kind,
+            chart.placement.section_index,
+            block,
+        )
     for figure in document.figures:
         block = _figure_block(figure, media_ref)
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
@@ -337,7 +348,7 @@ def project_publication_to_typst_model(
 
     figure_number = 0
     for block in (*reference_blocks, *body_blocks):
-        if block.get("type") in {"diagram", "figure"}:
+        if block.get("type") in {"diagram", "figure", "chart"}:
             figure_number += 1
             block["figure_number"] = figure_number
 
@@ -622,5 +633,26 @@ def _figure_block(
         "caption": figure.caption,
         "provenance": figure.provenance,
         "locator": ", ".join(locator_parts) if locator_parts else None,
+        "media_path": media.media_path,
+    }
+
+
+def _chart_block(
+    chart: PublicationChartV1,
+    media_ref_factory: Callable[..., TypstMediaRef],
+) -> dict[str, Any]:
+    media = media_ref_factory(
+        asset_id=chart.asset_id,
+        expected_kind=MediaAssetKind.CHART_SVG,
+        expected_mime_type="image/svg+xml",
+        expected_sha256=None,
+        expected_byte_size=None,
+    )
+    return {
+        "type": "chart",
+        "key": chart.key,
+        "kind": chart.kind.value,
+        "title": chart.title,
+        "caption": chart.caption,
         "media_path": media.media_path,
     }

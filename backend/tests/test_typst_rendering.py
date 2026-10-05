@@ -17,12 +17,15 @@ from cti_app.application.typst_rendering import (
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
+    project_publication_to_typst_model,
 )
 from cti_app.domain.media_assets import MediaAssetKind
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
 )
+from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
 from cti_app.domain.publication import (
     ArtifactType,
     PublicationEvidenceKind,
@@ -36,6 +39,7 @@ from cti_app.domain.publication import (
     PublicationUncertaintyV1,
 )
 from cti_app.domain.publication_document import (
+    PublicationChartV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
     publication_document_text_anchors,
@@ -231,7 +235,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v5-dated-references-ioc-groups"
+    assert data["schema_version"] == "typst-publication-model-v6-timeline-charts"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -248,6 +252,36 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
         "type": "synthesis",
         "blocks": [{"type": "paragraph", "text": "Initial assessment"}],
     }
+
+
+def test_chart_projection_uses_svg_media_and_shared_figure_numbering() -> None:
+    asset_id = UUID(int=4242)
+    chart = PublicationChartV1(
+        key="domain_registrations",
+        kind=ChartKind.TIMELINE,
+        title="Domain registrations",
+        caption="Dates reported in the source.",
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        asset_id=asset_id,
+        evidence_refs=(
+            ExtractionEvidenceRefV1(
+                UUID("00000000-0000-0000-0000-000000000001"),
+                EvidenceKind.FACT,
+                "a" * 64,
+            ),
+        ),
+    )
+    document = replace(_document(figures=(_figure(),)), charts=(chart,))
+
+    model = project_publication_to_typst_model(document)
+    synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    chart_block = next(item for item in synthesis["blocks"] if item["type"] == "chart")
+    figure_block = next(item for item in synthesis["blocks"] if item["type"] == "figure")
+
+    assert chart_block["media_path"] == f"media/{asset_id}.svg"
+    assert chart_block["figure_number"] == 1
+    assert figure_block["figure_number"] == 2
+    assert model.media_refs[0].expected_kind is MediaAssetKind.CHART_SVG
 
 
 def test_french_publication_dates_use_first_day_typography() -> None:
@@ -412,7 +446,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v5-dated-references-ioc-groups"
+    assert data["schema_version"] == "typst-publication-model-v6-timeline-charts"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

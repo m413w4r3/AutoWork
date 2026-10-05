@@ -45,6 +45,9 @@ from cti_app.domain.production import (
     ProductionInputSnapshot,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
+    ChartPointV1,
+    ChartSpecV1,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
@@ -135,12 +138,14 @@ def _enrichment_with(
     extraction,
     synthesis,
     tables=(),
+    charts=(),
     diagrams=(),
     source_figures=(),
 ):
     return replace(
         build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
         tables=tables,
+        charts=charts,
         diagrams=diagrams,
         source_figures=source_figures,
     )
@@ -167,6 +172,27 @@ def _table(ref: ExtractionEvidenceRefV1, *, key: str = "commands") -> TableSpecV
             knowledge_limits="No other command behavior is stated.",
             placement_reason="Place beside the command explanation.",
         ),
+    )
+
+
+def _chart(ref: ExtractionEvidenceRefV1) -> ChartSpecV1:
+    return ChartSpecV1(
+        key="domain_registrations",
+        kind=ChartKind.TIMELINE,
+        title="Domain registrations over time",
+        caption="Exact dates from the report.",
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_LEAD),
+        purpose=EditorialAnalyticPurposeV1(
+            question="When were the domains registered?",
+            available_data="Two exact registration dates.",
+            comprehension_gain="A time axis makes the order visible.",
+            scope="Only the two reported domains.",
+            evidence_refs=(ref,),
+            knowledge_limits="No unreported events are inferred.",
+            placement_reason="Place by the infrastructure analysis.",
+        ),
+        points=(ChartPointV1("alpha.example", "2026-08-25", "Registered domains", (ref,)),),
+        compiled_asset_id=UUID(int=32),
     )
 
 
@@ -359,6 +385,30 @@ def test_diagram_is_projected_and_compiled_asset_id_is_preserved() -> None:
             asset_id=diagram.compiled_asset_id,
         ),
     )
+
+
+def test_compiled_chart_is_projected_with_its_asset_and_evidence() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    chart = _chart(evidence)
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis, charts=(chart,))
+
+    document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert len(document.charts) == 1
+    assert document.charts[0].key == chart.key
+    assert document.charts[0].kind is chart.kind
+    assert document.charts[0].title == chart.title
+    assert document.charts[0].caption == chart.caption
+    assert document.charts[0].placement == chart.placement
+    assert document.charts[0].asset_id == chart.compiled_asset_id
+    assert document.charts[0].evidence_refs == (evidence,)
 
 
 def test_diagram_without_compiled_asset_is_rejected() -> None:

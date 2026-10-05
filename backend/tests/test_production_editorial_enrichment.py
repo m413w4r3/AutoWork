@@ -243,6 +243,7 @@ def test_v3_enrichment_payload_remains_readable_without_v4_analytic_fields() -> 
     payload = editorial_enrichment_to_json(enrichment)
     payload["schema_version"] = 3
     payload["enrichment_policy_version"] = "editorial-enrichment-v3-figures-resource-proposals"
+    payload.pop("charts", None)
     for table in payload["tables"]:
         table.pop("purpose")
     for diagram in payload["diagrams"]:

@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v3-dated-references-ioc-groups",
+  "template_version": "chp-edition-v4-timeline-charts",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",

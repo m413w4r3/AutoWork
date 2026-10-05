@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.analyst_vt_enrichment import VirusTotalSeedEnrichmentService
+from cti_app.application.analytic_chart_compilation import AnalyticChartCompiler
 from cti_app.application.collection import SupplementalSource
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.diagram_compilation import DiagramCompiler
@@ -474,6 +475,7 @@ class ProductionWorkflowOrchestrator:
         pacing: ProductionPacingPolicy | None = None,
         media_asset_store: MediaAssetStore | None = None,
         diagram_compiler: DiagramCompiler | None = None,
+        chart_compiler: AnalyticChartCompiler | None = None,
     ) -> None:
         self._uow_factory = uow_factory
         self._model_gateway = model_gateway
@@ -541,6 +543,7 @@ class ProductionWorkflowOrchestrator:
                 artifact_reuse=self._artifact_reuse,
                 media_asset_store=media_asset_store,
                 diagram_compiler=diagram_compiler,
+                chart_compiler=chart_compiler,
                 source_media_archiver=(
                     getattr(collection_service, "source_media_archiver", None)
                     if collection_service is not None
@@ -1596,6 +1599,7 @@ class ProductionWorkflowOrchestrator:
             "input_hash": execution.input_hash,
             "tables": execution.table_count,
             "diagrams": execution.diagram_count,
+            "charts": execution.chart_count,
             "source_figures": execution.source_figure_count,
             "model_calls": execution.model_calls,
         }

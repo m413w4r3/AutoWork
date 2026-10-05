@@ -656,6 +656,7 @@ def create_job_registry(
     job_dispatcher: JobDispatcher | None = None,
     bridge_transport: object | None = None,
     production_diagram_compiler: object | None = None,
+    production_chart_compiler: object | None = None,
     edition_release_rematerializer: object | None = None,
 ) -> JobRegistry:
     registry = JobRegistry()
@@ -731,6 +732,7 @@ def create_job_registry(
             checkpoint=production_checkpoint,
             bridge_transport=cast(Any, bridge_transport),
             diagram_compiler=cast(Any, production_diagram_compiler),
+            chart_compiler=cast(Any, production_chart_compiler),
         )
     if publication_assembly is not None:
         from cti_app.application.edition_publication import (

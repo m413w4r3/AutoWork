@@ -19,6 +19,7 @@ SUPPORTED_MEDIA_MIME_TYPES = frozenset(
 
 class MediaAssetKind(StrEnum):
     DIAGRAM_SVG = "diagram_svg"
+    CHART_SVG = "chart_svg"
     SOURCE_FIGURE = "source_figure"
 
 
@@ -70,18 +71,18 @@ class MediaAssetManifest:
             raise ValueError("Media asset source and policy version must be non-empty")
         if self.asset_id != media_asset_id(self.sha256, self.mime_type):
             raise ValueError("Media asset identity does not match its content address")
-        if self.kind is MediaAssetKind.DIAGRAM_SVG:
+        if self.kind in {MediaAssetKind.DIAGRAM_SVG, MediaAssetKind.CHART_SVG}:
             if self.mime_type != "image/svg+xml":
-                raise ValueError("A compiled diagram asset must be an SVG")
+                raise ValueError("A compiled editorial asset must be an SVG")
             if (
                 not isinstance(self.compiler_name, str)
                 or not self.compiler_name.strip()
                 or not isinstance(self.compiler_version, str)
                 or not self.compiler_version.strip()
             ):
-                raise ValueError("A compiled diagram asset requires compiler metadata")
+                raise ValueError("A compiled editorial asset requires compiler metadata")
             if any(value is not None for value in (self.provenance, self.locator, self.decision)):
-                raise ValueError("Diagram assets cannot carry source figure metadata")
+                raise ValueError("Compiled assets cannot carry source figure metadata")
         elif (
             not isinstance(self.provenance, str)
             or not self.provenance.strip()

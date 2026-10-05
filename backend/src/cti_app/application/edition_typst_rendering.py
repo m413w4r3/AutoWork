@@ -18,7 +18,7 @@ from cti_app.application.typst_rendering import (
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v5-dated-references-ioc-groups"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v6-timeline-charts"
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",

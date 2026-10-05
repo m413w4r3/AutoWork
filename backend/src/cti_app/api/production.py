@@ -117,6 +117,7 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.selection import SubjectDiscoveryOrigin
+from cti_app.infrastructure.analytic_chart_renderer import AnalyticChartRenderer
 from cti_app.infrastructure.d2_diagram_compiler import D2DiagramCompiler
 from cti_app.logging import get_correlation_id
 
@@ -451,6 +452,7 @@ def _production_enrichment_revision_service(
         editorial_enrichment_service=EditorialEnrichmentService(uow_factory, artifact_store),
         media_asset_store=getattr(request.app.state, "media_asset_store", None),
         diagram_compiler=D2DiagramCompiler(),
+        chart_compiler=AnalyticChartRenderer(),
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
     return ProductionEditorialEnrichmentRevisionService(

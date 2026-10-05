@@ -11,6 +11,7 @@ from uuid import UUID
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import SUPPORTED_MEDIA_MIME_TYPES
 from cti_app.domain.production_editorial_enrichment import (
+    ChartKind,
     DiagramEdgeV1,
     DiagramGroupV1,
     DiagramNodeV1,
@@ -203,6 +204,36 @@ class PublicationDiagramV1:
 
 
 @dataclass(frozen=True, slots=True)
+class PublicationChartV1:
+    key: str
+    kind: ChartKind
+    title: str
+    caption: str | None
+    placement: EnrichmentPlacementV1
+    asset_id: UUID
+    evidence_refs: tuple[ExtractionEvidenceRefV1, ...]
+
+    def __post_init__(self) -> None:
+        validate_editorial_key(self.key, "Publication chart key")
+        if self.kind is not ChartKind.TIMELINE:
+            raise ValueError("Publication chart kind is invalid")
+        validate_text(self.title, "Publication chart title", semantic=True)
+        if self.caption is not None:
+            validate_text(self.caption, "Publication chart caption")
+            if not self.caption.strip():
+                object.__setattr__(self, "caption", None)
+        if not isinstance(self.placement, EnrichmentPlacementV1):
+            raise ValueError("Publication chart placement is invalid")
+        if not isinstance(self.asset_id, UUID):
+            raise ValueError("Publication chart asset identity must be a UUID")
+        object.__setattr__(
+            self,
+            "evidence_refs",
+            normalize_evidence_refs(self.evidence_refs, "Publication chart evidence references"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class PublicationSourceFigureV1:
     key: str
     asset_id: UUID
@@ -390,6 +421,40 @@ def _diagram_from_json(raw: Any, *, require_node_roles: bool = False) -> Publica
         ),
         placement=placement_from_json(item["placement"]),
         asset_id=json_uuid(item["asset_id"], "Diagram asset ID"),
+    )
+
+
+def _chart_to_json(chart: PublicationChartV1) -> dict[str, Any]:
+    return {
+        "key": chart.key,
+        "kind": chart.kind.value,
+        "title": chart.title,
+        "caption": chart.caption,
+        "placement": placement_to_json(chart.placement),
+        "asset_id": str(chart.asset_id),
+        "evidence_refs": [evidence_ref_to_json(ref) for ref in chart.evidence_refs],
+    }
+
+
+def _chart_from_json(raw: Any) -> PublicationChartV1:
+    item = json_object(
+        raw,
+        frozenset({"key", "kind", "title", "caption", "placement", "asset_id", "evidence_refs"}),
+        "Publication chart",
+    )
+    caption = item["caption"]
+    if caption is not None:
+        caption = json_text(caption, "Chart caption")
+    return PublicationChartV1(
+        key=json_text(item["key"], "Chart key"),
+        kind=json_enum(ChartKind, item["kind"], "Chart kind"),
+        title=json_text(item["title"], "Chart title"),
+        caption=caption,
+        placement=placement_from_json(item["placement"]),
+        asset_id=json_uuid(item["asset_id"], "Chart asset ID"),
+        evidence_refs=evidence_refs_from_json(
+            item["evidence_refs"], "Publication chart evidence references"
+        ),
     )
 
 
@@ -630,6 +695,7 @@ class PublicationDocumentV4:
     diagrams: tuple[PublicationDiagramV1, ...]
     figures: tuple[PublicationSourceFigureV1, ...]
     additional_source_ids: frozenset[UUID] = frozenset()
+    charts: tuple[PublicationChartV1, ...] = ()
 
     def __post_init__(self) -> None:
         if self.schema_version != PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION:
@@ -647,6 +713,7 @@ class PublicationDocumentV4:
             ("tables", self.tables, PublicationTableV1),
             ("diagrams", self.diagrams, PublicationDiagramV1),
             ("figures", self.figures, PublicationSourceFigureV1),
+            ("charts", self.charts, PublicationChartV1),
         )
         for label, items, item_type in tuple_fields:
             if not isinstance(items, tuple):
@@ -657,6 +724,7 @@ class PublicationDocumentV4:
             *(table.key for table in self.tables),
             *(diagram.key for diagram in self.diagrams),
             *(figure.key for figure in self.figures),
+            *(chart.key for chart in self.charts),
         )
         if len(rich_keys) != len(set(rich_keys)):
             raise ValueError("Publication enriched keys must be globally unique")
@@ -679,6 +747,9 @@ class PublicationDocumentV4:
             for ref in edge.evidence_refs
         )
         enrichment_source_ids.update(figure.source_document_id for figure in self.figures)
+        enrichment_source_ids.update(
+            ref.source_document_id for chart in self.charts for ref in chart.evidence_refs
+        )
         if not isinstance(self.additional_source_ids, frozenset) or any(
             not isinstance(source_id, UUID) for source_id in self.additional_source_ids
         ):
@@ -809,6 +880,7 @@ class PublicationDocumentV4:
             "tables": [_table_to_json(table) for table in self.tables],
             "diagrams": [_diagram_to_json(diagram) for diagram in self.diagrams],
             "figures": [_figure_to_json(figure) for figure in self.figures],
+            **({"charts": [_chart_to_json(chart) for chart in self.charts]} if self.charts else {}),
         }
 
     @classmethod
@@ -819,25 +891,28 @@ class PublicationDocumentV4:
         additional_source_ids: frozenset[UUID] = frozenset(),
         require_node_roles: bool = False,
     ) -> PublicationDocumentV4:
+        root_keys = frozenset(
+            {
+                "schema_version",
+                "subject_id",
+                "publication_language",
+                "title",
+                "lead",
+                "sections",
+                "timeline",
+                "indicators",
+                "sources",
+                "uncertainties",
+                "tables",
+                "diagrams",
+                "figures",
+            }
+        )
+        if isinstance(payload, Mapping) and "charts" in payload:
+            root_keys |= {"charts"}
         document = json_object(
             payload,
-            frozenset(
-                {
-                    "schema_version",
-                    "subject_id",
-                    "publication_language",
-                    "title",
-                    "lead",
-                    "sections",
-                    "timeline",
-                    "indicators",
-                    "sources",
-                    "uncertainties",
-                    "tables",
-                    "diagrams",
-                    "figures",
-                }
-            ),
+            root_keys,
             "PublicationDocumentV4",
         )
 
@@ -995,6 +1070,11 @@ class PublicationDocumentV4:
                 _figure_from_json(raw) for raw in json_array(document["figures"], "Figures")
             ),
             additional_source_ids=additional_source_ids,
+            charts=(
+                tuple(_chart_from_json(raw) for raw in json_array(document["charts"], "Charts"))
+                if "charts" in document
+                else ()
+            ),
         )
 
 
@@ -1028,6 +1108,10 @@ def publication_document_text_anchors(
         result[f"diagram:{diagram.key}:title"] = diagram.title
         if diagram.caption is not None:
             result[f"diagram:{diagram.key}:caption"] = diagram.caption
+    for chart in document.charts:
+        result[f"chart:{chart.key}:title"] = chart.title
+        if chart.caption is not None:
+            result[f"chart:{chart.key}:caption"] = chart.caption
     for figure in document.figures:
         result[f"figure:{figure.key}:caption"] = figure.caption
         result[f"figure:{figure.key}:provenance"] = figure.provenance
@@ -1150,28 +1234,31 @@ class PublicationDocumentV5:
 
     @classmethod
     def _from_json(cls, payload: Mapping[str, Any]) -> PublicationDocumentV5:
+        root_keys = frozenset(
+            {
+                "schema_version",
+                "subject_id",
+                "publication_language",
+                "title",
+                "lead",
+                "sections",
+                "timeline",
+                "indicators",
+                "sources",
+                "uncertainties",
+                "tables",
+                "diagrams",
+                "figures",
+                "references",
+                "original_indicators",
+                "rich_text",
+            }
+        )
+        if isinstance(payload, Mapping) and "charts" in payload:
+            root_keys |= {"charts"}
         document = json_object(
             payload,
-            frozenset(
-                {
-                    "schema_version",
-                    "subject_id",
-                    "publication_language",
-                    "title",
-                    "lead",
-                    "sections",
-                    "timeline",
-                    "indicators",
-                    "sources",
-                    "uncertainties",
-                    "tables",
-                    "diagrams",
-                    "figures",
-                    "references",
-                    "original_indicators",
-                    "rich_text",
-                }
-            ),
+            root_keys,
             "PublicationDocumentV5",
         )
         if document["schema_version"] != PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION:
@@ -1272,6 +1359,7 @@ __all__ = [
     "PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION",
     "PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION",
     "CanonicalPublicationDocument",
+    "PublicationChartV1",
     "PublicationDiagramV1",
     "PublicationDocumentV4",
     "PublicationDocumentV5",

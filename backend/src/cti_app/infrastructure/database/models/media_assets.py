@@ -22,7 +22,9 @@ class MediaAssetRow(Base):
     __tablename__ = "media_assets"
     __table_args__ = (
         UniqueConstraint("sha256", "mime_type", name="uq_media_assets_sha256_mime_type"),
-        CheckConstraint("kind IN ('diagram_svg', 'source_figure')", name="ck_media_assets_kind"),
+        CheckConstraint(
+            "kind IN ('diagram_svg', 'chart_svg', 'source_figure')", name="ck_media_assets_kind"
+        ),
         CheckConstraint("byte_size > 0", name="ck_media_assets_byte_size_positive"),
         CheckConstraint("length(btrim(mime_type)) > 0", name="ck_media_assets_mime_type_nonempty"),
         CheckConstraint("length(btrim(source)) > 0", name="ck_media_assets_source_nonempty"),
@@ -35,7 +37,7 @@ class MediaAssetRow(Base):
             name="ck_media_assets_sha256_format",
         ),
         CheckConstraint(
-            "((kind = 'diagram_svg' AND mime_type = 'image/svg+xml' "
+            "((kind IN ('diagram_svg', 'chart_svg') AND mime_type = 'image/svg+xml' "
             "AND compiler_name IS NOT NULL AND compiler_version IS NOT NULL "
             "AND provenance IS NULL AND locator IS NULL AND decision IS NULL) OR "
             "(kind = 'source_figure' AND provenance IS NOT NULL AND locator IS NOT NULL "

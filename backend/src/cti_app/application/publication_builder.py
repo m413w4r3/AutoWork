@@ -27,6 +27,7 @@ from cti_app.application.semantic_annotation import (
 from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import ExtractionProfile, ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import (
+    ChartSpecV1,
     DiagramSpecV1,
     EditorialEnrichmentV1,
     SourceFigureCandidateV1,
@@ -56,6 +57,7 @@ from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
+    evidence_ref_sort_key,
     extraction_evidence_elements,
     extraction_evidence_refs_v1,
     synthesis_evidence_refs,
@@ -80,6 +82,7 @@ from cti_app.domain.publication import (
 from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION,
     PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
+    PublicationChartV1,
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
@@ -620,6 +623,33 @@ def _project_publication_diagrams(
     return tuple(projected)
 
 
+def _project_publication_charts(
+    charts: tuple[ChartSpecV1, ...],
+) -> tuple[PublicationChartV1, ...]:
+    projected: list[PublicationChartV1] = []
+    for chart in charts:
+        if chart.compiled_asset_id is None:
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.CHART_ASSET_MISSING,
+                f"Publication chart {chart.key} has no compiled asset",
+            )
+        evidence_refs = {ref for point in chart.points for ref in point.evidence_refs} | set(
+            chart.purpose.evidence_refs
+        )
+        projected.append(
+            PublicationChartV1(
+                key=chart.key,
+                kind=chart.kind,
+                title=chart.title,
+                caption=chart.caption,
+                placement=chart.placement,
+                asset_id=chart.compiled_asset_id,
+                evidence_refs=tuple(sorted(evidence_refs, key=evidence_ref_sort_key)),
+            )
+        )
+    return tuple(projected)
+
+
 def _project_publication_figures(
     source_figures: tuple[SourceFigureCandidateV1, ...],
 ) -> tuple[PublicationSourceFigureV1, ...]:
@@ -704,6 +734,7 @@ def build_publication_document_v4(
         relevance_projection=relevance_projection,
     )
     tables = _project_publication_tables(editorial_enrichment.tables)
+    charts = _project_publication_charts(editorial_enrichment.charts)
     diagrams = _project_publication_diagrams(editorial_enrichment.diagrams)
     figures = _project_publication_figures(editorial_enrichment.source_figures)
 
@@ -730,6 +761,7 @@ def build_publication_document_v4(
         tables=tables,
         diagrams=diagrams,
         figures=figures,
+        charts=charts,
     )
 
 
