@@ -155,3 +155,6 @@ La stratégie et les invariants de l'incrément sont détaillés dans
 [docs/brief_workflow.md](docs/brief_workflow.md). Les conversations persistantes,
 leur politique `fresh`/`continue` et leurs limites sont documentées dans
 [docs/model_conversations.md](docs/model_conversations.md).
+
+Les arbitrages et cas de référence des enrichissements visuels CTI sont décrits
+dans [docs/design/cti-visual-enrichment-reference-cases.md](docs/design/cti-visual-enrichment-reference-cases.md).
