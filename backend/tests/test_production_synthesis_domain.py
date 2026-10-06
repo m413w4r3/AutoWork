@@ -186,10 +186,17 @@ def test_evidence_reference_rejects_invalid_key() -> None:
 
 def test_editorial_title_contract_accepts_plain_titles_and_rejects_invalid_forms() -> None:
     assert is_valid_editorial_title("[Seedworm / MuddyWater] Adoption de ChainShell et CastleRAT")
+    assert is_valid_editorial_title("[APT31] Plusieurs acteurs adoptent rapidement BlueMoon")
+    assert is_valid_editorial_title(
+        "[Void Blizzard / Laundry Bear] Exploitation zero-click de Zimbra"
+    )
     assert is_valid_editorial_title("[Publication] Analyse d\u2019un implant de commande")
     for value in (
         "Frozen subject title",
+        "Acteur : APT31 | Outil : BlueMoon",
         "[] Titre sans groupe",
+        "**[APT31]** Plusieurs acteurs adoptent rapidement BlueMoon",
+        "[APT31] Titre.",
         "[Groupe] Une campagne documentée.",
         "[Groupe] **Une campagne documentée**",
         "[Groupe] *Une campagne documentée*",

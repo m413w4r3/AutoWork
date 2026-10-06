@@ -540,8 +540,8 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "-enc",
         "Execution",
         "Section paragraph describing the observed activity.",
-        "Figure 1 - Diagram asset caption.",
-        "Figure 2 - Source figure caption.",
+        "Figure 1 : Diagram asset caption.",
+        "Figure 2 : Source figure caption.",
         "Provenance : Figure 1 from the source publication",
         "Display ip",
         "Display domain",
@@ -831,9 +831,9 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
     reader = PdfReader(BytesIO(pdf_bytes), strict=True)
     page_text = [page.extract_text() or "" for page in reader.pages]
     normalized = " ".join(" ".join(text.split()) for text in page_text)
-    assert "Figure 1 - Résolution du C2 iranien via Bitcoin" in normalized
-    assert f"Figure 2 - {relationship_caption}" in normalized
-    assert "Figure 3 - Capture d'une preuve technique" in normalized
+    assert "Figure 1 : Résolution du C2 iranien via Bitcoin" in normalized
+    assert f"Figure 2 : {relationship_caption}" in normalized
+    assert "Figure 3 : Capture d'une preuve technique" in normalized
     assert "Provenance : Figure 1 from the source publication" in normalized
 
     review_directory = Path(os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", tmp_path / "review"))
@@ -1003,16 +1003,19 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert len(reader.pages) >= 2
     assert "[Example actor] Décrit une activité documentée" in text
     assert "RÉFÉRENCES" in text
-    assert "IOC originaux" in text
+    assert text.count("IOC") == 1
+    assert "IOC originaux" not in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
     assert all(f"original-{index:03d}.example" in compact_text for index in range(120))
 
-    output_dir = Path.home() / ".cache" / "audit" / "out" / "B"
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = anyio.Path(
+        os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))
+    )
+    await output_dir.mkdir(parents=True, exist_ok=True)
     pdf_path = output_dir / "frontmatter-ioc-review.pdf"
-    pdf_path.write_bytes(compiled.content)
+    await pdf_path.write_bytes(compiled.content)
     rasterizer = shutil.which("pdftoppm")
     assert rasterizer is not None, "pdftoppm is required to save review PNG pages"
     png_prefix = output_dir / "frontmatter-ioc-review"
@@ -1021,4 +1024,5 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
         check=False,
     )
     assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
-    assert len(tuple(output_dir.glob("frontmatter-ioc-review-*.png"))) >= 2
+    review_pages = [path async for path in output_dir.glob("frontmatter-ioc-review-*.png")]
+    assert len(review_pages) >= 2

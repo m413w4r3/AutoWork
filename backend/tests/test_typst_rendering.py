@@ -14,6 +14,7 @@ from cti_app.application.typst_rendering import (
     TypstRenderer,
     TypstTemplateBundle,
     _display_date,
+    _indicator_values,
     _table_column_weights,
     _timeline_source_urls,
     load_template_bundle,
@@ -235,7 +236,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v7-editorial-tables"
+    assert data["schema_version"] == "typst-publication-model-v8-unified-ioc-rendering"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -271,17 +272,23 @@ def test_chart_projection_uses_svg_media_and_shared_figure_numbering() -> None:
             ),
         ),
     )
-    document = replace(_document(figures=(_figure(),)), charts=(chart,))
+    diagram = _diagram_at(
+        "numbering-diagram", "Numbering diagram", EnrichmentPlacementKind.AFTER_LEAD
+    )
+    document = replace(_full_document(figures=(_figure(),), diagrams=(diagram,)), charts=(chart,))
 
     model = project_publication_to_typst_model(document)
     synthesis = next(item for item in model.content_sections if item["type"] == "synthesis")
+    diagram_block = next(item for item in synthesis["blocks"] if item["type"] == "diagram")
     chart_block = next(item for item in synthesis["blocks"] if item["type"] == "chart")
     figure_block = next(item for item in synthesis["blocks"] if item["type"] == "figure")
 
+    assert diagram_block["figure_number"] == 1
     assert chart_block["media_path"] == f"media/{asset_id}.svg"
-    assert chart_block["figure_number"] == 1
-    assert figure_block["figure_number"] == 2
-    assert model.media_refs[0].expected_kind is MediaAssetKind.CHART_SVG
+    assert chart_block["figure_number"] == 2
+    assert figure_block["figure_number"] == 3
+    chart_media = next(media for media in model.media_refs if media.asset_id == asset_id)
+    assert chart_media.expected_kind is MediaAssetKind.CHART_SVG
 
 
 def test_french_publication_dates_use_first_day_typography() -> None:
@@ -308,7 +315,43 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     assert synthesis["type"] == "synthesis"
     assert annex["type"] == "technical_annex"
     assert annex["indicators"]["domains"]
+    assert set(annex["original_indicators"]["domains"]).issubset(
+        set(annex["indicators"]["domains"])
+    )
+    assert len(annex["indicators"]["domains"]) == len(set(annex["indicators"]["domains"]))
     assert annex["original_indicators"]["domains"] == [
+        "context.example",
+        "original.example",
+    ]
+
+
+def test_v6_render_model_keeps_original_ioc_metadata_separate_from_merged_values(
+    tmp_path: Path,
+) -> None:
+    publication, *_ = _frontmatter_v6_case()
+    original = publication.original_indicators[0].indicators[0]
+    renderer, bundle = _renderer(tmp_path)
+
+    model = json.loads(renderer.render(publication, bundle).render_data_bytes)
+    annex = model["content_sections"][-1]
+
+    displayed_domains = annex["indicators"]["domains"]
+    assert original.value in displayed_domains
+    assert len(displayed_domains) == len({value.casefold() for value in displayed_domains})
+    assert publication.original_indicators[0].indicators[0] == original
+    assert annex["original_indicators"]["domains"] == [
+        "context.example",
+        "original.example",
+    ]
+
+
+def test_render_ioc_projection_deduplicates_normalized_values_across_groups() -> None:
+    publication, *_ = _frontmatter_v6_case()
+    original_group = publication.original_indicators[0]
+
+    displayed = _indicator_values((original_group, original_group))
+
+    assert displayed["domains"] == [
         "context.example",
         "original.example",
     ]
@@ -446,7 +489,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v7-editorial-tables"
+    assert data["schema_version"] == "typst-publication-model-v8-unified-ioc-rendering"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text

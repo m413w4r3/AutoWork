@@ -37,7 +37,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v7-editorial-tables"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v8-unified-ioc-rendering"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -91,6 +91,23 @@ def _breakable_typst_display_text(value: str) -> str:
         value[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
         for index in range(0, len(value), _TYPOGRAPHIC_BREAK_INTERVAL)
     )
+
+
+def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[str]]:
+    """Merge display IOC values and deduplicate without changing canonical records."""
+    result: dict[str, list[str]] = {
+        key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
+    }
+    seen: dict[str, set[str]] = {key: set() for key in result}
+    for group in groups:
+        key = _INDICATOR_KEYS[group.artifact_type]
+        for indicator in group.indicators:
+            normalized_value = indicator.normalized_value.casefold()
+            if normalized_value in seen[key]:
+                continue
+            seen[key].add(normalized_value)
+            result[key].append(_breakable_typst_display_text(indicator.value))
+    return result
 
 
 def _table_cell_typst_spans(value: str) -> list[dict[str, str]]:
@@ -456,18 +473,8 @@ def project_publication_to_typst_model(
         for source in document.sources
     ]
 
-    def indicator_values(groups: tuple[Any, ...]) -> dict[str, list[str]]:
-        result: dict[str, list[str]] = {
-            key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
-        }
-        for group in groups:
-            result[_INDICATOR_KEYS[group.artifact_type]] = [
-                _breakable_typst_display_text(item.value) for item in group.indicators
-            ]
-        return result
-
-    indicators = indicator_values(document.indicators)
-    original_indicators = indicator_values(original_indicator_groups)
+    indicators = _indicator_values((*document.indicators, *original_indicator_groups))
+    original_indicators = _indicator_values(original_indicator_groups)
     original_publishers = sorted(
         {
             (sources_by_id[source_id].publisher or "").strip()

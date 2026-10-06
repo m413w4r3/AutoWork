@@ -264,26 +264,31 @@ def test_v6_qa_requires_editorial_title_format() -> None:
     valid = qa_publication_v5(publication=publication, **inputs)
 
     assert valid["checks"]["title_format"] is True
-    base = replace(publication.document, title="Title without an editorial group")
-    semantic_text = replace(
-        publication.semantic_text,
-        paragraphs=tuple(
-            SemanticParagraphV1(
-                paragraph.anchor,
-                (SemanticTextSpanV1(SemanticRole.TEXT, base.title),),
-            )
-            if paragraph.anchor == "title"
-            else paragraph
-            for paragraph in publication.semantic_text.paragraphs
-        ),
-    )
-    invalid = PublicationDocumentV5(
-        document=base,
-        semantic_text=semantic_text,
-        references=publication.references,
-        original_indicators=publication.original_indicators,
-    )
-    rejected = qa_publication_v5(publication=invalid, **inputs)
+    for title in (
+        "Acteur : APT31 | Outil : BlueMoon",
+        "**[APT31]** Plusieurs acteurs adoptent rapidement BlueMoon",
+        "[APT31] Titre.",
+    ):
+        base = replace(publication.document, title=title)
+        semantic_text = replace(
+            publication.semantic_text,
+            paragraphs=tuple(
+                SemanticParagraphV1(
+                    paragraph.anchor,
+                    (SemanticTextSpanV1(SemanticRole.TEXT, base.title),),
+                )
+                if paragraph.anchor == "title"
+                else paragraph
+                for paragraph in publication.semantic_text.paragraphs
+            ),
+        )
+        invalid = PublicationDocumentV5(
+            document=base,
+            semantic_text=semantic_text,
+            references=publication.references,
+            original_indicators=publication.original_indicators,
+        )
+        rejected = qa_publication_v5(publication=invalid, **inputs)
 
-    assert rejected["checks"]["title_format"] is False
-    assert rejected["passed"] is False
+        assert rejected["checks"]["title_format"] is False
+        assert rejected["passed"] is False

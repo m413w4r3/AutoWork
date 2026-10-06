@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v6-editorial-tables",
+  "template_version": "chp-article-v7-natural-media-ioc-layout",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

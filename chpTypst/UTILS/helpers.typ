@@ -399,7 +399,7 @@
   emails: [],
   hashes: [],
 ) = {
-  set par(leading: 0pt)
+  set text(hyphenate: false)
   let parse-list(value) = {
     if type(value) == array {
       value
@@ -413,9 +413,8 @@
   }
 
   let ioc-listt(items) = {
-    
     for item in items {
-      text(font: "Cascadia Mono")[#item]
+      text(font: "Cascadia Mono", size: 8.75pt)[#item]
       linebreak()
     }
   }
