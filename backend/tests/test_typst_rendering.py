@@ -235,7 +235,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v6-timeline-charts"
+    assert data["schema_version"] == "typst-publication-model-v7-editorial-tables"
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -446,7 +446,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v6-timeline-charts"
+    assert data["schema_version"] == "typst-publication-model-v7-editorial-tables"
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
@@ -457,7 +457,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     assert {"semantic-actor", "semantic-command", "semantic-technical-literal"} <= styles
     assert len(semantic_cells) == sum(len(row) for row in table["rows"])
     assert all(isinstance(cell_spans, list) for cell_spans in semantic_cells)
-    assert "semantic-command" in {span["style"] for span in semantic_cells[0]}
+    assert "semantic-table-command" in {span["style"] for span in semantic_cells[0]}
     assert "semantic-actor" in {span["style"] for span in table["semantic_caption"]}
 
 
@@ -534,6 +534,55 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     assert document.document.lead[0].text == lead_text
     assert document.document.indicators[0].indicators[0].value == long_hash
     assert "\u200b" not in lead_text
+
+
+def test_technical_table_cells_render_monospace_and_break_long_values(
+    tmp_path: Path,
+) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    base_table = _table()
+    sha256 = "a" * 64
+    long_url = (
+        "https://downloads.example.test/releases/2026/10/06/"
+        "example-rat-loader-package?campaign=autumn-update&source=bulletin"
+    )
+    cells = (
+        ("Contexte", "Deux observations consignées dans le rapport"),
+        ("Hash SHA-256", sha256),
+        ("URL", long_url),
+        ("IP", "198.51.100.42"),
+        ("Domaine", "cdn.example.test"),
+        ("Chemin", "/opt/example-rat/payloads/loader.bin"),
+    )
+    table = replace(
+        base_table,
+        title="Valeurs techniques observées",
+        caption="Les valeurs exactes documentées par la source.",
+        rows=tuple(replace(base_table.rows[0], cells=row) for row in cells),
+    )
+    data = json.loads(renderer.render(_full_document(tables=(table,)), bundle).render_data_bytes)
+    rendered_table = next(
+        block for block in data["content_sections"][1]["blocks"] if block["type"] == "table"
+    )
+    styles = [
+        {span["style"] for span in cell_spans} for cell_spans in rendered_table["semantic_cells"]
+    ]
+    display_values = [
+        "".join(span["text"] for span in cell_spans).replace("\u200b", "")
+        for cell_spans in rendered_table["semantic_cells"]
+    ]
+
+    assert styles[3] == {"semantic-table-technical"}
+    assert styles[5] == {"semantic-table-ioc"}
+    assert styles[7] == {"semantic-table-ioc"}
+    assert styles[9] == {"semantic-table-ioc"}
+    assert styles[11] == {"semantic-table-path"}
+    assert display_values[3] == sha256
+    assert display_values[5] == long_url
+    assert "\u200b" in rendered_table["semantic_cells"][5][0]["text"]
+    assert rendered_table["rows"][2][1] == long_url
+    assert rendered_table["column_weights"][1] == 2.4
+    assert rendered_table["caption"] == "Les valeurs exactes documentées par la source."
 
 
 def test_lead_is_the_first_synthesis_paragraph_and_repeated_intro_is_suppressed(

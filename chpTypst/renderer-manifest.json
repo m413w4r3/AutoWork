@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v5-timeline-charts",
+  "template_version": "chp-article-v6-editorial-tables",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

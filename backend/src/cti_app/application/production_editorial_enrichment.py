@@ -187,19 +187,17 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v6-dedicated-annotations"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v7-editorial-tables"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v9-d2-diagram-profiles"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v10-editorial-tables"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v4-d2-diagram-profiles"
+    "editorial-enrichment-analytic-policy-v5-editorial-tables"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
-EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = (
-    "editorial-enrichment-model-policy-v6-d2-diagram-profiles"
-)
+EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v7-editorial-tables"
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
     "CHART": EditorialMediaType.CHART,
@@ -754,6 +752,7 @@ class EditorialEnrichmentAcceptedBlock:
     block_id: str
     scope_id: str
     proposal_key: str
+    raw_sha256: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1768,6 +1767,10 @@ def _reject_paraphrase_rows(
             )
         else:
             kept_rows.append(row)
+    if duplicate_count:
+        warnings.append(
+            f"editorial_enrichment_table_row_paraphrase_only:{block.block_id}:{duplicate_count}"
+        )
     if not kept_rows:
         rejections.append(
             _enrichment_wire_rejection(
@@ -1777,6 +1780,7 @@ def _reject_paraphrase_rows(
                 block.raw_lines,
             )
         )
+        warnings.append(f"editorial_enrichment_table_paraphrase_only:{block.block_id}")
         return None
     purpose = _trim_analytic_purpose_evidence(
         block,
@@ -2299,6 +2303,7 @@ def parse_editorial_enrichment_proposal_wire(
     rejected_blocks: list[EditorialEnrichmentRejectedBlock] = []
     canonical_keys: set[str] = set()
     analytic_questions: set[str] = set()
+    chart_questions: dict[str, str] = {}
     source_figure_questions: dict[str, str] = {}
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
     proposed_figure_handles: set[str] = set()
@@ -2306,7 +2311,11 @@ def parse_editorial_enrichment_proposal_wire(
     # Source figures are considered first so an equivalent reconstructed form
     # cannot win just because the model emitted it earlier in the response.
     processing_blocks = sorted(
-        top_blocks, key=lambda item: _editorial_enrichment_media_priority(item.kind)
+        top_blocks,
+        key=lambda item: (
+            _editorial_enrichment_media_priority(item.kind),
+            item.kind != "CHART",
+        ),
     )
     for top in processing_blocks:
         rejection_start = len(rejections)
@@ -2318,14 +2327,24 @@ def parse_editorial_enrichment_proposal_wire(
             table = _parse_enrichment_wire_table(top, evidence_pack, rejections, warnings)
             if table is not None:
                 table = _reject_paraphrase_rows(top, table, evidence_pack, rejections, warnings)
+            if table is not None and len(table.rows) < 2:
+                reject(top, "editorial_enrichment_table_single_row")
+                warnings.append(f"editorial_enrichment_table_single_row:{top.block_id}")
+                table = None
             if table is not None:
                 question_key = normalize_analytic_question(table.purpose.question)
                 preferred_figure = source_figure_questions.get(question_key)
+                preferred_chart = chart_questions.get(question_key)
                 if preferred_figure is not None:
                     reject(top, "editorial_enrichment_source_figure_preferred_over_reconstruction")
                     warnings.append(
                         "editorial_enrichment_source_figure_preferred_over_reconstruction:"
                         f"{preferred_figure}:{top.kind}:{top.block_id}"
+                    )
+                elif preferred_chart is not None:
+                    reject(top, "editorial_enrichment_table_duplicates_chart")
+                    warnings.append(
+                        f"editorial_enrichment_table_duplicates_chart:{preferred_chart}:{table.key}"
                     )
                 elif not question_key or question_key in analytic_questions:
                     reject(top, "editorial_enrichment_duplicate_analytic_purpose")
@@ -2355,6 +2374,7 @@ def parse_editorial_enrichment_proposal_wire(
                 else:
                     canonical_keys.add(chart.key)
                     analytic_questions.add(question_key)
+                    chart_questions[question_key] = chart.key
                     charts.append(chart)
                     accepted = True
                     proposal_key = chart.key
@@ -2422,7 +2442,13 @@ def parse_editorial_enrichment_proposal_wire(
                     proposal_key = diagram.key
         if accepted:
             accepted_blocks.append(
-                EditorialEnrichmentAcceptedBlock(top.kind, top.block_id, top.scope_id, proposal_key)
+                EditorialEnrichmentAcceptedBlock(
+                    top.kind,
+                    top.block_id,
+                    top.scope_id,
+                    proposal_key,
+                    hashlib.sha256("\n".join(top.raw_lines).encode("utf-8")).hexdigest(),
+                )
             )
         elif top.kind in {"TABLE", "CHART", "DIAGRAM", "FIGURE"}:
             block_rejections = tuple(
@@ -2532,8 +2558,36 @@ def _merge_repaired_editorial_enrichment_proposal(
     discarded_accepted_blocks: set[tuple[str, str]] = set()
     repaired_identities: list[tuple[str, str]] = []
     repaired_blocks: list[EditorialEnrichmentAcceptedBlock] = []
+    chart_questions = {
+        normalize_analytic_question(item.purpose.question): item.key for item in charts
+    }
 
-    for target in sorted(repair_targets, key=lambda item: item.kind != "FIGURE"):
+    def reject_accepted_table(table: TableProposalV1, reason_code: str) -> None:
+        block = next(
+            (
+                item
+                for item in first_pass.accepted_blocks
+                if item.kind == "TABLE" and item.proposal_key == table.key
+            ),
+            None,
+        )
+        new_rejections.append(
+            EditorialEnrichmentWireRejection(
+                block_id=block.block_id if block is not None else table.key,
+                reason_code=reason_code,
+                raw_sha256=(
+                    block.raw_sha256
+                    if block is not None and block.raw_sha256
+                    else hashlib.sha256(table.model_dump_json().encode("utf-8")).hexdigest()
+                ),
+                scope_id=block.scope_id if block is not None else None,
+            )
+        )
+        if block is not None:
+            discarded_accepted_blocks.add((block.kind, block.block_id))
+
+    repair_priority = {"FIGURE": 0, "CHART": 1, "DIAGRAM": 2, "TABLE": 3}
+    for target in sorted(repair_targets, key=lambda item: repair_priority.get(item.kind, 4)):
         identity = (target.kind, target.block_id)
         candidate = repaired_by_identity.get(identity)
         if candidate is None:
@@ -2546,14 +2600,19 @@ def _merge_repaired_editorial_enrichment_proposal(
             question = normalize_analytic_question(candidate.purpose.question)
             if reason is not None:
                 pass
-            elif candidate.key in keys:
-                reason = "editorial_enrichment_duplicate_key"
             elif question in source_figure_questions:
                 reason = "editorial_enrichment_source_figure_preferred_over_reconstruction"
                 new_warnings.append(
                     "editorial_enrichment_source_figure_preferred_over_reconstruction:"
                     f"{source_figure_questions[question]}:TABLE:{candidate.key}"
                 )
+            elif question in chart_questions:
+                reason = "editorial_enrichment_table_duplicates_chart"
+                new_warnings.append(
+                    f"editorial_enrichment_table_duplicates_chart:{chart_questions[question]}:{candidate.key}"
+                )
+            elif candidate.key in keys:
+                reason = "editorial_enrichment_duplicate_key"
             elif not question or question in questions:
                 reason = "editorial_enrichment_duplicate_analytic_purpose"
             else:
@@ -2584,20 +2643,53 @@ def _merge_repaired_editorial_enrichment_proposal(
             question = normalize_analytic_question(candidate.purpose.question)
             if reason is not None:
                 pass
-            elif candidate.key in keys:
-                reason = "editorial_enrichment_duplicate_key"
             elif question in source_figure_questions:
                 reason = "editorial_enrichment_source_figure_preferred_over_reconstruction"
                 new_warnings.append(
                     "editorial_enrichment_source_figure_preferred_over_reconstruction:"
                     f"{source_figure_questions[question]}:CHART:{candidate.key}"
                 )
-            elif not question or question in questions:
+            elif not question:
                 reason = "editorial_enrichment_duplicate_analytic_purpose"
             else:
-                charts.append(candidate)
-                keys.add(candidate.key)
-                questions.add(question)
+                colliding_tables = [
+                    table_item
+                    for table_item in tables
+                    if normalize_analytic_question(table_item.purpose.question) == question
+                ]
+                colliding_other_media = any(
+                    normalize_analytic_question(item.purpose.question) == question
+                    for item in charts
+                ) or any(
+                    normalize_analytic_question(item.purpose.question) == question
+                    for item in diagrams
+                )
+                key_collision = candidate.key in keys and not any(
+                    table_item.key == candidate.key for table_item in colliding_tables
+                )
+                if colliding_other_media or key_collision:
+                    reason = (
+                        "editorial_enrichment_duplicate_key"
+                        if key_collision
+                        else "editorial_enrichment_duplicate_analytic_purpose"
+                    )
+                else:
+                    for table_item in colliding_tables:
+                        keys.discard(table_item.key)
+                        reject_accepted_table(
+                            table_item, "editorial_enrichment_table_duplicates_chart"
+                        )
+                        new_warnings.append(
+                            "editorial_enrichment_table_duplicates_chart:"
+                            f"{candidate.key}:{table_item.key}"
+                        )
+                    if colliding_tables:
+                        tables = [item for item in tables if item not in colliding_tables]
+                        questions.discard(question)
+                    charts.append(candidate)
+                    keys.add(candidate.key)
+                    questions.add(question)
+                    chart_questions[question] = candidate.key
         elif target.kind == "FIGURE":
             assert isinstance(candidate, FigureProposalV1)
             question = normalize_analytic_question(candidate.purpose.question)
@@ -2629,6 +2721,10 @@ def _merge_repaired_editorial_enrichment_proposal(
                 ]
                 for table_item in colliding_tables:
                     keys.discard(table_item.key)
+                    reject_accepted_table(
+                        table_item,
+                        "editorial_enrichment_source_figure_preferred_over_reconstruction",
+                    )
                     new_warnings.append(
                         "editorial_enrichment_source_figure_preferred_over_reconstruction:"
                         f"{candidate.figure_handle}:TABLE:{table_item.key}"
@@ -2697,6 +2793,7 @@ def _merge_repaired_editorial_enrichment_proposal(
                 proposal_key=(
                     candidate.figure_handle if target.kind == "FIGURE" else candidate.key
                 ),
+                raw_sha256=target.raw_sha256,
             )
         )
 
@@ -4134,10 +4231,23 @@ Pour chaque question analytique :
 3. Sinon, faut-il montrer des relations, une séquence,
    une architecture, un routage ou un flux ?
       OUI → DIAGRAM
-4. Sinon, faut-il comparer plusieurs objets selon les mêmes champs
-   ou représenter une correspondance structurée ?
+4. Sinon, un tableau est-il approprié parce qu'au moins deux objets ont
+   des champs comparables, qu'un mécanisme définit des correspondances,
+   ou que plusieurs valeurs exactes doivent être consultées rapidement ?
       OUI → TABLE
 5. Sinon → aucun enrichissement.
+
+Exemples de correspondances adaptées à un tableau :
+- Commande SOAP | Namespace | Étape
+- Type de donnée | Canal | Identifiant
+- Variant | Payload | C2
+- Domaine | Date | Acteur, seulement si le lecteur doit consulter les valeurs
+  exactes. Si le besoin est de comprendre leur répartition dans le temps,
+  choisis CHART.
+
+Un tableau doit contenir au moins deux lignes informatives. Rejette un tableau
+qui reprend simplement un paragraphe, qui duplique un CHART ou qui reconstruit
+ce qu'explique déjà une figure source.
 
 CHART accepte uniquement le KIND timeline. Chaque POINT doit citer une date ISO
 exacte, un LABEL et une SERIES présents dans ses preuves, plus au moins un
@@ -4404,8 +4514,10 @@ def build_editorial_enrichment_model_request(
             "faut-il montrer des relations, une séquence, une architecture, un routage "
             "ou un flux ? "
             "OUI → DIAGRAM. "
-            "4. Sinon, faut-il comparer plusieurs objets selon les mêmes champs ou représenter une "
-            "correspondance structurée ? OUI → TABLE. 5. Sinon → aucun enrichissement. CHART "
+            "4. Sinon, un tableau est-il approprié parce qu'au moins deux objets ont des champs "
+            "comparables, qu'un mécanisme définit des correspondances, ou que plusieurs valeurs "
+            "exactes doivent être consultées rapidement ? OUI → TABLE. 5. Sinon → aucun "
+            "enrichissement. CHART "
             "accepte uniquement KIND: timeline, avec des POINT blocks; chaque date ISO exacte, "
             "label et série doit être présente dans les preuves du point, chaque point cite au "
             "moins un evidence handle, et aucune date relative ou interpolation n'est permise. "
@@ -4420,9 +4532,14 @@ def build_editorial_enrichment_model_request(
             "(comprehension gain : avantage sur le paragraphe), SCOPE, "
             "PURPOSE_EVIDENCE, LIMITS, PLACEMENT et "
             "PLACEMENT_REASON; tous sont obligatoires et non vides. Refuse un tableau qui "
-            "reformule seulement les phrases de synthèse. N'impose aucun minimum de lignes ou de "
-            "nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro diagramme sont "
-            "valides lorsque la prose suffit. N'ajoute aucun fait, "
+            "reformule seulement un paragraphe de synthèse; n'accepte pas un tableau d'une seule "
+            "ligne. Un tableau qui duplique un chart ou une figure source doit être rejeté. "
+            "Exemples de correspondances : « Commande SOAP | Namespace | Étape », « Type de "
+            "donnée | Canal | Identifiant », « Variant | Payload | C2 » et « Domaine | Date | "
+            "Acteur ». Ce dernier tableau sert uniquement à consulter les dates et domaines "
+            "exacts; pour comprendre leur répartition dans le temps, choisis CHART. N'impose "
+            "aucun minimum de nœuds et n'ajoute aucune complexité décorative. Zéro table et zéro "
+            "diagramme sont valides lorsque la prose suffit. N'ajoute aucun fait, "
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
             "fournies. Chaque point, ligne, nœud et arête cite des evidence handles existants et "
             "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
@@ -4631,6 +4748,11 @@ def build_editorial_enrichment_repair_request(
             "Repair only the rejected TABLE, CHART, DIAGRAM, or FIGURE blocks listed below. Return "
             "corrected replacements in the same plain-text block format and preserve each exact "
             "analytic question and all required purpose fields, including for FIGURE blocks. "
+            "A TABLE is appropriate only when at least two objects have comparable fields, a "
+            "mechanism defines mappings, or several exact values need quick lookup. A repaired "
+            "table needs at least two informative rows; reject a paragraph paraphrase or a table "
+            "that duplicates a CHART or source FIGURE. For Domain | Date | Actor, use a table only "
+            "for exact-value lookup; use CHART to show temporal distribution. "
             "Respect the source-figure priority and never make two repaired or existing blocks "
             "answer the same normalized analytic question. "
             "block kind and local header id. Use only the current synthesis, evidence pack, "
@@ -4829,7 +4951,7 @@ def validate_editorial_enrichment_proposal(
     charts: list[ChartSpecV1] = []
     diagrams: list[DiagramSpecV1] = []
     for table in parsed.tables:
-        if len(table.columns) < 2 or not table.rows:
+        if len(table.columns) < 2 or len(table.rows) < 2:
             raise EditorialEnrichmentProposalControlError(
                 EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
             )

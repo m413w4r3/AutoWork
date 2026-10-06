@@ -370,6 +370,9 @@ def _proposal(handle: str) -> EditorialEnrichmentProposalV1:
                 ),
                 rows=(
                     TableRowProposalV1(cells=("ExampleRAT", "malware"), evidence_handles=(handle,)),
+                    TableRowProposalV1(
+                        cells=("ExampleRAT", "launches execution"), evidence_handles=(handle,)
+                    ),
                 ),
                 placement=EnrichmentPlacementProposalV1(kind=EnrichmentPlacementKind.AFTER_LEAD),
                 purpose=AnalyticPurposeProposalV1(
@@ -749,6 +752,9 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
     assert "Commence par identifier une question analytique" in request.text
     assert "CHART accepte uniquement le KIND timeline" in request.text
+    assert "plusieurs valeurs exactes doivent être consultées rapidement" in request.text
+    assert "Domaine | Date | Acteur" in request.text
+    assert "pour comprendre leur répartition dans le temps, choisis CHART" in request.text
     assert "Aucun quota minimal de médias ne s'applique" in request.text
     assert prompt_payload["editorial_guidance"]["analytic_validation_policy_version"] == (
         enrichment_module.EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION
@@ -924,6 +930,12 @@ END CHART"""
         warning.startswith("editorial_enrichment_source_figure_preferred_over_reconstruction:F001:")
         for warning in parsed.warnings
     )
+    assert any(
+        warning.startswith(
+            "editorial_enrichment_source_figure_preferred_over_reconstruction:F001:TABLE:T001"
+        )
+        for warning in parsed.warnings
+    )
 
     enrichment = validate_editorial_enrichment_proposal(
         parsed.proposal,
@@ -938,6 +950,143 @@ END CHART"""
     restored = editorial_enrichment_from_json(payload)
     assert figure.purpose is not None
     assert restored.source_figures[-1].purpose == figure.purpose
+
+
+def test_table_duplicate_chart_is_rejected_before_and_after_repair() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    table_wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001")
+    question = next(
+        line.removeprefix("PURPOSE: ")
+        for line in table_wire.splitlines()
+        if line.startswith("PURPOSE: ")
+    )
+    chart_wire = f"""CHART C001
+KEY: execution_timeline
+KIND: timeline
+TITLE: ExampleRAT execution events
+PURPOSE: {question}
+DATA: E001 describes the execution event.
+GAIN: A time axis makes the recorded event easy to locate.
+SCOPE: The one event stated in E001.
+PURPOSE_EVIDENCE: E001
+LIMITS: No other event is included.
+PLACEMENT: after_lead
+PLACEMENT_REASON: Place beside the execution description.
+POINT P001
+DATE: 2026-01-03
+LABEL: ExampleRAT
+SERIES: ExampleRAT execution
+EVIDENCE: E001
+END POINT
+END CHART"""
+
+    for wire in (f"{table_wire}\n\n{chart_wire}", f"{chart_wire}\n\n{table_wire}"):
+        parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+        assert parsed.proposal is not None
+        assert parsed.proposal.tables == ()
+        assert len(parsed.proposal.charts) == 1
+        assert "editorial_enrichment_table_duplicates_chart" in {
+            item.reason_code for item in parsed.rejections
+        }
+        assert any(
+            warning.startswith("editorial_enrichment_table_duplicates_chart:")
+            for warning in parsed.warnings
+        )
+
+    first_pass = parse_editorial_enrichment_proposal_wire(f"{chart_wire}\n\n{table_wire}", pack)
+    repair_pass = parse_editorial_enrichment_proposal_wire(table_wire, pack)
+    merged, repaired, _unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
+        first_pass, repair_pass, first_pass.rejected_blocks
+    )
+
+    assert merged.proposal is not None
+    assert merged.proposal.tables == ()
+    assert len(merged.proposal.charts) == 1
+    assert repaired == ()
+    assert "editorial_enrichment_table_duplicates_chart" in {
+        item.reason_code for item in merged.rejections
+    }
+    assert any(
+        warning.startswith("editorial_enrichment_table_duplicates_chart:")
+        for warning in merged.warnings
+    )
+
+
+def test_repaired_table_duplicate_source_figure_is_rejected() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+    question = "What execution action does ExampleRAT perform?"
+    table_wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001")
+    table_wire = table_wire.replace(
+        "PURPOSE: Which named tool is documented?", f"PURPOSE: {question}", 1
+    )
+    figure_wire = _figure_wire(purpose_question=question)
+    first_pass = parse_editorial_enrichment_proposal_wire(
+        f"{figure_wire}\n\n{table_wire}", pack, figure_catalog=catalog
+    )
+    repair_pass = parse_editorial_enrichment_proposal_wire(table_wire, pack)
+    merged, repaired, _unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
+        first_pass, repair_pass, first_pass.rejected_blocks
+    )
+
+    assert merged.proposal is not None
+    assert len(merged.proposal.figures) == 1
+    assert merged.proposal.tables == ()
+    assert repaired == ()
+    assert "editorial_enrichment_source_figure_preferred_over_reconstruction" in {
+        item.reason_code for item in merged.rejections
+    }
+    assert any(
+        warning.startswith(
+            "editorial_enrichment_source_figure_preferred_over_reconstruction:F001:TABLE:tools_table"
+        )
+        for warning in merged.warnings
+    )
+
+
+def test_repaired_source_figure_rejects_an_already_accepted_duplicate_table() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+    question = "What execution action does ExampleRAT perform?"
+    table_wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001")
+    table_wire = table_wire.replace(
+        "PURPOSE: Which named tool is documented?", f"PURPOSE: {question}", 1
+    )
+    invalid_figure_wire = _figure_wire(purpose_question=question).replace(
+        "REASON: The source figure clarifies the execution context.\n", ""
+    )
+    first_pass = parse_editorial_enrichment_proposal_wire(
+        f"{table_wire}\n\n{invalid_figure_wire}", pack, figure_catalog=catalog
+    )
+    repair_pass = parse_editorial_enrichment_proposal_wire(
+        _figure_wire(purpose_question=question), pack, figure_catalog=catalog
+    )
+    merged, repaired, _unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
+        first_pass, repair_pass, first_pass.rejected_blocks
+    )
+
+    assert merged.proposal is not None
+    assert len(merged.proposal.figures) == 1
+    assert merged.proposal.tables == ()
+    assert repaired == (("FIGURE", "P001"),)
+    assert "editorial_enrichment_source_figure_preferred_over_reconstruction" in {
+        item.reason_code for item in merged.rejections
+    }
+    assert any(
+        warning.startswith(
+            "editorial_enrichment_source_figure_preferred_over_reconstruction:F001:TABLE:tools_table"
+        )
+        for warning in merged.warnings
+    )
 
 
 def test_fixture_b_c2_without_source_figure_keeps_the_diagram() -> None:
@@ -1138,8 +1287,31 @@ END TABLE"""
 
     assert parsed.proposal is not None
     assert len(parsed.proposal.tables) == 1
+    assert len(parsed.proposal.tables[0].rows) == 2
+    assert [column.label for column in parsed.proposal.tables[0].columns] == [
+        "Information",
+        "Step",
+        "Identifier",
+    ]
     assert parsed.proposal.diagrams == ()
     assert parsed.proposal.figures == ()
+
+
+def test_single_row_table_is_rejected_with_code_and_warning() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    table_wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001")
+    one_row_wire = table_wire.split("ROW R001_002", maxsplit=1)[0] + "END TABLE"
+
+    parsed = parse_editorial_enrichment_proposal_wire(one_row_wire, pack)
+
+    assert parsed.proposal is None
+    assert "editorial_enrichment_table_single_row" in {
+        item.reason_code for item in parsed.rejections
+    }
+    assert "editorial_enrichment_table_single_row:T001" in parsed.warnings
 
 
 def test_fixture_e_trivial_prose_accepts_nothing() -> None:
@@ -1169,6 +1341,11 @@ def test_paraphrase_only_table_is_rejected_while_a_valid_table_sibling_survives(
         "CELL: ExampleRAT was observed.\nCELL: ExampleRAT was observed.",
         1,
     )
+    wire = wire.replace(
+        "CELL: ExampleRAT\nCELL: launches execution",
+        "CELL: ExampleRAT was observed.\nCELL: ExampleRAT was observed.",
+        1,
+    )
     wire += """
 TABLE T002
 KEY: documented_action
@@ -1195,6 +1372,11 @@ CELL: ExampleRAT
 CELL: launches execution
 EVIDENCE: E001
 END ROW
+ROW R003
+CELL: ExampleRAT
+CELL: execution
+EVIDENCE: E001
+END ROW
 END TABLE
 """
 
@@ -1205,6 +1387,7 @@ END TABLE
     assert {item.reason_code for item in result.rejections} >= {
         "editorial_enrichment_table_paraphrase_only"
     }
+    assert "editorial_enrichment_table_paraphrase_only:T001" in result.warnings
 
 
 def test_relation_without_endpoint_support_is_rejected_without_dropping_table() -> None:
@@ -1853,7 +2036,10 @@ def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
                     {"key": "indicator", "label": "Indicator"},
                     {"key": "role", "label": "Role"},
                 ],
-                "rows": [{"cells": ["203.0.113.9", "C2"], "evidence_handles": [example_handle]}],
+                "rows": [
+                    {"cells": ["203.0.113.9", "C2"], "evidence_handles": [example_handle]},
+                    {"cells": ["ExampleRAT", "malware"], "evidence_handles": [example_handle]},
+                ],
                 "placement": {"kind": "after_lead"},
                 "purpose": {
                     "question": "Which infrastructure indicator is recorded?",
@@ -1977,9 +2163,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v6-dedicated-annotations"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v7-editorial-tables"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v11-d2-diagram-profiles"
+        "editorial-enrichment-block-contract-v12-editorial-tables"
     )
 
     assert "sélectionne zéro ou une image" in request.text
@@ -2870,7 +3056,7 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
         "editorial_enrichment_diagram_relation_unknown_node",
     }
     enrichment = world.writer.calls[0]["enrichment"]
-    assert len(enrichment.tables[0].rows) == 1  # type: ignore[attr-defined]
+    assert len(enrichment.tables[0].rows) == 2  # type: ignore[attr-defined]
     assert enrichment.tables[0].rows[0].cells[0] == '"ExampleRAT"'  # type: ignore[attr-defined]
     assert len(enrichment.diagrams[0].edges) == 1  # type: ignore[attr-defined]
     assert len(enrichment.diagrams[0].groups) == 1  # type: ignore[attr-defined]

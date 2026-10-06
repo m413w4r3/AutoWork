@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date
@@ -35,7 +37,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v6-timeline-charts"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v7-editorial-tables"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -67,6 +69,18 @@ _INDICATOR_KEYS = {
 }
 _BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command"})
 _TYPOGRAPHIC_BREAK_INTERVAL = 16
+_TABLE_SEMANTIC_STYLE_BY_STYLE = {
+    "semantic-command": "semantic-table-command",
+    "semantic-ioc": "semantic-table-ioc",
+    "semantic-path": "semantic-table-path",
+    "semantic-technical-literal": "semantic-table-technical",
+}
+_TABLE_SHA256 = re.compile(r"^(?:sha-?256(?:\s*:\s*|\s+))?[0-9a-f]{64}$", re.IGNORECASE)
+_TABLE_DOMAIN = re.compile(
+    r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\.?$",
+    re.IGNORECASE,
+)
+_TABLE_WINDOWS_PATH = re.compile(r"^[a-z]:[\\/].+", re.IGNORECASE)
 
 
 def _breakable_typst_display_text(value: str) -> str:
@@ -77,6 +91,47 @@ def _breakable_typst_display_text(value: str) -> str:
         value[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
         for index in range(0, len(value), _TYPOGRAPHIC_BREAK_INTERVAL)
     )
+
+
+def _table_cell_typst_spans(value: str) -> list[dict[str, str]]:
+    """Format exact technical table values and add invisible wrap points to long cells."""
+    style = "semantic-plain"
+    if _TABLE_SHA256.fullmatch(value):
+        style = "semantic-table-technical"
+    elif value.startswith(("/", "\\")) or _TABLE_WINDOWS_PATH.fullmatch(value):
+        style = "semantic-table-path"
+    elif value.startswith(("http://", "https://")) and not any(char.isspace() for char in value):
+        style = "semantic-table-ioc"
+    elif _TABLE_DOMAIN.fullmatch(value):
+        style = "semantic-table-ioc"
+    else:
+        try:
+            ipaddress.ip_address(value)
+        except ValueError:
+            pass
+        else:
+            style = "semantic-table-ioc"
+    return [
+        {
+            "style": style,
+            "text": _breakable_typst_display_text(value),
+        }
+    ]
+
+
+def _table_cell_render_spans(
+    value: str,
+    semantic_cell_spans: list[dict[str, str]] | None,
+) -> list[dict[str, str]]:
+    if semantic_cell_spans is None:
+        return _table_cell_typst_spans(value)
+    return [
+        {
+            "style": _TABLE_SEMANTIC_STYLE_BY_STYLE.get(span["style"], span["style"]),
+            "text": _breakable_typst_display_text(span["text"].replace("\u200b", "")),
+        }
+        for span in semantic_cell_spans
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,13 +310,19 @@ def project_publication_to_typst_model(
         if column_spans and all(item is not None for item in column_spans):
             block["semantic_columns"] = column_spans
         cell_spans = [
-            semantic_spans(f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}", cell)
+            _table_cell_render_spans(
+                cell,
+                semantic_spans(
+                    f"table:{table.key}:row:{row_index:04d}:cell:{cell_index:04d}",
+                    cell,
+                ),
+            )
             for row_index, row in enumerate(table.rows, start=1)
             for cell_index, cell in enumerate(row.cells, start=1)
         ]
-        if cell_spans and all(spans is not None for spans in cell_spans):
-            # Match the renderer's flat row-cell sequence without recursively
-            # flattening each cell's own array of semantic span objects.
+        if cell_spans:
+            # Keep the renderer's flat row-cell sequence; each entry is one cell's
+            # semantic spans, not a recursively flattened span array.
             block["semantic_cells"] = cell_spans
         add_rich(
             table.placement.kind,

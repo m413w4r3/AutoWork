@@ -17,9 +17,28 @@
   size: 9pt,
   fill: purple-dark,
 )[#text(body)]
+#let semantic-table-technical(body) = text(
+  font: "Cascadia Mono",
+  size: 9pt,
+  fill: purple-dark,
+  hyphenate: false,
+)[#text(body)]
 #let semantic-ioc(body) = text(font: "Cascadia Mono", size: 9pt, fill: accent)[#text(body)]
+#let semantic-table-ioc(body) = text(
+  font: "Cascadia Mono",
+  size: 9pt,
+  fill: accent,
+  hyphenate: false,
+)[#text(body)]
 #let semantic-path(body) = text(font: "Cascadia Mono", size: 9pt)[#text(body)]
+#let semantic-table-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#text(body)]
 #let semantic-command(body) = text(font: "Cascadia Mono", size: 9pt, fill: dark)[#text(body)]
+#let semantic-table-command(body) = text(
+  font: "Cascadia Mono",
+  size: 9pt,
+  fill: dark,
+  hyphenate: false,
+)[#text(body)]
 #let semantic-protocol-field(body) = text(font: "Cascadia Mono", size: 9pt, fill: purple-dark)[#text(body)]
 #let semantic-source(body) = text(size: 9pt, fill: accent)[#text(body)]
 #let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#text(body)]
@@ -35,9 +54,13 @@
   else if style == "semantic-english-term" { semantic-english-term(span.text) }
   else if style == "semantic-technical" { semantic-technical(span.text) }
   else if style == "semantic-technical-literal" { semantic-technical-literal(span.text) }
+  else if style == "semantic-table-technical" { semantic-table-technical(span.text) }
   else if style == "semantic-ioc" { semantic-ioc(span.text) }
+  else if style == "semantic-table-ioc" { semantic-table-ioc(span.text) }
   else if style == "semantic-path" { semantic-path(span.text) }
+  else if style == "semantic-table-path" { semantic-table-path(span.text) }
   else if style == "semantic-command" { semantic-command(span.text) }
+  else if style == "semantic-table-command" { semantic-table-command(span.text) }
   else if style == "semantic-protocol-field" { semantic-protocol-field(span.text) }
   else if style == "semantic-source" { semantic-source(span.text) }
   else if style == "semantic-proof" { semantic-proof(span.text) }

@@ -17,6 +17,7 @@ from cti_app.application.typst_compilation import (
     load_font_bundle_snapshot,
     materialize_font_bundle,
 )
+from cti_app.application.typst_rendering import _table_cell_typst_spans
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -67,6 +68,16 @@ def typst_binary() -> str:
 
 
 def _runtime_render_data() -> dict[str, Any]:
+    table_rows = [
+        ["Contexte", "Deux observations consignées dans le rapport"],
+        ["Hash SHA-256", "a" * 64],
+        [
+            "URL de téléchargement",
+            "https://downloads.example.test/releases/2026/10/06/example-rat-loader-package?campaign=autumn-update&source=bulletin",
+        ],
+        ["Adresse IP", "198.51.100.42"],
+        ["Domaine", "cdn.example.test"],
+    ]
     return {
         "schema_version": "typst-publication-model-v5-dated-references-ioc-groups",
         "language": "fr",
@@ -103,10 +114,13 @@ def _runtime_render_data() -> dict[str, Any]:
                     {
                         "type": "table",
                         "key": "lead-table",
-                        "title": "Table after the lead",
-                        "caption": "A compact local table.",
-                        "columns": ["Indicator", "Value"],
-                        "rows": [["IP", "192.0.2.10"], ["Domain", "example.test"]],
+                        "title": "Observed technical values",
+                        "caption": "Exact values from the cited source.",
+                        "columns": ["Type", "Value"],
+                        "rows": table_rows,
+                        "semantic_cells": [
+                            _table_cell_typst_spans(value) for row in table_rows for value in row
+                        ],
                     },
                     {"type": "paragraph", "text": "First section content."},
                     {
@@ -125,7 +139,7 @@ def _runtime_render_data() -> dict[str, Any]:
                         "title": "End placement table",
                         "caption": "A rich block after the final section.",
                         "columns": ["Check", "Result"],
-                        "rows": [["PDF", "valid"]],
+                        "rows": [["PDF", "valid"], ["Page size", "A4"]],
                     },
                 ],
             },

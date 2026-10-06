@@ -48,7 +48,9 @@
 
   v(4pt)
   if has-text(item.caption) [
-    #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
+    #block(above: 2pt, below: 4pt)[
+      #text(size: 9pt, fill: grey)[#semantic-or-plain(item.caption, item.at("semantic_caption", default: none))]
+    ]
   ]
 }
 
