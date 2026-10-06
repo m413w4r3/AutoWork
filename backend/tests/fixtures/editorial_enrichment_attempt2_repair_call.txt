@@ -1,0 +1,69 @@
+DIAGRAM D001
+KEY: flux_c2_bitcoin_iran
+KIND: network_flow
+PROFILE: FLOW
+TITLE: Récupération de données C2 via Bitcoin
+CAPTION: Des acteurs soupçonnés d’être liés au Ministry of Intelligence iranien inscrivent des données de routage C2 encodées sur Bitcoin ; le malware les récupère avant la poursuite de l’opération hors chaîne.
+PURPOSE: Comment les données C2 publiées sur Bitcoin sont-elles utilisées par le malware dans cette activité ?
+DATA: L’écriture de données C2 encodées dans une transaction Bitcoin, leur récupération ultérieure par le malware et le passage hors chaîne après récupération.
+GAIN: Le schéma sépare clairement le stockage on-chain, la récupération par le malware et la phase hors chaîne.
+SCOPE: Uniquement le mécanisme documenté par E020, E022 et E034.
+PURPOSE_EVIDENCE: E020, E022, E034
+LIMITS: Le lien avec le Ministry of Intelligence iranien reste une suspicion et ne repose pas sur l’activité blockchain seule.
+DIRECTION: top_to_bottom
+PLACEMENT: after_section
+SECTION_INDEX: 0
+PLACEMENT_REASON: Le schéma complète directement le paragraphe décrivant l’usage de Bitcoin comme relais de données C2.
+NODE N001
+ID: actors
+ROLE: actor
+LABEL: Acteurs soupçonnés liés au MOI
+EVIDENCE: E020
+NODE N002
+ID: bitcoin_transaction
+ROLE: data_artifact
+LABEL: Transaction Bitcoin
+EVIDENCE: E022
+NODE N003
+ID: c2_data
+ROLE: data_artifact
+LABEL: Données de routage C2
+EVIDENCE: E022
+NODE N004
+ID: malware
+ROLE: malware_tool
+LABEL: Malware
+EVIDENCE: E022, E034
+NODE N005
+ID: offchain
+ROLE: technique_step
+LABEL: Opération hors chaîne
+EVIDENCE: E034
+RELATION L001
+FROM: actors
+TO: bitcoin_transaction
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: écrivent sur Bitcoin
+EVIDENCE: E020, E022
+RELATION L002
+FROM: bitcoin_transaction
+TO: c2_data
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: stocke
+EVIDENCE: E022
+RELATION L003
+FROM: malware
+TO: c2_data
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: récupère
+EVIDENCE: E022
+RELATION L004
+FROM: malware
+TO: offchain
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: poursuit hors chaîne
+EVIDENCE: E034

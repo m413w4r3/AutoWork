@@ -1,0 +1,94 @@
+DIAGRAM D001
+KEY: flux_c2_bitcoin_iran
+KIND: network_flow
+PROFILE: FLOW
+TITLE: Récupération de données C2 via Bitcoin
+CAPTION: Des acteurs soupçonnés d’être liés au Ministry of Intelligence iranien inscrivent des données de routage C2 encodées sur Bitcoin ; le malware les récupère avant la poursuite de l’opération hors chaîne.
+PURPOSE: Comment les données C2 publiées sur Bitcoin sont-elles utilisées par le malware dans cette activité ?
+DATA: L’écriture de données C2 encodées dans une transaction Bitcoin, leur récupération ultérieure par le malware et le passage hors chaîne après récupération.
+GAIN: Le schéma sépare clairement le stockage on-chain, la récupération par le malware et la phase hors chaîne.
+SCOPE: Uniquement le mécanisme documenté par E020, E022 et E034.
+PURPOSE_EVIDENCE: E020, E022, E034
+LIMITS: Le lien avec le Ministry of Intelligence iranien reste une suspicion et ne repose pas sur l’activité blockchain seule.
+DIRECTION: left_to_right
+PLACEMENT: after_section
+SECTION_INDEX: 0
+PLACEMENT_REASON: Le schéma complète directement le paragraphe décrivant l’usage de Bitcoin comme relais de données C2.
+NODE N001
+ID: actors
+ROLE: actor
+LABEL: Acteurs soupçonnés liés au MOI
+EVIDENCE: E020
+END NODE
+NODE N002
+ID: bitcoin_transaction
+ROLE: data_artifact
+LABEL: Transaction Bitcoin
+EVIDENCE: E022
+END NODE
+NODE N003
+ID: c2_data
+ROLE: data_artifact
+LABEL: Données de routage C2
+EVIDENCE: E022
+END NODE
+NODE N004
+ID: malware
+ROLE: malware_tool
+LABEL: Malware
+EVIDENCE: E022, E034
+END NODE
+NODE N005
+ID: offchain
+ROLE: technique_step
+LABEL: Opération hors chaîne
+EVIDENCE: E034
+END NODE
+RELATION L001
+FROM: actors
+TO: bitcoin_transaction
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: écrivent sur Bitcoin
+EVIDENCE: E020, E022
+END RELATION
+RELATION L002
+FROM: bitcoin_transaction
+TO: c2_data
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: stocke
+EVIDENCE: E022
+END RELATION
+RELATION L003
+FROM: malware
+TO: c2_data
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: récupère
+EVIDENCE: E022
+END RELATION
+RELATION L004
+FROM: malware
+TO: offchain
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: poursuit hors chaîne
+EVIDENCE: E034
+END RELATION
+END DIAGRAM
+
+FIGURE P001
+FIGURE_HANDLE: F031
+CAPTION: Évolution de la part des activités blockchain dead drop attribuées selon le type d’acteur.
+PURPOSE: Comment la composition de l’activité BDD attribuée évolue-t-elle entre cybercriminels et acteurs liés à des États ?
+DATA: Les cybercriminels représentent l’essentiel de l’activité jusqu’au début de 2024, les acteurs liés à des États apparaissent significativement à partir de mi-2024 et représentent environ deux tiers des nouvelles activités trimestrielles au T2 2026.
+GAIN: La figure source rend immédiatement visible le changement de composition de l’activité que la prose décrit par plusieurs jalons relatifs.
+SCOPE: L’activité BDD attribuée par type d’acteur telle que présentée par Chainalysis.
+PURPOSE_EVIDENCE: E004, E008, E013
+LIMITS: Cette vue agrégée ne démontre pas l’attribution d’une campagne particulière à l’Iran ou au Ministry of Intelligence.
+EVIDENCE: E004, E008, E013
+PLACEMENT: after_timeline
+PLACEMENT_REASON: La figure contextualise les jalons de la chronologie en montrant la montée globale des acteurs liés à des États, sans dupliquer le schéma du mécanisme iranien.
+REASON: La publication source comporte déjà une visualisation consacrée à la répartition de l’activité BDD par type d’acteur ; elle répond mieux à cette question quantitative qu’un graphique reconstruit.
+END FIGURE

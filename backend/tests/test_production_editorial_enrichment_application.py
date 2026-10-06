@@ -42,6 +42,7 @@ from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentProposalControlError,
     EditorialEnrichmentProposalV1,
     EditorialEnrichmentStageErrorCode,
+    EditorialFigureCatalogEntry,
     EnrichmentPlacementProposalV1,
     ProductionEditorialEnrichmentExecution,
     ProductionEditorialEnrichmentService,
@@ -746,11 +747,13 @@ def test_prompt_uses_analytic_intent_without_row_or_node_quotas() -> None:
     assert "diagrammes : choisis PROFILE" in request.text
     assert prompt_payload["editorial_guidance"]["diagram_layout_budgets"]["maximum_nodes"] == 8
     layout_budgets = prompt_payload["editorial_guidance"]["diagram_layout_budgets"]
-    assert layout_budgets["vertical_when_nodes_over"] == 3
-    assert layout_budgets["vertical_when_label_characters_over"] == 30
+    assert "vertical_when_nodes_over" not in layout_budgets
+    assert "vertical_when_label_characters_over" not in layout_budgets
     assert "plus de 4 nœuds" not in request.text
     assert "infection_chain aux étapes ordonnées d'une intrusion" in request.text
-    assert "Commence par identifier une question analytique" in request.text
+    assert "Détermine intérieurement une question analytique" in request.text
+    assert "ne produis pas de bloc QUESTION" in request.text
+    assert "DIRECTION est une préférence de rendu" in request.text
     assert "CHART accepte uniquement le KIND timeline" in request.text
     assert "plusieurs valeurs exactes doivent être consultées rapidement" in request.text
     assert "Domaine | Date | Acteur" in request.text
@@ -800,7 +803,7 @@ def test_parser_keeps_table_rows_unbounded_and_accepts_eight_diagram_nodes() -> 
     assert len(result.proposal.diagrams[0].nodes) == 8
 
 
-def test_diagram_with_long_labels_requires_top_to_bottom_direction() -> None:
+def test_diagram_with_long_labels_normalizes_to_top_to_bottom_direction() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
     synthesis = _synthesis(extraction)
@@ -808,18 +811,29 @@ def test_diagram_with_long_labels_requires_top_to_bottom_direction() -> None:
     wire = _proposal_to_wire(_proposal("E001")).replace(
         "LABEL: ExampleRAT", "LABEL: Résolution Bitcoin serveur C2 iranien", 1
     )
+    pack = replace(
+        pack,
+        narrative_evidence=(
+            {
+                "handle": "E001",
+                "context": (
+                    "Résolution Bitcoin serveur C2 iranien launches execution. "
+                    "The documented execution stage is stated here."
+                ),
+            },
+        ),
+    )
 
     result = parse_editorial_enrichment_proposal_wire(wire, pack)
 
     assert result.proposal is not None
-    assert result.proposal.diagrams == ()
-    assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" in {
-        item.reason_code for item in result.rejections
-    }
+    assert len(result.proposal.diagrams) == 1
+    assert result.proposal.diagrams[0].direction is EnrichmentDiagramDirection.TOP_TO_BOTTOM
+    assert "editorial_enrichment_diagram_direction_normalized" in result.transformations
 
 
 @pytest.mark.parametrize("label_kind", ("relation", "group"))
-def test_diagram_relation_and_group_labels_require_top_to_bottom_direction(
+def test_diagram_relation_and_group_labels_normalize_to_top_to_bottom_direction(
     label_kind: str,
 ) -> None:
     snapshot = _snapshot()
@@ -829,7 +843,18 @@ def test_diagram_relation_and_group_labels_require_top_to_bottom_direction(
     proposal_payload = _proposal("E001").model_dump(mode="json")
     diagram_payload = proposal_payload["diagrams"][0]
     if label_kind == "relation":
-        diagram_payload["edges"][0]["label"] = "x" * 31
+        diagram_payload["edges"][0]["label"] = "ExampleRAT launches execution through"
+        pack = replace(
+            pack,
+            narrative_evidence=(
+                {
+                    "handle": "E001",
+                    "context": (
+                        "ExampleRAT launches execution through the documented execution stage."
+                    ),
+                },
+            ),
+        )
     else:
         diagram_payload["groups"] = [
             {
@@ -843,10 +868,9 @@ def test_diagram_relation_and_group_labels_require_top_to_bottom_direction(
     result = parse_editorial_enrichment_proposal_wire(_proposal_to_wire(proposal), pack)
 
     assert result.proposal is not None
-    assert result.proposal.diagrams == ()
-    assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" in {
-        item.reason_code for item in result.rejections
-    }
+    assert len(result.proposal.diagrams) == 1
+    assert result.proposal.diagrams[0].direction is EnrichmentDiagramDirection.TOP_TO_BOTTOM
+    assert "editorial_enrichment_diagram_direction_normalized" in result.transformations
 
 
 def test_purpose_is_required_and_duplicate_questions_reject_only_one_sibling() -> None:
@@ -2163,9 +2187,9 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v7-editorial-tables"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v8-editorial-tables"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
-        "editorial-enrichment-block-contract-v12-editorial-tables"
+        "editorial-enrichment-block-contract-v13-editorial-tables"
     )
 
     assert "sélectionne zéro ou une image" in request.text
@@ -3082,6 +3106,10 @@ async def test_unintelligible_nonempty_response_needs_review() -> None:
     assert result.error_code == EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value
     assert result.details is not None
     assert result.details["wire_error_code"] == "editorial_enrichment_unintelligible_response"
+    assert any(
+        warning.startswith("editorial_enrichment_output_invalid:")
+        for warning in result.details["warnings"]
+    )
     assert result.model_calls == 1
     assert world.writer.calls == []
 
@@ -3288,20 +3316,26 @@ async def test_invalid_structured_output_needs_review_without_artifact(failure: 
 
     result = await _execute(world)
 
+    if failure == "unknown_handle":
+        assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+        assert result.error_code is None
+        assert (result.table_count, result.diagram_count) == (0, 0)
+        assert len(world.writer.calls) == 1
+        metadata = world.writer.calls[0]["metadata_extra"]
+        wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+        assert any(
+            item["reason_code"] == "editorial_enrichment_unknown_evidence_handle"
+            for item in wire_details["final_rejections"]  # type: ignore[index]
+        )
+        return
+
     assert result.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
     assert result.error_code in {
         EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value,
         EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE.value,
-        EditorialEnrichmentStageErrorCode.EMPTY_AFTER_REJECTIONS.value,
     }
-    assert result.model_calls == (2 if failure == "unknown_handle" else 1)
+    assert result.model_calls == 1
     assert world.writer.calls == []
-    if failure == "unknown_handle":
-        assert result.details is not None
-        assert any(
-            item["reason_code"] == "editorial_enrichment_unknown_evidence_handle"
-            for item in result.details["rejections"]
-        )
 
 
 @pytest.mark.asyncio
@@ -3875,6 +3909,72 @@ def _real_run_evidence_pack() -> EditorialEnrichmentEvidencePackV1:
     )
 
 
+def _chainalysis_enrichment_inputs() -> tuple[
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+    EditorialEnrichmentEvidencePackV1,
+    tuple[EditorialFigureCatalogEntry, ...],
+]:
+    snapshot = _snapshot()
+    contexts = {
+        "E004": "La part des activités blockchain dead drop attribuées selon le type d'acteur.",
+        "E008": "Les cybercriminels représentent l'essentiel de l'activité jusqu'au début de 2024.",
+        "E013": (
+            "Les acteurs liés à des États représentent deux tiers des nouvelles activités "
+            "au T2 2026."
+        ),
+        "E020": (
+            "Acteurs soupçonnés liés au MOI. The origin of an event is not in this excerpt, "
+            "and it has not been independently established for this report."
+        ),
+        "E022": (
+            "Transaction Bitcoin stocke des données de routage C2 encodées; le malware récupère "
+            "ces données. The report describes this event as part of an observed sequence."
+        ),
+        "E025": ("Récupération par le malware puis bascule vers la compromission hors chaîne."),
+        "E034": (
+            "Malware poursuit l'opération hors chaîne après récupération. The operator "
+            "describes this as the following stage."
+        ),
+    }
+    facts = tuple(
+        ExtractionFactV1(
+            category="infrastructure",
+            value=context,
+            attack_id=None,
+            context=context,
+            evidence_quote=context,
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        )
+        for context in contexts.values()
+    )
+    extraction = _extraction(facts=facts, input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    base = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    refs = extraction_evidence_refs_v1(extraction)
+    pack = replace(
+        base,
+        publication_language="fr",
+        narrative_evidence=tuple(
+            {"handle": handle, "context": context} for handle, context in contexts.items()
+        ),
+        technical_evidence=(),
+        _handle_to_ref=dict(zip(contexts, refs, strict=True)),
+    )
+    inventory = _figure_inventory(
+        extraction,
+        figure_label="Blockchain dead drop activity by actor type",
+        source_caption="Attributed blockchain dead drop activity by actor type",
+        alt_text="Quarterly activity by actor type",
+    )
+    catalog = tuple(
+        replace(entry, handle="F031")
+        for entry in build_editorial_figure_catalog(extraction, inventory)
+    )
+    return extraction, synthesis, pack, catalog
+
+
 def _top_wire_block(wire: str, header: str) -> str:
     kind = header.split()[0]
     lines = wire.splitlines()
@@ -3929,6 +4029,112 @@ def test_real_run_wire_fixture_keeps_evidence_backed_enrichments_and_needs() -> 
     assert "editorial_enrichment_duplicate_local_block_id" not in {
         item.reason_code for item in parsed.rejections
     }
+
+
+def test_real_attempt1_rejects_unknown_question_and_publication_blocks_individually() -> None:
+    _extraction_value, _synthesis_value, pack, _catalog = _chainalysis_enrichment_inputs()
+    wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt1_first_call.txt"
+    ).read_text(encoding="utf-8")
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is not None
+    assert [item.key for item in parsed.proposal.diagrams] == ["bitcoin_c2_offchain_flow"]
+    assert "editorial_enrichment_inline_source_handles_removed" in parsed.transformations
+    assert "E022" not in parsed.proposal.diagrams[0].purpose.scope
+    assert "E025" not in parsed.proposal.diagrams[0].purpose.scope
+    assert len(parsed.rejections) == 3
+    assert {item.reason_code for item in parsed.rejections} == {
+        "editorial_enrichment_unexpected_block_kind"
+    }
+    assert {
+        "editorial_enrichment_unexpected_block_kind:QUESTION:Q001",
+        "editorial_enrichment_unexpected_block_kind:PUBLICATION:U001",
+        "editorial_enrichment_unexpected_block_kind:PUBLICATION:U002",
+    } <= set(parsed.warnings)
+
+
+def test_real_attempt2_normalizes_direction_and_keeps_distinct_source_figure() -> None:
+    extraction, synthesis, pack, catalog = _chainalysis_enrichment_inputs()
+    wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_first_call.txt"
+    ).read_text(encoding="utf-8")
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
+
+    assert parsed.proposal is not None
+    assert len(parsed.proposal.diagrams) == 1
+    diagram = parsed.proposal.diagrams[0]
+    assert diagram.direction.value == "top_to_bottom"
+    assert len(diagram.nodes) == 5
+    assert len(diagram.edges) == 3
+    assert "editorial_enrichment_inline_source_handles_removed" in parsed.transformations
+    assert [item.figure_handle for item in parsed.proposal.figures] == ["F031"]
+    assert diagram.purpose.question != parsed.proposal.figures[0].purpose.question
+    assert "editorial_enrichment_diagram_direction_normalized" in parsed.transformations
+    assert any(
+        item.reason_code == "editorial_enrichment_diagram_relation_without_endpoint_support"
+        for item in parsed.rejections
+    )
+    assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" not in {
+        item.reason_code for item in parsed.rejections
+    }
+    assert not any(
+        item.reason_code == "editorial_enrichment_source_figure_preferred_over_reconstruction"
+        for item in parsed.rejections
+    )
+    validated = validate_editorial_enrichment_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        synthesis,
+        figure_catalog=catalog,
+        warnings=parsed.warnings,
+    )
+    assert len(validated.diagrams) == len(validated.source_figures) == 1
+
+
+def test_real_repair_output_recovers_terminators_and_merges_without_losing_figure() -> None:
+    _extraction_value, _synthesis_value, pack, catalog = _chainalysis_enrichment_inputs()
+    first_wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_first_call.txt"
+    ).read_text(encoding="utf-8")
+    repair_wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_repair_call.txt"
+    ).read_text(encoding="utf-8")
+    # Keep the original accepted figure while making the diagram a real repair target.
+    rejected_first_pass = first_wire.replace("PROFILE: FLOW", "PROFILE: INVALID", 1)
+    first_pass = parse_editorial_enrichment_proposal_wire(
+        rejected_first_pass, pack, figure_catalog=catalog
+    )
+    repair_pass = parse_editorial_enrichment_proposal_wire(
+        repair_wire, pack, figure_catalog=catalog
+    )
+
+    assert repair_pass.proposal is not None
+    assert len(repair_pass.proposal.diagrams) == 1
+    assert len(repair_pass.proposal.diagrams[0].nodes) == 5
+    assert "editorial_enrichment_missing_block_terminator_recovered" in (
+        repair_pass.transformations
+    )
+    assert any(
+        item.reason_code == "editorial_enrichment_diagram_relation_without_endpoint_support"
+        for item in repair_pass.rejections
+    )
+    merged, repaired, unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
+        first_pass, repair_pass, first_pass.rejected_blocks
+    )
+
+    assert unexpected == ()
+    assert repaired == (("DIAGRAM", "D001"),)
+    assert merged.proposal is not None
+    assert len(merged.proposal.diagrams) == len(merged.proposal.figures) == 1
+    assert merged.proposal.figures[0].figure_handle == "F031"
+    assert (
+        merged.proposal.diagrams[0].purpose.question != merged.proposal.figures[0].purpose.question
+    )
+    assert "editorial_enrichment_missing_block_terminator_recovered" in (merged.transformations)
 
 
 def test_relation_type_synonyms_normalize_only_for_infection_chain() -> None:
@@ -4100,7 +4306,92 @@ async def test_targeted_repair_is_single_call_versioned_and_reused_on_replay() -
 
 
 @pytest.mark.asyncio
-async def test_repair_failure_keeps_first_pass_and_all_rejected_proposals_need_review() -> None:
+async def test_rejected_diagram_does_not_discard_a_valid_source_figure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    valid_wire = _proposal_to_wire(_proposal("E001"))
+    invalid_diagram = _top_wire_block(valid_wire, "DIAGRAM D001").replace(
+        "RELATION_TYPE: factual", "RELATION_TYPE: causal", 1
+    )
+    first_wire = f"{_figure_wire()}\n\n{invalid_diagram}"
+
+    def respond(request: ModelRequest) -> ModelExecution:
+        return _succeeded_text(
+            request,
+            invalid_diagram
+            if request.prompt_template_id == "production-editorial-enrichment-repair"
+            else first_wire,
+        )
+
+    world = _world(_RecordingGateway(respond))
+    inventory = _figure_inventory(world.extraction)
+
+    async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
+        return inventory
+
+    async def no_ingest(_inventory: SourceFigureInventoryResult) -> None:
+        return None
+
+    monkeypatch.setattr(enrichment_module, "load_archived_source_figure_inventory", load_inventory)
+    monkeypatch.setattr(world.service, "_ingest_source_figures", no_ingest)
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.diagram_count == 0
+    assert result.source_figure_count == 1
+    assert len(world.writer.calls) == 1
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert len(enrichment.source_figures) == 1  # type: ignore[attr-defined]
+    metadata = world.writer.calls[0]["metadata_extra"]
+    wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+    assert wire_details["repair"]["blocks_repaired"] == 0  # type: ignore[index]
+    assert any(
+        item["reason_code"] == "editorial_enrichment_diagram_relation_type_invalid"
+        for item in wire_details["final_rejections"]  # type: ignore[index]
+    )
+
+
+@pytest.mark.asyncio
+async def test_enrichment_and_repair_prompts_keep_the_text_block_contract() -> None:
+    world = _world(
+        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT"))
+    )
+    result = await _execute(world)
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+
+    request = world.gateway.calls[0][0]
+    prompt = json.loads(request.text)
+    assert "ne produis pas de bloc QUESTION" in prompt["instructions"]
+    assert "Do not return JSON" in prompt["instructions"]
+    rejected_block = enrichment_module.EditorialEnrichmentRejectedBlock(
+        kind="DIAGRAM",
+        block_id="D001",
+        scope_id="B000001",
+        raw_text="DIAGRAM D001",
+        raw_sha256="c" * 64,
+        reason_codes=("editorial_enrichment_diagram_invalid",),
+    )
+    repair_request, _identity = enrichment_module.build_editorial_enrichment_repair_request(
+        request,
+        raw_output_sha256="a" * 64,
+        rejected_blocks=(rejected_block,),
+    )
+    repair_prompt = json.loads(repair_request.text)
+    assert "Do not return JSON" in repair_prompt["instructions"]
+    assert "END NODE" in repair_prompt["instructions"]
+    assert "END RELATION" in repair_prompt["instructions"]
+    assert "END DIAGRAM" in repair_prompt["instructions"]
+
+    for prompt_text in (
+        prompt["instructions"] + prompt["output_contract"],
+        repair_prompt["instructions"] + repair_prompt["output_contract"],
+    ):
+        assert "JSON" not in prompt_text.replace("Do not return JSON", "")
+
+
+@pytest.mark.asyncio
+async def test_repair_failure_keeps_valid_siblings_and_all_rejected_blocks_can_be_empty() -> None:
     valid_wire = _proposal_to_wire(_proposal("E001"))
     table = _top_wire_block(valid_wire, "TABLE T001")
     invalid_sibling = table.replace("TABLE T001", "TABLE T002", 1).replace(
@@ -4133,9 +4424,16 @@ async def test_repair_failure_keeps_first_pass_and_all_rejected_proposals_need_r
 
     rejected_world = _world(_RecordingGateway(unrepaired))
     rejected = await _execute(rejected_world)
-    assert rejected.status is EditorialEnrichmentExecutionStatus.NEEDS_REVIEW
-    assert rejected.error_code == "editorial_enrichment_empty_after_rejections"
-    assert rejected.model_calls == 2
+    assert rejected.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert rejected.error_code is None
+    assert rejected.model_calls == 3
+    assert (rejected.table_count, rejected.diagram_count, rejected.source_figure_count) == (0, 0, 0)
+    assert len(rejected_world.writer.calls) == 1
+    metadata = rejected_world.writer.calls[0]["metadata_extra"]
+    wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+    rejection_codes = {item["reason_code"] for item in wire_details["final_rejections"]}
+    assert "editorial_enrichment_unknown_evidence_handle" in rejection_codes
+    assert "editorial_enrichment_diagram_relation_type_invalid" in rejection_codes
 
 
 def test_source_figure_inventory_warning_only_reports_pending_items() -> None:

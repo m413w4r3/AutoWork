@@ -36,7 +36,7 @@ EDITORIAL_ENRICHMENT_V5_POLICY_VERSION = "editorial-enrichment-v5-diagram-node-r
 EDITORIAL_ENRICHMENT_V6_POLICY_VERSION = "editorial-enrichment-v6-source-figure-provenance"
 EDITORIAL_ENRICHMENT_V7_POLICY_VERSION = "editorial-enrichment-v7-analytic-media-arbitration"
 EDITORIAL_ENRICHMENT_V8_POLICY_VERSION = "editorial-enrichment-v8-timeline-charts"
-EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v10-editorial-tables"
+EDITORIAL_ENRICHMENT_POLICY_VERSION = "editorial-enrichment-v11-editorial-tables"
 EDITORIAL_FIGURE_DECISION_POLICY_VERSION = "editorial-figure-selection-v3-source-context"
 EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 

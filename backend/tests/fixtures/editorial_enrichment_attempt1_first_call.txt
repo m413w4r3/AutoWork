@@ -1,0 +1,67 @@
+QUESTION Q001
+TEXT: Comment les données C2 transitent-elles d’une transaction Bitcoin vers la phase de compromission hors chaîne ?
+EVIDENCE: E022, E025
+DECISION: DIAGRAM
+END QUESTION
+
+DIAGRAM D001
+KEY: bitcoin_c2_offchain_flow
+KIND: network_flow
+PROFILE: FLOW
+TITLE: Routage C2 via une transaction Bitcoin
+CAPTION: Une transaction Bitcoin stocke des données de routage C2 encodées que le malware récupère avant que l’opération ne se poursuive hors chaîne.
+PURPOSE: Comment les données C2 transitent-elles d’une transaction Bitcoin vers la phase de compromission hors chaîne ?
+DATA: E022 documente le stockage de données de routage C2 encodées dans une transaction Bitcoin et leur récupération ultérieure par le malware ; E025 documente le basculement hors chaîne après cette récupération.
+GAIN: Un flux séquentiel distingue immédiatement le relais on-chain de la compromission effective hors chaîne, distinction moins perceptible dans un paragraphe.
+SCOPE: Uniquement le stockage des données C2 dans Bitcoin, leur récupération par le malware et le basculement hors chaîne documentés dans E022 et E025.
+PURPOSE_EVIDENCE: E022, E025
+LIMITS: Le schéma ne démontre pas à lui seul l’identité de l’opérateur ni son rattachement au Ministry of Intelligence ; il ne représente aucun détail de compromission non documenté.
+DIRECTION: left_to_right
+PLACEMENT: after_section
+SECTION_INDEX: 1
+PLACEMENT_REASON: À placer après la section technique qui explique le rôle de la blockchain comme relais de données C2 avant la phase hors chaîne.
+NODE N001
+ID: bitcoin_transaction
+ROLE: data_artifact
+LABEL: Transaction Bitcoin
+EVIDENCE: E022
+END NODE
+NODE N002
+ID: malware_retrieval
+ROLE: technique_step
+LABEL: Récupération par le malware
+EVIDENCE: E022
+END NODE
+NODE N003
+ID: offchain_compromise
+ROLE: technique_step
+LABEL: Compromission hors chaîne
+EVIDENCE: E025
+END NODE
+RELATION L001
+FROM: bitcoin_transaction
+TO: malware_retrieval
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: fournit données C2
+EVIDENCE: E022
+END RELATION
+RELATION L002
+FROM: malware_retrieval
+TO: offchain_compromise
+RELATION_TYPE: factual
+DIRECTION: directed
+LABEL: bascule vers
+EVIDENCE: E025
+END RELATION
+END DIAGRAM
+
+PUBLICATION U001
+LABEL: Chainalysis — DPRK and Iran are Leading a 5.2x Surge YoY in Blockchain-Assisted Cyberattacks
+URL: [Publication Chainalysis](https://www.chainalysis.com/blog/etherhiding-blockchain-dead-drops/)
+END PUBLICATION
+
+PUBLICATION U002
+LABEL: Cointelegraph — State hackers drive 420% surge in onchain malware, Chainalysis finds
+URL: [Publication Cointelegraph](https://cointelegraph.com/news/onchain-malware-writes-surge-420-north-korea-iran-chainalysis)
+END PUBLICATION

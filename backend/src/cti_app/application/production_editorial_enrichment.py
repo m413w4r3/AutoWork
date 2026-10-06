@@ -103,8 +103,6 @@ from cti_app.domain.production import (
     model_run_awaits_reconciliation,
 )
 from cti_app.domain.production_editorial_enrichment import (
-    DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS,
-    DIAGRAM_VERTICAL_AFTER_NODES,
     EDITORIAL_ENRICHMENT_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_SCHEMA_VERSION,
     EDITORIAL_FIGURE_DECISION_POLICY_VERSION,
@@ -187,12 +185,12 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v7-editorial-tables"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v8-editorial-tables"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v7-timeline-anchors"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v10-editorial-tables"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v11-editorial-tables"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v5-editorial-tables"
 )
@@ -828,6 +826,58 @@ class _EditorialEnrichmentWireBlock:
         values.append(value)
 
 
+_ENRICHMENT_INLINE_EVIDENCE_REFERENCE = re.compile(
+    r"(?:\b(?:document\w*\s+(?:in|dans|par)|in|dans|par|selon|according\s+to)\s+)?"
+    r"(?:\[\s*)?\b[ER]\d{3,}\b(?:\s*\])?"
+    r"(?:\s*(?:,|et|and)\s*(?:\[\s*)?\b[ER]\d{3,}\b(?:\s*\])?)*",
+    re.IGNORECASE,
+)
+_ENRICHMENT_PROSE_FIELDS = frozenset(
+    {
+        "title",
+        "caption",
+        "purpose",
+        "available_data",
+        "comprehension_gain",
+        "scope",
+        "knowledge_limits",
+        "placement_reason",
+        "label",
+        "cell",
+        "series",
+        "reason",
+        "text",
+    }
+)
+
+
+def _normalize_inline_wire_evidence_references(
+    block: _EditorialEnrichmentWireBlock,
+    transformations: list[str],
+    warnings: list[str],
+) -> None:
+    removed_count = 0
+    for item in (block, *block.children):
+        for field_name in sorted(_ENRICHMENT_PROSE_FIELDS):
+            values = item.fields.get(field_name)
+            if not values:
+                continue
+            for index, value in enumerate(values):
+                cleaned, count = _ENRICHMENT_INLINE_EVIDENCE_REFERENCE.subn(" ", value)
+                if not count:
+                    continue
+                cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+                cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+                values[index] = cleaned
+                removed_count += count
+    if not removed_count:
+        return
+    transformation = "editorial_enrichment_inline_source_handles_removed"
+    if transformation not in transformations:
+        transformations.append(transformation)
+    warnings.append(f"{transformation}:{block.kind}:{block.block_id}:{removed_count}")
+
+
 _ENRICHMENT_FENCE = re.compile(r"^\s*(?:```|~~~)")
 _ENRICHMENT_BLOCK_WRAPPER = re.compile(r"^@@\s*(.*?)\s*@@$")
 _ENRICHMENT_HEADER = re.compile(
@@ -835,6 +885,7 @@ _ENRICHMENT_HEADER = re.compile(
     r"(?:(?:\s*:\s*|\s+)([A-Za-z0-9][A-Za-z0-9._-]*))?\s*:?$",
     re.IGNORECASE,
 )
+_ENRICHMENT_UNKNOWN_TOP_LEVEL_HEADER = re.compile(r"^([A-Z][A-Z0-9_]*)\s+([A-Z]\d{3,})$")
 _ENRICHMENT_FIELD = re.compile(r"^\*{0,2}([A-Za-z][A-Za-z0-9 _-]*?)\*{0,2}\s*:\s?(.*)$")
 _ENRICHMENT_HANDLE = re.compile(r"\bE\d{3,}\b")
 _ENRICHMENT_NODE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -1978,7 +2029,9 @@ def parse_editorial_enrichment_proposal_wire(
     """Recover independent text blocks, leaving canonical validation strict."""
     if not isinstance(raw_text, str):
         return EditorialEnrichmentWireParseResult(
-            None, error_code="editorial_enrichment_unintelligible_response"
+            None,
+            error_code="editorial_enrichment_unintelligible_response",
+            warnings=("editorial_enrichment_unintelligible_response",),
         )
     sanitized = sanitize_bridge_output_text(raw_text).replace("\r\n", "\n").replace("\r", "\n")
     transformations: list[str] = []
@@ -2001,13 +2054,21 @@ def parse_editorial_enrichment_proposal_wire(
             _enrichment_wire_rejection(block, block.block_id, reason, block.raw_lines)
         )
 
-    def finish_child() -> None:
+    def recover_missing_terminator(block: _EditorialEnrichmentWireBlock) -> None:
+        transformation = "editorial_enrichment_missing_block_terminator_recovered"
+        if transformation not in transformations:
+            transformations.append(transformation)
+        warnings.append(f"{transformation}:{block.kind}:{block.block_id}")
+
+    def finish_child(*, explicitly_terminated: bool = False) -> None:
         nonlocal current_child, last_field
         child = current_child
         current_child = None
         last_field = None
         if child is None:
             return
+        if not explicitly_terminated:
+            recover_missing_terminator(child)
         if current_top is None:
             reject(child, "editorial_enrichment_orphan_block")
             return
@@ -2017,10 +2078,12 @@ def parse_editorial_enrichment_proposal_wire(
         current_top.children.append(child)
         current_top.raw_lines.extend(child.raw_lines)
 
-    def finish_top() -> None:
+    def finish_top(*, explicitly_terminated: bool = False) -> None:
         nonlocal current_top, last_field
         finish_child()
         if current_top is not None:
+            if not explicitly_terminated:
+                recover_missing_terminator(current_top)
             top_blocks.append(current_top)
         current_top = None
         last_field = None
@@ -2118,6 +2181,23 @@ def parse_editorial_enrichment_proposal_wire(
             last_field = None
             continue
 
+        unknown_header = _ENRICHMENT_UNKNOWN_TOP_LEVEL_HEADER.fullmatch(header_value)
+        if unknown_header is not None:
+            kind, block_id = unknown_header.groups()
+            finish_top()
+            block_sequence += 1
+            unknown = _EditorialEnrichmentWireBlock(
+                kind=kind,
+                block_id=block_id,
+                scope_id=f"B{block_sequence:06d}",
+                raw_lines=[raw_line],
+            )
+            reject(unknown, "editorial_enrichment_unexpected_block_kind")
+            warnings.append(f"editorial_enrichment_unexpected_block_kind:{kind}:{block_id}")
+            recognized = True
+            last_field = None
+            continue
+
         end_match = re.fullmatch(
             r"END(?:\s+(TABLE|CHART|DIAGRAM|ANNOTATION|FIGURE|NEEDS|COLUMN|ROW|POINT|NODE|RELATION|EDGE|GROUP|ITEM))?",
             line,
@@ -2128,11 +2208,11 @@ def parse_editorial_enrichment_proposal_wire(
             last_field = None
             end_kind = (end_match.group(1) or "").upper()
             if current_top is not None and end_kind == current_top.kind:
-                finish_top()
+                finish_top(explicitly_terminated=True)
             elif current_child is not None:
-                finish_child()
+                finish_child(explicitly_terminated=(not end_kind or end_kind == current_child.kind))
             elif current_top is not None:
-                finish_top()
+                finish_top(explicitly_terminated=not end_kind)
             continue
 
         target = current_child or current_top
@@ -2284,7 +2364,9 @@ def parse_editorial_enrichment_proposal_wire(
             tuple(rejections),
             error_code="editorial_enrichment_unintelligible_response",
             transformations=tuple(transformations),
-            warnings=tuple(warnings),
+            warnings=tuple(
+                dict.fromkeys((*warnings, "editorial_enrichment_unintelligible_response"))
+            ),
         )
     if explicit_empty and not top_blocks and not rejections:
         return EditorialEnrichmentWireParseResult(
@@ -2292,6 +2374,9 @@ def parse_editorial_enrichment_proposal_wire(
             explicit_empty=True,
             transformations=tuple(transformations),
         )
+
+    for block in top_blocks:
+        _normalize_inline_wire_evidence_references(block, transformations, warnings)
 
     tables: list[TableProposalV1] = []
     charts: list[ChartProposalV1] = []
@@ -2416,7 +2501,9 @@ def parse_editorial_enrichment_proposal_wire(
                     accepted = True
                     proposal_key = need.key
         else:
-            diagram = _parse_enrichment_wire_diagram(top, evidence_pack, rejections, warnings)
+            diagram = _parse_enrichment_wire_diagram(
+                top, evidence_pack, rejections, warnings, transformations
+            )
             if diagram is not None:
                 diagram = _filter_diagram_relations(
                     top, diagram, evidence_pack, rejections, warnings
@@ -2474,7 +2561,7 @@ def parse_editorial_enrichment_proposal_wire(
             tuple(rejections),
             error_code="editorial_enrichment_no_valid_blocks",
             transformations=tuple(transformations),
-            warnings=tuple(dict.fromkeys(warnings)),
+            warnings=tuple(dict.fromkeys((*warnings, "editorial_enrichment_no_valid_blocks"))),
             rejected_blocks=tuple(rejected_blocks),
             accepted_blocks=tuple(accepted_blocks),
         )
@@ -2821,8 +2908,9 @@ def _merge_repaired_editorial_enrichment_proposal(
             proposal.resource_needs,
         )
     )
-    transformations = first_pass.transformations
-    warnings = tuple(dict.fromkeys(new_warnings))
+    has_proposal = first_pass.proposal is not None or repair_pass.proposal is not None
+    transformations = (*first_pass.transformations, *repair_pass.transformations)
+    warnings = (*new_warnings, *repair_pass.warnings)
     accepted_blocks = (
         *(
             block
@@ -2834,15 +2922,17 @@ def _merge_repaired_editorial_enrichment_proposal(
     if repaired_identities:
         transformations = (
             *transformations,
-            *repair_pass.transformations,
             f"editorial_enrichment_repair_blocks_repaired:{len(repaired_identities)}",
         )
-        warnings = (*warnings, *repair_pass.warnings)
     return (
         EditorialEnrichmentWireParseResult(
-            proposal=proposal if has_content else None,
+            proposal=proposal if has_content or has_proposal else None,
             rejections=tuple((*new_rejections, *repair_pass.rejections)),
-            error_code=None if has_content else first_pass.error_code or repair_pass.error_code,
+            error_code=(
+                None
+                if has_content or has_proposal
+                else first_pass.error_code or repair_pass.error_code
+            ),
             explicit_empty=first_pass.explicit_empty,
             transformations=tuple(dict.fromkeys(transformations)),
             warnings=tuple(dict.fromkeys(warnings)),
@@ -3209,6 +3299,7 @@ def _parse_enrichment_wire_diagram(
     evidence_pack: EditorialEnrichmentEvidencePackV1,
     rejections: list[EditorialEnrichmentWireRejection],
     warnings: list[str],
+    transformations: list[str],
 ) -> DiagramProposalV1 | None:
     def reject(item: _EditorialEnrichmentWireBlock, code: str) -> None:
         rejections.append(_enrichment_wire_rejection(item, item.block_id, code, item.raw_lines))
@@ -3511,8 +3602,11 @@ def _parse_enrichment_wire_diagram(
     if diagram_requires_vertical_layout(len(nodes), layout_labels) and (
         direction is not EnrichmentDiagramDirection.TOP_TO_BOTTOM
     ):
-        reject(block, "editorial_enrichment_diagram_direction_requires_top_to_bottom")
-        return None
+        direction = EnrichmentDiagramDirection.TOP_TO_BOTTOM
+        transformation = "editorial_enrichment_diagram_direction_normalized"
+        if transformation not in transformations:
+            transformations.append(transformation)
+        warnings.append(f"{transformation}:{block.block_id}:left_to_right->top_to_bottom")
     if len(nodes) < 2 or not edges:
         reject(block, "editorial_enrichment_diagram_incomplete_after_rejections")
         return None
@@ -4219,7 +4313,8 @@ def editorial_enrichment_output_contract_example() -> str:
     """The text-block contract shown to the model; it is not a schema payload."""
     return (
         """Return independent plain-text blocks. Give every block a local id.
-Commence par identifier une question analytique pour chaque besoin.
+Détermine intérieurement une question analytique pour chaque besoin.
+Ne produis pas de bloc QUESTION.
 
 Pour chaque question analytique :
 1. Une figure de la publication source répond-elle déjà correctement
@@ -4270,7 +4365,7 @@ KIND: timeline
 TITLE: Domain registrations by actor
 CAPTION: Exact documented registration dates for observed actors.
 PURPOSE: When were the documented domains registered, and which actors show bursts?
-DATA: The exact dates, domain labels and actors stated in E014 and E021.
+DATA: Exact dates, domain labels and actor names reported in the cited entries.
 GAIN: A shared time axis makes bursts and differences between actors visible.
 SCOPE: Only registrations with exact dates in the cited evidence.
 PURPOSE_EVIDENCE: E014, E021
@@ -4297,7 +4392,7 @@ KEY: mechanism_comparison
 KIND: custom
 TITLE: Reported mechanism observations
 PURPOSE: Which reported mechanism details can be compared?
-DATA: Placeholder field names and values from E001 and E002.
+DATA: Placeholder field names and values from the two cited observations.
 GAIN: Adjacent cells expose differences that are easy to miss in prose.
 SCOPE: Only the two observations cited below.
 PURPOSE_EVIDENCE: E001, E002
@@ -4315,12 +4410,12 @@ LABEL: Observed detail
 END COLUMN
 ROW R001
 CELL: Mechanism A
-CELL: [verbatim placeholder detail from E001]
+CELL: [verbatim placeholder detail from the cited source]
 EVIDENCE: E001
 END ROW
 ROW R002
 CELL: Mechanism B
-CELL: [verbatim placeholder detail from E002]
+CELL: [verbatim placeholder detail from the cited source]
 EVIDENCE: E002
 END ROW
 END TABLE
@@ -4332,9 +4427,9 @@ PROFILE: FLOW
 TITLE: Résolution via une adresse Bitcoin
 CAPTION: Le malware extrait une destination C2 d'un champ OP_RETURN.
 PURPOSE: Comment une graine mène-t-elle à une destination ?
-DATA: Les deux étapes documentées dans E001.
+DATA: Les deux étapes documentées dans les preuves fournies.
 GAIN: Deux étapes courtes rendent le flux visible.
-SCOPE: Les deux étapes citées dans E001.
+SCOPE: Les deux étapes décrites dans le dossier de preuve fourni.
 PURPOSE_EVIDENCE: E001
 LIMITS: Le schéma ne montre que les étapes documentées.
 DIRECTION: top_to_bottom
@@ -4377,7 +4472,7 @@ Neutral intent examples (bracketed details are placeholders, not facts):
   flows; show an infrastructure timeline or annotated sequence only when the
   roles, dates, endpoints, and relations are documented in cited evidence.
 
-Do not use JSON, Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or
+Do not return JSON. Do not use Markdown tables, D2, Mermaid, code, HTML, SVG, Typst, or
 generated render syntax. Keep every chart point, table cell, diagram element,
 and figure label grounded in the supplied text and evidence handles.
 
@@ -4507,7 +4602,8 @@ def build_editorial_enrichment_model_request(
     prompt_payload = {
         "instructions": (
             "Tu es un arbitre de représentations éditoriales, pas un chercheur ni un renderer. "
-            "Commence par identifier une question analytique pour chaque besoin. Pour chaque "
+            "Détermine intérieurement une question analytique pour chaque besoin; ne produis pas "
+            "de bloc QUESTION. Pour chaque "
             "question analytique : 1. Une figure de la publication source répond-elle déjà "
             "correctement à la question ? OUI → FIGURE SOURCE. 2. Sinon, les informations "
             "sont-elles principalement temporelles ou quantitatives ? OUI → CHART. 3. Sinon, "
@@ -4542,7 +4638,10 @@ def build_editorial_enrichment_model_request(
             "diagramme sont valides lorsque la prose suffit. N'ajoute aucun fait, "
             "n'effectue aucune recherche pendant cet appel, et utilise uniquement les preuves "
             "fournies. Chaque point, ligne, nœud et arête cite des evidence handles existants et "
-            "pertinents. Une relation factuelle exige un handle dont le texte/contexte mentionne "
+            "pertinents; garde ces handles dans EVIDENCE ou PURPOSE_EVIDENCE, jamais dans les "
+            "champs de prose (TITLE, CAPTION, PURPOSE, DATA, GAIN, SCOPE, LIMITS, "
+            "PLACEMENT_REASON, labels ou cellules). Une relation factuelle exige un handle dont "
+            "le texte/contexte mentionne "
             "les deux endpoints et soutient le libellé de la relation. RELATION_TYPE est "
             "obligatoire : RELATION_TYPE: factual | inference | comparison, avec une seule "
             "valeur choisie. Une inférence doit être typée inference et citée par ses handles "
@@ -4577,9 +4676,9 @@ def build_editorial_enrichment_model_request(
             "x, y, SVG ou D2; le code local décide la forme et les couleurs. "
             "graphes : limite-toi à 8 nœuds; chaque nœud exprime une seule idée, avec "
             "6 mots et environ 40 caractères au maximum; un libellé d'arête a au plus 5 mots. "
-            "Choisis DIRECTION parmi left_to_right et top_to_bottom selon les seuils de "
-            "diagram_layout_budgets; ils s'appliquent aux libellés des nœuds, relations et "
-            "groupes. Choisis le rôle parmi actor, victim, malware_tool, "
+            "DIRECTION est une préférence de rendu parmi left_to_right et top_to_bottom; le "
+            "compilateur local applique sa disposition verticale lorsque ses budgets de mise en "
+            "page l'exigent. Choisis le rôle parmi actor, victim, malware_tool, "
             "infrastructure, data_artifact, technique_step et unknown. Utilise network_flow pour "
             "un flux de résolution, de données ou de paiement; infrastructure pour les hôtes, "
             "services et connexions; component_relationship pour les liens entre composants. "
@@ -4589,7 +4688,8 @@ def build_editorial_enrichment_model_request(
             "LINK_NOT_DEMONSTRATED; elles ne prouvent aucun lien. Conserve chaque commande, "
             "chemin, nom, date, adresse, hash et autre littéral exactement comme dans la preuve. "
             "Si aucune représentation n'améliore la compréhension, renvoie le marqueur explicite "
-            "prévu. Ne génère ni JSON, tableau Markdown, HTML, Mermaid, D2, DOT, TikZ, Typst, "
+            "prévu. Do not return JSON. Ne produis ni tableau Markdown, HTML, Mermaid, D2, DOT, "
+            "TikZ, Typst, "
             "SVG, image source, ni corps de règle. Les diagrammes décrivent seulement une "
             "spécification sémantique en blocs. Titres et captions restent descriptifs. Le "
             "catalogue figure_catalog contient des médias archivés : propose uniquement un "
@@ -4649,8 +4749,6 @@ def build_editorial_enrichment_model_request(
                 "maximum_node_words": 6,
                 "maximum_node_characters": 40,
                 "maximum_edge_label_words": 5,
-                "vertical_when_nodes_over": DIAGRAM_VERTICAL_AFTER_NODES,
-                "vertical_when_label_characters_over": DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS,
             },
             "placements": [item.value for item in EnrichmentPlacementKind],
             "section_indexes": [
@@ -4745,7 +4843,11 @@ def build_editorial_enrichment_repair_request(
     repair_run_id = uuid5(NAMESPACE_URL, f"production-editorial-enrichment-repair:{identity}")
     prompt_payload = {
         "instructions": (
-            "Repair only the rejected TABLE, CHART, DIAGRAM, or FIGURE blocks listed below. Return "
+            "Repair only the rejected TABLE, CHART, DIAGRAM, or FIGURE blocks listed below. "
+            "Do not return JSON; return only plain-text blocks. Keep evidence handles only in "
+            "EVIDENCE and PURPOSE_EVIDENCE fields, never in prose. Close every NODE with END NODE, "
+            "every RELATION with END RELATION, and every DIAGRAM with END DIAGRAM. Follow the "
+            "complete output example, including all block terminators. Return "
             "corrected replacements in the same plain-text block format and preserve each exact "
             "analytic question and all required purpose fields, including for FIGURE blocks. "
             "A TABLE is appropriate only when at least two objects have comparable fields, a "
@@ -5667,25 +5769,31 @@ class ProductionEditorialEnrichmentService:
             wire_details["warnings"] = list(parsed.warnings)
             wire_details["transformations"] = list(parsed.transformations)
 
-        target_kinds = {"TABLE", "CHART", "DIAGRAM", "FIGURE"}
-        initially_proposed_targets = tuple(
-            item for item in first_pass.accepted_blocks if item.kind in target_kinds
-        ) + tuple(item for item in first_pass.rejected_blocks if item.kind in target_kinds)
-        finally_accepted_targets = tuple(
-            item for item in parsed.accepted_blocks if item.kind in target_kinds
-        )
-        if initially_proposed_targets and not finally_accepted_targets:
-            return self._needs_review(
-                input_hash=input_hash,
-                model_run_id=model_run.id,
-                error_code=EditorialEnrichmentStageErrorCode.EMPTY_AFTER_REJECTIONS,
-                error_message=(
-                    "Every proposed table, chart, diagram, or figure was rejected after the "
-                    "repair attempt."
-                ),
-                details=wire_details,
-                model_calls=model_calls,
+        if (
+            parsed.proposal is None
+            and parsed.error_code == "editorial_enrichment_no_valid_blocks"
+            and parsed.rejections
+        ):
+            # A readable response whose individual proposals were rejected is a
+            # valid empty enrichment; retain every rejection for the artifact trace.
+            parsed = replace(
+                parsed,
+                proposal=EditorialEnrichmentProposalV1(),
+                error_code=None,
             )
+            wire_details.pop("wire_error_code", None)
+            wire_details["final_rejections"] = [
+                {
+                    "block_id": item.block_id,
+                    "reason_code": item.reason_code,
+                    "raw_sha256": item.raw_sha256,
+                    "scope_id": item.scope_id,
+                }
+                for item in parsed.rejections
+            ]
+            wire_details["warnings"] = list(parsed.warnings)
+            wire_details["transformations"] = list(parsed.transformations)
+
         if parsed.proposal is None:
             return self._needs_review(
                 input_hash=input_hash,
@@ -6176,7 +6284,7 @@ class ProductionEditorialEnrichmentService:
                 "transformations": list(repair_pass.transformations),
             }
         )
-        return (merged if repaired_identities else first_pass), details, model_calls
+        return merged, details, model_calls
 
     async def _verified_existing_execution(
         self, request: ModelRequest
@@ -6676,6 +6784,14 @@ class ProductionEditorialEnrichmentService:
         details: Mapping[str, Any] | None = None,
         model_calls: int = 1,
     ) -> ProductionEditorialEnrichmentExecution:
+        if error_code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID:
+            diagnostic_details = dict(details or {})
+            warnings = diagnostic_details.get("warnings", ())
+            if not isinstance(warnings, (list, tuple)):
+                warnings = ()
+            diagnostic = f"editorial_enrichment_output_invalid:{error_code.value}"
+            diagnostic_details["warnings"] = list(dict.fromkeys((*warnings, diagnostic)))
+            details = diagnostic_details
         return ProductionEditorialEnrichmentExecution(
             status=EditorialEnrichmentExecutionStatus.NEEDS_REVIEW,
             input_hash=input_hash,

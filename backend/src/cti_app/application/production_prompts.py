@@ -168,14 +168,14 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v17-editorial-tables"
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v18-editorial-tables"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
-    "editorial-enrichment-block-contract-v12-editorial-tables"
+    "editorial-enrichment-block-contract-v13-editorial-tables"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v12-editorial-tables"
-EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v5-editorial-tables"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v13-editorial-tables"
+EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v6-editorial-tables"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
-    "editorial-enrichment-repair-contract-v5-editorial-tables"
+    "editorial-enrichment-repair-contract-v6-editorial-tables"
 )
 SEMANTIC_ANNOTATION_PROMPT_VERSION = "semantic-annotation-document-lexicon-v2-no-title"
 SEMANTIC_ANNOTATION_CONTRACT_VERSION = "semantic-annotation-term-role-blocks-v2-no-title"
