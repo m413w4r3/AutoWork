@@ -1234,7 +1234,7 @@ def _technical_evidence_publication_case() -> tuple[dict[str, Any], PublicationD
         sections=(
             SynthesisSectionV1(
                 kind=SynthesisSectionKind.INFECTION_CHAIN,
-                heading="Internal anchor",
+                heading="Infrastructure C2",
                 paragraphs=(
                     SynthesisParagraphV1(
                         "Le domaine c2.example.com figure dans une règle YARA de détection.",
@@ -1261,7 +1261,7 @@ def test_synthesis_publication_preserves_technical_evidence_in_infection_chain()
 
     section = publication.sections[0]
     assert section.kind is PublicationSectionKind.INFECTION_CHAIN
-    assert section.heading == ""
+    assert section.heading == "Infrastructure C2"
     assert {ref.kind for ref in section.paragraphs[0].evidence_refs} == {
         PublicationEvidenceKind.INDICATOR,
         PublicationEvidenceKind.RULE,
@@ -1803,7 +1803,7 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
         )
 
 
-def test_publication_builder_removes_internal_headings_but_keeps_section_anchors() -> None:
+def test_publication_builder_preserves_optional_headings_and_section_anchors() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
     evidence = extraction_evidence_refs_v1(extraction)[0]
     synthesis = replace(
@@ -1812,7 +1812,7 @@ def test_publication_builder_removes_internal_headings_but_keeps_section_anchors
         sections=(
             SynthesisSectionV1(
                 SynthesisSectionKind.TECHNICAL,
-                "Internal technical title",
+                "Accès initial",
                 (SynthesisParagraphV1("Technical continuation.", (evidence,)),),
             ),
         ),
@@ -1829,9 +1829,41 @@ def test_publication_builder_removes_internal_headings_but_keeps_section_anchors
 
     assert len(document.sections) == 1
     assert document.sections[0].kind is PublicationSectionKind.TECHNICAL
-    assert document.sections[0].heading == ""
+    assert document.sections[0].heading == "Accès initial"
     assert document.lead[0].text == "Lead first paragraph."
     assert document.sections[0].paragraphs[0].text == "Technical continuation."
+
+    legacy_synthesis = replace(
+        synthesis,
+        sections=(replace(synthesis.sections[0], heading=""),),
+    )
+    legacy_enrichment = build_empty_editorial_enrichment(
+        extraction=extraction,
+        synthesis=legacy_synthesis,
+    )
+    headed_assembly_hash = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    legacy_assembly_hash = compute_assembly_input_hash(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=legacy_synthesis,
+        editorial_enrichment=legacy_enrichment,
+    )
+    assert headed_assembly_hash != legacy_assembly_hash
+    legacy_document = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=legacy_synthesis,
+        editorial_enrichment=legacy_enrichment,
+    )
+    assert legacy_document.sections[0].heading == ""
 
 
 def _frontmatter_v6_case():

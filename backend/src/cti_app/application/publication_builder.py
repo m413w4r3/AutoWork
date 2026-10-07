@@ -161,10 +161,7 @@ def _project_synthesis_publication(
     sections = tuple(
         PublicationSectionV1(
             kind=PublicationSectionKind(section.kind.value),
-            # Section kinds and positions remain useful as stable placement
-            # anchors, but internal synthesis headings are not publication
-            # content.
-            heading="",
+            heading=section.heading,
             paragraphs=tuple(paragraph(value) for value in section.paragraphs),
         )
         for section in synthesis.sections
@@ -398,7 +395,7 @@ def _validate_publication_lineage(
             )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "7-semantic-annotation-exact-occurrence-coverage"
+ASSEMBLY_POLICY_VERSION: Final[str] = "8-adaptive-synthesis-section-headings"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:

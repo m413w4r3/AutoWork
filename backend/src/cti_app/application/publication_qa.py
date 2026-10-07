@@ -16,7 +16,11 @@ from cti_app.domain.production_editorial_enrichment import EditorialEnrichmentV1
 from cti_app.domain.production_extraction import ProductionExtractionV1
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
 from cti_app.domain.production_relevance import RelevanceProjectionV1
-from cti_app.domain.production_synthesis import ProductionSynthesisV1, is_valid_editorial_title
+from cti_app.domain.production_synthesis import (
+    ProductionSynthesisV1,
+    is_valid_editorial_title,
+    validate_synthesis_section_headings,
+)
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV5,
@@ -251,11 +255,20 @@ def qa_publication_v5(
     if not checks["no_legacy_citation"]:
         errors.append("Publication contains a legacy source marker")
 
-    checks["no_internal_synthesis_headings"] = all(
-        not section.heading.strip() for section in publication.sections
-    )
-    if not checks["no_internal_synthesis_headings"]:
-        errors.append("Publication synthesis contains an internal section heading")
+    try:
+        validate_synthesis_section_headings(
+            (
+                section.heading,
+                (paragraph.text for paragraph in section.paragraphs),
+            )
+            for section in publication.sections
+        )
+    except ValueError:
+        checks["valid_synthesis_section_headings"] = False
+    else:
+        checks["valid_synthesis_section_headings"] = True
+    if not checks["valid_synthesis_section_headings"]:
+        errors.append("Publication synthesis contains an invalid section heading")
 
     checks["no_uncertainty_list"] = not publication.uncertainties
     if not checks["no_uncertainty_list"]:

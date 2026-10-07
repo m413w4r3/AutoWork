@@ -818,7 +818,7 @@ def test_proposal_resolves_exact_handles_to_canonical_evidence_refs():
     assert lead[0].text == "FooRAT was identified in the report."
     assert lead[0].evidence_refs == (pack.resolve_handle(handle),)
     assert sections[0].kind is SynthesisSectionKind.OVERVIEW
-    assert sections[0].heading == ""
+    assert sections[0].heading == "Overview"
     assert not hasattr(lead[0], "evidence_handles")
 
 
@@ -1051,11 +1051,13 @@ def test_output_invalid_carries_a_diagnosable_reason():
 def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
     assert SYNTHESIS_POLICY_VERSION == "production-synthesis-v7-source-domain-grounding"
     assert synthesis_module.SYNTHESIS_VALIDATOR_VERSION == (
-        "synthesis-validator-v5-source-domain-diagnostics"
+        "synthesis-validator-v6-grounded-section-headings"
     )
-    assert synthesis_module.SYNTHESIS_PROMPT_VERSION == "synthesis-draft-v10-actor-grounded-title"
+    assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
+        "synthesis-draft-v11-adaptive-section-headings"
+    )
     assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
-        "synthesis-text-parser-v4-claim-block-diagnostics"
+        "synthesis-text-parser-v6-heading-warning-recovery"
     )
 
 
@@ -1341,7 +1343,7 @@ def test_synthesis_proposal_preserves_an_attached_placeholder_in_claim_text() ->
     assert lead[0].text == claim_text
 
 
-def test_proposal_drops_model_section_heading_without_rejecting_claims():
+def test_proposal_preserves_cleaned_model_section_heading():
     subject_id, source_id = uuid4(), uuid4()
     extraction = make_extraction(
         subject_id,
@@ -1355,7 +1357,7 @@ def test_proposal_drops_model_section_heading_without_rejecting_claims():
         pack,
         extraction,
     )
-    assert sections[0].heading == ""
+    assert sections[0].heading == "Overview"
 
 
 def test_proposal_rejects_technical_literals_missing_from_extraction():
@@ -1871,7 +1873,8 @@ async def test_model_gateway_receives_synthesis_as_plain_text_without_schema():
     assert request.text.index("Attribution remains uncertain.") < request.text.index(
         "Scope remains unknown."
     )
-    assert "HEADING: a short" not in request.text
+    assert "optional `HEADING: <short descriptive title>`" in request.text
+    assert "force headings into a brief" in request.text
     assert "Return JSON" not in request.text
 
 
@@ -2714,9 +2717,7 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
     assert [(item.block_id, item.reason_code) for item in parsed.rejections] == [
         ("BROKEN", "synthesis_claim_missing_text")
     ]
-    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
-        ("S001", "synthesis_section_heading_dropped")
-    ]
+    assert parsed.warnings == ()
     assert parsed.transformations == ("bridge_ui_markers_removed",)
 
     world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
@@ -2740,7 +2741,7 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
         'L\'analyse cite aussi "FooRAT" comme élément du dossier.',
     ]
     assert len(synthesis.sections) == 1
-    assert synthesis.sections[0].heading == ""
+    assert synthesis.sections[0].heading == "Constat principal"
     assert synthesis.sections[0].paragraphs[0].evidence_refs == (
         world.pack.resolve_handle(world.handle),
     )
@@ -2753,7 +2754,7 @@ TEXT: Le texte associe "FooRAT" à cette campagne.
     assert normalized.lead[0].evidence_handles == (world.handle,)
 
 
-def test_wire_parser_accepts_headingless_sections_and_drops_present_heading_with_warning():
+def test_wire_parser_preserves_optional_section_headings():
     world = _fresh_setup()
 
     def wire(heading: str) -> str:
@@ -2772,15 +2773,151 @@ def test_wire_parser_accepts_headingless_sections_and_drops_present_heading_with
         )
 
     headingless = parse_synthesis_proposal_wire(wire(""))
-    headed = parse_synthesis_proposal_wire(wire("Internal heading"))
+    headed = parse_synthesis_proposal_wire(wire("  **Accès initial**  "))
 
     assert headingless.proposal is not None
     assert headingless.proposal.sections[0].heading == ""
     assert headingless.warnings == ()
     assert headed.proposal is not None
-    assert headed.proposal.sections[0].heading == ""
-    assert [(item.block_id, item.warning_code) for item in headed.warnings] == [
-        ("S001", "synthesis_section_heading_dropped")
+    assert headed.proposal.sections[0].heading == "Accès initial"
+    assert headed.warnings == ()
+
+
+@pytest.mark.parametrize(
+    ("heading", "warning_code"),
+    (
+        ("E001 Accès initial", "synthesis_section_heading_dropped_invalid"),
+        ("Campagne 2025", "synthesis_section_heading_dropped_invalid"),
+        ("Domaine evil.example", "synthesis_section_heading_dropped_invalid"),
+        ("Adresse 2001:db8::1", "synthesis_section_heading_dropped_invalid"),
+        ("Compte alice@example.net", "synthesis_section_heading_dropped_invalid"),
+        ("Pipeline interne", "synthesis_section_heading_dropped_invalid"),
+        ("Synthesis parser", "synthesis_section_heading_dropped_invalid"),
+        ("A" * 91, "synthesis_section_heading_dropped_invalid"),
+        (
+            "Infrastructure et protocole C2",
+            "synthesis_section_heading_dropped_invalid",
+        ),
+        ("", "synthesis_section_heading_dropped_empty"),
+    ),
+)
+def test_wire_parser_drops_invalid_section_headings_without_losing_claims(
+    heading: str, warning_code: str
+) -> None:
+    world = _fresh_setup()
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@SECTION technical S001@@\n"
+        f"HEADING: {heading}\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the technical section.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    assert len(parsed.proposal.sections) == 1
+    section = parsed.proposal.sections[0]
+    assert section.heading == ""
+    assert len(section.claims) == 1
+    assert section.claims[0].text == "FooRAT was identified in the technical section."
+    assert section.claims[0].evidence_handles == (world.handle,)
+    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
+        ("S001", warning_code)
+    ]
+
+
+def test_wire_parser_drops_duplicate_section_heading_and_preserves_both_claims() -> None:
+    world = _fresh_setup()
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@SECTION technical S001@@\n"
+        "HEADING: Persistance\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the technical section.\n"
+        "@@END SECTION@@\n"
+        "@@SECTION technical S002@@\n"
+        "HEADING: Persistance\n"
+        "@@CLAIM C002@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in another technical section.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert [section.heading for section in parsed.proposal.sections] == ["Persistance", ""]
+    assert [section.claims[0].text for section in parsed.proposal.sections] == [
+        "FooRAT was identified in the technical section.",
+        "FooRAT was identified in another technical section.",
+    ]
+    assert parsed.rejections == ()
+    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
+        ("S002", "synthesis_section_heading_dropped_duplicate")
+    ]
+
+
+def test_wire_parser_drops_mispositioned_section_heading_and_preserves_claim() -> None:
+    world = _fresh_setup()
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@SECTION technical S001@@\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the technical section.\n"
+        "HEADING: Accès initial\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    assert len(parsed.proposal.sections) == 1
+    section = parsed.proposal.sections[0]
+    assert section.heading == ""
+    assert [claim.text for claim in section.claims] == [
+        "FooRAT was identified in the technical section."
+    ]
+    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
+        ("S001", "synthesis_section_heading_dropped_mispositioned")
+    ]
+
+
+def test_wire_parser_drops_ambiguous_duplicate_heading_fields_but_keeps_claims() -> None:
+    world = _fresh_setup()
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@SECTION technical S001@@\n"
+        "HEADING: Accès initial\n"
+        "HEADING: Exécution\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {world.handle}\n"
+        "TEXT: FooRAT was identified in the technical section.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    assert len(parsed.proposal.sections) == 1
+    section = parsed.proposal.sections[0]
+    assert section.heading == ""
+    assert [claim.text for claim in section.claims] == [
+        "FooRAT was identified in the technical section."
+    ]
+    assert [(item.block_id, item.warning_code) for item in parsed.warnings] == [
+        ("S001", "synthesis_section_heading_dropped_duplicate")
     ]
 
 
@@ -2792,7 +2929,7 @@ async def test_synthesis_diagnostics_are_persisted_separately_from_body():
 EVIDENCE: {world.handle}
 TEXT: FooRAT was identified in the report.
 @@SECTION overview S001@@
-HEADING: Drafted title that must be dropped
+HEADING: E001 Activité examinée
 @@CLAIM BROKEN@@
 EVIDENCE: {world.handle}
 @@CLAIM C001@@
@@ -2814,12 +2951,20 @@ MISSING COVERAGE: the delivery chain is absent from the supplied extraction
         {"block_id": "BROKEN", "reason_code": "synthesis_claim_missing_text"}
     ]
     assert result.details["diagnostics"]["parse_warnings"] == [
-        {"block_id": "S001", "warning_code": "synthesis_section_heading_dropped"}
+        {
+            "block_id": "S001",
+            "warning_code": "synthesis_section_heading_dropped_invalid",
+        }
     ]
+    warning_transformation = "synthesis_wire_warning:synthesis_section_heading_dropped_invalid"
+    assert warning_transformation in world.gateway.diagnostics[0]["transformations"]
     synthesis = world.writer.calls[0]["synthesis"]
     assert isinstance(synthesis, ProductionSynthesisV1)
     body = render_synthesis_markdown(synthesis, world.extraction)
-    assert "Drafted title that must be dropped" not in body
+    assert synthesis.sections[0].heading == ""
+    assert [paragraph.text for paragraph in synthesis.sections[0].paragraphs] == [
+        "FooRAT was also examined technically."
+    ]
     assert "delivery chain is absent" not in body
     assert "synthesis_section_heading_dropped" not in body
     assert "Attribution remains uncertain." not in body

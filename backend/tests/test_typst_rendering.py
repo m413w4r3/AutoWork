@@ -236,7 +236,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == ("typst-publication-model-v16-semantic-annotation-coverage")
+    assert data["schema_version"] == ("typst-publication-model-v17-synthesis-section-headings")
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -425,27 +425,47 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
         {"type": "paragraph", "text": _INJECTION_TEXT},
         {"type": "paragraph", "text": "Second lead paragraph"},
     ]
-    assert synthesis["blocks"][2] == {"type": "paragraph", "text": "Section body"}
-    assert all(
-        block["type"] != "section_heading"
-        for section in data["content_sections"]
-        for block in section.get("blocks", [])
-    )
+    assert synthesis["blocks"][2] == {"type": "section_heading", "text": _INJECTION_TEXT}
+    assert synthesis["blocks"][3] == {"type": "paragraph", "text": "Section body"}
     assert "—été".encode() in renderer.render(document, bundle).render_data_bytes
 
 
-def test_internal_section_heading_is_not_projected(tmp_path: Path) -> None:
+def test_synthesis_section_heading_is_projected_before_its_paragraph(tmp_path: Path) -> None:
     renderer, bundle = _renderer(tmp_path)
     document = _full_document()
     document = replace(
         document,
-        sections=(replace(document.sections[0], heading="Internal title"),),
+        sections=(
+            replace(document.sections[0], heading="Accès initial"),
+            replace(
+                document.sections[0],
+                heading="Persistance",
+                paragraphs=(
+                    replace(document.sections[0].paragraphs[0], text="A task is created."),
+                ),
+            ),
+        ),
     )
 
     data = json.loads(renderer.render(document, bundle).render_data_bytes)
 
     synthesis = data["content_sections"][1]
-    assert {"type": "paragraph", "text": "Section body"} in synthesis["blocks"]
+    assert synthesis["blocks"][2:] == [
+        {"type": "section_heading", "text": "Accès initial"},
+        {"type": "paragraph", "text": "Section body"},
+        {"type": "section_heading", "text": "Persistance"},
+        {"type": "paragraph", "text": "A task is created."},
+    ]
+
+
+def test_brief_without_synthesis_sections_has_no_section_headings(tmp_path: Path) -> None:
+    renderer, bundle = _renderer(tmp_path)
+    document = replace(_full_document(), sections=())
+
+    data = json.loads(renderer.render(document, bundle).render_data_bytes)
+    synthesis = data["content_sections"][1]
+
+    assert synthesis["blocks"]
     assert all(block["type"] != "section_heading" for block in synthesis["blocks"])
 
 
@@ -496,7 +516,7 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == ("typst-publication-model-v16-semantic-annotation-coverage")
+    assert data["schema_version"] == ("typst-publication-model-v17-synthesis-section-headings")
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
@@ -742,7 +762,7 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     }
     observed_after_timeline = [block["key"] for block in reference_blocks]
     observed_after_lead = [block["key"] for block in blocks[2:8]]
-    section_rich_start = 9
+    section_rich_start = 10
     observed_after_section = [
         block["key"] for block in blocks[section_rich_start : section_rich_start + 6]
     ]

@@ -38,7 +38,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v16-semantic-annotation-coverage"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v17-synthesis-section-headings"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -418,7 +418,7 @@ def project_publication_to_typst_model(
     body_blocks.extend(rich_by_placement.get((EnrichmentPlacementKind.AFTER_LEAD, None), ()))
     lead_fingerprints = {" ".join(item.text.casefold().split()) for item in document.lead}
     for section_index, section in enumerate(document.sections):
-        body_blocks.extend(
+        paragraph_blocks = [
             {
                 "type": "paragraph",
                 "text": paragraph.text,
@@ -436,7 +436,10 @@ def project_publication_to_typst_model(
             }
             for paragraph_index, paragraph in enumerate(section.paragraphs, start=1)
             if " ".join(paragraph.text.casefold().split()) not in lead_fingerprints
-        )
+        ]
+        if section.heading and paragraph_blocks:
+            body_blocks.append({"type": "section_heading", "text": section.heading})
+        body_blocks.extend(paragraph_blocks)
         body_blocks.extend(
             rich_by_placement.get((EnrichmentPlacementKind.AFTER_SECTION, section_index), ())
         )

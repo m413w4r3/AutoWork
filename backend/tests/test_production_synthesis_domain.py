@@ -105,6 +105,47 @@ def test_production_synthesis_round_trip_and_deterministic_collections() -> None
     assert production_synthesis_to_json(synthesis) == production_synthesis_to_json(synthesis)
 
 
+def test_legacy_synthesis_without_heading_field_remains_readable() -> None:
+    payload = production_synthesis_to_json(_synthesis())
+    payload["sections"][0].pop("heading")
+
+    legacy = production_synthesis_from_json(payload)
+
+    assert legacy.sections[0].heading == ""
+    assert production_synthesis_to_json(legacy)["sections"][0]["heading"] == ""
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "E001 Accès initial",
+        "Infrastructure et protocole C2",
+        "Pipeline interne",
+        "A" * 91,
+    ),
+)
+def test_synthesis_section_rejects_invalid_headings(heading: str) -> None:
+    with pytest.raises(ValueError):
+        SynthesisSectionV1(
+            SynthesisSectionKind.TECHNICAL,
+            heading,
+            (SynthesisParagraphV1("The activity affected several systems.", (_ref(),)),),
+        )
+
+
+def test_stored_synthesis_with_duplicate_headings_is_rejected() -> None:
+    payload = production_synthesis_to_json(_synthesis())
+    payload["sections"].append(
+        {
+            **payload["sections"][0],
+            "heading": "overview",
+        }
+    )
+
+    with pytest.raises(ValueError, match="must not be duplicated"):
+        production_synthesis_from_json(payload)
+
+
 def test_evidence_refs_and_timeline_are_normalized_deterministically() -> None:
     first = _ref(key=_HASH_A)
     second = _ref(key=_HASH_B)
@@ -156,7 +197,7 @@ def test_section_kinds_round_trip_indicator_and_rule_evidence(
         sections=(
             SynthesisSectionV1(
                 section_kind,
-                "Internal anchor",
+                "Accès initial",
                 (SynthesisParagraphV1("A technical claim.", (indicator_ref, rule_ref)),),
             ),
         ),

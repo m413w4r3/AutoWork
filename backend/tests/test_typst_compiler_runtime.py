@@ -208,7 +208,7 @@ def _runtime_render_data() -> dict[str, Any]:
         ["Domaine", "cdn.example.test"],
     ]
     return {
-        "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
+        "schema_version": "typst-publication-model-v17-synthesis-section-headings",
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
         "content_sections": [
@@ -484,7 +484,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tu
 
     return (
         {
-            "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
+            "schema_version": "typst-publication-model-v17-synthesis-section-headings",
             "language": "fr",
             "title": "[LOT 6] Fixture de composition A4",
             "content_sections": [
@@ -704,7 +704,7 @@ async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
     media_type: str,
 ) -> None:
     render_data = {
-        "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
+        "schema_version": "typst-publication-model-v17-synthesis-section-headings",
         "language": "fr",
         "title": "Tall diagram layout regression",
         "content_sections": [

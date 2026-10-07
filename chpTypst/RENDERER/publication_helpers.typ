@@ -139,7 +139,9 @@
 }
 
 #let render-body-block(item) = {
-  if item.type == "paragraph" {
+  if item.type == "section_heading" {
+    heading(level: 3)[#item.text]
+  } else if item.type == "paragraph" {
     [#semantic-or-plain(item.text, item.at("semantic_spans", default: none)) #parbreak()]
   } else if item.type == "table" {
     render-table(item)

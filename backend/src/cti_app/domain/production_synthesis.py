@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
@@ -26,6 +26,92 @@ SYNTHESIS_POLICY_VERSION = "production-synthesis-v7-source-domain-grounding"
 
 EDITORIAL_TITLE_MAX_LENGTH = 110
 EDITORIAL_TITLE_PATTERN = re.compile(r"\[(?P<group>[^\[\]\r\n]+)\] (?P<title>[^\[\]\r\n]+)")
+SYNTHESIS_SECTION_HEADING_MAX_LENGTH = 90
+_SECTION_HEADING_HANDLE = re.compile(r"(?<!\w)[ER]\d{3,}(?!\w)", re.IGNORECASE)
+_SECTION_HEADING_INTERNAL_JARGON = re.compile(
+    r"(?<!\w)(?:backend|evidence\s+pack|evidence\s+handles?|"
+    r"handles?\s+d['\u2019]?\s*evidence|pack\s+de\s+preuves|"
+    r"wire\s+format|parser(?:\s+output)?|prompt\s+(?:version|contract)|validator|"
+    r"model\s+run|relevance\s+projection|production\s+(?:run|artifact|stage)|"
+    r"synthesis\s+(?:artifact|stage)|editorial\s+enrichment|enrichment\s+(?:artifact|stage)|"
+    r"extraction\s+(?:artifact|stage)|publication\s+(?:builder|assembly)|assembly\s+policy|"
+    r"diagnostic\s+code|internal\s+pipeline|pipeline(?:\s+interne)?|"
+    r"internal\s+stage|étape\s+interne|étape\s+(?:de\s+)?(?:production|extraction|synthèse|"
+    r"enrichissement|publication|assemblage)|schéma\s+de\s+sortie)(?!\w)",
+    re.IGNORECASE,
+)
+_SECTION_HEADING_NUMBERED_FACT = re.compile(
+    r"(?<![\w])(?:[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*|"
+    r"\d+(?:[.,]\d+)*(?:[-/]\d+(?:[.,]\d+)*)*)(?![\w])"
+)
+_SECTION_HEADING_IOC = re.compile(
+    r"https?://[^\s,;()\[\]]+|"
+    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}|"
+    r"(?<![\w:])(?:[0-9a-f]{0,4}:){2,7}[0-9a-f]{0,4}(?![\w:])|"
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])|"
+    r"\b[a-f0-9]{32,64}\b|\bCVE-\d{4}-\d{4,}\b|"
+    r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,63}\b",
+    re.IGNORECASE,
+)
+
+
+def validate_synthesis_section_heading(
+    heading: str,
+    claim_texts: Iterable[str] = (),
+) -> str:
+    """Normalize and validate an optional section label against its claims.
+
+    Headings are editorial labels. Deterministic checks reject internal handles,
+    pipeline vocabulary, and any number or IOC literal that the section's own
+    claims do not contain.
+    """
+    if not isinstance(heading, str):
+        raise ValueError("Synthesis section heading must be text")
+    normalized = " ".join(unicodedata.normalize("NFKC", heading).split())
+    normalized = re.sub(r"^#{1,6}\s*", "", normalized)
+    if len(normalized) >= 4 and normalized.startswith("**") and normalized.endswith("**"):
+        normalized = normalized[2:-2].strip()
+    if len(normalized) >= 2 and normalized.startswith("`") and normalized.endswith("`"):
+        normalized = normalized[1:-1].strip()
+    normalized = " ".join(normalized.split())
+    if not normalized:
+        return ""
+    if len(normalized) > SYNTHESIS_SECTION_HEADING_MAX_LENGTH:
+        raise ValueError("Synthesis section heading exceeds its length limit")
+    if _SECTION_HEADING_HANDLE.search(normalized):
+        raise ValueError("Synthesis section heading contains an evidence handle")
+    if _SECTION_HEADING_INTERNAL_JARGON.search(normalized):
+        raise ValueError("Synthesis section heading contains internal pipeline vocabulary")
+
+    claims = tuple(claim_texts)
+    if any(not isinstance(text, str) for text in claims):
+        raise ValueError("Synthesis section claims must be text")
+    folded_claims = tuple(unicodedata.normalize("NFKC", text).casefold() for text in claims)
+    facts = {
+        match.group(0).casefold()
+        for pattern in (_SECTION_HEADING_NUMBERED_FACT, _SECTION_HEADING_IOC)
+        for match in pattern.finditer(normalized)
+    }
+    if any(not any(fact in text for text in folded_claims) for fact in facts):
+        raise ValueError("Synthesis section heading contains a fact absent from its claims")
+    return normalized
+
+
+def validate_synthesis_section_headings(
+    sections: Iterable[tuple[str, Iterable[str]]],
+) -> None:
+    """Validate every optional heading and reject case-insensitive duplicates."""
+    seen: set[str] = set()
+    for heading, claim_texts in sections:
+        normalized = validate_synthesis_section_heading(heading, claim_texts)
+        if not normalized:
+            continue
+        duplicate_key = unicodedata.normalize("NFKC", normalized).casefold()
+        if duplicate_key in seen:
+            raise ValueError("Synthesis section headings must not be duplicated")
+        seen.add(duplicate_key)
+
+
 # Names of real HTML and SVG elements are never treated as placeholders.
 _HTML_SVG_ELEMENTS = frozenset(
     """
@@ -187,12 +273,18 @@ class SynthesisSectionV1:
     def __post_init__(self) -> None:
         if not isinstance(self.kind, SynthesisSectionKind):
             raise ValueError("Synthesis section kind is invalid")
-        if not isinstance(self.heading, str):
-            raise ValueError("Synthesis section heading must be text")
         if not isinstance(self.paragraphs, tuple) or not self.paragraphs:
             raise ValueError("Synthesis section paragraphs must be a non-empty tuple")
         if any(not isinstance(paragraph, SynthesisParagraphV1) for paragraph in self.paragraphs):
             raise ValueError("Synthesis section paragraphs have an invalid type")
+        object.__setattr__(
+            self,
+            "heading",
+            validate_synthesis_section_heading(
+                self.heading,
+                (paragraph.text for paragraph in self.paragraphs),
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -503,6 +595,13 @@ class ProductionSynthesisV1:
                 not isinstance(value, item_type) for value in values
             ):
                 raise ValueError(f"Production synthesis {field_name} have an invalid type")
+        validate_synthesis_section_headings(
+            (
+                section.heading,
+                (paragraph.text for paragraph in section.paragraphs),
+            )
+            for section in self.sections
+        )
         if not isinstance(self.warnings, tuple) or any(
             not isinstance(warning, str) or not warning.strip() for warning in self.warnings
         ):
@@ -711,6 +810,7 @@ _SYNTHESIS_KEYS = frozenset(
 _REF_KEYS = frozenset({"source_document_id", "kind", "evidence_key"})
 _PARAGRAPH_KEYS = frozenset({"text", "evidence_refs"})
 _SECTION_KEYS = frozenset({"kind", "heading", "paragraphs"})
+_LEGACY_SECTION_KEYS = frozenset({"kind", "paragraphs"})
 _TIMELINE_KEYS = frozenset({"event_date", "date_text", "text", "evidence_refs"})
 _SOURCE_NOTE_KEYS = frozenset({"source_document_id", "text", "evidence_refs"})
 _UNCERTAINTY_KEYS = frozenset({"text", "source_document_ids"})
@@ -783,7 +883,12 @@ def _paragraph_from_json(raw: Any) -> SynthesisParagraphV1:
 
 
 def _section_from_json(raw: Any) -> SynthesisSectionV1:
-    payload = _object(raw, _SECTION_KEYS, "Synthesis section")
+    if not isinstance(raw, Mapping) or frozenset(raw) not in {
+        _SECTION_KEYS,
+        _LEGACY_SECTION_KEYS,
+    }:
+        raise ValueError("Synthesis section has missing or extra fields")
+    payload = raw
     try:
         kind = SynthesisSectionKind(_text(payload["kind"], "Section kind"))
     except ValueError as exc:
@@ -793,7 +898,7 @@ def _section_from_json(raw: Any) -> SynthesisSectionV1:
     )
     return SynthesisSectionV1(
         kind=kind,
-        heading=_text(payload["heading"], "Section heading"),
+        heading=_text(payload.get("heading", ""), "Section heading"),
         paragraphs=paragraphs,
     )
 

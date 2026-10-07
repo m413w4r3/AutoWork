@@ -42,7 +42,7 @@ from cti_app.application.production_artifact_store import (
 )
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
-    SYNTHESIS_EDITORIAL_CONTRACT_V4,
+    SYNTHESIS_EDITORIAL_CONTRACT_V5,
     SYNTHESIS_PROMPT_VERSION,
     SYNTHESIS_PROPOSAL_CONTRACT_VERSION,
     SYNTHESIS_WIRE_PARSER_VERSION,
@@ -106,6 +106,8 @@ from cti_app.domain.production_synthesis import (
     technical_literal_markup_exception_spans,
     timeline_sort_key,
     validate_synthesis_lineage,
+    validate_synthesis_section_heading,
+    validate_synthesis_section_headings,
 )
 
 if TYPE_CHECKING:
@@ -116,7 +118,7 @@ SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v9-source-publ
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v5-source-domain-diagnostics"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v6-grounded-section-headings"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
@@ -168,6 +170,11 @@ class SynthesisSectionProposalV1(_StrictProposalModel):
     kind: SynthesisSectionKind
     heading: StrictStr = ""
     claims: tuple[SynthesisClaimProposalV1, ...]
+
+    @field_validator("heading")
+    @classmethod
+    def _valid_heading_text(cls, value: str) -> str:
+        return validate_synthesis_section_heading(value)
 
     @field_validator("claims")
     @classmethod
@@ -237,6 +244,8 @@ class _WireSection:
     block_id: str
     kind: SynthesisSectionKind | None
     heading_present: bool = False
+    heading: str = ""
+    heading_warning_code: str | None = None
     claims: list[SynthesisClaimProposalV1] = field(default_factory=list)
     raw_lines: list[str] = field(default_factory=list)
     error_code: str | None = None
@@ -346,6 +355,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
     recognized = False
     sequence = 0
     seen_ids: set[str] = set()
+    seen_headings: set[str] = set()
 
     def reject(block_id: str, code: str, raw_lines: Iterable[str]) -> None:
         rejected.append(_wire_rejection(block_id, code, raw_lines))
@@ -393,24 +403,39 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         if section.error_code is not None:
             reject(section.block_id, section.error_code, section.raw_lines)
             return
-        if section.heading_present:
-            warnings.append(
-                SynthesisWireWarning(
-                    block_id=section.block_id,
-                    warning_code="synthesis_section_heading_dropped",
-                )
-            )
         if not section.claims:
             reject(section.block_id, "synthesis_section_missing_valid_claims", section.raw_lines)
             return
+        heading = ""
+        heading_warning_code = section.heading_warning_code
+        if heading_warning_code is None and section.heading_present:
+            if not section.heading.strip():
+                heading_warning_code = "synthesis_section_heading_dropped_empty"
+            else:
+                try:
+                    heading = validate_synthesis_section_heading(
+                        section.heading,
+                        (claim.text for claim in section.claims),
+                    )
+                except ValueError:
+                    heading_warning_code = "synthesis_section_heading_dropped_invalid"
+        duplicate_key = heading.casefold()
+        if heading and duplicate_key in seen_headings:
+            heading = ""
+            heading_warning_code = "synthesis_section_heading_dropped_duplicate"
+        if heading_warning_code is not None:
+            heading = ""
+            warnings.append(SynthesisWireWarning(section.block_id, heading_warning_code))
         try:
             sections.append(
                 SynthesisSectionProposalV1(
                     kind=section.kind,
-                    heading="",
+                    heading=heading,
                     claims=tuple(section.claims),
                 )
             )
+            if heading:
+                seen_headings.add(duplicate_key)
         except ValueError:
             reject(section.block_id, "synthesis_section_schema_invalid", section.raw_lines)
 
@@ -651,6 +676,24 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                     current_source_note.error_code = "synthesis_source_note_unknown_field"
                 recognized = True
                 continue
+            if current_section is not None and field_name == "heading":
+                current_section.raw_lines.append(raw_line)
+                if current_section.heading_present:
+                    current_section.heading = ""
+                    current_section.heading_warning_code = (
+                        "synthesis_section_heading_dropped_duplicate"
+                    )
+                elif current_claim is not None or current_section.claims:
+                    current_section.heading_present = True
+                    current_section.heading = ""
+                    current_section.heading_warning_code = (
+                        "synthesis_section_heading_dropped_mispositioned"
+                    )
+                else:
+                    current_section.heading_present = True
+                    current_section.heading = value
+                recognized = True
+                continue
             if current_claim is not None:
                 current_claim.raw_lines.append(raw_line)
                 if field_name.startswith("evidence") or field_name == "handles":
@@ -668,11 +711,6 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
                         current_claim.text_lines.append(value)
                 else:
                     current_claim.error_code = "synthesis_claim_unknown_field"
-                recognized = True
-                continue
-            if current_section is not None and field_name == "heading":
-                current_section.raw_lines.append(raw_line)
-                current_section.heading_present = True
                 recognized = True
                 continue
             if current_group == "diagnostics":
@@ -1714,7 +1752,7 @@ def build_synthesis_model_request(
         f"Actor or campaign: {snapshot.actor_or_campaign}",
         f"Period: {snapshot.period_start.isoformat()} to {snapshot.period_end.isoformat()}",
         "",
-        *SYNTHESIS_EDITORIAL_CONTRACT_V4.strip().splitlines(),
+        *SYNTHESIS_EDITORIAL_CONTRACT_V5.strip().splitlines(),
         f"Allowed section kinds: {', '.join(kind.value for kind in SynthesisSectionKind)}",
         "If no narrative claim can be supported, return only @@EMPTY@@.",
         "",
@@ -2344,6 +2382,18 @@ def validate_synthesis_proposal(
             convert_claim(claim, section_kind="lead", allow_technical=False)
             for claim in parsed.lead
         )
+        try:
+            validate_synthesis_section_headings(
+                (
+                    section.heading,
+                    (claim.text for claim in section.claims),
+                )
+                for section in parsed.sections
+            )
+        except ValueError as exc:
+            _invalid_proposal("synthesis_section_heading_invalid")
+            raise AssertionError("unreachable") from exc
+
         sections: list[SynthesisSectionV1] = []
         for section in parsed.sections:
             paragraphs = tuple(
@@ -2357,7 +2407,7 @@ def validate_synthesis_proposal(
             sections.append(
                 SynthesisSectionV1(
                     kind=section.kind,
-                    heading="",
+                    heading=section.heading,
                     paragraphs=paragraphs,
                 )
             )
@@ -3605,7 +3655,7 @@ class ProductionSynthesisService:
             )
         transformations = [
             *parsed.transformations,
-            *(("synthesis_section_heading_dropped",) if parsed.warnings else ()),
+            *(f"synthesis_wire_warning:{item.warning_code}" for item in parsed.warnings),
             *(("synthesis_missing_coverage_diagnostics",) if parsed.diagnostics else ()),
             f"synthesis_parser:{SYNTHESIS_WIRE_PARSER_VERSION}",
             f"synthesis_contract:{SYNTHESIS_PROPOSAL_CONTRACT_VERSION}",

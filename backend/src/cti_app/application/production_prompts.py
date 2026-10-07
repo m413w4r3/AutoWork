@@ -16,11 +16,11 @@ REFERENCES_PROMPT_VERSION = "10"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v10-actor-grounded-title"
-SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v3-title-source-notes"
-SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v4-claim-block-diagnostics"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v11-adaptive-section-headings"
+SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
+SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v6-heading-warning-recovery"
 
-SYNTHESIS_EDITORIAL_CONTRACT_V4 = """EDITORIAL CONTRACT
+SYNTHESIS_EDITORIAL_CONTRACT_V5 = """EDITORIAL CONTRACT
 
 Write dense, coherent CTI prose in the publication language. For French
 publications, write in French except for source names, quotations and exact
@@ -54,7 +54,14 @@ progression, combining related observations into substantial paragraphs:
    prose, stating the confidence level and its basis where supported, informed
    by the projected, ranked uncertainty observations below.
 
-Do not write section titles, subtitles, lists of uncertainties, or filler.
+Section titles are optional. For a substantial synthesis, use short,
+case-specific headings when distinct themes need clear separation. Do not use a
+fixed taxonomy or force headings into a brief; do not title a section made of
+one short paragraph. A heading describes the claims in its own section and may
+not add a name, number, indicator, or other fact absent from those claims. Keep
+headings concise and free of internal production vocabulary or evidence
+handles. Do not add prose to explain or justify the structure.
+
 Section kinds are internal placement anchors only. A paragraph may cite several
 evidence handles when they all support its full account. Keep lineage fine
 grained: cite every supporting handle and no unrelated handle. State the
@@ -153,8 +160,12 @@ signal établit le comportement observé, pas l'identité de l'opérateur.
 
 OUTPUT FORMAT
 Use only the text-block wire format below. Do not return JSON. Do not write any
-text outside these blocks. Do not emit a HEADING field. Sections and source
-notes are optional; section kinds are only stable internal placement anchors.
+text outside these blocks. Sections and source notes are optional; section
+kinds are only stable internal placement anchors. A section may include one
+optional `HEADING: <short descriptive title>` field immediately after its
+header and before its first claim. Omit the field when the content does not
+need a title. Never put evidence handles, unsupported numbers or indicators, or
+internal production vocabulary in a heading.
 
 @@TITLE@@
 [Groupe] Titre
@@ -167,6 +178,7 @@ EVIDENCE: E001, E002
 TEXT: one plain-text synthesis paragraph in the publication language
 
 @@SECTION technical S001@@
+HEADING: A short title that describes this section's supported content
 @@CLAIM C001@@
 EVIDENCE: E003
 TEXT: one plain-text synthesis paragraph in the publication language

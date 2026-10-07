@@ -54,12 +54,14 @@ from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
     build_editorial_enrichment_model_request,
     build_editorial_figure_catalog,
+    canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
     compute_editorial_enrichment_invocation_hash,
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_model_run_id,
     editorial_enrichment_output_contract_example,
     parse_editorial_enrichment_proposal_wire,
+    semantic_annotation_anchor_texts,
     validate_editorial_enrichment_proposal,
 )
 from cti_app.application.production_enrichment_revision import (
@@ -447,6 +449,34 @@ def test_evidence_pack_is_stable_private_and_resolves_exact_refs() -> None:
     assert first.resolve_handle("E001") == extraction_evidence_refs_v1(extraction)[0]
     assert "source_document_id" not in json.dumps([dict(item) for item in first.narrative_evidence])
     assert all("body" not in record for record in first.technical_evidence)
+
+
+def test_headings_invalidate_enrichment_lineage_without_changing_paragraph_anchors() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    base = _synthesis(extraction)
+    headingless = replace(
+        base,
+        sections=(replace(base.sections[0], heading=""),),
+    )
+    headed = replace(
+        headingless,
+        sections=(replace(headingless.sections[0], heading="Accès initial"),),
+    )
+
+    legacy_pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, headingless)
+    headed_pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, headed)
+
+    assert canonical_synthesis_hash(headingless) != canonical_synthesis_hash(headed)
+    assert editorial_enrichment_evidence_pack_hash(legacy_pack) != (
+        editorial_enrichment_evidence_pack_hash(headed_pack)
+    )
+    assert semantic_annotation_anchor_texts(headingless) == semantic_annotation_anchor_texts(headed)
+    legacy_section = legacy_pack.current_synthesis["sections"][0]
+    headed_section = headed_pack.current_synthesis["sections"][0]
+    assert legacy_section["paragraphs"] == headed_section["paragraphs"]
+    assert legacy_section["heading"] == ""
+    assert headed_section["heading"] == "Accès initial"
 
 
 def test_source_pair_relation_uncertainty_from_non_full_source_gets_reserve_handle() -> None:

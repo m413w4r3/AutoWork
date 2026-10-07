@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v14-table-pagination",
+  "template_version": "chp-article-v15-synthesis-section-headings",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

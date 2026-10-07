@@ -155,7 +155,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == ("typst-edition-model-v16-semantic-annotation-coverage")
+    assert data["schema_version"] == ("typst-edition-model-v17-synthesis-section-headings")
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -257,7 +257,11 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     assert publication["title"] == "Intrusion report"
     assert references["timeline"][0]["text"] == "No display date"
     assert synthesis["blocks"][0]["text"] == _INJECTION_TEXT
-    assert "section_heading" not in body_types
+    assert "section_heading" in body_types
+    assert any(
+        block["type"] == "section_heading" and block["text"] == _INJECTION_TEXT
+        for block in synthesis["blocks"]
+    )
     assert "table" in body_types
     assert "diagram" in body_types
     assert "figure" in body_types
@@ -538,7 +542,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v13-table-pagination"
+    assert bundle.template_version == "chp-edition-v14-synthesis-section-headings"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

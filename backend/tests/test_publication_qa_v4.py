@@ -110,6 +110,7 @@ def test_qa_accepts_technical_evidence_in_infection_chain_section() -> None:
     result = qa_publication_v4(publication=publication, **inputs)
 
     assert result["passed"] is True
+    assert result["checks"]["valid_synthesis_section_headings"] is True
 
 
 def test_v5_qa_excludes_other_case_iocs_from_publication() -> None:
@@ -215,13 +216,13 @@ def test_publication_format_checks_reject_headings_uncertainties_language_and_di
         sections=(
             PublicationSectionV1(
                 PublicationSectionKind.TECHNICAL,
-                "Internal technical heading",
+                "Evidence pack output",
                 (publication.lead[0],),
             ),
         ),
     )
     result = _assert_failed(inputs, headed)
-    assert result["checks"]["no_internal_synthesis_headings"] is False
+    assert result["checks"]["valid_synthesis_section_headings"] is False
 
     uncertain = replace(
         publication,

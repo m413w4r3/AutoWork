@@ -322,11 +322,31 @@ def chp_parity_document() -> PublicationDocumentV4:
         sections=(
             replace(
                 document.sections[0],
-                heading="synthesis_internal_heading",
+                heading="Accès initial",
                 paragraphs=(
                     replace(
                         document.sections[0].paragraphs[0],
                         text="Section paragraph describing the observed activity.",
+                    ),
+                ),
+            ),
+            replace(
+                document.sections[0],
+                heading="Persistance",
+                paragraphs=(
+                    replace(
+                        document.sections[0].paragraphs[0],
+                        text="The activity maintains access through a documented task.",
+                    ),
+                ),
+            ),
+            replace(
+                document.sections[0],
+                heading="Détection",
+                paragraphs=(
+                    replace(
+                        document.sections[0].paragraphs[0],
+                        text="The report identifies the process relationship as observable.",
                     ),
                 ),
             ),
@@ -878,6 +898,9 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "One source event",
         "Several source event",
         "SYNTHÈSE",
+        "Accès initial",
+        "Persistance",
+        "Détection",
         "Synthesis lead paragraph for parity coverage.",
         "A second lead paragraph.",
         "Observed command table",
@@ -909,6 +932,41 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     ):
         assert internal_detail not in text
     assert "synthesis_internal_heading" not in text
+
+    brief_document = replace(
+        chp_parity_document,
+        title="GTG-30004 brief",
+        lead=(
+            replace(
+                chp_parity_document.lead[0],
+                text="Le rapport décrit brièvement une activité documentée.",
+            ),
+        ),
+        sections=(),
+        timeline=(),
+        indicators=(),
+        tables=(),
+        diagrams=(),
+        figures=(),
+    )
+    brief_render_source = TypstRenderer().render(brief_document, template_bundle)
+    brief_workspace_root = tmp_path / "brief-workspace"
+    _build_workspace(
+        brief_workspace_root,
+        bundle_files=template_bundle.files,
+        render_data_bytes=brief_render_source.render_data_bytes,
+        media_refs=brief_render_source.media_refs,
+    )
+    brief_request = TypstCompileRequest(
+        workspace_root=brief_workspace_root,
+        entrypoint_relative_path="RENDERER/publication.typ",
+        font_paths=materialize_font_bundle(font_snapshot, font_root),
+    )
+    brief_compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(brief_request)
+    brief_text, _ = _normalized_pdf_text(PdfReader(BytesIO(brief_compiled.content), strict=True))
+    assert "GTG-30004 brief" in brief_text
+    assert "SYNTHÈSE" in brief_text
+    assert all(title not in brief_text for title in ("Accès initial", "Persistance", "Détection"))
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
     assert "Attribution remains unresolved" not in text
