@@ -10,7 +10,10 @@ function progress(sources: ProgressSource[]): ExtractionProgress {
   return {
     total_sources: sources.length,
     completed_sources: sources.filter(
-      (source) => source.status === "cached" || source.status === "succeeded",
+      (source) =>
+        source.status === "cached" ||
+        source.status === "reused" ||
+        source.status === "succeeded",
     ).length,
     full_total: sources.filter((source) => source.profile === "full").length,
     full_completed: 0,
@@ -71,8 +74,16 @@ describe("ExtractionProgressView", () => {
           source("https://support.example/b", {
             tier: "supporting",
             profile: "ioc_rules",
-            status: "cached",
-            reuse_state: "content_duplicate",
+            status: "reused",
+            reuse_state: "duplicate_content",
+            scope: {
+              kind: "case",
+              case_id: "GTG-30004",
+              kept_sections: 1,
+              total_sections: 38,
+              kept_chars: 8361,
+              total_chars: 258860,
+            },
           }),
           source("https://tech.example/c", {
             tier: "technical",
@@ -90,6 +101,12 @@ describe("ExtractionProgressView", () => {
     );
     expect(sourceRow("https://support.example/b")).toHaveTextContent(
       "contenu identique à une autre source",
+    );
+    expect(sourceRow("https://support.example/b")).toHaveTextContent(
+      "Cas GTG-30004 · 1/38 sections · 8361/258860 caractères",
+    );
+    expect(sourceRow("https://support.example/b")).toHaveTextContent(
+      "Réutilisé",
     );
     // A source the corpus left out keeps its line, without any profile.
     expect(sourceRow("https://tech.example/c")).toHaveTextContent(

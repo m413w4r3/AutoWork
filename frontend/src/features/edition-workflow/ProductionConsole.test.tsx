@@ -5,8 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Edition } from "../../api/editions";
 import type {
+  BatchItemDetail,
   BatchStatus,
   CancelProductionBatchResponse,
+  ProductionActivity,
+  ProductionSubject,
 } from "../../api/production";
 import { ProductionConsole } from "./ProductionConsole";
 import { productionBatchPollingInterval } from "../production/productionPolling";
@@ -22,6 +25,7 @@ function renderConsole(
     edition_state: "open",
     edition_version: 4,
   },
+  subjects: ProductionSubject[] = [],
 ) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -47,7 +51,7 @@ function renderConsole(
     return Promise.resolve(
       Response.json({
         edition_id: EDITION_ID,
-        subjects: [],
+        subjects,
         active_batch: batch,
         recent_batches: [],
       }),
@@ -64,12 +68,189 @@ function renderConsole(
 
 afterEach(() => vi.unstubAllGlobals());
 
+function activityItem(
+  activity: ProductionActivity,
+  status: BatchItemDetail["status"] = "running",
+): BatchItemDetail {
+  return {
+    position: 1,
+    subject_id: "subject-activity",
+    title: "Sujet activité",
+    run_id: "run-activity",
+    status,
+    current_stage: activity.stage ?? "extraction",
+    pipeline_generation: 0,
+    auto_recovery_count: 0,
+    error_code: null,
+    error_message: null,
+    activity,
+  };
+}
+
+function activityBatch(item: BatchItemDetail): BatchStatus {
+  return {
+    batch_id: "batch-activity",
+    edition_id: EDITION_ID,
+    status: "running",
+    phase: "initial",
+    next_dispatch_at: null,
+    items: 1,
+    completed: 0,
+    needs_review: 0,
+    failed: 0,
+    cancelled: 0,
+    item_details: [item],
+    created_at: "2026-10-07T11:00:00Z",
+    started_at: "2026-10-07T11:00:00Z",
+    finished_at: null,
+  };
+}
+
+function activitySubject(
+  subjectId: string,
+  title: string,
+  activity: ProductionActivity,
+): ProductionSubject {
+  return {
+    subject_id: subjectId,
+    title,
+    tlp: "GREEN",
+    latest_run_id: "run-activity",
+    latest_run_number: 1,
+    latest_status: "running",
+    latest_stage: activity.stage,
+    active_run_id: "run-activity",
+    can_start: false,
+    blocking_reason: "production_subject_active",
+    activity,
+  };
+}
+
 describe("ProductionConsole", () => {
   it("affiche l’état vide d’un board 200 sans lot", async () => {
     renderConsole(null);
 
     expect(
       await screen.findByText("Aucun lot de production n’est disponible."),
+    ).toBeInTheDocument();
+  });
+
+  it("explique le sondage de réconciliation sans le présenter comme un démarrage modèle", async () => {
+    renderConsole(
+      activityBatch(
+        activityItem(
+          {
+            kind: "reconciliation_probe",
+            stage: "synthesis",
+            started_at: "2026-10-07T11:58:00Z",
+            since_seconds: 120,
+            detail: "Sondage de réconciliation · aucune requête modèle",
+            attempt: 1,
+          },
+          "needs_review",
+        ),
+      ),
+    );
+
+    expect(
+      await screen.findByText(
+        "Sondage de réconciliation programmé (aucune requête modèle)",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Démarrage planifié")).not.toBeInTheDocument();
+  });
+
+  it("affiche l’heure d’un nouvel essai programmé", async () => {
+    const scheduledAt = new Date(2026, 9, 7, 14, 5).toISOString();
+    renderConsole(
+      activityBatch(
+        activityItem({
+          kind: "retry_scheduled",
+          stage: "extraction",
+          started_at: scheduledAt,
+          since_seconds: 0,
+          detail: "Nouvel essai programmé",
+          attempt: 2,
+        }),
+      ),
+    );
+
+    expect(
+      await screen.findByText(
+        `Nouvel essai programmé à ${new Intl.DateTimeFormat("fr-FR", {
+          hour: "2-digit",
+          minute: "2-digit",
+        }).format(new Date(scheduledAt))}`,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("résume les appels, sondages et essais programmés au niveau du système", async () => {
+    const subjects = [
+      activitySubject("subject-model", "Sujet modèle", {
+        kind: "model_call",
+        stage: "synthesis",
+        started_at: "2026-10-07T11:59:00Z",
+        since_seconds: 60,
+        detail: "Appel modèle en cours",
+        attempt: 1,
+      }),
+      activitySubject("subject-probe", "Sujet sondage", {
+        kind: "reconciliation_probe",
+        stage: "synthesis",
+        started_at: "2026-10-07T11:58:00Z",
+        since_seconds: 120,
+        detail: "Sondage de réconciliation · aucune requête modèle",
+        attempt: 1,
+      }),
+      activitySubject("subject-retry", "Sujet nouvel essai", {
+        kind: "retry_scheduled",
+        stage: "extraction",
+        started_at: new Date(2026, 9, 7, 14, 5).toISOString(),
+        since_seconds: 0,
+        detail: "Nouvel essai programmé",
+        attempt: 2,
+      }),
+    ];
+    renderConsole(null, undefined, subjects);
+
+    expect(
+      await screen.findByRole("heading", { name: "Activité du système" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Sujet modèle — Synthèse, appel modèle en cours depuis 1 min 0 s/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Sujet sondage — Sondage de réconciliation programmé/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Sujet nouvel essai — Nouvel essai programmé à/),
+    ).toBeInTheDocument();
+  });
+
+  it("explique la réactivation manuelle d’un batch terminé", async () => {
+    const batch = activityBatch(
+      activityItem(
+        {
+          kind: "deterministic_stage",
+          stage: "extraction",
+          started_at: "2026-10-07T11:58:00Z",
+          since_seconds: 120,
+          detail: "Étape en cours",
+          attempt: 1,
+        },
+        "running",
+      ),
+    );
+    batch.reactivated_by_retry = true;
+    renderConsole(batch);
+
+    expect(
+      await screen.findByText(
+        "Ce lot a été réactivé par un nouvel essai manuel. Les articles déjà terminés restent comptabilisés.",
+      ),
     ).toBeInTheDocument();
   });
 
@@ -97,6 +278,14 @@ describe("ProductionConsole", () => {
           auto_recovery_count: 0,
           error_code: null,
           error_message: null,
+          activity: {
+            kind: "model_call",
+            stage: "extraction",
+            started_at: "2026-10-07T11:57:50Z",
+            since_seconds: 130,
+            detail: "Appel modèle en cours",
+            attempt: 1,
+          },
           extraction_progress: {
             total_sources: 3,
             completed_sources: 2,
@@ -106,6 +295,8 @@ describe("ProductionConsole", () => {
             ioc_rules_completed: 1,
             cache_hits: 1,
             model_calls: 1,
+            current_source_id: "11111111-1111-4111-8111-111111111111",
+            current_chunk_index: 7,
             confirmed_iocs: 184,
             contextual_iocs: 12,
             rules_total: 5,
@@ -125,6 +316,9 @@ describe("ProductionConsole", () => {
                 reuse_state: "fresh",
                 ioc_count: 100,
                 rule_count: 3,
+                chunks_done: 6,
+                chunks_total: 14,
+                chunks_total_is_estimate: true,
               },
               {
                 source_id: "22222222-2222-4222-8222-222222222222",
@@ -175,6 +369,15 @@ describe("ProductionConsole", () => {
     expect(screen.getByText("Second source")).toBeInTheDocument();
     expect(progress).toHaveTextContent("Résultat existant");
     expect(progress).toHaveTextContent("En attente");
+    expect(progress).toHaveTextContent("6 / 14 tranches (estimées)");
+    expect(
+      await screen.findByText(
+        "Activité: Extraction — appel modèle en cours depuis 2 min 10 s — tranche 7/14 (estimée)",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Tranches terminées pour First source"),
+    ).toHaveAttribute("max", "14");
   });
 
   it("affiche la phase, les compteurs, les récupérations et les erreurs", async () => {
@@ -280,7 +483,7 @@ describe("ProductionConsole", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", {
-        name: "Arrêter le lot de production",
+        name: "Annuler le lot de production",
       }),
     ).toBeInTheDocument();
   });
@@ -359,7 +562,9 @@ describe("ProductionConsole", () => {
 
     renderConsole(batch);
 
-    expect(await screen.findByText("Démarrage planifié")).toBeInTheDocument();
+    expect(
+      await screen.findByText("En attente du prochain article"),
+    ).toBeInTheDocument();
     expect(screen.getByText("En attente du démarrage")).toBeInTheDocument();
     expect(screen.queryByText("Étape : Sources")).not.toBeInTheDocument();
   });
@@ -387,7 +592,7 @@ describe("ProductionConsole", () => {
     await screen.findByRole("heading", { name: "0 / 0 sujets traités" });
     expect(
       screen.queryByRole("button", {
-        name: "Arrêter le lot de production",
+        name: "Annuler le lot de production",
       }),
     ).not.toBeInTheDocument();
     await waitFor(() =>
@@ -428,7 +633,7 @@ describe("ProductionConsole", () => {
 
     await user.click(
       await screen.findByRole("button", {
-        name: "Arrêter le lot de production",
+        name: "Annuler le lot de production",
       }),
     );
 
@@ -464,9 +669,99 @@ describe("ProductionConsole", () => {
     });
   });
 
+  it("met en pause un lot actif et garde une action distincte pour l’annuler", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-pause",
+      edition_id: EDITION_ID,
+      status: "running",
+      phase: "initial",
+      next_dispatch_at: null,
+      items: 1,
+      completed: 0,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 0,
+      item_details: [],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: null,
+    };
+    const { fetchMock } = renderConsole(batch);
+    const user = userEvent.setup();
+
+    await user.click(
+      await screen.findByRole("button", { name: "Mettre en pause" }),
+    );
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/editions/${EDITION_ID}/production/${batch.batch_id}/pause`,
+        { method: "POST" },
+      ),
+    );
+    expect(
+      screen.getByRole("button", { name: "Annuler le lot de production" }),
+    ).toBeInTheDocument();
+  });
+
+  it("affiche l’étape en pause et reprend le même lot", async () => {
+    const batch: BatchStatus = {
+      batch_id: "batch-resume",
+      edition_id: EDITION_ID,
+      status: "paused",
+      phase: "initial",
+      next_dispatch_at: null,
+      paused_at: "2026-08-29T10:02:00Z",
+      paused_by: "dev-analyst",
+      items: 1,
+      completed: 0,
+      needs_review: 0,
+      failed: 0,
+      cancelled: 0,
+      item_details: [
+        {
+          position: 1,
+          subject_id: "subject-paused",
+          title: "Article en pause",
+          run_id: "run-paused",
+          status: "running",
+          current_stage: "synthesis",
+          paused: true,
+          paused_stage: "synthesis",
+          pipeline_generation: 0,
+          auto_recovery_count: 0,
+          error_code: null,
+          error_message: null,
+        },
+      ],
+      created_at: "2026-08-29T10:00:00Z",
+      started_at: "2026-08-29T10:00:00Z",
+      finished_at: null,
+    };
+    const { fetchMock } = renderConsole(batch);
+    const user = userEvent.setup();
+
+    expect(
+      await screen.findByText("En pause à l’étape : Synthèse"),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("En pause");
+    await user.click(screen.getByRole("button", { name: "Reprendre" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/editions/${EDITION_ID}/production/${batch.batch_id}/resume`,
+        { method: "POST" },
+      ),
+    );
+    expect(
+      screen.getByRole("button", { name: "Annuler le lot de production" }),
+    ).toBeInTheDocument();
+  });
+
   it.each([
     ["queued", 2_000],
     ["running", 2_000],
+    ["paused", 5_000],
     ["completed", false],
     ["completed_with_issues", false],
     ["cancelled", false],

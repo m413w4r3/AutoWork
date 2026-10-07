@@ -9,12 +9,15 @@ visual material, not that the source collection itself is missing.
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 from dataclasses import dataclass
 from datetime import date
 from enum import StrEnum
 from html import unescape
 from html.parser import HTMLParser
+from urllib.parse import urlsplit
 
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
@@ -23,9 +26,18 @@ from cti_app.application.production_parsers import (
     Q2RuleProposal,
     Q2SourceOutput,
 )
+from cti_app.domain.production_extraction import (
+    ExtractionScopeKind,
+    ExtractionScopeV1,
+    case_ids_from_text,
+    case_section_headings_for_scoping,
+    encode_indicator_section_paths,
+    is_case_section_heading,
+)
+from cti_app.domain.production_references import ProductionReferenceKind
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "7"
+SOURCE_EVIDENCE_VERSION = "11"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
@@ -37,6 +49,7 @@ _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
 _DEFANGED_SCHEME = re.compile(r"(?<!\w)hxxp(?P<secure>s?)://", re.IGNORECASE)
+_MARKDOWN_AUTOLINK = re.compile(r"\[([^\r\n]+)\]\(([^()\r\n]+)\)")
 
 # These are continuation characters of an indicator token.  Punctuation not
 # listed here remains a delimiter; no punctuation is removed from the value.
@@ -48,6 +61,7 @@ _URL_CONTINUATION = "!#$%&'*+,-./:;=?@_~%"
 _EMAIL_CONTINUATION = "!#$%&'*+-./=?^_`{|}~@"
 _FILENAME_CONTINUATION = ".-_"
 _FILEPATH_CONTINUATION = "._-/\\:"
+_QUOTE_DELIMITERS = frozenset({"'", '"', "`"})
 
 
 class SourceEvidenceSpanKind(StrEnum):
@@ -69,6 +83,7 @@ class SourceEvidenceSpan:
 
     kind: SourceEvidenceSpanKind
     text: str = ""
+    section_path: tuple[tuple[int, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +99,20 @@ class SourceEvidenceDocument:
     decoded_source_view: str = ""
     has_unverifiable_visuals: bool = False
     spans: tuple[SourceEvidenceSpan, ...] = ()
+    headings: tuple[tuple[int, str], ...] = ()
+    scope: ExtractionScopeV1 | None = None
+
+    @property
+    def has_multiple_case_sections(self) -> bool:
+        return (
+            len(
+                {
+                    title.casefold()
+                    for _level, title in case_section_headings_for_scoping(self.headings)
+                }
+            )
+            > 1
+        )
 
     def __post_init__(self) -> None:
         if not self.spans and self.parsed_text:
@@ -245,12 +274,16 @@ class _StructuredEvidenceParser(HTMLParser):
         self.skip_depth = 0
         self._kind: SourceEvidenceSpanKind | None = None
         self._buffer: list[str] = []
+        self.section_path: list[tuple[int, str]] = []
+        self.headings: list[tuple[int, str]] = []
+        self._active_heading_level: int | None = None
+        self._heading_buffer: list[str] = []
 
     def _flush(self) -> None:
         if self._kind is not None:
             text = "".join(self._buffer).strip()
             if text:
-                self.spans.append(SourceEvidenceSpan(self._kind, text))
+                self.spans.append(SourceEvidenceSpan(self._kind, text, tuple(self.section_path)))
         self._kind = None
         self._buffer = []
 
@@ -279,6 +312,10 @@ class _StructuredEvidenceParser(HTMLParser):
         if tag in self._SKIPPED_TAGS:
             self.skip_depth += 1
             return
+        if len(tag) == 2 and tag[0] == "h" and tag[1] in "123456":
+            self._flush()
+            self._active_heading_level = int(tag[1])
+            self._heading_buffer = []
         for key, value in attrs:
             if key.casefold() == "alt" and value:
                 self._flush()
@@ -296,6 +333,26 @@ class _StructuredEvidenceParser(HTMLParser):
         if tag in self._SKIPPED_TAGS and self.skip_depth:
             self.skip_depth -= 1
             return
+        if (
+            self._active_heading_level is not None
+            and len(tag) == 2
+            and tag[0] == "h"
+            and tag[1] in "123456"
+            and int(tag[1]) == self._active_heading_level
+        ):
+            title = " ".join(" ".join(self._heading_buffer).split())
+            level = self._active_heading_level
+            if title:
+                self.headings.append((level, title))
+                self.section_path = [
+                    (heading_level, heading_title)
+                    for heading_level, heading_title in self.section_path
+                    if heading_level < level
+                ]
+                self.section_path.append((level, title))
+            self._flush()
+            self._active_heading_level = None
+            self._heading_buffer = []
         self._flush()
         if self.stack:
             try:
@@ -311,6 +368,8 @@ class _StructuredEvidenceParser(HTMLParser):
         cleaned = re.sub(r"\s+", " ", data)
         if not cleaned:
             return
+        if self._active_heading_level is not None:
+            self._heading_buffer.append(cleaned)
         kind = self._kind_for_stack()
         if self._kind is not None and kind is not self._kind:
             self._flush()
@@ -340,6 +399,136 @@ def source_evidence_document_from_html(
         decoded_source_view=parser.text,
         has_unverifiable_visuals=parser.has_unverifiable_visuals,
         spans=spans,
+        headings=tuple(structured.headings),
+    )
+
+
+def scope_source_evidence_document(
+    document: SourceEvidenceDocument,
+    *,
+    subject_title: str,
+    actor_or_campaign: str,
+    canonical_url: str,
+    source_kind: ProductionReferenceKind,
+    mime_type: str | None,
+) -> SourceEvidenceDocument:
+    """Keep only one explicit case section plus preamble, or matching CSV rows."""
+
+    subject_case_ids = {
+        case_id
+        for text in (subject_title, actor_or_campaign)
+        for case_id in case_ids_from_text(text)
+    }
+    if len(subject_case_ids) != 1:
+        return document
+    case_id = next(iter(subject_case_ids))
+
+    path = urlsplit(canonical_url).path.casefold()
+    mime = (mime_type or "").split(";", 1)[0].strip().casefold()
+    is_csv = source_kind is ProductionReferenceKind.TECHNICAL_RESOURCE and (
+        mime == "text/csv" or path.endswith(".csv")
+    )
+    if is_csv:
+        return _scope_csv_evidence_document(document, case_id=case_id)
+
+    case_sections = case_section_headings_for_scoping(document.headings)
+    if len(case_sections) < 2:
+        return document
+    matching_sections = [
+        title for _level, title in case_sections if case_id in case_ids_from_text(title)
+    ]
+    # A repeated subject identifier across separate case headings is not a
+    # unique mapping; retain the full source so a human can review it.
+    if len(matching_sections) != 1:
+        return document
+
+    first_case_index = next(
+        (
+            index
+            for index, span in enumerate(document.spans)
+            if any(
+                level <= 3 and is_case_section_heading(title) for level, title in span.section_path
+            )
+        ),
+        None,
+    )
+    if first_case_index is None:
+        return document
+    preamble = document.spans[:first_case_index]
+    case_spans = tuple(
+        span
+        for span in document.spans
+        if any(
+            level <= 3 and is_case_section_heading(title) and case_id in case_ids_from_text(title)
+            for level, title in span.section_path
+        )
+    )
+    selected_spans = (*preamble, *case_spans)
+    scoped_text = "\n".join(
+        span.text
+        for span in selected_spans
+        if span.text and span.kind is not SourceEvidenceSpanKind.ALT_TEXT
+    ).strip()
+    if not scoped_text:
+        return document
+    scope = ExtractionScopeV1(
+        kind=ExtractionScopeKind.CASE,
+        case_id=case_id,
+        kept_sections=len(matching_sections),
+        total_sections=len(case_sections),
+        kept_chars=len(scoped_text),
+        total_chars=len(document.parsed_text),
+    )
+    return SourceEvidenceDocument(
+        parsed_text=scoped_text,
+        decoded_source_view=scoped_text,
+        has_unverifiable_visuals=any(
+            span.kind is SourceEvidenceSpanKind.VISUAL_UNLOCATED for span in selected_spans
+        ),
+        spans=selected_spans,
+        headings=document.headings,
+        scope=scope,
+    )
+
+
+def _scope_csv_evidence_document(
+    document: SourceEvidenceDocument, *, case_id: str
+) -> SourceEvidenceDocument:
+    rows = list(csv.reader(io.StringIO(document.parsed_text)))
+    if not rows:
+        return document
+    header = rows[0]
+    gtg_columns = [index for index, value in enumerate(header) if value.strip().casefold() == "gtg"]
+    if len(gtg_columns) != 1:
+        return document
+    gtg_column = gtg_columns[0]
+    data_rows = [row for row in rows[1:] if any(value.strip() for value in row)]
+    matching_rows = [
+        row
+        for row in data_rows
+        if gtg_column < len(row) and row[gtg_column].strip().upper() == case_id
+    ]
+    if not matching_rows:
+        return document
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(header)
+    writer.writerows(matching_rows)
+    scoped_text = output.getvalue().strip()
+    scope = ExtractionScopeV1(
+        kind=ExtractionScopeKind.CASE,
+        case_id=case_id,
+        kept_sections=len(matching_rows),
+        total_sections=len(data_rows),
+        kept_chars=len(scoped_text),
+        total_chars=len(document.parsed_text),
+    )
+    return SourceEvidenceDocument(
+        parsed_text=scoped_text,
+        decoded_source_view=scoped_text,
+        spans=(SourceEvidenceSpan(SourceEvidenceSpanKind.BODY_TEXT, scoped_text),),
+        headings=document.headings,
+        scope=scope,
     )
 
 
@@ -536,15 +725,18 @@ def _quote_around(view: str, start: int, length: int) -> str:
 
 
 def _evidence_areas(document: SourceEvidenceDocument) -> tuple[str, ...]:
-    """Structural areas first; whole views only when no span exists."""
+    """Structural areas that are contained in the exact text sent to extraction."""
+    parsed_view = _text_comparison_view(document.parsed_text)
     areas = tuple(
         span.text
         for span in document.spans
-        if span.text and span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
+        if span.text
+        and span.kind is not SourceEvidenceSpanKind.VISUAL_UNLOCATED
+        and _text_comparison_view(span.text) in parsed_view
     )
     if areas:
         return areas
-    return tuple(view for view in (document.parsed_text, document.decoded_source_view) if view)
+    return (document.parsed_text,) if document.parsed_text else ()
 
 
 def locate_text_evidence(
@@ -556,10 +748,10 @@ def locate_text_evidence(
     """Return the local quote proving ``anchor``, or ``None``.
 
     The anchor must appear, whitespace-collapsed and case-insensitively, in one
-    structural area of the exact archived document.  When ``stated_date`` is
-    given, the same area must also state that calendar date, so a date is never
-    borrowed from an unrelated part of the publication.  An undated anchor
-    wrapped across two structural areas is still found in the whole views.
+    structural area of the exact normalized text sent to extraction. When
+    ``stated_date`` is given, the same area must state that calendar date. An
+    undated anchor wrapped across structural areas is checked against that same
+    exact sent text as a whole.
     """
     needle = _text_comparison_view(anchor)
     if not needle:
@@ -574,7 +766,7 @@ def locate_text_evidence(
         return _quote_around(view, position, len(needle))
     if stated_date is not None:
         return None
-    for whole in (document.parsed_text, document.decoded_source_view):
+    for whole in (document.parsed_text,):
         view = _text_comparison_view(whole)
         position = _find(view, needle)
         if position >= 0:
@@ -598,18 +790,36 @@ def _first_located(
 def _artifact_quote(artifact: Q2ArtifactProposal, document: SourceEvidenceDocument) -> str:
     """Quote the structural area of a proven artifact, else its literal value."""
     candidate = _artifact_comparison_view(artifact.value)
-    for span in source_evidence_context_for_artifact(artifact, document):
-        view = _text_comparison_view(_artifact_comparison_view(span.text))
+    for area in _evidence_areas(document):
+        view = _text_comparison_view(_artifact_comparison_view(area))
         position = _find(view, candidate)
-        return _quote_around(view, max(position, 0), len(candidate))
+        if position >= 0:
+            return _quote_around(view, position, len(candidate))
     return candidate[:MAX_EVIDENCE_QUOTE_CHARS]
+
+
+def _artifact_section_path_context(
+    artifact: Q2ArtifactProposal, document: SourceEvidenceDocument
+) -> str:
+    if not document.has_multiple_case_sections:
+        return ""
+    spans = tuple(
+        span
+        for span in source_evidence_context_for_artifact(artifact, document)
+        if _text_comparison_view(span.text) in _text_comparison_view(document.parsed_text)
+    )
+    paths = tuple(dict.fromkeys(span.section_path for span in spans if span.section_path))
+    return encode_indicator_section_paths(paths)
 
 
 def _rule_quote(rule: Q2RuleProposal, document: SourceEvidenceDocument) -> str:
     body = _text_comparison_view(rule.body)
-    spans = source_evidence_context_for_rule(rule, document)
-    area = _text_comparison_view(spans[0].text) if spans else body
-    return _quote_around(area, max(_find(area, body), 0), len(body))
+    for area in _evidence_areas(document):
+        view = _text_comparison_view(area)
+        position = _find(view, body)
+        if position >= 0:
+            return _quote_around(view, position, len(body))
+    return body[:MAX_EVIDENCE_QUOTE_CHARS]
 
 
 def _verify_output_against_source(
@@ -629,19 +839,21 @@ def _verify_output_against_source(
         if isinstance(source_text, SourceEvidenceDocument)
         else SourceEvidenceDocument(parsed_text=source_text)
     )
-    base_source_views = tuple(
-        _artifact_comparison_view(value)
-        for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
-        if value
+    # Only the exact canonical text hashed and sent to the model can establish
+    # proof. The parallel safe HTML projection supplies structural paths only.
+    base_source_views = (
+        (_artifact_comparison_view(evidence_document.parsed_text),)
+        if evidence_document.parsed_text
+        else ()
     )
     # Un IOC publié dans une cellule de tableau est souvent replié : le rendu
     # texte insère un saut de ligne ou une suite d'espaces au milieu du token.
     # La vue compactée retire seulement ces coupures, sans rien réécrire.
     unwrapped_source_views = tuple(_artifact_unwrapped_view(value) for value in base_source_views)
-    text_source_views = tuple(
-        _text_comparison_view(value)
-        for value in (evidence_document.parsed_text, evidence_document.decoded_source_view)
-        if value
+    text_source_views = (
+        (_text_comparison_view(evidence_document.parsed_text),)
+        if evidence_document.parsed_text
+        else ()
     )
     facts: list[Q2FactProposal] = []
     events: list[Q2EventProposal] = []
@@ -701,6 +913,10 @@ def _verify_output_against_source(
 
     for artifact in output.artifacts:
         proposal_index += 1
+        unwrapped_value = _markdown_autolink_value(artifact)
+        if unwrapped_value is not None:
+            artifact = artifact.model_copy(update={"value": unwrapped_value})
+            warnings.append("artifact_markdown_autolink_unwrapped")
         proven = any(_artifact_is_proven(artifact, source) for source in base_source_views)
         if not proven and any(
             _artifact_is_proven(artifact, source) for source in unwrapped_source_views
@@ -711,7 +927,7 @@ def _verify_output_against_source(
             artifacts.append(
                 artifact.model_copy(
                     update={
-                        "context": "",
+                        "context": _artifact_section_path_context(artifact, evidence_document),
                         "evidence_quote": _artifact_quote(artifact, evidence_document),
                     }
                 )
@@ -775,6 +991,59 @@ def _artifact_comparison_view(value: str) -> str:
         view,
     )
     return view
+
+
+def _markdown_autolink_value(artifact: Q2ArtifactProposal) -> str | None:
+    """Return the visible URL only for an unambiguous self-link URL artifact.
+
+    ChatGPT's DOM serializer can turn a source URL into ``[X](X)``.  Unwrap
+    only URL artifacts where both sides are equivalent under the same refang
+    view used by the evidence gate.  The visible text is retained verbatim;
+    this never guesses from a differing target or rewrites the IOC itself.
+    """
+    if artifact.artifact_type != ArtifactType.URL.value:
+        return None
+    match = _MARKDOWN_AUTOLINK.fullmatch(artifact.value)
+    if match is None:
+        return None
+    visible_text, target = match.groups()
+    visible_identity = _http_url_identity(visible_text)
+    if visible_identity is None or visible_identity != _http_url_identity(target):
+        return None
+    return visible_text
+
+
+def _http_url_identity(value: str) -> tuple[str, str, str, str, str] | None:
+    """Build a strict local identity for a complete HTTP(S) URL."""
+    if (
+        any(character.isspace() for character in value)
+        or any(character in "<>\"'" for character in value)
+        or re.search(r"\\(?!:)", value)
+    ):
+        return None
+    comparable = _artifact_comparison_view(value)
+    if any(character.isspace() for character in comparable):
+        return None
+    try:
+        parsed = urlsplit(comparable)
+        hostname = parsed.hostname
+        # Accessing port also rejects malformed numeric ports.
+        _ = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.casefold()
+    if (
+        scheme not in {"http", "https"}
+        or not parsed.netloc
+        or hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    # Only an origin's empty path and "/" are treated as the same URL. A slash
+    # at the end of a non-root path can change its meaning, so it stays exact.
+    path = "" if parsed.path == "/" else parsed.path
+    return scheme, parsed.netloc.casefold(), path, parsed.query, parsed.fragment
 
 
 _ARTIFACT_WRAP = re.compile(r"[ \t]*\n[ \t]*")
@@ -982,8 +1251,24 @@ def _contains_bounded(
 
 def _has_token_boundaries(source: str, start: int, end: int, continuation: str) -> bool:
     before = source[start - 1] if start else ""
+    opening_quote = before if before in _QUOTE_DELIMITERS else ""
+    if _is_continuation(before, continuation) and not opening_quote:
+        return False
+    return _has_trailing_boundary(source, end, continuation, opening_quote)
+
+
+def _has_trailing_boundary(source: str, end: int, continuation: str, opening_quote: str) -> bool:
     after = source[end] if end < len(source) else ""
-    return not _is_continuation(before, continuation) and not _is_continuation(after, continuation)
+    if not _is_continuation(after, continuation):
+        return True
+    if after not in _QUOTE_DELIMITERS:
+        return False
+    if opening_quote and after == opening_quote:
+        return True
+    if not opening_quote:
+        following = source[end + 1] if end + 1 < len(source) else ""
+        return not _is_continuation(following, continuation)
+    return False
 
 
 def _has_domain_boundaries(source: str, start: int, end: int) -> bool:
@@ -1020,22 +1305,24 @@ def _has_ip_boundaries(source: str, candidate: str, start: int, end: int) -> boo
 def _has_email_boundaries(source: str, start: int, end: int) -> bool:
     before = source[start - 1] if start else ""
     after = source[end] if end < len(source) else ""
-    if _is_continuation(before, _EMAIL_CONTINUATION):
+    opening_quote = before if before in _QUOTE_DELIMITERS else ""
+    if _is_continuation(before, _EMAIL_CONTINUATION) and not opening_quote:
         return False
     if after == ".":
         return not (end + 1 < len(source) and source[end + 1].isalnum())
-    return not _is_continuation(after, _EMAIL_CONTINUATION)
+    return _has_trailing_boundary(source, end, _EMAIL_CONTINUATION, opening_quote)
 
 
 def _has_url_boundaries(source: str, start: int, end: int) -> bool:
     before = source[start - 1] if start else ""
     after = source[end] if end < len(source) else ""
-    if _is_continuation(before, _URL_CONTINUATION):
+    opening_quote = before if before in _QUOTE_DELIMITERS else ""
+    if _is_continuation(before, _URL_CONTINUATION) and not opening_quote:
         return False
     if after in ".,;:!?":
         next_value = source[end + 1] if end + 1 < len(source) else ""
         return not next_value or next_value.isspace() or next_value in ")]}>"
-    return not _is_continuation(after, _URL_CONTINUATION)
+    return _has_trailing_boundary(source, end, _URL_CONTINUATION, opening_quote)
 
 
 def _is_continuation(value: str, continuation: str) -> bool:

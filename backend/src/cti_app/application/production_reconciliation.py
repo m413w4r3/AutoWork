@@ -21,6 +21,7 @@ from cti_app.application.production_review_recovery import (
     ACTIVE_SIBLING,
     BATCH_CANCELLED,
     BATCH_MISSING,
+    BATCH_PAUSED,
     BATCH_SUPERSEDED,
     ReviewRecoveryConflictError,
     prepare_batch_for_recovery,
@@ -45,6 +46,10 @@ _RECOVERY_CONFLICTS = {
     BATCH_CANCELLED: (
         "production_reconciliation_batch_cancelled",
         "Un lot de production annulé ne peut pas être repris.",
+    ),
+    BATCH_PAUSED: (
+        "production_batch_paused",
+        "Le lot de production est en pause. Reprenez-le avant cette action.",
     ),
     BATCH_SUPERSEDED: (
         "production_reconciliation_batch_superseded",

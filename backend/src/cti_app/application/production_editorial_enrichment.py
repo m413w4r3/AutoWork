@@ -73,6 +73,7 @@ from cti_app.application.production_synthesis import (
     _date_literals,
     _date_supported_by_payload,
     _string_values,
+    _technical_literal_aliases,
     _technical_literals,
     _validate_plain_text,
     build_synthesis_access_policy,
@@ -162,6 +163,7 @@ from cti_app.domain.production_synthesis import (
     ProductionSynthesisV1,
     evidence_ref_sort_key,
     extraction_evidence_refs_v1,
+    mask_technical_literal_markup_exceptions,
     production_synthesis_from_json,
     production_synthesis_to_json,
     synthesis_evidence_refs,
@@ -188,9 +190,9 @@ if TYPE_CHECKING:
 EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v8-editorial-tables"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
-    "editorial-enrichment-evidence-pack-v7-timeline-anchors"
+    "editorial-enrichment-evidence-pack-v8-relation-support"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v11-editorial-tables"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v17-www-domain-aliases"
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v5-editorial-tables"
 )
@@ -751,6 +753,30 @@ class EditorialEnrichmentAcceptedBlock:
     scope_id: str
     proposal_key: str
     raw_sha256: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialEnrichmentValidationRejection:
+    """A parsed block dropped after strict final validation."""
+
+    kind: str
+    block_id: str
+    scope_id: str | None
+    proposal_key: str
+    reason_code: str
+    reason: str
+    raw_sha256: str
+
+    def to_json(self) -> dict[str, str | None]:
+        return {
+            "kind": self.kind,
+            "block_id": self.block_id,
+            "scope_id": self.scope_id,
+            "proposal_key": self.proposal_key,
+            "reason_code": self.reason_code,
+            "reason": self.reason,
+            "raw_sha256": self.raw_sha256,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1986,12 +2012,14 @@ def _filter_diagram_relations(
 ) -> DiagramProposalV1 | None:
     valid_edges: list[DiagramEdgeProposalV1] = []
     rejected_count = 0
+    rejected_reasons: list[str] = []
     for edge in diagram.edges:
         reason = _edge_projection_rejection(diagram, edge, evidence_pack)
         if reason is None:
             valid_edges.append(edge)
             continue
         rejected_count += 1
+        rejected_reasons.append(reason)
         rejections.append(
             _enrichment_wire_rejection(
                 block,
@@ -2000,6 +2028,30 @@ def _filter_diagram_relations(
                 block.raw_lines,
             )
         )
+    if rejected_count:
+        if not valid_edges:
+            rejections.append(
+                _enrichment_wire_rejection(
+                    block,
+                    block.block_id,
+                    "editorial_enrichment_diagram_has_no_supported_relations",
+                    block.raw_lines,
+                )
+            )
+        reason_codes = tuple(dict.fromkeys(rejected_reasons))
+        rejections.append(
+            _enrichment_wire_rejection(
+                block,
+                block.block_id,
+                "editorial_enrichment_diagram_rejected_after_relation_filter",
+                block.raw_lines,
+            )
+        )
+        warnings.append(
+            "editorial_enrichment_diagram_rejected_after_relation_filter:"
+            f"{block.block_id}:{','.join(reason_codes)}"
+        )
+        return None
     if not valid_edges:
         rejections.append(
             _enrichment_wire_rejection(
@@ -3453,9 +3505,11 @@ def _parse_enrichment_wire_diagram(
     known_nodes = {item.node_id for item in nodes}
 
     edges: list[DiagramEdgeProposalV1] = []
+    relation_scope_ids: set[str] = set()
     for child in block.children:
         if child.kind not in {"RELATION", "EDGE"}:
             continue
+        relation_scope_ids.add(child.scope_id)
         error = _block_child_error(
             child,
             frozenset(
@@ -3564,6 +3618,16 @@ def _parse_enrichment_wire_diagram(
         except (TypeError, ValueError, ValidationError):
             reject(child, "editorial_enrichment_diagram_relation_invalid")
 
+    rejected_relations = tuple(item for item in rejections if item.scope_id in relation_scope_ids)
+    if rejected_relations:
+        reason_codes = tuple(dict.fromkeys(item.reason_code for item in rejected_relations))
+        reject(block, "editorial_enrichment_diagram_rejected_after_invalid_relations")
+        warnings.append(
+            "editorial_enrichment_diagram_rejected_after_invalid_relations:"
+            f"{block.block_id}:{','.join(reason_codes)}"
+        )
+        return None
+
     groups: list[DiagramGroupProposalV1] = []
     grouped_nodes: set[str] = set()
     group_ids: set[str] = set()
@@ -3659,7 +3723,8 @@ class EditorialEnrichmentEvidencePackV1:
             return self._handle_to_ref[handle]
         except (KeyError, TypeError) as exc:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+                EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+                message=f"evidence_handle_not_in_pack:{handle}",
             ) from exc
 
     def evidence_handles_for_source(self, source_document_id: UUID) -> tuple[str, ...]:
@@ -3697,9 +3762,10 @@ class EditorialEnrichmentStageErrorCode(StrEnum):
 
 
 class EditorialEnrichmentProposalControlError(RuntimeError):
-    def __init__(self, code: EditorialEnrichmentStageErrorCode) -> None:
+    def __init__(self, code: EditorialEnrichmentStageErrorCode, message: str | None = None) -> None:
         self.code = code
-        super().__init__(code.value)
+        detail = " ".join(message.split())[:300] if message else code.value
+        super().__init__(detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -4050,10 +4116,6 @@ def build_editorial_enrichment_evidence_pack(
             ref
             for relation in projection.source_pair_relations
             for ref in relation.supporting_evidence_refs
-            if (
-                ref.kind is not EvidenceKind.UNCERTAINTY
-                or source_by_id[ref.source_document_id].profile is ExtractionProfile.FULL
-            )
         }
         if projection is not None
         else set()
@@ -4121,6 +4183,13 @@ def build_editorial_enrichment_evidence_pack(
     reserve_handle_for_ref = {
         ref: f"R{index:03d}" for index, ref in enumerate(ordered_reserve_refs, start=1)
     }
+    missing_relation_handles = relation_refs - reserve_handle_for_ref.keys()
+    if missing_relation_handles:
+        raise _EditorialEnrichmentInputControl(
+            EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+            "Source-pair relation support is missing reserve evidence handles",
+            details={"missing_support_ref_count": len(missing_relation_handles)},
+        )
     narrative_evidence = tuple(
         _prompt_evidence_record(
             handle_for_ref[ref],
@@ -4910,25 +4979,36 @@ def build_editorial_enrichment_repair_request(
     return request, identity
 
 
-def _validate_plain_editorial_text(value: str) -> None:
+def _editorial_text_diagnostic(context: str | None, reason: str) -> str:
+    return f"{context}:{reason}" if context else reason
+
+
+def _validate_plain_editorial_text(value: str, *, context: str | None = None) -> None:
     try:
         _validate_plain_text(value)
     except (TypeError, ValueError, RuntimeError) as exc:
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message=_editorial_text_diagnostic(context, f"plain_text_validation_failed:{exc}"),
         ) from exc
-    if _RENDERER_SYNTAX.search(value):
+    if _RENDERER_SYNTAX.search(mask_technical_literal_markup_exceptions(value)):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message=_editorial_text_diagnostic(
+                context, "renderer_syntax_not_allowed_in_plain_editorial_text"
+            ),
         )
 
 
-def _validate_ungrounded_editorial_text(value: str) -> None:
+def _validate_ungrounded_editorial_text(value: str, *, context: str | None = None) -> None:
     """Column and group labels carry no evidence, so they cannot state a fact."""
-    _validate_plain_editorial_text(value)
+    _validate_plain_editorial_text(value, context=context)
     if _technical_literals(value) or _date_literals(value):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+            message=_editorial_text_diagnostic(
+                context, "ungrounded_label_contains_technical_value"
+            ),
         )
 
 
@@ -4943,19 +5023,25 @@ def _validate_grounded_editorial_text(
     refs: tuple[ExtractionEvidenceRefV1, ...],
     entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
     technical_support: Mapping[tuple[str, str], set[ExtractionEvidenceRefV1]],
+    *,
+    context: str | None = None,
 ) -> None:
-    _validate_plain_editorial_text(value)
+    _validate_plain_editorial_text(value, context=context)
     ref_set = set(refs)
     for literal in _technical_literals(value):
         support = technical_support.get(literal, set())
         if not support or not support.intersection(ref_set):
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+                EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                message=_editorial_text_diagnostic(
+                    context, "technical_literal_not_supported_by_block_evidence"
+                ),
             )
     for date_key in _date_literals(value):
         if not any(_date_supported_by_payload(entries[ref], date_key) for ref in refs):
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+                EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                message=_editorial_text_diagnostic(context, "date_not_supported_by_block_evidence"),
             )
 
 
@@ -4963,6 +5049,8 @@ def _validate_exact_evidence_text(
     value: str,
     refs: tuple[ExtractionEvidenceRefV1, ...],
     entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
+    *,
+    context: str | None = None,
 ) -> None:
     needle = " ".join(value.split()).casefold()
     if not needle or not any(
@@ -4971,7 +5059,10 @@ def _validate_exact_evidence_text(
         for text in _string_values(entries[ref])
     ):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+            message=_editorial_text_diagnostic(
+                context, "chart_value_not_found_verbatim_in_evidence"
+            ),
         )
 
 
@@ -4986,6 +5077,9 @@ def validate_editorial_enrichment_proposal(
     resource_proposals: tuple[ResourceProposalV1, ...] = (),
     resource_model_run_id: UUID | None = None,
     warnings: tuple[str, ...] = (),
+    accepted_blocks: tuple[EditorialEnrichmentAcceptedBlock, ...] = (),
+    validation_rejections: list[EditorialEnrichmentValidationRejection] | None = None,
+    _drop_invalid_blocks: bool = True,
 ) -> EditorialEnrichmentV1:
     """Resolve exact handles, ground technical literals, and build canonical V1."""
     try:
@@ -4996,11 +5090,13 @@ def validate_editorial_enrichment_proposal(
         )
     except (TypeError, ValueError, ValidationError) as exc:
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message=f"proposal_shape_invalid:{type(exc).__name__}",
         ) from exc
     if not isinstance(evidence_pack, EditorialEnrichmentEvidencePackV1):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message="evidence_pack_type_invalid",
         )
     if (
         len(parsed.figures) > MAX_ENRICHMENT_FIGURE_PROPOSALS
@@ -5008,14 +5104,141 @@ def validate_editorial_enrichment_proposal(
         or len(resource_proposals) > MAX_ENRICHMENT_RESOURCE_PROPOSALS
     ):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message="proposal_count_limit_exceeded",
+        )
+
+    if _drop_invalid_blocks:
+        droppable_codes = {
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
+            EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
+        }
+        full_failure: EditorialEnrichmentProposalControlError | None = None
+        try:
+            return validate_editorial_enrichment_proposal(
+                parsed,
+                evidence_pack,
+                extraction,
+                synthesis,
+                source_figures=source_figures,
+                figure_catalog=figure_catalog,
+                resource_proposals=resource_proposals,
+                resource_model_run_id=resource_model_run_id,
+                warnings=warnings,
+                accepted_blocks=accepted_blocks,
+                _drop_invalid_blocks=False,
+            )
+        except EditorialEnrichmentProposalControlError as full_error:
+            if full_error.code not in droppable_codes:
+                raise
+            full_failure = full_error
+
+        accepted_by_proposal = {(item.kind, item.proposal_key): item for item in accepted_blocks}
+        valid: dict[str, list[Any]] = {
+            "TABLE": [],
+            "CHART": [],
+            "DIAGRAM": [],
+            "FIGURE": [],
+        }
+        dropped: list[EditorialEnrichmentValidationRejection] = []
+        proposal_groups = (
+            ("TABLE", parsed.tables, "key"),
+            ("CHART", parsed.charts, "key"),
+            ("DIAGRAM", parsed.diagrams, "key"),
+            ("FIGURE", parsed.figures, "figure_handle"),
+        )
+        for kind, values, key_name in proposal_groups:
+            for item in values:
+                proposal_key = getattr(item, key_name)
+                single = EditorialEnrichmentProposalV1(
+                    tables=(item,) if kind == "TABLE" else (),
+                    charts=(item,) if kind == "CHART" else (),
+                    diagrams=(item,) if kind == "DIAGRAM" else (),
+                    figures=(item,) if kind == "FIGURE" else (),
+                )
+                try:
+                    validate_editorial_enrichment_proposal(
+                        single,
+                        evidence_pack,
+                        extraction,
+                        synthesis,
+                        source_figures=source_figures,
+                        figure_catalog=figure_catalog,
+                        resource_proposals=resource_proposals,
+                        resource_model_run_id=resource_model_run_id,
+                        warnings=warnings,
+                        accepted_blocks=accepted_blocks,
+                        _drop_invalid_blocks=False,
+                    )
+                except EditorialEnrichmentProposalControlError as block_error:
+                    if block_error.code not in droppable_codes:
+                        raise
+                    accepted = accepted_by_proposal.get((kind, proposal_key))
+                    block_id = accepted.block_id if accepted is not None else proposal_key
+                    scope_id = accepted.scope_id if accepted is not None else None
+                    raw_sha256 = (
+                        accepted.raw_sha256
+                        if accepted is not None and accepted.raw_sha256
+                        else hashlib.sha256(item.model_dump_json().encode("utf-8")).hexdigest()
+                    )
+                    diagnostic = " ".join(str(block_error).split())[:300]
+                    dropped.append(
+                        EditorialEnrichmentValidationRejection(
+                            kind=kind,
+                            block_id=block_id,
+                            scope_id=scope_id,
+                            proposal_key=proposal_key,
+                            reason_code=(
+                                "editorial_enrichment_block_final_validation_failed:"
+                                f"{kind.casefold()}:{block_error.code.value}"
+                            ),
+                            reason=(f"{kind} {block_id} ({proposal_key}): {diagnostic}")[:300],
+                            raw_sha256=raw_sha256,
+                        )
+                    )
+                else:
+                    valid[kind].append(item)
+        if not dropped:
+            # Isolated blocks passed; preserve the original cross-block failure.
+            assert full_failure is not None
+            raise full_failure
+        if validation_rejections is not None:
+            validation_rejections.extend(dropped)
+        block_warnings = tuple(
+            f"editorial_enrichment_validation_block_dropped:{item.kind}:{item.block_id}:"
+            f"{item.reason_code.rsplit(':', 1)[-1]}"
+            for item in dropped
+        )
+        filtered = parsed.model_copy(
+            update={
+                "tables": tuple(valid["TABLE"]),
+                "charts": tuple(valid["CHART"]),
+                "diagrams": tuple(valid["DIAGRAM"]),
+                "figures": tuple(valid["FIGURE"]),
+            }
+        )
+        return validate_editorial_enrichment_proposal(
+            filtered,
+            evidence_pack,
+            extraction,
+            synthesis,
+            source_figures=source_figures,
+            figure_catalog=figure_catalog,
+            resource_proposals=resource_proposals,
+            resource_model_run_id=resource_model_run_id,
+            warnings=tuple(dict.fromkeys((*warnings, *block_warnings))),
+            accepted_blocks=accepted_blocks,
+            _drop_invalid_blocks=False,
         )
 
     entries = _all_evidence_entries(extraction)
+    extraction_sources = {source.source_document_id: source for source in extraction.sources}
     handle_refs = set(evidence_pack._handle_to_ref.values())
     if not handle_refs <= set(entries):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+            EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+            message="evidence_pack_contains_refs_missing_from_extraction",
         )
     technical_support_mutable: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = defaultdict(
         set
@@ -5023,7 +5246,8 @@ def validate_editorial_enrichment_proposal(
     for ref, payload in entries.items():
         for value in _string_values(payload):
             for literal in _technical_literals(value):
-                technical_support_mutable[literal].add(ref)
+                for alias in _technical_literal_aliases(literal):
+                    technical_support_mutable[alias].add(ref)
     technical_support = dict(technical_support_mutable)
     section_count = len(synthesis.sections)
     paragraph_text_by_anchor = semantic_annotation_anchor_texts(synthesis)
@@ -5032,11 +5256,13 @@ def validate_editorial_enrichment_proposal(
         anchored_text = paragraph_text_by_anchor.get(annotation.paragraph_anchor)
         if anchored_text is None:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"annotation_anchor_not_found:{annotation.paragraph_anchor}",
             )
         if annotation.text not in anchored_text or annotation.role is SemanticRole.TEXT:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"annotation_text_or_role_invalid:{annotation.paragraph_anchor}",
             )
         annotations.append(_proposal_annotation_to_domain(annotation))
 
@@ -5045,7 +5271,8 @@ def validate_editorial_enrichment_proposal(
             value.section_index is None or value.section_index >= section_count
         ):
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID
+                EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
+                message="placement_section_index_out_of_range",
             )
         return EnrichmentPlacementV1(kind=value.kind, section_index=value.section_index)
 
@@ -5055,43 +5282,61 @@ def validate_editorial_enrichment_proposal(
     for table in parsed.tables:
         if len(table.columns) < 2 or len(table.rows) < 2:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"table_shape_invalid:{table.key}:requires_two_columns_and_rows",
             )
         for column in table.columns:
-            _validate_ungrounded_editorial_text(column.label)
+            _validate_ungrounded_editorial_text(
+                column.label, context=f"table:{table.key}:column.{column.key}.label"
+            )
         rows: list[TableRowV1] = []
         table_refs: set[ExtractionEvidenceRefV1] = set()
-        for row in table.rows:
+        for row_index, row in enumerate(table.rows, start=1):
             if len(row.cells) != len(table.columns):
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                    message=f"table_row_cell_count_mismatch:{table.key}:row.{row_index}",
                 )
             refs = _all_refs_for_handles(row.evidence_handles, evidence_pack)
             table_refs.update(refs)
-            for cell in row.cells:
-                _validate_grounded_editorial_text(cell, refs, entries, technical_support)
+            for cell_index, cell in enumerate(row.cells, start=1):
+                _validate_grounded_editorial_text(
+                    cell,
+                    refs,
+                    entries,
+                    technical_support,
+                    context=f"table:{table.key}:row.{row_index}.cell.{cell_index}",
+                )
             rows.append(TableRowV1(cells=row.cells, evidence_refs=refs))
-        for value in (table.title, table.caption or ""):
+        for field_name, value in (("title", table.title), ("caption", table.caption or "")):
             _validate_grounded_editorial_text(
                 value,
                 tuple(sorted(table_refs, key=evidence_ref_sort_key)),
                 entries,
                 technical_support,
+                context=f"table:{table.key}:{field_name}",
             )
         purpose_refs = _all_refs_for_handles(table.purpose.evidence_handles, evidence_pack)
         if not set(purpose_refs) <= table_refs:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"table_purpose_evidence_not_used_by_rows:{table.key}",
             )
-        for value in (
-            table.purpose.question,
-            table.purpose.available_data,
-            table.purpose.comprehension_gain,
-            table.purpose.scope,
-            table.purpose.knowledge_limits,
-            table.purpose.placement_reason,
+        for field_name, value in (
+            ("question", table.purpose.question),
+            ("available_data", table.purpose.available_data),
+            ("comprehension_gain", table.purpose.comprehension_gain),
+            ("scope", table.purpose.scope),
+            ("knowledge_limits", table.purpose.knowledge_limits),
+            ("placement_reason", table.purpose.placement_reason),
         ):
-            _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+            _validate_grounded_editorial_text(
+                value,
+                purpose_refs,
+                entries,
+                technical_support,
+                context=f"table:{table.key}:purpose.{field_name}",
+            )
         try:
             tables.append(
                 TableSpecV1(
@@ -5117,13 +5362,15 @@ def validate_editorial_enrichment_proposal(
             )
         except ValueError as exc:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"table_domain_invariant_failed:{table.key}:{exc}",
             ) from exc
 
     for diagram in parsed.diagrams:
         if len(diagram.nodes) < 2 or not diagram.edges:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"diagram_shape_invalid:{diagram.key}:requires_two_nodes_and_an_edge",
             )
         # Domain invariants of nodes, edges and groups are model output defects too.
         try:
@@ -5134,7 +5381,13 @@ def validate_editorial_enrichment_proposal(
             for node in diagram.nodes:
                 refs = _all_refs_for_handles(node.evidence_handles, evidence_pack)
                 diagram_refs.update(refs)
-                _validate_grounded_editorial_text(node.label, refs, entries, technical_support)
+                _validate_grounded_editorial_text(
+                    node.label,
+                    refs,
+                    entries,
+                    technical_support,
+                    context=f"diagram:{diagram.key}:node.{node.node_id}.label",
+                )
                 nodes.append(
                     DiagramNodeV1(
                         node_id=node.node_id,
@@ -5147,7 +5400,13 @@ def validate_editorial_enrichment_proposal(
                 refs = _all_refs_for_handles(edge.evidence_handles, evidence_pack)
                 diagram_refs.update(refs)
                 if edge.label is not None:
-                    _validate_grounded_editorial_text(edge.label, refs, entries, technical_support)
+                    _validate_grounded_editorial_text(
+                        edge.label,
+                        refs,
+                        entries,
+                        technical_support,
+                        context=f"diagram:{diagram.key}:edge.{edge.source_node_id}.{edge.target_node_id}.label",
+                    )
                 edges.append(
                     DiagramEdgeV1(
                         source_node_id=edge.source_node_id,
@@ -5159,7 +5418,9 @@ def validate_editorial_enrichment_proposal(
                     )
                 )
             for group in diagram.groups:
-                _validate_ungrounded_editorial_text(group.label)
+                _validate_ungrounded_editorial_text(
+                    group.label, context=f"diagram:{diagram.key}:group.{group.group_id}.label"
+                )
                 groups.append(
                     DiagramGroupV1(
                         group_id=group.group_id,
@@ -5167,27 +5428,38 @@ def validate_editorial_enrichment_proposal(
                         node_ids=group.node_ids,
                     )
                 )
-            for value in (diagram.title, diagram.caption or ""):
+            for field_name, value in (
+                ("title", diagram.title),
+                ("caption", diagram.caption or ""),
+            ):
                 _validate_grounded_editorial_text(
                     value,
                     tuple(sorted(diagram_refs, key=evidence_ref_sort_key)),
                     entries,
                     technical_support,
+                    context=f"diagram:{diagram.key}:{field_name}",
                 )
             purpose_refs = _all_refs_for_handles(diagram.purpose.evidence_handles, evidence_pack)
             if not set(purpose_refs) <= diagram_refs:
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                    message=f"diagram_purpose_evidence_not_used_by_graph:{diagram.key}",
                 )
-            for value in (
-                diagram.purpose.question,
-                diagram.purpose.available_data,
-                diagram.purpose.comprehension_gain,
-                diagram.purpose.scope,
-                diagram.purpose.knowledge_limits,
-                diagram.purpose.placement_reason,
+            for field_name, value in (
+                ("question", diagram.purpose.question),
+                ("available_data", diagram.purpose.available_data),
+                ("comprehension_gain", diagram.purpose.comprehension_gain),
+                ("scope", diagram.purpose.scope),
+                ("knowledge_limits", diagram.purpose.knowledge_limits),
+                ("placement_reason", diagram.purpose.placement_reason),
             ):
-                _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+                _validate_grounded_editorial_text(
+                    value,
+                    purpose_refs,
+                    entries,
+                    technical_support,
+                    context=f"diagram:{diagram.key}:purpose.{field_name}",
+                )
             diagrams.append(
                 DiagramSpecV1(
                     key=diagram.key,
@@ -5213,13 +5485,15 @@ def validate_editorial_enrichment_proposal(
             )
         except ValueError as exc:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"diagram_domain_invariant_failed:{diagram.key}:{exc}",
             ) from exc
 
     for chart in parsed.charts:
         if not chart.points:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"chart_has_no_points:{chart.key}",
             )
         points: list[ChartPointV1] = []
         chart_refs: set[ExtractionEvidenceRefV1] = set()
@@ -5227,14 +5501,39 @@ def validate_editorial_enrichment_proposal(
             refs = _all_refs_for_handles(point.evidence_handles, evidence_pack)
             if not refs:
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+                    message=f"chart_point_has_no_evidence:{chart.key}",
                 )
-            _validate_grounded_editorial_text(point.date, refs, entries, technical_support)
-            _validate_exact_evidence_text(point.date, refs, entries)
-            _validate_grounded_editorial_text(point.label, refs, entries, technical_support)
-            _validate_exact_evidence_text(point.label, refs, entries)
-            _validate_grounded_editorial_text(point.series, refs, entries, technical_support)
-            _validate_exact_evidence_text(point.series, refs, entries)
+            _validate_grounded_editorial_text(
+                point.date,
+                refs,
+                entries,
+                technical_support,
+                context=f"chart:{chart.key}:point.{point.label}.date",
+            )
+            _validate_exact_evidence_text(
+                point.date, refs, entries, context=f"chart:{chart.key}:point.{point.label}.date"
+            )
+            _validate_grounded_editorial_text(
+                point.label,
+                refs,
+                entries,
+                technical_support,
+                context=f"chart:{chart.key}:point.label",
+            )
+            _validate_exact_evidence_text(
+                point.label, refs, entries, context=f"chart:{chart.key}:point.label"
+            )
+            _validate_grounded_editorial_text(
+                point.series,
+                refs,
+                entries,
+                technical_support,
+                context=f"chart:{chart.key}:point.series",
+            )
+            _validate_exact_evidence_text(
+                point.series, refs, entries, context=f"chart:{chart.key}:point.series"
+            )
             chart_refs.update(refs)
             points.append(
                 ChartPointV1(
@@ -5246,26 +5545,41 @@ def validate_editorial_enrichment_proposal(
             )
         ordered_chart_refs = tuple(sorted(chart_refs, key=evidence_ref_sort_key))
         _validate_grounded_editorial_text(
-            chart.title, ordered_chart_refs, entries, technical_support
+            chart.title,
+            ordered_chart_refs,
+            entries,
+            technical_support,
+            context=f"chart:{chart.key}:title",
         )
         if chart.caption is not None:
             _validate_grounded_editorial_text(
-                chart.caption, ordered_chart_refs, entries, technical_support
+                chart.caption,
+                ordered_chart_refs,
+                entries,
+                technical_support,
+                context=f"chart:{chart.key}:caption",
             )
         purpose_refs = _all_refs_for_handles(chart.purpose.evidence_handles, evidence_pack)
         if not purpose_refs or not set(purpose_refs) <= chart_refs:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"chart_purpose_evidence_not_used_by_points:{chart.key}",
             )
-        for value in (
-            chart.purpose.question,
-            chart.purpose.available_data,
-            chart.purpose.comprehension_gain,
-            chart.purpose.scope,
-            chart.purpose.knowledge_limits,
-            chart.purpose.placement_reason,
+        for field_name, value in (
+            ("question", chart.purpose.question),
+            ("available_data", chart.purpose.available_data),
+            ("comprehension_gain", chart.purpose.comprehension_gain),
+            ("scope", chart.purpose.scope),
+            ("knowledge_limits", chart.purpose.knowledge_limits),
+            ("placement_reason", chart.purpose.placement_reason),
         ):
-            _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+            _validate_grounded_editorial_text(
+                value,
+                purpose_refs,
+                entries,
+                technical_support,
+                context=f"chart:{chart.key}:purpose.{field_name}",
+            )
         try:
             charts.append(
                 ChartSpecV1(
@@ -5288,7 +5602,8 @@ def validate_editorial_enrichment_proposal(
             )
         except ValueError as exc:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message=f"chart_domain_invariant_failed:{chart.key}:{exc}",
             ) from exc
 
     catalog_by_handle = {entry.handle: entry for entry in figure_catalog}
@@ -5297,7 +5612,8 @@ def validate_editorial_enrichment_proposal(
         catalog_by_handle
     ):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message="figure_catalog_has_duplicate_handles_or_proposal_has_unknown_handle",
         )
     figure_decisions: list[EditorialFigureDecisionTraceV1] = []
     selected_source_figures = list(source_figures)
@@ -5313,29 +5629,44 @@ def validate_editorial_enrichment_proposal(
         if proposed is not None:
             if figure.decision is not SourceFigureDecision.ACCEPTED:
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                    message=f"figure_not_accepted_by_catalog:{catalog_entry.handle}",
+                )
+            source = extraction_sources.get(figure.source_document_id)
+            if source is None:
+                raise EditorialEnrichmentProposalControlError(
+                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+                    message=f"figure_source_document_missing_from_extraction:{catalog_entry.handle}",
                 )
             evidence_refs = _all_refs_for_handles(proposed.evidence_handles, evidence_pack)
             if not evidence_refs or any(
                 ref.source_document_id != figure.source_document_id for ref in evidence_refs
             ):
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE
+                    EditorialEnrichmentStageErrorCode.UNKNOWN_EVIDENCE,
+                    message=f"figure_evidence_missing_or_cross_source:{catalog_entry.handle}",
                 )
             purpose_refs = _all_refs_for_handles(proposed.purpose.evidence_handles, evidence_pack)
             if not purpose_refs or not set(purpose_refs) <= set(evidence_refs):
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                    EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                    message=f"figure_purpose_evidence_not_used_by_block:{catalog_entry.handle}",
                 )
-            for value in (
-                proposed.purpose.question,
-                proposed.purpose.available_data,
-                proposed.purpose.comprehension_gain,
-                proposed.purpose.scope,
-                proposed.purpose.knowledge_limits,
-                proposed.purpose.placement_reason,
+            for field_name, value in (
+                ("question", proposed.purpose.question),
+                ("available_data", proposed.purpose.available_data),
+                ("comprehension_gain", proposed.purpose.comprehension_gain),
+                ("scope", proposed.purpose.scope),
+                ("knowledge_limits", proposed.purpose.knowledge_limits),
+                ("placement_reason", proposed.purpose.placement_reason),
             ):
-                _validate_grounded_editorial_text(value, purpose_refs, entries, technical_support)
+                _validate_grounded_editorial_text(
+                    value,
+                    purpose_refs,
+                    entries,
+                    technical_support,
+                    context=f"figure:{catalog_entry.handle}:purpose.{field_name}",
+                )
             figure_purpose = EditorialAnalyticPurposeV1(
                 question=proposed.purpose.question,
                 available_data=proposed.purpose.available_data,
@@ -5352,31 +5683,50 @@ def validate_editorial_enrichment_proposal(
                 source_caption = catalog_entry.source_caption
                 if source_caption is None:
                     raise EditorialEnrichmentProposalControlError(
-                        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                        message=f"figure_caption_missing_and_no_source_fallback:{catalog_entry.handle}",
                     )
                 caption = source_caption
                 local_warnings.add(
                     f"editorial_enrichment_figure_caption_downgraded:{catalog_entry.handle}"
                 )
-            _validate_plain_editorial_text(caption)
+            _validate_plain_editorial_text(
+                caption, context=f"figure:{catalog_entry.handle}:caption"
+            )
             try:
+                canonical_figure = figure
+                if figure.source != source.canonical_url:
+                    canonical_figure = ResolvedSourceFigureV1(
+                        figure_id=figure.figure_id,
+                        blob_id=figure.blob_id,
+                        sha256=figure.sha256,
+                        mime_type=figure.mime_type,
+                        byte_size=figure.byte_size,
+                        source_document_id=figure.source_document_id,
+                        source=source.canonical_url,
+                        provenance=figure.provenance,
+                        locator=figure.locator,
+                        decision=figure.decision,
+                        decision_reason=figure.decision_reason,
+                    )
                 selected_source_figures.append(
                     SourceFigureCandidateV1(
                         key=f"source_figure_{figure.figure_id.hex}",
                         source_document_id=figure.source_document_id,
-                        source_url=figure.source,
+                        source_url=source.canonical_url,
                         caption=caption,
                         provenance=figure.provenance,
                         locator=figure.locator,
                         inclusion_status=SourceFigureInclusionStatus.INCLUDED,
                         placement=placement(proposed.placement),
-                        resolved_figure=figure,
+                        resolved_figure=canonical_figure,
                         purpose=figure_purpose,
                     )
                 )
             except ValueError as exc:
                 raise EditorialEnrichmentProposalControlError(
-                    EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID
+                    EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
+                    message=f"figure_placement_or_domain_invariant_failed:{catalog_entry.handle}:{exc}",
                 ) from exc
             trace_decision = EditorialFigureDecision.INCLUDED_BY_MODEL
             trace_actor = EditorialFigureDecisionActor.MODEL_PROPOSAL
@@ -5427,7 +5777,8 @@ def validate_editorial_enrichment_proposal(
     if resource_proposals:
         if resource_model_run_id is None:
             raise EditorialEnrichmentProposalControlError(
-                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+                EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+                message="resource_proposals_missing_source_model_run_id",
             )
         persisted_resource_proposals = tuple(
             EditorialResourceProposalV1(
@@ -5444,7 +5795,8 @@ def validate_editorial_enrichment_proposal(
         item.need_key not in {need.key for need in needs} for item in persisted_resource_proposals
     ):
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message="resource_proposal_references_unknown_need_key",
         )
 
     # Root invariants (e.g. globally unique table/diagram keys) are a model
@@ -5475,10 +5827,11 @@ def validate_editorial_enrichment_proposal(
             if exc.code == "editorial_enrichment_placement_invalid"
             else EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
         )
-        raise EditorialEnrichmentProposalControlError(code) from exc
+        raise EditorialEnrichmentProposalControlError(code, message=f"{exc.code}: {exc}") from exc
     except ValueError as exc:
         raise EditorialEnrichmentProposalControlError(
-            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+            EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
+            message=f"{type(exc).__name__}: {exc}",
         ) from exc
     return enrichment
 
@@ -5844,6 +6197,7 @@ class ProductionEditorialEnrichmentService:
                     }
                     for item in resource_proposals
                 ]
+        validation_rejections: list[EditorialEnrichmentValidationRejection] = []
         try:
             enrichment = validate_editorial_enrichment_proposal(
                 parsed.proposal,
@@ -5857,15 +6211,42 @@ class ProductionEditorialEnrichmentService:
                     *_source_figure_inventory_warnings(source_figure_inventory),
                     *parsed.warnings,
                 ),
+                accepted_blocks=parsed.accepted_blocks,
+                validation_rejections=validation_rejections,
             )
         except EditorialEnrichmentProposalControlError as exc:
+            validation_details = [item.to_json() for item in validation_rejections]
             return self._needs_review(
                 input_hash=input_hash,
                 model_run_id=model_run.id,
                 error_code=exc.code,
                 error_message=str(exc),
-                details={**wire_details, "validation_error_code": exc.code.value},
+                details={
+                    **wire_details,
+                    "validation_error_code": exc.code.value,
+                    "validation_error_message": str(exc),
+                    **({"validation_rejections": validation_details} if validation_details else {}),
+                },
                 model_calls=model_calls,
+            )
+        if validation_rejections:
+            serialized_rejections = [item.to_json() for item in validation_rejections]
+            wire_details["validation_rejections"] = serialized_rejections
+            final_rejections = wire_details.get("final_rejections")
+            if not isinstance(final_rejections, list):
+                final_rejections = list(wire_details.get("rejections", ()))
+            wire_details["final_rejections"] = [*final_rejections, *serialized_rejections]
+            wire_details["warnings"] = list(
+                dict.fromkeys(
+                    (
+                        *wire_details.get("warnings", ()),
+                        *(
+                            "editorial_enrichment_validation_block_dropped:"
+                            f"{item.kind}:{item.block_id}:{item.reason_code}"
+                            for item in validation_rejections
+                        ),
+                    )
+                )
             )
         if parsed.rejections:
             enrichment = replace(

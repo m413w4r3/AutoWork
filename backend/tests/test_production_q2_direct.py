@@ -21,7 +21,10 @@ from cti_app.application.model_gateway import (
     ModelRequest,
     ModelSubmissionReconciliationRequiredError,
 )
-from cti_app.application.production_extraction import build_extraction_plan
+from cti_app.application.production_extraction import (
+    ExtractionProgressEvent,
+    build_extraction_plan,
+)
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2EventProposal,
@@ -30,7 +33,10 @@ from cti_app.application.production_parsers import (
     Q2SourceOutput,
 )
 from cti_app.application.production_references import production_reference_corpus_to_json
-from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
+from cti_app.application.production_workflow import (
+    ProductionWorkflowOrchestrator,
+    _should_persist_live_extraction_progress,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -601,7 +607,7 @@ async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
     assert artifact.metadata["source_count"] == 3
     assert artifact.metadata["full_source_count"] == 2
     assert artifact.metadata["ioc_rules_source_count"] == 1
-    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-core-first-v4"
+    assert artifact.metadata["profile_policy_version"] == "production-reference-tier-core-first-v5"
     assert artifact.metadata["contract_version"]
     assert "ExampleRAT" not in repr(artifact.metadata)
 
@@ -611,6 +617,75 @@ async def test_extraction_stage_persists_one_canonical_v1_artifact() -> None:
         assert request.web_search is False
         assert request.prompt_template_id.startswith("production-extraction-archive")
     assert any("evil.security-lab.io" in request.text for request in gateway.calls)
+
+
+@pytest.mark.asyncio
+async def test_extraction_progress_is_persisted_at_call_boundaries_with_legacy_counters() -> None:
+    world, run, snapshot = _tiered_world()
+    gateway = _gateway()
+
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=gateway)
+
+    assert result["status"] == "success"
+    progress = world.runs.run.extraction_progress
+    assert progress is not None
+    assert progress["model_calls"] == len(gateway.calls)
+    assert progress["stage_started_at"]
+    assert progress["last_call_at"]
+    assert progress["last_call_duration_ms"] >= 0
+    assert progress["current_model_run_id"] is None
+    assert progress["current_model_call_started_at"] is None
+    assert progress["total_sources"] == 3
+    assert progress["completed_sources"] == 3
+    assert progress["full_total"] == 2
+    assert progress["full_completed"] == 2
+    assert progress["sources"]
+    assert all(source["chunks_done"] == 1 for source in progress["sources"])
+    # Initial and final snapshots plus both sides of every call are durable.
+    assert world.runs.saved >= 2 + 2 * len(gateway.calls)
+
+
+def test_extraction_progress_throttles_only_non_boundary_updates() -> None:
+    update = ExtractionProgressEvent(
+        event="source",
+        source_ids=(),
+        status="running",
+        chunks_done=0,
+        chunks_total=4,
+        chunks_total_is_estimate=False,
+        model_calls=0,
+    )
+    call_start = ExtractionProgressEvent(
+        event="call_started",
+        source_ids=(),
+        status="running",
+        chunks_done=0,
+        chunks_total=4,
+        chunks_total_is_estimate=False,
+        model_calls=1,
+    )
+
+    assert not _should_persist_live_extraction_progress(update, elapsed_seconds=1.99)
+    assert _should_persist_live_extraction_progress(update, elapsed_seconds=2.0)
+    assert _should_persist_live_extraction_progress(call_start, elapsed_seconds=0.01)
+
+
+@pytest.mark.asyncio
+async def test_extraction_progress_write_failure_does_not_fail_the_stage() -> None:
+    world, run, snapshot = _tiered_world()
+
+    class _FailingRuns(_Runs):
+        async def save(self, run: ProductionRun) -> None:
+            del run
+            raise RuntimeError("progress storage unavailable")
+
+    world.runs = _FailingRuns(run)
+    result = await _run_stage(world, run, snapshot=snapshot, gateway=_gateway())
+
+    assert result["status"] == "success"
+    assert any(
+        artifact.stage is ProductionArtifactStage.EXTRACTION for artifact in world.artifacts.items
+    )
 
 
 @pytest.mark.asyncio

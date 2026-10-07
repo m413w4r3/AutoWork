@@ -3,12 +3,42 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
 SEMANTIC_ANNOTATION_SCHEMA_VERSION = "1"
-SEMANTIC_ANNOTATION_POLICY_VERSION = "semantic-annotation-policy-v2-document-lexicon"
+SEMANTIC_ANNOTATION_POLICY_VERSION = (
+    "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage"
+)
+
+# New documents are always written with the current policy. Verified historical
+# artifacts are immutable, so parsing them must not apply rules introduced by a
+# later policy version.
+LEGACY_SEMANTIC_TEXT_POLICY_VERSIONS = frozenset(
+    {
+        "semantic-annotation-policy-v1",
+        "semantic-annotation-policy-v2-document-lexicon",
+        "semantic-annotation-policy-v3-attached-placeholders",
+        "semantic-annotation-policy-v4-technical-literal-globs",
+    }
+)
+SUPPORTED_SEMANTIC_TEXT_POLICY_VERSIONS = LEGACY_SEMANTIC_TEXT_POLICY_VERSIONS | frozenset(
+    {SEMANTIC_ANNOTATION_POLICY_VERSION}
+)
+
+_FULL_OCCURRENCE_COVERAGE_MIN_POLICY_REVISION = 5
+_SEMANTIC_POLICY_REVISION = re.compile(r"^semantic-annotation-policy-v(?P<revision>\d+)(?:-|$)")
+
+
+def semantic_policy_requires_full_occurrence_coverage(policy_version: str) -> bool:
+    """Whether a document's recorded policy includes the v5 coverage rule."""
+    match = _SEMANTIC_POLICY_REVISION.match(policy_version)
+    return (
+        match is not None
+        and int(match.group("revision")) >= _FULL_OCCURRENCE_COVERAGE_MIN_POLICY_REVISION
+    )
 
 
 class SemanticRole(StrEnum):
@@ -89,6 +119,42 @@ def timeline_anchor(index: int) -> str:
     return f"timeline:{index:04d}"
 
 
+def exact_word_occurrences(text: str, term: str) -> tuple[tuple[int, int], ...]:
+    """Return case-sensitive exact occurrences with bounded outer word edges."""
+    if not text or not term:
+        return ()
+    occurrences: list[tuple[int, int]] = []
+    start = 0
+    while True:
+        start = text.find(term, start)
+        if start < 0:
+            break
+        end = start + len(term)
+        left_word = term[0].isalnum() or term[0] == "_"
+        right_word = term[-1].isalnum() or term[-1] == "_"
+        if not (
+            left_word and start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_")
+        ) and not (right_word and end < len(text) and (text[end].isalnum() or text[end] == "_")):
+            occurrences.append((start, end))
+        start += 1
+    return tuple(occurrences)
+
+
+def semantic_ranges_cover_occurrence(
+    start: int,
+    end: int,
+    ranges: Sequence[tuple[int, int]],
+) -> bool:
+    """Return whether contiguous semantic ranges cover an exact occurrence."""
+    covered_until = start
+    for range_start, range_end in ranges:
+        if range_start <= covered_until < range_end:
+            covered_until = range_end
+            if covered_until >= end:
+                return True
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class SemanticAnnotationProposalV1:
     """An exact text proposal anchored to one stable paragraph identity."""
@@ -148,7 +214,7 @@ class SemanticTextV1:
     def __post_init__(self) -> None:
         if self.schema_version != SEMANTIC_ANNOTATION_SCHEMA_VERSION:
             raise ValueError("Semantic text schema version is unsupported")
-        if self.policy_version != SEMANTIC_ANNOTATION_POLICY_VERSION:
+        if self.policy_version not in SUPPORTED_SEMANTIC_TEXT_POLICY_VERSIONS:
             raise ValueError("Semantic text policy version is unsupported")
         if not isinstance(self.paragraphs, tuple) or any(
             not isinstance(paragraph, SemanticParagraphV1) for paragraph in self.paragraphs

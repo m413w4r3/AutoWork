@@ -48,6 +48,13 @@ le contexte vérifie à chaque heartbeat/progression. Le processus `job-recovery
 périodiquement au worker de reprendre les jobs `running` dont le heartbeat a expiré. La reprise
 est idempotente et respecte `max_attempts`.
 
+Pour un job de production rattaché à un batch `paused`, le worker ne réclame pas un job `queued` :
+il reste en base sans consommer de tentative. Le job-recovery worker laisse également les jobs
+`running` de ce batch à leur place. Si l’étape active se termine avec une erreur transitoire après
+la demande de pause, le job attend la reprise humaine au lieu de programmer son retry. La reprise
+du batch rediffuse le même job idempotent ; les tentatives et le backoff ne progressent pas pendant
+la pause.
+
 ## API et démonstration
 
 - `POST /api/jobs` soumet un job et retourne HTTP 409 pour une clé déjà utilisée ;

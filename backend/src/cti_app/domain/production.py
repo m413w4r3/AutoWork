@@ -374,7 +374,7 @@ class ExtractionProfile(StrEnum):
     IOC_RULES = "ioc_rules"
 
 
-EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-tier-core-first-v4"
+EXTRACTION_PROFILE_POLICY_VERSION = "production-reference-tier-core-first-v5"
 
 
 class DetectionRuleType(StrEnum):
@@ -1506,6 +1506,7 @@ class SampleAcquisitionAttempt:
 class ProductionBatchStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSED = "paused"
     COMPLETED = "completed"
     COMPLETED_WITH_ISSUES = "completed_with_issues"
     CANCELLED = "cancelled"
@@ -1529,6 +1530,15 @@ class ProductionBatchRecoveryConflictError(ValueError):
     def __init__(self, status: ProductionBatchStatus) -> None:
         self.status = status
         super().__init__(f"Production batch in {status.value} status cannot be reopened")
+
+
+class ProductionBatchPauseConflictError(ValueError):
+    """Raised when a terminal batch cannot be paused or resumed."""
+
+    def __init__(self, code: str, status: ProductionBatchStatus) -> None:
+        self.code = code
+        self.status = status
+        super().__init__(code)
 
 
 def production_batch_request_fingerprint(
@@ -1555,6 +1565,8 @@ class EditionProductionBatch:
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    paused_at: datetime | None = None
+    paused_by: str | None = None
     id: UUID = field(default_factory=uuid4)
     version: int = 1
 
@@ -1571,6 +1583,10 @@ class EditionProductionBatch:
             raise ValueError("actor_id must be non-empty and at most 255 characters")
         if not self.correlation_id.strip() or len(self.correlation_id) > 128:
             raise ValueError("correlation_id must be non-empty and at most 128 characters")
+        if self.paused_by is not None and (not self.paused_by.strip() or len(self.paused_by) > 255):
+            raise ValueError("paused_by must be non-empty and at most 255 characters")
+        if (self.paused_at is None) != (self.paused_by is None):
+            raise ValueError("paused_at and paused_by must be supplied together")
 
     def start(self, *, now: datetime | None = None) -> None:
         if self.status is not ProductionBatchStatus.QUEUED:
@@ -1590,6 +1606,34 @@ class EditionProductionBatch:
         self.finished_at = now or datetime.now(UTC)
         self.version += 1
 
+    def pause(self, *, actor_id: str, now: datetime | None = None) -> bool:
+        if self.status is ProductionBatchStatus.PAUSED:
+            return False
+        if self.status not in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}:
+            raise ProductionBatchPauseConflictError("production_batch_not_pausable", self.status)
+        if not actor_id.strip() or len(actor_id) > 255:
+            raise ValueError("paused_by must be non-empty and at most 255 characters")
+        self.status = ProductionBatchStatus.PAUSED
+        self.paused_at = now or datetime.now(UTC)
+        self.paused_by = actor_id
+        self.version += 1
+        return True
+
+    def resume(self, *, now: datetime | None = None) -> bool:
+        if self.status in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}:
+            return False
+        if self.status is not ProductionBatchStatus.PAUSED:
+            raise ProductionBatchPauseConflictError("production_batch_not_resumable", self.status)
+        # A batch paused before its initial dispatch must remain queued so its
+        # first run follows the same start transition as a newly-created batch.
+        self.status = (
+            ProductionBatchStatus.RUNNING
+            if self.started_at is not None
+            else ProductionBatchStatus.QUEUED
+        )
+        self.version += 1
+        return True
+
     def cancel(self, *, now: datetime | None = None) -> bool:
         if self.status is ProductionBatchStatus.CANCELLED:
             return False
@@ -1601,6 +1645,7 @@ class EditionProductionBatch:
         if self.status not in {
             ProductionBatchStatus.QUEUED,
             ProductionBatchStatus.RUNNING,
+            ProductionBatchStatus.PAUSED,
         }:
             raise ProductionBatchCancellationConflictError(self.status)
         self.status = ProductionBatchStatus.CANCELLED
@@ -1648,6 +1693,8 @@ class EditionProductionBatch:
         Returns whether the batch actually changed.
         """
         if self.status is ProductionBatchStatus.CANCELLED:
+            raise ProductionBatchRecoveryConflictError(self.status)
+        if self.status is ProductionBatchStatus.PAUSED:
             raise ProductionBatchRecoveryConflictError(self.status)
         if self.status in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}:
             return False

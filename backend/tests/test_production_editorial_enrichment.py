@@ -9,6 +9,7 @@ from cti_app.application.production_editorial_enrichment import (
     EditorialEnrichmentValidationError,
     _record_covers,
     _record_is_foreign_to,
+    _validate_plain_editorial_text,
     canonical_editorial_enrichment_hash,
     canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
@@ -71,6 +72,15 @@ from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 _SUBJECT_ID = UUID("a0a4f09c-1107-4ae1-8311-bf43fd2a2ce0")
 _DOCUMENT_ID = UUID("b8f83b7b-7088-409a-9667-4f93758c18e1")
 _INPUT_HASH = "a" * 64
+
+
+def test_plain_editorial_validator_accepts_technical_placeholders_and_wildcard_domains() -> None:
+    _validate_plain_editorial_text(
+        r"Une tâche NetSync_<username> utilise %APPDATA%\Microsoft\Network; "
+        "# shepherd-persist; ~/.node_packages; "
+        "conhost.exe --headless <deno_path> --allow-run <workdir> app.js; "
+        "WebSocket vers *.cloudfront.net et fichier *.exe."
+    )
 
 
 def _extraction(

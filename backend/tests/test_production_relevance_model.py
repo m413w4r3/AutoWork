@@ -30,6 +30,7 @@ from cti_app.application.production_prompts import (
 from cti_app.application.production_relevance import (
     ProductionRelevanceProjectionService,
     RelevanceProjectionExecutionStatus,
+    _indicator_case_section_matches_subject,
     build_relevance_projection,
     relevance_projection_input_hash,
     subject_relevance_evidence_counts,
@@ -68,6 +69,7 @@ from cti_app.domain.production import (
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
+    encode_indicator_section_paths,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -84,8 +86,10 @@ from cti_app.domain.production_relevance import (
     RelevanceClassification,
     RelevanceDecisionProvenance,
     RelevanceProposalRejectionReason,
+    RelevanceReasonCode,
     RelevanceSourcePairRelation,
     relevance_projection_from_json,
+    relevance_projection_to_json,
 )
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
@@ -142,6 +146,222 @@ def _world() -> tuple[ProductionInputSnapshot, ProductionExtractionV1, tuple[UUI
         ),
     )
     return snapshot, _extraction(snapshot, (primary, counter)), (primary_id, counter_id)
+
+
+def test_case_section_paths_scope_multi_case_iocs_without_changing_single_case_defaults() -> None:
+    snapshot, extraction, _source_ids = _world()
+    primary = next(
+        source
+        for source in extraction.sources
+        if source.editorial_role is ProductionEditorialRole.PRIMARY
+    )
+    other_case = replace(
+        primary.indicators[0],
+        value="198.51.100.28",
+        context=encode_indicator_section_paths(
+            (
+                (
+                    (1, "Detecting and countering misuse of AI: September 2026"),
+                    (2, "AI supply chain as target, loot, and attack compute"),
+                    (4, "GTG-84006 indicators of compromise"),
+                ),
+            )
+        ),
+    )
+    subject_case = replace(
+        primary.indicators[0],
+        value="198.51.100.29",
+        context=encode_indicator_section_paths(
+            (((2, "GTG-30004: MOIS malware activity"), (4, "Indicators of compromise")),)
+        ),
+    )
+    extraction = replace(
+        extraction,
+        sources=tuple(
+            replace(source, indicators=(other_case, subject_case))
+            if source.source_document_id == primary.source_document_id
+            else source
+            for source in extraction.sources
+        ),
+    )
+
+    projection = build_relevance_projection(snapshot, extraction)
+    other_decision = projection.classification_for(
+        _ref_for(extraction, EvidenceKind.INDICATOR, other_case.value)
+    )
+    subject_decision = projection.classification_for(
+        _ref_for(extraction, EvidenceKind.INDICATOR, subject_case.value)
+    )
+
+    assert other_decision.classification is RelevanceClassification.OUT_OF_SCOPE
+    assert other_decision.reason_code.value == "indicator_section_other_case"
+    assert subject_decision.classification is RelevanceClassification.DIRECT
+    assert subject_decision.reason_code is RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION
+
+    single_case_snapshot, single_case_extraction, _ = _world()
+    single_case = build_relevance_projection(single_case_snapshot, single_case_extraction)
+    normal_ioc = _ref_for(single_case_extraction, EvidenceKind.INDICATOR, "198.51.100.27")
+    normal_decision = single_case.classification_for(normal_ioc)
+    assert normal_decision.classification is RelevanceClassification.DIRECT
+
+    restored_projection = relevance_projection_from_json(relevance_projection_to_json(projection))
+    assert (
+        restored_projection.classification_for(
+            _ref_for(extraction, EvidenceKind.INDICATOR, other_case.value)
+        ).classification
+        is RelevanceClassification.OUT_OF_SCOPE
+    )
+
+    plain_source = next(
+        source
+        for source in single_case_extraction.sources
+        if source.editorial_role is ProductionEditorialRole.PRIMARY
+    )
+    plain_indicator = replace(plain_source.indicators[0], context="")
+    plain_extraction = replace(
+        single_case_extraction,
+        sources=tuple(
+            replace(source, indicators=(plain_indicator, *source.indicators[1:]))
+            if source.source_document_id == plain_source.source_document_id
+            else source
+            for source in single_case_extraction.sources
+        ),
+    )
+    plain_ref = _ref_for(plain_extraction, EvidenceKind.INDICATOR, "198.51.100.27")
+    annotated_indicator = replace(
+        plain_indicator,
+        context=encode_indicator_section_paths(
+            (((2, "GTG-20006: Russian espionage"), (4, "Indicators of compromise")),)
+        ),
+    )
+    annotated_extraction = replace(
+        plain_extraction,
+        sources=tuple(
+            replace(
+                source,
+                indicators=(annotated_indicator, *source.indicators[1:]),
+            )
+            if source.source_document_id == plain_source.source_document_id
+            else source
+            for source in plain_extraction.sources
+        ),
+    )
+    assert _ref_for(annotated_extraction, EvidenceKind.INDICATOR, "198.51.100.27") == plain_ref
+    assert canonical_extraction_hash(annotated_extraction) != canonical_extraction_hash(
+        plain_extraction
+    )
+    section_only_indicator = replace(
+        plain_indicator,
+        context=encode_indicator_section_paths((((4, "Indicators of compromise"),),)),
+    )
+    section_only_extraction = replace(
+        plain_extraction,
+        sources=tuple(
+            replace(source, indicators=(section_only_indicator, *source.indicators[1:]))
+            if source.source_document_id == plain_source.source_document_id
+            else source
+            for source in plain_extraction.sources
+        ),
+    )
+    section_only_ref = _ref_for(section_only_extraction, EvidenceKind.INDICATOR, "198.51.100.27")
+    section_only_decision = build_relevance_projection(
+        single_case_snapshot, section_only_extraction
+    ).classification_for(section_only_ref)
+    assert section_only_decision.classification is RelevanceClassification.DIRECT
+    assert section_only_decision.reason_code is RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION
+
+
+def test_indicator_case_section_matcher_uses_deepest_case_heading_at_any_level() -> None:
+    path_to_other_case = (
+        (1, "Detecting and countering misuse of AI: September 2026"),
+        (2, "AI supply chain as target, loot, and attack compute"),
+        (4, "GTG-50021 indicators of compromise"),
+    )
+    payload = {
+        "context": encode_indicator_section_paths((path_to_other_case,)),
+    }
+    subject_30004 = SimpleNamespace(
+        subject_title="GTG-30004 — profilage OSINT du réseau de collecte Iran-nexus",
+        actor_or_campaign="GTG-30004 · GTG-30004 / Iran-nexus threat actor",
+    )
+    subject_34007 = SimpleNamespace(
+        subject_title="GTG-34007 — campagne de vol de données",
+        actor_or_campaign="GTG-34007 · campagne de vol de données",
+    )
+
+    assert _indicator_case_section_matches_subject(subject_30004, payload) is False
+    assert _indicator_case_section_matches_subject(subject_34007, payload) is False
+
+    subject_path = encode_indicator_section_paths(
+        (
+            (
+                (2, "GTG-30004: profilage OSINT Iran-nexus"),
+                (4, "GTG-30004 indicators of compromise"),
+            ),
+        )
+    )
+    assert _indicator_case_section_matches_subject(subject_30004, {"context": subject_path}) is True
+
+    nested_other_case_path = encode_indicator_section_paths(
+        (
+            (
+                (2, "GTG-30004: profilage OSINT Iran-nexus"),
+                (4, "GTG-50021 indicators of compromise"),
+            ),
+        )
+    )
+    assert (
+        _indicator_case_section_matches_subject(subject_30004, {"context": nested_other_case_path})
+        is False
+    )
+
+    no_case_path = encode_indicator_section_paths(
+        (((1, "Threat activity"), (4, "Indicators of compromise")),)
+    )
+    assert _indicator_case_section_matches_subject(subject_30004, {"context": no_case_path}) is None
+
+
+def test_level_four_other_case_section_classifies_indicator_out_of_scope() -> None:
+    snapshot, extraction, _ = _world()
+    snapshot = _snapshot(
+        subject_id=snapshot.subject_id,
+        title="GTG-30004 — profilage OSINT du réseau de collecte Iran-nexus",
+        actor_or_campaign="GTG-30004 · GTG-30004 / Iran-nexus threat actor",
+    )
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    primary = next(
+        source
+        for source in extraction.sources
+        if source.editorial_role is ProductionEditorialRole.PRIMARY
+    )
+    indicator = replace(
+        primary.indicators[0],
+        context=encode_indicator_section_paths(
+            (
+                (
+                    (1, "Detecting and countering misuse of AI: September 2026"),
+                    (2, "AI supply chain as target, loot, and attack compute"),
+                    (4, "GTG-50021 indicators of compromise"),
+                ),
+            )
+        ),
+    )
+    extraction = replace(
+        extraction,
+        sources=tuple(
+            replace(source, indicators=(indicator,))
+            if source.source_document_id == primary.source_document_id
+            else source
+            for source in extraction.sources
+        ),
+    )
+
+    decision = build_relevance_projection(snapshot, extraction).classification_for(
+        _ref_for(extraction, EvidenceKind.INDICATOR, indicator.value)
+    )
+
+    assert decision.classification is RelevanceClassification.OUT_OF_SCOPE
+    assert decision.reason_code is RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE
 
 
 def _access_policy(snapshot: ProductionInputSnapshot, source_ids: tuple[UUID, ...]):
@@ -517,19 +737,136 @@ def test_model_direct_core_ioc_without_documented_relation_keeps_baseline() -> N
     baseline = build_relevance_projection(snapshot, extraction)
     from cti_app.application.production_relevance_model import ModelRelevanceProposalExecution
 
+    model_proposal = ModelRelevanceProposalExecution(
+        status=RelevanceProposalStatus.SUCCEEDED,
+        classifications=parsed.classifications,
+        rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+    )
     merged = ProductionRelevanceProjectionService._merge_model_proposals(
         baseline,
         extraction,
-        ModelRelevanceProposalExecution(
-            status=RelevanceProposalStatus.SUCCEEDED,
-            classifications=parsed.classifications,
-            rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
-        ),
+        model_proposal,
     )
 
     decision = merged.classification_for(ioc_ref)
     assert decision.classification is RelevanceClassification.DIRECT
     assert decision.provenance is RelevanceDecisionProvenance.DETERMINISTIC_POLICY
+    assert any(
+        item.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
+        for item in merged.model_proposal_rejections
+    )
+
+
+def test_model_cannot_promote_ioc_from_another_explicit_case_section() -> None:
+    snapshot, extraction, _ = _world()
+    snapshot = _snapshot(
+        subject_id=snapshot.subject_id,
+        title="GTG-30004 — profilage OSINT du réseau de collecte Iran-nexus",
+        actor_or_campaign="GTG-30004 · GTG-30004 / Iran-nexus threat actor",
+    )
+    extraction = replace(extraction, production_input_hash=snapshot.input_hash)
+    primary = next(
+        source
+        for source in extraction.sources
+        if source.editorial_role is ProductionEditorialRole.PRIMARY
+    )
+    other_case = replace(
+        primary.indicators[0],
+        value="198.51.100.28",
+        context=encode_indicator_section_paths(
+            (
+                (
+                    (1, "Detecting and countering misuse of AI: September 2026"),
+                    (2, "AI supply chain as target, loot, and attack compute"),
+                    (4, "GTG-84006 indicators of compromise"),
+                ),
+            )
+        ),
+    )
+    extraction = replace(
+        extraction,
+        sources=tuple(
+            replace(source, indicators=(other_case,))
+            if source.source_document_id == primary.source_document_id
+            else source
+            for source in extraction.sources
+        ),
+    )
+    ioc_ref = _ref_for(extraction, EvidenceKind.INDICATOR, other_case.value)
+    baseline = build_relevance_projection(snapshot, extraction)
+    assert baseline.classification_for(ioc_ref).reason_code is (
+        RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE
+    )
+
+    pack = build_relevance_model_evidence_pack(snapshot, extraction)
+    support_ref = _ref_for(extraction, EvidenceKind.FACT, "MOIS Bitcoin operation")
+    valid_other_case_proposal = parse_relevance_classifier_wire(
+        _wire_classification(
+            pack._handle_for_ref[ioc_ref],
+            "OUT_OF_SCOPE",
+            "indicator_section_other_case",
+        ),
+        pack,
+        extraction,
+    )
+    assert valid_other_case_proposal.classifications
+    assert not valid_other_case_proposal.rejections
+    parsed = parse_relevance_classifier_wire(
+        _wire_classification(
+            pack._handle_for_ref[ioc_ref],
+            "DIRECT",
+            "malicious_subject_relation",
+            supporting=pack._handle_for_ref[support_ref],
+        ),
+        pack,
+        extraction,
+    )
+    from cti_app.application.production_relevance_model import ModelRelevanceProposalExecution
+
+    model_proposal = ModelRelevanceProposalExecution(
+        status=RelevanceProposalStatus.SUCCEEDED,
+        classifications=parsed.classifications,
+        rejections=tuple(item.as_domain_rejection() for item in parsed.rejections),
+    )
+    merged = ProductionRelevanceProjectionService._merge_model_proposals(
+        baseline,
+        extraction,
+        model_proposal,
+    )
+
+    decision = merged.classification_for(ioc_ref)
+    assert decision.classification is RelevanceClassification.OUT_OF_SCOPE
+    assert decision.reason_code is RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE
+
+    # Exercise the matcher-based merge guard independently of the baseline's
+    # OUT_OF_SCOPE reason-code guard.
+    guarded_baseline = replace(
+        baseline,
+        classifications=tuple(
+            replace(
+                item,
+                classification=RelevanceClassification.CONTEXT,
+                reason_code=RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+            )
+            if item.evidence_ref == ioc_ref
+            else item
+            for item in baseline.classifications
+        ),
+    )
+    guarded_merge = ProductionRelevanceProjectionService._merge_model_proposals(
+        guarded_baseline,
+        extraction,
+        model_proposal,
+        snapshot=snapshot,
+    )
+
+    assert guarded_merge.classification_for(ioc_ref).classification is (
+        RelevanceClassification.CONTEXT
+    )
+    assert any(
+        rejection.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
+        for rejection in guarded_merge.model_proposal_rejections
+    )
     assert any(
         item.reason_code is RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED
         for item in merged.model_proposal_rejections
@@ -815,9 +1152,7 @@ async def test_classifier_retries_after_fallback_with_model_classifier_identity(
     assert first.status is RelevanceProjectionExecutionStatus.SUCCEEDED
     assert second.status is RelevanceProjectionExecutionStatus.SUCCEEDED
     assert first.projection.classifier_version == DEFAULT_RELEVANCE_CLASSIFIER_VERSION
-    assert second.projection.classifier_version.startswith(
-        "model-subject-scope-v3-counter-analysis:"
-    )
+    assert second.projection.classifier_version.startswith("model-subject-scope-v4-case-sections:")
     assert len(gateway.calls) == 2
 
 
@@ -1241,11 +1576,21 @@ async def test_saved_fixture_repairs_reasons_and_publishes_counter_reserve() -> 
 
 
 def test_relevance_contract_versions_invalidate_old_classifier_reuse() -> None:
-    assert RELEVANCE_CLASSIFIER_PROMPT_VERSION == "subject-relevance-classifier-v3-counter-analysis"
-    assert RELEVANCE_CLASSIFIER_CONTRACT_VERSION == "subject-relevance-text-blocks-v2-reason-pairs"
-    assert RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION == "subject-relevance-wire-v3-repair-reserves"
-    assert RELEVANCE_PROJECTION_POLICY_VERSION == "subject-relevance-counter-analysis-v4"
-    assert DEFAULT_RELEVANCE_CLASSIFIER_VERSION == "deterministic-subject-scope-v4-counter-reserve"
+    assert RELEVANCE_CLASSIFIER_PROMPT_VERSION == (
+        "subject-relevance-classifier-v5-other-case-out-of-scope"
+    )
+    assert RELEVANCE_CLASSIFIER_CONTRACT_VERSION == (
+        "subject-relevance-text-blocks-v3-other-case-out-of-scope"
+    )
+    assert RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION == (
+        "subject-relevance-wire-v4-other-case-out-of-scope"
+    )
+    assert RELEVANCE_PROJECTION_POLICY_VERSION == (
+        "subject-relevance-counter-analysis-v7-deep-case-section-out-of-scope"
+    )
+    assert DEFAULT_RELEVANCE_CLASSIFIER_VERSION == (
+        "deterministic-subject-scope-v7-deep-case-section-out-of-scope"
+    )
 
     snapshot, extraction, source_ids = _world()
     pack = build_relevance_model_evidence_pack(snapshot, extraction)

@@ -1,0 +1,119 @@
+{
+  "diagram": {
+    "asset_id": "a1afcb28-5f08-5c4e-aecb-b7aa38f70321",
+    "caption": "Les données de routage C2 publiées dans une transaction Bitcoin sont récupérées par le malware avant la poursuite de l’opération hors chaîne.",
+    "direction": "top_to_bottom",
+    "edges": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "ae1d55b9eef56687f1f595878845ce633b400a502599692c46dafa9e703d0417",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          }
+        ],
+        "label": "publient les données C2",
+        "source_node_id": "actors",
+        "target_node_id": "bitcoin_transaction"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "87c7e36360cde5c02f11839013f1a6f9df1fc7436d2584aca5a795021e107f02",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          }
+        ],
+        "label": "données récupérées par",
+        "source_node_id": "bitcoin_transaction",
+        "target_node_id": "malware"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "dd584f497a4fa975cf6bba4aaa839c2c2e89219991d13f8403f6a1b13a7cd0f5",
+            "kind": "fact",
+            "source_document_id": "aaef05f6-a4a3-4499-99eb-fb21aa9b96ea"
+          }
+        ],
+        "label": "poursuit l’opération",
+        "source_node_id": "malware",
+        "target_node_id": "offchain"
+      }
+    ],
+    "groups": [],
+    "key": "bitcoin_dead_drop_c2_flow",
+    "kind": "network_flow",
+    "nodes": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "87c7e36360cde5c02f11839013f1a6f9df1fc7436d2584aca5a795021e107f02",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          },
+          {
+            "evidence_key": "ae1d55b9eef56687f1f595878845ce633b400a502599692c46dafa9e703d0417",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          }
+        ],
+        "label": "Acteurs présumés liés à l’Iran",
+        "node_id": "actors",
+        "role": "actor"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "87c7e36360cde5c02f11839013f1a6f9df1fc7436d2584aca5a795021e107f02",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          },
+          {
+            "evidence_key": "ae1d55b9eef56687f1f595878845ce633b400a502599692c46dafa9e703d0417",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          }
+        ],
+        "label": "Transaction Bitcoin avec routage C2",
+        "node_id": "bitcoin_transaction",
+        "role": "data_artifact"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "87c7e36360cde5c02f11839013f1a6f9df1fc7436d2584aca5a795021e107f02",
+            "kind": "fact",
+            "source_document_id": "65d67fad-0e6b-47bc-81af-0ce1a20452b5"
+          },
+          {
+            "evidence_key": "dd584f497a4fa975cf6bba4aaa839c2c2e89219991d13f8403f6a1b13a7cd0f5",
+            "kind": "fact",
+            "source_document_id": "aaef05f6-a4a3-4499-99eb-fb21aa9b96ea"
+          }
+        ],
+        "label": "Malware",
+        "node_id": "malware",
+        "role": "malware_tool"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "dd584f497a4fa975cf6bba4aaa839c2c2e89219991d13f8403f6a1b13a7cd0f5",
+            "kind": "fact",
+            "source_document_id": "aaef05f6-a4a3-4499-99eb-fb21aa9b96ea"
+          }
+        ],
+        "label": "Activité hors chaîne",
+        "node_id": "offchain",
+        "role": "technique_step"
+      }
+    ],
+    "placement": {
+      "kind": "after_section",
+      "section_index": 1
+    },
+    "title": "Du dead drop Bitcoin à l’activité hors chaîne"
+  },
+  "subject_id": "fdde6348-2f3d-4466-b7e2-8be1999c35e7"
+}

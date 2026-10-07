@@ -1,0 +1,167 @@
+{
+  "diagram": {
+    "asset_id": "e38cd915-7e50-539f-a6f0-009362459e1e",
+    "caption": "Une unité provinciale de Qom développe « al-Najm al-thāqib », tandis qu’une deuxième unité construit un front-end Web pour « Arman » ; le système partagé centralise des dossiers issus des collectes de surveillance.",
+    "direction": "top_to_bottom",
+    "edges": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1f9a9ca25e993ecc3dfad1a6efc85b9aaac5fc1460a1e18edd02b08f57b58aaf",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "développe",
+        "source_node_id": "unit_qom",
+        "target_node_id": "al_najm"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1f9a9ca25e993ecc3dfad1a6efc85b9aaac5fc1460a1e18edd02b08f57b58aaf",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          },
+          {
+            "evidence_key": "8446454b8c27fdc4f17a60991f865f058c95b820bbeebcabef486a78bc6461a7",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "alimente",
+        "source_node_id": "unit_qom",
+        "target_node_id": "arman"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1b102e1f409e595624bbd1033a71fa15eb46f4e4b5c6f7949441ce4ab2de473d",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "construit",
+        "source_node_id": "second_unit",
+        "target_node_id": "arman_frontend"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1b102e1f409e595624bbd1033a71fa15eb46f4e4b5c6f7949441ce4ab2de473d",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "front-end de",
+        "source_node_id": "arman_frontend",
+        "target_node_id": "arman"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "c692a72ae51b144cd5b1d1601182c18157d651685f4e34e8e511df2de024fd94",
+            "kind": "fact",
+            "source_document_id": "1656bb26-60c1-466c-aa49-73516cc78207"
+          }
+        ],
+        "label": "contient",
+        "source_node_id": "arman",
+        "target_node_id": "subject_files"
+      }
+    ],
+    "groups": [],
+    "key": "architecture_arman",
+    "kind": "component_relationship",
+    "nodes": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1f9a9ca25e993ecc3dfad1a6efc85b9aaac5fc1460a1e18edd02b08f57b58aaf",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "Unité provinciale de Qom",
+        "node_id": "unit_qom",
+        "role": "actor"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1f9a9ca25e993ecc3dfad1a6efc85b9aaac5fc1460a1e18edd02b08f57b58aaf",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "al-Najm al-thāqib",
+        "node_id": "al_najm",
+        "role": "malware_tool"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1b102e1f409e595624bbd1033a71fa15eb46f4e4b5c6f7949441ce4ab2de473d",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          },
+          {
+            "evidence_key": "48e903cf6609f12fa1ae43904320c0642029aa558beb01223d239bc2f7c2fa83",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "Deuxième unité",
+        "node_id": "second_unit",
+        "role": "actor"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1b102e1f409e595624bbd1033a71fa15eb46f4e4b5c6f7949441ce4ab2de473d",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "Front-end Web d’Arman",
+        "node_id": "arman_frontend",
+        "role": "infrastructure"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "c692a72ae51b144cd5b1d1601182c18157d651685f4e34e8e511df2de024fd94",
+            "kind": "fact",
+            "source_document_id": "1656bb26-60c1-466c-aa49-73516cc78207"
+          },
+          {
+            "evidence_key": "8446454b8c27fdc4f17a60991f865f058c95b820bbeebcabef486a78bc6461a7",
+            "kind": "fact",
+            "source_document_id": "33572a54-b149-4467-bdf2-3ecdd44b75c3"
+          }
+        ],
+        "label": "Arman",
+        "node_id": "arman",
+        "role": "infrastructure"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "c692a72ae51b144cd5b1d1601182c18157d651685f4e34e8e511df2de024fd94",
+            "kind": "fact",
+            "source_document_id": "1656bb26-60c1-466c-aa49-73516cc78207"
+          }
+        ],
+        "label": "Dossiers de sujets",
+        "node_id": "subject_files",
+        "role": "data_artifact"
+      }
+    ],
+    "placement": {
+      "kind": "after_section",
+      "section_index": 2
+    },
+    "title": "Deux unités convergent vers le système Arman"
+  },
+  "subject_id": "30fe8e86-f22d-436c-a3df-f5837e1661e2"
+}

@@ -38,6 +38,9 @@ from cti_app.domain.production import (
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
+    case_ids_from_text,
+    case_section_headings_any_level,
+    decode_indicator_section_paths,
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import (
@@ -71,6 +74,35 @@ from cti_app.domain.production_synthesis import (
 
 RELEVANCE_CLASSIFIER_VERSION = DEFAULT_RELEVANCE_CLASSIFIER_VERSION
 _WORD = re.compile(r"[^\W_]+", re.UNICODE)
+_GENERIC_CASE_TITLE_TERMS = frozenset(
+    {
+        "activity",
+        "campaign",
+        "operation",
+        "report",
+        "malware",
+        "actor",
+        "threat",
+        "espionage",
+        "case",
+        "study",
+        "developing",
+        "development",
+        "targeting",
+        "targeted",
+        "target",
+        "using",
+        "use",
+        "detection",
+        "detecting",
+        "automating",
+        "automation",
+        "intelligence",
+        "open",
+        "source",
+        "osint",
+    }
+)
 _EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[A-Za-z]{2,}\b")
 _GENERIC_FILENAMES = frozenset(
     {
@@ -209,7 +241,49 @@ def _item_text(kind: EvidenceKind, payload: Mapping[str, Any]) -> str:
         EvidenceKind.RULE: ("name", "context", "evidence_quote", "body"),
         EvidenceKind.UNCERTAINTY: ("text",),
     }[kind]
+    if (
+        kind is EvidenceKind.INDICATOR
+        and decode_indicator_section_paths(str(payload.get("context") or "")) is not None
+    ):
+        fields = ("value", "evidence_quote")
     return " ".join(str(payload.get(key) or "") for key in fields)
+
+
+def _indicator_case_section_matches_subject(
+    snapshot: ProductionInputSnapshot, payload: Mapping[str, Any]
+) -> bool | None:
+    """Resolve generated multi-case section metadata against frozen subject terms."""
+    paths = decode_indicator_section_paths(str(payload.get("context") or ""))
+    if paths is None:
+        return None
+    subject_case_ids = {
+        case_id
+        for value in (snapshot.subject_title, snapshot.actor_or_campaign or "")
+        for case_id in case_ids_from_text(value)
+    }
+    case_titles: list[str] = []
+    for path in paths:
+        path_case_headings = case_section_headings_any_level(path)
+        if path_case_headings:
+            # A nested case heading (often a level-4 IOC subsection) overrides
+            # a case-naming parent heading for the indicator's section path.
+            case_titles.append(max(path_case_headings, key=lambda heading: heading[0])[1])
+    if not case_titles:
+        return None
+    if subject_case_ids:
+        section_case_ids = {
+            case_id for title in case_titles for case_id in case_ids_from_text(title)
+        }
+        return bool(subject_case_ids & section_case_ids)
+    anchors = {
+        term
+        for value in (snapshot.subject_title, snapshot.actor_or_campaign or "")
+        for term in _normalize(value).split()
+        if len(term) >= 4
+        and term not in _BROAD_SCOPE_WORDS
+        and term not in _GENERIC_CASE_TITLE_TERMS
+    }
+    return any(_matches_subject(title, frozenset(anchors)) for title in case_titles)
 
 
 def _source_for_ref(extraction: ProductionExtractionV1) -> dict[UUID, Any]:
@@ -274,9 +348,14 @@ def _classify_item(
                 RelevanceClassification.CONTEXT,
                 RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
             )
+        if primary_core and _indicator_case_section_matches_subject(snapshot, payload) is False:
+            return decision(
+                RelevanceClassification.OUT_OF_SCOPE,
+                RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE,
+            )
         if primary_core:
-            # The primary CORE publication is about this subject: a value it
-            # presents as malicious belongs to it unless another actor is named.
+            # Primary CORE evidence remains the default only when its explicit
+            # multi-case section does not contradict the subject attribution.
             return decision(
                 RelevanceClassification.DIRECT,
                 RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
@@ -803,7 +882,9 @@ class ProductionRelevanceProjectionService:
                     invocation_hash=proposal.invocation_hash,
                     parse_identity=proposal.parse_identity,
                 )
-            projection = self._merge_model_proposals(projection, extraction, proposal)
+            projection = self._merge_model_proposals(
+                projection, extraction, proposal, snapshot=snapshot
+            )
             artifact_metadata = {
                 "model_classifier_enabled": True,
                 "model_calls": proposal.model_calls,
@@ -952,6 +1033,8 @@ class ProductionRelevanceProjectionService:
         baseline: RelevanceProjectionV1,
         extraction: ProductionExtractionV1,
         proposal: ModelRelevanceProposalExecution,
+        *,
+        snapshot: ProductionInputSnapshot | None = None,
     ) -> RelevanceProjectionV1:
         evidence = dict(extraction_evidence_elements(extraction))
         decisions = {item.evidence_ref: item for item in baseline.classifications}
@@ -981,6 +1064,22 @@ class ProductionRelevanceProjectionService:
                 continue
             seen.add(item.evidence_ref)
             payload = evidence[item.evidence_ref]
+            baseline_decision = decisions[item.evidence_ref]
+            if item.evidence_ref.kind is EvidenceKind.INDICATOR and (
+                baseline_decision.reason_code is RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE
+                or (
+                    snapshot is not None
+                    and _indicator_case_section_matches_subject(snapshot, payload) is False
+                )
+            ):
+                rejections.append(
+                    RelevanceProposalRejectionV1(
+                        item.block_id,
+                        RelevanceProposalRejectionReason.RELATION_NOT_DOCUMENTED,
+                        item.raw_sha256,
+                    )
+                )
+                continue
             if item.evidence_ref.kind is EvidenceKind.INDICATOR:
                 value = str(payload.get("value") or "").strip().casefold()
                 if value in _GENERIC_FILENAMES:
@@ -1001,7 +1100,6 @@ class ProductionRelevanceProjectionService:
                         )
                     )
                     continue
-            baseline_decision = decisions[item.evidence_ref]
             fallback_pair = fallback_pair_by_ref.get(item.evidence_ref)
             if (
                 fallback_pair is not None

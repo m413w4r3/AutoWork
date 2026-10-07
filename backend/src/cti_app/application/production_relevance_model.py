@@ -106,7 +106,12 @@ _REASON_CODES: dict[RelevanceClassification, frozenset[RelevanceReasonCode]] = {
             RelevanceReasonCode.EXPLICIT_SUBJECT_DENIAL,
         }
     ),
-    RelevanceClassification.OUT_OF_SCOPE: frozenset({RelevanceReasonCode.EXPLICIT_OTHER_ACTOR}),
+    RelevanceClassification.OUT_OF_SCOPE: frozenset(
+        {
+            RelevanceReasonCode.EXPLICIT_OTHER_ACTOR,
+            RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE,
+        }
+    ),
     RelevanceClassification.INDETERMINATE: frozenset(
         {
             RelevanceReasonCode.RELATION_NOT_ESTABLISHED,
@@ -406,7 +411,7 @@ def build_relevance_classifier_model_request(
         "CORROBORATION: subject_matched_corroboration, malicious_subject_corroboration",
         "CONTEXT: context_source_without_relation, malicious_role_not_demonstrated",
         "COUNTER_INDICATION: explicit_counter_analysis, explicit_subject_denial",
-        "OUT_OF_SCOPE: explicit_other_actor",
+        "OUT_OF_SCOPE: explicit_other_actor, indicator_section_other_case",
         "INDETERMINATE: relation_not_established, subject_link_not_demonstrated",
         (
             "For DIRECT or CORROBORATION on an indicator, cite at least one additional "
@@ -823,7 +828,7 @@ class ModelRelevanceClassifier:
     def version(self) -> str:
         return ":".join(
             (
-                "model-subject-scope-v3-counter-analysis",
+                "model-subject-scope-v4-case-sections",
                 self._contract_version,
                 self._prompt_version,
                 self._parser_version,

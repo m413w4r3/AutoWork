@@ -21,10 +21,11 @@
 }
 
 #let render-table(item) = {
-  if has-text(item.title) [
-    #text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]
-    #v(4pt)
-  ]
+  let title = if has-text(item.title) {
+    [#text(size: 12pt, weight: "bold")[#semantic-or-plain(item.title, item.at("semantic_title", default: none))]]
+  } else {
+    none
+  }
 
   let weights = item.at("column_weights", default: item.columns.map(column => 1.0))
   let widths = weights.map(weight => weight * 1fr)
@@ -43,6 +44,7 @@
   styled-table(
     widths,
     cell-align: cell-alignments,
+    title: title,
     ..(header-cells + body-cells),
   )
 
@@ -59,10 +61,11 @@
   text(size: 9pt, fill: grey)[Figure #number : #semantic-or-plain(caption, semantic-spans)],
 )
 
-// Measure against the active page's printable frame. Keep natural dimensions
-// unless the image plus its caption and source notes would exceed that frame.
-#let render-publication-image(media-path, caption, annotation: []) = layout(size => {
-  let natural-image = image(media-path, width: size.width)
+// Preserve intrinsic dimensions and scale down to the printable frame before
+// laying out the image with its caption and source note.
+#let render-publication-image(media-path, caption, annotation: [], max-height-fraction: 0.82) = layout(size => {
+  let natural-image = image(media-path)
+  let natural-size = measure(natural-image)
   let following-content = [
     #if caption != none [
       #v(4pt)
@@ -70,16 +73,19 @@
     ]
     #annotation
   ]
-  let following-height = measure(following-content, width: size.width).height
-  let available-image-height = calc.max(1pt, size.height - following-height)
-  let rendered-image = if measure(natural-image, width: size.width).height > available-image-height {
-    image(media-path, width: size.width, height: available-image-height, fit: "contain")
+  let max-image-height = calc.max(1pt, size.height * max-height-fraction)
+  let scale = calc.min(
+    1,
+    calc.min(size.width / natural-size.width, max-image-height / natural-size.height),
+  )
+  let rendered-image = if scale < 1 {
+    image(media-path, width: natural-size.width * scale)
   } else {
     natural-image
   }
 
   block(breakable: false, width: 100%)[
-    #rendered-image
+    #align(center)[#rendered-image]
     #following-content
   ]
 })
@@ -96,7 +102,7 @@
   } else {
     none
   }
-  render-publication-image(item.media_path, caption-content)
+  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.55)
 }
 
 #let render-figure(item) = {
@@ -110,11 +116,8 @@
     none
   }
   let annotation = [
-    #if has-text(item.provenance) [
-      #block(above: 2pt, text(size: 8pt, fill: grey)[Provenance : #semantic-or-plain(item.provenance, item.at("semantic_provenance", default: none))])
-    ]
-    #if has-text(item.locator) [
-      #block(above: 2pt, text(size: 8pt, fill: grey)[Repère : #item.locator])
+    #if has-text(item.source_note) [
+      #block(above: 2pt, text(size: 8pt, fill: grey)[Source : #item.source_note])
     ]
   ]
   render-publication-image(item.media_path, caption-content, annotation: annotation)
@@ -132,7 +135,7 @@
   } else {
     none
   }
-  render-publication-image(item.media_path, caption-content)
+  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.55)
 }
 
 #let render-body-block(item) = {
@@ -170,6 +173,7 @@
       }
     ] else if content_section.type == "technical_annex" [
       #let indicators = content_section.indicators
+      #let originals = content_section.original_indicators
       #if indicators.ips.len() > 0 or indicators.domains.len() > 0 or indicators.urls.len() > 0 or indicators.emails.len() > 0 or indicators.hashes.len() > 0 [
         #ioc-list(
           title: [IOC],
@@ -178,6 +182,18 @@
           urls: indicators.urls,
           emails: indicators.emails,
           hashes: indicators.hashes,
+        )
+      ]
+      #if originals.ips.len() > 0 or originals.domains.len() > 0 or originals.urls.len() > 0 or originals.emails.len() > 0 or originals.hashes.len() > 0 [
+        #v(8pt)
+        #ioc-list(
+          title: [IOC originaux à lien non démontré],
+          note: content_section.original_indicator_note,
+          ips: originals.ips,
+          domains: originals.domains,
+          urls: originals.urls,
+          emails: originals.emails,
+          hashes: originals.hashes,
         )
       ]
     ] else {

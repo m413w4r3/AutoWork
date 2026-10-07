@@ -94,7 +94,11 @@ class _Batches:
                 for batch_id in self.order
                 if self.items[batch_id].edition_id == edition_id
                 and self.items[batch_id].status
-                in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}
+                in {
+                    ProductionBatchStatus.QUEUED,
+                    ProductionBatchStatus.RUNNING,
+                    ProductionBatchStatus.PAUSED,
+                }
             ),
             None,
         )

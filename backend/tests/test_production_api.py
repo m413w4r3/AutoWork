@@ -25,7 +25,10 @@ from cti_app.api import production as production_api
 from cti_app.api.production import router
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.identity import LocalIdentityProvider
-from cti_app.application.production_read_model import BatchStatusItem
+from cti_app.application.production_read_model import (
+    BatchStatusItem,
+    ProductionActivitySnapshot,
+)
 from cti_app.application.production_reconciliation_resolver import ReconciliationOutcome
 from cti_app.application.production_state import (
     ProductionStateSnapshotV5,
@@ -338,7 +341,7 @@ class _Batches:
             (
                 b
                 for b in self.items.values()
-                if b.edition_id == edition_id and b.status in ("queued", "running")
+                if b.edition_id == edition_id and b.status in ("queued", "running", "paused")
             ),
             None,
         )
@@ -350,7 +353,7 @@ class _Batches:
         matches = [
             b
             for b in self.items.values()
-            if b.edition_id == edition_id and b.status not in ("queued", "running")
+            if b.edition_id == edition_id and b.status not in ("queued", "running", "paused")
         ]
         return list(reversed(matches))[:limit]
 
@@ -376,6 +379,18 @@ class _BatchStatusReadModel:
         self._uow = uow
         self.calls = 0
         self.snapshots: dict[UUID, SimpleNamespace] = {}
+        self.activity_calls = 0
+        self.activity_snapshots: dict[UUID, ProductionActivitySnapshot] = {}
+
+    async def list_activity_for_runs(
+        self, run_ids: Sequence[UUID]
+    ) -> Sequence[ProductionActivitySnapshot]:
+        self.activity_calls += 1
+        return tuple(
+            self.activity_snapshots[run_id]
+            for run_id in run_ids
+            if run_id in self.activity_snapshots
+        )
 
     async def list_for_batch(self, batch_id: UUID) -> Sequence[BatchStatusItem]:
         self.calls += 1
@@ -774,6 +789,59 @@ async def test_get_edition_production_without_batch_returns_an_empty_board(
         "subjects": [],
         "recent_batches": [],
     }
+
+
+async def test_get_edition_production_exposes_subject_activity_schema(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Probe", subject_id)
+    run = ProductionRun(subject_id=subject_id, edition_id=edition_id)
+    await uow.production_runs.add(run)
+    created_at = datetime.now(UTC)
+    uow.batch_status_read_model.activity_snapshots[run.id] = ProductionActivitySnapshot(
+        subject_id=subject_id,
+        run_id=run.id,
+        stage=run.current_stage,
+        run_status=run.status,
+        job_kind="production.subject.reconciliation_probe",
+        job_status="queued",
+        job_created_at=created_at,
+        attempt=1,
+    )
+
+    response = await api.get(f"/api/editions/{edition_id}/production")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    activity = body["subjects"][0]["activity"]
+    assert activity["kind"] == "reconciliation_probe"
+    assert activity["stage"] == run.current_stage.value
+    assert activity["started_at"] == created_at.isoformat()
+    assert activity["attempt"] == 1
+    assert "aucune requête modèle" in activity["detail"]
+    assert uow.batch_status_read_model.activity_calls == 1
+
+
+async def test_batch_status_marks_a_manual_retry_reopening_review(
+    api: AsyncClient, uow: _Uow
+) -> None:
+    edition_id, subject_id = uuid4(), uuid4()
+    _select(uow, edition_id, "Retry", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
+    assert started.status_code == 200, started.text
+    batch_id = UUID(started.json()["batch_id"])
+    batch = uow.edition_production_batches.items[batch_id]
+    item = uow.edition_production_batch_items.items[0]
+    run = uow.production_runs.items[item.production_run_id]
+    run.pipeline_generation = 1
+    batch.status = ProductionBatchStatus.RUNNING
+    batch.phase = ProductionBatchPhase.REVIEW
+
+    response = await api.get(f"/api/editions/{edition_id}/production")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["active_batch"]["reactivated_by_retry"] is True
 
 
 async def test_invalidate_reuse_without_run_returns_404(api: AsyncClient) -> None:
@@ -1218,6 +1286,50 @@ async def test_batch_status_exposes_phase_schedule_and_item_error_details(
     assert body["item_details"][0]["error_code"] == "bridge_timeout"
     assert body["item_details"][0]["error_message"] == "bridge stopped"
     assert "error_details" not in body["item_details"][0]
+
+
+async def test_batch_pause_and_resume_are_visible_and_emit_events(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+    tmp_path: Path,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
+    assert started.status_code == 200, started.text
+    batch_id = started.json()["batch_id"]
+    production_app.state.production_diagnostics = DiagnosticsLog.from_env(tmp_path)
+
+    paused = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/pause")
+    repeated = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/pause")
+    board = await api.get(f"/api/editions/{edition_id}/production")
+
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["status"] == "paused"
+    assert paused.json()["paused_at"] is not None
+    assert paused.json()["paused_by"] == "dev-analyst"
+    assert paused.json()["changed"] is True
+    assert repeated.status_code == 200
+    assert repeated.json()["changed"] is False
+    active = board.json()["active_batch"]
+    assert active["status"] == "paused"
+    assert active["paused_at"] == paused.json()["paused_at"]
+    assert active["item_details"][0]["status"] == "running"
+    assert active["item_details"][0]["paused"] is True
+    assert active["item_details"][0]["paused_stage"] == "sources"
+
+    resumed = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/resume")
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["status"] == "running"
+    assert resumed.json()["changed"] is True
+    events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert "production.batch_paused" in events
+    assert "production.batch_resumed" in events
 
 
 async def test_subject_and_batch_status_expose_extraction_progress(
@@ -2226,6 +2338,76 @@ async def test_batch_cancel_marks_every_active_run_and_cancels_exact_jobs(
     assert unrelated.id not in jobs.cancelled
 
 
+async def test_batch_cancel_still_works_after_pause(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    _select(uow, edition_id, "TAG-182", subject_id)
+    jobs = _CancelableJobs()
+    production_app.state.job_service = jobs
+    started = await _start_batch(api, edition_id, [subject_id])
+    batch_id = started.json()["batch_id"]
+
+    paused = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/pause")
+    cancelled = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/cancel")
+
+    assert paused.status_code == 200
+    assert cancelled.status_code == 200, cancelled.text
+    assert cancelled.json()["status"] == "cancelled"
+    assert all(
+        run.status is ProductionRunStatus.CANCELLED for run in uow.production_runs.items.values()
+    )
+
+
+async def test_batch_pause_and_resume_reject_terminal_batches(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    edition_id = uuid4()
+    subject_id = uuid4()
+    _select(uow, edition_id, "TAG-182", subject_id)
+    started = await _start_batch(api, edition_id, [subject_id])
+    batch_id = started.json()["batch_id"]
+    batch = uow.edition_production_batches.items[UUID(batch_id)]
+    batch.finish(completed_with_issues=True)
+
+    paused = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/pause")
+    resumed = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/resume")
+
+    assert paused.status_code == 409
+    assert paused.json()["detail"]["code"] == "production_batch_not_pausable"
+    assert resumed.status_code == 409
+    assert resumed.json()["detail"]["code"] == "production_batch_not_resumable"
+
+
+async def test_per_run_retry_is_rejected_while_owning_batch_is_paused(
+    api: AsyncClient,
+    uow: _Uow,
+) -> None:
+    edition_id = uuid4()
+    subjects = [uuid4(), uuid4()]
+    for name, subject_id in zip(("TAG-182", "TAG-183"), subjects, strict=True):
+        _select(uow, edition_id, name, subject_id)
+    started = await _start_batch(api, edition_id, subjects)
+    items = sorted(uow.edition_production_batch_items.items, key=lambda item: item.position)
+    current = uow.production_runs.items[items[0].production_run_id]
+    current.mark_needs_review(code="manual_review", message="Needs an operator")
+    batch_id = started.json()["batch_id"]
+
+    paused = await api.post(f"/api/editions/{edition_id}/production/{batch_id}/pause")
+    retry = await api.post(
+        f"/api/production/runs/{current.id}/retry",
+        json={"stage": "sources"},
+    )
+
+    assert paused.status_code == 200
+    assert retry.status_code == 409
+    assert retry.json()["detail"]["code"] == "production_batch_paused"
+
+
 async def test_batch_cancel_preserves_terminal_runs(
     api: AsyncClient,
     uow: _Uow,
@@ -3194,7 +3376,7 @@ def _finish_current_batch(uow: _Uow) -> None:
                 run.start_running()
             run.mark_ready()
     for batch in uow.edition_production_batches.items.values():
-        if batch.status in ("queued", "running"):
+        if batch.status in ("queued", "running", "paused"):
             batch.finish()
 
 

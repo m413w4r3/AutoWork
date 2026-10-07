@@ -22,6 +22,11 @@ from cti_app.domain.publication_document import (
     PublicationDocumentV5,
     serialize_publication_document,
 )
+from cti_app.domain.semantic_annotation import (
+    exact_word_occurrences,
+    semantic_policy_requires_full_occurrence_coverage,
+    semantic_ranges_cover_occurrence,
+)
 
 _LEGACY_CITATION = re.compile(r"\[S\d+\]", re.IGNORECASE)
 _INTERNAL_DIAGNOSTIC = re.compile(
@@ -72,30 +77,10 @@ def _semantic_annotation_has_full_occurrence_coverage(
                 if span.role.value != "text":
                     ranges.append((cursor, end))
                 cursor = end
-            start = 0
-            left_word = term[0].isalnum() or term[0] == "_"
-            right_word = term[-1].isalnum() or term[-1] == "_"
-            while True:
-                start = text.find(term, start)
-                if start < 0:
-                    break
-                end = start + len(term)
-                if (
-                    left_word
-                    and start > 0
-                    and (text[start - 1].isalnum() or text[start - 1] == "_")
-                ) or (right_word and end < len(text) and (text[end].isalnum() or text[end] == "_")):
-                    start += 1
-                    continue
-                covered_until = start
-                for range_start, range_end in ranges:
-                    if range_start <= covered_until < range_end:
-                        covered_until = range_end
-                        if covered_until >= end:
-                            break
-                if covered_until < end:
+            semantic_ranges = tuple(ranges)
+            for start, end in exact_word_occurrences(text, term):
+                if not semantic_ranges_cover_occurrence(start, end, semantic_ranges):
                     return False
-                start += 1
     return True
 
 
@@ -135,11 +120,16 @@ def qa_publication_v5(
     if not checks["title_format"]:
         errors.append("Publication title does not match the [Groupe] Titre format")
     if isinstance(publication, PublicationDocumentV5):
-        checks["semantic_annotation_coverage"] = _semantic_annotation_has_full_occurrence_coverage(
-            publication
-        )
-        if not checks["semantic_annotation_coverage"]:
-            errors.append("A semantic annotation is missing from another exact occurrence")
+        if semantic_policy_requires_full_occurrence_coverage(
+            publication.semantic_text.policy_version
+        ):
+            checks["semantic_annotation_coverage"] = (
+                _semantic_annotation_has_full_occurrence_coverage(publication)
+            )
+            if not checks["semantic_annotation_coverage"]:
+                errors.append("A semantic annotation is missing from another exact occurrence")
+        else:
+            checks["semantic_annotation_coverage"] = True
         semantic_paragraphs = publication.semantic_text.paragraphs
         annotated_spans = sum(
             span.role.value != "text"
@@ -281,6 +271,45 @@ def qa_publication_v5(
         if publication.indicators or (v5 and v5.original_indicators):
             expected_types.append("technical_annex")
         checks["references_then_synthesis"] = section_types == expected_types
+        annex = next(
+            (
+                section
+                for section in render_model.content_sections
+                if section["type"] == "technical_annex"
+            ),
+            None,
+        )
+        rendered_main = {
+            str(item["text"]).casefold()
+            for group in (annex or {}).get("indicators", {}).values()
+            for item in group
+        }
+        rendered_original = {
+            str(item["text"]).casefold()
+            for group in (annex or {}).get("original_indicators", {}).values()
+            for item in group
+        }
+        expected_main = {
+            indicator.normalized_value.casefold()
+            for group in publication.indicators
+            for indicator in group.indicators
+        }
+        expected_original = {
+            indicator.normalized_value.casefold()
+            for group in (v5.original_indicators if v5 else ())
+            for indicator in group.indicators
+        }
+        checks["ioc_groups_separated"] = (
+            rendered_main == expected_main
+            and rendered_original == expected_original
+            and not rendered_main.intersection(rendered_original)
+            and (
+                not expected_original
+                or "pas démontré" in str((annex or {}).get("original_indicator_note", ""))
+            )
+        )
+        if not checks["ioc_groups_separated"]:
+            errors.append("Subject IOCs and unlinked original IOCs are not clearly separated")
         synthesis_section = next(
             (
                 section

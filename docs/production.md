@@ -216,8 +216,15 @@ regroupées dans un lot, uniquement entre captures soumises à la même politiqu
 handles `B#` du lot sont temporaires : une réponse non attribuable sans ambiguïté est rejetée pour
 la source concernée, qui est relue seule, et aucun IOC n’est redistribué entre publications.
 
-La progression publiée par le stage liste chaque source du corpus avec son tier, son profil et son
-verdict (`succeeded`, `cached`, `failed`, `omitted`).
+La progression publiée par le stage garde les compteurs historiques (`sources`, `total_sources`,
+`completed_sources`, `model_calls`, `full_total`, etc.) et ajoute les compteurs live par source :
+`status`, `chunks_done`, `chunks_total` et `chunks_total_is_estimate`. Les grandes sources utilisent
+le nombre exact de tranches produit par `archived_source_chunks`; les petites sources regroupées
+indiquent une tranche estimée, car une réponse non attribuable peut les relancer individuellement.
+Chaque appel expose `current_model_call_started_at`, `last_call_at` et
+`last_call_duration_ms`. Ces champs résident dans `production_runs.extraction_progress` et ne
+participent ni aux hashes ni aux versions fonctionnelles. Une erreur d’écriture de progression est
+consignée sans interrompre l’extraction.
 
 Les consommateurs historiques (export d’état et certaines fonctions du Repair Desk) peuvent
 encore lire `TechnicalExtraction` via la frontière legacy `application/production_extraction.py`.
@@ -255,6 +262,31 @@ chaque affirmation factuelle canonique doit citer une `ExtractionEvidenceRefV1`.
 n’effectue aucune recherche Web, ne rouvre aucun corps source pour découvrir des faits, ne prend
 pas `ReferenceReport` ni `TechnicalExtraction` comme entrées canoniques et ne consomme pas l’état
 `EVENT` Q1 de REFERENCES. Une information absente de l’extraction est omise.
+
+Le kind d’une section est un ancrage de placement interne et son heading n’est pas publié.
+Les handles E d’indicateurs et de règles peuvent donc étayer une affirmation dans n’importe
+quel kind de section narrative. Le lead garde sa règle propre : il ne cite pas de handle E
+technique. Les handles R restent réservés aux qualifications ou contradictions qu’ils
+représentent, et les littéraux techniques du texte doivent être soutenus par les handles E
+cités. Un hostname dérivé de l’URL canonique d’une source, avec ou sans son préfixe `www.`,
+peut aussi nommer cette source sans handle dédié ; cette variante reste limitée à son propre
+hostname. Les variantes de host dérivées du contenu extrait gardent l’exigence d’un handle cité
+qui les soutient. Un littéral absent de l’extraction ou soutenu uniquement par des handles non
+cités fait échouer la validation. `validation_reason` conserve le bloc, le type et la valeur
+bornée du littéral, ainsi que la cause. Toutes les citations doivent toujours résoudre vers
+l’extraction courante.
+
+Pour les documents multi-cas dont les titres de section identifient explicitement les cas
+(par exemple `GTG-30004` ou `Case study 2`), la gate Q2 conserve le chemin de titres qui
+encadre chaque IOC dans le champ `context` existant. La projection rend un IOC primaire
+`DIRECT` seulement si ce chemin nomme le sujet ; un IOC placé sous un autre cas reçoit la
+classification `OUT_OF_SCOPE` et le motif stable `indicator_section_other_case`. Il reste
+visible dans la projection de diagnostic, mais est exclu de la publication, y compris du groupe
+réserve des IOC originaux à lien non démontré. Ce groupe reste destiné aux IOC de sources
+FULL dont le lien avec le sujet n’est pas démontré, par exemple les sources de soutien. Une
+source à cas unique garde son comportement antérieur. Cette règle ne détecte pas les
+roundups qui n’identifient pas leurs sections par un identifiant de cas explicite, et ne
+déduit pas un rattachement depuis la seule proximité textuelle.
 
 Le brouillon passe par `ModelGateway.draft` sous forme stateless, avec Web désactivé et sortie
 structurée. L’identité durable du `ModelRun` porte la soumission et sa réconciliation : une
@@ -368,6 +400,15 @@ Il retourne `200` même lorsqu’aucun sujet n’est éligible et expose :
 - le batch actif, sa progression et ses étapes ;
 - les batchs récents et leurs résultats.
 
+Chaque sujet et article de batch porte aussi `activity`, une lecture ensembliste des jobs actifs et
+du `ModelRun` courant : `model_call`, `reconciliation_probe`, `retry_scheduled`, `waiting_batch`,
+`deterministic_stage` ou `idle`, avec étape, heure de début, durée et détail. Un sondage de
+réconciliation reste explicitement une vérification sans soumission modèle. Le batch expose
+`reactivated_by_retry` lorsqu’un nouvel essai manuel rouvre depuis Review un batch et relance un run
+dont la génération a déjà avancé. Les autres étapes modèle affichent leur étape déterministe ; leur
+association directe à un `ModelRun` reste un suivi ultérieur, car leurs requêtes n’ont pas de lien
+persisté vers le run de production.
+
 Le board ne lit pas la route Selection. Une édition `ARCHIVED` reste lisible, mais son board est
 en lecture seule : aucun nouveau batch ni changement de sujet n’est accepté.
 
@@ -410,6 +451,27 @@ est `RUNNING` à la fois ; un run terminal (`READY`, `NEEDS_REVIEW`, `FAILED`, `
 la main au suivant. Plusieurs vagues peuvent se succéder dans l’édition : `[A, B]`, puis `[C]`,
 puis de nouveau `[A]`. L’édition ne porte aucun statut ni phase de production.
 
+Un batch peut aussi être `PAUSED`. `POST /api/editions/{edition_id}/production/{batch_id}/pause`
+et `/resume` commandent cette transition. La pause conserve l’ordre, la phase et l’échéance de
+pacing du batch, ainsi que `paused_at` et `paused_by`. Elle n’annule aucun run. Si une étape est
+en cours, cette étape se termine ; son run reste `RUNNING` et son `current_stage` devient l’étape
+exacte à reprendre. La chaîne ne soumet alors aucune étape suivante. Un article déjà en attente
+reste `QUEUED`.
+
+Le worker vérifie l’état du batch avant de réclamer un job de production. Les jobs en attente
+restent en base sans consommer de tentative et le job de reprise des heartbeats laisse les jobs
+actifs d’un batch en pause en attente. À la reprise, la chaîne rediffuse la clé d’idempotence
+existante pour `current_stage`, ou démarre le premier article `QUEUED` dans l’ordre d’origine.
+Une étape déjà en cours n’est pas interrompue ; une réponse modèle ambiguë conserve donc son
+identité de soumission et ses règles de réconciliation.
+
+Une pause répétée et une reprise répétée sont idempotentes. Une pause d’un batch terminé ou
+annulé et la reprise d’un batch terminé ou annulé répondent `409` avec un code stable. Annuler
+reste disponible pendant une pause et arrête alors aussi le run en cours. Les retries, reprises
+de run et réémissions de réconciliation d’un article appartenant à un batch en pause sont
+refusés jusqu’à la reprise du batch ; les lectures et réparations qui ne démarrent pas de travail
+modèle restent disponibles.
+
 L’historique d’un sujet est lu par `GET /api/subjects/{subject_id}/production/runs` (du plus
 récent au plus ancien), un run par `GET /api/production/runs/{run_id}`, et
 `GET /api/subjects/{subject_id}/production` reste un raccourci vers le dernier run.
@@ -441,3 +503,5 @@ manifeste de publication immutable contenant l’ordre, les `subject_id`, les ru
 les versions et les hashes retenus. L’assemblage et les rendus lisent uniquement ce manifeste.
 
 Une nouvelle production ne modifie donc pas les snapshots, artifacts ou manifestes historiques.
+Les nouvelles productions utilisent toujours la policy sémantique courante ; un ensemble explicite
+de versions historiques garde les documents déjà émis lisibles après un changement de policy.

@@ -15,16 +15,70 @@ from uuid import UUID
 
 from cti_app.domain.production import ProductionInputSnapshot
 from cti_app.domain.production_extraction import (
+    INDICATOR_SECTION_PATH_CONTEXT_PREFIX,
     ProductionExtractionV1,
     production_extraction_to_json,
 )
 
 PRODUCTION_SYNTHESIS_SCHEMA_VERSION = 2
 SYNTHESIS_EVIDENCE_REF_ALGORITHM_VERSION = "sha256-canonical-extraction-element-v1"
-SYNTHESIS_POLICY_VERSION = "production-synthesis-v2-editorial-title-source-notes"
+SYNTHESIS_POLICY_VERSION = "production-synthesis-v7-source-domain-grounding"
 
 EDITORIAL_TITLE_MAX_LENGTH = 110
 EDITORIAL_TITLE_PATTERN = re.compile(r"\[(?P<group>[^\[\]\r\n]+)\] (?P<title>[^\[\]\r\n]+)")
+# Names of real HTML and SVG elements are never treated as placeholders.
+_HTML_SVG_ELEMENTS = frozenset(
+    """
+    a abbr acronym address altglyph altglyphdef altglyphitem animate animatecolor animatemotion
+    animatetransform applet area
+    article aside audio b base basefont bdi bdo bgsound big blink blockquote body br button
+    canvas caption center circle cite clippath code col colgroup command content data datalist
+    color-profile cursor dd defs del desc details dfn dialog dir div dl dt ellipse em embed
+    feblend fecolormatrix
+    fecomponenttransfer fecomposite feconvolvematrix fediffuselighting fedisplacementmap
+    fedistantlight fedropshadow feflood fefunca fefuncb fefuncg fefuncr fegaussianblur feimage
+    femerge femergenode femorphology feoffset fepointlight fespecularlighting fespotlight fetile
+    feturbulence fieldset figcaption figure filter font footer foreignobject form frame frameset
+    g glyph glyphref h1 h2 h3 h4 h5 h6 hatch hatchpath head header hgroup hkern hr html i iframe
+    image img input ins
+    isindex kbd keygen label legend li lineargradient link listing main map mark marquee math
+    line lineargradient marker mask menu menuitem mesh meshgradient meshpatch meshrow meta meter
+    mfenced mfrac mi mmultiscripts mn mo mover mpadded mphantom mroot mpath
+    mrow ms mspace msqrt mstyle msub msubsup msup mtable mtd mtext mtr munder munderover nav
+    missing-glyph nextid nobr noembed noframes noscript object ol optgroup option output p param
+    path pattern picture polygon polyline plaintext portal pre progress q radialgradient rb rp rt
+    ruby s samp
+    script search section select set slot small solidcolor source span stop strike strong style sub
+    summary sup svg switch symbol table tbody td template text textarea tfoot th thead time title
+    tr track tref tspan tt u ul use var video view vkern wbr xmp font-face font-face-format
+    font-face-name font-face-src font-face-uri
+    """.split()
+)
+_TECHNICAL_PLACEHOLDER = re.compile(r"<(?P<name>[A-Za-z0-9_][A-Za-z0-9_-]{0,63})>")
+_TECHNICAL_GLOB = re.compile(
+    r"\*\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*(?![\w-])"
+)
+
+
+def technical_literal_markup_exception_spans(value: str) -> tuple[tuple[int, int], ...]:
+    """Return non-markup technical placeholders and wildcard patterns in prose."""
+    spans: list[tuple[int, int]] = []
+    for match in _TECHNICAL_PLACEHOLDER.finditer(value):
+        if match["name"].casefold() in _HTML_SVG_ELEMENTS:
+            continue
+        spans.append(match.span())
+    spans.extend(match.span() for match in _TECHNICAL_GLOB.finditer(value))
+    return tuple(sorted(spans))
+
+
+def mask_technical_literal_markup_exceptions(value: str) -> str:
+    """Mask accepted technical literals in a validation-only copy of ``value``."""
+    for start, end in reversed(technical_literal_markup_exception_spans(value)):
+        value = f"{value[:start]}technical-placeholder{value[end:]}"
+    return value
+
+
 # Markdown, HTML, evidence handles ("E012") and quotes wrapping the whole title.
 _EDITORIAL_TITLE_FORBIDDEN = re.compile(
     r"`|\*|__|~~|\[[^\]]+\]\([^)]*\)|<\s*/?\s*[A-Za-z]|\b[ER]\d{3,}\b"
@@ -40,12 +94,13 @@ def is_valid_editorial_title(value: object) -> bool:
     if match is None or value != value.strip():
         return False
     group, title = match["group"], match["title"]
+    masked_title = mask_technical_literal_markup_exceptions(value)
     return (
         group == group.strip()
         and bool(group)
         and bool(title.strip())
         and not title.endswith(".")
-        and _EDITORIAL_TITLE_FORBIDDEN.search(value) is None
+        and _EDITORIAL_TITLE_FORBIDDEN.search(masked_title) is None
         and (title[0], title[-1]) not in _EDITORIAL_TITLE_QUOTES
     )
 
@@ -513,8 +568,20 @@ def extraction_evidence_ref(
     source_document_id: UUID, kind: EvidenceKind, payload: Mapping[str, Any]
 ) -> ExtractionEvidenceRefV1:
     """Identify one element by its owning source, kind and canonical payload."""
+    canonical_payload = dict(payload)
+    if kind is EvidenceKind.INDICATOR and str(canonical_payload.get("context") or "").startswith(
+        INDICATOR_SECTION_PATH_CONTEXT_PREFIX
+    ):
+        # Section paths are derived localization metadata. They affect the
+        # extraction/projection lineage, but do not change the identity of an
+        # otherwise unchanged source evidence element.
+        canonical_payload["context"] = ""
     encoded = json.dumps(
-        {"source_document_id": str(source_document_id), "kind": kind.value, "payload": payload},
+        {
+            "source_document_id": str(source_document_id),
+            "kind": kind.value,
+            "payload": canonical_payload,
+        },
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

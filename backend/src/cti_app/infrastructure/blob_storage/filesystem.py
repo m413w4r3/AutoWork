@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import BinaryIO
 from uuid import uuid4
 
-from cti_app.application.blob_storage import MaterializationMethod
+from cti_app.application.blob_storage import BlobReadLimitExceededError, MaterializationMethod
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.infrastructure.blob_storage.common import (
     spool_and_describe,
@@ -38,7 +38,7 @@ class FilesystemBlobStore:
         path = self._path_for(descriptor)
         verify_file(path, descriptor)
         if descriptor.size > max_bytes:
-            raise ValueError("Blob exceeds the read limit")
+            raise BlobReadLimitExceededError(size_bytes=descriptor.size, max_bytes=max_bytes)
         return path.read_bytes()
 
     def _put_sync(self, source: BinaryIO, *, logical_bucket: str, mime_type: str) -> BlobDescriptor:

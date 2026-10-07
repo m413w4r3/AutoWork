@@ -258,6 +258,29 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
     ) != diagram_semantic_sha256(diagram)
 
 
+def test_multiline_actor_uses_text_containing_shape_and_keeps_actor_colour() -> None:
+    diagram = _diagram(
+        nodes=(
+            _node(
+                "actor",
+                "Acteurs soupçonnés liés à l\u2019Iran",
+                DiagramNodeRole.ACTOR,
+            ),
+            _node("wallet", "Transaction Bitcoin", DiagramNodeRole.DATA_ARTIFACT),
+        ),
+        edges=(_edge("actor", "wallet", "écrivent données C2"),),
+    )
+
+    source = encode_d2_source(diagram).decode()
+
+    actor_block = source.split("n002:", maxsplit=1)[0]
+    assert 'n001: "Acteurs soupçonnés liés\\nà l\u2019Iran" {' in actor_block
+    assert "shape: rectangle" in actor_block
+    assert 'fill: "#FBE3E6"' in actor_block
+    assert "shape: person" not in actor_block
+    assert 'n001 -> n002: "écrivent données C2"' in source
+
+
 def test_profile_and_relation_direction_change_semantic_identity() -> None:
     diagram = _diagram()
 
@@ -341,9 +364,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == (
-        "diagram-d2-svg-v5-profile-aware-relation-direction"
-    )
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v7-elk-compact"
 
 
 @dataclass(frozen=True, slots=True)
@@ -465,7 +486,9 @@ async def test_compile_pins_version_render_argv_environment_and_limits() -> None
     assert version_call.stdin == b""
     assert render_call.argv == (
         "d2",
-        "--layout=dagre",
+        "--layout=elk",
+        "--pad=8",
+        "--elk-nodeNodeBetweenLayers=15",
         "--timeout=10",
         "--omit-version",
         f"--salt={hashlib.sha256(encode_d2_source(diagram)).hexdigest()}",
@@ -509,7 +532,7 @@ async def test_compile_is_deterministic_for_identical_diagrams() -> None:
     assert len(runner.calls) == 3
     assert runner.calls[0].argv == ("d2", "--version")
     assert runner.calls[1].argv == runner.calls[2].argv
-    assert runner.calls[1].argv[4] == f"--salt={first.source_sha256}"
+    assert runner.calls[1].argv[6] == f"--salt={first.source_sha256}"
     assert first.media_bytes == second.media_bytes
     assert first.media_sha256 == second.media_sha256
 
@@ -555,7 +578,7 @@ async def test_compile_rejects_invalid_svg_after_successful_process() -> None:
 async def test_compile_ignores_d2_and_home_environment_configuration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("D2_LAYOUT", "elk")
+    monkeypatch.setenv("D2_LAYOUT", "dagre")
     monkeypatch.setenv("D2_SALT", "attacker")
     monkeypatch.setenv("D2_THEME", "0")
     monkeypatch.setenv("HOME", "/home/attacker")
@@ -644,7 +667,7 @@ async def test_salt_uses_canonical_d2_source_not_semantic_metadata() -> None:
     await compiler.compile(first)
     await compiler.compile(second)
 
-    first_salt, second_salt = runner.calls[1].argv[4], runner.calls[2].argv[4]
+    first_salt, second_salt = runner.calls[1].argv[6], runner.calls[2].argv[6]
     expected_salt = f"--salt={hashlib.sha256(encode_d2_source(first)).hexdigest()}"
     assert encode_d2_source(first) == encode_d2_source(second)
     assert first_salt == second_salt == expected_salt

@@ -1,0 +1,13 @@
+{
+  "schema_version": "1",
+  "policy_version": "semantic-annotation-policy-v1",
+  "paragraphs": [
+    {
+      "anchor": "title",
+      "spans": [
+        {"role": "actor", "text": "Mandiant"},
+        {"role": "text", "text": " published the report."}
+      ]
+    }
+  ]
+}

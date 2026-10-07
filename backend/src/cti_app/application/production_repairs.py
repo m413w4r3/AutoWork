@@ -30,7 +30,6 @@ from cti_app.application.production_editorial_enrichment import (
 )
 from cti_app.application.production_extraction import (
     extraction_compatibility_view,
-    is_current_source_checkpoint,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import (
@@ -95,7 +94,6 @@ from cti_app.domain.production import (
     PUBLICATION_REBUILD_REQUIRED_ERROR_CODE,
     DetectionRule,
     DetectionRuleType,
-    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -1622,10 +1620,7 @@ class ProductionRepairIssueService:
                     candidate.canonical_url for candidate in view.candidates
                 }
                 q2_previews[run.id] = await _q2_reuse_preview(
-                    uow,
-                    run=run,
                     source_urls=sorted(source_urls & archived_urls),
-                    collections=collections,
                 )
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
@@ -5970,56 +5965,22 @@ async def _references_input_snapshot(uow: Any, run_id: UUID) -> Any | None:
 
 
 async def _q2_reuse_preview(
-    uow: Any,
     *,
-    run: Any,
     source_urls: Sequence[str],
-    collections: Sequence[Any],
 ) -> dict[str, int]:
-    """Estimate Q2 calls from durable source checkpoints before a rebuild."""
-    documents_repository = getattr(uow, "source_documents", None)
-    documents = (
-        await documents_repository.list_for_subject(run.subject_id)
-        if documents_repository is not None
-        and callable(getattr(documents_repository, "list_for_subject", None))
-        else ()
-    )
-    documents_by_id = {getattr(document, "id", None): document for document in documents}
-    hashes: dict[str, str] = {}
-    for collection in collections:
-        url = getattr(collection, "canonical_url", None)
-        document = documents_by_id.get(getattr(collection, "source_document_id", None))
-        digest = getattr(document, "decoded_sha256", None)
-        if isinstance(url, str) and isinstance(digest, str) and _is_sha256(digest):
-            hashes[url] = digest.casefold()
+    """Estimate Q2 reuse only when the effective text identity is available.
 
-    snapshots = getattr(uow, "production_input_snapshots", None)
-    snapshot = (
-        await snapshots.get_by_run(run.id)
-        if snapshots is not None and callable(getattr(snapshots, "get_by_run", None))
-        else None
-    )
-    core_urls = {source.canonical_url for source in getattr(snapshot, "core_sources", ())}
-    repository = getattr(uow, "source_extractions", None)
-    finder = getattr(repository, "list_for_url", None)
-    expected_reuses = 0
-    unknown = 0
-    for url in sorted(set(source_urls)):
-        digest = hashes.get(url)
-        if digest is None or not callable(finder):
-            unknown += 1
-            continue
-        profile = ExtractionProfile.FULL if url in core_urls else ExtractionProfile.IOC_RULES
-        rows = await finder(url)
-        reusable = any(
-            is_current_source_checkpoint(row, content_sha256=digest, profile=profile)
-            for row in rows
-        )
-        if reusable:
-            expected_reuses += 1
+    The REFERENCES/collection digest is the raw decoded archive hash. Source
+    checkpoints now use normalized, possibly case-scoped evidence text, so the
+    raw digest alone cannot prove a cache hit or a cache miss.
+    """
+    # This preview does not load archived bodies, which are required to
+    # reproduce normalized and possibly case-scoped evidence hashes. Treat
+    # every source as unknown rather than reporting false checkpoint misses.
+    unknown = len(set(source_urls))
     return {
-        "expected_q2_calls": max(0, len(set(source_urls)) - expected_reuses - unknown),
-        "expected_q2_reuses": expected_reuses,
+        "expected_q2_calls": 0,
+        "expected_q2_reuses": 0,
         "reuse_unknown_count": unknown,
     }
 

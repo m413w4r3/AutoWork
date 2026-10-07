@@ -5,6 +5,7 @@ import json
 from dataclasses import replace
 from datetime import date
 from inspect import Parameter, signature
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -40,6 +41,7 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import (
+    DetectionRuleType,
     ExtractionProfile,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
@@ -76,8 +78,10 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorV1,
     ExtractionProfileReasonCode,
     ExtractionReuseState,
+    ExtractionRuleV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    encode_indicator_section_paths,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -1041,6 +1045,61 @@ def test_publication_v5_applies_deterministic_extraction_roles_without_proposals
     assert any(span.text == "example.net" and span.role.value == "technical" for span in lead_spans)
 
 
+def test_publication_v5_propagates_a_port_literal_to_every_exact_occurrence() -> None:
+    from cti_app.application.publication_qa import qa_publication_v5
+
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    evidence_refs = extraction_evidence_refs_v1(extraction)
+    synthesis = replace(
+        synthesis,
+        lead=(
+            SynthesisParagraphV1(
+                "Les données reçues sont renvoyées vers back.js sur le port 10020.",
+                evidence_refs,
+            ),
+            SynthesisParagraphV1(
+                "La télémétrie recherche les ports 10020\u201310022 et écarte sub10020.",
+                evidence_refs,
+            ),
+        ),
+    )
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    spans_by_anchor = {
+        paragraph.anchor: paragraph.spans for paragraph in publication.semantic_text.paragraphs
+    }
+    qa = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        publication=publication,
+    )
+
+    assert any(
+        span.text == "10020" and span.role.value == "technical_literal"
+        for span in spans_by_anchor["lead:0001"]
+    )
+    assert any(
+        span.text == "10020" and span.role.value == "technical_literal"
+        for span in spans_by_anchor["lead:0002"]
+    )
+    assert any(
+        span.role.value == "text" and "sub10020" in span.text
+        for span in spans_by_anchor["lead:0002"]
+    )
+    assert qa["checks"]["semantic_annotation_coverage"] is True
+    assert qa["passed"] is True
+
+
 @pytest.mark.parametrize("artifact", ("snapshot", "references", "extraction", "synthesis"))
 def test_publication_v4_lineage_rejects_each_subject_mismatch(artifact: str) -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
@@ -1139,6 +1198,74 @@ def test_synthesis_evidence_validation_rejects_noncurrent_identity(
 
     with pytest.raises(ValueError, match="absent from the current extraction"):
         _validate_synthesis_evidence_refs(extraction=extraction, synthesis=synthesis)
+
+
+def _technical_evidence_publication_case() -> tuple[dict[str, Any], PublicationDocumentV4]:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="c2.example.com",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context="Published command infrastructure.",
+        evidence_quote="The report identifies c2.example.com as command infrastructure.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    rule_body = 'rule DinDoor { strings: $domain = "c2.example.com" condition: $domain }'
+    rule = ExtractionRuleV1(
+        rule_type=DetectionRuleType.YARA,
+        name="DinDoor domain rule",
+        body=rule_body,
+        sha256=hashlib.sha256(rule_body.encode()).hexdigest(),
+        context="Detects the published command domain.",
+        evidence_quote=f"The report publishes this rule: {rule_body}",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction = replace(
+        extraction,
+        sources=(replace(source, indicators=(indicator,), rules=(rule,)),),
+    )
+    refs_by_kind = {ref.kind: ref for ref, _payload in extraction_evidence_elements(extraction)}
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.INFECTION_CHAIN,
+                heading="Internal anchor",
+                paragraphs=(
+                    SynthesisParagraphV1(
+                        "Le domaine c2.example.com figure dans une règle YARA de détection.",
+                        (refs_by_kind[EvidenceKind.INDICATOR], refs_by_kind[EvidenceKind.RULE]),
+                    ),
+                ),
+            ),
+        ),
+    )
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    inputs: dict[str, Any] = {
+        "snapshot": snapshot,
+        "references": references,
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "editorial_enrichment": enrichment,
+    }
+    publication = build_publication_document_v4(**inputs)
+    return inputs, publication
+
+
+def test_synthesis_publication_preserves_technical_evidence_in_infection_chain() -> None:
+    _inputs, publication = _technical_evidence_publication_case()
+
+    section = publication.sections[0]
+    assert section.kind is PublicationSectionKind.INFECTION_CHAIN
+    assert section.heading == ""
+    assert {ref.kind for ref in section.paragraphs[0].evidence_refs} == {
+        PublicationEvidenceKind.INDICATOR,
+        PublicationEvidenceKind.RULE,
+    }
 
 
 def test_synthesis_publication_projection_preserves_narrative_and_order() -> None:
@@ -2073,3 +2200,40 @@ def test_v6_ioc_projection_separates_core_supported_and_original_values() -> Non
     assert "out.example" not in str(publication.original_indicators)
     assert "technical.example" not in str(publication.original_indicators)
     assert "a" * 63 not in str(publication.original_indicators)
+
+
+def test_multi_case_primary_iocs_without_subject_section_are_excluded() -> None:
+    snapshot, _references, extraction, synthesis = _canonical_inputs()
+    core = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="other-case.example",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context=encode_indicator_section_paths(
+            (((2, "GTG-84006: MEK-aligned activity"), (4, "Indicators of compromise")),)
+        ),
+        evidence_quote="other-case.example",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(core.source_document_id,),
+    )
+    extraction = replace(extraction, sources=(replace(core, indicators=(indicator,)),))
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    relevance = build_relevance_projection(snapshot, extraction)
+    indicator_ref = next(
+        ref
+        for ref, _payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.INDICATOR
+    )
+    narrative = _project_synthesis_publication(extraction=extraction, synthesis=synthesis)
+
+    projected = _project_publication_iocs(
+        extraction=extraction,
+        narrative=narrative,
+        relevance_projection=relevance,
+    )
+
+    decision = relevance.classification_for(indicator_ref)
+    assert decision.classification is RelevanceClassification.OUT_OF_SCOPE
+    assert decision.reason_code is RelevanceReasonCode.INDICATOR_SECTION_OTHER_CASE
+    assert projected.indicators == ()
+    assert projected.original_indicators == ()

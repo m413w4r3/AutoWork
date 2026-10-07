@@ -22,10 +22,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import unicodedata
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
+from difflib import SequenceMatcher
 from enum import StrEnum
 from typing import Any, Protocol, cast
+from urllib.parse import parse_qsl, urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.extraction import _html_encoding, parse_document
@@ -87,6 +92,7 @@ from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     SourceEvidenceDocument,
     SourceEvidenceRejection,
+    scope_source_evidence_document,
     source_evidence_document_from_html,
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
@@ -120,6 +126,7 @@ from cti_app.domain.production_extraction import (
     ExtractionProfileReasonCode,
     ExtractionReuseState,
     ExtractionRuleV1,
+    ExtractionScopeV1,
     ProductionExtractionOmissionReason,
     ProductionExtractionOmissionV1,
     ProductionExtractionV1,
@@ -138,7 +145,7 @@ from cti_app.domain.publication import ArtifactType
 
 #: Canonical service contract version. It participates in the run-level input
 #: hash but never in a per-source checkpoint identity.
-PRODUCTION_EXTRACTION_SERVICE_VERSION = "production-extraction-service-v2"
+PRODUCTION_EXTRACTION_SERVICE_VERSION = "production-extraction-service-v3"
 
 #: Model and routing policies of the archive-backed path. The service asks for a
 #: capability; the gateway decides which authorized adapter answers it.
@@ -151,10 +158,13 @@ EXTRACTION_RESPONSE_PARSER_VERSION = Q2_MARKDOWN_PARSER_VERSION
 #: Deterministic archived-text transform. Chunking is a pure function of the
 #: archived content, the transformers' versions, the maximum size and the
 #: overlap, so it never depends on the provider that answers.
-SOURCE_TEXT_CONTRACT_VERSION = "archived-text-v1"
+SOURCE_TEXT_CONTRACT_VERSION = "archived-text-v2"
 SOURCE_TEXT_CHUNKER_VERSION = "chunker-v2"
 SOURCE_CHUNK_MAX_CHARS = 24_000
 SOURCE_CHUNK_OVERLAP_CHARS = 400
+# Near-duplicate reuse is deliberately rare: only page/tracking URL variants
+# with nearly identical effective text can share one computation.
+NEAR_DUPLICATE_EVIDENCE_SIMILARITY_THRESHOLD = 0.999
 
 #: Bounded model input. A capture larger than the chunk size is chunked
 #: deterministically instead of being truncated.
@@ -240,6 +250,28 @@ class ExtractionArtifactStore(Protocol):
 BeforeModelCall = Callable[[], Awaitable[None]]
 
 
+@dataclass(frozen=True, slots=True)
+class ExtractionProgressEvent:
+    """Compact, non-canonical progress for one extraction source or call."""
+
+    event: str
+    source_ids: tuple[UUID, ...]
+    status: str | None
+    chunks_done: int
+    chunks_total: int
+    chunks_total_is_estimate: bool
+    model_calls: int
+    current_model_run_id: UUID | None = None
+    current_chunk_index: int | None = None
+    current_model_call_started_at: datetime | None = None
+    last_call_at: datetime | None = None
+    last_call_duration_ms: int | None = None
+
+
+ExtractionProgressObserver = Callable[[ExtractionProgressEvent], Awaitable[None]]
+_LOGGER = logging.getLogger(__name__)
+
+
 # --- Planning --------------------------------------------------------------
 
 
@@ -258,12 +290,22 @@ class PlannedExtractionSource:
     profile_reason_code: ExtractionProfileReasonCode
     title: str | None
     collection_state: CollectionState
+    effective_evidence_sha256: str | None = None
+    computation_identity_sha256: str | None = None
+    computation_profile: ExtractionProfile | None = None
+    computation_representative_source_id: UUID | None = None
+    scope: ExtractionScopeV1 | None = None
     position: int = 0
 
     @property
     def computation_key(self) -> tuple[str, ExtractionProfile]:
-        """Identical bytes under one profile are computed once per run."""
-        return (self.content_sha256, self.profile)
+        """One effective text/profile computation, with FULL serving IOC_RULES."""
+        return (
+            self.computation_identity_sha256
+            or self.effective_evidence_sha256
+            or self.content_sha256,
+            self.computation_profile or self.profile,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +320,10 @@ class ExtractionPlan:
     sources: tuple[PlannedExtractionSource, ...]
     omitted_sources: tuple[ProductionExtractionOmissionV1, ...]
     warnings: tuple[str, ...]
+    evidence_documents: Mapping[UUID, SourceEvidenceDocument] = field(
+        default_factory=dict, compare=False, repr=False
+    )
+    archives: Mapping[UUID, SourceArchive] = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def full_sources(self) -> tuple[PlannedExtractionSource, ...]:
@@ -301,6 +347,60 @@ def source_text_contract_version() -> str:
     )
 
 
+def normalize_effective_evidence_text(text: str) -> str:
+    """Canonicalize text without removing words or punctuation from evidence."""
+
+    normalized = unicodedata.normalize("NFC", text.replace("\r\n", "\n").replace("\r", "\n"))
+    return normalized.strip()
+
+
+def effective_evidence_sha256(text: str) -> str:
+    """Hash the exact canonical text supplied to the source extractor."""
+
+    return hashlib.sha256(normalize_effective_evidence_text(text).encode("utf-8")).hexdigest()
+
+
+def _same_url_except_page_or_tracking(first_url: str, second_url: str) -> bool:
+    first = urlsplit(first_url)
+    second = urlsplit(second_url)
+    if (
+        first.scheme.casefold() != second.scheme.casefold()
+        or (first.hostname or "").casefold() != (second.hostname or "").casefold()
+        or first.port != second.port
+        or first.path != second.path
+        or first.fragment != second.fragment
+    ):
+        return False
+
+    def stable_query(query: str) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            sorted(
+                (key, value)
+                for key, value in parse_qsl(query, keep_blank_values=True)
+                if key.casefold() != "page" and not key.casefold().startswith("utm_")
+            )
+        )
+
+    return stable_query(first.query) == stable_query(second.query)
+
+
+def _can_reuse_near_duplicate(
+    first: PlannedExtractionSource,
+    second: PlannedExtractionSource,
+    *,
+    first_text: str,
+    second_text: str,
+) -> bool:
+    if first.profile is not second.profile or not _same_url_except_page_or_tracking(
+        first.canonical_url, second.canonical_url
+    ):
+        return False
+    return (
+        SequenceMatcher(None, first_text, second_text).ratio()
+        >= NEAR_DUPLICATE_EVIDENCE_SIMILARITY_THRESHOLD
+    )
+
+
 def references_corpus_hash(corpus: ProductionReferenceCorpusV1) -> str:
     """Return the content-addressed identity of one canonical corpus."""
 
@@ -310,7 +410,11 @@ def references_corpus_hash(corpus: ProductionReferenceCorpusV1) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan:
+def build_extraction_plan(
+    corpus: ProductionReferenceCorpusV1,
+    *,
+    evidence_documents: Mapping[UUID, SourceEvidenceDocument] | None = None,
+) -> ExtractionPlan:
     """Plan one extraction run exclusively from the canonical REFERENCES corpus.
 
     Editorial authority and source kind select the profile; tier remains the
@@ -369,6 +473,16 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
                 editorial_role=source.editorial_role,
             )
         )
+        evidence = (evidence_documents or {}).get(source.source_document_id)
+        effective_hash = (
+            effective_evidence_sha256(evidence.parsed_text) if evidence is not None else None
+        )
+        if evidence is not None and evidence.scope is not None:
+            warnings.append(
+                "extraction_scoped_to_case:"
+                f"{evidence.scope.case_id}:"
+                f"{evidence.scope.kept_sections}/{evidence.scope.total_sections}"
+            )
         planned.append(
             PlannedExtractionSource(
                 source_document_id=source.source_document_id,
@@ -382,6 +496,8 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
                 profile_reason_code=profile_reason_code,
                 title=source.title,
                 collection_state=source.collection_state,
+                effective_evidence_sha256=effective_hash,
+                scope=evidence.scope if evidence is not None else None,
             )
         )
 
@@ -412,6 +528,7 @@ def build_extraction_plan(corpus: ProductionReferenceCorpusV1) -> ExtractionPlan
             )
         ),
         warnings=tuple(dict.fromkeys(warnings)),
+        evidence_documents=evidence_documents or {},
     )
 
 
@@ -466,14 +583,16 @@ def source_prompt_version(profile: ExtractionProfile) -> str:
 
 def source_checkpoint_identity(
     *,
-    content_sha256: str,
+    effective_evidence_sha256: str,
     profile: ExtractionProfile,
     prompt_version: str,
 ) -> dict[str, str]:
     """The durable functional identity of one subject-independent checkpoint."""
 
     return {
-        "source_content_sha256": content_sha256,
+        # The existing durable column is retained, but its identity semantics
+        # are now the exact normalized text sent to extraction.
+        "source_content_sha256": effective_evidence_sha256,
         "profile": profile.value,
         "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
         "contract_version": Q2_EXTRACTION_CONTRACT_VERSION,
@@ -506,15 +625,25 @@ def _checkpoint_identities_satisfying(
 
 
 def is_current_source_checkpoint(
-    row: SourceExtraction, *, content_sha256: str, profile: ExtractionProfile
+    row: SourceExtraction,
+    *,
+    profile: ExtractionProfile,
+    effective_evidence_sha256: str | None = None,
+    content_sha256: str | None = None,
 ) -> bool:
     """Whether a durable checkpoint row would satisfy ``profile`` today."""
 
+    # ``content_sha256`` remains a read-only compatibility argument for callers
+    # that only have the raw archive digest. It cannot match a text-addressed
+    # checkpoint unless the caller's value is already the effective digest.
+    effective_digest = effective_evidence_sha256 or content_sha256
+    if effective_digest is None:
+        return False
     if row.status is not SourceExtractionStatus.VERIFIED or row.canonical_blob_id is None:
         return False
     for candidate_profile, prompt_version in _checkpoint_identities_satisfying(profile):
         identity = source_checkpoint_identity(
-            content_sha256=content_sha256,
+            effective_evidence_sha256=effective_digest,
             profile=candidate_profile,
             prompt_version=prompt_version,
         )
@@ -970,6 +1099,7 @@ def build_canonical_source_extraction(
         indicators=indicators,
         rules=rules,
         uncertainties=tuple(dict.fromkeys(gated.uncertainties)),
+        scope=planned.scope,
     )
 
 
@@ -1020,9 +1150,9 @@ def _union_provenance(
 ) -> tuple[ProductionSourceExtractionV1, ...]:
     """Give every equivalent element the union of the documents publishing it.
 
-    Deduplication across sources never removes a source entry: each source keeps
-    its own elements, and an element published by several documents names all of
-    them, so no provenance silently disappears.
+    Deduplication never removes a source entry. Duplicate-content aliases keep
+    no repeated elements, while each representative element names every source
+    document that published it.
     """
 
     def keys(source: ProductionSourceExtractionV1) -> dict[str, list[Any]]:
@@ -1046,7 +1176,10 @@ def _union_provenance(
 
     def widened(items: tuple[Any, ...], kind: str, identities: list[Any]) -> tuple[Any, ...]:
         return tuple(
-            replace(item, source_document_ids=tuple(documents[(kind, identity)]))
+            replace(
+                item,
+                source_document_ids=tuple(sorted(documents[(kind, identity)], key=str)),
+            )
             for item, identity in zip(items, identities, strict=True)
         )
 
@@ -1062,7 +1195,59 @@ def _union_provenance(
                 rules=widened(source.rules, "rules", source_keys["rules"]),
             )
         )
-    return tuple(result)
+    seen_duplicate_values: dict[str, set[Any]] = {
+        "facts": set(),
+        "events": set(),
+        "indicators": set(),
+        "rules": set(),
+        "uncertainties": set(),
+    }
+    representative_values: dict[str, set[Any]] = {
+        "facts": set(),
+        "events": set(),
+        "indicators": set(),
+        "rules": set(),
+        "uncertainties": set(),
+    }
+    for source in result:
+        if source.reuse_state is ExtractionReuseState.CONTENT_DUPLICATE:
+            continue
+        source_keys = keys(source)
+        for kind in ("facts", "events", "indicators", "rules"):
+            representative_values[kind].update(source_keys[kind])
+        representative_values["uncertainties"].update(source.uncertainties)
+
+    deduplicated: list[ProductionSourceExtractionV1] = []
+    for source in result:
+        source_keys = keys(source)
+        updates: dict[str, Any] = {}
+        for kind in ("facts", "events", "indicators", "rules"):
+            identities = source_keys[kind]
+            items = getattr(source, kind)
+            if source.reuse_state is ExtractionReuseState.CONTENT_DUPLICATE:
+                kept = [
+                    item
+                    for item, identity in zip(items, identities, strict=True)
+                    if identity not in representative_values[kind]
+                    and identity not in seen_duplicate_values[kind]
+                ]
+                updates[kind] = tuple(kept)
+            else:
+                kept = list(items)
+                updates[kind] = tuple(kept)
+            seen_duplicate_values[kind].update(identity for identity in identities)
+        if source.reuse_state is ExtractionReuseState.CONTENT_DUPLICATE:
+            updates["uncertainties"] = tuple(
+                uncertainty
+                for uncertainty in source.uncertainties
+                if uncertainty not in representative_values["uncertainties"]
+                and uncertainty not in seen_duplicate_values["uncertainties"]
+            )
+        else:
+            updates["uncertainties"] = source.uncertainties
+        seen_duplicate_values["uncertainties"].update(source.uncertainties)
+        deduplicated.append(replace(source, **updates))
+    return tuple(deduplicated)
 
 
 def build_production_extraction(
@@ -1193,13 +1378,59 @@ class ProductionExtractionService:
     async def plan(
         self, *, run: ProductionRun, snapshot: ProductionInputSnapshot | None = None
     ) -> ExtractionPlan:
-        """Load the canonical corpus of ``run`` and plan its extraction."""
+        """Load references and prepare exact source evidence before execution."""
 
         async with self._uow_factory() as uow:
+            if snapshot is None:
+                snapshot = await uow.production_input_snapshots.get_by_run(run.id)
             corpus = await load_reference_corpus(
                 uow=uow, run=run, snapshot=snapshot, artifact_store=self._artifact_store
             )
-        return build_extraction_plan(corpus)
+        seed_plan = build_extraction_plan(corpus)
+        archives = await self._load_archives(seed_plan)
+        evidence_documents: dict[UUID, SourceEvidenceDocument] = {}
+        assert snapshot is not None
+        for planned in seed_plan.sources:
+            archive = archives[planned.source_document_id]
+            try:
+                evidence = build_source_evidence_document(
+                    archive.content, mime_type=archive.document.detected_mime_type
+                )
+            except SourceExtractionFailure:
+                # Keep the source in the plan so execute() records the existing
+                # source-local failure and its progress status.
+                continue
+            total_chars = len(normalize_effective_evidence_text(evidence.parsed_text))
+            evidence = scope_source_evidence_document(
+                evidence,
+                subject_title=snapshot.subject_title,
+                actor_or_campaign=snapshot.actor_or_campaign,
+                canonical_url=planned.canonical_url,
+                source_kind=planned.kind,
+                mime_type=archive.document.detected_mime_type,
+            )
+            effective_text = normalize_effective_evidence_text(evidence.parsed_text)
+            scope = evidence.scope
+            if scope is not None:
+                scope = replace(
+                    scope,
+                    kept_chars=len(effective_text),
+                    total_chars=total_chars,
+                )
+            evidence_documents[planned.source_document_id] = replace(
+                evidence, parsed_text=effective_text, scope=scope
+            )
+        plan = build_extraction_plan(corpus, evidence_documents=evidence_documents)
+        planned_by_id = {source.source_document_id: source for source in plan.sources}
+        prepared_archives = {
+            source_id: replace(archive, planned=planned_by_id[source_id])
+            for source_id, archive in archives.items()
+        }
+        return replace(
+            plan,
+            evidence_documents=evidence_documents,
+            archives=prepared_archives,
+        )
 
     async def execute(
         self,
@@ -1208,6 +1439,7 @@ class ProductionExtractionService:
         snapshot: ProductionInputSnapshot | None = None,
         plan: ExtractionPlan | None = None,
         before_model_call: BeforeModelCall | None = None,
+        on_progress: ExtractionProgressObserver | None = None,
     ) -> ProductionExtractionExecution:
         """Run the canonical extraction of one production run.
 
@@ -1219,7 +1451,7 @@ class ProductionExtractionService:
         try:
             if plan is None:
                 plan = await self.plan(run=run, snapshot=snapshot)
-            archives = await self._load_archives(plan)
+            archives = dict(plan.archives) or await self._load_archives(plan)
         except ProductionExtractionControlError as control:
             # A control invariant failed: the legacy REFERENCES RAW is never a
             # fallback input and no model call is attempted.
@@ -1235,7 +1467,9 @@ class ProductionExtractionService:
             run=run,
             plan=plan,
             archives=archives,
+            snapshot=snapshot,
             before_model_call=before_model_call,
+            on_progress=on_progress,
         ).execute()
 
     async def _load_archives(self, plan: ExtractionPlan) -> dict[UUID, SourceArchive]:
@@ -1255,7 +1489,9 @@ class ProductionExtractionService:
     async def _read_checkpoint(self, planned: PlannedExtractionSource) -> _Computation | None:
         for profile, prompt_version in _checkpoint_identities_satisfying(planned.profile):
             identity = source_checkpoint_identity(
-                content_sha256=planned.content_sha256,
+                effective_evidence_sha256=(
+                    planned.effective_evidence_sha256 or planned.content_sha256
+                ),
                 profile=profile,
                 prompt_version=prompt_version,
             )
@@ -1297,7 +1533,7 @@ class ProductionExtractionService:
         """Persist one content-addressed checkpoint, or return the winner's id."""
 
         identity = source_checkpoint_identity(
-            content_sha256=planned.content_sha256,
+            effective_evidence_sha256=planned.effective_evidence_sha256 or planned.content_sha256,
             profile=planned.profile,
             prompt_version=prompt_version,
         )
@@ -1310,7 +1546,7 @@ class ProductionExtractionService:
         )
         row = SourceExtraction(
             canonical_url=planned.canonical_url,
-            source_content_sha256=planned.content_sha256,
+            source_content_sha256=(planned.effective_evidence_sha256 or planned.content_sha256),
             profile=planned.profile,
             contract_version=identity["contract_version"],
             prompt_version=prompt_version,
@@ -1448,18 +1684,61 @@ class _ExtractionRun:
         run: ProductionRun,
         plan: ExtractionPlan,
         archives: Mapping[UUID, SourceArchive],
+        snapshot: ProductionInputSnapshot | None,
         before_model_call: BeforeModelCall | None,
+        on_progress: ExtractionProgressObserver | None,
     ) -> None:
         self._service = service
         self._run = run
         self._plan = plan
         self._archives = archives
+        self._snapshot = snapshot
         self._before_model_call = before_model_call
+        self._on_progress = on_progress
         self._evidence: dict[UUID, SourceEvidenceDocument] = {}
         self._computations: dict[tuple[str, ExtractionProfile], _Computation] = {}
         self._failures: dict[UUID, SourceExtractionFailure] = {}
         self._warnings: list[str] = []
         self._model_calls = 0
+        self._last_call_at: datetime | None = None
+        self._last_call_duration_ms: int | None = None
+
+    async def _notify_progress(
+        self,
+        *,
+        event: str,
+        sources: Sequence[PlannedExtractionSource],
+        status: str | None,
+        chunks_done: int,
+        chunks_total: int,
+        chunks_total_is_estimate: bool,
+        current_model_run_id: UUID | None = None,
+        current_chunk_index: int | None = None,
+        current_model_call_started_at: datetime | None = None,
+    ) -> None:
+        if self._on_progress is None:
+            return
+        try:
+            await self._on_progress(
+                ExtractionProgressEvent(
+                    event=event,
+                    source_ids=tuple(source.source_document_id for source in sources),
+                    status=status,
+                    chunks_done=chunks_done,
+                    chunks_total=chunks_total,
+                    chunks_total_is_estimate=chunks_total_is_estimate,
+                    model_calls=self._model_calls,
+                    current_model_run_id=current_model_run_id,
+                    current_chunk_index=current_chunk_index,
+                    current_model_call_started_at=current_model_call_started_at,
+                    last_call_at=self._last_call_at,
+                    last_call_duration_ms=self._last_call_duration_ms,
+                )
+            )
+        except Exception:
+            # Progress is observability only. Its failure never changes the
+            # extraction result or the stage's cancellation/retry behavior.
+            _LOGGER.exception("Could not publish live extraction progress")
 
     async def execute(self) -> ProductionExtractionExecution:
         try:
@@ -1496,14 +1775,140 @@ class _ExtractionRun:
             raise _CoreSourceFailed(planned, failure)
 
     async def _compute(self) -> None:
+        prepared_sources: list[PlannedExtractionSource] = []
+        evidence_documents: dict[UUID, SourceEvidenceDocument] = {}
+        scope_warnings: list[str] = []
         for planned in self._plan.sources:
             archive = self._archives[planned.source_document_id]
             try:
-                self._evidence[planned.source_document_id] = build_source_evidence_document(
-                    archive.content, mime_type=archive.document.detected_mime_type
-                )
+                evidence = self._plan.evidence_documents.get(planned.source_document_id)
+                if evidence is None:
+                    evidence = build_source_evidence_document(
+                        archive.content, mime_type=archive.document.detected_mime_type
+                    )
+                    if self._snapshot is not None:
+                        total_chars = len(normalize_effective_evidence_text(evidence.parsed_text))
+                        evidence = scope_source_evidence_document(
+                            evidence,
+                            subject_title=self._snapshot.subject_title,
+                            actor_or_campaign=self._snapshot.actor_or_campaign,
+                            canonical_url=planned.canonical_url,
+                            source_kind=planned.kind,
+                            mime_type=archive.document.detected_mime_type,
+                        )
+                        if evidence.scope is not None:
+                            evidence = replace(
+                                evidence,
+                                scope=replace(evidence.scope, total_chars=total_chars),
+                            )
             except SourceExtractionFailure as failure:
+                await self._notify_progress(
+                    event="source",
+                    sources=(planned,),
+                    status="failed",
+                    chunks_done=0,
+                    chunks_total=0,
+                    chunks_total_is_estimate=False,
+                )
                 self._fail(planned, failure)
+                prepared_sources.append(planned)
+                continue
+            effective_text = normalize_effective_evidence_text(evidence.parsed_text)
+            scope = evidence.scope
+            if scope is not None:
+                scope = replace(scope, kept_chars=len(effective_text))
+                scope_warnings.append(
+                    "extraction_scoped_to_case:"
+                    f"{scope.case_id}:{scope.kept_sections}/{scope.total_sections}"
+                )
+            evidence = replace(evidence, parsed_text=effective_text, scope=scope)
+            self._evidence[planned.source_document_id] = evidence
+            evidence_documents[planned.source_document_id] = evidence
+            prepared_sources.append(
+                replace(
+                    planned,
+                    effective_evidence_sha256=effective_evidence_sha256(effective_text),
+                    scope=scope,
+                )
+            )
+
+        exact_representatives: dict[str, PlannedExtractionSource] = {}
+        for planned in prepared_sources:
+            digest = planned.effective_evidence_sha256
+            if digest is None:
+                continue
+            current = exact_representatives.get(digest)
+            if current is None or (
+                current.profile is ExtractionProfile.IOC_RULES
+                and planned.profile is ExtractionProfile.FULL
+            ):
+                # FULL is a strict superset of IOC_RULES, so one FULL result
+                # can serve both profiles when exact evidence bytes match.
+                exact_representatives[digest] = planned
+
+        canonical_sources: list[PlannedExtractionSource] = []
+        representatives: list[PlannedExtractionSource] = []
+        for planned in prepared_sources:
+            effective_hash = planned.effective_evidence_sha256
+            if effective_hash is None:
+                canonical_sources.append(planned)
+                continue
+            exact_representative = exact_representatives[effective_hash]
+            if exact_representative.source_document_id != planned.source_document_id:
+                canonical_sources.append(
+                    replace(
+                        planned,
+                        computation_identity_sha256=(
+                            exact_representative.effective_evidence_sha256
+                            or exact_representative.content_sha256
+                        ),
+                        computation_profile=exact_representative.profile,
+                        computation_representative_source_id=(
+                            exact_representative.source_document_id
+                        ),
+                    )
+                )
+                continue
+            duplicate = next(
+                (
+                    representative
+                    for representative in representatives
+                    if representative.profile is planned.profile
+                    and (
+                        representative.effective_evidence_sha256 == effective_hash
+                        or _can_reuse_near_duplicate(
+                            representative,
+                            planned,
+                            first_text=self._evidence[
+                                representative.source_document_id
+                            ].parsed_text,
+                            second_text=self._evidence[planned.source_document_id].parsed_text,
+                        )
+                    )
+                ),
+                None,
+            )
+            if duplicate is None:
+                representatives.append(planned)
+                canonical_sources.append(planned)
+                continue
+            canonical_sources.append(
+                replace(
+                    planned,
+                    computation_identity_sha256=(
+                        duplicate.effective_evidence_sha256 or duplicate.content_sha256
+                    ),
+                    computation_profile=duplicate.profile,
+                    computation_representative_source_id=duplicate.source_document_id,
+                )
+            )
+
+        self._plan = replace(
+            self._plan,
+            sources=tuple(canonical_sources),
+            evidence_documents=evidence_documents,
+            warnings=tuple(dict.fromkeys((*self._plan.warnings, *scope_warnings))),
+        )
 
         misses: list[PlannedExtractionSource] = []
         for planned in self._representatives():
@@ -1512,6 +1917,18 @@ class _ExtractionRun:
                 misses.append(planned)
             else:
                 self._computations[planned.computation_key] = computation
+
+        for planned in self._plan.sources:
+            computation = self._computations.get(planned.computation_key)
+            if computation is not None and not computation.fresh:
+                await self._notify_progress(
+                    event="source",
+                    sources=(planned,),
+                    status="reused",
+                    chunks_done=0,
+                    chunks_total=0,
+                    chunks_total_is_estimate=False,
+                )
 
         # CORE (FULL) work is planned first, so a blocking failure stops the
         # stage before any complementary source is sent to a provider.  A
@@ -1539,12 +1956,16 @@ class _ExtractionRun:
             raise deferred[0]
 
     def _representatives(self) -> list[PlannedExtractionSource]:
-        """The first source of every computation key still worth computing."""
+        """The canonical source for every computation key still worth computing."""
 
         seen: set[tuple[str, ExtractionProfile]] = set()
         representatives: list[PlannedExtractionSource] = []
         for planned in self._plan.sources:
-            if planned.source_document_id in self._failures or planned.computation_key in seen:
+            if (
+                planned.source_document_id in self._failures
+                or planned.computation_representative_source_id is not None
+                or planned.computation_key in seen
+            ):
                 continue
             seen.add(planned.computation_key)
             representatives.append(planned)
@@ -1579,7 +2000,9 @@ class _ExtractionRun:
                 tuple(
                     ArchiveQ2BatchSource(
                         source_document_id=planned.source_document_id,
-                        content_sha256=planned.content_sha256,
+                        content_sha256=(
+                            planned.effective_evidence_sha256 or planned.content_sha256
+                        ),
                     )
                     for planned in group
                 ),
@@ -1600,16 +2023,75 @@ class _ExtractionRun:
         batches.sort(key=lambda batch: batch[0].position)
         return singles, batches
 
-    async def _call(self, request: ModelRequest) -> ModelExecution:
+    async def _call(
+        self,
+        request: ModelRequest,
+        *,
+        sources: Sequence[PlannedExtractionSource],
+        chunks_done: int,
+        chunks_total: int,
+        chunks_total_is_estimate: bool,
+        current_chunk_index: int | None,
+    ) -> ModelExecution:
         if self._before_model_call is not None:
             await self._before_model_call()
+        call_started_at = datetime.now(UTC)
         self._model_calls += 1
-        return await self._service.invoke(request)
+        await self._notify_progress(
+            event="call_started",
+            sources=sources,
+            status="running",
+            chunks_done=chunks_done,
+            chunks_total=chunks_total,
+            chunks_total_is_estimate=chunks_total_is_estimate,
+            current_model_run_id=request.run_id,
+            current_chunk_index=current_chunk_index,
+            current_model_call_started_at=call_started_at,
+        )
+        try:
+            execution = await self._service.invoke(request)
+        except BaseException:
+            finished_at = datetime.now(UTC)
+            self._last_call_at = finished_at
+            self._last_call_duration_ms = max(
+                0, int((finished_at - call_started_at).total_seconds() * 1000)
+            )
+            await self._notify_progress(
+                event="call_finished",
+                sources=sources,
+                status="running",
+                chunks_done=chunks_done,
+                chunks_total=chunks_total,
+                chunks_total_is_estimate=chunks_total_is_estimate,
+            )
+            raise
+        finished_at = datetime.now(UTC)
+        self._last_call_at = finished_at
+        self._last_call_duration_ms = max(
+            0, int((finished_at - call_started_at).total_seconds() * 1000)
+        )
+        await self._notify_progress(
+            event="call_finished",
+            sources=sources,
+            status="running",
+            chunks_done=chunks_done,
+            chunks_total=chunks_total,
+            chunks_total_is_estimate=chunks_total_is_estimate,
+        )
+        return execution
 
     async def _compute_single(self, planned: PlannedExtractionSource) -> None:
         archive = self._archives[planned.source_document_id]
         chunks = archived_source_chunks(self._evidence[planned.source_document_id].parsed_text)
         if len(chunks) > MAX_CHUNKS_PER_SOURCE:
+            await self._notify_progress(
+                event="source",
+                sources=(planned,),
+                status="failed",
+                chunks_done=0,
+                chunks_total=len(chunks),
+                chunks_total_is_estimate=False,
+            )
             self._fail(
                 planned,
                 SourceExtractionFailure(
@@ -1635,7 +2117,7 @@ class _ExtractionRun:
                     prompt_version=prompt_version,
                     unit_identity={
                         "kind": "source",
-                        "source_content_sha256": planned.content_sha256,
+                        "effective_evidence_sha256": planned.effective_evidence_sha256,
                         "profile": planned.profile.value,
                         "profile_policy_version": EXTRACTION_PROFILE_POLICY_VERSION,
                         "prompt_version": prompt_version,
@@ -1646,11 +2128,35 @@ class _ExtractionRun:
                     metadata={
                         "tier": planned.tier.value,
                         "source_content_sha256": planned.content_sha256,
+                        "effective_evidence_sha256": planned.effective_evidence_sha256,
                         "chunk_index": index,
                         "chunk_count": len(chunks),
                     },
                 )
-                execution = await self._call(request)
+                await self._notify_progress(
+                    event="source",
+                    sources=(planned,),
+                    status="running",
+                    chunks_done=index - 1,
+                    chunks_total=len(chunks),
+                    chunks_total_is_estimate=False,
+                )
+                execution = await self._call(
+                    request,
+                    sources=(planned,),
+                    chunks_done=index - 1,
+                    chunks_total=len(chunks),
+                    chunks_total_is_estimate=False,
+                    current_chunk_index=index,
+                )
+                await self._notify_progress(
+                    event="source",
+                    sources=(planned,),
+                    status="running",
+                    chunks_done=index,
+                    chunks_total=len(chunks),
+                    chunks_total_is_estimate=False,
+                )
                 raw_text = execution.output_text or ""
                 raw_texts.append(raw_text)
                 parsed = parse_q2_proposals_markdown(raw_text)
@@ -1664,9 +2170,25 @@ class _ExtractionRun:
                 outputs.append(parsed.value)
                 model_run_id = execution.run.id if execution.run is not None else model_run_id
         except SourceExtractionFailure as failure:
+            await self._notify_progress(
+                event="source",
+                sources=(planned,),
+                status="failed",
+                chunks_done=0,
+                chunks_total=len(chunks),
+                chunks_total_is_estimate=False,
+            )
             self._fail(planned, failure)
             return
         if not outputs:
+            await self._notify_progress(
+                event="source",
+                sources=(planned,),
+                status="failed",
+                chunks_done=len(chunks),
+                chunks_total=len(chunks),
+                chunks_total_is_estimate=False,
+            )
             self._fail(
                 planned,
                 SourceExtractionFailure(
@@ -1686,13 +2208,31 @@ class _ExtractionRun:
         self._computations[planned.computation_key] = _Computation(
             output=merged, checkpoint_id=checkpoint_id, model_run_id=model_run_id, fresh=True
         )
+        aliases = [
+            source
+            for source in self._plan.sources
+            if source.computation_key == planned.computation_key
+        ]
+        for alias in aliases:
+            await self._notify_progress(
+                event="source",
+                sources=(alias,),
+                status=(
+                    "succeeded"
+                    if alias.source_document_id == planned.source_document_id
+                    else "reused"
+                ),
+                chunks_done=len(chunks),
+                chunks_total=len(chunks),
+                chunks_total_is_estimate=False,
+            )
 
     async def _compute_batch(self, sources: tuple[PlannedExtractionSource, ...]) -> _BatchResult:
         entries = make_archive_q2_batch(
             tuple(
                 ArchiveQ2BatchSource(
                     source_document_id=source.source_document_id,
-                    content_sha256=source.content_sha256,
+                    content_sha256=(source.effective_evidence_sha256 or source.content_sha256),
                 )
                 for source in sources
             )
@@ -1721,13 +2261,31 @@ class _ExtractionRun:
             metadata={
                 "batch_identity": batch_identity,
                 "batch_sources": [
-                    {"batch_id": entry.batch_id, "source_content_sha256": entry.content_sha256}
+                    {
+                        "batch_id": entry.batch_id,
+                        "effective_evidence_sha256": entry.content_sha256,
+                    }
                     for entry in entries
                 ],
             },
         )
         try:
-            execution = await self._call(request)
+            await self._notify_progress(
+                event="source",
+                sources=sources,
+                status="running",
+                chunks_done=0,
+                chunks_total=1,
+                chunks_total_is_estimate=True,
+            )
+            execution = await self._call(
+                request,
+                sources=sources,
+                chunks_done=0,
+                chunks_total=1,
+                chunks_total_is_estimate=True,
+                current_chunk_index=1,
+            )
         except SourceExtractionFailure as failure:
             # A batch failure is never attributed to one publication: every
             # capture is retried individually, where its own outcome is known.
@@ -1775,6 +2333,14 @@ class _ExtractionRun:
             computations[planned.source_document_id] = _Computation(
                 output=output, checkpoint_id=checkpoint_id, model_run_id=model_run_id, fresh=True
             )
+            await self._notify_progress(
+                event="source",
+                sources=(planned,),
+                status="succeeded",
+                chunks_done=1,
+                chunks_total=1,
+                chunks_total_is_estimate=True,
+            )
         return _BatchResult(
             computations=computations,
             retry_individually=tuple(retry),
@@ -1786,7 +2352,6 @@ class _ExtractionRun:
         rejections: list[ExtractionRejection] = []
         failed: list[tuple[PlannedExtractionSource, str]] = []
         warnings = list(self._warnings)
-        representatives_done: set[tuple[str, ExtractionProfile]] = set()
         for planned in self._plan.sources:
             failure = self._failures.get(planned.source_document_id)
             computation = self._computations.get(planned.computation_key)
@@ -1803,13 +2368,12 @@ class _ExtractionRun:
                 failed.append((planned, code))
                 warnings.append(f"extraction_source_skipped:{planned.canonical_url}:{code}")
                 continue
-            if not computation.fresh:
-                reuse_state = ExtractionReuseState.REUSED
-            elif planned.computation_key in representatives_done:
+            if planned.computation_representative_source_id is not None:
                 reuse_state = ExtractionReuseState.CONTENT_DUPLICATE
+            elif not computation.fresh:
+                reuse_state = ExtractionReuseState.REUSED
             else:
                 reuse_state = ExtractionReuseState.FRESH
-            representatives_done.add(planned.computation_key)
             gated, gate_warnings, gate_rejections = gate_source_output(
                 computation.output,
                 self._evidence[planned.source_document_id],

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from cti_app.application.typst_bundle import hash_bundle_contents, resolve_bundle_files
@@ -37,7 +38,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v8-unified-ioc-rendering"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v16-semantic-annotation-coverage"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -67,8 +68,9 @@ _INDICATOR_KEYS = {
     ArtifactType.EMAIL: "emails",
     ArtifactType.HASH: "hashes",
 }
-_BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command"})
-_TYPOGRAPHIC_BREAK_INTERVAL = 16
+_BREAKABLE_SEMANTIC_ROLES = frozenset({"ioc", "path", "command", "technical_literal"})
+_TYPOGRAPHIC_BREAK_INTERVAL = 8
+_TYPOGRAPHIC_BREAK_THRESHOLD = 32
 _TABLE_SEMANTIC_STYLE_BY_STYLE = {
     "semantic-command": "semantic-table-command",
     "semantic-ioc": "semantic-table-ioc",
@@ -81,21 +83,42 @@ _TABLE_DOMAIN = re.compile(
     re.IGNORECASE,
 )
 _TABLE_WINDOWS_PATH = re.compile(r"^[a-z]:[\\/].+", re.IGNORECASE)
+_TABLE_WINDOWS_REGISTRY_PATH = re.compile(
+    r"^(?:HK(?:CU|LM|CR|U|CC)|HKEY_(?:CLASSES_ROOT|CURRENT_USER|LOCAL_MACHINE|USERS|CURRENT_CONFIG))\\",
+    re.IGNORECASE,
+)
 
 
-def _breakable_typst_display_text(value: str) -> str:
-    """Add line-break opportunities to render data without changing canonical text."""
-    if len(value) <= _TYPOGRAPHIC_BREAK_INTERVAL:
-        return value
-    return "\u200b".join(
-        value[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
-        for index in range(0, len(value), _TYPOGRAPHIC_BREAK_INTERVAL)
-    )
+def _breakable_typst_display_text(value: str) -> dict[str, Any]:
+    """Keep exact text and add wrap points only inside long unbroken tokens."""
+    tokens = re.findall(r"\s+|\S+", value)
+    if not any(
+        not token.isspace() and len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD for token in tokens
+    ):
+        return {"text": value, "break_chunks": []}
+
+    chunks: list[str] = []
+    break_after: list[bool] = []
+    for token in tokens:
+        pieces = (
+            [
+                token[index : index + _TYPOGRAPHIC_BREAK_INTERVAL]
+                for index in range(0, len(token), _TYPOGRAPHIC_BREAK_INTERVAL)
+            ]
+            if not token.isspace() and len(token) > _TYPOGRAPHIC_BREAK_THRESHOLD
+            else [token]
+        )
+        for index, piece in enumerate(pieces):
+            if chunks:
+                break_after.append(index > 0)
+            chunks.append(piece)
+
+    return {"text": value, "break_chunks": chunks, "break_after": break_after}
 
 
-def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[str]]:
+def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[dict[str, Any]]]:
     """Merge display IOC values and deduplicate without changing canonical records."""
-    result: dict[str, list[str]] = {
+    result: dict[str, list[dict[str, Any]]] = {
         key: [] for key in ("ips", "domains", "urls", "emails", "hashes")
     }
     seen: dict[str, set[str]] = {key: set() for key in result}
@@ -110,12 +133,16 @@ def _indicator_values(groups: tuple[Any, ...]) -> dict[str, list[str]]:
     return result
 
 
-def _table_cell_typst_spans(value: str) -> list[dict[str, str]]:
+def _table_cell_typst_spans(value: str) -> list[dict[str, Any]]:
     """Format exact technical table values and add invisible wrap points to long cells."""
     style = "semantic-plain"
     if _TABLE_SHA256.fullmatch(value):
         style = "semantic-table-technical"
-    elif value.startswith(("/", "\\")) or _TABLE_WINDOWS_PATH.fullmatch(value):
+    elif (
+        value.startswith(("/", "\\"))
+        or _TABLE_WINDOWS_PATH.fullmatch(value)
+        or _TABLE_WINDOWS_REGISTRY_PATH.match(value)
+    ):
         style = "semantic-table-path"
     elif value.startswith(("http://", "https://")) and not any(char.isspace() for char in value):
         style = "semantic-table-ioc"
@@ -128,24 +155,19 @@ def _table_cell_typst_spans(value: str) -> list[dict[str, str]]:
             pass
         else:
             style = "semantic-table-ioc"
-    return [
-        {
-            "style": style,
-            "text": _breakable_typst_display_text(value),
-        }
-    ]
+    return [{"style": style, **_breakable_typst_display_text(value)}]
 
 
 def _table_cell_render_spans(
     value: str,
-    semantic_cell_spans: list[dict[str, str]] | None,
-) -> list[dict[str, str]]:
+    semantic_cell_spans: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
     if semantic_cell_spans is None:
         return _table_cell_typst_spans(value)
     return [
         {
             "style": _TABLE_SEMANTIC_STYLE_BY_STYLE.get(span["style"], span["style"]),
-            "text": _breakable_typst_display_text(span["text"].replace("\u200b", "")),
+            **_breakable_typst_display_text(span["text"]),
         }
         for span in semantic_cell_spans
     ]
@@ -257,17 +279,19 @@ def project_publication_to_typst_model(
             return None
         if paragraph.text != text:
             raise ValueError(f"Semantic text differs from publication content at {anchor}")
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for span in paragraph.spans:
+            projected_span: dict[str, Any] = {
                 "style": SEMANTIC_ROLE_TYPST_FUNCTION_V1[span.role],
-                "text": (
-                    _breakable_typst_display_text(span.text)
-                    if span.role.value in _BREAKABLE_SEMANTIC_ROLES
-                    else span.text
-                ),
+                "text": span.text,
             }
-            for span in paragraph.spans
-        ]
+            if span.role.value in _BREAKABLE_SEMANTIC_ROLES:
+                breakable_text = _breakable_typst_display_text(span.text)
+                projected_span["break_chunks"] = breakable_text["break_chunks"]
+                if "break_after" in breakable_text:
+                    projected_span["break_after"] = breakable_text["break_after"]
+            result.append(projected_span)
+        return result
 
     def rich_block(block: dict[str, Any], field_name: str, anchor: str, text: str) -> None:
         spans = semantic_spans(anchor, text)
@@ -369,12 +393,6 @@ def project_publication_to_typst_model(
     for figure in document.figures:
         block = _figure_block(figure, media_ref)
         rich_block(block, "semantic_caption", f"figure:{figure.key}:caption", figure.caption)
-        rich_block(
-            block,
-            "semantic_provenance",
-            f"figure:{figure.key}:provenance",
-            figure.provenance,
-        )
         add_rich(
             figure.placement.kind,
             figure.placement.section_index,
@@ -473,7 +491,7 @@ def project_publication_to_typst_model(
         for source in document.sources
     ]
 
-    indicators = _indicator_values((*document.indicators, *original_indicator_groups))
+    indicators = _indicator_values(document.indicators)
     original_indicators = _indicator_values(original_indicator_groups)
     original_publishers = sorted(
         {
@@ -688,21 +706,43 @@ def _figure_block(
         expected_sha256=figure.sha256,
         expected_byte_size=figure.byte_size,
     )
-    locator_parts = []
-    if figure.locator.page is not None:
-        locator_parts.append(f"page {figure.locator.page}")
-    if figure.locator.section is not None:
-        locator_parts.append(f"section {figure.locator.section}")
-    if figure.locator.figure_label is not None:
-        locator_parts.append(f"figure {figure.locator.figure_label}")
     return {
         "type": "figure",
         "key": figure.key,
         "caption": figure.caption,
-        "provenance": figure.provenance,
-        "locator": ", ".join(locator_parts) if locator_parts else None,
+        "source_note": _reader_facing_figure_source(figure),
         "media_path": media.media_path,
     }
+
+
+_INTERNAL_FIGURE_LOCATOR_TEXT = re.compile(
+    r"(?:/html\[|\b(?:html|body|div|span|img|svg|section|article)\[\d+\]|"
+    r"\bxpath\b|\bdom(?:\s|[_:-])|\banchor\s*:|https?://|"
+    r"\bhtml\s+image\s+\d+\b|\bblob(?:\s|[_-])?id\b|"
+    r"\b[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\b)",
+    re.IGNORECASE,
+)
+
+
+def _reader_facing_figure_source(figure: PublicationSourceFigureV1) -> str | None:
+    """Project technical figure metadata into a short, reader-facing source note."""
+    parts: list[str] = []
+    try:
+        host = urlsplit(figure.source_url).hostname
+    except ValueError:
+        host = None
+    if host and not _INTERNAL_FIGURE_LOCATOR_TEXT.search(host):
+        parts.append(host.removeprefix("www."))
+
+    section = figure.locator.section
+    if section is not None:
+        section = section.strip()
+        if section and not _INTERNAL_FIGURE_LOCATOR_TEXT.search(section):
+            parts.append(section)
+
+    if figure.locator.page is not None:
+        parts.append(f"p. {figure.locator.page}")
+    return " — ".join(parts) if parts else None
 
 
 def _chart_block(

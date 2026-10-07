@@ -17,7 +17,7 @@ from cti_app.domain.typst_render import (
 )
 
 EDITION_RENDERER = "typst"
-EDITION_RENDERER_VERSION = "edition-v2-typst-v1"
+EDITION_RENDERER_VERSION = "edition-v2-typst-v2-semantic-annotation-coverage"
 EDITION_RENDER_POLICY_VERSION = "typst-edition-v2-v1"
 
 

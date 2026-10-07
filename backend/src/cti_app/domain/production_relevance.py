@@ -19,9 +19,14 @@ from cti_app.domain.production_synthesis import (
     extraction_evidence_refs_v1,
 )
 
-RELEVANCE_PROJECTION_SCHEMA_VERSION = 2
-RELEVANCE_PROJECTION_POLICY_VERSION = "subject-relevance-counter-analysis-v4"
-DEFAULT_RELEVANCE_CLASSIFIER_VERSION = "deterministic-subject-scope-v4-counter-reserve"
+RELEVANCE_PROJECTION_SCHEMA_VERSION = 3
+RELEVANCE_PROJECTION_POLICY_VERSION = (
+    "subject-relevance-counter-analysis-v7-deep-case-section-out-of-scope"
+)
+DEFAULT_RELEVANCE_CLASSIFIER_VERSION = (
+    "deterministic-subject-scope-v7-deep-case-section-out-of-scope"
+)
+_LEGACY_RELEVANCE_PROJECTION_SCHEMA_VERSIONS = frozenset({1, 2})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -46,6 +51,7 @@ class RelevanceReasonCode(StrEnum):
     FOOTER_CONTACT = "footer_contact"
     MALICIOUS_ROLE_NOT_DEMONSTRATED = "malicious_role_not_demonstrated"
     SUBJECT_LINK_NOT_DEMONSTRATED = "subject_link_not_demonstrated"
+    INDICATOR_SECTION_OTHER_CASE = "indicator_section_other_case"
     MALICIOUS_SUBJECT_RELATION = "malicious_subject_relation"
     MALICIOUS_SUBJECT_CORROBORATION = "malicious_subject_corroboration"
     EXPLICIT_SUBJECT_DENIAL = "explicit_subject_denial"
@@ -229,10 +235,10 @@ class RelevanceProjectionV1:
         _sha256(self.production_input_hash, "Projection production input hash")
         _sha256(self.extraction_hash, "Projection extraction hash")
         _sha256(self.input_hash, "Projection input hash")
-        if (
-            type(self.schema_version) is not int
-            or self.schema_version != RELEVANCE_PROJECTION_SCHEMA_VERSION
-        ):
+        if type(self.schema_version) is not int or self.schema_version not in {
+            *_LEGACY_RELEVANCE_PROJECTION_SCHEMA_VERSIONS,
+            RELEVANCE_PROJECTION_SCHEMA_VERSION,
+        }:
             raise ValueError("Projection schema version is unsupported")
         if not isinstance(self.policy_version, str) or not self.policy_version.strip():
             raise ValueError("Projection policy version is unsupported")
@@ -316,6 +322,60 @@ class RelevanceProjectionV1:
 def _projection_payload(
     projection: RelevanceProjectionV1, *, include_hash: bool = True
 ) -> dict[str, Any]:
+    classifications: list[dict[str, Any]]
+    source_pair_relations: list[dict[str, Any]]
+    if projection.schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION:
+        ref_indexes = {ref: index for index, ref in enumerate(projection.extraction_evidence_refs)}
+        classifications = [
+            {
+                "evidence_ref_index": ref_indexes[item.evidence_ref],
+                "classification": item.classification.value,
+                "reason_code": item.reason_code.value,
+                "supporting_evidence_ref_indexes": [
+                    ref_indexes[ref] for ref in item.supporting_evidence_refs
+                ],
+                "provenance": item.provenance.value,
+            }
+            for item in projection.classifications
+        ]
+        source_pair_relations = [
+            {
+                "relation": item.relation.value,
+                "reason": item.reason,
+                "provenance": item.provenance.value,
+                "supporting_evidence_ref_indexes": [
+                    ref_indexes[ref] for ref in item.supporting_evidence_refs
+                ],
+            }
+            for item in projection.source_pair_relations
+        ]
+    else:
+        # Schema 1 and 2 stored each complete reference object at every use.
+        # Keep their canonical representation available so persisted hashes
+        # remain verifiable when loading old artifacts.
+        classifications = [
+            {
+                "evidence_ref": _ref_payload(item.evidence_ref),
+                "classification": item.classification.value,
+                "reason_code": item.reason_code.value,
+                "supporting_evidence_refs": [
+                    _ref_payload(ref) for ref in item.supporting_evidence_refs
+                ],
+                "provenance": item.provenance.value,
+            }
+            for item in projection.classifications
+        ]
+        source_pair_relations = [
+            {
+                "relation": item.relation.value,
+                "reason": item.reason,
+                "provenance": item.provenance.value,
+                "supporting_evidence_refs": [
+                    _ref_payload(ref) for ref in item.supporting_evidence_refs
+                ],
+            }
+            for item in projection.source_pair_relations
+        ]
     payload = {
         "schema_version": projection.schema_version,
         "policy_version": projection.policy_version,
@@ -327,29 +387,8 @@ def _projection_payload(
         "extraction_evidence_refs": [
             _ref_payload(ref) for ref in projection.extraction_evidence_refs
         ],
-        "classifications": [
-            {
-                "evidence_ref": _ref_payload(item.evidence_ref),
-                "classification": item.classification.value,
-                "reason_code": item.reason_code.value,
-                "supporting_evidence_refs": [
-                    _ref_payload(ref) for ref in item.supporting_evidence_refs
-                ],
-                "provenance": item.provenance.value,
-            }
-            for item in projection.classifications
-        ],
-        "source_pair_relations": [
-            {
-                "relation": item.relation.value,
-                "reason": item.reason,
-                "provenance": item.provenance.value,
-                "supporting_evidence_refs": [
-                    _ref_payload(ref) for ref in item.supporting_evidence_refs
-                ],
-            }
-            for item in projection.source_pair_relations
-        ],
+        "classifications": classifications,
+        "source_pair_relations": source_pair_relations,
         "model_proposal_rejections": [
             {
                 "block_id": item.block_id,
@@ -389,45 +428,103 @@ def relevance_projection_from_json(payload: Any) -> RelevanceProjectionV1:
         raise ValueError("Relevance projection fields are invalid")
     if type(payload["schema_version"]) is not int:
         raise ValueError("Projection schema version must be an integer")
+    schema_version = payload["schema_version"]
+    if schema_version not in {
+        *_LEGACY_RELEVANCE_PROJECTION_SCHEMA_VERSIONS,
+        RELEVANCE_PROJECTION_SCHEMA_VERSION,
+    }:
+        raise ValueError("Projection schema version is unsupported")
     try:
-        classifications = tuple(
-            RelevanceClassificationItemV1(
-                evidence_ref=_ref_from_json(item["evidence_ref"]),
-                classification=RelevanceClassification(item["classification"]),
-                reason_code=RelevanceReasonCode(item["reason_code"]),
-                supporting_evidence_refs=tuple(
-                    _ref_from_json(ref) for ref in item["supporting_evidence_refs"]
-                ),
-                provenance=RelevanceDecisionProvenance(item["provenance"]),
-            )
-            for item in payload["classifications"]
-            if isinstance(item, dict)
-            and set(item)
-            == {
+        extraction_evidence_refs = tuple(
+            _ref_from_json(ref) for ref in payload["extraction_evidence_refs"]
+        )
+
+        def indexed_ref(index: Any) -> ExtractionEvidenceRefV1:
+            if type(index) is not int or not 0 <= index < len(extraction_evidence_refs):
+                raise ValueError("Projection evidence reference index is invalid")
+            return extraction_evidence_refs[index]
+
+        def supporting_refs(item: dict[str, Any]) -> tuple[ExtractionEvidenceRefV1, ...]:
+            if schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION:
+                indexes = item["supporting_evidence_ref_indexes"]
+                if not isinstance(indexes, list):
+                    raise ValueError("Projection supporting evidence indexes are invalid")
+                return tuple(indexed_ref(index) for index in indexes)
+            return tuple(_ref_from_json(ref) for ref in item["supporting_evidence_refs"])
+
+        if not isinstance(payload["classifications"], list):
+            raise ValueError("Projection classifications must be an array")
+        classifications_list = []
+        for item in payload["classifications"]:
+            legacy_item_keys = {
                 "evidence_ref",
                 "classification",
                 "reason_code",
                 "supporting_evidence_refs",
                 "provenance",
             }
-        )
-        if len(classifications) != len(payload["classifications"]):
-            raise ValueError("Projection classification fields are invalid")
-        source_pair_relations = tuple(
-            RelevanceSourcePairRelationV1(
-                relation=RelevanceSourcePairRelation(item["relation"]),
-                reason=item["reason"],
-                provenance=RelevanceDecisionProvenance(item["provenance"]),
-                supporting_evidence_refs=tuple(
-                    _ref_from_json(ref) for ref in item["supporting_evidence_refs"]
-                ),
+            indexed_item_keys = {
+                "evidence_ref_index",
+                "classification",
+                "reason_code",
+                "supporting_evidence_ref_indexes",
+                "provenance",
+            }
+            expected_item_keys = (
+                indexed_item_keys
+                if schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION
+                else legacy_item_keys
             )
-            for item in payload["source_pair_relations"]
-            if isinstance(item, dict)
-            and set(item) == {"relation", "reason", "provenance", "supporting_evidence_refs"}
-        )
-        if len(source_pair_relations) != len(payload["source_pair_relations"]):
-            raise ValueError("Projection source-pair relation fields are invalid")
+            if not isinstance(item, dict) or set(item) != expected_item_keys:
+                raise ValueError("Projection classification fields are invalid")
+            evidence_ref = (
+                indexed_ref(item["evidence_ref_index"])
+                if schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION
+                else _ref_from_json(item["evidence_ref"])
+            )
+            classifications_list.append(
+                RelevanceClassificationItemV1(
+                    evidence_ref=evidence_ref,
+                    classification=RelevanceClassification(item["classification"]),
+                    reason_code=RelevanceReasonCode(item["reason_code"]),
+                    supporting_evidence_refs=supporting_refs(item),
+                    provenance=RelevanceDecisionProvenance(item["provenance"]),
+                )
+            )
+        classifications = tuple(classifications_list)
+
+        if not isinstance(payload["source_pair_relations"], list):
+            raise ValueError("Projection source-pair relations must be an array")
+        source_pair_relations_list = []
+        for item in payload["source_pair_relations"]:
+            legacy_relation_keys = {
+                "relation",
+                "reason",
+                "provenance",
+                "supporting_evidence_refs",
+            }
+            indexed_relation_keys = {
+                "relation",
+                "reason",
+                "provenance",
+                "supporting_evidence_ref_indexes",
+            }
+            expected_relation_keys = (
+                indexed_relation_keys
+                if schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION
+                else legacy_relation_keys
+            )
+            if not isinstance(item, dict) or set(item) != expected_relation_keys:
+                raise ValueError("Projection source-pair relation fields are invalid")
+            source_pair_relations_list.append(
+                RelevanceSourcePairRelationV1(
+                    relation=RelevanceSourcePairRelation(item["relation"]),
+                    reason=item["reason"],
+                    provenance=RelevanceDecisionProvenance(item["provenance"]),
+                    supporting_evidence_refs=supporting_refs(item),
+                )
+            )
+        source_pair_relations = tuple(source_pair_relations_list)
         rejections = tuple(
             RelevanceProposalRejectionV1(
                 block_id=item["block_id"],
@@ -440,16 +537,14 @@ def relevance_projection_from_json(payload: Any) -> RelevanceProjectionV1:
         if len(rejections) != len(payload["model_proposal_rejections"]):
             raise ValueError("Projection model proposal rejection fields are invalid")
         projection = RelevanceProjectionV1(
-            schema_version=payload["schema_version"],
+            schema_version=schema_version,
             policy_version=payload["policy_version"],
             classifier_version=payload["classifier_version"],
             subject_id=UUID(payload["subject_id"]),
             production_input_hash=payload["production_input_hash"],
             extraction_hash=payload["extraction_hash"],
             input_hash=payload["input_hash"],
-            extraction_evidence_refs=tuple(
-                _ref_from_json(ref) for ref in payload["extraction_evidence_refs"]
-            ),
+            extraction_evidence_refs=extraction_evidence_refs,
             classifications=classifications,
             source_pair_relations=source_pair_relations,
             model_proposal_rejections=rejections,

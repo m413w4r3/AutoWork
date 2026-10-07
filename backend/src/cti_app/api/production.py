@@ -31,13 +31,19 @@ from cti_app.application.production_enrichment_revision import (
 )
 from cti_app.application.production_jobs import (
     PRODUCTION_STAGE_MAX_ATTEMPTS,
+    ProductionBatchPausedError,
     ProductionStageChain,
     ProductionStageParameters,
     production_stage_idempotency_key,
     stage_job_kind,
 )
 from cti_app.application.production_pacing import ProductionPacingPolicy
-from cti_app.application.production_read_model import BatchStatusReadService, ProductionRunSummary
+from cti_app.application.production_read_model import (
+    BatchStatusReadService,
+    ProductionActivitySnapshot,
+    ProductionRunSummary,
+    derive_production_activity,
+)
 from cti_app.application.production_reconciliation import (
     ProductionReconciliationError,
     ProductionReconciliationService,
@@ -99,6 +105,7 @@ from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionArtifactStage,
     ProductionBatchCancellationConflictError,
+    ProductionBatchPauseConflictError,
     ProductionBatchStatus,
     ProductionReconciliationRequiredError,
     ProductionRepairAction,
@@ -299,12 +306,15 @@ class BatchItemDetail(BaseModel):
     run_id: str
     status: ProductionRunStatus
     current_stage: ProductionStage
+    paused: bool = False
+    paused_stage: ProductionStage | None = None
     pipeline_generation: int
     auto_recovery_count: int
     error_code: str | None = None
     error_message: str | None = None
     extraction_progress: dict[str, Any] | None = None
     reconciliation: ProductionReconciliationView | None = None
+    activity: ProductionActivityView | None = None
 
 
 class ProductionReconciliationView(BaseModel):
@@ -320,6 +330,25 @@ class ProductionReconciliationView(BaseModel):
     provenance: str | None = None
     visible_available: bool
     batch_id: str | None = None
+
+
+ProductionActivityKind = Literal[
+    "model_call",
+    "reconciliation_probe",
+    "retry_scheduled",
+    "waiting_batch",
+    "deterministic_stage",
+    "idle",
+]
+
+
+class ProductionActivityView(BaseModel):
+    kind: ProductionActivityKind
+    stage: ProductionStage | None = None
+    started_at: str | None = None
+    since_seconds: int | None = None
+    detail: str | None = None
+    attempt: int | None = None
 
 
 ProductionStatus.model_rebuild()
@@ -339,8 +368,11 @@ class BatchStatus(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    paused_at: str | None = None
+    paused_by: str | None = None
     phase: str
     next_dispatch_at: str | None
+    reactivated_by_retry: bool = False
 
 
 class ProductionSubject(BaseModel):
@@ -354,6 +386,7 @@ class ProductionSubject(BaseModel):
     active_run_id: str | None = None
     can_start: bool
     blocking_reason: str | None = None
+    activity: ProductionActivityView | None = None
 
 
 class ProductionBoard(BaseModel):
@@ -796,7 +829,12 @@ def reconciliation_view(
     )
 
 
-async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
+async def _batch_status_view(
+    uow: Any,
+    batch: Any,
+    *,
+    activity_by_subject: dict[UUID, ProductionActivityView] | None = None,
+) -> BatchStatus:
     """Build a batch response from the UI-optimized read model."""
     items = await BatchStatusReadService(uow.batch_status_read_model).list_items(batch.id)
     completed = needs_review = failed = cancelled = 0
@@ -819,6 +857,16 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                 run_id=str(item.run_id),
                 status=item.status,
                 current_stage=item.current_stage,
+                paused=(
+                    batch.status is ProductionBatchStatus.PAUSED
+                    and item.status in {ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING}
+                ),
+                paused_stage=(
+                    item.current_stage
+                    if batch.status is ProductionBatchStatus.PAUSED
+                    and item.status is ProductionRunStatus.RUNNING
+                    else None
+                ),
                 pipeline_generation=item.pipeline_generation,
                 auto_recovery_count=item.auto_recovery_count,
                 error_code=item.error_code,
@@ -835,8 +883,19 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
                         batch_id=batch.id,
                     )
                 ),
+                activity=(activity_by_subject or {}).get(item.subject_id),
             )
         )
+    reactivated_by_retry = (
+        batch.status is ProductionBatchStatus.RUNNING
+        and batch.phase.value == "review"
+        and any(
+            item.status in {ProductionRunStatus.QUEUED, ProductionRunStatus.RUNNING}
+            and item.pipeline_generation > 0
+            and item.auto_recovery_count == 0
+            for item in items
+        )
+    )
     return BatchStatus(
         batch_id=str(batch.id),
         edition_id=str(batch.edition_id),
@@ -850,9 +909,45 @@ async def _batch_status_view(uow: Any, batch: Any) -> BatchStatus:
         created_at=batch.created_at.isoformat(),
         started_at=batch.started_at.isoformat() if batch.started_at else None,
         finished_at=batch.finished_at.isoformat() if batch.finished_at else None,
+        paused_at=batch.paused_at.isoformat() if batch.paused_at else None,
+        paused_by=batch.paused_by,
         phase=batch.phase.value,
         next_dispatch_at=(batch.next_dispatch_at.isoformat() if batch.next_dispatch_at else None),
+        reactivated_by_retry=reactivated_by_retry,
     )
+
+
+async def _production_activity_for_runs(
+    uow: Any, runs: Sequence[ProductionRun]
+) -> dict[UUID, ProductionActivityView]:
+    """Fetch one activity projection for the latest runs in this edition."""
+    if not runs:
+        return {}
+    repository = getattr(uow, "batch_status_read_model", None)
+    list_activity = getattr(repository, "list_activity_for_runs", None)
+    snapshots: Sequence[ProductionActivitySnapshot] = (
+        await list_activity([run.id for run in runs]) if callable(list_activity) else ()
+    )
+    snapshots_by_run = {snapshot.run_id: snapshot for snapshot in snapshots}
+    now = datetime.now(UTC)
+    activities: dict[UUID, ProductionActivityView] = {}
+    for run in runs:
+        snapshot = snapshots_by_run.get(run.id) or ProductionActivitySnapshot(
+            subject_id=run.subject_id,
+            run_id=run.id,
+            stage=run.current_stage,
+            run_status=run.status,
+        )
+        derived = derive_production_activity(snapshot, now=now)
+        activities[run.subject_id] = ProductionActivityView(
+            kind=derived.kind,
+            stage=derived.stage,
+            started_at=derived.started_at.isoformat() if derived.started_at else None,
+            since_seconds=derived.since_seconds,
+            detail=derived.detail,
+            attempt=derived.attempt,
+        )
+    return activities
 
 
 async def ensure_initial_dispatch(
@@ -994,6 +1089,26 @@ async def _production_run_can_dispatch(
         }
 
 
+async def _production_batch_is_paused(
+    uow_factory: UnitOfWorkFactory,
+    batch_id: UUID,
+) -> bool:
+    async with uow_factory() as uow:
+        batch = await uow.edition_production_batches.get(batch_id)
+        return batch is not None and batch.status is ProductionBatchStatus.PAUSED
+
+
+async def _batch_diagnostics_identity(
+    uow_factory: UnitOfWorkFactory,
+    batch_id: UUID,
+) -> tuple[UUID, UUID | None]:
+    async with uow_factory() as uow:
+        items = await uow.edition_production_batch_items.list_for_batch(batch_id)
+        if items:
+            return items[0].production_run_id, items[0].subject_id
+    return batch_id, None
+
+
 async def _dispatch_handed_off_production_run(
     request: Request,
     started: ProductionRun,
@@ -1022,20 +1137,105 @@ async def _dispatch_handed_off_production_run(
     chain = ProductionStageChain(pacing)
     chain.bind(jobs, dispatcher)
     try:
-        await chain.submit(
-            run=latest,
-            stage=latest.current_stage,
-            correlation_id=get_correlation_id(),
-            actor_id=actor_id,
-            delay_ms=delay_ms,
-            before_dispatch=lambda: _production_run_can_dispatch(
-                uow_factory, latest.id, batch_id=batch_id
-            ),
-        )
-    except (DuplicateJobError, JobCancelledError):
+
+        async def before_dispatch() -> bool:
+            return await _production_run_can_dispatch(uow_factory, latest.id, batch_id=batch_id)
+
+        async def pause_check() -> bool:
+            return await _production_batch_is_paused(uow_factory, batch_id)
+
+        if (
+            latest.status is ProductionRunStatus.RUNNING
+            and latest.error_code is None
+            and latest.reconciliation is not None
+            and latest.reconciliation.output_sha256 is not None
+        ):
+            await chain.submit_reconciliation_resume(
+                run=latest,
+                correlation_id=get_correlation_id(),
+                actor_id=actor_id,
+                delay_ms=delay_ms,
+                before_dispatch=before_dispatch,
+                pause_check=pause_check,
+            )
+        else:
+            await chain.submit(
+                run=latest,
+                stage=latest.current_stage,
+                correlation_id=get_correlation_id(),
+                actor_id=actor_id,
+                delay_ms=delay_ms,
+                before_dispatch=before_dispatch,
+                pause_check=pause_check,
+            )
+    except (DuplicateJobError, JobCancelledError, ProductionBatchPausedError):
         # Another worker may have completed this hand-off, or cancellation may
         # have won the final fence.  Both outcomes are already persisted.
         return
+
+
+async def _dispatch_resumed_batch(
+    request: Request,
+    batch_id: UUID,
+    *,
+    actor_id: str,
+) -> None:
+    """Resume the exact active stage or the first queued item in editorial order."""
+    uow_factory, jobs, dispatcher = _runtime(request)
+    async with uow_factory() as uow:
+        batch = await uow.edition_production_batches.get(batch_id)
+        items = await uow.edition_production_batch_items.list_for_batch(batch_id)
+    if batch is None or batch.status not in {
+        ProductionBatchStatus.QUEUED,
+        ProductionBatchStatus.RUNNING,
+    }:
+        return
+    if not items:
+        return
+
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
+    # This transaction serializes resumed dispatch with the batch pause guard.
+    started = await service.on_subject_terminal(
+        batch_id,
+        items[0].production_run_id,
+        actor_id=actor_id,
+        correlation_id=get_correlation_id(),
+    )
+    if started is not None:
+        await _dispatch_handed_off_production_run(
+            request,
+            started,
+            batch_id,
+            actor_id=actor_id,
+        )
+
+    async with uow_factory() as uow:
+        latest_batch = await uow.edition_production_batches.get(batch_id)
+    if latest_batch is None or latest_batch.status not in {
+        ProductionBatchStatus.QUEUED,
+        ProductionBatchStatus.RUNNING,
+    }:
+        return
+
+    # Resume any already-persisted auxiliary or stage jobs for members of this
+    # batch. Their idempotency keys and run/stage checks reject stale work.
+    list_for_aggregate = getattr(jobs, "list_for_aggregate", None)
+    if list_for_aggregate is None:
+        return
+    for item in items:
+        async with uow_factory() as uow:
+            run = await uow.production_runs.get(item.production_run_id)
+        if run is None:
+            continue
+        for job in await list_for_aggregate("subject", run.subject_id):
+            if job.input_parameters.get("run_id") != str(run.id):
+                continue
+            if job.status is JobStatus.WAITING_HUMAN:
+                resume_waiting_human = getattr(jobs, "resume_waiting_human", None)
+                if resume_waiting_human is not None:
+                    job = await resume_waiting_human(job.id, actor_id=actor_id)
+            if job.status is JobStatus.QUEUED:
+                await dispatcher.dispatch(job.id)
 
 
 # A refused retry is an operational instruction, not a stack trace.  The code
@@ -1068,6 +1268,7 @@ _RETRY_CONFLICT_MESSAGES: dict[str, str] = {
         "Un autre article du lot est en cours de production. Réessayez quand il sera terminé."
     ),
     "production_batch_not_recoverable": "Le lot de production ne peut pas être rouvert.",
+    "production_batch_paused": "Le lot de production est en pause. Reprenez-le avant cette action.",
 }
 
 _STAGE_LABELS: dict[str, str] = {
@@ -2631,6 +2832,13 @@ async def get_edition_production(
         for run in runs:
             runs_by_subject.setdefault(run.subject_id, []).append(run)
 
+        latest_runs = [
+            max(subject_runs, key=lambda run: (run.run_number, run.created_at))
+            for subject_runs in runs_by_subject.values()
+            if subject_runs
+        ]
+        activity_by_subject = await _production_activity_for_runs(uow, latest_runs)
+
         subjects: list[ProductionSubject] = []
         archived = edition.state is EditionStatus.ARCHIVED
         for origin in origins:
@@ -2674,14 +2882,152 @@ async def get_edition_production(
                     active_run_id=str(active.id) if active else None,
                     can_start=reason is None,
                     blocking_reason=reason,
+                    activity=activity_by_subject.get(subject.id)
+                    or ProductionActivityView(
+                        kind="idle", stage=latest.current_stage if latest else None
+                    ),
                 )
             )
         return ProductionBoard(
             edition_id=str(edition_id),
-            active_batch=(await _batch_status_view(uow, active_batch) if active_batch else None),
+            active_batch=(
+                await _batch_status_view(uow, active_batch, activity_by_subject=activity_by_subject)
+                if active_batch
+                else None
+            ),
             subjects=subjects,
-            recent_batches=[await _batch_status_view(uow, batch) for batch in recent_batches],
+            recent_batches=[
+                await _batch_status_view(uow, batch, activity_by_subject=activity_by_subject)
+                for batch in recent_batches
+            ],
         )
+
+
+@router.post("/editions/{edition_id}/production/{batch_id}/pause")
+async def pause_edition_batch(
+    edition_id: UUID,
+    batch_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    uow_factory, _, _ = _runtime(request)
+    actor_id = await _actor_id(request)
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
+    try:
+        result = await service.pause_batch_with_result(
+            edition_id,
+            batch_id,
+            actor_id=actor_id,
+        )
+    except EditionProductionBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch {batch_id} not found",
+        ) from exc
+    except EditionProductionBatchOwnershipError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except StaleEditionProductionBatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "stale_production_batch", "message": str(exc)},
+        ) from exc
+    except ProductionBatchPauseConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "status": exc.status.value},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(exc)},
+        ) from exc
+
+    diagnostics = getattr(request.app.state, "production_diagnostics", None)
+    if diagnostics is not None:
+        run_id, subject_id = await _batch_diagnostics_identity(uow_factory, batch_id)
+        diagnostics.record(
+            event="production.batch_paused",
+            run_id=run_id,
+            subject_id=subject_id,
+            batch_id=result.batch.id,
+            edition_id=edition_id,
+            actor_id=actor_id,
+            changed=result.changed,
+            phase=result.batch.phase.value,
+        )
+    return {
+        "action": "pause",
+        "batch_id": str(result.batch.id),
+        "status": result.batch.status.value,
+        "paused_at": result.batch.paused_at.isoformat() if result.batch.paused_at else None,
+        "paused_by": result.batch.paused_by,
+        "changed": result.changed,
+    }
+
+
+@router.post("/editions/{edition_id}/production/{batch_id}/resume")
+async def resume_edition_batch(
+    edition_id: UUID,
+    batch_id: UUID,
+    request: Request,
+) -> dict[str, Any]:
+    uow_factory, _, _ = _runtime(request)
+    actor_id = await _actor_id(request)
+    service = ProductionBatchService(uow_factory, _production_pacing(request))
+    try:
+        result = await service.resume_batch_with_result(edition_id, batch_id)
+    except EditionProductionBatchNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch {batch_id} not found",
+        ) from exc
+    except EditionProductionBatchOwnershipError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    except StaleEditionProductionBatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "stale_production_batch", "message": str(exc)},
+        ) from exc
+    except ProductionBatchPauseConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "status": exc.status.value},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": str(exc)},
+        ) from exc
+
+    # Dispatch is repeated for an idempotent replay. The stage key is the
+    # existing job identity, so this repairs a lost post-commit dispatch
+    # without creating a second model submission.
+    await _dispatch_resumed_batch(request, batch_id, actor_id=actor_id)
+    async with uow_factory() as uow:
+        persisted_batch = await uow.edition_production_batches.get(batch_id)
+    if persisted_batch is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Batch {batch_id} not found",
+        )
+    diagnostics = getattr(request.app.state, "production_diagnostics", None)
+    if diagnostics is not None:
+        run_id, subject_id = await _batch_diagnostics_identity(uow_factory, batch_id)
+        diagnostics.record(
+            event="production.batch_resumed",
+            run_id=run_id,
+            subject_id=subject_id,
+            batch_id=result.batch.id,
+            edition_id=edition_id,
+            actor_id=actor_id,
+            changed=result.changed,
+            phase=persisted_batch.phase.value,
+        )
+    return {
+        "action": "resume",
+        "batch_id": str(result.batch.id),
+        "status": persisted_batch.status.value,
+        "changed": result.changed,
+    }
 
 
 @router.post("/editions/{edition_id}/production/{batch_id}/cancel")

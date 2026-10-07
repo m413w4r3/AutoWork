@@ -37,6 +37,8 @@
 
   set par(justify: true)
 
+  show heading: set block(sticky: true)
+
   // Gray background with a superscript footnote number.
   show footnote: it => {
     set text(weight: "regular", size: 12pt)

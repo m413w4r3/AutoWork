@@ -39,6 +39,7 @@ from cti_app.domain.production_editorial_enrichment import (
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
+    decode_indicator_section_paths,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -248,8 +249,9 @@ def _project_publication_iocs(
 
     IOCs that the relevance projection ties to the subject are the subject's IOCs.
     Confirmed IOCs of non-core sources read in full, whose link with the subject is not
-    demonstrated, are published apart as original IOCs. A value present in both groups
-    is published once, in the subject's.
+    demonstrated, are published apart as original IOCs. Indicators in an explicitly
+    identified other case of a primary CORE source are out of scope and omitted. A value
+    present in both groups is published once, in the subject's.
     """
     indicator_ref_by_identity = {
         (
@@ -290,7 +292,10 @@ def _project_publication_iocs(
                 ):
                     destination = main
                 elif (
-                    source.tier is not ProductionReferenceTier.CORE
+                    (
+                        source.tier is not ProductionReferenceTier.CORE
+                        or decode_indicator_section_paths(item.context) is not None
+                    )
                     and source.profile is ExtractionProfile.FULL
                     and decision.classification in _UNDEMONSTRATED_IOC_CLASSIFICATIONS
                     and decision.reason_code in _UNDEMONSTRATED_IOC_REASONS
@@ -393,7 +398,7 @@ def _validate_publication_lineage(
             )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "6-dated-source-references-original-iocs"
+ASSEMBLY_POLICY_VERSION: Final[str] = "7-semantic-annotation-exact-occurrence-coverage"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -839,16 +844,12 @@ def build_publication_document_v5(
     semantic_text = SemanticTextV1(
         schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
         policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
-        paragraphs=tuple(
-            annotator.annotate_paragraph(
-                anchor=anchor,
-                text=text,
-                entities=entities,
-                proposals=editorial_enrichment.annotations,
-            )
-            for anchor, text in publication_document_text_anchors(
-                document, references=reference_entries
-            ).items()
+        paragraphs=annotator.annotate_paragraphs(
+            tuple(
+                publication_document_text_anchors(document, references=reference_entries).items()
+            ),
+            entities=entities,
+            proposals=editorial_enrichment.annotations,
         ),
     )
     return PublicationDocumentV5(

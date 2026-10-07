@@ -85,7 +85,12 @@ class _BatchRepo:
             return None
         return (
             self.batch
-            if self.batch.status in {ProductionBatchStatus.QUEUED, ProductionBatchStatus.RUNNING}
+            if self.batch.status
+            in {
+                ProductionBatchStatus.QUEUED,
+                ProductionBatchStatus.RUNNING,
+                ProductionBatchStatus.PAUSED,
+            }
             else None
         )
 

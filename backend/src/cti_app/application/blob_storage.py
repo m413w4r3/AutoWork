@@ -11,6 +11,17 @@ class BlobStorageUnavailableError(RuntimeError):
     retryable = True
 
 
+class BlobReadLimitExceededError(ValueError):
+    """A blob is larger than the caller's explicit read limit."""
+
+    code = "blob_read_limit_exceeded"
+
+    def __init__(self, *, size_bytes: int, max_bytes: int) -> None:
+        self.size_bytes = size_bytes
+        self.max_bytes = max_bytes
+        super().__init__("Blob exceeds the read limit")
+
+
 MaterializationMethod = Literal["hardlink", "copy", "existing"]
 
 

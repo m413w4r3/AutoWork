@@ -7,11 +7,22 @@ from uuid import UUID
 import pytest
 
 from cti_app.application import publication_qa
-from cti_app.application.publication_builder import build_publication_document_v4
+from cti_app.application.production_relevance import build_relevance_projection
+from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.publication_builder import (
+    build_publication_document_v4,
+    build_publication_document_v5,
+)
 from cti_app.application.publication_qa import qa_publication_v4, qa_publication_v5
 from cti_app.application.typst_rendering import project_publication_to_typst_model
+from cti_app.domain.production import ProductionEvidenceBasis
+from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
+    ExtractionIndicatorV1,
+    encode_indicator_section_paths,
+)
 from cti_app.domain.production_synthesis import extraction_evidence_refs_v1
-from cti_app.domain.publication import PublicationSectionKind, PublicationSectionV1
+from cti_app.domain.publication import ArtifactType, PublicationSectionKind, PublicationSectionV1
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
@@ -28,6 +39,7 @@ from tests.test_publication_builder_v4 import (
     _frontmatter_v6_case,
     _resolved_figure,
     _table,
+    _technical_evidence_publication_case,
     _with_extra_source,
 )
 
@@ -90,6 +102,56 @@ def test_correct_v4_passes_and_title_tampering_fails() -> None:
     tampered = replace(publication, title="Manually changed title")
     result = _assert_failed(inputs, tampered)
     assert result["checks"]["exact_projection"] is False  # type: ignore[index]
+
+
+def test_qa_accepts_technical_evidence_in_infection_chain_section() -> None:
+    inputs, publication = _technical_evidence_publication_case()
+
+    result = qa_publication_v4(publication=publication, **inputs)
+
+    assert result["passed"] is True
+
+
+def test_v5_qa_excludes_other_case_iocs_from_publication() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    core = extraction.sources[0]
+    indicator = ExtractionIndicatorV1(
+        value="other-case.example",
+        artifact_type=ArtifactType.DOMAIN,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context=encode_indicator_section_paths(
+            (((2, "GTG-84006: MEK-aligned activity"), (4, "Indicators of compromise")),)
+        ),
+        evidence_quote="other-case.example",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(core.source_document_id,),
+    )
+    extraction = replace(extraction, sources=(replace(core, indicators=(indicator,)),))
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    relevance_projection = build_relevance_projection(snapshot, extraction)
+    editorial_enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance_projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+    )
+    result = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=relevance_projection,
+        synthesis=synthesis,
+        editorial_enrichment=editorial_enrichment,
+        publication=publication,
+    )
+
+    assert result["passed"] is True
+    assert result["checks"]["ioc_groups_separated"] is True
+    assert publication.indicators == ()
+    assert publication.original_indicators == ()
 
 
 def test_table_cell_and_diagram_asset_tampering_fail() -> None:

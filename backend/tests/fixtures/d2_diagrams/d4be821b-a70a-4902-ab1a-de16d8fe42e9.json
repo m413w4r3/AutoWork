@@ -1,0 +1,210 @@
+{
+  "diagram": {
+    "asset_id": "451e9786-003b-52b2-adce-40e0c9400006",
+    "caption": "Le premier flux automatise le profilage OSINT et l’enrichissement d’une liste de cibles ; le second modifie NanoDump et s’appuie sur une chaîne C++/Python qui renomme les identifiants et injecte des fonctions factices.",
+    "direction": "top_to_bottom",
+    "edges": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "25f970dd24b6e045ddaa62dc7c14f37b351183049a58cdad136e7006ada2c690",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          },
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "construit et orchestre",
+        "source_node_id": "gtg30004",
+        "target_node_id": "osint_harness"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "enrichit",
+        "source_node_id": "osint_harness",
+        "target_node_id": "target_list"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "profile",
+        "source_node_id": "osint_harness",
+        "target_node_id": "profiled_people"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "modifie",
+        "source_node_id": "gtg30004",
+        "target_node_id": "nanodump"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "développe",
+        "source_node_id": "gtg30004",
+        "target_node_id": "obfuscation_pipeline"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "renomme",
+        "source_node_id": "obfuscation_pipeline",
+        "target_node_id": "renamed_identifiers"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "injecte",
+        "source_node_id": "obfuscation_pipeline",
+        "target_node_id": "dummy_functions"
+      }
+    ],
+    "groups": [],
+    "key": "gtg30004_parallel_workstreams",
+    "kind": "component_relationship",
+    "nodes": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "25f970dd24b6e045ddaa62dc7c14f37b351183049a58cdad136e7006ada2c690",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "GTG-30004",
+        "node_id": "gtg30004",
+        "role": "actor"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "25f970dd24b6e045ddaa62dc7c14f37b351183049a58cdad136e7006ada2c690",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          },
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Harnais de profilage OSINT",
+        "node_id": "osint_harness",
+        "role": "technique_step"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Liste de cibles préexistante",
+        "node_id": "target_list",
+        "role": "data_artifact"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "6d8196e9ec5e59aaeca578611f53cf622a854667dd8e7ae10d265ee563ebda0d",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Personnes profilées",
+        "node_id": "profiled_people",
+        "role": "victim"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "NanoDump",
+        "node_id": "nanodump",
+        "role": "malware_tool"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Pipeline C++/Python",
+        "node_id": "obfuscation_pipeline",
+        "role": "malware_tool"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Identifiants renommés",
+        "node_id": "renamed_identifiers",
+        "role": "technique_step"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "1e5c33f2b01d0f0496078fc5927efca133ed065c4030deb3baddb18be2938804",
+            "kind": "fact",
+            "source_document_id": "4d6df629-26e7-4d2d-83cc-23615d4a2d0f"
+          }
+        ],
+        "label": "Fonctions factices injectées",
+        "node_id": "dummy_functions",
+        "role": "technique_step"
+      }
+    ],
+    "placement": {
+      "kind": "after_lead",
+      "section_index": null
+    },
+    "title": "Deux flux de préparation attribués à GTG-30004"
+  },
+  "subject_id": "d4be821b-a70a-4902-ab1a-de16d8fe42e9"
+}

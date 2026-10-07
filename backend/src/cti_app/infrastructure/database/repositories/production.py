@@ -3,13 +3,17 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import String, Uuid, and_, case, func, select, update
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from cti_app.application.persistence import ActiveSubjectProductionRunConflictError
-from cti_app.application.production_read_model import BatchStatusItem
+from cti_app.application.production_read_model import (
+    BatchStatusItem,
+    ProductionActivitySnapshot,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.editorial import AnalystDecision, AnalystDecisionTargetType, AnalystDecisionType
 from cti_app.domain.production import (
@@ -45,6 +49,8 @@ from cti_app.domain.production_pipeline import (
     production_artifact_stages,
 )
 from cti_app.infrastructure.database.models.core import SubjectRow
+from cti_app.infrastructure.database.models.jobs import JobRow
+from cti_app.infrastructure.database.models.model_execution import ModelRunRow
 from cti_app.infrastructure.database.models.production import (
     AnalystDecisionRow,
     AnalystInputPackRow,
@@ -915,6 +921,8 @@ class SqlAlchemyEditionProductionBatchRepository:
             created_at=batch.created_at,
             started_at=batch.started_at,
             finished_at=batch.finished_at,
+            paused_at=batch.paused_at,
+            paused_by=batch.paused_by,
             version=batch.version,
         )
         self._session.add(row)
@@ -976,6 +984,8 @@ class SqlAlchemyEditionProductionBatchRepository:
                 next_dispatch_at=batch.next_dispatch_at,
                 started_at=batch.started_at,
                 finished_at=batch.finished_at,
+                paused_at=batch.paused_at,
+                paused_by=batch.paused_by,
                 version=batch.version,
             )
         )
@@ -988,7 +998,11 @@ class SqlAlchemyEditionProductionBatchRepository:
                 (EditionProductionBatchRow.edition_id == edition_id)
                 & (
                     EditionProductionBatchRow.status.in_(
-                        (ProductionBatchStatus.QUEUED.value, ProductionBatchStatus.RUNNING.value)
+                        (
+                            ProductionBatchStatus.QUEUED.value,
+                            ProductionBatchStatus.RUNNING.value,
+                            ProductionBatchStatus.PAUSED.value,
+                        )
                     )
                 )
             )
@@ -1010,7 +1024,11 @@ class SqlAlchemyEditionProductionBatchRepository:
             .where(
                 EditionProductionBatchRow.edition_id == edition_id,
                 EditionProductionBatchRow.status.not_in(
-                    (ProductionBatchStatus.QUEUED.value, ProductionBatchStatus.RUNNING.value)
+                    (
+                        ProductionBatchStatus.QUEUED.value,
+                        ProductionBatchStatus.RUNNING.value,
+                        ProductionBatchStatus.PAUSED.value,
+                    )
                 ),
             )
             .order_by(
@@ -1155,6 +1173,97 @@ class SqlAlchemyBatchStatusReadRepository:
             )
             for row in rows
         ]
+
+    async def list_activity_for_runs(
+        self, run_ids: Sequence[UUID]
+    ) -> Sequence[ProductionActivitySnapshot]:
+        """Read active jobs and their current model run for a set of runs once."""
+        if not run_ids:
+            return ()
+
+        job_run_id = JobRow.input_parameters["run_id"].as_string()
+        ranked_jobs = (
+            select(
+                job_run_id.label("run_id"),
+                JobRow.aggregate_id.label("subject_id"),
+                JobRow.kind.label("job_kind"),
+                JobRow.status.label("job_status"),
+                JobRow.created_at.label("job_created_at"),
+                JobRow.started_at.label("job_started_at"),
+                JobRow.next_retry_at.label("next_retry_at"),
+                JobRow.attempt.label("attempt"),
+                func.row_number()
+                .over(
+                    partition_by=job_run_id,
+                    order_by=(
+                        case((JobRow.status == "running", 0), else_=1),
+                        JobRow.created_at.desc(),
+                    ),
+                )
+                .label("job_rank"),
+            )
+            .where(
+                JobRow.aggregate_type == "subject",
+                JobRow.kind.like("production.subject.%"),
+                JobRow.status.in_(("queued", "running")),
+                job_run_id.in_([str(run_id) for run_id in run_ids]),
+            )
+            .subquery()
+        )
+        current_model_run_id = sql_cast(
+            ProductionRunRow.extraction_progress["current_model_run_id"].as_string(), Uuid
+        )
+        query = (
+            select(
+                ProductionRunRow.subject_id.label("subject_id"),
+                ProductionRunRow.id.label("run_id"),
+                ProductionRunRow.current_stage.label("stage"),
+                ProductionRunRow.status.label("run_status"),
+                ranked_jobs.c.job_kind,
+                ranked_jobs.c.job_status,
+                ranked_jobs.c.job_created_at,
+                ranked_jobs.c.job_started_at,
+                ranked_jobs.c.next_retry_at,
+                ranked_jobs.c.attempt,
+                ModelRunRow.status.label("model_run_status"),
+                ModelRunRow.started_at.label("model_run_started_at"),
+            )
+            .select_from(ProductionRunRow)
+            .outerjoin(
+                ranked_jobs,
+                and_(
+                    ranked_jobs.c.run_id == sql_cast(ProductionRunRow.id, String),
+                    ranked_jobs.c.subject_id == ProductionRunRow.subject_id,
+                    ranked_jobs.c.job_rank == 1,
+                ),
+            )
+            .outerjoin(
+                ModelRunRow,
+                and_(
+                    ModelRunRow.id == current_model_run_id,
+                    ModelRunRow.status == "running",
+                ),
+            )
+            .where(ProductionRunRow.id.in_(run_ids))
+        )
+        rows = (await self._session.execute(query)).mappings()
+        return tuple(
+            ProductionActivitySnapshot(
+                subject_id=row["subject_id"],
+                run_id=row["run_id"],
+                stage=ProductionStage(row["stage"]),
+                run_status=ProductionRunStatus(row["run_status"]),
+                job_kind=row["job_kind"],
+                job_status=row["job_status"],
+                job_created_at=row["job_created_at"],
+                job_started_at=row["job_started_at"],
+                next_retry_at=row["next_retry_at"],
+                attempt=row["attempt"],
+                model_run_status=row["model_run_status"],
+                model_run_started_at=row["model_run_started_at"],
+            )
+            for row in rows
+        )
 
 
 def _production_run_from_row(row: ProductionRunRow) -> ProductionRun:
@@ -1419,6 +1528,8 @@ def _edition_production_batch_from_row(row: EditionProductionBatchRow) -> Editio
         created_at=row.created_at,
         started_at=row.started_at,
         finished_at=row.finished_at,
+        paused_at=row.paused_at,
+        paused_by=row.paused_by,
         version=row.version,
     )
 

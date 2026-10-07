@@ -17,6 +17,7 @@ from cti_app.domain.production import (
     EditionProductionBatch,
     EditionProductionBatchItem,
     ProductionBatchPhase,
+    ProductionBatchStatus,
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
@@ -50,6 +51,17 @@ class _Batches:
 
     async def save(self, batch: EditionProductionBatch) -> None:
         self.item = batch
+
+    async def get_active_for_edition(self, edition_id: UUID) -> EditionProductionBatch | None:
+        if self.item.edition_id != edition_id:
+            return None
+        if self.item.status in {
+            ProductionBatchStatus.QUEUED,
+            ProductionBatchStatus.RUNNING,
+            ProductionBatchStatus.PAUSED,
+        }:
+            return self.item
+        return None
 
 
 class _BatchItems:
@@ -207,6 +219,90 @@ async def test_reconciliation_failure_is_never_automatically_recovered() -> None
     assert item.auto_recovery_count == 0
     assert runs[0].pipeline_generation == 0
     assert uow.edition_production_batches.item.phase is ProductionBatchPhase.REVIEW
+
+
+@pytest.mark.asyncio
+async def test_pause_keeps_active_run_and_batch_visible_without_chaining() -> None:
+    uow, runs = _batch_uow(["unknown_code", "unknown_code"])
+    batch = uow.edition_production_batches.item
+    batch.started_at = datetime.now(UTC)
+    runs[0].status = ProductionRunStatus.RUNNING
+    runs[0].current_stage = ProductionStage.SYNTHESIS
+    runs[1].status = ProductionRunStatus.QUEUED
+    service = ProductionBatchService(lambda: uow)
+
+    paused = await service.pause_batch_with_result(
+        batch.edition_id,
+        batch.id,
+        actor_id="dev-analyst",
+    )
+    assert paused.changed
+    assert batch.status is ProductionBatchStatus.PAUSED
+    assert batch.paused_at is not None
+    assert batch.paused_by == "dev-analyst"
+    assert runs[0].status is ProductionRunStatus.RUNNING
+    assert runs[0].current_stage is ProductionStage.SYNTHESIS
+    assert await uow.edition_production_batches.get_active_for_edition(batch.edition_id) is batch
+
+    assert await service.on_subject_terminal(batch.id, runs[0].id) is runs[0]
+    assert runs[1].status is ProductionRunStatus.QUEUED
+
+
+@pytest.mark.asyncio
+async def test_pause_between_items_preserves_order_until_resume() -> None:
+    uow, runs = _batch_uow(["unknown_code", "unknown_code"])
+    batch = uow.edition_production_batches.item
+    batch.started_at = datetime.now(UTC)
+    runs[1].status = ProductionRunStatus.QUEUED
+    service = ProductionBatchService(lambda: uow)
+
+    await service.pause_batch_with_result(batch.edition_id, batch.id, actor_id="operator")
+    assert await service.on_subject_terminal(batch.id, runs[0].id) is None
+    assert runs[1].status is ProductionRunStatus.QUEUED
+
+    resumed = await service.resume_batch_with_result(batch.edition_id, batch.id)
+    assert resumed.changed
+    assert batch.status is ProductionBatchStatus.RUNNING
+    assert await service.on_subject_terminal(batch.id, runs[0].id) is runs[1]
+    assert runs[1].status is ProductionRunStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_pause_before_initial_dispatch_resumes_as_queued() -> None:
+    uow, runs = _batch_uow(["unknown_code"])
+    batch = uow.edition_production_batches.item
+    batch.status = ProductionBatchStatus.QUEUED
+    runs[0].status = ProductionRunStatus.QUEUED
+    service = ProductionBatchService(lambda: uow)
+
+    await service.pause_batch_with_result(batch.edition_id, batch.id, actor_id="operator")
+    assert await service.start_next(batch.id) is None
+    await service.resume_batch_with_result(batch.edition_id, batch.id)
+
+    assert batch.status is ProductionBatchStatus.QUEUED
+    assert await service.start_next(batch.id) is runs[0]
+    assert batch.status is ProductionBatchStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_pause_is_idempotent_blocks_auto_recovery_and_cancel_still_works() -> None:
+    uow, runs = _batch_uow(["bridge_timeout"])
+    batch = uow.edition_production_batches.item
+    batch.started_at = datetime.now(UTC)
+    service = ProductionBatchService(lambda: uow)
+    first = await service.pause_batch_with_result(batch.edition_id, batch.id, actor_id="operator")
+    second = await service.pause_batch_with_result(batch.edition_id, batch.id, actor_id="operator")
+
+    assert first.changed
+    assert not second.changed
+    assert await service.on_subject_terminal(batch.id, runs[0].id) is None
+    assert uow.edition_production_batch_items.items[0].auto_recovery_count == 0
+    assert runs[0].pipeline_generation == 0
+
+    runs[0].status = ProductionRunStatus.RUNNING
+    cancelled = await service.cancel_batch_with_result(batch.edition_id, batch.id)
+    assert cancelled.batch.status is ProductionBatchStatus.CANCELLED
+    assert cancelled.cancelled_runs == ((runs[0].id, runs[0].subject_id),)
 
 
 @pytest.mark.asyncio

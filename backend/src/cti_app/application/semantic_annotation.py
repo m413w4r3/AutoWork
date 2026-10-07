@@ -21,6 +21,7 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
 )
+from cti_app.domain.production_synthesis import technical_literal_markup_exception_spans
 from cti_app.domain.publication import ArtifactType, RichSpan, RichSpanKind, RichText
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ROLE_PRIORITY,
@@ -28,6 +29,7 @@ from cti_app.domain.semantic_annotation import (
     SemanticParagraphV1,
     SemanticRole,
     SemanticTextSpanV1,
+    exact_word_occurrences,
 )
 
 SEMANTIC_ANNOTATOR_VERSION = "2-document-lexicon-technical-literals"
@@ -163,6 +165,9 @@ _COMMAND_HEAD = re.compile(
     re.IGNORECASE,
 )
 _UPPER_TECHNICAL_IDENTIFIER = re.compile(r"(?<![\w])(?:[A-Z][A-Z0-9]*)(?:[_-][A-Z0-9]+)+(?![\w])")
+_TECHNICAL_PLACEHOLDER_RUN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_\\/.-:%~"
+)
 
 
 def _name_like_fact_value(value: str) -> bool:
@@ -226,26 +231,33 @@ def _technical_literal_spans(text: str) -> tuple[tuple[TextSpan, SemanticRole], 
         if _looks_like_backticked_command(match.group(1)):
             found.append((TextSpan(match.start(), match.end()), SemanticRole.COMMAND))
     add(_UPPER_TECHNICAL_IDENTIFIER, SemanticRole.TECHNICAL_LITERAL)
+    for placeholder_start, placeholder_end in technical_literal_markup_exception_spans(text):
+        start, end = placeholder_start, placeholder_end
+        if not text[start:end].startswith("*."):
+            while start > 0 and text[start - 1] in _TECHNICAL_PLACEHOLDER_RUN_CHARS:
+                start -= 1
+            while end < len(text) and text[end] in _TECHNICAL_PLACEHOLDER_RUN_CHARS:
+                end += 1
+        found.append((TextSpan(start, end), SemanticRole.TECHNICAL_LITERAL))
     return tuple(found)
 
 
 def _exact_word_matches(text: str, term: str) -> tuple[TextSpan, ...]:
-    """Return case-sensitive exact occurrences whose outer word edges are bounded."""
-    spans: list[TextSpan] = []
-    start = 0
-    while True:
-        start = text.find(term, start)
-        if start < 0:
-            break
-        end = start + len(term)
-        left_word = term[0].isalnum() or term[0] == "_"
-        right_word = term[-1].isalnum() or term[-1] == "_"
-        if not (
-            left_word and start > 0 and (text[start - 1].isalnum() or text[start - 1] == "_")
-        ) and not (right_word and end < len(text) and (text[end].isalnum() or text[end] == "_")):
-            spans.append(TextSpan(start, end))
-        start += 1
-    return tuple(spans)
+    """Adapt shared semantic occurrence ranges to the annotator's span type."""
+    return tuple(TextSpan(start, end) for start, end in exact_word_occurrences(text, term))
+
+
+def _preferred_role(current: SemanticRole | None, candidate: SemanticRole) -> SemanticRole:
+    if (
+        current is None
+        or SEMANTIC_ROLE_PRIORITY[candidate] > SEMANTIC_ROLE_PRIORITY[current]
+        or (
+            SEMANTIC_ROLE_PRIORITY[candidate] == SEMANTIC_ROLE_PRIORITY[current]
+            and candidate.value < current.value
+        )
+    ):
+        return candidate
+    return current
 
 
 def _technical_literal_values(value: str) -> tuple[str, ...]:
@@ -422,6 +434,44 @@ class SemanticAnnotator:
             output.append(RichSpan(RichSpanKind.TEXT, text[cursor:]))
         return tuple(output)
 
+    def annotate_paragraphs(
+        self,
+        paragraphs: Sequence[tuple[str, str]],
+        *,
+        entities: Sequence[tuple[SemanticRole, str]],
+        proposals: Sequence[SemanticAnnotationProposalV1] = (),
+    ) -> tuple[SemanticParagraphV1, ...]:
+        """Annotate paragraphs, then propagate every discovered exact term document-wide."""
+        paragraph_inputs = tuple(paragraphs)
+        initial = tuple(
+            self.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=entities,
+                proposals=proposals,
+            )
+            for anchor, text in paragraph_inputs
+        )
+        document_terms: dict[str, SemanticRole] = {}
+        for paragraph in initial:
+            for span in paragraph.spans:
+                if span.role is SemanticRole.TEXT:
+                    continue
+                document_terms[span.text] = _preferred_role(
+                    document_terms.get(span.text), span.role
+                )
+        propagated_terms = tuple((role, term) for term, role in sorted(document_terms.items()))
+        return tuple(
+            self.annotate_paragraph(
+                anchor=anchor,
+                text=text,
+                entities=entities,
+                proposals=proposals,
+                propagated_terms=propagated_terms,
+            )
+            for anchor, text in paragraph_inputs
+        )
+
     def annotate_paragraph(
         self,
         *,
@@ -429,6 +479,7 @@ class SemanticAnnotator:
         text: str,
         entities: Sequence[tuple[SemanticRole, str]],
         proposals: Sequence[SemanticAnnotationProposalV1] = (),
+        propagated_terms: Sequence[tuple[SemanticRole, str]] = (),
     ) -> SemanticParagraphV1:
         """Build full-coverage spans without changing any source character."""
         candidates: list[_RoleCandidate] = []
@@ -450,18 +501,16 @@ class SemanticAnnotator:
             candidates.append(_RoleCandidate(span.start, span.end, SemanticRole.ENGLISH_TERM))
 
         document_terms: dict[str, SemanticRole] = {}
+
+        def add_document_term(term: str, role: SemanticRole) -> None:
+            document_terms[term] = _preferred_role(document_terms.get(term), role)
+
         for proposal in proposals:
-            current = document_terms.get(proposal.text)
-            if (
-                current is None
-                or SEMANTIC_ROLE_PRIORITY[proposal.role] > SEMANTIC_ROLE_PRIORITY[current]
-                or (
-                    SEMANTIC_ROLE_PRIORITY[proposal.role] == SEMANTIC_ROLE_PRIORITY[current]
-                    and proposal.role.value < current.value
-                )
-            ):
-                document_terms[proposal.text] = proposal.role
-        for term, role in document_terms.items():
+            add_document_term(proposal.text, proposal.role)
+        for role, term in propagated_terms:
+            if term and role is not SemanticRole.TEXT:
+                add_document_term(term, role)
+        for term, role in sorted(document_terms.items()):
             candidates.extend(
                 _RoleCandidate(span.start, span.end, role)
                 for span in _exact_word_matches(text, term)

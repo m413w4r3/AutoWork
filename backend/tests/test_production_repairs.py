@@ -25,6 +25,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueService,
     ProductionRepairProjectionService,
     _impact_from_projection_hashes,
+    _q2_reuse_preview,
     build_repair_evidence_pack,
     repair_key_for_rejection,
 )
@@ -65,6 +66,20 @@ SUBJECT_ID = uuid4()
 RUN_ID = uuid4()
 ARTIFACT_ID = uuid4()
 SOURCE_URL = "https://example.test/report/"
+
+
+async def test_repair_preview_marks_effective_checkpoint_reuse_unknown_without_archive_text() -> (
+    None
+):
+    preview = await _q2_reuse_preview(
+        source_urls=("https://example.test/a", "https://example.test/b")
+    )
+
+    assert preview == {
+        "expected_q2_calls": 0,
+        "expected_q2_reuses": 0,
+        "reuse_unknown_count": 2,
+    }
 
 
 class _BlobCatalog:

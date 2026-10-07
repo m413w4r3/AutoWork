@@ -97,7 +97,7 @@ class _Batches:
             (
                 b
                 for b in self.items.values()
-                if b.edition_id == edition_id and b.status in ("queued", "running")
+                if b.edition_id == edition_id and b.status in ("queued", "running", "paused")
             ),
             None,
         )

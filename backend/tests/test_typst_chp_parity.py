@@ -20,7 +20,9 @@ import tempfile
 import zlib
 from dataclasses import replace
 from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
+from typing import Any
 from uuid import UUID
 
 import anyio
@@ -39,6 +41,7 @@ from cti_app.application.typst_rendering import (
     TemplateFile,
     TypstMediaRef,
     TypstRenderer,
+    TypstRenderSource,
     TypstTemplateBundle,
     load_template_bundle,
 )
@@ -99,6 +102,10 @@ _CHP_TYPST_ROOT = _REPOSITORY_ROOT / "chpTypst"
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
 _IMPORT_RE = re.compile(r'^\s*#import\s+"([^"]+)"\s*:\s*(.*?)\s*$', re.MULTILINE)
 _IDENTIFIER_RE = re.compile(r"\*|[A-Za-z_][A-Za-z_0-9-]*")
+
+
+def _run_typst_compile(argv: tuple[str, ...]) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(argv, capture_output=True, check=False, timeout=20)
 
 
 @pytest.fixture
@@ -291,10 +298,17 @@ def chp_parity_document() -> PublicationDocumentV4:
             ),
         ),
         figures=(
-            _figure_at(
-                "parity-figure",
-                "Source figure caption.",
-                EnrichmentPlacementKind.END,
+            replace(
+                _figure_at(
+                    "parity-figure",
+                    "Source figure caption.",
+                    EnrichmentPlacementKind.END,
+                ),
+                provenance=(
+                    "archived source document 65d67fad-2db8-4e50-a6a0-6fd09e790000; "
+                    "/html[1]/body[1]/div[3]/img[3]; anchor: "
+                    "https://secret.example/image.png"
+                ),
             ),
         ),
     )
@@ -351,11 +365,343 @@ def _resolved_imports(
 
 
 def _normalized_pdf_text(reader: PdfReader) -> tuple[str, str]:
-    # Zero-width spaces are display-only break opportunities inserted in long
-    # IOC/path/command spans; they are not part of the canonical text.
-    extracted = "\n".join(page.extract_text() or "" for page in reader.pages).replace("\u200b", "")
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
     normalized = " ".join(extracted.split())
     return normalized, re.sub(r"\s+", "", extracted)
+
+
+def _page_content_lines(page_text: str) -> list[str]:
+    return [
+        line.strip()
+        for line in page_text.splitlines()
+        if line.strip()
+        and re.fullmatch(r"\d+\s*/\s*\d+", line.strip()) is None
+        and not line.strip().startswith("Bulletin-")
+    ]
+
+
+def _page_body_text_lines(page: Any) -> list[tuple[float, float, str]]:
+    positioned: list[tuple[float, float, str]] = []
+
+    def collect(
+        text: str,
+        ctm: Any,
+        text_matrix: Any,
+        font_dictionary: Any,
+        font_size: float,
+    ) -> None:
+        del font_dictionary
+        if not text.strip() or font_size < 7:
+            return
+        y = ctm[1] * text_matrix[4] + ctm[3] * text_matrix[5] + ctm[5]
+        if 50 <= y <= 785:
+            positioned.append((float(y), float(font_size), text.strip()))
+
+    page.extract_text(visitor_text=collect)
+    positioned.sort(key=lambda item: item[0], reverse=True)
+    lines: list[tuple[float, float, str]] = []
+    for y, font_size, text in positioned:
+        if lines and abs(lines[-1][0] - y) <= max(2.0, 0.45 * min(lines[-1][1], font_size)):
+            prior_y, prior_size, prior_text = lines[-1]
+            line_y = prior_y if prior_size >= font_size else y
+            lines[-1] = (line_y, max(prior_size, font_size), f"{prior_text} {text}")
+        else:
+            lines.append((y, font_size, text))
+    return lines
+
+
+def _assert_page_body_text_does_not_overlap(reader: PdfReader) -> None:
+    for page_number, page in enumerate(reader.pages, start=1):
+        lines = _page_body_text_lines(page)
+        for upper, lower in pairwise(lines):
+            gap = upper[0] - lower[0]
+            minimum_gap = 0.9 * max(upper[1], lower[1])
+            assert gap >= minimum_gap, (
+                f"page {page_number} has overlapping text lines: "
+                f"{upper[2]!r} at y={upper[0]:.2f}pt and "
+                f"{lower[2]!r} at y={lower[0]:.2f}pt "
+                f"(gap {gap:.2f}pt, need {minimum_gap:.2f}pt)"
+            )
+
+
+def _keep_with_next_sections(
+    target: str,
+    filler_count: int,
+    table: dict[str, object] | None = None,
+) -> list[dict[str, object]]:
+    filler = [
+        {"type": "paragraph", "text": f"Boundary filler {index:03d}."}
+        for index in range(filler_count)
+    ]
+    sections: list[dict[str, object]] = [
+        {"type": "references", "timeline": [], "blocks": [], "sources": []}
+    ]
+    if target in {"table", "long-table"}:
+        assert table is not None
+        table["title"] = (
+            "Vulnérabilités cataloguées par système"
+            if target == "table"
+            else "Long table pagination probe"
+        )
+        table["columns"] = ["Système", "Vulnérabilités recherchées"]
+        table["column_weights"] = [1.0, 1.0]
+        if target == "table":
+            table["rows"] = [
+                ["Windows", "CVE-2025-001"],
+                ["Linux", "CVE-2025-002"],
+                ["VPN", "CVE-2025-003"],
+                ["Firewall", "CVE-2025-004"],
+                ["Hypervisor", "CVE-2025-005"],
+            ]
+        else:
+            long_description = (
+                "Description text that wraps across multiple table lines to exercise "
+                "repeated headers when the table continues onto another page. "
+            ) * 3
+            table["rows"] = [
+                [f"System {index:02d}", f"Finding {index:02d}. {long_description}"]
+                for index in range(1, 31)
+            ]
+        table.pop("semantic_title", None)
+        table.pop("semantic_columns", None)
+        table.pop("semantic_cells", None)
+        sections.append({"type": "synthesis", "blocks": [*filler, table]})
+    else:
+        sections.extend(
+            (
+                {"type": "synthesis", "blocks": filler},
+                {
+                    "type": "technical_annex",
+                    "indicators": {
+                        "ips": [f"192.0.2.{index}" for index in range(1, 14)],
+                        "domains": [],
+                        "urls": [],
+                        "emails": [],
+                        "hashes": [],
+                    },
+                    "original_indicators": {
+                        "ips": [],
+                        "domains": [],
+                        "urls": [],
+                        "emails": [],
+                        "hashes": [],
+                    },
+                    "original_indicator_note": "",
+                },
+            )
+        )
+    return sections
+
+
+async def _assert_real_typst_keep_with_next_case(
+    *,
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+    template_files: tuple[TemplateFile, ...],
+    source: TypstRenderSource,
+    target: str,
+    edition: bool = False,
+) -> None:
+    """Check real Typst page-boundary behavior and body-line geometry."""
+    render_source = source
+    control_files = tuple(
+        replace(
+            file,
+            content=file.content.replace(b"sticky: true", b"sticky: false")
+            .replace(b"breakable: false", b"breakable: true")
+            .replace(b"table.header(repeat: true, ..header-cells),", b"..header-cells,")
+            .replace(b"repeat: true", b"repeat: false"),
+        )
+        for file in template_files
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / f"{target}-font-snapshot"
+    font_root.mkdir()
+    font_paths = materialize_font_bundle(font_snapshot, font_root)
+
+    def make_render_data(filler_count: int) -> bytes:
+        data = json.loads(render_source.render_data_bytes)
+        publication = data["publications"][0] if edition else data
+        table = None
+        if target in {"table", "long-table"}:
+            table = next(
+                block
+                for section in publication["content_sections"]
+                for block in section["blocks"]
+                if block["type"] == "table"
+            )
+        publication["content_sections"] = _keep_with_next_sections(target, filler_count, table)
+        return json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+    async def prepare_workspace(name: str, files: tuple[TemplateFile, ...]) -> tuple[Path, Path]:
+        workspace = tmp_path / name
+        _build_workspace(
+            workspace,
+            bundle_files=files,
+            render_data_bytes=make_render_data(0),
+            media_refs=render_source.media_refs,
+        )
+        data_path = workspace / render_source.render_data_relative_path
+        if data_path != workspace / "RENDERER" / "render-data.json":
+            (workspace / "RENDERER" / "render-data.json").unlink(missing_ok=True)
+            data_path.parent.mkdir(parents=True, exist_ok=True)
+            data_path.write_bytes(make_render_data(0))
+        return workspace, data_path
+
+    fixed_workspace, fixed_data_path = await prepare_workspace(
+        f"{target}-sticky-output", template_files
+    )
+
+    async def compile_at(workspace: Path, data_path: Path, filler_count: int) -> PdfReader:
+        await anyio.Path(data_path).write_bytes(make_render_data(filler_count))
+        output_path = workspace / "keep-with-next.pdf"
+        argv = [typst_binary, "compile", "--root", str(workspace)]
+        for font_path in font_paths:
+            argv.extend(("--font-path", str(font_path)))
+        argv.extend(
+            (
+                "--ignore-system-fonts",
+                "--creation-timestamp",
+                "0",
+                str(workspace / render_source.entrypoint_relative_path),
+                str(output_path),
+            )
+        )
+        completed = await anyio.to_thread.run_sync(_run_typst_compile, tuple(argv))
+        assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+        return PdfReader(BytesIO(await anyio.Path(output_path).read_bytes()), strict=True)
+
+    is_table = target in {"table", "long-table"}
+    marker = (
+        "Vulnérabilités cataloguées par système"
+        if target == "table"
+        else "Long table pagination probe"
+        if target == "long-table"
+        else "IOC"
+    )
+    following = (
+        ("Système", "Windows")
+        if target == "table"
+        else ("Système", "System 01")
+        if target == "long-table"
+        else ("Adresses IP :", "192.0.2.1")
+    )
+    filler_count = (29 if edition else 30) if is_table else (30 if edition else 31)
+    control_page_index: int | None = None
+    selected_filler_count = filler_count
+    if target == "long-table":
+        control_workspace, control_data_path = await prepare_workspace(
+            f"{target}-unsticky-control", control_files
+        )
+        observed_endings: list[str] = []
+        for candidate_filler_count in range(filler_count, max(-1, filler_count - 9), -1):
+            control_reader = await compile_at(
+                control_workspace, control_data_path, candidate_filler_count
+            )
+            for page_index, page in enumerate(control_reader.pages[:-1]):
+                page_text = page.extract_text() or ""
+                lines = _page_content_lines(page_text)
+                observed_endings.append(lines[-1] if lines else "<empty>")
+                next_page_text = control_reader.pages[page_index + 1].extract_text() or ""
+                page_ending = " ".join(lines[-2:])
+                header_is_last = all(
+                    heading in page_ending for heading in ("Système", "Vulnérabilités recherchées")
+                )
+                first_row = following[-1]
+                if (
+                    marker in page_text
+                    and header_is_last
+                    and first_row not in page_text
+                    and first_row in next_page_text
+                ):
+                    control_page_index = page_index
+                    selected_filler_count = candidate_filler_count
+                    break
+            if control_page_index is not None:
+                break
+        assert control_page_index is not None, (
+            f"could not calibrate a split table {marker!r} at {filler_count} filler blocks; "
+            f"page endings: {observed_endings!r}"
+        )
+
+    fixed_reader = await compile_at(fixed_workspace, fixed_data_path, selected_filler_count)
+    _assert_page_body_text_does_not_overlap(fixed_reader)
+    fixed_page_index = next(
+        (
+            page_index
+            for page_index, page in enumerate(fixed_reader.pages)
+            if marker in (page.extract_text() or "")
+        ),
+        None,
+    )
+    assert fixed_page_index is not None
+    if control_page_index is not None:
+        assert fixed_page_index > control_page_index
+    else:
+        assert fixed_page_index > 0
+    fixed_page_text = fixed_reader.pages[fixed_page_index].extract_text() or ""
+    assert all(item in fixed_page_text for item in following)
+    fixed_page_lines = _page_body_text_lines(fixed_reader.pages[fixed_page_index])
+    marker_line_index = next(
+        index for index, line in enumerate(fixed_page_lines) if marker in line[2]
+    )
+    following_lines = fixed_page_lines[marker_line_index + 1 :]
+    assert len(following_lines) >= 3, (
+        f"{marker!r} has fewer than three following body lines on its page: "
+        f"{[line[2] for line in following_lines]!r}"
+    )
+    if target == "ioc":
+        following_text = " ".join(line[2] for line in following_lines)
+        assert "Adresses IP" in following_text
+        assert all(f"192.0.2.{index}" in following_text for index in range(1, 4))
+    elif target == "table":
+        table_page_text = fixed_reader.pages[fixed_page_index].extract_text() or ""
+        assert all(
+            row_label in table_page_text
+            for row_label in ("Windows", "Linux", "VPN", "Firewall", "Hypervisor")
+        )
+        assert "Vulnérabilités recherchées" in table_page_text
+        previous_page_lines = _page_content_lines(
+            fixed_reader.pages[fixed_page_index - 1].extract_text() or ""
+        )
+        assert previous_page_lines
+        assert "Vulnérabilités recherchées" not in " ".join(previous_page_lines[-2:])
+    else:
+        assert target == "long-table"
+        first_table_page_text = fixed_reader.pages[fixed_page_index].extract_text() or ""
+        first_page_rows = [
+            f"System {index:02d}"
+            for index in range(1, 31)
+            if f"System {index:02d}" in first_table_page_text
+        ]
+        assert len(first_page_rows) >= 2, (
+            f"long table starts with fewer than two body rows: {first_page_rows!r}"
+        )
+        assert "Vulnérabilités recherchées" in first_table_page_text
+        continuation_pages = [
+            page
+            for page in fixed_reader.pages[fixed_page_index + 1 :]
+            if re.search(r"System \d{2}", page.extract_text() or "")
+        ]
+        assert continuation_pages, "30-row table did not continue on a later page"
+        for continuation_page in continuation_pages:
+            continuation_text = continuation_page.extract_text() or ""
+            assert "Vulnérabilités recherchées" in continuation_text
+            continuation_rows = [
+                f"System {index:02d}"
+                for index in range(1, 31)
+                if f"System {index:02d}" in continuation_text
+            ]
+            assert len(continuation_rows) >= 2, (
+                f"continuation page has fewer than two body rows: {continuation_rows!r}"
+            )
+    previous_page_lines = _page_content_lines(
+        fixed_reader.pages[fixed_page_index - 1].extract_text() or ""
+    )
+    assert previous_page_lines
+    assert previous_page_lines[-1] != marker
+    assert any("Boundary filler" in line for line in previous_page_lines[-3:])
 
 
 def _embedded_visual_xobject_count(reader: PdfReader) -> int:
@@ -542,7 +888,7 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
         "Section paragraph describing the observed activity.",
         "Figure 1 : Diagram asset caption.",
         "Figure 2 : Source figure caption.",
-        "Provenance : Figure 1 from the source publication",
+        "Source : example.test — p. 1",
         "Display ip",
         "Display domain",
         "Display url",
@@ -554,6 +900,14 @@ async def test_real_typst_pdf_preserves_chp_publication_structure(
     )
     for expected in expected_text:
         assert expected in text
+    for internal_detail in (
+        "Provenance",
+        "65d67fad-2db8-4e50-a6a0-6fd09e790000",
+        "/html[1]",
+        "secret.example",
+        "HTML image",
+    ):
+        assert internal_detail not in text
     assert "synthesis_internal_heading" not in text
     assert "extraction_source_skipped" not in text
     assert "synthesis_output_invalid" not in text
@@ -834,7 +1188,9 @@ async def test_real_typst_render_shows_diagram_and_archived_figure_captions(
     assert "Figure 1 : Résolution du C2 iranien via Bitcoin" in normalized
     assert f"Figure 2 : {relationship_caption}" in normalized
     assert "Figure 3 : Capture d'une preuve technique" in normalized
-    assert "Provenance : Figure 1 from the source publication" in normalized
+    assert "Source : example.test" in normalized
+    assert "Provenance" not in normalized
+    assert "HTML image" not in normalized
 
     review_directory = Path(os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", tmp_path / "review"))
     rasterizer = shutil.which("pdftoppm") if "AUTOWORK_REVIEW_ARTIFACT_DIR" in os.environ else None
@@ -889,7 +1245,11 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
     chp_parity_document: PublicationDocumentV4,
 ) -> None:
     command = '`curl "$x" #import "evil" ] $math$`'
-    lead_text = f"APT Étoile used the literal command {command}."
+    literal_text = (
+        r"NetSync_<username>, %APPDATA%\Microsoft\Network, "
+        "# shepherd-persist; and ~/.node_packages"
+    )
+    lead_text = f"APT Étoile used the literal command {command}. It also used {literal_text}."
     base = replace(
         chp_parity_document,
         title="APT Étoile activity",
@@ -952,6 +1312,13 @@ async def test_real_typst_renders_annotated_literal_content_without_evaluating_i
 
     assert "APT Étoile" in text
     assert 'curl "$x"' in text
+    for literal in (
+        "NetSync_<username>",
+        r"%APPDATA%\Microsoft\Network",
+        "# shepherd-persist;",
+        "~/.node_packages",
+    ):
+        assert literal in text
     for literal in ("#import", "evil", "]", "$math$", "`"):
         assert literal in text or literal.replace(" ", "") in compact_text
 
@@ -1003,12 +1370,20 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert len(reader.pages) >= 2
     assert "[Example actor] Décrit une activité documentée" in text
     assert "RÉFÉRENCES" in text
-    assert text.count("IOC") == 1
-    assert "IOC originaux" not in text
+    assert text.count("IOC") == 2
+    reserve_heading = "IOC originaux à lien non démontré"
+    assert reserve_heading in text
+    reserve_position = text.index(reserve_heading)
+    assert text.index("core.example") < reserve_position
+    assert "Le lien avec le sujet" in text and "pas démontré" in text
     assert "10 janvier 2026" in text
     assert "https://a.example/report" in text
     assert "Date de publication non précisée" in text
     assert all(f"original-{index:03d}.example" in compact_text for index in range(120))
+    main_list_text = text[:reserve_position]
+    reserve_list_text = text[reserve_position:]
+    assert all(f"original-{index:03d}.example" not in main_list_text for index in range(120))
+    assert all(f"original-{index:03d}.example" in reserve_list_text for index in range(120))
 
     output_dir = anyio.Path(
         os.environ.get("AUTOWORK_REVIEW_ARTIFACT_DIR", str(tmp_path / "review"))
@@ -1026,3 +1401,34 @@ async def test_real_typst_frontmatter_and_120_original_iocs_flow_across_pages(
     assert rasterized.returncode == 0, rasterized.stderr.decode("utf-8", errors="replace")
     review_pages = [path async for path in output_dir.glob("frontmatter-ioc-review-*.png")]
     assert len(review_pages) >= 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ("table", "long-table", "ioc"))
+async def test_real_typst_article_keeps_titles_with_following_content(
+    target: str,
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    template_bundle = load_template_bundle(_CHP_TYPST_ROOT)
+    tables = (
+        (
+            _table_at(
+                "sticky-title",
+                "Migrations recommandées des protocoles OT",
+                EnrichmentPlacementKind.AFTER_LEAD,
+            ),
+        )
+        if target in {"table", "long-table"}
+        else ()
+    )
+    render_source = TypstRenderer().render(_full_document(tables=tables), template_bundle)
+    await _assert_real_typst_keep_with_next_case(
+        tmp_path=tmp_path,
+        typst_binary=typst_binary,
+        font_bundle_root=font_bundle_root,
+        template_files=template_bundle.files,
+        source=render_source,
+        target=target,
+    )

@@ -122,6 +122,42 @@ def test_source_verified_ports_and_parameters_get_monospace_literal_roles() -> N
     )
 
 
+def test_attached_angle_placeholders_remain_in_full_technical_literal_spans() -> None:
+    text = (
+        r"NetSync_<username> C:\Users\<user>\AppData "
+        r"/home/<user>/.config %USERPROFILE%\<name>.dll"
+    )
+    annotated = SemanticAnnotator(EnglishTermDetector(())).annotate_paragraph(
+        anchor="lead:0001", text=text, entities=()
+    )
+
+    assert annotated.text == text
+    assert "".join(span.text for span in annotated.spans) == text
+    literals = [
+        span.text for span in annotated.spans if span.role is SemanticRole.TECHNICAL_LITERAL
+    ]
+    assert literals == [
+        "NetSync_<username>",
+        r"C:\Users\<user>\AppData",
+        r"/home/<user>/.config",
+        r"%USERPROFILE%\<name>.dll",
+    ]
+
+
+def test_standalone_placeholders_and_wildcard_domains_are_technical_literals() -> None:
+    text = "Commande <deno_path> vers *.cloudfront.net et fichier *.exe."
+    annotated = SemanticAnnotator(EnglishTermDetector(())).annotate_paragraph(
+        anchor="lead:0001", text=text, entities=()
+    )
+
+    literals = [
+        span.text for span in annotated.spans if span.role is SemanticRole.TECHNICAL_LITERAL
+    ]
+    assert "<deno_path>" in literals
+    assert "*.cloudfront.net" in literals
+    assert "*.exe" in literals
+
+
 def test_model_segment_resolves_every_exact_occurrence_with_punctuation_local() -> None:
     from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1
 

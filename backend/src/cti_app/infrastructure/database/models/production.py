@@ -42,7 +42,7 @@ PRODUCTION_REPAIR_ISSUE_KIND_VALUES_SQL = (
 PRODUCTION_REPAIR_ACTION_VALUES_SQL = "'include', 'exclude', 'replace', 'continue_without_source'"
 PRODUCTION_REPAIR_VERIFICATION_STATE_VALUES_SQL = "'source_verified', 'analyst_override'"
 PRODUCTION_BATCH_STATUS_VALUES_SQL = (
-    "'queued', 'running', 'completed', 'completed_with_issues', 'cancelled'"
+    "'queued', 'running', 'paused', 'completed', 'completed_with_issues', 'cancelled'"
 )
 PRODUCTION_BATCH_PHASE_VALUES_SQL = "'initial', 'recovery', 'review'"
 ANALYST_INVESTIGATION_STATUS_VALUES_SQL = (
@@ -204,7 +204,11 @@ class ProductionArtifactRow(Base):
 
 
 class SourceExtractionRow(Base):
-    """Canonical extraction checkpoint keyed only by source content and contract."""
+    """Checkpoint keyed by effective evidence text and extraction contract.
+
+    ``source_content_sha256`` retains its durable column name for compatibility;
+    its current semantics are the SHA-256 of normalized text sent to extraction.
+    """
 
     __tablename__ = "source_extractions"
     __table_args__ = (
@@ -461,6 +465,9 @@ class EditionProductionBatchRow(Base):
         ),
         CheckConstraint(f"phase IN ({PRODUCTION_BATCH_PHASE_VALUES_SQL})", name="ck_batch_phase"),
         CheckConstraint(
+            "(paused_at IS NULL) = (paused_by IS NULL)", name="ck_batch_pause_identity"
+        ),
+        CheckConstraint(
             "length(trim(idempotency_key)) BETWEEN 1 AND 255", name="ck_batch_idempotency_key"
         ),
         CheckConstraint("length(trim(actor_id)) BETWEEN 1 AND 255", name="ck_batch_actor_id"),
@@ -488,6 +495,8 @@ class EditionProductionBatchRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paused_by: Mapped[str | None] = mapped_column(String(255))
     version: Mapped[int] = mapped_column(nullable=False)
 
 

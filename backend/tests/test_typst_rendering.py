@@ -236,7 +236,7 @@ def test_minimal_document_has_complete_empty_sections_and_is_deterministic(tmp_p
     assert first.source_bytes == second.source_bytes
     assert first.render_data_sha256 == second.render_data_sha256
     assert first.media_refs == ()
-    assert data["schema_version"] == "typst-publication-model-v8-unified-ioc-rendering"
+    assert data["schema_version"] == ("typst-publication-model-v16-semantic-annotation-coverage")
     references, synthesis = data["content_sections"]
     assert references["type"] == "references"
     assert references["timeline"] == []
@@ -315,17 +315,18 @@ def test_v6_render_model_uses_dated_source_references_and_both_ioc_groups(
     assert synthesis["type"] == "synthesis"
     assert annex["type"] == "technical_annex"
     assert annex["indicators"]["domains"]
-    assert set(annex["original_indicators"]["domains"]).issubset(
-        set(annex["indicators"]["domains"])
-    )
-    assert len(annex["indicators"]["domains"]) == len(set(annex["indicators"]["domains"]))
-    assert annex["original_indicators"]["domains"] == [
+    displayed_domain_texts = [item["text"] for item in annex["indicators"]["domains"]]
+    assert len(displayed_domain_texts) == len(set(displayed_domain_texts))
+    assert not {
+        item["text"].casefold() for item in annex["original_indicators"]["domains"]
+    }.intersection(item.casefold() for item in displayed_domain_texts)
+    assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
         "context.example",
         "original.example",
     ]
 
 
-def test_v6_render_model_keeps_original_ioc_metadata_separate_from_merged_values(
+def test_v6_render_model_keeps_original_ioc_values_separate_from_subject_values(
     tmp_path: Path,
 ) -> None:
     publication, *_ = _frontmatter_v6_case()
@@ -336,10 +337,13 @@ def test_v6_render_model_keeps_original_ioc_metadata_separate_from_merged_values
     annex = model["content_sections"][-1]
 
     displayed_domains = annex["indicators"]["domains"]
-    assert original.value in displayed_domains
-    assert len(displayed_domains) == len({value.casefold() for value in displayed_domains})
+    displayed_texts = [item["text"] for item in displayed_domains]
+    assert original.value not in displayed_texts
+    assert original.value in {item["text"] for item in annex["original_indicators"]["domains"]}
+    assert "pas démontré" in annex["original_indicator_note"]
+    assert len(displayed_texts) == len({value.casefold() for value in displayed_texts})
     assert publication.original_indicators[0].indicators[0] == original
-    assert annex["original_indicators"]["domains"] == [
+    assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
         "context.example",
         "original.example",
     ]
@@ -351,7 +355,7 @@ def test_render_ioc_projection_deduplicates_normalized_values_across_groups() ->
 
     displayed = _indicator_values((original_group, original_group))
 
-    assert displayed["domains"] == [
+    assert [item["text"] for item in displayed["domains"]] == [
         "context.example",
         "original.example",
     ]
@@ -387,11 +391,14 @@ def test_full_mapping_preserves_text_timeline_indicators_and_optional_sources(
     ]
     assert technical_annex["type"] == "technical_annex"
     assert technical_annex["indicators"] == {
-        "ips": ["Display ip"],
-        "domains": ["Display domain"],
-        "urls": ["Display url"],
-        "emails": ["Display email"],
-        "hashes": ["Display hash"],
+        key: [{"text": f"Display {label}", "break_chunks": []}]
+        for key, label in (
+            ("ips", "ip"),
+            ("domains", "domain"),
+            ("urls", "url"),
+            ("emails", "email"),
+            ("hashes", "hash"),
+        )
     }
     assert "uncertainties" not in data
     assert references["sources"] == [
@@ -489,14 +496,11 @@ def test_v5_projection_maps_semantic_spans_to_closed_typst_helpers(tmp_path: Pat
     styles = {span["style"] for span in paragraph["semantic_spans"]}
     semantic_cells = table["semantic_cells"]
 
-    assert data["schema_version"] == "typst-publication-model-v8-unified-ioc-rendering"
+    assert data["schema_version"] == ("typst-publication-model-v16-semantic-annotation-coverage")
     assert table["column_weights"] == _table_column_weights(base.tables[0])
     assert all(0.8 <= weight <= 2.4 for weight in table["column_weights"])
     assert paragraph["text"] == lead_text
-    assert (
-        "".join(span["text"] for span in paragraph["semantic_spans"]).replace("\u200b", "")
-        == lead_text
-    )
+    assert "".join(span["text"] for span in paragraph["semantic_spans"]) == lead_text
     assert {"semantic-actor", "semantic-command", "semantic-technical-literal"} <= styles
     assert len(semantic_cells) == sum(len(row) for row in table["rows"])
     assert all(isinstance(cell_spans, list) for cell_spans in semantic_cells)
@@ -511,7 +515,15 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
     long_hash = "a" * 128
     long_path = "/opt/very-long-installation/path/to/a/critical/binary"
     long_command = "powershell.exe -ExecutionPolicy Bypass -EncodedCommand " + "B" * 48
-    lead_text = f"Hash {long_hash}; path {long_path}; command {long_command}."
+    registry_path = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+    lead_text = " ".join(
+        (
+            f"Hash {long_hash};",
+            f"path {long_path};",
+            f"registry {registry_path};",
+            f"command {long_command}.",
+        )
+    )
     base = _full_document()
     base = replace(
         base,
@@ -539,6 +551,7 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
         for role, value in (
             (SemanticRole.IOC, long_hash),
             (SemanticRole.PATH, long_path),
+            (SemanticRole.TECHNICAL_LITERAL, registry_path),
             (SemanticRole.COMMAND, long_command),
         )
     )
@@ -565,15 +578,26 @@ def test_long_iocs_and_semantic_literals_get_render_only_break_opportunities(
         for block in synthesis["blocks"]
         if block.get("type") == "paragraph" and block.get("text") == lead_text
     )
-    spans = {span["style"]: span["text"] for span in lead["semantic_spans"]}
+    spans = {span["style"]: span for span in lead["semantic_spans"]}
 
-    def break_text(value: str) -> str:
-        return "\u200b".join(value[index : index + 16] for index in range(0, len(value), 16))
+    def expected_chunks(value: str) -> list[str]:
+        return [value[index : index + 8] for index in range(0, len(value), 8)]
 
-    assert data["content_sections"][2]["indicators"]["hashes"] == [break_text(long_hash)]
-    assert spans["semantic-ioc"] == break_text(long_hash)
-    assert spans["semantic-path"] == break_text(long_path)
-    assert spans["semantic-command"] == break_text(long_command)
+    assert data["content_sections"][2]["indicators"]["hashes"] == [
+        {
+            "text": long_hash,
+            "break_chunks": expected_chunks(long_hash),
+            "break_after": [True] * (len(expected_chunks(long_hash)) - 1),
+        }
+    ]
+    for style, value in (
+        ("semantic-ioc", long_hash),
+        ("semantic-path", long_path),
+        ("semantic-technical-literal", registry_path),
+        ("semantic-command", long_command),
+    ):
+        assert spans[style]["text"] == value
+        assert "".join(spans[style]["break_chunks"]) == value
     assert document.document.lead[0].text == lead_text
     assert document.document.indicators[0].indicators[0].value == long_hash
     assert "\u200b" not in lead_text
@@ -596,6 +620,7 @@ def test_technical_table_cells_render_monospace_and_break_long_values(
         ("IP", "198.51.100.42"),
         ("Domaine", "cdn.example.test"),
         ("Chemin", "/opt/example-rat/payloads/loader.bin"),
+        ("Registre", r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"),
     )
     table = replace(
         base_table,
@@ -611,7 +636,7 @@ def test_technical_table_cells_render_monospace_and_break_long_values(
         {span["style"] for span in cell_spans} for cell_spans in rendered_table["semantic_cells"]
     ]
     display_values = [
-        "".join(span["text"] for span in cell_spans).replace("\u200b", "")
+        "".join(span["text"] for span in cell_spans)
         for cell_spans in rendered_table["semantic_cells"]
     ]
 
@@ -620,9 +645,11 @@ def test_technical_table_cells_render_monospace_and_break_long_values(
     assert styles[7] == {"semantic-table-ioc"}
     assert styles[9] == {"semantic-table-ioc"}
     assert styles[11] == {"semantic-table-path"}
+    assert styles[13] == {"semantic-table-path"}
     assert display_values[3] == sha256
     assert display_values[5] == long_url
-    assert "\u200b" in rendered_table["semantic_cells"][5][0]["text"]
+    assert rendered_table["semantic_cells"][5][0]["text"] == long_url
+    assert "".join(rendered_table["semantic_cells"][5][0]["break_chunks"]) == long_url
     assert rendered_table["rows"][2][1] == long_url
     assert rendered_table["column_weights"][1] == 2.4
     assert rendered_table["caption"] == "Les valeurs exactes documentées par la source."
@@ -752,16 +779,34 @@ def test_all_placements_preserve_collection_order_and_type_priority(tmp_path: Pa
     assert diagram_ref.media_path.endswith(".svg")
 
 
-def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
+def test_figure_reader_source_hides_pipeline_locators_and_media_refs_deduplicate(
     tmp_path: Path,
 ) -> None:
     renderer, bundle = _renderer(tmp_path)
     shared_asset_id = UUID("30000000-0000-4000-8000-000000000001")
-    first = _figure_at(
-        "figure_one",
-        "Caption one",
-        EnrichmentPlacementKind.AFTER_LEAD,
-        asset_id=shared_asset_id,
+    technical_provenance = (
+        "archived source document 65d67fad-2db8-4e50-a6a0-6fd09e790000; "
+        "/html[1]/body[1]/div[3]/img[3]; anchor: https://secret.example/image.png"
+    )
+    first = replace(
+        _figure_at(
+            "figure_one",
+            "Caption one",
+            EnrichmentPlacementKind.AFTER_LEAD,
+            asset_id=shared_asset_id,
+        ),
+        source_url="https://www.example.test/source-image.png",
+        provenance=technical_provenance,
+        locator=replace(
+            _figure_at(
+                "locator_template",
+                "Caption",
+                EnrichmentPlacementKind.AFTER_LEAD,
+            ).locator,
+            page=1,
+            section="Bitcoin wallet recovery",
+            figure_label="HTML image 6",
+        ),
     )
     second = replace(
         _figure_at(
@@ -773,12 +818,18 @@ def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
         locator=replace(
             first.locator,
             page=None,
-            section=None,
-            figure_label=None,
+            section="HTML image 6",
+            figure_label="HTML image 6",
             original_asset_url="https://secret.example/source-image.png",
         ),
     )
-    document = _full_document(figures=(first, second))
+    third = replace(
+        second,
+        key="figure_three",
+        source_url="about:blank",
+        locator=replace(second.locator, section=None, figure_label="HTML image 7"),
+    )
+    document = _full_document(figures=(first, second, third))
     rendered = renderer.render(document, bundle)
     data = json.loads(rendered.render_data_bytes)
     figure_blocks = [
@@ -794,10 +845,19 @@ def test_figure_locator_does_not_leak_original_url_and_media_refs_deduplicate(
     assert [block["media_path"] for block in figure_blocks] == [
         f"media/{shared_asset_id}.png",
         f"media/{shared_asset_id}.png",
+        f"media/{shared_asset_id}.png",
     ]
-    assert figure_blocks[0]["locator"] == "page 1"
-    assert figure_blocks[1]["locator"] is None
-    assert "secret.example" not in rendered.render_data_bytes.decode("utf-8")
+    assert figure_blocks[0]["source_note"] == ("example.test — Bitcoin wallet recovery — p. 1")
+    assert figure_blocks[1]["source_note"] == "example.test"
+    assert figure_blocks[2]["source_note"] is None
+    render_data = rendered.render_data_bytes.decode("utf-8")
+    assert "provenance" not in render_data
+    assert "locator" not in render_data
+    assert "secret.example" not in render_data
+    assert "65d67fad-2db8-4e50-a6a0-6fd09e790000" not in render_data
+    assert "/html[1]" not in render_data
+    assert "HTML image" not in render_data
+    assert document.figures[0].provenance == technical_provenance
 
 
 def test_empty_evidence_reference_list_maps_to_zero_source_urls() -> None:

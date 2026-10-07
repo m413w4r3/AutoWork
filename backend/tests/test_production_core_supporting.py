@@ -30,7 +30,7 @@ from cti_app.domain.production_references import (
 
 def test_references_prompt_keeps_core_and_supporting_separate() -> None:
     prompt = ProductionPromptTemplates.get_references_prompt(
-        subject_title="Subject",
+        subject_title="[Iran-linked actors] C2 routing through Bitcoin OP_RETURN",
         subject_description="Description",
         actor_info="Actor",
         technical_summary="Summary",
@@ -44,6 +44,10 @@ def test_references_prompt_keeps_core_and_supporting_separate() -> None:
     assert "**Core Publications**" in prompt
     assert "**Previously Known Supporting References**" in prompt
     assert "they do not replace them" in prompt
+    assert "The frozen Subject title is discovery context, not evidence." in prompt
+    assert "for this same actor, campaign, or case" in prompt
+    assert "A detail given only as a generic" in prompt
+    assert "Apply the same discipline to the lead." in prompt
 
 
 def test_references_prompt_separates_linked_technical_sources_without_following_all_links() -> None:
@@ -69,7 +73,7 @@ def test_references_prompt_separates_linked_technical_sources_without_following_
         assert linked_resource in one_line
     assert "same subject" in one_line
     assert "Do not turn every hyperlink into a SOURCE" in one_line
-    assert REFERENCES_PROMPT_VERSION == "9"
+    assert REFERENCES_PROMPT_VERSION == "10"
     assert "kind: publication|technical_resource" in one_line
     assert "editorial-role: primary|corroboration|context|counter-analysis" in one_line
     assert "reason: <short explanation of relevance to the Subject>" in one_line

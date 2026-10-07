@@ -31,6 +31,13 @@ class DuplicateJobError(ValueError):
         self.existing_job_id = existing_job_id
 
 
+class JobPausedBatchError(ValueError):
+    code = "production_batch_paused"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
 class UnknownJobKindError(ValueError):
     pass
 
@@ -59,6 +66,33 @@ class JobCancelledError(Exception):
 
 class JobWaitingHumanError(Exception):
     pass
+
+
+async def _job_batch_is_paused(uow: Any, job: Job) -> bool:
+    """Return whether a production job belongs to a currently paused batch."""
+    if not job.kind.startswith("production."):
+        return False
+    raw_run_id = job.input_parameters.get("run_id")
+    if not isinstance(raw_run_id, str):
+        return False
+    try:
+        run_id = UUID(raw_run_id)
+    except ValueError:
+        return False
+    items = getattr(uow, "edition_production_batch_items", None)
+    batches = getattr(uow, "edition_production_batches", None)
+    if items is None or batches is None:
+        return False
+    item = await items.get_by_run(run_id)
+    if item is None:
+        return False
+    # Serialize job claims with the batch pause transaction. Without a row
+    # lock, a worker could read "running", then claim the job after pause had
+    # committed.
+    get_for_update = getattr(batches, "get_for_update", None)
+    get_batch = get_for_update if get_for_update is not None else batches.get
+    batch = await get_batch(item.batch_id)
+    return batch is not None and getattr(batch.status, "value", batch.status) == "paused"
 
 
 class JobDispatcher(Protocol):
@@ -323,6 +357,8 @@ class JobService:
             job = await uow.jobs.get_for_update(job_id)
             if job is None:
                 raise JobNotFoundError(str(job_id))
+            if await _job_batch_is_paused(uow, job):
+                raise JobPausedBatchError
             previous_status = job.status
             job.retry_manually()
             await uow.jobs.save(job)
@@ -352,6 +388,8 @@ class JobService:
         async with self._uow_factory() as uow:
             abandoned = list(await uow.jobs.list_abandoned(cutoff))
             for job in abandoned:
+                if await _job_batch_is_paused(uow, job):
+                    continue
                 previous_status = job.status
                 if resume_current_attempt_kinds is None:
                     resume_current_attempt = self._registry.resumes_after_worker_loss(job.kind)
@@ -502,6 +540,16 @@ class JobExecutor:
                 raise JobNotFoundError(str(job_id))
             if job.is_terminal or job.status is not JobStatus.QUEUED:
                 return job, False
+            if await _job_batch_is_paused(uow, job):
+                # A delayed retry that matures during a pause is held in the
+                # canonical queue without consuming another attempt. Resume
+                # dispatches the same idempotent job key.
+                if job.next_retry_at is not None:
+                    job.next_retry_at = None
+                    job.updated_at = datetime.now(UTC)
+                    await uow.jobs.save(job)
+                    await uow.commit()
+                return job, False
             if (
                 job.next_retry_at is not None
                 and job.next_retry_at > datetime.now(UTC)
@@ -550,6 +598,14 @@ class JobExecutor:
         async with self._uow_factory() as uow:
             job = await self._require_job(uow, job_id)
             previous_status = job.status
+            if error.transient and await _job_batch_is_paused(uow, job):
+                job.wait_for_human("Le lot de production est en pause.")
+                await uow.jobs.save(job)
+                await _append_job_event(
+                    uow, job, previous_status, "job.waiting_human", "system:worker"
+                )
+                await uow.commit()
+                return job
             if job.cancellation_requested:
                 job.mark_cancelled()
             elif error.transient and job.attempt < job.max_attempts:

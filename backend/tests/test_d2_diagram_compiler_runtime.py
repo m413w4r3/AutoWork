@@ -3,13 +3,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import html
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import replace
+from importlib import util
+from pathlib import Path
 from typing import NoReturn
 from uuid import UUID
+from xml.etree import ElementTree
 
 import pytest
 
@@ -28,7 +33,23 @@ from cti_app.domain.production_editorial_enrichment import (
     EnrichmentPlacementV1,
 )
 from cti_app.domain.production_synthesis import EvidenceKind, ExtractionEvidenceRefV1
-from cti_app.infrastructure.d2_diagram_compiler import D2_COMPILER_VERSION, D2DiagramCompiler
+from cti_app.infrastructure.d2_diagram_compiler import (
+    D2_COMPILER_VERSION,
+    D2DiagramCompiler,
+    encode_d2_source,
+    validate_d2_svg,
+)
+
+_LAYOUT_HELPERS_SPEC = util.spec_from_file_location(
+    "d2_svg_layout_helpers", Path(__file__).with_name("d2_svg_layout_helpers.py")
+)
+if _LAYOUT_HELPERS_SPEC is None or _LAYOUT_HELPERS_SPEC.loader is None:
+    raise RuntimeError("Unable to load D2 SVG layout test helpers")
+_LAYOUT_HELPERS = util.module_from_spec(_LAYOUT_HELPERS_SPEC)
+sys.modules[_LAYOUT_HELPERS_SPEC.name] = _LAYOUT_HELPERS
+_LAYOUT_HELPERS_SPEC.loader.exec_module(_LAYOUT_HELPERS)
+estimate_printed_font_sizes = _LAYOUT_HELPERS.estimate_printed_font_sizes
+measure_svg_overlaps = _LAYOUT_HELPERS.measure_svg_overlaps
 
 _EVIDENCE = ExtractionEvidenceRefV1(
     source_document_id=UUID("00000000-0000-0000-0000-000000000001"),
@@ -119,6 +140,120 @@ def _skip_unless_ci(reason: str) -> NoReturn:
     if os.environ.get("CI", "").lower() == "true":
         pytest.fail(reason)
     pytest.skip(reason)
+
+
+def _fixture_evidence_refs(raw_refs: list[dict[str, str]]) -> tuple[ExtractionEvidenceRefV1, ...]:
+    return tuple(
+        ExtractionEvidenceRefV1(
+            source_document_id=UUID(raw["source_document_id"]),
+            kind=EvidenceKind(raw["kind"]),
+            evidence_key=raw["evidence_key"],
+        )
+        for raw in raw_refs
+    )
+
+
+def _published_diagram_corpus() -> tuple[tuple[str, DiagramSpecV1], ...]:
+    fixture_root = Path(__file__).parent / "fixtures" / "d2_diagrams"
+    results: list[tuple[str, DiagramSpecV1]] = []
+    for fixture_path in sorted(fixture_root.glob("*.json")):
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        raw = fixture["diagram"]
+        nodes = tuple(
+            DiagramNodeV1(
+                node_id=node["node_id"],
+                label=node["label"],
+                evidence_refs=_fixture_evidence_refs(node["evidence_refs"]),
+                role=DiagramNodeRole(node["role"]),
+            )
+            for node in raw["nodes"]
+        )
+        edges = tuple(
+            DiagramEdgeV1(
+                source_node_id=edge["source_node_id"],
+                target_node_id=edge["target_node_id"],
+                label=edge["label"],
+                evidence_refs=_fixture_evidence_refs(edge["evidence_refs"]),
+                relation_type=DiagramRelationType(
+                    edge.get("relation_type", DiagramRelationType.FACTUAL.value)
+                ),
+                direction=(
+                    DiagramRelationDirection(edge["direction"]) if "direction" in edge else None
+                ),
+            )
+            for edge in raw["edges"]
+        )
+        groups = tuple(
+            DiagramGroupV1(group["group_id"], group["label"], tuple(group["node_ids"]))
+            for group in raw["groups"]
+        )
+        placement = raw["placement"]
+        diagram = DiagramSpecV1(
+            key=raw["key"],
+            kind=EnrichmentDiagramKind(raw["kind"]),
+            title=raw["title"],
+            caption=raw["caption"],
+            direction=EnrichmentDiagramDirection(raw["direction"]),
+            nodes=nodes,
+            edges=edges,
+            groups=groups,
+            placement=EnrichmentPlacementV1(
+                EnrichmentPlacementKind(placement["kind"]), placement.get("section_index")
+            ),
+        )
+        results.append((fixture["subject_id"], diagram))
+    assert len(results) == 4, "The published D2 corpus must contain all four subject fixtures"
+    return tuple(results)
+
+
+_LAYOUT_CANDIDATES = (
+    ("dagre-default", "dagre", ()),
+    ("dagre-spaced", "dagre", ("--dagre-nodesep=120", "--dagre-edgesep=40")),
+    ("elk-default", "elk", ()),
+    ("elk-compact", "elk", ("--pad=8", "--elk-nodeNodeBetweenLayers=15")),
+)
+
+
+def _render_layout_candidate(
+    d2_binary: str,
+    diagram: DiagramSpecV1,
+    *,
+    layout: str,
+    layout_flags: tuple[str, ...],
+) -> bytes:
+    source = encode_d2_source(diagram)
+    argv = (
+        d2_binary,
+        f"--layout={layout}",
+        *layout_flags,
+        "--timeout=10",
+        "--omit-version",
+        f"--salt={hashlib.sha256(source).hexdigest()}",
+        "--stdout-format=svg",
+        "-",
+        "-",
+    )
+    result = subprocess.run(
+        argv,
+        input=source,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    validate_d2_svg(result.stdout)
+    return result.stdout
+
+
+def _directed_arrowhead_count(svg_bytes: bytes) -> int:
+    root = ElementTree.fromstring(svg_bytes)
+    return sum(
+        1
+        for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "path"
+        and "connection" in element.attrib.get("class", "").split()
+        and "marker-end" in element.attrib
+    )
 
 
 def _svg_text(svg: bytes) -> list[str]:
@@ -339,3 +474,70 @@ def test_real_d2_compiles_cti_profiles_and_printable_relationships(d2_binary: st
     assert '"Infrastructure opérateur"'.encode() in compiled[3].source_bytes
     assert b"--" in compiled[3].source_bytes
     assert compiled[-1].source_bytes.startswith(b"direction: down\n")
+
+
+def test_real_d2_layout_candidates_on_published_diagram_corpus(d2_binary: str) -> None:
+    corpus = _published_diagram_corpus()
+    metrics: dict[str, dict[str, tuple[int, int]]] = {
+        candidate: {} for candidate, _, _ in _LAYOUT_CANDIDATES
+    }
+    for subject_id, diagram in corpus:
+        for candidate, layout, flags in _LAYOUT_CANDIDATES:
+            svg = _render_layout_candidate(
+                d2_binary,
+                diagram,
+                layout=layout,
+                layout_flags=flags,
+            )
+            report = measure_svg_overlaps(svg)
+            metrics[candidate][subject_id] = (
+                report.text_overlap_count,
+                report.edge_node_overlap_count,
+            )
+            if candidate == "elk-compact":
+                node_pt, edge_pt = estimate_printed_font_sizes(svg)
+                assert node_pt >= 9.0, f"{subject_id} node labels print at only {node_pt:.2f}pt"
+                assert edge_pt >= 8.0, f"{subject_id} edge labels print at only {edge_pt:.2f}pt"
+
+    if os.environ.get("D2_LAYOUT_METRICS") == "1":
+        print(json.dumps(metrics, ensure_ascii=False, sort_keys=True))
+
+    elk_issues = {
+        subject_id: counts
+        for subject_id, counts in metrics["elk-compact"].items()
+        if counts != (0, 0)
+    }
+    assert not elk_issues, (
+        f"Compact ELK overlaps published diagram labels or node shapes: {elk_issues}"
+    )
+    s7_metrics = metrics["dagre-default"]["30fe8e86-f22d-436c-a3df-f5837e1661e2"]
+    assert s7_metrics[0] > 0, "The published Arman overlap must remain detectable under dagre"
+
+
+def test_real_d2_published_diagrams_are_clear_and_deterministic(d2_binary: str) -> None:
+    async def compile_twice() -> tuple[tuple[str, DiagramSpecV1, bytes, bytes], ...]:
+        compiler = D2DiagramCompiler(binary=d2_binary)
+        outputs = []
+        for subject_id, diagram in _published_diagram_corpus():
+            first = await compiler.compile(diagram)
+            second = await compiler.compile(diagram)
+            outputs.append((subject_id, diagram, first.media_bytes, second.media_bytes))
+        return tuple(outputs)
+
+    for subject_id, diagram, first_svg, second_svg in asyncio.run(compile_twice()):
+        assert first_svg == second_svg
+        report = measure_svg_overlaps(first_svg)
+        assert report.text_overlap_count == 0, (
+            f"{subject_id}/{diagram.key} has overlapping text boxes: {report.text_overlap_pairs}"
+        )
+        assert report.edge_node_overlap_count == 0, (
+            f"{subject_id}/{diagram.key} has edge labels over node shapes: "
+            f"{report.edge_node_overlap_pairs}"
+        )
+        node_pt, edge_pt = estimate_printed_font_sizes(first_svg)
+        assert node_pt >= 9.0, f"{subject_id}/{diagram.key} node labels print at {node_pt:.2f}pt"
+        assert edge_pt >= 8.0, f"{subject_id}/{diagram.key} edge labels print at {edge_pt:.2f}pt"
+        expected_arrowheads = sum(
+            edge.direction is DiagramRelationDirection.DIRECTED for edge in diagram.edges
+        )
+        assert _directed_arrowhead_count(first_svg) == expected_arrowheads

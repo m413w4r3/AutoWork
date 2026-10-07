@@ -34,7 +34,7 @@ from cti_app.domain.production_pipeline import (
 # A Q2 source entry only counts as done under these two statuses; every other
 # status (pending, running, failed, skipped) may still cost a model call.
 # ``production_workflow`` writes them and imports this set back.
-EXTRACTION_PROGRESS_COMPLETED_STATUSES = frozenset({"cached", "succeeded"})
+EXTRACTION_PROGRESS_COMPLETED_STATUSES = frozenset({"cached", "reused", "succeeded"})
 
 # Model calls a stage still owes when it has to run.  Extraction is variable:
 # it owes one call per source that has no usable answer yet.

@@ -390,7 +390,7 @@ class Q2SourceOutput(BaseModel):
 
 # Bump whenever Q2SourceOutput contract changes. Checkpoints validate against it.
 Q2_SCHEMA_VERSION = "4"
-Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v4"
+Q2_EXTRACTION_CONTRACT_VERSION = "q2-source-extraction-v5"
 
 # Bump whenever the Q2 Markdown dialect or its lexing rules change. Participates
 # in the Q2 checkpoint identity so a parser change forces a fresh model call.

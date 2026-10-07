@@ -32,9 +32,11 @@ from cti_app.application.model_gateway import (
 from cti_app.application.production_artifact_reuse import ProductionArtifactReuseResult
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
+    EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION,
     EDITORIAL_ENRICHMENT_GENERATOR_VERSION,
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
     EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
+    EDITORIAL_ENRICHMENT_VALIDATOR_VERSION,
     AnalyticPurposeProposalV1,
     AnnotationProposalV1,
     EditorialEnrichmentEvidencePackV1,
@@ -65,6 +67,7 @@ from cti_app.application.production_enrichment_revision import (
     ProductionEditorialEnrichmentRevisionService,
 )
 from cti_app.application.production_prompts import EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
@@ -128,9 +131,14 @@ from cti_app.domain.production_references import (
     ProductionReferenceKind,
     ProductionReferenceTier,
 )
+from cti_app.domain.production_relevance import (
+    RelevanceSourcePairRelation,
+    RelevanceSourcePairRelationV1,
+)
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
+    EvidenceKind,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     SynthesisSectionKind,
@@ -441,6 +449,69 @@ def test_evidence_pack_is_stable_private_and_resolves_exact_refs() -> None:
     assert all("body" not in record for record in first.technical_evidence)
 
 
+def test_source_pair_relation_uncertainty_from_non_full_source_gets_reserve_handle() -> None:
+    snapshot = _snapshot()
+    primary_id, annex_id = uuid4(), uuid4()
+    primary = _source(
+        primary_id,
+        editorial_role=ProductionEditorialRole.PRIMARY,
+    )
+    annex = replace(
+        _source(
+            annex_id,
+            facts=(),
+            tier=ProductionReferenceTier.TECHNICAL,
+            kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+            profile=ExtractionProfile.IOC_RULES,
+            editorial_role=ProductionEditorialRole.CONTEXT,
+            url_suffix="technical-annex",
+        ),
+        uncertainties=("The annex does not establish a link to the activity.",),
+    )
+    extraction = _extraction(
+        input_hash=snapshot.input_hash,
+        sources=(primary, annex),
+    )
+    refs = extraction_evidence_refs_v1(extraction)
+    fact_ref = next(ref for ref in refs if ref.kind is EvidenceKind.FACT)
+    uncertainty_ref = next(ref for ref in refs if ref.kind is EvidenceKind.UNCERTAINTY)
+    relation = RelevanceSourcePairRelationV1(
+        relation=RelevanceSourcePairRelation.LINK_NOT_DEMONSTRATED,
+        reason="The technical annex does not establish the source relationship.",
+        supporting_evidence_refs=(fact_ref, uncertainty_ref),
+    )
+    projection = build_relevance_projection(
+        snapshot,
+        extraction,
+        source_pair_relations=(relation,),
+    )
+
+    pack = build_editorial_enrichment_evidence_pack(
+        snapshot,
+        extraction,
+        _synthesis(extraction),
+        projection,
+    )
+
+    relation_record = next(
+        item
+        for item in pack.source_pair_relations
+        if item["relation"] == RelevanceSourcePairRelation.LINK_NOT_DEMONSTRATED.value
+    )
+    supporting_handles = set(relation_record["supporting_handles"])
+    assert pack.policy_version == "editorial-enrichment-evidence-pack-v8-relation-support"
+    assert pack.policy_version == EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
+    assert {pack._reserve_handle_to_ref[handle] for handle in supporting_handles} == {
+        fact_ref,
+        uncertainty_ref,
+    }
+    assert supporting_handles <= {str(item["handle"]) for item in pack.reserve_evidence}
+    uncertainty_record = next(
+        item for item in pack.reserve_evidence if item["kind"] == EvidenceKind.UNCERTAINTY.value
+    )
+    assert uncertainty_record["text"] == "The annex does not establish a link to the activity."
+
+
 def test_core_full_narrative_evidence_is_available_after_primary_core():
     snapshot = _snapshot()
     core_id, supporting_id, annex_id = uuid4(), uuid4(), uuid4()
@@ -639,6 +710,7 @@ def test_global_key_collision_is_output_invalid_not_a_raw_domain_error(collision
         )
 
     assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+    assert "Editorial enrichment keys must be globally unique" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -662,10 +734,22 @@ def test_invalid_diagram_groups_are_output_invalid_not_a_raw_domain_error(
     proposal = _proposal("E001").model_dump(mode="json")
     proposal["diagrams"][0]["groups"] = groups
 
-    with pytest.raises(EditorialEnrichmentProposalControlError) as caught:
-        validate_editorial_enrichment_proposal(proposal, pack, extraction, synthesis)
+    validation_rejections = []
+    enrichment = validate_editorial_enrichment_proposal(
+        proposal,
+        pack,
+        extraction,
+        synthesis,
+        validation_rejections=validation_rejections,
+    )
 
-    assert caught.value.code is EditorialEnrichmentStageErrorCode.OUTPUT_INVALID
+    assert len(enrichment.tables) == 1
+    assert enrichment.diagrams == ()
+    assert len(validation_rejections) == 1
+    assert validation_rejections[0].kind == "DIAGRAM"
+    assert validation_rejections[0].reason_code.endswith(
+        EditorialEnrichmentStageErrorCode.OUTPUT_INVALID.value
+    )
 
 
 def test_prompt_output_contract_example_satisfies_the_enforced_contract() -> None:
@@ -1240,8 +1324,17 @@ END CHART"""
     ):
         invalid = parse_editorial_enrichment_proposal_wire(invalid_wire, pack)
         assert invalid.proposal is not None
-        with pytest.raises(EditorialEnrichmentProposalControlError):
-            validate_editorial_enrichment_proposal(invalid.proposal, pack, extraction, synthesis)
+        validation_rejections = []
+        enrichment = validate_editorial_enrichment_proposal(
+            invalid.proposal,
+            pack,
+            extraction,
+            synthesis,
+            validation_rejections=validation_rejections,
+        )
+        assert enrichment.charts == ()
+        assert len(validation_rejections) == 1
+        assert validation_rejections[0].kind == "CHART"
 
     missing_evidence = parse_editorial_enrichment_proposal_wire(
         wire.replace("EVIDENCE: E001\nEND POINT", "END POINT", 1), pack
@@ -2079,9 +2172,70 @@ def test_evidence_must_support_technical_literals_on_the_same_element() -> None:
         "diagrams": [],
     }
 
-    with pytest.raises(EditorialEnrichmentProposalControlError) as error:
-        validate_editorial_enrichment_proposal(proposal, pack, extraction, synthesis)
-    assert error.value.code is EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE
+    validation_rejections = []
+    enrichment = validate_editorial_enrichment_proposal(
+        proposal,
+        pack,
+        extraction,
+        synthesis,
+        validation_rejections=validation_rejections,
+    )
+    assert enrichment.tables == ()
+    assert len(validation_rejections) == 1
+    assert validation_rejections[0].kind == "TABLE"
+    assert validation_rejections[0].reason_code.endswith(
+        EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE.value
+    )
+
+
+def test_www_host_alias_remains_grounded_in_its_cited_extraction_handle() -> None:
+    source_id = _DOCUMENT_ID
+    snapshot = _snapshot()
+    source_url = "https://www.malwarebytes.com/article"
+    source_url_fact = ExtractionFactV1(
+        category="infrastructure",
+        value=source_url,
+        attack_id=None,
+        context="",
+        evidence_quote=source_url,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source_id,),
+    )
+    extraction = _extraction(facts=(source_url_fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    source_url_handle = next(
+        handle
+        for handle, ref in pack._handle_to_ref.items()
+        if _all_evidence_payload(extraction, ref)["value"] == source_url
+    )
+    proposal = _proposal(source_url_handle).model_dump(mode="json")
+    proposal["diagrams"] = []
+    table = proposal["tables"][0]
+    table["title"] = "Publisher domain"
+    table["rows"] = [
+        {"cells": ["malwarebytes.com", "publisher"], "evidence_handles": [source_url_handle]},
+        {"cells": ["malwarebytes.com", "canonical host"], "evidence_handles": [source_url_handle]},
+    ]
+    table["purpose"] = {
+        "question": "Which source domain is recorded?",
+        "available_data": "The extraction contains one source URL.",
+        "comprehension_gain": "The table identifies its host.",
+        "scope": "Only the domain shown in the captured URL.",
+        "evidence_handles": [source_url_handle],
+        "knowledge_limits": "No additional source properties are stated.",
+        "placement_reason": "Place with the source discussion.",
+    }
+
+    enrichment = validate_editorial_enrichment_proposal(
+        proposal,
+        pack,
+        extraction,
+        synthesis,
+    )
+
+    assert len(enrichment.tables) == 1
+    assert enrichment.tables[0].rows[0].cells[0] == "malwarebytes.com"
 
 
 def _all_evidence_payload(extraction: ProductionExtractionV1, wanted: object) -> dict[str, object]:
@@ -2272,6 +2426,35 @@ def test_parser_version_changes_artifact_identity_but_not_invocation_identity() 
     assert artifact_v1 != artifact_v2
 
 
+def test_validator_version_changes_artifact_identity_without_changing_invocation_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extraction = _extraction()
+    synthesis = _synthesis(extraction)
+    common = {
+        "extraction": extraction,
+        "synthesis": synthesis,
+        "evidence_pack_hash": "1" * 64,
+        "access_policy_hash": "2" * 64,
+    }
+    invocation_before = compute_editorial_enrichment_invocation_hash(**common)
+    artifact_before = compute_editorial_enrichment_input_hash(**common)
+
+    monkeypatch.setattr(
+        enrichment_module,
+        "EDITORIAL_ENRICHMENT_VALIDATOR_VERSION",
+        "editorial-enrichment-validator-v15-final-block-isolation-test",
+    )
+    invocation_after = compute_editorial_enrichment_invocation_hash(**common)
+    artifact_after = compute_editorial_enrichment_input_hash(**common)
+
+    assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
+        "editorial-enrichment-validator-v17-www-domain-aliases"
+    )
+    assert invocation_before == invocation_after
+    assert artifact_before != artifact_after
+
+
 def test_resource_search_setting_changes_artifact_identity_without_changing_primary_call() -> None:
     extraction = _extraction()
     synthesis = _synthesis(extraction)
@@ -2308,9 +2491,19 @@ def test_column_labels_carry_no_evidence_so_they_cannot_state_facts(
     proposal = _proposal("E001").model_dump(mode="json")
     proposal["tables"][0]["columns"][0]["label"] = label
 
-    with pytest.raises(EditorialEnrichmentProposalControlError) as error:
-        validate_editorial_enrichment_proposal(proposal, pack, extraction, synthesis)
-    assert error.value.code is code
+    validation_rejections = []
+    enrichment = validate_editorial_enrichment_proposal(
+        proposal,
+        pack,
+        extraction,
+        synthesis,
+        validation_rejections=validation_rejections,
+    )
+    assert enrichment.tables == ()
+    assert len(enrichment.diagrams) == 1
+    assert len(validation_rejections) == 1
+    assert validation_rejections[0].kind == "TABLE"
+    assert validation_rejections[0].reason_code.endswith(code.value)
 
 
 # --- ProductionEditorialEnrichmentService -----------------------------------
@@ -3072,20 +3265,20 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     result = await _execute(world)
 
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
-    assert result.table_count == result.diagram_count == 1
+    assert result.table_count == 1
+    assert result.diagram_count == 0
     assert result.details is not None
     rejections = result.details["rejections"]
     assert {item["reason_code"] for item in rejections} == {
         "editorial_enrichment_table_row_column_count_mismatch",
         "editorial_enrichment_diagram_relation_unknown_node",
+        "editorial_enrichment_diagram_rejected_after_invalid_relations",
     }
     enrichment = world.writer.calls[0]["enrichment"]
     assert len(enrichment.tables[0].rows) == 2  # type: ignore[attr-defined]
     assert enrichment.tables[0].rows[0].cells[0] == '"ExampleRAT"'  # type: ignore[attr-defined]
-    assert len(enrichment.diagrams[0].edges) == 1  # type: ignore[attr-defined]
-    assert len(enrichment.diagrams[0].groups) == 1  # type: ignore[attr-defined]
+    assert enrichment.diagrams == ()  # type: ignore[attr-defined]
     assert enrichment.tables[0].placement.kind is EnrichmentPlacementKind.AFTER_LEAD  # type: ignore[attr-defined]
-    assert enrichment.diagrams[0].placement.section_index == 0  # type: ignore[attr-defined]
     assert world.writer.calls[0]["raw_result"] == polluted
     run = world.gateway.runs[result.model_run_id]
     assert "bridge_ui_markers_removed" in run.transformations
@@ -3093,6 +3286,7 @@ async def test_dirty_text_blocks_keep_valid_items_and_report_local_rejections() 
     assert {item["code"] for item in run.validation_errors} == {
         "editorial_enrichment_table_row_column_count_mismatch",
         "editorial_enrichment_diagram_relation_unknown_node",
+        "editorial_enrichment_diagram_rejected_after_invalid_relations",
     }
 
 
@@ -4064,18 +4258,21 @@ def test_real_attempt2_normalizes_direction_and_keeps_distinct_source_figure() -
     parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
 
     assert parsed.proposal is not None
-    assert len(parsed.proposal.diagrams) == 1
-    diagram = parsed.proposal.diagrams[0]
-    assert diagram.direction.value == "top_to_bottom"
-    assert len(diagram.nodes) == 5
-    assert len(diagram.edges) == 3
+    assert parsed.proposal.diagrams == ()
     assert "editorial_enrichment_inline_source_handles_removed" in parsed.transformations
     assert [item.figure_handle for item in parsed.proposal.figures] == ["F031"]
-    assert diagram.purpose.question != parsed.proposal.figures[0].purpose.question
     assert "editorial_enrichment_diagram_direction_normalized" in parsed.transformations
     assert any(
         item.reason_code == "editorial_enrichment_diagram_relation_without_endpoint_support"
         for item in parsed.rejections
+    )
+    assert any(
+        item.reason_code == "editorial_enrichment_diagram_rejected_after_relation_filter"
+        for item in parsed.rejections
+    )
+    assert any(
+        warning.startswith("editorial_enrichment_diagram_rejected_after_relation_filter:D001:")
+        for warning in parsed.warnings
     )
     assert "editorial_enrichment_diagram_direction_requires_top_to_bottom" not in {
         item.reason_code for item in parsed.rejections
@@ -4092,10 +4289,190 @@ def test_real_attempt2_normalizes_direction_and_keeps_distinct_source_figure() -
         figure_catalog=catalog,
         warnings=parsed.warnings,
     )
-    assert len(validated.diagrams) == len(validated.source_figures) == 1
+    assert validated.diagrams == ()
+    assert len(validated.source_figures) == 1
 
 
-def test_real_repair_output_recovers_terminators_and_merges_without_losing_figure() -> None:
+def test_diagram_with_two_rejected_relations_is_dropped_as_one_block(monkeypatch) -> None:
+    _extraction, _synthesis, pack, catalog = _chainalysis_enrichment_inputs()
+    wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_first_call.txt"
+    ).read_text(encoding="utf-8")
+
+    def without_child(text: str, header: str, terminator: str) -> str:
+        lines = text.splitlines()
+        start = lines.index(header)
+        end = lines.index(terminator, start)
+        return "\n".join((*lines[:start], *lines[end + 1 :]))
+
+    wire = without_child(wire, "NODE N001", "END NODE")
+    wire = without_child(wire, "RELATION L001", "END RELATION")
+    assert sum(line.startswith("NODE N") for line in wire.splitlines()) == 4
+    assert sum(line.startswith("RELATION L") for line in wire.splitlines()) == 3
+
+    strict_rejection = enrichment_module._edge_projection_rejection
+
+    def reject_two_relations(diagram, edge, evidence_pack):
+        if edge.source_node_id == "bitcoin_transaction" or edge.target_node_id == "c2_data":
+            return "editorial_enrichment_diagram_relation_text_not_supported"
+        return strict_rejection(diagram, edge, evidence_pack)
+
+    monkeypatch.setattr(enrichment_module, "_edge_projection_rejection", reject_two_relations)
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=catalog)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.diagrams == ()
+    assert [item.figure_handle for item in parsed.proposal.figures] == ["F031"]
+    reasons = [item.reason_code for item in parsed.rejections]
+    assert reasons.count("editorial_enrichment_diagram_relation_text_not_supported") == 2
+    assert "editorial_enrichment_diagram_rejected_after_relation_filter" in reasons
+    assert len(parsed.rejected_blocks) == 1
+    assert parsed.rejected_blocks[0].kind == "DIAGRAM"
+    assert parsed.rejected_blocks[0].block_id == "D001"
+    assert "editorial_enrichment_diagram_relation_text_not_supported" in (
+        parsed.rejected_blocks[0].reason_codes
+    )
+    assert any(
+        warning.startswith("editorial_enrichment_diagram_rejected_after_relation_filter:D001:")
+        for warning in parsed.warnings
+    )
+
+
+def test_redirected_source_figure_uses_canonical_source_and_drops_rejected_diagram() -> None:
+    extraction, synthesis, pack, catalog = _chainalysis_enrichment_inputs()
+    source = extraction.sources[0]
+    entry = catalog[0]
+    redirected_figure = entry.figure.model_copy(update={"source": f"{source.canonical_url}/"})
+    redirected_catalog = (replace(entry, figure=redirected_figure),)
+    wire = (
+        Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_first_call.txt"
+    ).read_text(encoding="utf-8")
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack, figure_catalog=redirected_catalog)
+
+    assert parsed.proposal is not None
+    assert parsed.proposal.diagrams == ()
+    assert [item.figure_handle for item in parsed.proposal.figures] == ["F031"]
+    assert any(
+        item.reason_code == "editorial_enrichment_diagram_relation_without_endpoint_support"
+        for item in parsed.rejections
+    )
+
+    validated = validate_editorial_enrichment_proposal(
+        parsed.proposal,
+        pack,
+        extraction,
+        synthesis,
+        figure_catalog=redirected_catalog,
+        warnings=parsed.warnings,
+    )
+
+    assert validated.diagrams == ()
+    assert len(validated.source_figures) == 1
+    assert validated.source_figures[0].source_url == source.canonical_url
+    assert validated.source_figures[0].resolved_figure is not None
+    assert validated.source_figures[0].resolved_figure.source == source.canonical_url
+
+
+def test_final_validation_drops_only_the_invalid_repaired_sibling_block() -> None:
+    snapshot = _snapshot()
+    extraction = _extraction(input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    catalog = build_editorial_figure_catalog(extraction, _figure_inventory(extraction))
+    proposal_wire = _proposal_to_wire(_proposal("E001"))
+    table_wire = _top_wire_block(proposal_wire, "TABLE T001").replace(
+        "LIMITS: No additional tool behavior is documented.",
+        "LIMITS: The table excludes operations under prefixes @@ and **.",
+        1,
+    )
+    diagram_wire = _top_wire_block(proposal_wire, "DIAGRAM D001")
+    invalid_figure = _figure_wire(extra="SOURCE_PAGE_URL: https://invented.example/source")
+    first_pass = parse_editorial_enrichment_proposal_wire(
+        "\n\n".join((table_wire, diagram_wire, invalid_figure)),
+        pack,
+        figure_catalog=catalog,
+    )
+    repair_pass = parse_editorial_enrichment_proposal_wire(
+        _figure_wire(), pack, figure_catalog=catalog
+    )
+
+    assert first_pass.proposal is not None
+    assert len(first_pass.proposal.tables) == 1
+    assert len(first_pass.proposal.diagrams) == 1
+    assert [(item.kind, item.block_id) for item in first_pass.rejected_blocks] == [
+        ("FIGURE", "P001")
+    ]
+    merged, repaired, unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
+        first_pass, repair_pass, first_pass.rejected_blocks
+    )
+    assert unexpected == ()
+    assert repaired == (("FIGURE", "P001"),)
+    assert merged.proposal is not None
+
+    validation_rejections = []
+    enrichment = validate_editorial_enrichment_proposal(
+        merged.proposal,
+        pack,
+        extraction,
+        synthesis,
+        figure_catalog=catalog,
+        accepted_blocks=merged.accepted_blocks,
+        validation_rejections=validation_rejections,
+    )
+
+    assert enrichment.tables == ()
+    assert len(enrichment.diagrams) == 1
+    assert len(enrichment.source_figures) == 1
+    assert len(validation_rejections) == 1
+    rejection = validation_rejections[0]
+    assert rejection.kind == "TABLE"
+    assert rejection.block_id == "T001"
+    assert rejection.proposal_key == "tools_table"
+    assert "table:tools_table:purpose.knowledge_limits" in rejection.reason
+    assert "plain_text_violation" in rejection.reason
+    assert len(rejection.raw_sha256) == 64
+
+    table_only = parse_editorial_enrichment_proposal_wire(table_wire, pack)
+    assert table_only.proposal is not None
+    empty_rejections = []
+    empty = validate_editorial_enrichment_proposal(
+        table_only.proposal,
+        pack,
+        extraction,
+        synthesis,
+        validation_rejections=empty_rejections,
+    )
+    assert empty.tables == empty.diagrams == empty.charts == empty.source_figures == ()
+    assert len(empty_rejections) == 1
+
+
+@pytest.mark.asyncio
+async def test_final_validation_rejection_is_persisted_even_for_empty_enrichment() -> None:
+    wire = _top_wire_block(_proposal_to_wire(_proposal("E001")), "TABLE T001").replace(
+        "LIMITS: No additional tool behavior is documented.",
+        "LIMITS: The table excludes operations under prefixes @@ and **.",
+        1,
+    )
+    world = _world(_RecordingGateway(lambda request: _succeeded_text(request, wire)))
+
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.table_count == result.diagram_count == result.source_figure_count == 0
+    enrichment = world.writer.calls[0]["enrichment"]
+    assert enrichment.tables == ()  # type: ignore[attr-defined]
+    metadata = world.writer.calls[0]["metadata_extra"]
+    wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+    rejection = wire_details["validation_rejections"][0]  # type: ignore[index]
+    assert rejection["kind"] == "TABLE"
+    assert rejection["block_id"] == "T001"
+    assert "purpose.knowledge_limits" in rejection["reason"]
+    assert "plain_text_violation" in rejection["reason"]
+    assert wire_details["final_rejections"][-1] == rejection  # type: ignore[index]
+
+
+def test_invalid_repair_output_is_dropped_without_losing_figure() -> None:
     _extraction_value, _synthesis_value, pack, catalog = _chainalysis_enrichment_inputs()
     first_wire = (
         Path(__file__).parent / "fixtures" / "editorial_enrichment_attempt2_first_call.txt"
@@ -4112,9 +4489,8 @@ def test_real_repair_output_recovers_terminators_and_merges_without_losing_figur
         repair_wire, pack, figure_catalog=catalog
     )
 
-    assert repair_pass.proposal is not None
-    assert len(repair_pass.proposal.diagrams) == 1
-    assert len(repair_pass.proposal.diagrams[0].nodes) == 5
+    assert repair_pass.proposal is None
+    assert repair_pass.error_code == "editorial_enrichment_no_valid_blocks"
     assert "editorial_enrichment_missing_block_terminator_recovered" in (
         repair_pass.transformations
     )
@@ -4122,18 +4498,20 @@ def test_real_repair_output_recovers_terminators_and_merges_without_losing_figur
         item.reason_code == "editorial_enrichment_diagram_relation_without_endpoint_support"
         for item in repair_pass.rejections
     )
+    assert any(
+        warning.startswith("editorial_enrichment_diagram_rejected_after_relation_filter:D001:")
+        for warning in repair_pass.warnings
+    )
     merged, repaired, unexpected = enrichment_module._merge_repaired_editorial_enrichment_proposal(
         first_pass, repair_pass, first_pass.rejected_blocks
     )
 
     assert unexpected == ()
-    assert repaired == (("DIAGRAM", "D001"),)
+    assert repaired == ()
     assert merged.proposal is not None
-    assert len(merged.proposal.diagrams) == len(merged.proposal.figures) == 1
+    assert merged.proposal.diagrams == ()
+    assert len(merged.proposal.figures) == 1
     assert merged.proposal.figures[0].figure_handle == "F031"
-    assert (
-        merged.proposal.diagrams[0].purpose.question != merged.proposal.figures[0].purpose.question
-    )
     assert "editorial_enrichment_missing_block_terminator_recovered" in (merged.transformations)
 
 

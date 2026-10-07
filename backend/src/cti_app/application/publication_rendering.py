@@ -50,7 +50,7 @@ from cti_app.domain.publication_render import (
 from cti_app.domain.typst_render import TypstRenderFormat, TypstRenderStatus
 
 PUBLICATION_RENDERER = "typst"
-PUBLICATION_RENDERER_VERSION = "publication-v4-typst-v2-timeline-charts"
+PUBLICATION_RENDERER_VERSION = "publication-v4-typst-v3-semantic-annotation-coverage"
 
 PUBLICATION_RENDER_BUCKETS = TypstRenderBuckets(
     source="publication-renders-source",

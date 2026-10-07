@@ -441,14 +441,16 @@ def test_annotation_request_is_separate_from_the_table_diagram_request_and_versi
         SEMANTIC_ANNOTATION_CONTRACT_VERSION == "semantic-annotation-term-role-blocks-v2-no-title"
     )
     assert SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION == "semantic-annotation-wire-v3-no-title"
-    assert EDITORIAL_ENRICHMENT_PROMPT_VERSION.endswith("source-figure-selection")
-    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("source-figure-captions")
-    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("source-figure-captions")
+    assert EDITORIAL_ENRICHMENT_PROMPT_VERSION.endswith("editorial-tables")
+    assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION.endswith("editorial-tables")
+    assert EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION.endswith("atomic-diagram-relations")
     assert "@@ANCHOR title@@" not in annotation_request.text
     assert "@@ANCHOR section:0:paragraph:0001@@" in annotation_request.text
     assert "@@ANCHOR diagram:" not in annotation_request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION.endswith("dedicated-annotations")
-    assert SEMANTIC_ANNOTATION_POLICY_VERSION.endswith("document-lexicon")
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION.endswith("editorial-tables")
+    assert SEMANTIC_ANNOTATION_POLICY_VERSION.endswith(
+        "technical-literal-globs-exact-occurrence-coverage"
+    )
 
 
 def test_annotation_call_failure_returns_warning_without_aborting_enrichment() -> None:
@@ -574,7 +576,20 @@ def test_publication_qa_reports_semantic_annotation_sparse_as_warning() -> None:
     assert result["warnings"] == ["semantic_annotation_sparse"]
 
 
-def test_publication_qa_fails_when_one_annotated_term_occurrence_is_unstyled() -> None:
+@pytest.mark.parametrize(
+    ("policy_version", "coverage_expected"),
+    [
+        (
+            "semantic-annotation-policy-v5-technical-literal-globs-exact-occurrence-coverage",
+            False,
+        ),
+        ("semantic-annotation-policy-v4-technical-literal-globs", True),
+    ],
+)
+def test_publication_qa_occurrence_coverage_uses_the_document_policy(
+    policy_version: str,
+    coverage_expected: bool,
+) -> None:
     from cti_app.application.publication_builder import build_publication_document_v4
     from cti_app.application.publication_qa import qa_publication_v5
     from cti_app.domain.publication_document import (
@@ -618,7 +633,7 @@ def test_publication_qa_fails_when_one_annotated_term_occurrence_is_unstyled() -
         document=base,
         semantic_text=SemanticTextV1(
             schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
-            policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+            policy_version=policy_version,
             paragraphs=tuple(spans),
         ),
     )
@@ -632,8 +647,9 @@ def test_publication_qa_fails_when_one_annotated_term_occurrence_is_unstyled() -
         publication=publication,
     )
 
-    assert result["checks"]["semantic_annotation_coverage"] is False
-    assert any("semantic annotation" in error.lower() for error in result["errors"])
+    assert result["checks"]["semantic_annotation_coverage"] is coverage_expected
+    coverage_error = "A semantic annotation is missing from another exact occurrence"
+    assert (coverage_error in result["errors"]) is not coverage_expected
 
 
 def test_semantic_annotation_wire_accepts_anchors_copied_with_their_prompt_frame() -> None:

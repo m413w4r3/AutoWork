@@ -17,8 +17,9 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, StrictStr, field_validator
 
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
@@ -102,6 +103,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     resolve_timeline_date_text,
     synthesis_evidence_refs,
+    technical_literal_markup_exception_spans,
     timeline_sort_key,
     validate_synthesis_lineage,
 )
@@ -114,7 +116,7 @@ SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v9-source-publ
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v2-headingless-reserve-handles"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v5-source-domain-diagnostics"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
@@ -144,6 +146,7 @@ class _StrictProposalModel(BaseModel):
 class SynthesisClaimProposalV1(_StrictProposalModel):
     text: StrictStr
     evidence_handles: tuple[StrictStr, ...]
+    _block_id: str | None = PrivateAttr(default=None)
 
     @field_validator("text")
     @classmethod
@@ -375,6 +378,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
         except ValueError:
             reject(claim.block_id, "synthesis_claim_schema_invalid", claim.raw_lines)
             return
+        parsed._block_id = claim.block_id
         if claim.group == "lead":
             lead.append(parsed)
         elif claim.section is not None:
@@ -856,17 +860,10 @@ _PROPOSAL_OPTIONAL_KEYS = frozenset({"title", "source_notes"})
 _CLAIM_PROPOSAL_KEYS = frozenset({"text", "evidence_handles"})
 _SECTION_PROPOSAL_KEYS = frozenset({"kind", "heading", "claims"})
 _SOURCE_NOTE_PROPOSAL_KEYS = frozenset({"source_alias", "evidence_handles", "text"})
-_TECHNICAL_SECTION_KINDS = frozenset(
-    {
-        SynthesisSectionKind.TECHNICAL,
-        SynthesisSectionKind.INFRASTRUCTURE,
-        SynthesisSectionKind.DETECTION,
-    }
-)
 _MARKDOWN_OR_HTML = re.compile(
     r"(?:^\s{0,3}#{1,6}(?:\s|$)|^\s*(?:[-*+]\s+|\d+[.)]\s+)|"
     r"^\s*>|^\s*```|`|\[[^\]]+\]\([^)]*\)|\[[^\]]+\]\[[^\]]*\]|"
-    r"<\s*/?\s*[A-Za-z][^>]*>|<!--|\*\*|__|(?<!\w)\*(?=\S)|(?<!\w)_(?=\S))",
+    r"(?P<html_tag><\s*/?\s*[A-Za-z][^>]*>)|<!--|\*\*|__|(?<!\w)\*(?=\S)|(?<!\w)_(?=\S))",
     re.MULTILINE,
 )
 _MARKDOWN_TABLE_SEPARATOR = re.compile(
@@ -1841,6 +1838,24 @@ def _invalid_proposal(reason: str) -> None:
     raise SynthesisProposalControlError(SynthesisProposalErrorCode.OUTPUT_INVALID, reason)
 
 
+def _contains_markdown_or_html(value: str) -> bool:
+    literal_exceptions = technical_literal_markup_exception_spans(value)
+    placeholders = frozenset(literal_exceptions)
+    for match in _MARKDOWN_OR_HTML.finditer(value):
+        if match.lastgroup == "html_tag" and match.span() in placeholders:
+            continue
+        if match.group() == "*" and any(
+            start <= match.start() < end for start, end in literal_exceptions
+        ):
+            continue
+        if match.group() == "_" and any(
+            match.end() == start or match.start() == end for start, end in placeholders
+        ):
+            continue
+        return True
+    return False
+
+
 def _strict_mapping(value: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping) or set(value) != keys:
         raise ValueError(f"{label} fields do not match the strict schema")
@@ -1921,7 +1936,7 @@ def _validate_plain_text(value: str) -> None:
     stripped = value.strip()
     if (
         stripped.startswith(("---", "+++"))
-        or _MARKDOWN_OR_HTML.search(value)
+        or _contains_markdown_or_html(value)
         or _MARKDOWN_TABLE_SEPARATOR.search(value)
         or _MARKDOWN_TABLE_ROW.search(value)
         or _SOURCE_MARKER.search(value)
@@ -2001,6 +2016,56 @@ def _technical_literals(text: str) -> set[tuple[str, str]]:
     return literals
 
 
+def _technical_literal_aliases(literal: tuple[str, str]) -> set[tuple[str, str]]:
+    """Return conservative host spellings for a URL or extracted domain.
+
+    Without a public suffix list, deriving the eTLD+1 of arbitrary nested
+    hosts would guess at suffix boundaries. The safe alias needed for common
+    publisher URLs is the same host with one leading ``www.`` removed.
+    """
+    aliases = {literal}
+    kind, value = literal
+    host = value if kind == "domain" else None
+    if kind == "url":
+        try:
+            host = urlsplit(value).hostname
+        except ValueError:
+            host = None
+    if not host:
+        return aliases
+
+    host = host.rstrip(".").casefold()
+    if not _DOMAIN.fullmatch(host):
+        return aliases
+    aliases.add(("domain", host))
+    if host.startswith("www."):
+        aliases.add(("domain", host[4:]))
+    return aliases
+
+
+def _diagnostic_value(value: str, *, limit: int = 80) -> str:
+    compact = " ".join(value.split())
+    if len(compact) > limit:
+        return f"{compact[: limit - 1]}…"
+    return compact
+
+
+def _grounding_failure_reason(
+    error: SynthesisProposalErrorCode,
+    *,
+    claim_id: str | None,
+    literal_kind: str,
+    literal_value: str,
+    cause: str,
+) -> str:
+    block_id = _diagnostic_value(claim_id or "unknown", limit=40)
+    value = _diagnostic_value(literal_value)
+    return (
+        f"{error.value}:claim={block_id}:literal_kind={literal_kind}:"
+        f"literal_value={value}:reason={cause}"
+    )
+
+
 def _string_values(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -2057,17 +2122,43 @@ def _resolve_claim_refs(
     removed_handles: set[str],
 ) -> tuple[ExtractionEvidenceRefV1, ...]:
     refs: list[ExtractionEvidenceRefV1] = []
+    claim_id = claim._block_id
     for handle in claim.evidence_handles:
         if handle in removed_handles:
-            raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_EVIDENCE)
+            raise SynthesisProposalControlError(
+                SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                    claim_id=claim_id,
+                    literal_kind="evidence_handle",
+                    literal_value=handle,
+                    cause="not_in_extraction",
+                ),
+            )
         try:
             ref = evidence_pack.resolve_handle(handle)
         except (KeyError, ValueError) as exc:
             raise SynthesisProposalControlError(
-                SynthesisProposalErrorCode.UNKNOWN_EVIDENCE
+                SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                    claim_id=claim_id,
+                    literal_kind="evidence_handle",
+                    literal_value=handle,
+                    cause="not_in_extraction",
+                ),
             ) from exc
         if ref not in current_refs or ref in removed_refs:
-            raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_EVIDENCE)
+            raise SynthesisProposalControlError(
+                SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_EVIDENCE,
+                    claim_id=claim_id,
+                    literal_kind="evidence_handle",
+                    literal_value=handle,
+                    cause="not_in_extraction",
+                ),
+            )
         refs.append(ref)
     # Citing the same evidence twice does not weaken the grounding: keep one.
     return tuple(dict.fromkeys(refs))
@@ -2097,6 +2188,7 @@ def _date_supported_by_payload(payload: Mapping[str, Any], date_key: str) -> boo
 
 def _validate_grounded_text(
     text: str,
+    claim_id: str | None,
     refs: tuple[ExtractionEvidenceRefV1, ...],
     entries: Mapping[ExtractionEvidenceRefV1, Mapping[str, Any]],
     known_technical: set[tuple[str, str]],
@@ -2105,13 +2197,44 @@ def _validate_grounded_text(
     ref_set = set(refs)
     for literal in _technical_literals(text):
         if literal not in known_technical:
-            raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE)
+            raise SynthesisProposalControlError(
+                SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                    claim_id=claim_id,
+                    literal_kind=literal[0],
+                    literal_value=literal[1],
+                    cause="not_in_extraction",
+                ),
+            )
         support = technical_support.get(literal, set())
         if support and not support.intersection(ref_set):
-            raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE)
+            raise SynthesisProposalControlError(
+                SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE,
+                    claim_id=claim_id,
+                    literal_kind=literal[0],
+                    literal_value=literal[1],
+                    cause="not_supported_by_cited_handles",
+                ),
+            )
     for date_key in _date_literals(text):
         if not any(_date_supported_by_payload(entries[ref], date_key) for ref in refs):
-            raise SynthesisProposalControlError(SynthesisProposalErrorCode.UNKNOWN_DATE)
+            date_in_extraction = any(
+                _date_supported_by_payload(payload, date_key) for payload in entries.values()
+            )
+            cause = "not_supported_by_cited_handles" if date_in_extraction else "not_in_extraction"
+            raise SynthesisProposalControlError(
+                SynthesisProposalErrorCode.UNKNOWN_DATE,
+                _grounding_failure_reason(
+                    SynthesisProposalErrorCode.UNKNOWN_DATE,
+                    claim_id=claim_id,
+                    literal_kind="date",
+                    literal_value=date_key.partition(":")[2],
+                    cause=cause,
+                ),
+            )
 
 
 def validate_synthesis_proposal(
@@ -2143,29 +2266,18 @@ def validate_synthesis_proposal(
 
         narrative_handles = {str(record["handle"]) for record in evidence_pack.narrative_evidence}
         technical_handles = {str(record["handle"]) for record in evidence_pack.technical_evidence}
-        reserve_narrative_handles = {
-            str(record["handle"])
-            for record in evidence_pack.reserve_evidence
-            if record.get("kind")
-            in {
-                EvidenceKind.FACT.value,
-                EvidenceKind.EVENT.value,
-                EvidenceKind.UNCERTAINTY.value,
-            }
-        }
-        reserve_technical_handles = {
-            str(record["handle"])
-            for record in evidence_pack.reserve_evidence
-            if record.get("kind") in {EvidenceKind.INDICATOR.value, EvidenceKind.RULE.value}
-        }
+        reserve_handles = {str(record["handle"]) for record in evidence_pack.reserve_evidence}
         narrative_refs = {evidence_pack.resolve_handle(handle) for handle in narrative_handles}
-        narrative_refs.update(
-            evidence_pack.resolve_handle(handle) for handle in reserve_narrative_handles
-        )
+        narrative_refs.update(evidence_pack.resolve_handle(handle) for handle in reserve_handles)
         technical_refs = {evidence_pack.resolve_handle(handle) for handle in technical_handles}
-        technical_refs.update(
-            evidence_pack.resolve_handle(handle) for handle in reserve_technical_handles
-        )
+        evidence_kind_by_handle = {
+            str(record["handle"]): str(record.get("kind", "unknown"))
+            for record in (
+                *evidence_pack.narrative_evidence,
+                *evidence_pack.technical_evidence,
+                *evidence_pack.reserve_evidence,
+            )
+        }
 
         known_technical: set[tuple[str, str]] = set()
         technical_support_mutable: dict[tuple[str, str], set[ExtractionEvidenceRefV1]] = (
@@ -2174,24 +2286,53 @@ def validate_synthesis_proposal(
         for ref, payload in entries.items():
             for value in _string_values(payload):
                 for literal in _technical_literals(value):
-                    known_technical.add(literal)
-                    technical_support_mutable[literal].add(ref)
+                    for alias in _technical_literal_aliases(literal):
+                        known_technical.add(alias)
+                        technical_support_mutable[alias].add(ref)
         for source in extraction.sources:
             for value in (source.canonical_url, source.content_sha256):
-                known_technical.update(_technical_literals(value))
+                for literal in _technical_literals(value):
+                    # Source metadata keeps the same citation-free grounding
+                    # as its canonical URL; do not add these aliases to the
+                    # extraction-handle support map.
+                    known_technical.update(_technical_literal_aliases(literal))
 
         def convert_claim(
-            claim: SynthesisClaimProposalV1, *, allow_technical: bool
+            claim: SynthesisClaimProposalV1,
+            *,
+            section_kind: str,
+            allow_technical: bool,
         ) -> SynthesisParagraphV1:
             _validate_plain_text(claim.text)
             refs = _resolve_claim_refs(
                 claim, evidence_pack, current_refs, removed_refs, removed_handles
             )
-            for ref in refs:
-                if ref not in narrative_refs and not (allow_technical and ref in technical_refs):
-                    _invalid_proposal("evidence_kind_not_allowed_in_section")
+            disallowed_refs = {
+                ref
+                for ref in refs
+                if ref not in narrative_refs and not (allow_technical and ref in technical_refs)
+            }
+            if disallowed_refs:
+                offending_handles = [
+                    handle
+                    for handle in claim.evidence_handles
+                    if evidence_pack.resolve_handle(handle) in disallowed_refs
+                ]
+                handle_descriptions = [
+                    f"{handle}(kind={evidence_kind_by_handle.get(handle, 'unknown')})"
+                    for handle in offending_handles[:6]
+                ]
+                if len(offending_handles) > 6:
+                    handle_descriptions.append(f"+{len(offending_handles) - 6}")
+                block_id = (claim._block_id or "unknown")[:40]
+                _invalid_proposal(
+                    "evidence_kind_not_allowed_in_section:"
+                    f"section={section_kind}:claim={block_id}:"
+                    f"handles={','.join(handle_descriptions)}"
+                )
             _validate_grounded_text(
                 claim.text,
+                claim._block_id,
                 refs,
                 entries,
                 known_technical,
@@ -2199,12 +2340,19 @@ def validate_synthesis_proposal(
             )
             return SynthesisParagraphV1(text=claim.text, evidence_refs=refs)
 
-        lead = tuple(convert_claim(claim, allow_technical=False) for claim in parsed.lead)
+        lead = tuple(
+            convert_claim(claim, section_kind="lead", allow_technical=False)
+            for claim in parsed.lead
+        )
         sections: list[SynthesisSectionV1] = []
         for section in parsed.sections:
-            allow_technical = section.kind in _TECHNICAL_SECTION_KINDS
             paragraphs = tuple(
-                convert_claim(claim, allow_technical=allow_technical) for claim in section.claims
+                convert_claim(
+                    claim,
+                    section_kind=section.kind.value,
+                    allow_technical=True,
+                )
+                for claim in section.claims
             )
             sections.append(
                 SynthesisSectionV1(
@@ -2245,7 +2393,7 @@ def validate_synthesis_source_notes(
             or not text
             or len(text) > 260
             or not 1 <= sentence_count <= 2
-            or _MARKDOWN_OR_HTML.search(text)
+            or _contains_markdown_or_html(text)
             or _MARKDOWN_TABLE_ROW.search(text)
             or _SOURCE_MARKER.search(text)
         ):
@@ -2270,31 +2418,95 @@ def validate_synthesis_source_notes(
     return tuple(valid_notes), tuple(dict.fromkeys(warnings))
 
 
-def _fallback_editorial_title(
+def _plain_editorial_title_component(value: str) -> str:
+    """Remove title-contract markup while preserving ordinary identifier characters."""
+    literal_exceptions = frozenset(technical_literal_markup_exception_spans(value))
+    value = re.sub(
+        r"<\s*/?\s*[A-Za-z][^>]*>?",
+        lambda match: match.group() if match.span() in literal_exceptions else " ",
+        value,
+    )
+    value = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", value)
+    value = re.sub(r"\b[ER]\d{3,}\b", " ", value)
+    value = re.sub(r"`|\*|__|~~|[\[\]]", " ", value)
+    return " ".join(value.split())
+
+
+def _editorial_title_group(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
 ) -> str:
-    """Build a ``[Publisher] Subject`` title when the model omits or misformats its own."""
-
-    def plain(value: str) -> str:
-        return " ".join(re.sub(r"[\[\]`*_~<>]", " ", value).split())
-
     publisher = next(
-        (plain(source.publisher) for source in snapshot.core_sources if plain(source.publisher)),
+        (
+            cleaned
+            for source in snapshot.core_sources
+            if (cleaned := _plain_editorial_title_component(source.publisher))
+        ),
         None,
     ) or next(
         (
-            (urlsplit(source.canonical_url).hostname or "").removeprefix("www.")
+            _plain_editorial_title_component(
+                (urlsplit(source.canonical_url).hostname or "").removeprefix("www.")
+            )
             for source in extraction.sources
             if source.tier is ProductionReferenceTier.CORE
         ),
         "",
     )
-    group = publisher or "Publication"
+    return publisher or "Publication"
+
+
+_EDITORIAL_TITLE_TRAILING_CONNECTORS = frozenset(
+    {
+        "de",
+        "des",
+        "du",
+        "pour",
+        "et",
+        "à",
+        "la",
+        "le",
+        "les",
+        "un",
+        "une",
+        "d\u2019",
+        "d'",
+        "l\u2019",
+        "l'",
+    }
+)
+
+
+def _truncate_editorial_title_component(value: str, max_length: int) -> str:
+    """Shorten a title at a word boundary and remove dangling French connectors."""
+    if max_length <= 0:
+        return ""
+    if len(value) <= max_length:
+        candidate = value
+    else:
+        candidate = value[:max_length].rstrip()
+        if max_length < len(value) and not value[max_length].isspace():
+            if " " not in candidate:
+                return ""
+            candidate = candidate.rsplit(" ", 1)[0].rstrip()
+
+    words = candidate.split()
+    while words and words[-1].rstrip(".,;:!?()[]{}").casefold() in (
+        _EDITORIAL_TITLE_TRAILING_CONNECTORS
+    ):
+        words.pop()
+    return " ".join(words)
+
+
+def _fallback_editorial_title(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> str:
+    """Build a ``[Publisher] Subject`` title when the model omits or misformats its own."""
+    group = _editorial_title_group(snapshot, extraction)
     budget = EDITORIAL_TITLE_MAX_LENGTH - len(group) - len("[] ")
-    title = plain(snapshot.subject_title).rstrip(".") or "Sujet CTI"
-    if len(title) > budget:
-        title = title[: max(budget - 1, 1)].rstrip() + "…"
+    title = _plain_editorial_title_component(snapshot.subject_title).rstrip(".…") or "Sujet CTI"
+    title = _truncate_editorial_title_component(title, budget) or "Sujet CTI"
     fallback = f"[{group}] {title}"
     return fallback if is_valid_editorial_title(fallback) else "[Publication] Sujet CTI"
 
@@ -2730,6 +2942,7 @@ class SynthesisStageErrorCode(StrEnum):
 
     INPUTS_MISSING = "synthesis_inputs_missing"
     INPUTS_MISMATCH = "synthesis_inputs_mismatch"
+    ARTIFACT_READ_LIMIT_EXCEEDED = "synthesis_artifact_read_limit_exceeded"
     ACCESS_POLICY_UNAVAILABLE = "synthesis_access_policy_unavailable"
     POLICY_BLOCKED = "synthesis_policy_blocked"
     REUSE_INVALID = "synthesis_reuse_invalid"
@@ -3061,6 +3274,17 @@ class ProductionSynthesisService:
             validate_relevance_projection_lineage(
                 projection, extraction, extraction_hash=extraction_hash
             )
+        except BlobReadLimitExceededError as exc:
+            raise _SynthesisControlError(
+                SynthesisStageErrorCode.ARTIFACT_READ_LIMIT_EXCEEDED,
+                "The subject relevance projection exceeds the artifact read limit",
+                details={
+                    "artifact_id": str(artifact.id),
+                    "reason": str(exc),
+                    "size_bytes": exc.size_bytes,
+                    "max_bytes": exc.max_bytes,
+                },
+            ) from exc
         except (TypeError, ValueError) as exc:
             raise _SynthesisControlError(
                 SynthesisStageErrorCode.INPUTS_MISMATCH,
@@ -3586,12 +3810,20 @@ class ProductionSynthesisService:
             )
         await self._record_wire_parse(model_run, evidence_pack, parsed)
 
-        title_is_valid = is_valid_editorial_title(parsed.proposal.title)
-        editorial_title = (
-            parsed.proposal.title
-            if title_is_valid and parsed.proposal.title is not None
-            else _fallback_editorial_title(snapshot, extraction)
-        )
+        model_title = parsed.proposal.title
+        title_is_valid = is_valid_editorial_title(model_title)
+        editorial_title = model_title if title_is_valid and model_title is not None else None
+        if editorial_title is None:
+            if (
+                isinstance(model_title, str)
+                and model_title.strip()
+                and not model_title.startswith("[")
+            ):
+                salvaged_title = f"[{_editorial_title_group(snapshot, extraction)}] {model_title}"
+                if is_valid_editorial_title(salvaged_title):
+                    editorial_title = salvaged_title
+            if editorial_title is None:
+                editorial_title = _fallback_editorial_title(snapshot, extraction)
         source_notes, source_note_warnings = validate_synthesis_source_notes(
             parsed.proposal, evidence_pack
         )

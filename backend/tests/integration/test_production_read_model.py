@@ -26,6 +26,7 @@ from cti_app.infrastructure.database.models.production import (
 from cti_app.infrastructure.database.models.selection import SelectionDecisionRow
 from cti_app.infrastructure.database.repositories.production import (
     SqlAlchemyBatchStatusReadRepository,
+    SqlAlchemyEditionProductionBatchRepository,
 )
 from cti_app.infrastructure.database.session import create_postgres_engine, create_session_factory
 
@@ -122,7 +123,7 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
     batch = EditionProductionBatchRow(
         id=batch_id,
         edition_id=edition_id,
-        status="running",
+        status="paused",
         phase="initial",
         idempotency_key=f"fixture-{batch_id.hex}",
         request_fingerprint="0" * 64,
@@ -132,6 +133,8 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
         created_at=now,
         started_at=now,
         finished_at=None,
+        paused_at=now,
+        paused_by="integration-operator",
         version=1,
     )
     batch_items = [
@@ -309,11 +312,19 @@ async def test_batch_status_read_model_is_one_real_postgres_select(
                 ).list_for_batch(batch.id)
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", count_selects)
+            batch_repository = SqlAlchemyEditionProductionBatchRepository(real_async_session)
+            active_batch = await batch_repository.get_active_for_edition(edition_id)
+            recent_batches = await batch_repository.list_recent_for_edition(edition_id)
 
     finally:
         await engine.dispose()
 
     assert len(select_statements) == 1
+    assert active_batch is not None
+    assert active_batch.status.value == "paused"
+    assert active_batch.paused_at == now
+    assert active_batch.paused_by == "integration-operator"
+    assert recent_batches == []
     assert len(result) == 3
     assert [(item.position, item.subject_id, item.run_id) for item in result] == [
         (1, subject_ids[1], run_ids[1]),

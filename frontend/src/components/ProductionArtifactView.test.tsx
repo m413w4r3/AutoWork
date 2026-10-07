@@ -2,7 +2,10 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
-import { isProductionSynthesisV1 } from "../api/production";
+import {
+  isProductionExtractionV1,
+  isProductionSynthesisV1,
+} from "../api/production";
 import { ProductionArtifactView } from "./ProductionArtifactView";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -55,7 +58,7 @@ function extractionArtifact(sources: unknown[]) {
       subject_id: SYNTHESIS_SUBJECT_ID,
       production_input_hash: "a".repeat(64),
       references_corpus_hash: "b".repeat(64),
-      profile_policy_version: "production-reference-tier-v1",
+      profile_policy_version: "production-reference-tier-core-first-v5",
       sources,
       omitted_sources: [],
       warnings: [],
@@ -81,7 +84,7 @@ function synthesisArtifact(
       extraction_hash: "b".repeat(64),
       publication_language: "fr",
       synthesis_policy_version:
-        "production-synthesis-v2-editorial-title-source-notes",
+        "production-synthesis-v4-attached-technical-placeholders",
       title: "Campagne Cavern Manticore",
       lead: [
         {
@@ -136,6 +139,20 @@ function synthesisArtifact(
     ...artifactOverrides,
   };
 }
+
+it("lit les politiques d'extraction historiques sans les réutiliser comme identité actuelle", () => {
+  const current = extractionArtifact([
+    extractionSource(VENDOR_DOCUMENT_ID, VENDOR_URL),
+  ]).canonical_content;
+
+  expect(isProductionExtractionV1(current)).toBe(true);
+  expect(
+    isProductionExtractionV1({
+      ...current,
+      profile_policy_version: "production-reference-tier-v1",
+    }),
+  ).toBe(true);
+});
 
 function urlOf(input: RequestInfo | URL): string {
   if (typeof input === "string") return input;
@@ -407,15 +424,24 @@ it("keeps ambiguous relevance decisions visible with their reasons", async () =>
         status: "verified",
         metadata: {},
         canonical_content: {
+          schema_version: 3,
+          extraction_evidence_refs: [
+            {
+              source_document_id: "source-1",
+              kind: "fact",
+              evidence_key: "a".repeat(64),
+            },
+          ],
           classifications: [
             {
               classification: "indeterminate",
               reason_code: "relation_not_established",
-              evidence_ref: { kind: "fact", evidence_key: "a".repeat(64) },
-              supporting_evidence_refs: [],
+              evidence_ref_index: 0,
+              supporting_evidence_ref_indexes: [0],
               provenance: "deterministic_policy",
             },
           ],
+          source_pair_relations: [],
         },
       }),
     ),
@@ -428,6 +454,12 @@ it("keeps ambiguous relevance decisions visible with their reasons", async () =>
   ).toBeInTheDocument();
   expect(
     screen.getByText(/"reason_code": "relation_not_established"/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/"supporting_evidence_refs": \[/),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/"source_document_id": "source-1"/),
   ).toBeInTheDocument();
 });
 
@@ -1035,7 +1067,8 @@ it("applique les rôles typographiques sémantiques d’un document V5", async (
           figures: [],
           rich_text: {
             schema_version: "1",
-            policy_version: "semantic-annotation-policy-v2-document-lexicon",
+            policy_version:
+              "semantic-annotation-policy-v3-attached-placeholders",
             paragraphs: [
               {
                 anchor: "title",
@@ -1445,7 +1478,7 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
           subject_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
           production_input_hash: "a".repeat(64),
           references_corpus_hash: "b".repeat(64),
-          profile_policy_version: "production-reference-tier-v1",
+          profile_policy_version: "production-reference-tier-core-first-v5",
           sources: [
             {
               source_document_id: fullDocumentId,
@@ -1483,6 +1516,14 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
               indicators: [],
               rules: [],
               uncertainties: [],
+              scope: {
+                kind: "case",
+                case_id: "GTG-30004",
+                kept_sections: 1,
+                total_sections: 38,
+                kept_chars: 8361,
+                total_chars: 258860,
+              },
             },
             {
               source_document_id: iocDocumentId,
@@ -1569,6 +1610,9 @@ it("rend l'extraction canonique V1 structurée avec ses preuves et omissions", a
     ).toBeInTheDocument();
   }
   expect(screen.getByText("Calculée")).toBeInTheDocument();
+  expect(
+    screen.getByText("Cas GTG-30004 · 1/38 sections · 8361/258860 caractères"),
+  ).toBeInTheDocument();
   expect(screen.getAllByText(/Réutilisée/)).toHaveLength(2);
   expect(screen.getByText("The campaign began.")).toBeInTheDocument();
   expect(

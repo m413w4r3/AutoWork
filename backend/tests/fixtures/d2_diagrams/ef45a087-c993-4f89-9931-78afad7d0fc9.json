@@ -1,0 +1,114 @@
+{
+  "diagram": {
+    "asset_id": "4cc6943a-dde4-505a-91c9-99fafc8a8b89",
+    "caption": "PollCat peut commencer son activité C2 avant la saisie du code ; un échec OTP le laisse actif, tandis qu’un succès démarre une instance supplémentaire.",
+    "direction": "top_to_bottom",
+    "edges": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "cd64a95e10278365188571a27d647fe1125b684e9f414c10a2558f2f13ef7d5c",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "sonde avant l’OTP",
+        "source_node_id": "application",
+        "target_node_id": "pollcat"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "38fd3d98f90803412181515b489a3d0e42b9a378c037b62c9bb4a1cd701dece7",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "échec: reste actif",
+        "source_node_id": "otp",
+        "target_node_id": "pollcat"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "ab31664f535b504e0abeed777352ec17a0b91b365ddc87eafc1d104f19e665bf",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "succès: lance instance",
+        "source_node_id": "otp",
+        "target_node_id": "pollcat_extra"
+      }
+    ],
+    "groups": [],
+    "key": "pollcat_otp_execution",
+    "kind": "execution_sequence",
+    "nodes": [
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "cd64a95e10278365188571a27d647fe1125b684e9f414c10a2558f2f13ef7d5c",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "Application locale",
+        "node_id": "application",
+        "role": "technique_step"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "38fd3d98f90803412181515b489a3d0e42b9a378c037b62c9bb4a1cd701dece7",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          },
+          {
+            "evidence_key": "cd64a95e10278365188571a27d647fe1125b684e9f414c10a2558f2f13ef7d5c",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "PollCat",
+        "node_id": "pollcat",
+        "role": "malware_tool"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "38fd3d98f90803412181515b489a3d0e42b9a378c037b62c9bb4a1cd701dece7",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          },
+          {
+            "evidence_key": "ab31664f535b504e0abeed777352ec17a0b91b365ddc87eafc1d104f19e665bf",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "Validation OTP",
+        "node_id": "otp",
+        "role": "technique_step"
+      },
+      {
+        "evidence_refs": [
+          {
+            "evidence_key": "ab31664f535b504e0abeed777352ec17a0b91b365ddc87eafc1d104f19e665bf",
+            "kind": "fact",
+            "source_document_id": "adbeec4d-5fbf-4671-abab-784664f03f40"
+          }
+        ],
+        "label": "Instance PollCat supplémentaire",
+        "node_id": "pollcat_extra",
+        "role": "malware_tool"
+      }
+    ],
+    "placement": {
+      "kind": "after_section",
+      "section_index": 1
+    },
+    "title": "Comportement de PollCat autour de l’OTP"
+  },
+  "subject_id": "ef45a087-c993-4f89-9931-78afad7d0fc9"
+}

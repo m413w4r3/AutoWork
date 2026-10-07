@@ -351,7 +351,7 @@ def test_policy_version_change_invalidates_source_checkpoint_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     identity_before = production_extraction.source_checkpoint_identity(
-        content_sha256="b" * 64,
+        effective_evidence_sha256="b" * 64,
         profile=ExtractionProfile.FULL,
         prompt_version=production_extraction.source_prompt_version(ExtractionProfile.FULL),
     )
@@ -362,7 +362,7 @@ def test_policy_version_change_invalidates_source_checkpoint_identity(
         "production-reference-tier-core-only-v4-test",
     )
     identity_after = production_extraction.source_checkpoint_identity(
-        content_sha256="b" * 64,
+        effective_evidence_sha256="b" * 64,
         profile=ExtractionProfile.FULL,
         prompt_version=production_extraction.source_prompt_version(ExtractionProfile.FULL),
     )
@@ -396,12 +396,12 @@ def test_same_source_capture_keeps_subject_independent_extraction_identity() -> 
     first = next(source for source in first_plan.sources if source.content_sha256 == shared_hash)
     second = next(source for source in second_plan.sources if source.content_sha256 == shared_hash)
     first_identity = production_extraction.source_checkpoint_identity(
-        content_sha256=first.content_sha256,
+        effective_evidence_sha256=first.content_sha256,
         profile=first.profile,
         prompt_version=production_extraction.source_prompt_version(first.profile),
     )
     second_identity = production_extraction.source_checkpoint_identity(
-        content_sha256=second.content_sha256,
+        effective_evidence_sha256=second.content_sha256,
         profile=second.profile,
         prompt_version=production_extraction.source_prompt_version(second.profile),
     )
@@ -503,15 +503,15 @@ def test_no_production_module_derives_full_from_the_source_role() -> None:
 
 def test_canonical_service_contract_helpers_exist() -> None:
     assert callable(production_extraction.production_extraction_metadata)
-    assert production_extraction.source_text_contract_version().startswith(
-        production_extraction.SOURCE_TEXT_CONTRACT_VERSION
-    )
+    source_text_version = production_extraction.source_text_contract_version()
+    assert source_text_version.startswith(production_extraction.SOURCE_TEXT_CONTRACT_VERSION)
+    assert f":evidence-{production_extraction.SOURCE_EVIDENCE_VERSION}:" in source_text_version
 
 
 def test_checkpoint_identity_fits_the_durable_columns() -> None:
     for profile in ExtractionProfile:
         identity = production_extraction.source_checkpoint_identity(
-            content_sha256="a" * 64,
+            effective_evidence_sha256="a" * 64,
             profile=profile,
             prompt_version=production_extraction.source_prompt_version(profile),
         )

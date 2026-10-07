@@ -16,9 +16,23 @@ export type ProductionBatchPhase = "initial" | "recovery" | "review";
 export type ProductionRecoveryDisposition = "auto" | "manual_only";
 
 export type ExtractionProgressProfile = "full" | "ioc_rules";
+export interface ProductionExtractionScopeV1 {
+  kind: "case";
+  case_id: string;
+  kept_sections: number;
+  total_sections: number;
+  kept_chars: number;
+  total_chars: number;
+}
 /** Per-source verdict of the canonical EXTRACTION stage. */
 export type ExtractionProgressSourceStatus =
-  "pending" | "cached" | "succeeded" | "failed" | "omitted";
+  | "pending"
+  | "running"
+  | "cached"
+  | "reused"
+  | "succeeded"
+  | "failed"
+  | "omitted";
 
 export interface ExtractionProgressSource {
   /** The exact ``source_document_id``, or the URL of an omitted source. */
@@ -29,9 +43,14 @@ export interface ExtractionProgressSource {
   /** ``null`` for a source the REFERENCES corpus left out of the plan. */
   profile: ExtractionProgressProfile | null;
   status: ExtractionProgressSourceStatus;
-  reuse_state: "fresh" | "reused" | "content_duplicate" | null;
+  reuse_state:
+    "fresh" | "reused" | "duplicate_content" | "content_duplicate" | null;
   ioc_count: number;
   rule_count: number;
+  chunks_done?: number;
+  chunks_total?: number | null;
+  chunks_total_is_estimate?: boolean;
+  scope?: ProductionExtractionScopeV1 | null;
 }
 
 export interface ExtractionProgress {
@@ -52,6 +71,30 @@ export interface ExtractionProgress {
   suricata_rules: number;
   snort_rules: number;
   sources: ExtractionProgressSource[];
+  stage_started_at?: string | null;
+  current_model_run_id?: string | null;
+  current_model_call_started_at?: string | null;
+  current_source_id?: string | null;
+  current_chunk_index?: number | null;
+  last_call_at?: string | null;
+  last_call_duration_ms?: number | null;
+}
+
+export type ProductionActivityKind =
+  | "model_call"
+  | "reconciliation_probe"
+  | "retry_scheduled"
+  | "waiting_batch"
+  | "deterministic_stage"
+  | "idle";
+
+export interface ProductionActivity {
+  kind: ProductionActivityKind;
+  stage: ProductionStage | null;
+  started_at: string | null;
+  since_seconds: number | null;
+  detail: string | null;
+  attempt: number | null;
 }
 
 export interface ExtractionRejection {
@@ -75,7 +118,12 @@ export interface ExtractionRejections {
 }
 
 export type ProductionBatchStatus =
-  "queued" | "running" | "completed" | "completed_with_issues" | "cancelled";
+  | "queued"
+  | "running"
+  | "paused"
+  | "completed"
+  | "completed_with_issues"
+  | "cancelled";
 
 export interface StageStatus {
   status:
@@ -192,12 +240,15 @@ export interface BatchItemDetail {
   run_id: string;
   status: ProductionRunStatus;
   current_stage: ProductionStage;
+  paused?: boolean;
+  paused_stage?: ProductionStage | null;
   pipeline_generation: number;
   auto_recovery_count: number;
   error_code: string | null;
   error_message: string | null;
   extraction_progress?: ExtractionProgress | null;
   reconciliation?: ProductionReconciliation | null;
+  activity?: ProductionActivity | null;
 }
 
 export interface ProductionSubject {
@@ -211,6 +262,7 @@ export interface ProductionSubject {
   active_run_id: string | null;
   can_start: boolean;
   blocking_reason: string | null;
+  activity?: ProductionActivity | null;
 }
 
 export interface ProductionRunSummary {
@@ -244,6 +296,9 @@ export interface ProductionBatch {
   created_at: string;
   started_at: string | null;
   finished_at: string | null;
+  paused_at?: string | null;
+  paused_by?: string | null;
+  reactivated_by_retry?: boolean;
 }
 
 export type BatchStatus = ProductionBatch;
@@ -265,6 +320,15 @@ export interface CancelProductionBatchResponse {
   status: "cancelled";
   edition_state: EditionStatus;
   edition_version: number;
+}
+
+export interface ProductionBatchControlResponse {
+  action: "pause" | "resume";
+  batch_id: string;
+  status: "queued" | "running" | "paused";
+  changed: boolean;
+  paused_at?: string | null;
+  paused_by?: string | null;
 }
 
 export interface ArtifactResponse {
@@ -294,11 +358,11 @@ export interface ArtifactResponse {
 export type ProductionExtractionTierV1 = "core" | "supporting" | "technical";
 export type ProductionExtractionProfileV1 = "full" | "ioc_rules";
 export type ProductionExtractionReuseStateV1 =
-  "fresh" | "reused" | "content_duplicate";
+  "fresh" | "reused" | "duplicate_content" | "content_duplicate";
 export type ProductionExtractionOmissionReasonV1 =
   "reference_not_eligible" | "source_extraction_failed";
 export const PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION =
-  "production-reference-tier-v1" as const;
+  "production-reference-tier-core-first-v5" as const;
 
 /** Every canonical element is proven by a local quote of its documents. */
 export interface ProductionExtractionEvidenceV1 {
@@ -348,6 +412,7 @@ export interface ProductionSourceExtractionV1 {
   indicators: ProductionExtractionIndicatorV1[];
   rules: ProductionExtractionRuleV1[];
   uncertainties: string[];
+  scope?: ProductionExtractionScopeV1 | null;
 }
 
 export interface ProductionExtractionOmissionV1 {
@@ -364,7 +429,7 @@ export interface ProductionExtractionV1 {
   subject_id: string;
   production_input_hash: string;
   references_corpus_hash: string;
-  profile_policy_version: typeof PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION;
+  profile_policy_version: string;
   sources: ProductionSourceExtractionV1[];
   omitted_sources: ProductionExtractionOmissionV1[];
   warnings: string[];
@@ -495,10 +560,44 @@ function isRule(value: unknown): value is ProductionExtractionRuleV1 {
   );
 }
 
-function isSource(value: unknown): value is ProductionSourceExtractionV1 {
+function isProductionExtractionScopeV1(
+  value: unknown,
+): value is ProductionExtractionScopeV1 {
   return (
     isRecord(value) &&
     hasExactKeys(value, [
+      "kind",
+      "case_id",
+      "kept_sections",
+      "total_sections",
+      "kept_chars",
+      "total_chars",
+    ]) &&
+    value.kind === "case" &&
+    isNonEmptyString(value.case_id) &&
+    /^GTG-\d{5}$/.test(value.case_id) &&
+    typeof value.kept_sections === "number" &&
+    Number.isInteger(value.kept_sections) &&
+    value.kept_sections >= 0 &&
+    typeof value.total_sections === "number" &&
+    Number.isInteger(value.total_sections) &&
+    value.total_sections >= 0 &&
+    typeof value.kept_chars === "number" &&
+    Number.isInteger(value.kept_chars) &&
+    value.kept_chars >= 0 &&
+    typeof value.total_chars === "number" &&
+    Number.isInteger(value.total_chars) &&
+    value.total_chars >= 0 &&
+    value.kept_sections > 0 &&
+    value.total_sections >= value.kept_sections &&
+    value.total_sections > 0
+  );
+}
+
+function isSource(value: unknown): value is ProductionSourceExtractionV1 {
+  return (
+    isRecord(value) &&
+    (hasExactKeys(value, [
       "source_document_id",
       "canonical_url",
       "content_sha256",
@@ -513,7 +612,24 @@ function isSource(value: unknown): value is ProductionSourceExtractionV1 {
       "indicators",
       "rules",
       "uncertainties",
-    ]) &&
+      "scope",
+    ]) ||
+      hasExactKeys(value, [
+        "source_document_id",
+        "canonical_url",
+        "content_sha256",
+        "tier",
+        "kind",
+        "role",
+        "profile",
+        "checkpoint_id",
+        "reuse_state",
+        "facts",
+        "events",
+        "indicators",
+        "rules",
+        "uncertainties",
+      ])) &&
     isUuid(value.source_document_id) &&
     isNonEmptyString(value.canonical_url) &&
     isSha256(value.content_sha256) &&
@@ -525,7 +641,11 @@ function isSource(value: unknown): value is ProductionSourceExtractionV1 {
     (value.checkpoint_id === null || isUuid(value.checkpoint_id)) &&
     (value.reuse_state === "fresh" ||
       value.reuse_state === "reused" ||
+      value.reuse_state === "duplicate_content" ||
       value.reuse_state === "content_duplicate") &&
+    (!("scope" in value) ||
+      value.scope === null ||
+      isProductionExtractionScopeV1(value.scope)) &&
     Array.isArray(value.facts) &&
     value.facts.every(isFact) &&
     Array.isArray(value.events) &&
@@ -582,8 +702,7 @@ export function isProductionExtractionV1(
     !isUuid(value.subject_id) ||
     !isSha256(value.production_input_hash) ||
     !isSha256(value.references_corpus_hash) ||
-    value.profile_policy_version !==
-      PRODUCTION_EXTRACTION_PROFILE_POLICY_VERSION ||
+    !isNonEmptyString(value.profile_policy_version) ||
     !Array.isArray(value.sources) ||
     !value.sources.every(isSource) ||
     !Array.isArray(value.omitted_sources) ||
@@ -612,7 +731,7 @@ export type ProductionSynthesisSectionKindV1 =
   | "other";
 
 export const PRODUCTION_SYNTHESIS_POLICY_VERSION =
-  "production-synthesis-v2-editorial-title-source-notes" as const;
+  "production-synthesis-v4-attached-technical-placeholders" as const;
 
 /**
  * Canonical identity of one piece of evidence. The ``evidence_key`` is an
@@ -1311,6 +1430,24 @@ export async function cancelProductionBatch(
   batchId: string,
 ): Promise<CancelProductionBatchResponse> {
   return request(`/api/editions/${editionId}/production/${batchId}/cancel`, {
+    method: "POST",
+  });
+}
+
+export async function pauseProductionBatch(
+  editionId: string,
+  batchId: string,
+): Promise<ProductionBatchControlResponse> {
+  return request(`/api/editions/${editionId}/production/${batchId}/pause`, {
+    method: "POST",
+  });
+}
+
+export async function resumeProductionBatch(
+  editionId: string,
+  batchId: string,
+): Promise<ProductionBatchControlResponse> {
+  return request(`/api/editions/${editionId}/production/${batchId}/resume`, {
     method: "POST",
   });
 }

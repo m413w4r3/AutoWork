@@ -40,6 +40,7 @@ from cti_app.application.subject_production import (
     ProductionBatchService,
     SubjectProductionService,
 )
+from cti_app.domain.jobs import JobStatus
 from cti_app.domain.production import (
     PRODUCTION_RECONCILIATION_ERROR_CODE,
     ProductionBatchStatus,
@@ -79,6 +80,10 @@ class ProductionStageParameters(JobParameters):
     run_id: UUID = Field(..., description="Production run ID")
     expected_stage: str = Field(..., description="Expected production stage")
     pipeline_generation: int = Field(0, ge=0, description="Pipeline generation")
+
+
+class ProductionBatchPausedError(RuntimeError):
+    """A chained stage is held because its owning batch is paused."""
 
 
 class ProductionReconciliationResumeParameters(ProductionStageParameters):
@@ -223,6 +228,7 @@ class ProductionStageChain:
         actor_id: str = "system",
         delay_ms: int | None = None,
         before_dispatch: Callable[[], Awaitable[bool]] | None = None,
+        pause_check: Callable[[], Awaitable[bool]] | None = None,
     ) -> UUID | None:
         """Worker attempts share a generation; manual retries get a new one."""
         if self._jobs is None or self._dispatcher is None:
@@ -231,22 +237,35 @@ class ProductionStageChain:
             raise JobCancelledError
         if run.requires_reconciliation:
             raise ProductionReconciliationRequiredError
+        if pause_check is not None and await pause_check():
+            raise ProductionBatchPausedError
         parameters = ProductionStageParameters(
             run_id=run.id,
             expected_stage=stage.value,
             pipeline_generation=run.pipeline_generation,
         )
-        job = await self._jobs.submit(
-            kind=stage_job_kind(stage),
-            aggregate_type="subject",
-            aggregate_id=run.subject_id,
-            idempotency_key=production_stage_idempotency_key(run, stage),
-            correlation_id=correlation_id,
-            input_parameters=parameters.model_dump(mode="json"),
-            max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
-            actor_id=actor_id,
-        )
+        try:
+            job = await self._jobs.submit(
+                kind=stage_job_kind(stage),
+                aggregate_type="subject",
+                aggregate_id=run.subject_id,
+                idempotency_key=production_stage_idempotency_key(run, stage),
+                correlation_id=correlation_id,
+                input_parameters=parameters.model_dump(mode="json"),
+                max_attempts=PRODUCTION_STAGE_MAX_ATTEMPTS,
+                actor_id=actor_id,
+            )
+        except DuplicateJobError as exc:
+            job = await self._jobs.get(exc.existing_job_id)
+            if job.status is JobStatus.WAITING_HUMAN:
+                resume = getattr(self._jobs, "resume_waiting_human", None)
+                if resume is not None:
+                    job = await resume(job.id, actor_id=actor_id)
+        if pause_check is not None and await pause_check():
+            raise ProductionBatchPausedError
         if before_dispatch is not None and not await before_dispatch():
+            if pause_check is not None and await pause_check():
+                return job.id
             cancel = getattr(self._jobs, "cancel", None)
             if cancel is not None:
                 await cancel(job.id, actor_id=actor_id)
@@ -265,8 +284,11 @@ class ProductionStageChain:
         correlation_id: str,
         delay_ms: int = 0,
         actor_id: str = "system",
+        pause_check: Callable[[], Awaitable[bool]] | None = None,
     ) -> UUID | None:
         if self._jobs is None or self._dispatcher is None:
+            return None
+        if pause_check is not None and await pause_check():
             return None
         parameters = ProductionReconciliationProbeParameters(
             run_id=run.id,
@@ -285,6 +307,8 @@ class ProductionStageChain:
             )
         except DuplicateJobError as exc:
             job = await self._jobs.get(exc.existing_job_id)
+        if pause_check is not None and await pause_check():
+            return job.id
         await self._dispatcher.dispatch(job.id, delay_ms=max(0, delay_ms))
         return job.id
 
@@ -296,12 +320,15 @@ class ProductionStageChain:
         delay_ms: int | None = None,
         actor_id: str = "system",
         before_dispatch: Callable[[], Awaitable[bool]] | None = None,
+        pause_check: Callable[[], Awaitable[bool]] | None = None,
     ) -> UUID | None:
         if self._jobs is None or self._dispatcher is None:
             return None
         identity = run.reconciliation
         if identity is None or identity.output_sha256 is None:
             return None
+        if pause_check is not None and await pause_check():
+            raise ProductionBatchPausedError
         parameters = ProductionReconciliationResumeParameters(
             run_id=run.id,
             expected_stage=identity.stage.value,
@@ -328,7 +355,15 @@ class ProductionStageChain:
             )
         except DuplicateJobError as exc:
             job = await self._jobs.get(exc.existing_job_id)
+            if job.status is JobStatus.WAITING_HUMAN:
+                resume = getattr(self._jobs, "resume_waiting_human", None)
+                if resume is not None:
+                    job = await resume(job.id, actor_id=actor_id)
+        if pause_check is not None and await pause_check():
+            raise ProductionBatchPausedError
         if before_dispatch is not None and not await before_dispatch():
+            if pause_check is not None and await pause_check():
+                return job.id
             cancel = getattr(self._jobs, "cancel", None)
             if cancel is not None:
                 await cancel(job.id, actor_id=actor_id)
@@ -393,6 +428,7 @@ def register_production_jobs(
             delay_ms=production_pacing.subject_delay_ms(
                 sequence_index=production_pacing.cooldown_every_n_subjects
             ),
+            pause_check=lambda: batch_is_paused(run_id),
         )
 
     async def dispatch_reconciled_stage(
@@ -418,6 +454,7 @@ def register_production_jobs(
                     correlation_id=await context.correlation_id(),
                     delay_ms=batch_delay,
                     before_dispatch=lambda: can_dispatch(run.id, context),
+                    pause_check=lambda: batch_is_paused(run.id),
                 )
             else:
                 await stage_chain.submit(
@@ -426,8 +463,9 @@ def register_production_jobs(
                     correlation_id=await context.correlation_id(),
                     delay_ms=batch_delay,
                     before_dispatch=lambda: can_dispatch(run.id, context),
+                    pause_check=lambda: batch_is_paused(run.id),
                 )
-        except (DuplicateJobError, JobCancelledError):
+        except (DuplicateJobError, JobCancelledError, ProductionBatchPausedError):
             return
 
     async def handle_reconciliation_probe(
@@ -532,6 +570,14 @@ def register_production_jobs(
                 ProductionBatchStatus.RUNNING,
             }
 
+    async def batch_is_paused(run_id: UUID) -> bool:
+        async with uow_factory() as uow:
+            item = await uow.edition_production_batch_items.get_by_run(run_id)
+            if item is None:
+                return False
+            batch = await uow.edition_production_batches.get(item.batch_id)
+            return batch is not None and batch.status is ProductionBatchStatus.PAUSED
+
     async def advance_batch(
         run_id: UUID,
         correlation_id: str,
@@ -591,8 +637,9 @@ def register_production_jobs(
                 correlation_id=correlation_id,
                 delay_ms=subject_delay_ms,
                 before_dispatch=lambda: can_dispatch(started.id, context),
+                pause_check=lambda: batch_is_paused(started.id),
             )
-        except (DuplicateJobError, JobCancelledError):
+        except (DuplicateJobError, JobCancelledError, ProductionBatchPausedError):
             # A recovered worker may reach this hand-off after the original
             # dispatch already committed. The idempotency key is the proof
             # that the existing job is the exact same stage attempt.  A
@@ -651,8 +698,9 @@ def register_production_jobs(
                         stage=current.current_stage,
                         correlation_id=await context.correlation_id(),
                         before_dispatch=lambda: can_dispatch(parameters.run_id, context),
+                        pause_check=lambda: batch_is_paused(parameters.run_id),
                     )
-                except DuplicateJobError:
+                except (DuplicateJobError, ProductionBatchPausedError):
                     pass
             return f"production-stage://{parameters.run_id}/{stage.value}#superseded"
         await context.check_cancelled()
@@ -798,12 +846,16 @@ def register_production_jobs(
             latest = await uow.production_runs.get(parameters.run_id)
         if latest is None or latest.status is ProductionRunStatus.CANCELLED:
             return f"production-stage://{parameters.run_id}/{stage.value}#cancelled"
-        job_id = await stage_chain.submit(
-            run=latest,
-            stage=next_stage,
-            correlation_id=correlation_id,
-            before_dispatch=lambda: can_dispatch(parameters.run_id, context),
-        )
+        try:
+            job_id = await stage_chain.submit(
+                run=latest,
+                stage=next_stage,
+                correlation_id=correlation_id,
+                before_dispatch=lambda: can_dispatch(parameters.run_id, context),
+                pause_check=lambda: batch_is_paused(parameters.run_id),
+            )
+        except ProductionBatchPausedError:
+            return f"production-stage://{parameters.run_id}/{stage.value}#paused"
         if job_id is None:
             raise JobHandlerError(
                 code="production_chain_unbound",

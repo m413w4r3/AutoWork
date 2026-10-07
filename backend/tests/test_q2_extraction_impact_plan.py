@@ -244,7 +244,7 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
     assert len(progress["sources"]) == 4
     assert statuses["https://example.test/core-a"] == "succeeded"
     assert statuses["https://example.test/core-b"] == "cached"
-    assert statuses["https://example.test/core-c"] == "cached"
+    assert statuses["https://example.test/core-c"] == "reused"
     assert statuses["https://example.test/unavailable"] == "omitted"
     assert progress["completed_sources"] == 3
     assert progress["model_calls"] == 1
@@ -258,7 +258,25 @@ def test_progress_reports_every_corpus_source_with_its_canonical_status() -> Non
     assert progress["confirmed_iocs"] == 1
     assert progress["rules_total"] == 1
     assert progress["yara_rules"] == 1
-    assert progress["profile_policy_version"] == "production-reference-tier-core-first-v4"
+    assert progress["profile_policy_version"] == "production-reference-tier-core-first-v5"
+    assert all(
+        {
+            "source_id",
+            "canonical_url",
+            "tier",
+            "profile",
+            "status",
+            "reuse_state",
+            "ioc_count",
+            "rule_count",
+            "chunks_done",
+            "chunks_total",
+            "chunks_total_is_estimate",
+        }
+        <= set(source)
+        for source in progress["sources"]
+    )
+    assert all(source["scope"] is None for source in progress["sources"])
 
 
 def test_a_blocking_source_is_failed_and_the_others_stay_pending() -> None:

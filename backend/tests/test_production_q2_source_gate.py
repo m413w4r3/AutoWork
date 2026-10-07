@@ -12,6 +12,8 @@ from cti_app.application.production_artifact_verification import (
 )
 from cti_app.application.production_extraction import gate_source_output
 from cti_app.application.production_parsers import (
+    DisplayPolicy,
+    IndicatorStatus,
     Q2ArtifactProposal,
     Q2EventProposal,
     Q2FactProposal,
@@ -27,6 +29,7 @@ from cti_app.application.production_source_evidence import (
     verify_q2_output_against_source,
 )
 from cti_app.domain.production import ExtractionProfile
+from cti_app.domain.publication import is_publication_ioc_artifact_type
 
 
 def _gate(text: str, source: str | SourceEvidenceDocument) -> SourceEvidenceResult:
@@ -108,6 +111,45 @@ def test_indicator_is_accepted_only_with_local_evidence() -> None:
     absent = _gate("IOC confirmed domain\n- absent.example\n", source)
     assert absent.output.artifacts == []
     assert absent.rejections[0].reason_code == "source_evidence_missing"
+
+
+def test_autolink_service_endpoints_keep_existing_indicator_and_publication_policy() -> None:
+    parsed = parse_q2_proposals_markdown(
+        "IOC confirmed url\n"
+        "- [https://api.telegram.org/](https://api.telegram.org/)\n"
+        "IOC contextual url\n"
+        "- [https://api.ipify.org](https://api.ipify.org)\n"
+        "- [https://graph.facebook.com/v12.0/me/messages]"
+        "(https://graph.facebook.com/v12.0/me/messages)\n"
+    )
+    assert parsed.usable, parsed.errors
+    assert parsed.value is not None
+    source = (
+        "https://api.telegram.org/ https://api.ipify.org "
+        "https://graph.facebook.com/v12.0/me/messages"
+    )
+
+    gated, warnings, rejections = gate_source_output(
+        parsed.value,
+        SourceEvidenceDocument(parsed_text=source),
+        profile=ExtractionProfile.FULL,
+    )
+    verified = verify_q2_proposals((Q2ProposalSubmission(output=gated, source_ids=("S1",)),))
+    by_value = {item.value: item for item in verified.canonical.items}
+
+    assert warnings == ("artifact_markdown_autolink_unwrapped",)
+    assert rejections == ()
+    assert set(by_value) == {
+        "https://api.telegram.org/",
+        "https://api.ipify.org",
+        "https://graph.facebook.com/v12.0/me/messages",
+    }
+    assert by_value["https://api.telegram.org/"].indicator_status is IndicatorStatus.CONFIRMED_IOC
+    assert by_value["https://api.telegram.org/"].display_policy is DisplayPolicy.IOC_SECTION
+    for url in ("https://api.ipify.org", "https://graph.facebook.com/v12.0/me/messages"):
+        assert by_value[url].indicator_status is IndicatorStatus.CONTEXTUAL
+        assert by_value[url].display_policy is DisplayPolicy.BODY_ONLY
+    assert is_publication_ioc_artifact_type("url")
 
 
 def test_dated_event_must_prove_its_date_in_the_same_evidence_area() -> None:

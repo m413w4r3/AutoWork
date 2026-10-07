@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import subprocess
+import unicodedata
+from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
 from typing import Any, NoReturn
@@ -19,13 +21,136 @@ from cti_app.application.typst_compilation import (
     materialize_font_bundle,
 )
 from cti_app.application.typst_rendering import (
+    TypstRenderer,
     _breakable_typst_display_text,
     _table_cell_typst_spans,
+    load_template_bundle,
+)
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from tests.test_publication_v4 import _SOURCE_ID
+from tests.test_typst_rendering import _full_document, _table
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _FONT_BUNDLE_LOCK = _REPOSITORY_ROOT / "infra" / "typst-fonts.lock"
+_COPYABLE_HASH = "0123456789abcdef" * 4
+_COPYABLE_LONG_URL = "https://example.test/" + "a" * (200 - len("https://example.test/"))
+_COPYABLE_EXACT_URL = "https://micbucket.ams1.vultrobjects.com/Exclude/Telegram.exe"
+_COPYABLE_WINDOWS_PATH = (
+    r"C:\ProgramData\ssh-cache-default{8bda3848-495e-43f4-8d10-7d37a67f1604}\RuntimeSSH.exe"
+)
+_COPYABLE_REGISTRY_PATH = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+_COPYABLE_TABLE_URL = "https://example.test/" + "u" * 99
+_COPYABLE_DEFANGED_URL = "hxxps://a[.]b[.]c"
+_COPYABLE_VALUES = (
+    _COPYABLE_HASH,
+    _COPYABLE_LONG_URL,
+    _COPYABLE_EXACT_URL,
+    _COPYABLE_WINDOWS_PATH,
+    _COPYABLE_REGISTRY_PATH,
+    _COPYABLE_TABLE_URL,
+    _COPYABLE_DEFANGED_URL,
+)
+
+
+def _copyable_ioc_document():
+    groups = (
+        (ArtifactType.IP, ("198.51.100.42",)),
+        (ArtifactType.DOMAIN, ("host-" + "d" * 58 + ".example.test",)),
+        (
+            ArtifactType.URL,
+            (
+                _COPYABLE_LONG_URL,
+                _COPYABLE_EXACT_URL,
+                _COPYABLE_WINDOWS_PATH,
+                _COPYABLE_DEFANGED_URL,
+            ),
+        ),
+        (ArtifactType.EMAIL, ("analyst-" + "e" * 64 + "@example.test",)),
+        (ArtifactType.HASH, (_COPYABLE_HASH,)),
+    )
+    indicators = tuple(
+        PublicationIndicatorGroupV1(
+            artifact_type,
+            tuple(
+                PublicationIndicatorV1(
+                    value=value,
+                    normalized_value=value.casefold(),
+                    artifact_type=artifact_type,
+                    source_document_ids=(_SOURCE_ID,),
+                )
+                for value in values
+            ),
+        )
+        for artifact_type, values in groups
+    )
+    table = replace(
+        _table(),
+        title="Narrow hash column",
+        rows=(replace(_table().rows[0], cells=("SHA-256", _COPYABLE_HASH)),),
+    )
+    return replace(_full_document(tables=(table,)), indicators=indicators)
+
+
+def _install_narrow_technical_table(render_data: dict[str, Any]) -> None:
+    if "content_sections" in render_data:
+        publications = [render_data]
+    else:
+        publications = render_data["publications"]
+    table = next(
+        block
+        for publication in publications
+        for section in publication["content_sections"]
+        for block in section["blocks"]
+        if block["type"] == "table"
+    )
+    table["columns"] = ["Observable", "Niveau de contrôle", "Contrôle recommandé"]
+    table["rows"] = [
+        [_COPYABLE_REGISTRY_PATH, "Registre Windows", "Surveiller la clé"],
+        [_COPYABLE_TABLE_URL, "URL", "Bloquer la destination"],
+        [_COPYABLE_HASH, "SHA-256", "Comparer l'empreinte"],
+    ]
+    table["column_weights"] = [0.8, 0.8, 1.6]
+    table["semantic_cells"] = [
+        _table_cell_typst_spans(value) for row in table["rows"] for value in row
+    ]
+
+    paragraph = next(
+        block
+        for publication in publications
+        for section in publication["content_sections"]
+        for block in section["blocks"]
+        if block["type"] == "paragraph"
+    )
+    paragraph["text"] = f"Run key: {_COPYABLE_REGISTRY_PATH}."
+    paragraph["semantic_spans"] = [
+        {"style": "semantic-plain", "text": "Run key: "},
+        {
+            "style": "semantic-technical-literal",
+            **_breakable_typst_display_text(_COPYABLE_REGISTRY_PATH),
+        },
+        {"style": "semantic-plain", "text": "."},
+    ]
+
+
+def _assert_exact_copyable_pdf_text(reader: PdfReader, values: tuple[str, ...]) -> str:
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    formatting_chars = tuple(
+        (character, f"U+{ord(character):04X}")
+        for character in extracted
+        if unicodedata.category(character) == "Cf"
+    )
+    assert not formatting_chars, (
+        f"format characters found in extracted PDF text: {formatting_chars!r}"
+    )
+    without_linebreaks = extracted.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "")
+    for value in values:
+        assert value in without_linebreaks, f"PDF text does not reconstruct {value!r}"
+    return extracted
 
 
 @pytest.fixture(scope="session")
@@ -83,7 +208,7 @@ def _runtime_render_data() -> dict[str, Any]:
         ["Domaine", "cdn.example.test"],
     ]
     return {
-        "schema_version": "typst-publication-model-v8-unified-ioc-rendering",
+        "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
         "language": "fr",
         "title": "AW-019 runtime publication fixture",
         "content_sections": [
@@ -132,8 +257,7 @@ def _runtime_render_data() -> dict[str, Any]:
                         "figure_number": 1,
                         "key": "runtime-figure",
                         "caption": "Vendored CHP image used as a figure.",
-                        "provenance": "AW-019 runtime fixture",
-                        "locator": "page 1, figure A",
+                        "source_note": "example.test — p. 1",
                         "media_path": "media/figure.png",
                     },
                     {"type": "paragraph", "text": "Second section content."},
@@ -156,6 +280,14 @@ def _runtime_render_data() -> dict[str, Any]:
                     "emails": ["analyst@example.test"],
                     "hashes": ["0123456789abcdef0123456789abcdef"],
                 },
+                "original_indicators": {
+                    "ips": [],
+                    "domains": [],
+                    "urls": [],
+                    "emails": [],
+                    "hashes": [],
+                },
+                "original_indicator_note": "Le lien avec le sujet n'est pas démontré.",
             },
         ],
     }
@@ -189,6 +321,38 @@ def _build_runtime_workspace(
         separators=(",", ":"),
     )
     (workspace_root / "RENDERER" / "render-data.json").write_text(data, encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_real_typst_article_preserves_copyable_technical_literals(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    typst_root = _REPOSITORY_ROOT / "chpTypst"
+    bundle = load_template_bundle(typst_root)
+    source = TypstRenderer().render(_copyable_ioc_document(), bundle)
+    render_data = json.loads(source.render_data_bytes)
+    _install_narrow_technical_table(render_data)
+
+    workspace_root = tmp_path / "copyable-article-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "copyable-article-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = _assert_exact_copyable_pdf_text(reader, _COPYABLE_VALUES)
+    assert "IOC" in extracted
+    assert "Narrow hash column" in extracted
+    assert "Registre Windows" in extracted
+    assert len(reader.pages) >= 1
 
 
 def _svg_fixture(width: int, height: int, label: str, fill: str) -> str:
@@ -278,7 +442,7 @@ def _relationship_diagram_fixture() -> str:
     )
 
 
-def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
+def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...], tuple[str, ...]]:
     ips = [f"198.51.100.{index}" for index in range(1, 21)]
     domains = [f"host-{index:03d}.long-indicator.example.test" for index in range(1, 21)]
     raw_urls = [
@@ -292,11 +456,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
     ]
     emails = [f"analyst-{index:03d}@mail.example.test" for index in range(1, 21)]
     hashes = [f"{index:064x}" for index in range(1, 21)]
-    values = tuple(
-        _breakable_typst_display_text(value)
-        for group in (ips, domains, raw_urls, emails, hashes)
-        for value in group
-    )
+    values = tuple(value for group in (ips, domains, raw_urls, emails, hashes) for value in group)
     assert len(values) == 100
     rendered_values = {
         key: [_breakable_typst_display_text(value) for value in group]
@@ -308,14 +468,23 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
             ("hashes", hashes),
         )
     }
-    original_values = {key: group[:1] for key, group in rendered_values.items()}
-    for group in original_values.values():
-        for index, value in enumerate(group):
-            group[index] = _breakable_typst_display_text(value.replace("\u200b", ""))
+    original_iocs = (
+        "203.0.113.254",
+        "unlinked-reserve.example.test",
+        "https://unlinked-reserve.example.test/path",
+        "reserve-analyst@mail.example.test",
+        "f" * 64,
+    )
+    original_values = {
+        key: [_breakable_typst_display_text(value)]
+        for key, value in zip(
+            ("ips", "domains", "urls", "emails", "hashes"), original_iocs, strict=True
+        )
+    }
 
     return (
         {
-            "schema_version": "typst-publication-model-v8-unified-ioc-rendering",
+            "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
             "language": "fr",
             "title": "[LOT 6] Fixture de composition A4",
             "content_sections": [
@@ -334,8 +503,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
                             "figure_number": 1,
                             "key": "source-wide",
                             "caption": "Figure source wide, repère A.",
-                            "provenance": "Média source archivé",
-                            "locator": "page 2, figure A",
+                            "source_note": "example.test — section A — p. 2",
                             "media_path": "media/source-wide.svg",
                         }
                     ],
@@ -353,8 +521,7 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
                             "figure_number": 2,
                             "key": "source-portrait",
                             "caption": "Figure source portrait, repère B.",
-                            "provenance": "Média source archivé",
-                            "locator": "page 3, figure B",
+                            "source_note": "example.test — section B — p. 3",
                             "media_path": "media/source-portrait.svg",
                         },
                         {
@@ -396,11 +563,12 @@ def _lot6_composition_render_data() -> tuple[dict[str, Any], tuple[str, ...]]:
                     "type": "technical_annex",
                     "indicators": rendered_values,
                     "original_indicators": original_values,
-                    "original_indicator_note": "Classification originale conservée en interne.",
+                    "original_indicator_note": "Le lien avec le sujet n'est pas démontré.",
                 },
             ],
         },
         values,
+        original_iocs,
     )
 
 
@@ -442,7 +610,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     typst_binary: str,
     font_bundle_root: Path,
 ) -> None:
-    render_data, expected_iocs = _lot6_composition_render_data()
+    render_data, expected_iocs, original_iocs = _lot6_composition_render_data()
     media_files = {
         "source-wide.svg": _svg_fixture(1200, 420, "SOURCE WIDE MEDIA", "#e7eef8"),
         "source-portrait.svg": _svg_fixture(480, 1500, "SOURCE PORTRAIT MEDIA", "#f6eadb"),
@@ -487,7 +655,7 @@ async def test_real_typst_lot6_a4_composition_fixture(
     reader = PdfReader(BytesIO(compiled.content), strict=True)
     page_text = [page.extract_text() or "" for page in reader.pages]
     text = " ".join(" ".join(value.split()) for value in page_text)
-    compact_text = "".join(text.split()).replace("\u200b", "")
+    compact_text = "".join(text.split())
     assert len(reader.pages) >= 4
     assert all(
         abs(float(page.mediabox.width) - 595.28) < 0.2
@@ -513,15 +681,80 @@ async def test_real_typst_lot6_a4_composition_fixture(
     ):
         assert hidden_title not in text
     assert "Tableau des artefacts observés" in text
-    assert text.count("IOC") == 1
-    assert "IOC originaux" not in text
-    assert "Classification originale conservée en interne" not in text
-    missing_iocs = tuple(
-        value.replace("\u200b", "")
-        for value in expected_iocs
-        if value.replace("\u200b", "") not in compact_text
-    )
+    assert text.count("IOC") == 2
+    reserve_heading = "IOC originaux à lien non démontré"
+    assert reserve_heading in text
+    reserve_position = text.index(reserve_heading)
+    assert "Le lien avec le sujet" in text and "pas démontré" in text
+    assert all(value not in text[:reserve_position] for value in original_iocs)
+    assert all(value in text[reserve_position:] for value in original_iocs)
+    missing_iocs = tuple(value for value in expected_iocs if value not in compact_text)
     assert not missing_iocs, f"IOC values missing from extracted PDF text: {missing_iocs[:8]!r}"
     assert len(png_pages) == len(reader.pages)
     png_sizes = [(await path.stat()).st_size for path in png_pages]
     assert all(size > 0 for size in png_sizes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("media_type", ("diagram", "chart"))
+async def test_real_typst_bounds_tall_media_and_keeps_following_text_on_page(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+    media_type: str,
+) -> None:
+    render_data = {
+        "schema_version": "typst-publication-model-v16-semantic-annotation-coverage",
+        "language": "fr",
+        "title": "Tall diagram layout regression",
+        "content_sections": [
+            {"type": "references", "timeline": [], "blocks": [], "sources": []},
+            {
+                "type": "synthesis",
+                "blocks": [
+                    {"type": "paragraph", "text": "Text immediately before the diagram."},
+                    {
+                        "type": media_type,
+                        "figure_number": 1,
+                        "key": "portrait-diagram",
+                        "title": "Portrait diagram title fallback",
+                        "caption": "Portrait diagram caption stays with the image.",
+                        "source_note": "example.test — p. 1",
+                        "media_path": "media/portrait-diagram.svg",
+                    },
+                    {"type": "paragraph", "text": "Text immediately after the diagram."},
+                ],
+            },
+        ],
+    }
+    workspace_root = tmp_path / "tall-diagram-workspace"
+    _build_runtime_workspace(
+        _REPOSITORY_ROOT,
+        workspace_root,
+        render_data=render_data,
+        media_files={
+            "portrait-diagram.svg": _svg_fixture(
+                420,
+                1200,
+                "Node label remains readable",
+                "#e9e4f5",
+            )
+        },
+    )
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "tall-diagram-font-snapshot"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=str(typst_binary)).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    assert len(reader.pages) == 1
+    text = " ".join((reader.pages[0].extract_text() or "").split())
+    assert "Text immediately before the diagram." in text
+    assert "Figure 1 : Portrait diagram caption stays with the image." in text
+    assert "Text immediately after the diagram." in text

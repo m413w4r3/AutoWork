@@ -36,6 +36,16 @@ from cti_app.domain.production_editorial_enrichment import EnrichmentPlacementKi
 from cti_app.domain.publication_document import (
     CanonicalPublicationDocument,
     PublicationDocumentV4,
+    PublicationDocumentV5,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+    SemanticTextV1,
 )
 from tests.test_publication_builder_v4 import _frontmatter_v6_case
 from tests.test_typst_rendering import (
@@ -72,6 +82,29 @@ def _publication(title: str, subject_id: int) -> PublicationDocumentV4:
         _full_document(),
         title=title,
         subject_id=UUID(int=subject_id),
+    )
+
+
+def _semantic_policy_publication(policy_version: str, subject_id: int) -> PublicationDocumentV5:
+    base = _publication("Mandiant report", subject_id)
+    semantic_paragraphs: list[SemanticParagraphV1] = []
+    for anchor, text in publication_document_text_anchors(base).items():
+        if anchor == "lead:0001" and " " in text:
+            first_word, remainder = text.split(" ", 1)
+            spans = (
+                SemanticTextSpanV1(SemanticRole.ACTOR, first_word),
+                SemanticTextSpanV1(SemanticRole.TEXT, f" {remainder}"),
+            )
+        else:
+            spans = (SemanticTextSpanV1(SemanticRole.TEXT, text),)
+        semantic_paragraphs.append(SemanticParagraphV1(anchor, spans))
+    return PublicationDocumentV5(
+        document=base,
+        semantic_text=SemanticTextV1(
+            schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+            policy_version=policy_version,
+            paragraphs=tuple(semantic_paragraphs),
+        ),
     )
 
 
@@ -122,7 +155,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == "typst-edition-model-v8-unified-ioc-rendering"
+    assert data["schema_version"] == ("typst-edition-model-v16-semantic-annotation-coverage")
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -150,10 +183,39 @@ def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) 
     assert references["timeline"][0]["display_date"] == "10 janvier 2026"
     assert references["timeline"][0]["source_urls"] == ["https://a.example/report"]
     assert synthesis["type"] == "synthesis"
-    assert annex["original_indicators"]["domains"] == [
+    assert [item["text"] for item in annex["original_indicators"]["domains"]] == [
         "context.example",
         "original.example",
     ]
+
+
+def test_edition_uses_shared_reader_facing_figure_source_projection(tmp_path: Path) -> None:
+    figure = _figure_at("edition-figure", "Figure caption", EnrichmentPlacementKind.END)
+    figure = replace(
+        figure,
+        source_url="https://www.example.test/figures/source.png",
+        provenance="document 65d67fad-2db8-4e50-a6a0-6fd09e790000; /html[1]/body/img[2]",
+        locator=replace(
+            figure.locator, section="Bitcoin wallet recovery", figure_label="HTML image 2"
+        ),
+    )
+    publication = replace(_publication("With figure", 6), figures=(figure,))
+    edition = _edition_document(((1, publication),))
+
+    _, data = _render_data(tmp_path, edition)
+
+    embedded = data["publications"][0]
+    article_model = project_publication_to_typst_model(publication)
+    assert embedded["content_sections"] == article_model.content_sections
+    figure_block = next(
+        block
+        for section in embedded["content_sections"]
+        for block in section.get("blocks", [])
+        if block["type"] == "figure"
+    )
+    assert figure_block["source_note"] == "example.test — Bitcoin wallet recovery — p. 1"
+    assert "provenance" not in figure_block
+    assert "HTML image" not in json.dumps(figure_block)
 
 
 def test_orders_two_and_three_articles_by_position_not_title_or_input_order(
@@ -199,7 +261,7 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     assert "table" in body_types
     assert "diagram" in body_types
     assert "figure" in body_types
-    assert technical_annex["indicators"]["ips"] == ["Display ip"]
+    assert technical_annex["indicators"]["ips"] == [{"text": "Display ip", "break_chunks": []}]
     assert "uncertainties" not in publication
     assert references["sources"][0]["url"] == "https://example.test/one"
     assert len(source.media_refs) == 2
@@ -212,6 +274,27 @@ def test_shared_projection_covers_publication_content_and_typst_syntax_as_data(
     assert source.source_bytes == b'#let edition = json("edition-render-data.json")\n'
     assert source.source_bytes != _INJECTION_TEXT.encode()
     assert publication["content_sections"] == projected.content_sections
+
+
+def test_edition_typst_projection_accepts_legacy_and_current_semantic_policies(
+    tmp_path: Path,
+) -> None:
+    legacy = _semantic_policy_publication(
+        "semantic-annotation-policy-v4-technical-literal-globs", 101
+    )
+    current = _semantic_policy_publication(SEMANTIC_ANNOTATION_POLICY_VERSION, 102)
+    edition = _edition_document(((2, legacy), (1, current)))
+
+    _, data = _render_data(tmp_path, edition)
+
+    publications = data["publications"]
+    legacy_projection = project_publication_to_typst_model(legacy)
+    current_projection = project_publication_to_typst_model(current)
+    assert len(publications) == 2
+    assert publications[0]["content_sections"] == current_projection.content_sections
+    assert publications[1]["content_sections"] == legacy_projection.content_sections
+    assert legacy_projection.content_sections == current_projection.content_sections
+    assert "semantic-actor" in json.dumps(legacy_projection.content_sections)
 
 
 def test_shared_and_distinct_media_are_deduplicated_in_first_use_order(
@@ -455,7 +538,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v6-natural-media-ioc-layout"
+    assert bundle.template_version == "chp-edition-v13-table-pagination"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

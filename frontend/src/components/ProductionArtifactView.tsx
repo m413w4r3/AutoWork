@@ -224,6 +224,114 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+type ProjectionEvidenceReference = {
+  source_document_id: string;
+  kind: string;
+  evidence_key: string;
+};
+
+function isProjectionEvidenceReference(
+  value: unknown,
+): value is ProjectionEvidenceReference {
+  return (
+    isRecord(value) &&
+    typeof value.source_document_id === "string" &&
+    typeof value.kind === "string" &&
+    typeof value.evidence_key === "string"
+  );
+}
+
+function evidenceReferenceAt(
+  refs: unknown[],
+  index: unknown,
+): ProjectionEvidenceReference | null {
+  if (typeof index !== "number" || !Number.isInteger(index) || index < 0) {
+    return null;
+  }
+  const ref = refs[index];
+  return isProjectionEvidenceReference(ref) ? ref : null;
+}
+
+function evidenceReferencesAt(
+  refs: unknown[],
+  indexes: unknown,
+): ProjectionEvidenceReference[] | null {
+  if (!Array.isArray(indexes)) return null;
+  const resolved = indexes.map((index) => evidenceReferenceAt(refs, index));
+  return resolved.some((ref) => ref === null)
+    ? null
+    : resolved.filter(
+        (ref): ref is ProjectionEvidenceReference => ref !== null,
+      );
+}
+
+function relevanceProjectionForDisplay(value: unknown): unknown {
+  if (
+    !isRecord(value) ||
+    value.schema_version !== 3 ||
+    !Array.isArray(value.extraction_evidence_refs) ||
+    !Array.isArray(value.classifications) ||
+    !Array.isArray(value.source_pair_relations)
+  ) {
+    return value;
+  }
+
+  const refs = value.extraction_evidence_refs as unknown[];
+  let valid = true;
+  const classifications = (value.classifications as unknown[]).map(
+    (item: unknown) => {
+      if (!isRecord(item)) {
+        valid = false;
+        return item;
+      }
+      const evidenceRef = evidenceReferenceAt(refs, item.evidence_ref_index);
+      const supportingRefs = evidenceReferencesAt(
+        refs,
+        item.supporting_evidence_ref_indexes,
+      );
+      if (evidenceRef === null || supportingRefs === null) {
+        valid = false;
+        return item;
+      }
+      const expanded = { ...item };
+      delete expanded.evidence_ref_index;
+      delete expanded.supporting_evidence_ref_indexes;
+      return {
+        ...expanded,
+        evidence_ref: evidenceRef,
+        supporting_evidence_refs: supportingRefs,
+      };
+    },
+  );
+  const sourcePairRelations = (value.source_pair_relations as unknown[]).map(
+    (item: unknown) => {
+      if (!isRecord(item)) {
+        valid = false;
+        return item;
+      }
+      const supportingRefs = evidenceReferencesAt(
+        refs,
+        item.supporting_evidence_ref_indexes,
+      );
+      if (supportingRefs === null) {
+        valid = false;
+        return item;
+      }
+      const expanded = { ...item };
+      delete expanded.supporting_evidence_ref_indexes;
+      return { ...expanded, supporting_evidence_refs: supportingRefs };
+    },
+  );
+
+  return valid
+    ? {
+        ...value,
+        classifications,
+        source_pair_relations: sourcePairRelations,
+      }
+    : value;
+}
+
 function publicationParagraphFingerprint(text: string): string {
   const folded = Array.from(text, (character) =>
     character === "ı" ? character : character.toUpperCase().toLowerCase(),
@@ -514,6 +622,7 @@ function ExtractionPreview({ document }: { document: ExtractionDocumentV2 }) {
 const REUSE_STATE_LABELS: Record<ProductionExtractionReuseStateV1, string> = {
   fresh: "Calculée",
   reused: "Réutilisée",
+  duplicate_content: "Contenu identique à une autre source",
   content_duplicate: "Contenu identique à une autre source",
 };
 
@@ -565,6 +674,16 @@ function ProductionExtractionSourceCard({
             <dt>Statut</dt>
             <dd>{REUSE_STATE_LABELS[source.reuse_state]}</dd>
           </div>
+          {source.scope ? (
+            <div>
+              <dt>Cadrage</dt>
+              <dd>
+                Cas {source.scope.case_id} · {source.scope.kept_sections}/
+                {source.scope.total_sections} sections ·{" "}
+                {source.scope.kept_chars}/{source.scope.total_chars} caractères
+              </dd>
+            </div>
+          ) : null}
           <div>
             <dt>Faits</dt>
             <dd>{source.facts.length}</dd>
@@ -2544,10 +2663,17 @@ export function ProductionArtifactView({
           aria-label="Décisions de périmètre"
         >
           <p>
+            Les références indexées sont développées pour faciliter la lecture.
             Les décisions ambiguës restent visibles ici avec leur motif et les
-            références de preuve qui les soutiennent.
+            preuves qui les soutiennent.
           </p>
-          <pre>{JSON.stringify(artifact.canonical_content, null, 2)}</pre>
+          <pre>
+            {JSON.stringify(
+              relevanceProjectionForDisplay(artifact.canonical_content),
+              null,
+              2,
+            )}
+          </pre>
         </section>
       ) : null}
 

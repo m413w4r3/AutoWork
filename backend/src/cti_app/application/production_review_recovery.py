@@ -26,6 +26,7 @@ from cti_app.domain.production import (
 # error vocabulary instead of parsing a message.
 BATCH_MISSING = "batch_missing"
 BATCH_CANCELLED = "batch_cancelled"
+BATCH_PAUSED = "batch_paused"
 BATCH_SUPERSEDED = "batch_superseded"
 ACTIVE_SIBLING = "active_sibling"
 
@@ -68,6 +69,8 @@ async def prepare_batch_for_recovery(
         raise ReviewRecoveryConflictError(BATCH_MISSING)
     if batch.status is ProductionBatchStatus.CANCELLED:
         raise ReviewRecoveryConflictError(BATCH_CANCELLED)
+    if batch.status is ProductionBatchStatus.PAUSED:
+        raise ReviewRecoveryConflictError(BATCH_PAUSED)
 
     needs_reopening = batch.status not in {
         ProductionBatchStatus.QUEUED,
@@ -145,6 +148,7 @@ __all__ = [
     "ACTIVE_SIBLING",
     "BATCH_CANCELLED",
     "BATCH_MISSING",
+    "BATCH_PAUSED",
     "BATCH_SUPERSEDED",
     "ProductionBatchRecoveryConflictError",
     "ReviewRecoveryConflictError",

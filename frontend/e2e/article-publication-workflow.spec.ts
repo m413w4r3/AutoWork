@@ -521,7 +521,7 @@ test("Sujet : sélection, production, revue et publication PDF", async ({
             extraction_hash: "9".repeat(64),
             publication_language: "fr",
             synthesis_policy_version:
-              "production-synthesis-v2-editorial-title-source-notes",
+              "production-synthesis-v4-attached-technical-placeholders",
             title: synthesisTitle,
             lead: [
               {

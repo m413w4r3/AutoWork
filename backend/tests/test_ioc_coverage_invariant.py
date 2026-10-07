@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from cti_app.application.extraction import parse_document
 from cti_app.application.production_artifact_verification import (
     Q2ProposalSubmission,
     verify_q2_proposals,
@@ -35,6 +36,7 @@ from cti_app.application.production_source_evidence import (
     verify_ioc_rules_output_against_source,
     verify_q2_output_against_source,
 )
+from cti_app.domain.collection import DetectedMimeType
 from cti_app.domain.publication import ArtifactType
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -270,7 +272,7 @@ def test_source_evidence_gate_binds_a_value_to_the_source_that_published_it() ->
     assert [artifact.value for artifact in right_source.output.artifacts] == [S3_DOMAINS[0]]
 
 
-def test_an_ioc_split_by_inline_markup_is_still_proven_by_its_source() -> None:
+def test_an_ioc_split_by_inline_markup_is_not_proven_when_sent_text_splits_it() -> None:
     html = (
         "<html><body><table>"
         "<tr><td>Domain</td><td>Hash</td></tr>"
@@ -279,7 +281,8 @@ def test_an_ioc_split_by_inline_markup_is_still_proven_by_its_source() -> None:
         "<tr><td>cloud.tiktok-u.sbs</td><td>node-01.security-lab.io</td></tr>"
         "</table></body></html>"
     )
-    document = source_evidence_document_from_html("", html)
+    parsed = parse_document(html.encode("utf-8"), DetectedMimeType.HTML)
+    document = source_evidence_document_from_html(parsed.text, html)
     output = Q2SourceOutput(
         artifacts=[
             Q2ArtifactProposal(
@@ -295,8 +298,8 @@ def test_an_ioc_split_by_inline_markup_is_still_proven_by_its_source() -> None:
 
     gated = verify_ioc_rules_output_against_source(output, document)
 
-    assert gated.rejections == ()
-    assert [artifact.value for artifact in gated.output.artifacts] == [
+    assert [artifact.value for artifact in gated.output.artifacts] == []
+    assert [rejection.value for rejection in gated.rejections] == [
         "uae1.locat.sbs",
         "5d41402abc4b2a76b9719d911017c592",
     ]

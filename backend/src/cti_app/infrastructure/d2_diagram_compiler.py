@@ -38,7 +38,8 @@ D2_COMPILER = "d2"
 D2_SOURCE_FORMAT = "d2"
 D2_SOURCE_ENCODING = "utf-8"
 D2_MEDIA_TYPE = "image/svg+xml"
-D2_LAYOUT = "dagre"
+D2_LAYOUT = "elk"
+D2_LAYOUT_OPTIONS = ("--pad=8", "--elk-nodeNodeBetweenLayers=15")
 D2_COMPILER_VERSION = "0.9.0"
 D2_COMPILATION_TIMEOUT_SECONDS = 10
 D2_MAX_STDOUT_BYTES = 2 * 1024 * 1024
@@ -218,10 +219,14 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
 
     for node in diagram.nodes:
         shape, fill, stroke = _NODE_STYLE_BY_ROLE[node.role]
+        label = _wrap_d2_label(node.label)
+        # D2 places person labels below the icon. Switch text-heavy actors to
+        # a filled rectangle so wrapped text sits inside the node boundary.
+        if node.role is DiagramNodeRole.ACTOR and "\n" in label:
+            shape = "rectangle"
         lines.extend(
             (
-                f"{node_references[node.node_id]}: "
-                f"{_escape_d2_label(_wrap_d2_label(node.label))} {{",
+                f"{node_references[node.node_id]}: {_escape_d2_label(label)} {{",
                 f"  shape: {shape}",
                 "  style: {",
                 f'    fill: "{fill}"',
@@ -577,6 +582,7 @@ class D2DiagramCompiler:
             (
                 self._binary,
                 f"--layout={D2_LAYOUT}",
+                *D2_LAYOUT_OPTIONS,
                 f"--timeout={D2_COMPILATION_TIMEOUT_SECONDS}",
                 "--omit-version",
                 f"--salt={source_sha256}",

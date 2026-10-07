@@ -13,6 +13,7 @@ from cti_app.application.jobs import (
     DuplicateJobError,
     JobDispatcher,
     JobNotFoundError,
+    JobPausedBatchError,
     JobService,
     UnknownJobKindError,
 )
@@ -167,6 +168,11 @@ async def retry_job(job_id: UUID, request: Request) -> JobView:
         job = await service.retry(job_id, actor_id=await _actor_id(request))
     except JobNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found") from exc
+    except JobPausedBatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": "Le lot de production est en pause."},
+        ) from exc
     except InvalidJobTransitionError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

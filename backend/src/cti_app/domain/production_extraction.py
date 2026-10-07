@@ -9,6 +9,7 @@ no I/O, no provider, no run or checkpoint lifecycle state lives here.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -33,6 +34,86 @@ from cti_app.domain.production_references import (
 from cti_app.domain.publication import ArtifactType
 
 PRODUCTION_EXTRACTION_SCHEMA_VERSION = 1
+
+INDICATOR_SECTION_PATH_CONTEXT_PREFIX = "source_section_path_v1:"
+_CASE_SECTION_HEADING = re.compile(r"\bGTG-\d{5}\b|\bcase\s+study(?:\s+\d+)?\b", re.I)
+_GTG_CASE_ID = re.compile(r"\bGTG-(\d{5})\b", re.I)
+
+
+def is_case_section_heading(title: str) -> bool:
+    """Whether a structural title explicitly names a report case section."""
+
+    return bool(_CASE_SECTION_HEADING.search(title))
+
+
+def case_section_headings_for_scoping(
+    headings: Sequence[tuple[int, str]],
+) -> tuple[tuple[int, str], ...]:
+    """Return case titles in the structural levels used by extraction scoping."""
+
+    return tuple(
+        (level, title) for level, title in headings if level <= 3 and is_case_section_heading(title)
+    )
+
+
+def case_section_headings_any_level(
+    headings: Sequence[tuple[int, str]],
+) -> tuple[tuple[int, str], ...]:
+    """Return all case-naming titles, including nested indicator subsections.
+
+    Relevance uses section paths rather than extraction scope headings. Reports
+    can put a heading such as ``GTG-50021 indicators of compromise`` at level 4,
+    so applying the extraction scoping depth limit here would lose case identity.
+    """
+
+    return tuple((level, title) for level, title in headings if is_case_section_heading(title))
+
+
+def case_ids_from_text(text: str) -> tuple[str, ...]:
+    """Extract canonical GTG identifiers from frozen titles and section paths."""
+
+    return tuple(dict.fromkeys(f"GTG-{digits}" for digits in _GTG_CASE_ID.findall(text)))
+
+
+def encode_indicator_section_paths(
+    paths: Sequence[Sequence[tuple[int, str]]],
+) -> str:
+    """Encode deterministic source section paths in the existing context field."""
+    payload = {
+        "paths": [[{"level": level, "title": title} for level, title in path] for path in paths]
+    }
+    return INDICATOR_SECTION_PATH_CONTEXT_PREFIX + json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def decode_indicator_section_paths(
+    context: str,
+) -> tuple[tuple[tuple[int, str], ...], ...] | None:
+    """Return generated section paths, or ``None`` for ordinary model context."""
+    if not context.startswith(INDICATOR_SECTION_PATH_CONTEXT_PREFIX):
+        return None
+    try:
+        payload = json.loads(context[len(INDICATOR_SECTION_PATH_CONTEXT_PREFIX) :])
+    except json.JSONDecodeError:
+        return ()
+    paths = payload.get("paths") if isinstance(payload, dict) else None
+    if not isinstance(paths, list):
+        return ()
+    decoded: list[tuple[tuple[int, str], ...]] = []
+    for path in paths:
+        if not isinstance(path, list):
+            continue
+        headings: list[tuple[int, str]] = []
+        for heading in path:
+            if not isinstance(heading, dict):
+                continue
+            level, title = heading.get("level"), heading.get("title")
+            if isinstance(level, int) and 1 <= level <= 6 and isinstance(title, str):
+                headings.append((level, title))
+        decoded.append(tuple(headings))
+    return tuple(decoded)
+
 
 EXTRACTION_TIER_ORDER: dict[ProductionReferenceTier, int] = {
     ProductionReferenceTier.CORE: 0,
@@ -75,8 +156,44 @@ class ExtractionReuseState(StrEnum):
     FRESH = "fresh"
     #: Satisfied by a durable source checkpoint; no model call.
     REUSED = "reused"
-    #: Another source of the run carries the exact same bytes.
-    CONTENT_DUPLICATE = "content_duplicate"
+    #: Another source in the run shares this effective extraction content.
+    CONTENT_DUPLICATE = "duplicate_content"
+    #: Kept readable for already-persisted V1 extraction artifacts.
+    LEGACY_CONTENT_DUPLICATE = "content_duplicate"
+
+
+class ExtractionScopeKind(StrEnum):
+    CASE = "case"
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractionScopeV1:
+    """Deterministic trace of the case sections sent for one source."""
+
+    kind: ExtractionScopeKind
+    case_id: str
+    kept_sections: int
+    total_sections: int
+    kept_chars: int
+    total_chars: int
+
+    def __post_init__(self) -> None:
+        if self.kind is not ExtractionScopeKind.CASE:
+            raise ValueError("Extraction scope kind is invalid")
+        if not isinstance(self.case_id, str) or self.case_id not in case_ids_from_text(
+            self.case_id
+        ):
+            raise ValueError("Extraction scope case id is invalid")
+        for field_name in ("kept_sections", "total_sections", "kept_chars", "total_chars"):
+            value = getattr(self, field_name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"Extraction scope {field_name} must be a non-negative integer")
+        if (
+            self.kept_sections == 0
+            or self.total_sections < self.kept_sections
+            or self.total_sections == 0
+        ):
+            raise ValueError("Extraction scope section counts are invalid")
 
 
 class ExtractionIndicatorStatus(StrEnum):
@@ -380,6 +497,7 @@ class ProductionSourceExtractionV1:
     indicators: tuple[ExtractionIndicatorV1, ...]
     rules: tuple[ExtractionRuleV1, ...]
     uncertainties: tuple[str, ...]
+    scope: ExtractionScopeV1 | None = None
     editorial_role: ProductionEditorialRole | None = None
     profile_reason_code: ExtractionProfileReasonCode | None = None
 
@@ -432,6 +550,8 @@ class ProductionSourceExtractionV1:
             raise ValueError("Extraction checkpoint identity must be a UUID or None")
         if not isinstance(self.reuse_state, ExtractionReuseState):
             raise ValueError("Extraction reuse state is invalid")
+        if self.scope is not None and not isinstance(self.scope, ExtractionScopeV1):
+            raise ValueError("Extraction source scope is invalid")
         for label, items, item_type in (
             ("facts", self.facts, ExtractionFactV1),
             ("events", self.events, ExtractionEventV1),
@@ -648,8 +768,10 @@ _SOURCE_KEYS = frozenset(
         "indicators",
         "rules",
         "uncertainties",
+        "scope",
     }
 )
+_LEGACY_SOURCE_KEYS = _SOURCE_KEYS - {"scope"}
 _FACT_KEYS = frozenset(
     {
         "category",
@@ -832,6 +954,20 @@ def _source_to_json(source: ProductionSourceExtractionV1) -> dict[str, Any]:
         "indicators": [_indicator_to_json(indicator) for indicator in source.indicators],
         "rules": [_rule_to_json(rule) for rule in source.rules],
         "uncertainties": list(source.uncertainties),
+        "scope": _scope_to_json(source.scope),
+    }
+
+
+def _scope_to_json(scope: ExtractionScopeV1 | None) -> dict[str, Any] | None:
+    if scope is None:
+        return None
+    return {
+        "kind": scope.kind.value,
+        "case_id": scope.case_id,
+        "kept_sections": scope.kept_sections,
+        "total_sections": scope.total_sections,
+        "kept_chars": scope.kept_chars,
+        "total_chars": scope.total_chars,
     }
 
 
@@ -923,7 +1059,9 @@ def _rule_from_json(raw: Any) -> ExtractionRuleV1:
 
 
 def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
-    payload = _require_mapping(raw, _SOURCE_KEYS, "Extraction source payload")
+    if not isinstance(raw, Mapping) or set(raw) not in {_SOURCE_KEYS, _LEGACY_SOURCE_KEYS}:
+        raise ValueError("Extraction source payload has an invalid shape")
+    payload = raw
     return ProductionSourceExtractionV1(
         source_document_id=_uuid(payload["source_document_id"], "source_document_id"),
         canonical_url=payload["canonical_url"],
@@ -950,6 +1088,34 @@ def _source_from_json(raw: Any) -> ProductionSourceExtractionV1:
         ),
         rules=tuple(_rule_from_json(item) for item in _require_array(payload["rules"], "rules")),
         uncertainties=tuple(_text_list(payload["uncertainties"], "uncertainties")),
+        scope=_scope_from_json(payload.get("scope")),
+    )
+
+
+def _scope_from_json(raw: Any) -> ExtractionScopeV1 | None:
+    if raw is None:
+        return None
+    payload = _require_mapping(
+        raw,
+        frozenset(
+            {
+                "kind",
+                "case_id",
+                "kept_sections",
+                "total_sections",
+                "kept_chars",
+                "total_chars",
+            }
+        ),
+        "Extraction scope payload",
+    )
+    return ExtractionScopeV1(
+        kind=_enum(ExtractionScopeKind, payload["kind"], "kind"),
+        case_id=payload["case_id"],
+        kept_sections=payload["kept_sections"],
+        total_sections=payload["total_sections"],
+        kept_chars=payload["kept_chars"],
+        total_chars=payload["total_chars"],
     )
 
 

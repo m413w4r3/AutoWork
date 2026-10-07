@@ -53,10 +53,15 @@ def _snapshot() -> ProductionInputSnapshot:
     )
 
 
-def _ref(document_id: UUID | None = None, *, key: str = _HASH_A) -> ExtractionEvidenceRefV1:
+def _ref(
+    document_id: UUID | None = None,
+    *,
+    key: str = _HASH_A,
+    kind: EvidenceKind = EvidenceKind.FACT,
+) -> ExtractionEvidenceRefV1:
     return ExtractionEvidenceRefV1(
         source_document_id=document_id or uuid4(),
-        kind=EvidenceKind.FACT,
+        kind=kind,
         evidence_key=key,
     )
 
@@ -130,6 +135,39 @@ def test_evidence_refs_and_timeline_are_normalized_deterministically() -> None:
     assert synthesis.warnings == ("a", "z")
 
 
+@pytest.mark.parametrize(
+    "section_kind",
+    (
+        SynthesisSectionKind.INFECTION_CHAIN,
+        SynthesisSectionKind.CAMPAIGN,
+        SynthesisSectionKind.OTHER,
+        SynthesisSectionKind.OVERVIEW,
+    ),
+)
+def test_section_kinds_round_trip_indicator_and_rule_evidence(
+    section_kind: SynthesisSectionKind,
+) -> None:
+    synthesis = _synthesis()
+    source_id = uuid4()
+    indicator_ref = _ref(source_id, kind=EvidenceKind.INDICATOR)
+    rule_ref = _ref(source_id, key=_HASH_B, kind=EvidenceKind.RULE)
+    synthesis = replace(
+        synthesis,
+        sections=(
+            SynthesisSectionV1(
+                section_kind,
+                "Internal anchor",
+                (SynthesisParagraphV1("A technical claim.", (indicator_ref, rule_ref)),),
+            ),
+        ),
+    )
+
+    restored = production_synthesis_from_json(production_synthesis_to_json(synthesis))
+
+    assert restored.sections[0].kind is section_kind
+    assert restored.sections[0].paragraphs[0].evidence_refs == (indicator_ref, rule_ref)
+
+
 @pytest.mark.parametrize("mutation", ["extra", "missing"])
 def test_decoder_rejects_extra_or_missing_fields(mutation: str) -> None:
     payload = production_synthesis_to_json(_synthesis())
@@ -191,6 +229,12 @@ def test_editorial_title_contract_accepts_plain_titles_and_rejects_invalid_forms
         "[Void Blizzard / Laundry Bear] Exploitation zero-click de Zimbra"
     )
     assert is_valid_editorial_title("[Publication] Analyse d\u2019un implant de commande")
+    assert is_valid_editorial_title("[Groupe] Bitcoin OP_RETURN comme dead drop C2")
+    assert is_valid_editorial_title("[Réseau] Connexions sortantes vers *.cloudfront.net")
+    assert is_valid_editorial_title("[Windows] Valeur de lancement <deno_path>")
+    assert is_valid_editorial_title("[Groupe] Un placeholder <username> en prose")
+    assert is_valid_editorial_title("[Windows] NetSync_<username> comme tâche planifiée")
+    assert is_valid_editorial_title(r"[Windows] C:\Users\<user>\AppData")
     for value in (
         "Frozen subject title",
         "Acteur : APT31 | Outil : BlueMoon",
@@ -201,6 +245,7 @@ def test_editorial_title_contract_accepts_plain_titles_and_rejects_invalid_forms
         "[Groupe] **Une campagne documentée**",
         "[Groupe] *Une campagne documentée*",
         "[Groupe] <em>Campagne</em>",
+        "[Groupe] <script>campagne</script>",
         "[Groupe] Une campagne E001 documentée",
         "[Groupe] " + "x" * 105,
     ):

@@ -2,6 +2,7 @@ import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -22,8 +23,33 @@ from cti_app.application.jobs import (
 )
 from cti_app.application.production_jobs import stage_job_kind
 from cti_app.domain.jobs import Job, JobStatus
-from cti_app.domain.production import ProductionStage
+from cti_app.domain.production import ProductionBatchStatus, ProductionStage
 from tests.job_support import InMemoryJobUnitOfWork, InMemoryJobUnitOfWorkFactory
+
+
+class _PausedBatchFactory(InMemoryJobUnitOfWorkFactory):
+    def __init__(self, run_id):
+        super().__init__()
+        self.run_id = run_id
+        self.batch_id = uuid4()
+        self.batch = SimpleNamespace(status=ProductionBatchStatus.PAUSED)
+
+    def __call__(self):
+        uow = super().__call__()
+
+        class BatchItems:
+            async def get_by_run(_self, run_id):
+                if run_id == self.run_id:
+                    return SimpleNamespace(batch_id=self.batch_id)
+                return None
+
+        class Batches:
+            async def get(_self, batch_id):
+                return self.batch if batch_id == self.batch_id else None
+
+        uow.edition_production_batch_items = BatchItems()
+        uow.edition_production_batches = Batches()
+        return uow
 
 
 async def test_submission_is_idempotent() -> None:
@@ -307,6 +333,96 @@ async def test_abandoned_running_job_is_requeued() -> None:
     assert [item.id for item in recovered] == [job.id]
     assert (await service.get(job.id)).status is JobStatus.QUEUED
     assert (await service.get(job.id)).error_code == "heartbeat_expired"
+
+
+async def test_paused_production_job_is_not_claimed_or_retried() -> None:
+    run_id = uuid4()
+    factory = _PausedBatchFactory(run_id)
+    registry = create_job_registry()
+    executor = JobExecutor(factory, registry)
+    job = Job(
+        kind=stage_job_kind(ProductionStage.SOURCES),
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key=f"paused-{uuid4()}",
+        correlation_id="test",
+        input_parameters={
+            "run_id": str(run_id),
+            "expected_stage": ProductionStage.SOURCES.value,
+            "pipeline_generation": 0,
+        },
+    )
+    job.start(datetime.now(UTC) - timedelta(minutes=5))
+    job.schedule_retry("bridge_ui_timeout", "retry pending", timedelta(minutes=5))
+    factory.state[job.id] = job
+
+    held = await executor.execute(job.id, allow_early_retry=True)
+    assert held.status is JobStatus.QUEUED
+    assert held.attempt == 1
+    assert held.next_retry_at is None
+
+
+async def test_transient_failure_finishing_during_pause_does_not_schedule_retry() -> None:
+    run_id = uuid4()
+    factory = _PausedBatchFactory(run_id)
+    factory.batch.status = ProductionBatchStatus.RUNNING
+    registry = JobRegistry()
+
+    class PausedStageParameters(JobParameters):
+        run_id: str
+
+    async def transient_handler(parameters: JobParameters, context: JobExecutionContext) -> None:
+        del parameters, context
+        factory.batch.status = ProductionBatchStatus.PAUSED
+        raise JobHandlerError("bridge_unavailable", "Bridge unavailable", transient=True)
+
+    kind = "production.test_paused_retry"
+    registry.register(kind, PausedStageParameters, transient_handler)
+    executor = JobExecutor(factory, registry)
+    job = Job(
+        kind=kind,
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key=f"paused-failure-{uuid4()}",
+        correlation_id="test",
+        input_parameters={"run_id": str(run_id)},
+    )
+    factory.state[job.id] = job
+
+    held = await executor.execute(job.id)
+
+    assert held.status is JobStatus.WAITING_HUMAN
+    assert held.attempt == 1
+    assert held.next_retry_at is None
+
+
+async def test_job_recovery_leaves_abandoned_production_job_in_paused_batch() -> None:
+    run_id = uuid4()
+    factory = _PausedBatchFactory(run_id)
+    service = JobService(factory, create_job_registry())
+    job = Job(
+        kind=stage_job_kind(ProductionStage.SOURCES),
+        aggregate_type="subject",
+        aggregate_id=uuid4(),
+        idempotency_key=f"paused-recovery-{uuid4()}",
+        correlation_id="test",
+        input_parameters={
+            "run_id": str(run_id),
+            "expected_stage": ProductionStage.SOURCES.value,
+            "pipeline_generation": 0,
+        },
+    )
+    job.start(datetime.now(UTC) - timedelta(minutes=10))
+    factory.state[job.id] = job
+
+    await service.recover_abandoned(
+        timedelta(minutes=1),
+        resume_current_attempt_kinds=frozenset({job.kind}),
+    )
+
+    held = await service.get(job.id)
+    assert held.status is JobStatus.RUNNING
+    assert held.attempt == 1
 
 
 async def test_long_handler_renews_job_lease() -> None:

@@ -161,7 +161,7 @@ test("Édition : arrêter la production conserve l’édition ouverte", async ({
     });
 
   const stop = page.getByRole("button", {
-    name: "Arrêter le lot de production",
+    name: "Annuler le lot de production",
   });
   await expect(stop).toBeVisible();
   await stop.click();

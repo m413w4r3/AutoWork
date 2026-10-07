@@ -7,12 +7,14 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
 from types import SimpleNamespace
+from typing import cast
 from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel
 
 import cti_app.application.production_synthesis as synthesis_module
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
     ModelExecution,
@@ -111,6 +113,7 @@ from cti_app.domain.production_synthesis import (
     SynthesisParagraphV1,
     SynthesisSectionKind,
     extraction_evidence_refs_v1,
+    is_valid_editorial_title,
     production_synthesis_to_json,
     resolve_timeline_date_text,
 )
@@ -237,10 +240,11 @@ def make_source(
     rules: tuple[ExtractionRuleV1, ...] = (),
     uncertainties: tuple[str, ...] = (),
     url_suffix: str = "core",
+    canonical_url: str | None = None,
 ) -> ProductionSourceExtractionV1:
     return ProductionSourceExtractionV1(
         source_document_id=source_id,
-        canonical_url=f"https://example.com/{url_suffix}",
+        canonical_url=canonical_url or f"https://example.com/{url_suffix}",
         content_sha256=hashlib.sha256(url_suffix.encode()).hexdigest(),
         tier=tier,
         kind=kind,
@@ -294,6 +298,29 @@ def make_proposal(
             }
         ],
     }
+
+
+def make_wire_proposal_with_section_claim(
+    text: str,
+    lead_handle: str,
+    claim_handle: str | None = None,
+    *,
+    claim_id: str = "C009",
+) -> SynthesisProposalV1:
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {lead_handle}\n"
+        "TEXT: FooRAT est décrit dans le rapport.\n"
+        "@@SECTION overview S001@@\n"
+        f"@@CLAIM {claim_id}@@\n"
+        f"EVIDENCE: {claim_handle or lead_handle}\n"
+        f"TEXT: {text}\n"
+        "@@END SECTION@@"
+    )
+    assert parsed.rejections == ()
+    assert parsed.proposal is not None
+    return parsed.proposal
 
 
 def assert_proposal_error(call: Callable[[], object], expected_code: str) -> None:
@@ -839,11 +866,19 @@ def test_proposal_rejects_unknown_handle_and_malformed_schema():
     )
     pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
 
-    assert_proposal_error(
-        lambda: validate_synthesis_proposal(
-            make_proposal("FooRAT was identified.", "E999"), pack, extraction
-        ),
-        "synthesis_unknown_evidence",
+    known_handle = str(pack.narrative_evidence[0]["handle"])
+    with pytest.raises(SynthesisProposalControlError) as unknown:
+        validate_synthesis_proposal(
+            make_wire_proposal_with_section_claim(
+                "FooRAT est décrit dans le rapport.", known_handle, "E999"
+            ),
+            pack,
+            extraction,
+        )
+    assert unknown.value.code == "synthesis_unknown_evidence"
+    assert unknown.value.reason == (
+        "synthesis_unknown_evidence:claim=C009:literal_kind=evidence_handle:"
+        "literal_value=E999:reason=not_in_extraction"
     )
     malformed = make_proposal("FooRAT was identified.", str(pack.narrative_evidence[0]["handle"]))
     malformed["subject_id"] = str(subject_id)
@@ -1013,6 +1048,17 @@ def test_output_invalid_carries_a_diagnosable_reason():
     assert shape.value.reason == "malformed_proposal"
 
 
+def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
+    assert SYNTHESIS_POLICY_VERSION == "production-synthesis-v7-source-domain-grounding"
+    assert synthesis_module.SYNTHESIS_VALIDATOR_VERSION == (
+        "synthesis-validator-v5-source-domain-diagnostics"
+    )
+    assert synthesis_module.SYNTHESIS_PROMPT_VERSION == "synthesis-draft-v10-actor-grounded-title"
+    assert synthesis_module.SYNTHESIS_WIRE_PARSER_VERSION == (
+        "synthesis-text-parser-v4-claim-block-diagnostics"
+    )
+
+
 @pytest.mark.parametrize(
     "text",
     (
@@ -1036,6 +1082,263 @@ def test_proposal_rejects_markdown_html_and_source_markers(text: str):
         lambda: validate_synthesis_proposal(make_proposal(text, handle), pack, extraction),
         "synthesis_output_invalid",
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Une tâche NetSync_<username> à 09AM sous Windows.",
+        "Le paramètre <username> reste à renseigner.",
+        "Une commande utilise <deno_path> avec <workdir>.",
+        "conhost.exe --headless <deno_path> --allow-run <workdir> app.js",
+        (
+            r"La persistance est établie via helper.js dans "
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run, avec la valeur "
+            r"Deno_AutoRun et une commande de la forme conhost.exe --headless "
+            r"<deno_path> --allow-run <workdir> app.js ; le même mécanisme est "
+            "réutilisé après redémarrage."
+        ),
+        r"C:\Users\<user>\AppData",
+        r"/home/<user>/.config",
+        r"%USERPROFILE%\<name>.dll",
+        r"_<user>",
+        r"<user>_",
+        "prefix<id>suffix",
+        (
+            r"Une tâche NetSync_<username> utilise %APPDATA%\Microsoft\Network, "
+            "# shepherd-persist; et ~/.node_packages."
+        ),
+        "Des WebSocket sortants visent *.cloudfront.net, *.exe ou *.example.co.uk.",
+        (
+            "Côté réseau, une visibilité associant les connexions au processus émetteur "
+            "permet de rechercher des WebSocket sortants sur le port 443 vers "
+            "*.cloudfront.net depuis des processus non navigateurs ; le caractère "
+            "pertinent vient ici de la combinaison entre WebSocket, processus et "
+            "comportement de l\u2019implant, non de CloudFront pris isolément. Dans Teams, "
+            "les journaux de messagerie et d\u2019identité externe peuvent révéler des comptes "
+            "*.onmicrosoft.com se faisant passer pour le support interne ou l\u2019envoi de "
+            "messages quasi identiques à plusieurs employés depuis un même tenant "
+            "externe. Ces signaux documentent le mode d\u2019approche observé, sans constituer "
+            "à eux seuls une attribution à MuddyWater."
+        ),
+    ),
+)
+def test_plain_text_validator_accepts_technical_placeholders_and_wildcard_globs(
+    text: str,
+) -> None:
+    synthesis_module._validate_plain_text(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "<script>alert(1)</script>",
+        "prefix<script>content</script>suffix",
+        "A <b>bold</b> phrase.",
+        "A closing tag </div>.",
+        "A line break <br/>.",
+        "A custom element <widget data-mode=compact>.",
+        "A self-closing element <widget/>.",
+        '<a href="https://example.com">link</a>',
+        '<img src="x.png" alt="image">',
+        "<!-- comment -->",
+        "# Markdown heading",
+        "* item in a Markdown list",
+        "*Markdown emphasis*",
+        "**Markdown emphasis**",
+    ),
+)
+def test_plain_text_validator_still_rejects_markup_and_markdown(text: str) -> None:
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        synthesis_module._validate_plain_text(text)
+    assert invalid.value.reason == "plain_text_violation"
+
+
+@pytest.mark.parametrize("section_kind", ("infection_chain", "campaign", "other", "overview"))
+def test_indicator_and_rule_handles_are_allowed_in_every_section_kind(section_kind: str) -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    rule_body = 'rule DinDoor { strings: $domain = "c2.example.com" condition: $domain }'
+    rule = ExtractionRuleV1(
+        rule_type=DetectionRuleType.YARA,
+        name="DinDoor domain rule",
+        body=rule_body,
+        sha256=hashlib.sha256(rule_body.encode()).hexdigest(),
+        context="Detects the published command domain.",
+        evidence_quote=f"The report publishes this rule: {rule_body}",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source_id,),
+    )
+    extraction = make_extraction(
+        subject_id,
+        (
+            make_source(
+                source_id,
+                facts=(make_fact(source_id, "FooRAT"),),
+                indicators=(make_indicator(source_id, "c2.example.com"),),
+                rules=(rule,),
+            ),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    indicator_handle = next(
+        str(record["handle"])
+        for record in pack.technical_evidence
+        if record["kind"] == EvidenceKind.INDICATOR.value
+    )
+    rule_handle = next(
+        str(record["handle"])
+        for record in pack.technical_evidence
+        if record["kind"] == EvidenceKind.RULE.value
+    )
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {fact_handle}\n"
+        "TEXT: FooRAT est décrit dans le rapport.\n"
+        f"@@SECTION {section_kind} S001@@\n"
+        "@@CLAIM C009@@\n"
+        f"EVIDENCE: {indicator_handle}, {rule_handle}\n"
+        "TEXT: Le domaine c2.example.com figure dans une règle YARA de détection.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    assert parsed.rejections == ()
+    lead, sections = validate_synthesis_proposal(parsed.proposal, pack, extraction)
+
+    assert lead[0].evidence_refs == (pack.resolve_handle(fact_handle),)
+    assert sections[0].kind is SynthesisSectionKind(section_kind)
+    assert sections[0].paragraphs[0].evidence_refs == (
+        pack.resolve_handle(indicator_handle),
+        pack.resolve_handle(rule_handle),
+    )
+
+
+def test_technical_evidence_handles_remain_disallowed_in_the_lead() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    rule_body = 'rule DinDoor { strings: $domain = "c2.example.com" condition: $domain }'
+    rule = ExtractionRuleV1(
+        rule_type=DetectionRuleType.YARA,
+        name="DinDoor domain rule",
+        body=rule_body,
+        sha256=hashlib.sha256(rule_body.encode()).hexdigest(),
+        context="Detects the published command domain.",
+        evidence_quote=f"The report publishes this rule: {rule_body}",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source_id,),
+    )
+    extraction = make_extraction(
+        subject_id,
+        (
+            make_source(
+                source_id,
+                indicators=(make_indicator(source_id, "c2.example.com"),),
+                rules=(rule,),
+            ),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    indicator_handle = next(
+        str(record["handle"])
+        for record in pack.technical_evidence
+        if record["kind"] == EvidenceKind.INDICATOR.value
+    )
+    rule_handle = next(
+        str(record["handle"])
+        for record in pack.technical_evidence
+        if record["kind"] == EvidenceKind.RULE.value
+    )
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {indicator_handle}, {rule_handle}\n"
+        "TEXT: Le domaine c2.example.com figure dans une règle YARA de détection."
+    )
+
+    assert parsed.proposal is not None
+    with pytest.raises(SynthesisProposalControlError) as invalid:
+        validate_synthesis_proposal(parsed.proposal, pack, extraction)
+
+    assert invalid.value.reason is not None
+    assert invalid.value.reason.startswith("evidence_kind_not_allowed_in_section:section=lead:")
+    assert f"{indicator_handle}(kind=indicator)" in invalid.value.reason
+    assert f"{rule_handle}(kind=rule)" in invalid.value.reason
+
+
+def test_counter_indication_reserve_handle_is_allowed_in_other_section() -> None:
+    subject_id = uuid4()
+    source_id = uuid4()
+    snapshot = make_snapshot(subject_id)
+    extraction = _matched_extraction(
+        snapshot,
+        make_source(
+            source_id,
+            facts=(make_fact(source_id, "FooRAT"),),
+            indicators=(make_indicator(source_id, "c2.example.com"),),
+        ),
+    )
+    indicator_ref = next(
+        ref
+        for ref, _payload in extraction_evidence_elements(extraction)
+        if ref.kind is EvidenceKind.INDICATOR
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    projection = replace(
+        projection,
+        classifications=tuple(
+            replace(item, classification=RelevanceClassification.COUNTER_INDICATION)
+            if item.evidence_ref == indicator_ref
+            else item
+            for item in projection.classifications
+        ),
+    )
+    pack = build_synthesis_evidence_pack(snapshot, extraction, projection)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    reserve = next(record for record in pack.reserve_evidence if record["kind"] == "indicator")
+    reserve_handle = str(reserve["handle"])
+    parsed = parse_synthesis_proposal_wire(
+        "@@LEAD@@\n"
+        "@@CLAIM L001@@\n"
+        f"EVIDENCE: {fact_handle}\n"
+        "TEXT: FooRAT est décrit dans le rapport.\n"
+        "@@SECTION other S001@@\n"
+        "@@CLAIM C009@@\n"
+        f"EVIDENCE: {fact_handle}, {reserve_handle}\n"
+        "TEXT: FooRAT reste associé à une hypothèse analytique selon la réserve.\n"
+        "@@END SECTION@@"
+    )
+
+    assert parsed.proposal is not None
+    _lead, sections = validate_synthesis_proposal(parsed.proposal, pack, extraction)
+
+    assert sections[0].paragraphs[0].evidence_refs == (
+        pack.resolve_handle(fact_handle),
+        pack.resolve_handle(reserve_handle),
+    )
+
+
+def test_synthesis_proposal_preserves_an_attached_placeholder_in_claim_text() -> None:
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    handle = str(pack.narrative_evidence[0]["handle"])
+    claim_text = "FooRAT used NetSync_<username>."
+
+    lead, _ = validate_synthesis_proposal(make_proposal(claim_text, handle), pack, extraction)
+
+    assert lead[0].text == claim_text
 
 
 def test_proposal_drops_model_section_heading_without_rejecting_claims():
@@ -1111,20 +1414,93 @@ def test_proposal_requires_technical_literal_to_be_covered_by_claim_refs():
         for record in pack.narrative_evidence
         if record["kind"] == EvidenceKind.FACT.value
     )
-    proposal = make_proposal(
-        "The domain evil.example supports the operation.",
-        fact_handle,
-        section_kind="technical",
-        heading="Technical findings",
+    proposal = make_wire_proposal_with_section_claim(
+        "The domain evil.example supports the operation.", fact_handle
     )
 
-    assert_proposal_error(
-        lambda: validate_synthesis_proposal(proposal, pack, extraction),
-        "synthesis_unknown_technical_value",
+    with pytest.raises(SynthesisProposalControlError) as unsupported:
+        validate_synthesis_proposal(proposal, pack, extraction)
+    assert unsupported.value.reason == (
+        "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
+        "literal_value=evil.example:reason=not_supported_by_cited_handles"
     )
 
 
-def test_proposal_rejects_technical_only_evidence_for_campaign_narrative():
+def test_source_canonical_url_host_alias_validates_without_a_source_handle():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (
+            make_source(
+                source_id,
+                facts=(make_fact(source_id, "FooRAT"),),
+                canonical_url="https://www.malwarebytes.com/blog/example",
+            ),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record["kind"] == EvidenceKind.FACT.value
+    )
+    proposal = make_wire_proposal_with_section_claim(
+        "Malwarebytes, via malwarebytes.com, décrit FooRAT.", fact_handle
+    )
+
+    lead, sections = validate_synthesis_proposal(proposal, pack, extraction)
+
+    assert lead[0].text == "FooRAT est décrit dans le rapport."
+    assert sections[0].paragraphs[0].text == "Malwarebytes, via malwarebytes.com, décrit FooRAT."
+
+
+def test_extraction_url_domain_alias_keeps_its_cited_handle_requirement():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (
+            make_source(
+                source_id,
+                facts=(
+                    make_fact(source_id, "Payload callback: https://www.evil-example.com/path"),
+                ),
+            ),
+        ),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = str(pack.narrative_evidence[0]["handle"])
+    proposal = make_wire_proposal_with_section_claim(
+        "Le rappel contacte evil-example.com.", fact_handle
+    )
+
+    _lead, sections = validate_synthesis_proposal(proposal, pack, extraction)
+
+    assert sections[0].paragraphs[0].text == "Le rappel contacte evil-example.com."
+
+
+def test_unextracted_domain_fails_with_bounded_grounding_reason():
+    subject_id, source_id = uuid4(), uuid4()
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
+    )
+    pack = build_synthesis_evidence_pack(make_snapshot(subject_id), extraction)
+    fact_handle = str(pack.narrative_evidence[0]["handle"])
+    proposal = make_wire_proposal_with_section_claim(
+        "Le domaine evil-example.com héberge FooRAT.", fact_handle
+    )
+
+    with pytest.raises(SynthesisProposalControlError) as unknown:
+        validate_synthesis_proposal(proposal, pack, extraction)
+
+    assert unknown.value.code == "synthesis_unknown_technical_value"
+    assert unknown.value.reason == (
+        "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
+        "literal_value=evil-example.com:reason=not_in_extraction"
+    )
+
+
+def test_proposal_rejects_technical_only_evidence_handles_in_the_lead():
     subject_id, source_id = uuid4(), uuid4()
     source = make_source(
         source_id,
@@ -1186,11 +1562,29 @@ def test_proposal_accepts_event_and_fact_supported_dates_and_rejects_unsupported
     assert event_result[0][0].evidence_refs == (pack.resolve_handle(event_handle),)
     assert fact_result[0][0].evidence_refs == (pack.resolve_handle(fact_handle),)
     assert textual_date_result[0][0].evidence_refs == (pack.resolve_handle(textual_date_handle),)
-    assert_proposal_error(
-        lambda: validate_synthesis_proposal(
-            make_proposal("The campaign began on 2026-07-03.", event_handle), pack, extraction
-        ),
-        "synthesis_unknown_date",
+    with pytest.raises(SynthesisProposalControlError) as absent_date:
+        validate_synthesis_proposal(
+            make_wire_proposal_with_section_claim(
+                "The campaign began on 2026-07-03.", event_handle
+            ),
+            pack,
+            extraction,
+        )
+    assert absent_date.value.reason == (
+        "synthesis_unknown_date:claim=C009:literal_kind=date:literal_value=2026-07-03:"
+        "reason=not_in_extraction"
+    )
+    with pytest.raises(SynthesisProposalControlError) as uncited_date:
+        validate_synthesis_proposal(
+            make_wire_proposal_with_section_claim(
+                "The campaign began on 2026-07-04.", event_handle
+            ),
+            pack,
+            extraction,
+        )
+    assert uncited_date.value.reason == (
+        "synthesis_unknown_date:claim=C009:literal_kind=date:literal_value=2026-07-04:"
+        "reason=not_supported_by_cited_handles"
     )
 
 
@@ -1295,9 +1689,14 @@ async def test_access_policy_fails_closed_for_unavailable_or_invalid_exact_docum
 
 
 @pytest.mark.asyncio
-async def test_synthesis_hash_request_and_model_identity_are_functional_and_stateless():
+async def test_synthesis_request_carries_actor_grounded_title_contract_and_is_stateless():
     subject_id, source_id = uuid4(), uuid4()
-    snapshot = make_snapshot(subject_id)
+    snapshot = replace(
+        make_snapshot(subject_id),
+        subject_title="[Acteurs présumés liés à l'Iran] Routage C2 via Bitcoin OP_RETURN",
+        input_hash="",
+        reuse_basis_hash="",
+    )
     extraction = make_extraction(
         subject_id,
         (make_source(source_id, facts=(make_fact(source_id, "FooRAT"),)),),
@@ -1334,6 +1733,14 @@ async def test_synthesis_hash_request_and_model_identity_are_functional_and_stat
     assert "@@EVIDENCE E001@@" in request.text
     assert "@@CLAIM L001@@" in request.text
     assert "Do not return JSON" in request.text
+    assert snapshot.subject_title in request.text
+    assert "The frozen subject title is DISCOVERY CONTEXT, NOT evidence." in request.text
+    assert "unless an evidence handle documents that detail for THIS" in request.text
+    assert "A detail that a source gives only as a generic" in request.text
+    assert "Apply the same evidence discipline to the lead." in request.text
+    assert "@@TITLE@@\n[Groupe] Titre\n@@END TITLE@@" in request.text
+    assert "Exemple court : [Groupe] Déploie un implant." in request.text
+    assert "NOT the publisher of its article" in " ".join(request.text.split())
     assert request.run_id == synthesis_model_run_id(
         run,
         synthesis_invocation_hash(
@@ -1906,6 +2313,43 @@ async def test_service_stops_on_lineage_mismatch_before_drafting(failure: str):
 
 
 @pytest.mark.asyncio
+async def test_projection_read_limit_is_not_reported_as_a_lineage_mismatch():
+    subject_id, source_id = uuid4(), uuid4()
+    snapshot = make_snapshot(subject_id)
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None))
+    extraction = _matched_extraction(snapshot, make_source(source_id))
+    projection_blob_id = uuid4()
+    world = _service_world(snapshot, extraction, (make_document(subject_id, source_id),), gateway)
+    projection_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.RELEVANCE_PROJECTION,
+        version=1,
+        input_hash="a" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=projection_blob_id,
+    )
+    original_read_json = world.store.read_json
+
+    async def reject_oversized_projection(blob_id: UUID) -> dict[str, object]:
+        if blob_id == projection_blob_id:
+            raise BlobReadLimitExceededError(size_bytes=4_472_692, max_bytes=4 * 1024 * 1024)
+        return cast(dict[str, object], await original_read_json(blob_id))
+
+    world.store.read_json = reject_oversized_projection
+    result = await world.service.execute(world.run, snapshot, world.artifact, projection_artifact)
+
+    assert result.status is SynthesisExecutionStatus.BLOCKED
+    assert result.error_code == SynthesisStageErrorCode.ARTIFACT_READ_LIMIT_EXCEEDED.value
+    assert result.error == "The subject relevance projection exceeds the artifact read limit"
+    assert result.details["size_bytes"] == 4_472_692
+    assert result.details["max_bytes"] == 4 * 1024 * 1024
+    assert result.model_calls == 0
+    assert gateway.calls == []
+    assert world.writer.calls == []
+
+
+@pytest.mark.asyncio
 async def test_fresh_synthesis_submits_once_and_never_reads_source_bodies():
     world = _fresh_setup()
 
@@ -1989,6 +2433,100 @@ TEXT: FooRAT est identifié dans le rapport.
     synthesis = world.writer.calls[0]["synthesis"]
     assert synthesis.title == "[example.com] Frozen subject title"
     assert synthesis.warnings.count("synthesis_title_invalid") == 1
+
+
+@pytest.mark.asyncio
+async def test_unprefixed_model_title_is_salvaged_with_source_group_and_warning() -> None:
+    world = _fresh_setup()
+    title = (
+        "Acteurs présumés liés au Ministry of Intelligence iranien utilisent "
+        "Bitcoin comme dead drop C2"
+    )
+    raw = f"""@@TITLE@@
+{title}
+@@END TITLE@@
+@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: FooRAT est identifié dans le rapport.
+"""
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.SUCCEEDED
+    assert result.model_calls == 1
+    assert len(world.gateway.calls) == 1
+    synthesis = world.writer.calls[0]["synthesis"]
+    assert synthesis.title == f"[example.com] {title}"
+    assert "OP_RETURN" not in synthesis.title
+    assert synthesis.warnings.count("synthesis_title_invalid") == 1
+
+
+def test_fallback_editorial_title_preserves_technical_underscores() -> None:
+    from cti_app.application.production_synthesis import _fallback_editorial_title
+
+    world = _fresh_setup()
+    snapshot = replace(
+        world.snapshot,
+        subject_title=("`Bitcoin OP_RETURN` **[dead drop](https://example.com)** E001 <em>C2</em>"),
+        input_hash="",
+        reuse_basis_hash="",
+    )
+
+    assert _fallback_editorial_title(snapshot, world.extraction) == (
+        "[example.com] Bitcoin OP_RETURN dead drop C2"
+    )
+    assert (
+        _fallback_editorial_title(
+            replace(
+                snapshot,
+                subject_title="NetSync_<username>",
+                input_hash="",
+                reuse_basis_hash="",
+            ),
+            world.extraction,
+        )
+        == "[example.com] NetSync_<username>"
+    )
+
+
+def test_fallback_title_for_subject_9f2825a0_stops_at_a_valid_word_boundary() -> None:
+    from cti_app.application.production_synthesis import _fallback_editorial_title
+
+    subject_id = UUID("9f2825a0-dd2c-4f4f-b62f-7dec9ef6828c")
+    source_id = uuid4()
+    snapshot = replace(
+        make_snapshot(subject_id),
+        subject_title=(
+            "GTG-30005 — reconnaissance navale et développement de capacités de "
+            "surveillance pour des systèmes…"
+        ),
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    extraction = make_extraction(
+        subject_id,
+        (make_source(source_id, canonical_url="https://www.anthropic.com/security/report"),),
+    )
+
+    title = _fallback_editorial_title(snapshot, extraction)
+
+    assert len(title) <= 110
+    assert not title.endswith("…")
+    assert title.endswith("surveillance")
+    assert is_valid_editorial_title(title)
+
+
+def test_fallback_title_drops_trailing_connectors_after_truncation() -> None:
+    from cti_app.application.production_synthesis import _truncate_editorial_title_component
+
+    assert (
+        _truncate_editorial_title_component(
+            "Capacités de surveillance pour des systèmes embarqués", 34
+        )
+        == "Capacités de surveillance"
+    )
 
 
 @pytest.mark.asyncio
@@ -2122,6 +2660,30 @@ TEXT: # FooRAT est identifié dans le rapport.
     stage_result = ProductionWorkflowOrchestrator._synthesis_execution_result(result)
     assert stage_result["status"] == "needs_review"
     assert "plain_text_violation" in stage_result["error"]
+
+
+@pytest.mark.asyncio
+async def test_grounding_reason_reaches_review_validation_reason() -> None:
+    world = _fresh_setup()
+    raw = f"""@@LEAD@@
+@@CLAIM L001@@
+EVIDENCE: {world.handle}
+TEXT: FooRAT est décrit dans le rapport.
+@@SECTION overview S001@@
+@@CLAIM C009@@
+EVIDENCE: {world.handle}
+TEXT: Le domaine evil-example.com héberge FooRAT.
+@@END SECTION@@"""
+    world.gateway._responder = lambda request: _succeeded(request, None, text=raw)
+
+    result = await world.service.execute(world.run, world.snapshot, world.artifact)
+
+    assert result.status is SynthesisExecutionStatus.NEEDS_REVIEW
+    assert result.error_code == SynthesisProposalErrorCode.UNKNOWN_TECHNICAL_VALUE.value
+    assert result.details["validation_reason"] == (
+        "synthesis_unknown_technical_value:claim=C009:literal_kind=domain:"
+        "literal_value=evil-example.com:reason=not_in_extraction"
+    )
 
 
 @pytest.mark.asyncio

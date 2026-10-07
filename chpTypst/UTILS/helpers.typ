@@ -2,68 +2,94 @@
 
 #set grid(gutter: 1em)
 
-// The semantic helpers receive only strings from the JSON render projection.
-// text(string) creates literal content, so source text is never parsed as Typst.
-#let semantic-plain(body) = text(body)
-#let semantic-actor(body) = text(weight: "bold", fill: accent)[#text(body)]
-#let semantic-campaign(body) = text(weight: "bold", fill: purple)[#text(body)]
-#let semantic-malware(body) = text(weight: "bold", fill: purple-dark)[#text(body)]
-#let semantic-tool(body) = text(weight: "bold", fill: accent)[#text(body)]
-#let semantic-product(body) = text(weight: "bold", fill: dark)[#text(body)]
-#let semantic-english-term(body) = emph(text(body))
-#let semantic-technical(body) = text(size: 10pt, fill: purple-dark)[#text(body)]
+// Rendered literal data stays exact. This tiny positive space creates a real
+// break opportunity without introducing a visible or extractable separator.
+#let display-text(item) = {
+  if type(item) == str {
+    text(item)
+  } else {
+    let chunks = item.at("break_chunks", default: ())
+    if chunks.len() == 0 {
+      text(item.text)
+    } else {
+      let break-after = item.at("break_after", default: ())
+      for (index, chunk) in chunks.enumerate() {
+        text(chunk)
+        if index < chunks.len() - 1 {
+          let should-break = if break-after.len() == chunks.len() - 1 {
+            break-after.at(index)
+          } else {
+            true
+          }
+          if should-break { h(0.01pt) }
+        }
+      }
+    }
+  }
+}
+
+#let semantic-plain(body) = body
+#let semantic-actor(body) = text(weight: "bold", fill: accent)[#body]
+#let semantic-campaign(body) = text(weight: "bold", fill: purple)[#body]
+#let semantic-malware(body) = text(weight: "bold", fill: purple-dark)[#body]
+#let semantic-tool(body) = text(weight: "bold", fill: accent)[#body]
+#let semantic-product(body) = text(weight: "bold", fill: dark)[#body]
+#let semantic-english-term(body) = emph(body)
+#let semantic-technical(body) = text(size: 10pt, fill: purple-dark)[#body]
 #let semantic-technical-literal(body) = text(
   font: "Cascadia Mono",
   size: 9pt,
   fill: purple-dark,
-)[#text(body)]
+  hyphenate: false,
+)[#body]
 #let semantic-table-technical(body) = text(
   font: "Cascadia Mono",
   size: 9pt,
   fill: purple-dark,
   hyphenate: false,
-)[#text(body)]
-#let semantic-ioc(body) = text(font: "Cascadia Mono", size: 9pt, fill: accent)[#text(body)]
+)[#body]
+#let semantic-ioc(body) = text(font: "Cascadia Mono", size: 9pt, fill: accent, hyphenate: false)[#body]
 #let semantic-table-ioc(body) = text(
   font: "Cascadia Mono",
   size: 9pt,
   fill: accent,
   hyphenate: false,
-)[#text(body)]
-#let semantic-path(body) = text(font: "Cascadia Mono", size: 9pt)[#text(body)]
-#let semantic-table-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#text(body)]
-#let semantic-command(body) = text(font: "Cascadia Mono", size: 9pt, fill: dark)[#text(body)]
+)[#body]
+#let semantic-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#body]
+#let semantic-table-path(body) = text(font: "Cascadia Mono", size: 9pt, hyphenate: false)[#body]
+#let semantic-command(body) = text(font: "Cascadia Mono", size: 9pt, fill: dark, hyphenate: false)[#body]
 #let semantic-table-command(body) = text(
   font: "Cascadia Mono",
   size: 9pt,
   fill: dark,
   hyphenate: false,
-)[#text(body)]
-#let semantic-protocol-field(body) = text(font: "Cascadia Mono", size: 9pt, fill: purple-dark)[#text(body)]
-#let semantic-source(body) = text(size: 9pt, fill: accent)[#text(body)]
-#let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#text(body)]
+)[#body]
+#let semantic-protocol-field(body) = text(font: "Cascadia Mono", size: 9pt, fill: purple-dark, hyphenate: false)[#body]
+#let semantic-source(body) = text(size: 9pt, fill: accent)[#body]
+#let semantic-proof(body) = text(size: 9pt, fill: purple-dark)[#body]
 
 #let semantic-span(span) = {
   let style = span.style
-  if style == "semantic-plain" { semantic-plain(span.text) }
-  else if style == "semantic-actor" { semantic-actor(span.text) }
-  else if style == "semantic-campaign" { semantic-campaign(span.text) }
-  else if style == "semantic-malware" { semantic-malware(span.text) }
-  else if style == "semantic-tool" { semantic-tool(span.text) }
-  else if style == "semantic-product" { semantic-product(span.text) }
-  else if style == "semantic-english-term" { semantic-english-term(span.text) }
-  else if style == "semantic-technical" { semantic-technical(span.text) }
-  else if style == "semantic-technical-literal" { semantic-technical-literal(span.text) }
-  else if style == "semantic-table-technical" { semantic-table-technical(span.text) }
-  else if style == "semantic-ioc" { semantic-ioc(span.text) }
-  else if style == "semantic-table-ioc" { semantic-table-ioc(span.text) }
-  else if style == "semantic-path" { semantic-path(span.text) }
-  else if style == "semantic-table-path" { semantic-table-path(span.text) }
-  else if style == "semantic-command" { semantic-command(span.text) }
-  else if style == "semantic-table-command" { semantic-table-command(span.text) }
-  else if style == "semantic-protocol-field" { semantic-protocol-field(span.text) }
-  else if style == "semantic-source" { semantic-source(span.text) }
-  else if style == "semantic-proof" { semantic-proof(span.text) }
+  let body = display-text(span)
+  if style == "semantic-plain" { semantic-plain(body) }
+  else if style == "semantic-actor" { semantic-actor(body) }
+  else if style == "semantic-campaign" { semantic-campaign(body) }
+  else if style == "semantic-malware" { semantic-malware(body) }
+  else if style == "semantic-tool" { semantic-tool(body) }
+  else if style == "semantic-product" { semantic-product(body) }
+  else if style == "semantic-english-term" { semantic-english-term(body) }
+  else if style == "semantic-technical" { semantic-technical(body) }
+  else if style == "semantic-technical-literal" { semantic-technical-literal(body) }
+  else if style == "semantic-table-technical" { semantic-table-technical(body) }
+  else if style == "semantic-ioc" { semantic-ioc(body) }
+  else if style == "semantic-table-ioc" { semantic-table-ioc(body) }
+  else if style == "semantic-path" { semantic-path(body) }
+  else if style == "semantic-table-path" { semantic-table-path(body) }
+  else if style == "semantic-command" { semantic-command(body) }
+  else if style == "semantic-table-command" { semantic-table-command(body) }
+  else if style == "semantic-protocol-field" { semantic-protocol-field(body) }
+  else if style == "semantic-source" { semantic-source(body) }
+  else if style == "semantic-proof" { semantic-proof(body) }
   else { panic("unsupported semantic style: " + style) }
 }
 
@@ -92,17 +118,14 @@
   #upper(content)
 ]
 
-#let section-title(content) = [
+#let section-title(content) = block(sticky: true)[
   #v(4pt)
 
   #text(
     size: 14pt,
     weight: "extrabold",
     fill: purple,
-  )[
-    #content
-  ]
-
+  )[#content]
 ]
 
 #let better-link(target, body) = {
@@ -333,27 +356,25 @@
 
 
 
-#let styled-table(columns, cell-align: auto, ..content) = {
+#let styled-table(columns, cell-align: auto, title: none, ..content) = {
   let cells = content.pos()
-
-  let styled-cells = cells.enumerate().map(((i, cell)) => {
-    let row = calc.floor(i / columns.len())
-
-    if row == 0 {
-      [
-        #set text(
-          weight: "bold",
-          fill: white,
-        )
-        #cell
-      ]
+  let column-count = columns.len()
+  let header-cells = cells.slice(0, column-count).map(cell => [
+    #set text(weight: "bold", fill: white)
+    #cell
+  ])
+  let body-cells = cells.slice(column-count).enumerate().map(((index, cell)) => {
+    let row = calc.floor(index / column-count)
+    if calc.rem(row, 2) == 0 {
+      [#block(sticky: true, breakable: false, above: 0pt, below: 0pt)[#cell]]
     } else {
-      cell
+      [#block(breakable: false, above: 0pt, below: 0pt)[#cell]]
     }
   })
+  let body-row-count = calc.floor((cells.len() - column-count) / column-count)
 
   set text(size: 9pt)
-  align(center, table(
+  let rendered-table = align(center, table(
     columns: columns,
     inset: (x: 5pt, y: 4pt),
 
@@ -374,8 +395,30 @@
     },
 
     stroke: 0.6pt + gray,
-    ..styled-cells,
+    table.header(repeat: true, ..header-cells),
+    ..body-cells,
   ))
+
+  if body-row-count <= 12 {
+    block(
+      breakable: false,
+      above: if title == none { 0pt } else { 6pt },
+    )[
+      #if title != none [
+        #title
+        #v(4pt)
+      ]
+      #rendered-table
+    ]
+  } else {
+    if title != none [
+      #block(sticky: true, above: 6pt)[
+        #title
+        #v(4pt)
+      ]
+    ]
+    rendered-table
+  }
 }
 
 #let fn(url) = {
@@ -412,11 +455,53 @@
     }
   }
 
-  let ioc-listt(items) = {
-    for item in items {
-      text(font: "Cascadia Mono", size: 8.75pt)[#item]
-      linebreak()
+  let ioc-listt(items, skip: 0) = {
+    for (index, item) in items.enumerate() {
+      if index >= skip {
+        block(breakable: false, above: 0pt, below: 0pt)[
+          #text(font: "Cascadia Mono", size: 8.75pt)[#display-text(item)]
+        ]
+        linebreak()
+      }
     }
+  }
+
+  let ioc-first-lines(items, take) = {
+    for (index, item) in items.enumerate() {
+      if index < take {
+        text(font: "Cascadia Mono", size: 8.75pt)[#display-text(item)]
+        linebreak()
+      }
+    }
+  }
+
+  let ioc-sublist(label, items, title: none, note: none) = {
+    if items.len() > 0 [
+      #let first-count = calc.min(3, items.len())
+      #let above-space = if title == none { 4pt } else { 8pt }
+      #block(
+        sticky: true,
+        breakable: false,
+        above: above-space,
+        below: 0pt,
+      )[
+        #if title != none [
+          #text(size: 13pt, fill: purple-dark)[*#title*]
+          #linebreak()
+        ]
+        #if note != none and note != "" [
+          #text(size: 9pt)[#note]
+          #linebreak()
+        ]
+        #text(label + " :")
+        #linebreak()
+        #ioc-first-lines(items, first-count)
+      ]
+      #if items.len() > first-count [
+        #v(6pt)
+      ]
+      #ioc-listt(items, skip: first-count)
+    ]
   }
 
   let ips = parse-list(ips)
@@ -426,35 +511,70 @@
   let hashes = parse-list(hashes)
 
   [
-    #text(size: 13pt, fill:purple-dark)[*#title*]
-    #if note != none and note != "" [
-      #text(size: 9pt)[#note]
-      #linebreak()
-    ]
-
     #if ips.len() > 0 [
-      Adresses IP : \
-      #ioc-listt(ips)
+      #ioc-sublist("Adresses IP", ips, title: title, note: note)
     ]
 
     #if domains.len() > 0 [
-      Noms de domaine : \
-      #ioc-listt(domains)
+      #ioc-sublist(
+        "Noms de domaine",
+        domains,
+        title: if ips.len() == 0 { title } else { none },
+        note: if ips.len() == 0 { note } else { none },
+      )
     ]
 
     #if urls.len() > 0 [
-      URL : \
-      #ioc-listt(urls)
+      #ioc-sublist(
+        "URL",
+        urls,
+        title: if ips.len() == 0 and domains.len() == 0 { title } else { none },
+        note: if ips.len() == 0 and domains.len() == 0 { note } else { none },
+      )
     ]
 
     #if emails.len() > 0 [
-      Adresses e-mail : \
-      #ioc-listt(emails)
+      #ioc-sublist(
+        "Adresses e-mail",
+        emails,
+        title: if ips.len() == 0 and domains.len() == 0 and urls.len() == 0 {
+          title
+        } else {
+          none
+        },
+        note: if ips.len() == 0 and domains.len() == 0 and urls.len() == 0 {
+          note
+        } else {
+          none
+        },
+      )
     ]
 
     #if hashes.len() > 0 [
-      Fichiers : \
-      #ioc-listt(hashes)
+      #ioc-sublist(
+        "Fichiers",
+        hashes,
+        title: if ips.len() == 0 and domains.len() == 0 and urls.len() == 0 and emails.len() == 0 {
+          title
+        } else {
+          none
+        },
+        note: if ips.len() == 0 and domains.len() == 0 and urls.len() == 0 and emails.len() == 0 {
+          note
+        } else {
+          none
+        },
+      )
+    ]
+
+    #if ips.len() + domains.len() + urls.len() + emails.len() + hashes.len() == 0 [
+      #block(sticky: true, above: 8pt, below: 0pt)[
+        #text(size: 13pt, fill: purple-dark)[*#title*]
+        #if note != none and note != "" [
+          #linebreak()
+          #text(size: 9pt)[#note]
+        ]
+      ]
     ]
 
   ]

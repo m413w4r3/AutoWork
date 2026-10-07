@@ -93,7 +93,7 @@ def _render(release_id: UUID, **overrides: object) -> EditionRender:
         "id": uuid4(),
         "edition_release_id": release_id,
         "renderer": "typst",
-        "renderer_version": "edition-v2-typst-v1",
+        "renderer_version": "edition-v2-typst-v2-semantic-annotation-coverage",
         "template_version": "chp-edition-v1",
         "template_sha256": "a" * 64,
         "compiler": "typst",

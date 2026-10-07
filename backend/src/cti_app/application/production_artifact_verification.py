@@ -31,9 +31,9 @@ from cti_app.domain.publication import ArtifactType
 
 # Bump whenever deterministic verification/normalization rules change (e.g. a
 # validation rule, a public-suffix check, or how facts get a semantic type).
-# Participates in the extraction artifact's input_hash so a canonical
-# extraction artifact gets recomputed, without forcing a new Q2 model call.
-ARTIFACT_VERIFIER_VERSION = "6"
+# It participates in extraction and source-checkpoint identities so output
+# verified under an older gate cannot be reused as proof.
+ARTIFACT_VERIFIER_VERSION = "7"
 
 
 class ProposalStatus(StrEnum):

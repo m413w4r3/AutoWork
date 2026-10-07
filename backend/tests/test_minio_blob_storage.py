@@ -9,6 +9,7 @@ import pytest
 from minio import Minio
 from minio.error import S3Error
 
+from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.infrastructure.blob_storage.minio import MinioBlobStore
 
 
@@ -82,3 +83,25 @@ async def test_minio_adapter_is_idempotent_with_simulated_client(
     destination = tmp_path / "workspace" / first.sha256
     assert await store.materialize(first, destination) == "copy"
     assert destination.read_bytes() == b"simulated minio content"
+
+
+@pytest.mark.asyncio
+async def test_minio_read_limit_has_a_specific_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(asyncio, "to_thread", _run_inline)
+    client = FakeMinioClient()
+    store = MinioBlobStore(
+        cast(Minio, client), physical_bucket="cti-local", temp_directory=tmp_path / "temp"
+    )
+    blob = await store.put(
+        BytesIO(b"more than one byte"),
+        logical_bucket="source-documents",
+        mime_type="text/plain",
+    )
+
+    with pytest.raises(BlobReadLimitExceededError) as raised:
+        await store.read(blob, max_bytes=1)
+
+    assert raised.value.size_bytes == len(b"more than one byte")
+    assert raised.value.max_bytes == 1

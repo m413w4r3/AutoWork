@@ -8,7 +8,11 @@ from uuid import uuid4
 from minio import Minio
 from minio.error import S3Error
 
-from cti_app.application.blob_storage import BlobStorageUnavailableError, MaterializationMethod
+from cti_app.application.blob_storage import (
+    BlobReadLimitExceededError,
+    BlobStorageUnavailableError,
+    MaterializationMethod,
+)
 from cti_app.domain.blobs import BlobDescriptor
 from cti_app.domain.errors import BlobIntegrityError
 from cti_app.infrastructure.blob_storage.common import (
@@ -54,7 +58,7 @@ class MinioBlobStore:
 
     async def read(self, descriptor: BlobDescriptor, *, max_bytes: int) -> bytes:
         if descriptor.size > max_bytes:
-            raise ValueError("Blob exceeds the read limit")
+            raise BlobReadLimitExceededError(size_bytes=descriptor.size, max_bytes=max_bytes)
         try:
             return await asyncio.to_thread(self._read_sync, descriptor)
         except (BlobIntegrityError, FileNotFoundError, ValueError):

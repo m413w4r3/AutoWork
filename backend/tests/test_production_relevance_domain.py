@@ -7,6 +7,10 @@ from uuid import uuid4
 
 import pytest
 
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
     compute_editorial_enrichment_input_hash,
@@ -56,10 +60,13 @@ from cti_app.domain.production_references import (
     ProductionReferenceTier,
 )
 from cti_app.domain.production_relevance import (
+    RELEVANCE_PROJECTION_SCHEMA_VERSION,
     RelevanceClassification,
     RelevanceDecisionProvenance,
     RelevanceProjectionV1,
     RelevanceReasonCode,
+    relevance_projection_from_json,
+    relevance_projection_to_json,
 )
 from cti_app.domain.production_synthesis import (
     PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
@@ -237,6 +244,51 @@ def test_projection_rejects_unknown_evidence_refs_and_round_trips() -> None:
     restored = relevance_projection_from_json(relevance_projection_to_json(projection))
     assert restored == projection
     assert restored.projection_hash == projection.projection_hash
+
+
+def test_large_projection_indexes_shared_support_refs_and_reads_legacy_payload() -> None:
+    snapshot = _snapshot(actor_or_campaign="MOIS", title="Subject")
+    source_id = uuid4()
+    facts = tuple(
+        _fact(source_id, f"MOIS supported claim {index:03d}") for index in range(64)
+    ) + tuple(_fact(source_id, f"unrelated claim {index:03d}") for index in range(536))
+    extraction = _extraction(snapshot, (_source(source_id, facts=facts),))
+    projection = build_relevance_projection(snapshot, extraction)
+
+    payload = relevance_projection_to_json(projection)
+    encoded = ProductionArtifactStore.canonical_json_bytes(payload)
+    legacy_projection = replace(projection, schema_version=2)
+    legacy_payload = relevance_projection_to_json(legacy_projection)
+    legacy_encoded = ProductionArtifactStore.canonical_json_bytes(legacy_payload)
+
+    assert projection.schema_version == RELEVANCE_PROJECTION_SCHEMA_VERSION
+    assert RELEVANCE_PROJECTION_SCHEMA_VERSION == 3
+    assert len(projection.classifications) == 600
+    assert len(legacy_encoded) > MAX_ARTIFACT_BYTES
+    assert len(encoded) < MAX_ARTIFACT_BYTES // 4
+    assert "evidence_ref_index" in payload["classifications"][0]
+    assert "supporting_evidence_refs" not in payload["classifications"][0]
+
+    restored = relevance_projection_from_json(payload)
+    assert restored == projection
+    assert restored.projection_hash == projection.projection_hash
+    changed_first = replace(
+        projection.classifications[0],
+        supporting_evidence_refs=(projection.classifications[0].evidence_ref,),
+    )
+    changed_support = replace(
+        projection,
+        classifications=(changed_first, *projection.classifications[1:]),
+    )
+    assert changed_support.projection_hash != projection.projection_hash
+    assert (
+        ProductionArtifactStore.canonical_json_bytes(relevance_projection_to_json(restored))
+        == encoded
+    )
+
+    legacy_restored = relevance_projection_from_json(legacy_payload)
+    assert legacy_restored == legacy_projection
+    assert legacy_restored.projection_hash == legacy_projection.projection_hash
 
 
 def test_projection_hash_changes_when_classification_changes() -> None:

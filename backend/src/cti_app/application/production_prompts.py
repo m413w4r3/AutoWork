@@ -6,7 +6,7 @@ from collections.abc import Sequence
 
 from cti_app.domain.production import ExtractionProfile
 
-REFERENCES_PROMPT_VERSION = "9"
+REFERENCES_PROMPT_VERSION = "10"
 
 # AW-011 canonical extraction. The archived document is the only source
 # material: each prompt is a pure function of that capture and of the requested
@@ -16,9 +16,9 @@ REFERENCES_PROMPT_VERSION = "9"
 CANONICAL_EXTRACTION_PROMPT_VERSION = "archive-full-v3"
 CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
-SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v8-editorial-title-source-notes"
+SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v10-actor-grounded-title"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v3-title-source-notes"
-SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v3-title-source-notes"
+SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v4-claim-block-diagnostics"
 
 SYNTHESIS_EDITORIAL_CONTRACT_V4 = """EDITORIAL CONTRACT
 
@@ -63,6 +63,13 @@ an adverse claim, independent corroboration, a hypothesis, and an analytical
 inference. A reserve that qualifies attribution or causality must qualify the
 same passage it concerns, not only the conclusion.
 
+Indicator and rule E handles may support claims in any non-lead section,
+including overview, campaign, infection_chain, and other. Section kind does not
+restrict evidence kind. Do not cite technical E handles in the lead. Keep exact
+technical literals in prose grounded in the evidence handles that support them.
+R handles remain available only for the qualification or
+contradiction they represent, including in the lead when relevant.
+
 The subject is treated from the angle of the core publication, the evidence
 whose editorial_role is primary: the lead, the scope and the order of the
 narrative follow it. Evidence from a corroboration source reinforces, dates,
@@ -95,10 +102,18 @@ analytical limit. Preserve the source's exact date precision.
 
 EDITORIAL TITLE
 Write one French editorial title in exactly this format: [Groupe] Titre.
-Groupe is the principal actor/group named by the core publication; join
-documented aliases with " / ". If no actor is named, use a precise generic
-attribution such as "Acteurs présumés liés à l\u2019Iran". For an item about a tool
-or publication rather than an actor, use that tool or publication's name.
+The frozen subject title is DISCOVERY CONTEXT, NOT evidence. Do not repeat in
+the title any mechanism, protocol, field, tool name, port, CVE, or other
+technical detail unless an evidence handle documents that detail for THIS
+actor, campaign, or case. A detail that a source gives only as a generic
+example of a technique family, or for another actor, must not appear in the
+title; use generic wording instead, such as "des données de routage C2 dans la
+blockchain Bitcoin". Apply the same evidence discipline to the lead.
+Groupe is the principal actor/group named by the core publication, NOT the
+publisher of its article. Join documented aliases with " / ". If no actor is
+named, use a precise generic attribution such as "Acteurs présumés liés à
+l\u2019Iran". For an item whose subject is a tool or publication, use that tool
+or publication's name.
 Titre is one French sentence in sentence case describing what happened,
 including a campaign, tool or technique. Keep the complete title to 110
 characters or fewer. Do not repeat the group in Titre, add a final period,
@@ -142,8 +157,9 @@ text outside these blocks. Do not emit a HEADING field. Sections and source
 notes are optional; section kinds are only stable internal placement anchors.
 
 @@TITLE@@
-[Groupe principal] Titre français sans point final
+[Groupe] Titre
 @@END TITLE@@
+Exemple court : [Groupe] Déploie un implant.
 
 @@LEAD@@
 @@CLAIM L001@@
@@ -172,7 +188,7 @@ EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v18-edit
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
     "editorial-enrichment-block-contract-v13-editorial-tables"
 )
-EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v13-editorial-tables"
+EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v14-atomic-diagram-relations"
 EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v6-editorial-tables"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
     "editorial-enrichment-repair-contract-v6-editorial-tables"
@@ -187,9 +203,9 @@ EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v4
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
     "editorial-enrichment-revision-contract-v4-editorial-tables"
 )
-RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v3-counter-analysis"
-RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v2-reason-pairs"
-RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v3-repair-reserves"
+RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
+RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"
+RELEVANCE_CLASSIFIER_WIRE_PARSER_VERSION = "subject-relevance-wire-v4-other-case-out-of-scope"
 CANONICAL_EXTRACTION_PROMPT_VERSION_BY_PROFILE = {
     ExtractionProfile.FULL: CANONICAL_EXTRACTION_PROMPT_VERSION,
     ExtractionProfile.IOC_RULES: CANONICAL_IOC_RULES_PROMPT_VERSION,
@@ -309,6 +325,13 @@ class ProductionPromptTemplates:
     REFERENCES_RESEARCH_V2 = """You are a threat intelligence research assistant. Your task is to conduct web research and build a chronological reference timeline for the following subject:
 
 **Subject**: {subject_title}
+
+The frozen Subject title is discovery context, not evidence. Do not carry a
+mechanism, protocol, field, tool name, port, CVE, or other technical detail
+from it into the editorial title unless a source directly documents that
+detail for this same actor, campaign, or case. A detail given only as a generic
+example of a technique family, or for another actor, must not appear in the
+title; use generic wording instead. Apply the same discipline to the lead.
 
 **Initial Information**:
 {subject_description}

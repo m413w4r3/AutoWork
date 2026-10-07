@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ from cti_app.application.production_editorial_enrichment import (
 from cti_app.application.production_extraction import (
     PRODUCTION_EXTRACTION_SERVICE_VERSION,
     ExtractionPlan,
+    ExtractionProgressEvent,
     ExtractionRejection,
     ProductionExtractionControlError,
     ProductionExtractionService,
@@ -122,6 +124,8 @@ from cti_app.domain.production_relevance import relevance_projection_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
 from cti_app.domain.publication_document import parse_publication_document
+
+_LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from cti_app.application.collection import SubjectCollectionService
@@ -296,7 +300,13 @@ def _canonical_extraction_progress(
     for planned in plan.sources:
         source = produced.get(planned.source_document_id)
         if source is not None:
-            status = "succeeded" if source.reuse_state is ExtractionReuseState.FRESH else "cached"
+            status = (
+                "succeeded"
+                if source.reuse_state is ExtractionReuseState.FRESH
+                else "reused"
+                if source.reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
+                else "cached"
+            )
         elif (
             planned.canonical_url in failed_urls
             or str(planned.source_document_id) == failed_source_id
@@ -317,6 +327,21 @@ def _canonical_extraction_progress(
                 "reuse_state": source.reuse_state.value if source is not None else None,
                 "ioc_count": len(source.indicators) if source is not None else 0,
                 "rule_count": len(source.rules) if source is not None else 0,
+                "scope": (
+                    {
+                        "kind": planned.scope.kind.value,
+                        "case_id": planned.scope.case_id,
+                        "kept_sections": planned.scope.kept_sections,
+                        "total_sections": planned.scope.total_sections,
+                        "kept_chars": planned.scope.kept_chars,
+                        "total_chars": planned.scope.total_chars,
+                    }
+                    if planned.scope is not None
+                    else None
+                ),
+                "chunks_done": 0,
+                "chunks_total": None,
+                "chunks_total_is_estimate": False,
             }
         )
     for omitted in plan.omitted_sources:
@@ -331,6 +356,10 @@ def _canonical_extraction_progress(
                 "reuse_state": None,
                 "ioc_count": 0,
                 "rule_count": 0,
+                "scope": None,
+                "chunks_done": 0,
+                "chunks_total": 0,
+                "chunks_total_is_estimate": False,
             }
         )
     rules = [rule for source in produced.values() for rule in source.rules]
@@ -349,7 +378,7 @@ def _canonical_extraction_progress(
         "full_completed": profile_count(completed, ExtractionProfile.FULL),
         "ioc_rules_total": profile_count(sources, ExtractionProfile.IOC_RULES),
         "ioc_rules_completed": profile_count(completed, ExtractionProfile.IOC_RULES),
-        "cache_hits": sum(entry["status"] == "cached" for entry in sources),
+        "cache_hits": sum(entry["status"] in {"cached", "reused"} for entry in sources),
         "model_calls": model_calls,
         "skipped_sources": sum(entry["status"] in {"omitted", "failed"} for entry in sources),
         "confirmed_iocs": sum(
@@ -367,6 +396,64 @@ def _canonical_extraction_progress(
         "profile_policy_version": plan.profile_policy_version,
         "references_corpus_hash": plan.references_corpus_hash,
     }
+
+
+def _merge_live_extraction_progress(canonical: dict[str, Any], live: dict[str, Any]) -> None:
+    """Carry call counters and partial source progress into the final snapshot."""
+    live_sources = {
+        source.get("source_id"): source
+        for source in live.get("sources", [])
+        if isinstance(source, dict)
+    }
+    for source in canonical.get("sources", []):
+        previous = live_sources.get(source.get("source_id"))
+        if previous is None:
+            continue
+        for key in ("scope", "chunks_done", "chunks_total", "chunks_total_is_estimate"):
+            if key in previous:
+                source[key] = previous[key]
+        if source.get("status") == "pending" and previous.get("status") != "pending":
+            source["status"] = "cached" if previous["status"] == "reused" else previous["status"]
+    completed = [
+        source
+        for source in canonical.get("sources", [])
+        if source.get("status") in {"cached", "reused", "succeeded"}
+    ]
+    canonical["completed_sources"] = len(completed)
+    canonical["full_completed"] = sum(
+        source.get("profile") == ExtractionProfile.FULL.value for source in completed
+    )
+    canonical["ioc_rules_completed"] = sum(
+        source.get("profile") == ExtractionProfile.IOC_RULES.value for source in completed
+    )
+    canonical["cache_hits"] = sum(
+        source.get("status") in {"cached", "reused"} for source in canonical.get("sources", [])
+    )
+    canonical["skipped_sources"] = sum(
+        source.get("status") in {"omitted", "failed"} for source in canonical.get("sources", [])
+    )
+    for key in (
+        "stage_started_at",
+        "last_call_at",
+        "last_call_duration_ms",
+        "current_model_run_id",
+        "current_model_call_started_at",
+        "current_source_id",
+        "current_chunk_index",
+    ):
+        canonical[key] = live.get(key)
+    canonical["model_calls"] = live.get("model_calls", canonical.get("model_calls", 0))
+
+
+def _should_persist_live_extraction_progress(
+    event: ExtractionProgressEvent, *, elapsed_seconds: float
+) -> bool:
+    """Keep progress-only updates at 2s while always recording call boundaries."""
+    if event.event in {"call_started", "call_finished"}:
+        return True
+    if event.status in {"succeeded", "failed", "reused", "omitted"}:
+        return True
+    return elapsed_seconds >= 2.0
 
 
 def _repair_evidence(
@@ -1220,6 +1307,95 @@ class ProductionWorkflowOrchestrator:
         if reused is not None:
             return reused
 
+        stage_started_at = datetime.now(UTC)
+        progress = _canonical_extraction_progress(plan)
+        progress.update(
+            {
+                "stage_started_at": stage_started_at.isoformat(),
+                "current_model_run_id": None,
+                "current_model_call_started_at": None,
+                "current_source_id": None,
+                "current_chunk_index": None,
+                "last_call_at": None,
+                "last_call_duration_ms": None,
+            }
+        )
+        progress_by_id = {source["source_id"]: source for source in progress["sources"]}
+        last_persisted_at = time.monotonic()
+
+        async def persist_best_effort(snapshot: dict[str, Any] | None = None) -> None:
+            nonlocal last_persisted_at
+            try:
+                await self._persist_extraction_progress(run.id, snapshot or progress)
+                last_persisted_at = time.monotonic()
+            except Exception:
+                # Progress is observability only and must not change the stage
+                # result, cancellation fence, or retry classification.
+                _LOGGER.exception("Could not persist extraction progress for run %s", run.id)
+
+        def refresh_counts() -> None:
+            completed = [
+                source
+                for source in progress["sources"]
+                if source.get("status") in {*EXTRACTION_PROGRESS_COMPLETED_STATUSES, "reused"}
+            ]
+            progress["completed_sources"] = len(completed)
+            progress["full_completed"] = sum(
+                source.get("profile") == ExtractionProfile.FULL.value for source in completed
+            )
+            progress["ioc_rules_completed"] = sum(
+                source.get("profile") == ExtractionProfile.IOC_RULES.value for source in completed
+            )
+            progress["cache_hits"] = sum(
+                source.get("status") in {"cached", "reused"} for source in progress["sources"]
+            )
+            progress["skipped_sources"] = sum(
+                source.get("status") in {"omitted", "failed"} for source in progress["sources"]
+            )
+
+        async def on_progress(event: ExtractionProgressEvent) -> None:
+            for source_id in event.source_ids:
+                source = progress_by_id.get(str(source_id))
+                if source is None:
+                    continue
+                if event.status is not None:
+                    source["status"] = event.status
+                source["chunks_done"] = event.chunks_done
+                source["chunks_total"] = event.chunks_total
+                source["chunks_total_is_estimate"] = event.chunks_total_is_estimate
+            progress["model_calls"] = event.model_calls
+            progress["last_call_at"] = (
+                event.last_call_at.isoformat() if event.last_call_at is not None else None
+            )
+            progress["last_call_duration_ms"] = event.last_call_duration_ms
+            if event.event == "call_started":
+                progress["current_model_run_id"] = (
+                    str(event.current_model_run_id)
+                    if event.current_model_run_id is not None
+                    else None
+                )
+                progress["current_model_call_started_at"] = (
+                    event.current_model_call_started_at.isoformat()
+                    if event.current_model_call_started_at is not None
+                    else None
+                )
+                progress["current_source_id"] = (
+                    str(event.source_ids[0]) if event.source_ids else None
+                )
+                progress["current_chunk_index"] = event.current_chunk_index
+            elif event.event == "call_finished":
+                progress["current_model_run_id"] = None
+                progress["current_model_call_started_at"] = None
+                progress["current_source_id"] = None
+                progress["current_chunk_index"] = None
+            refresh_counts()
+            if _should_persist_live_extraction_progress(
+                event, elapsed_seconds=time.monotonic() - last_persisted_at
+            ):
+                await persist_best_effort()
+
+        await persist_best_effort()
+
         calls = 0
 
         async def before_model_call() -> None:
@@ -1231,25 +1407,31 @@ class ProductionWorkflowOrchestrator:
 
         try:
             execution = await service.execute(
-                run=run, snapshot=snapshot, plan=plan, before_model_call=before_model_call
+                run=run,
+                snapshot=snapshot,
+                plan=plan,
+                before_model_call=before_model_call,
+                on_progress=on_progress,
             )
         except ModelGatewayError as exc:
             # Only a proven pre-submission failure is retryable; the retry
             # reuses the same deterministic ModelRun identities.
+            progress["current_model_run_id"] = None
+            progress["current_model_call_started_at"] = None
+            progress["current_source_id"] = None
+            progress["current_chunk_index"] = None
+            await persist_best_effort()
             return self._handle_stage_exception(run, "extraction", exc)
         extraction = execution.extraction
         if not execution.succeeded or extraction is None:
             failed_source_id = execution.details.get("source_document_id")
-            await self._persist_extraction_progress(
-                run.id,
-                _canonical_extraction_progress(
-                    plan,
-                    model_calls=execution.model_calls,
-                    failed_source_id=(
-                        failed_source_id if isinstance(failed_source_id, str) else None
-                    ),
-                ),
+            final_progress = _canonical_extraction_progress(
+                plan,
+                model_calls=execution.model_calls,
+                failed_source_id=(failed_source_id if isinstance(failed_source_id, str) else None),
             )
+            _merge_live_extraction_progress(final_progress, progress)
+            await persist_best_effort(final_progress)
             return {
                 "stage": "extraction",
                 "status": "needs_review",
@@ -1323,10 +1505,11 @@ class ProductionWorkflowOrchestrator:
                     effective_artifact_id = str(effective_artifact.id)
                 await replay_uow.commit()
 
-        progress = _canonical_extraction_progress(
+        final_progress = _canonical_extraction_progress(
             plan, extraction=extraction, model_calls=execution.model_calls
         )
-        await self._persist_extraction_progress(run.id, progress)
+        _merge_live_extraction_progress(final_progress, progress)
+        await persist_best_effort(final_progress)
         return {
             "stage": "extraction",
             "status": "success",

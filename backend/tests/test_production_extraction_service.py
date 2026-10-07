@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import date
 from types import SimpleNamespace
 from typing import Any
@@ -40,6 +41,7 @@ from cti_app.application.production_parsers import (
     Q2SourceOutput,
 )
 from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_workflow import _canonical_extraction_progress
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -60,6 +62,7 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
@@ -696,7 +699,7 @@ def test_plan_profile_follows_tier_and_never_role() -> None:
     assert profiles["https://example.test/other-1"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-2"] is ExtractionProfile.IOC_RULES
     assert profiles["https://example.test/other-3"] is ExtractionProfile.IOC_RULES
-    assert plan.profile_policy_version == "production-reference-tier-core-first-v4"
+    assert plan.profile_policy_version == "production-reference-tier-core-first-v5"
 
 
 def test_plan_and_hashes_are_stable_when_corpus_order_changes() -> None:
@@ -1211,6 +1214,12 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     mirror_document, mirror_sha = _register_source(
         world, subject_id=subject_id, url=MIRROR_URL, text=CORE_TEXT
     )
+    distinct_core_document, distinct_core_sha = _register_source(
+        world,
+        subject_id=subject_id,
+        url=CORE_URL,
+        text="Unique core context from another article.\n",
+    )
     support_document, support_sha = _register_source(
         world, subject_id=subject_id, url=SUPPORT_URL, text=SUPPORT_TEXT
     )
@@ -1235,7 +1244,8 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     assert first.status is ExtractionExecutionStatus.SUCCEEDED
     assert len(gateway.calls) == 1
 
-    # The same bytes, reached through a SUPPORTING and a TECHNICAL capture.
+    # The same bytes are now a single IOC_RULES source, so the saved FULL
+    # checkpoint can satisfy its lighter profile.
     support_corpus = _corpus(
         subject_id=subject_id,
         input_hash=snapshot.input_hash,
@@ -1243,24 +1253,27 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
             _reference(
                 url=CORE_URL,
                 tier=ProductionReferenceTier.CORE,
-                document_id=core_document,
-                sha256=core_sha,
+                document_id=distinct_core_document,
+                sha256=distinct_core_sha,
             ),
             _reference(
                 url=MIRROR_URL,
-                tier=ProductionReferenceTier.SUPPORTING,
+                tier=ProductionReferenceTier.TECHNICAL,
                 document_id=mirror_document,
                 sha256=mirror_sha,
+                kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
             ),
             _reference(
                 url=SUPPORT_URL,
                 tier=ProductionReferenceTier.TECHNICAL,
                 document_id=support_document,
                 sha256=support_sha,
+                kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
             ),
         ),
     )
     _publish(world, support_corpus)
+    gateway.outputs["loader.security-lab.io"] = _support_output()
 
     second = await _execute(
         world,
@@ -1272,7 +1285,7 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     )
 
     assert second.status is ExtractionExecutionStatus.SUCCEEDED
-    assert len(gateway.calls) == 2
+    assert len(gateway.calls) == 3
     assert second.extraction is not None
     by_url = {source.canonical_url: source for source in second.extraction.sources}
     # The FULL checkpoint of the same bytes satisfies the lighter profile.
@@ -1315,7 +1328,7 @@ async def test_full_checkpoint_satisfies_ioc_rules_but_not_the_reverse() -> None
     )
 
     assert third.status is ExtractionExecutionStatus.SUCCEEDED
-    assert len(gateway.calls) == 3
+    assert len(gateway.calls) == 4
     assert third.extraction is not None
     upgraded = {source.canonical_url: source for source in third.extraction.sources}[SUPPORT_URL]
     assert upgraded.profile is ExtractionProfile.FULL
@@ -1466,9 +1479,342 @@ async def test_duplicate_content_is_computed_once_and_keeps_both_sources() -> No
     assert by_url[MIRROR_URL].reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
     assert by_url[MIRROR_URL].source_document_id == mirror_document
     assert by_url[MIRROR_URL].content_sha256 == first_sha
-    assert [fact.value for fact in by_url[MIRROR_URL].facts] == [
-        fact.value for fact in by_url[CORE_URL].facts
+    assert by_url[MIRROR_URL].facts == ()
+    assert by_url[MIRROR_URL].events == ()
+    assert by_url[MIRROR_URL].indicators == ()
+    assert by_url[MIRROR_URL].rules == ()
+    assert all(
+        set(fact.source_document_ids) == {first_document, mirror_document}
+        for fact in by_url[CORE_URL].facts
+    )
+
+
+async def test_exact_duplicate_content_shares_one_full_call_across_profiles() -> None:
+    world = _World()
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    core_document, core_sha = _register_source(
+        world, subject_id=subject_id, url=CORE_URL, text=CORE_TEXT
+    )
+    technical_document, technical_sha = _register_source(
+        world, subject_id=subject_id, url=TECH_URL, text=CORE_TEXT
+    )
+    assert core_sha == technical_sha
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core_document,
+                sha256=core_sha,
+            ),
+            _reference(
+                url=TECH_URL,
+                tier=ProductionReferenceTier.TECHNICAL,
+                document_id=technical_document,
+                sha256=technical_sha,
+                kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    gateway = _StructuredGateway({"ExampleRAT": _full_output()})
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.model_calls == len(gateway.calls) == 1
+    assert execution.extraction is not None
+    by_url = {source.canonical_url: source for source in execution.extraction.sources}
+    assert by_url[CORE_URL].profile is ExtractionProfile.FULL
+    assert by_url[TECH_URL].profile is ExtractionProfile.IOC_RULES
+    assert by_url[TECH_URL].reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
+    assert by_url[TECH_URL].checkpoint_id == by_url[CORE_URL].checkpoint_id
+    assert by_url[TECH_URL].facts == by_url[TECH_URL].events == ()
+    assert by_url[TECH_URL].indicators == by_url[TECH_URL].rules == ()
+    assert all(
+        set(indicator.source_document_ids) == {core_document, technical_document}
+        for indicator in by_url[CORE_URL].indicators
+    )
+
+
+async def test_cross_profile_duplicate_aliases_a_later_full_representative() -> None:
+    world = _World()
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    core_document, core_sha = _register_source(
+        world, subject_id=subject_id, url=CORE_URL, text=CORE_TEXT
+    )
+    ioc_document, ioc_sha = _register_source(
+        world, subject_id=subject_id, url=SUPPORT_URL, text=SUPPORT_TEXT
+    )
+    full_document, full_sha = _register_source(
+        world,
+        subject_id=subject_id,
+        url="https://example.test/z-full",
+        text=SUPPORT_TEXT,
+    )
+    assert ioc_sha == full_sha
+    context_reference = replace(
+        _reference(
+            url=SUPPORT_URL,
+            tier=ProductionReferenceTier.SUPPORTING,
+            document_id=ioc_document,
+            sha256=ioc_sha,
+        ),
+        editorial_role=ProductionEditorialRole.CONTEXT,
+    )
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=core_document,
+                sha256=core_sha,
+            ),
+            context_reference,
+            _reference(
+                url="https://example.test/z-full",
+                tier=ProductionReferenceTier.SUPPORTING,
+                document_id=full_document,
+                sha256=full_sha,
+                role=SourceRole.INDEPENDENT,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    gateway = _StructuredGateway(
+        {"ExampleRAT": _full_output(), "loader.security-lab.io": _support_output()}
+    )
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.model_calls == len(gateway.calls) == 2
+    assert execution.extraction is not None
+    by_url = {source.canonical_url: source for source in execution.extraction.sources}
+    assert by_url[SUPPORT_URL].profile is ExtractionProfile.IOC_RULES
+    assert by_url[SUPPORT_URL].reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
+    assert by_url["https://example.test/z-full"].profile is ExtractionProfile.FULL
+    assert by_url["https://example.test/z-full"].reuse_state is ExtractionReuseState.FRESH
+    assert by_url[SUPPORT_URL].indicators == ()
+    assert [indicator.value for indicator in by_url["https://example.test/z-full"].indicators] == [
+        "loader.security-lab.io"
     ]
+    assert set(by_url["https://example.test/z-full"].indicators[0].source_document_ids) == {
+        ioc_document,
+        full_document,
+    }
+
+
+async def test_query_variant_with_same_effective_text_is_extracted_once() -> None:
+    base_url = "https://www.anthropic.com/threat-intelligence-report-september-2026"
+    page_url = f"{base_url}?page=1"
+    world = _World()
+    subject_id = uuid4()
+    snapshot = _snapshot(subject_id)
+    first_document, first_sha = _register_source(
+        world, subject_id=subject_id, url=base_url, text=CORE_TEXT
+    )
+    page_document, page_sha = _register_source(
+        world,
+        subject_id=subject_id,
+        url=page_url,
+        text=CORE_TEXT.replace("\n", "\r\n"),
+    )
+    assert first_sha != page_sha
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=base_url,
+                tier=ProductionReferenceTier.CORE,
+                document_id=first_document,
+                sha256=first_sha,
+            ),
+            _reference(
+                url=page_url,
+                tier=ProductionReferenceTier.CORE,
+                document_id=page_document,
+                sha256=page_sha,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    gateway = _StructuredGateway({"ExampleRAT": _full_output()})
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.model_calls == len(gateway.calls) == 1
+    assert execution.extraction is not None
+    assert {source.canonical_url for source in corpus.sources} == {base_url, page_url}
+    by_url = {source.canonical_url: source for source in execution.extraction.sources}
+    assert set(by_url) == {base_url, page_url}
+    canonical = by_url[base_url]
+    duplicate = by_url[page_url]
+    assert canonical.reuse_state is ExtractionReuseState.FRESH
+    assert duplicate.reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
+    assert canonical.checkpoint_id == duplicate.checkpoint_id
+    assert canonical.content_sha256 == first_sha
+    assert duplicate.content_sha256 == page_sha
+    assert duplicate.facts == duplicate.events == duplicate.indicators == duplicate.rules == ()
+    identities = {
+        "facts": lambda item: (item.category, item.value.casefold()),
+        "events": lambda item: (item.event_date, item.text.casefold()),
+        "indicators": lambda item: (item.artifact_type, item.value.casefold()),
+        "rules": lambda item: (item.rule_type, item.sha256),
+    }
+    for field, identity in identities.items():
+        values = [
+            item for source in execution.extraction.sources for item in getattr(source, field)
+        ]
+        assert len(values) == len({identity(item) for item in values})
+
+
+async def test_multi_case_extraction_sends_and_persists_only_the_subject_case() -> None:
+    html = """
+    <article>
+      <p>Report preamble shared by cases.</p>
+      <h2>GTG-15001: unrelated case</h2>
+      <p>OtherCaseRAT and other.security-lab.io.</p>
+      <h2>GTG-30004: target case</h2>
+      <p>TargetRAT and target.security-lab.io.</p>
+    </article>
+    """
+    world = _World()
+    subject_id = uuid4()
+    snapshot = replace(
+        _snapshot(subject_id),
+        subject_title="Threat activity GTG-30004",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    document_id, sha256 = _register_source(world, subject_id=subject_id, url=CORE_URL, text=html)
+    world.documents.rows[document_id].detected_mime_type = "text/html"
+    corpus = _corpus(
+        subject_id=subject_id,
+        input_hash=snapshot.input_hash,
+        sources=(
+            _reference(
+                url=CORE_URL,
+                tier=ProductionReferenceTier.CORE,
+                document_id=document_id,
+                sha256=sha256,
+            ),
+        ),
+    )
+    _publish(world, corpus)
+    gateway = _StructuredGateway(
+        {
+            "GTG-30004": Q2SourceOutput(
+                facts=[
+                    Q2FactProposal(category="malware", value="TargetRAT"),
+                    Q2FactProposal(category="malware", value="OtherCaseRAT"),
+                ],
+                artifacts=[
+                    Q2ArtifactProposal(
+                        value="target.security-lab.io",
+                        artifact_type="domain",
+                        indicator_status="confirmed_ioc",
+                    ),
+                    Q2ArtifactProposal(
+                        value="other.security-lab.io",
+                        artifact_type="domain",
+                        indicator_status="confirmed_ioc",
+                    ),
+                ],
+            )
+        }
+    )
+
+    execution = await _execute(
+        world, gateway, corpus=corpus, subject_id=subject_id, snapshot=snapshot
+    )
+
+    assert execution.status is ExtractionExecutionStatus.SUCCEEDED
+    assert execution.extraction is not None and execution.plan is not None
+    assert execution.model_calls == 1
+    assert len(gateway.calls) == 1
+    assert "Report preamble shared by cases." in gateway.calls[0].text
+    assert "TargetRAT" in gateway.calls[0].text
+    assert "OtherCaseRAT" not in gateway.calls[0].text
+    assert "other.security-lab.io" not in gateway.calls[0].text
+    source = execution.extraction.sources[0]
+    assert [fact.value for fact in source.facts] == ["TargetRAT"]
+    assert [indicator.value for indicator in source.indicators] == ["target.security-lab.io"]
+    assert source.scope is not None
+    assert source.scope.case_id == "GTG-30004"
+    assert "extraction_scoped_to_case:GTG-30004:1/2" in execution.extraction.warnings
+    progress = _canonical_extraction_progress(
+        execution.plan,
+        extraction=execution.extraction,
+        model_calls=execution.model_calls,
+    )
+    progress_source = progress["sources"][0]
+    assert progress_source["scope"]["case_id"] == "GTG-30004"
+    assert {
+        "source_id",
+        "canonical_url",
+        "tier",
+        "profile",
+        "status",
+        "reuse_state",
+        "ioc_count",
+        "rule_count",
+        "chunks_done",
+        "chunks_total",
+        "chunks_total_is_estimate",
+    } <= set(progress_source)
+
+
+def test_near_duplicate_reuse_requires_same_location_allowed_query_and_threshold() -> None:
+    base_url = "https://example.test/report?edition=september"
+    page_url = f"{base_url}&page=1"
+    first = _reference(
+        url=base_url,
+        tier=ProductionReferenceTier.CORE,
+        document_id=uuid4(),
+        sha256="a" * 64,
+    )
+    second = _reference(
+        url=page_url,
+        tier=ProductionReferenceTier.CORE,
+        document_id=uuid4(),
+        sha256="b" * 64,
+    )
+    plan = build_extraction_plan(
+        _corpus(subject_id=uuid4(), input_hash="c" * 64, sources=(first, second))
+    )
+    first_source, second_source = plan.sources
+    original = "The report describes a threat actor and its operation. " * 20
+    near = original[:-1] + "!"
+
+    assert production_extraction.NEAR_DUPLICATE_EVIDENCE_SIMILARITY_THRESHOLD == 0.999
+    assert production_extraction._can_reuse_near_duplicate(
+        first_source, second_source, first_text=original, second_text=near
+    )
+    assert not production_extraction._can_reuse_near_duplicate(
+        first_source,
+        second_source,
+        first_text=original,
+        second_text=original.replace("threat actor", "unrelated material"),
+    )
+    other_path = replace(second_source, canonical_url="https://example.test/other?example=1")
+    assert not production_extraction._can_reuse_near_duplicate(
+        first_source, other_path, first_text=original, second_text=near
+    )
 
 
 async def test_ioc_rules_batch_keeps_an_unambiguous_source_mapping() -> None:

@@ -150,6 +150,13 @@ class EditionProductionCancellationResult:
     changed: bool
 
 
+@dataclass(frozen=True, slots=True)
+class EditionProductionBatchControlResult:
+    edition: Edition
+    batch: EditionProductionBatch
+    changed: bool
+
+
 async def capture_production_input_snapshot(
     uow: ProductionUnitOfWork,
     *,
@@ -967,6 +974,70 @@ class ProductionBatchService:
                 changed=True,
             )
 
+    async def pause_batch_with_result(
+        self,
+        edition_id: UUID,
+        batch_id: UUID,
+        *,
+        actor_id: str,
+    ) -> EditionProductionBatchControlResult:
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get_for_update(edition_id)
+            if edition is None:
+                raise EditionProductionBatchNotFoundError(str(edition_id))
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("production_edition_archived")
+
+            batch = await uow.edition_production_batches.get_for_update(batch_id)
+            if batch is None:
+                raise EditionProductionBatchNotFoundError(str(batch_id))
+            if batch.edition_id != edition_id:
+                raise EditionProductionBatchOwnershipError(
+                    "Production batch does not belong to this edition"
+                )
+            active = await uow.edition_production_batches.get_active_for_edition(edition_id)
+            if active is not None and active.id != batch.id:
+                raise StaleEditionProductionBatchError(
+                    "A newer production batch is active for this edition"
+                )
+
+            changed = batch.pause(actor_id=actor_id)
+            if changed:
+                await uow.edition_production_batches.save(batch)
+            await uow.commit()
+            return EditionProductionBatchControlResult(edition, batch, changed)
+
+    async def resume_batch_with_result(
+        self,
+        edition_id: UUID,
+        batch_id: UUID,
+    ) -> EditionProductionBatchControlResult:
+        async with self._uow_factory() as uow:
+            edition = await uow.editions.get_for_update(edition_id)
+            if edition is None:
+                raise EditionProductionBatchNotFoundError(str(edition_id))
+            if edition.state is EditionStatus.ARCHIVED:
+                raise ValueError("production_edition_archived")
+
+            batch = await uow.edition_production_batches.get_for_update(batch_id)
+            if batch is None:
+                raise EditionProductionBatchNotFoundError(str(batch_id))
+            if batch.edition_id != edition_id:
+                raise EditionProductionBatchOwnershipError(
+                    "Production batch does not belong to this edition"
+                )
+            active = await uow.edition_production_batches.get_active_for_edition(edition_id)
+            if active is not None and active.id != batch.id:
+                raise StaleEditionProductionBatchError(
+                    "A newer production batch is active for this edition"
+                )
+
+            changed = batch.resume()
+            if changed:
+                await uow.edition_production_batches.save(batch)
+            await uow.commit()
+            return EditionProductionBatchControlResult(edition, batch, changed)
+
     async def _get_batch_for_update_in_lock_order(
         self,
         uow: ProductionUnitOfWork,
@@ -1003,6 +1074,8 @@ class ProductionBatchService:
         whole decision; the caller commits and dispatches afterwards.
         """
         items = await uow.edition_production_batch_items.list_for_batch(batch.id)
+        if batch.status is ProductionBatchStatus.PAUSED:
+            return None
         if batch.status is ProductionBatchStatus.CANCELLED:
             for item in items:
                 run = await uow.production_runs.get_for_update(item.production_run_id)

@@ -18,7 +18,9 @@ const TIER_LABELS: Record<ExtractionProgressSource["tier"], string> = {
 
 const SOURCE_STATUS_LABELS: Record<ExtractionProgressSourceStatus, string> = {
   pending: "En attente",
+  running: "En cours",
   cached: "Résultat existant",
+  reused: "Réutilisé",
   succeeded: "Terminé",
   failed: "Échec",
   omitted: "Non éligible dans le corpus",
@@ -26,7 +28,9 @@ const SOURCE_STATUS_LABELS: Record<ExtractionProgressSourceStatus, string> = {
 
 const SOURCE_STATUS_ICONS: Record<ExtractionProgressSourceStatus, string> = {
   pending: "○",
+  running: "◉",
   cached: "✓",
+  reused: "↻",
   succeeded: "✓",
   failed: "×",
   omitted: "–",
@@ -34,7 +38,8 @@ const SOURCE_STATUS_ICONS: Record<ExtractionProgressSourceStatus, string> = {
 
 function statusLabel(source: ExtractionProgressSource): string {
   const label = SOURCE_STATUS_LABELS[source.status];
-  return source.reuse_state === "content_duplicate"
+  return source.reuse_state === "duplicate_content" ||
+    source.reuse_state === "content_duplicate"
     ? `${label} · contenu identique à une autre source`
     : label;
 }
@@ -93,6 +98,26 @@ export function ExtractionProgressView({
             <span className="extraction-progress__source-status">
               {statusLabel(source)}
             </span>
+            {source.scope ? (
+              <span className="extraction-progress__scope">
+                Cas {source.scope.case_id} · {source.scope.kept_sections}/
+                {source.scope.total_sections} sections ·{" "}
+                {source.scope.kept_chars}/{source.scope.total_chars} caractères
+              </span>
+            ) : null}
+            {source.chunks_total != null && source.chunks_total > 0 ? (
+              <span className="extraction-progress__chunks">
+                <progress
+                  max={source.chunks_total}
+                  value={Math.min(source.chunks_done ?? 0, source.chunks_total)}
+                  aria-label={`Tranches terminées pour ${source.title?.trim() || source.canonical_url}`}
+                />
+                <span>
+                  {source.chunks_done ?? 0} / {source.chunks_total} tranches
+                  {source.chunks_total_is_estimate ? " (estimées)" : ""}
+                </span>
+              </span>
+            ) : null}
           </li>
         ))}
       </ul>
