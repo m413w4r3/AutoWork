@@ -38,6 +38,7 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
+    ExtractionReuseState,
     ProductionExtractionV1,
     decode_indicator_section_paths,
 )
@@ -395,7 +396,9 @@ def _validate_publication_lineage(
             )
 
 
-ASSEMBLY_POLICY_VERSION: Final[str] = "8-adaptive-synthesis-section-headings"
+# V9 changes only PUBLICATION presentation: identical archived content now has
+# one deterministic reader-facing source entry. Upstream artifacts remain valid.
+ASSEMBLY_POLICY_VERSION: Final[str] = "9-content-identity-reference-deduplication"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -451,27 +454,23 @@ def _project_publication_sources(
     used_source_document_ids: frozenset[UUID] | set[UUID],
 ) -> tuple[PublicationSourceV1, ...]:
     """Project exactly the canonical reference sources used by a publication."""
-    sources_by_id: dict[UUID, ProductionReferenceSourceV1] = {}
+    sources_by_id: dict[UUID, list[ProductionReferenceSourceV1]] = defaultdict(list)
     for source in references.sources:
         source_document_id = source.source_document_id
         if source_document_id is None:
             continue
-        if source_document_id in sources_by_id:
-            raise PublicationAssemblyValidationError(
-                PublicationAssemblyErrorCode.VALIDATION_FAILED,
-                f"Canonical reference corpus repeats source_document_id {source_document_id}",
-            )
-        sources_by_id[source_document_id] = source
+        sources_by_id[source_document_id].append(source)
 
     publication_sources: list[PublicationSourceV1] = []
     for source_document_id in sorted(used_source_document_ids, key=str):
-        resolved_source = sources_by_id.get(source_document_id)
-        if resolved_source is None:
+        matching_sources = sources_by_id.get(source_document_id)
+        if not matching_sources:
             raise PublicationAssemblyValidationError(
                 PublicationAssemblyErrorCode.SOURCE_MISSING,
                 "Used publication source is absent from the canonical reference corpus: "
                 f"{source_document_id}",
             )
+        resolved_source = min(matching_sources, key=_publication_reference_source_order)
         publication_sources.append(
             PublicationSourceV1(
                 source_document_id=source_document_id,
@@ -495,6 +494,119 @@ def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
     return f"{publisher} publie « {(source.title or '').strip() or source.canonical_url} »."
 
 
+def _publication_reference_source_order(source: ProductionReferenceSourceV1) -> tuple[Any, ...]:
+    """Stable reader-facing representative order for proven duplicate sources."""
+    tier_order = {
+        ProductionReferenceTier.CORE: 0,
+        ProductionReferenceTier.SUPPORTING: 1,
+        ProductionReferenceTier.TECHNICAL: 2,
+    }
+    return (
+        tier_order[source.tier],
+        bool(urlsplit(source.canonical_url).query),
+        len(source.canonical_url),
+        source.canonical_url,
+        str(source.source_document_id or ""),
+    )
+
+
+def _publication_reference_groups(
+    *,
+    references: ProductionReferenceCorpusV1,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+) -> tuple[tuple[ProductionReferenceSourceV1, ...], ...]:
+    """Group cited/full-read publication sources only when identity is proven.
+
+    Equal archive SHA-256 values are sufficient proof. Extraction's
+    ``duplicate_content`` state can also connect rows that share the same
+    durable extraction checkpoint. That state does not persist the representative
+    source ID, so the flag alone is not enough to guess a pairing.
+    """
+    corpus_sources_by_id: dict[UUID, list[ProductionReferenceSourceV1]] = defaultdict(list)
+    for source in references.sources:
+        if source.source_document_id is not None:
+            corpus_sources_by_id[source.source_document_id].append(source)
+    extraction_by_id = {source.source_document_id: source for source in extraction.sources}
+
+    candidate_ids = {ref.source_document_id for ref in synthesis_evidence_refs(synthesis)}
+    candidate_ids.update(
+        source.source_document_id
+        for source in extraction.sources
+        if source.profile is ExtractionProfile.FULL
+    )
+
+    candidates: dict[UUID, ProductionReferenceSourceV1] = {}
+    for source_id in candidate_ids:
+        matching_sources = corpus_sources_by_id.get(source_id)
+        if not matching_sources:
+            continue
+        source = min(matching_sources, key=_publication_reference_source_order)
+        if source.kind is ProductionReferenceKind.PUBLICATION and source.tier in {
+            ProductionReferenceTier.CORE,
+            ProductionReferenceTier.SUPPORTING,
+        }:
+            candidates[source_id] = source
+
+    parent_by_id = {source_id: source_id for source_id in candidates}
+
+    def root(source_id: UUID) -> UUID:
+        parent = parent_by_id[source_id]
+        while parent != parent_by_id[parent]:
+            parent = parent_by_id[parent]
+        while source_id != parent:
+            next_id = parent_by_id[source_id]
+            parent_by_id[source_id] = parent
+            source_id = next_id
+        return parent
+
+    def union(left: UUID, right: UUID) -> None:
+        left_root = root(left)
+        right_root = root(right)
+        if left_root == right_root:
+            return
+        lower, higher = sorted((left_root, right_root), key=str)
+        parent_by_id[higher] = lower
+
+    by_content_sha256: dict[str, list[UUID]] = defaultdict(list)
+    by_checkpoint: dict[UUID, list[UUID]] = defaultdict(list)
+    for source_id, source in candidates.items():
+        extraction_source = extraction_by_id.get(source_id)
+        content_sha256 = source.content_sha256 or (
+            extraction_source.content_sha256 if extraction_source is not None else None
+        )
+        if content_sha256 is not None:
+            by_content_sha256[content_sha256].append(source_id)
+        if extraction_source is not None and extraction_source.checkpoint_id is not None:
+            by_checkpoint[extraction_source.checkpoint_id].append(source_id)
+
+    for grouped_ids in by_content_sha256.values():
+        if len(grouped_ids) < 2:
+            continue
+        first_id = min(grouped_ids, key=str)
+        for source_id in grouped_ids:
+            union(first_id, source_id)
+
+    for grouped_ids in by_checkpoint.values():
+        if len(grouped_ids) < 2 or not any(
+            extraction_by_id[source_id].reuse_state is ExtractionReuseState.CONTENT_DUPLICATE
+            for source_id in grouped_ids
+        ):
+            continue
+        first_id = min(grouped_ids, key=str)
+        for source_id in grouped_ids:
+            union(first_id, source_id)
+
+    groups: dict[UUID, list[ProductionReferenceSourceV1]] = defaultdict(list)
+    for source_id, source in candidates.items():
+        groups[root(source_id)].append(source)
+
+    return tuple(
+        tuple(sorted(group, key=_publication_reference_source_order))
+        for _, group in sorted(groups.items(), key=lambda item: str(item[0]))
+    )
+
+
 def _project_publication_references(
     *,
     references: ProductionReferenceCorpusV1,
@@ -503,32 +615,33 @@ def _project_publication_references(
 ) -> tuple[PublicationReferenceEntryV1, ...]:
     """One entry per core/supporting publication cited by the synthesis or read in full.
 
-    The note comes from the synthesis; a source without one keeps a deterministic note so
-    it is never dropped from the references.
+    A representative's synthesis note wins; otherwise the first note in stable
+    representative order supplies the text. Evidence refs from every note in the
+    proven duplicate group remain attached to the reader-facing representative.
     """
-    corpus_by_id = {
-        source.source_document_id: source
-        for source in references.sources
-        if source.source_document_id is not None
-    }
-    candidate_ids = {ref.source_document_id for ref in synthesis_evidence_refs(synthesis)}
-    candidate_ids |= {
-        source.source_document_id
-        for source in extraction.sources
-        if source.profile is ExtractionProfile.FULL
-    }
-    candidate_ids &= {source.source_document_id for source in extraction.sources}
     notes = {note.source_document_id: note for note in synthesis.source_notes}
     entries: list[PublicationReferenceEntryV1] = []
-    for source_id in candidate_ids:
-        source = corpus_by_id.get(source_id)
-        if (
-            source is None
-            or source.kind is not ProductionReferenceKind.PUBLICATION
-            or source.tier not in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
-        ):
-            continue
-        note = notes.get(source_id)
+    for group in _publication_reference_groups(
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+    ):
+        source = group[0]
+        source_id = source.source_document_id
+        assert source_id is not None
+        group_notes = tuple(
+            note
+            for member in group
+            if member.source_document_id is not None
+            and (note := notes.get(member.source_document_id)) is not None
+        )
+        note = group_notes[0] if group_notes else None
+        evidence_refs = tuple(
+            sorted(
+                {ref for group_note in group_notes for ref in group_note.evidence_refs},
+                key=evidence_ref_sort_key,
+            )
+        )
         entries.append(
             PublicationReferenceEntryV1(
                 source_document_id=source_id,
@@ -539,7 +652,7 @@ def _project_publication_references(
                         kind=PublicationEvidenceKind(ref.kind.value),
                         evidence_key=ref.evidence_key,
                     )
-                    for ref in (note.evidence_refs if note else ())
+                    for ref in evidence_refs
                 ),
             )
         )
@@ -804,6 +917,9 @@ def build_publication_document_v5(
     diagrams = _project_publication_diagrams(editorial_enrichment.diagrams)
     figures = _project_publication_figures(editorial_enrichment.source_figures)
     additional_source_ids = {item.source_document_id for item in reference_entries}
+    additional_source_ids.update(
+        ref.source_document_id for item in reference_entries for ref in item.evidence_refs
+    )
     additional_source_ids.update(
         source_id
         for group in projection.original_indicators

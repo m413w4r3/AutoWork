@@ -128,7 +128,10 @@ from cti_app.domain.publication_document import (
     PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
     PublicationDiagramV1,
     PublicationDocumentV4,
+    PublicationDocumentV5,
     publication_document_v4_to_json,
+    publication_document_v5_from_json,
+    publication_document_v5_to_json,
 )
 from cti_app.domain.publication_render import compute_publication_render_input_hash
 from cti_app.domain.semantic_annotation import SEMANTIC_ANNOTATION_POLICY_VERSION
@@ -733,8 +736,250 @@ def _canonical_inputs() -> tuple[
     return snapshot, references, extraction, synthesis
 
 
+def _publication_case_with_content_variants(
+    content_hashes: tuple[str, ...],
+    *,
+    reverse_sources: bool = False,
+    shared_duplicate_checkpoint: bool = False,
+) -> tuple[
+    ProductionInputSnapshot,
+    ProductionReferenceCorpusV1,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+]:
+    snapshot, base_references, base_extraction, base_synthesis = _canonical_inputs()
+    core_reference = replace(base_references.sources[0], published_at=date(2025, 1, 10))
+    checkpoint_id = UUID(int=900) if shared_duplicate_checkpoint else None
+    core_extraction = replace(base_extraction.sources[0], checkpoint_id=checkpoint_id)
+    reference_sources = [core_reference]
+    extraction_sources = [core_extraction]
+    alias_ids: list[UUID] = []
+
+    for index, content_hash in enumerate(content_hashes, start=1):
+        source_id = UUID(int=200 + index)
+        source_url = f"https://example.com/report?page={index}"
+        alias_ids.append(source_id)
+        reference_sources.append(
+            replace(
+                core_reference,
+                canonical_url=source_url,
+                tier=ProductionReferenceTier.SUPPORTING,
+                role=SourceRole.UNKNOWN,
+                editorial_role=ProductionEditorialRole.CONTEXT,
+                title=f"Report page {index}",
+                published_at=date(2025, 1, 5 + index),
+                source_collection_id=UUID(int=300 + index),
+                source_document_id=source_id,
+                content_sha256=content_hash,
+                relevance_reason="Same reporting page collected with another URL",
+            )
+        )
+        extraction_sources.append(
+            replace(
+                core_extraction,
+                source_document_id=source_id,
+                canonical_url=source_url,
+                content_sha256=content_hash,
+                tier=ProductionReferenceTier.SUPPORTING,
+                role=SourceRole.UNKNOWN,
+                profile=ExtractionProfile.IOC_RULES,
+                checkpoint_id=checkpoint_id,
+                reuse_state=(
+                    ExtractionReuseState.CONTENT_DUPLICATE
+                    if content_hash == core_reference.content_sha256 or shared_duplicate_checkpoint
+                    else ExtractionReuseState.FRESH
+                ),
+                facts=tuple(
+                    replace(fact, source_document_ids=(source_id,))
+                    for fact in core_extraction.facts
+                ),
+                editorial_role=ProductionEditorialRole.CONTEXT,
+                profile_reason_code=ExtractionProfileReasonCode.SUPPORTING_CONTEXT,
+            )
+        )
+
+    if reverse_sources:
+        reference_sources.reverse()
+        extraction_sources.reverse()
+    references = replace(base_references, sources=tuple(reference_sources))
+    extraction = replace(
+        base_extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=tuple(extraction_sources),
+    )
+    evidence_refs = extraction_evidence_refs_v1(extraction)
+    note_source_id = alias_ids[-1]
+    note_evidence_ref = next(
+        ref for ref in evidence_refs if ref.source_document_id == note_source_id
+    )
+    lead_evidence_ref = next(
+        ref for ref in evidence_refs if ref.source_document_id == core_reference.source_document_id
+    )
+    synthesis = replace(
+        base_synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        lead=(SynthesisParagraphV1("Example finding.", (lead_evidence_ref,)),),
+        source_notes=(
+            SynthesisSourceNoteV1(
+                source_document_id=note_source_id,
+                text="The query variant confirms the reported finding.",
+                evidence_refs=(note_evidence_ref,),
+            ),
+        ),
+    )
+    return snapshot, references, extraction, synthesis
+
+
+def _build_publication_for_content_variants(
+    content_hashes: tuple[str, ...],
+    *,
+    reverse_sources: bool = False,
+    shared_duplicate_checkpoint: bool = False,
+) -> tuple[
+    PublicationDocumentV5,
+    ProductionReferenceCorpusV1,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+]:
+    snapshot, references, extraction, synthesis = _publication_case_with_content_variants(
+        content_hashes,
+        reverse_sources=reverse_sources,
+        shared_duplicate_checkpoint=shared_duplicate_checkpoint,
+    )
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    return publication, references, extraction, synthesis
+
+
+def test_publication_v5_deduplicates_same_archive_but_keeps_source_lineage() -> None:
+    from cti_app.application.typst_rendering import project_publication_to_typst_model
+
+    publication, references, extraction, synthesis = _build_publication_for_content_variants(
+        ("c" * 64,)
+    )
+    representative_id = UUID(int=2)
+    duplicate_id = UUID(int=201)
+
+    assert len(references.sources) == 2
+    assert [item.source_document_id for item in publication.references] == [representative_id]
+    assert publication.references[0].text == ("The query variant confirms the reported finding.")
+    assert any(
+        ref.source_document_id == duplicate_id for ref in publication.references[0].evidence_refs
+    )
+    document_sources = {source.source_document_id: source for source in publication.sources}
+    assert set(document_sources) == {representative_id, duplicate_id}
+    assert document_sources[duplicate_id].canonical_url == "https://example.com/report?page=1"
+    assert all(
+        any(
+            evidence_ref.source_document_id == reference.source_document_id
+            and evidence_ref.kind.value == reference.kind.value
+            and evidence_ref.evidence_key == reference.evidence_key
+            for evidence_ref in extraction_evidence_refs_v1(extraction)
+        )
+        for paragraph in publication.lead
+        for reference in paragraph.evidence_refs
+    )
+    assert any(
+        ref.source_document_id == duplicate_id
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref in synthesis.source_notes[0].evidence_refs
+    )
+    restored = publication_document_v5_from_json(publication_document_v5_to_json(publication))
+    assert restored.references == publication.references
+    assert {source.source_document_id for source in restored.sources} == {
+        representative_id,
+        duplicate_id,
+    }
+
+    reference_anchors = {
+        item.anchor
+        for item in publication.semantic_text.paragraphs
+        if item.anchor.startswith("reference:")
+    }
+    assert reference_anchors == {"reference:0001"}
+    render_model = project_publication_to_typst_model(publication)
+    published_rows = render_model.content_sections[0]["timeline"]
+    assert len(published_rows) == 1
+    assert published_rows[0]["source_urls"] == ["https://example.com/report"]
+    assert published_rows[0]["display_date"] == "10 janvier 2025"
+
+
+def test_publication_v5_keeps_query_variants_without_shared_content_identity() -> None:
+    publication, _, _, _ = _build_publication_for_content_variants(("d" * 64,))
+
+    assert len(publication.references) == 2
+    assert {item.source_document_id for item in publication.references} == {
+        UUID(int=2),
+        UUID(int=201),
+    }
+
+
+def test_publication_v5_deduplicates_repeated_source_document_identity() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    canonical_source = references.sources[0]
+    second_url = replace(
+        canonical_source,
+        canonical_url="https://example.com/report?page=1",
+        source_collection_id=UUID(int=100),
+        tier=ProductionReferenceTier.SUPPORTING,
+        role=SourceRole.UNKNOWN,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        title="Alternate report URL",
+    )
+    references = replace(references, sources=(second_url, canonical_source))
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+    )
+    synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert len(references.sources) == 2
+    assert [item.source_document_id for item in publication.references] == [UUID(int=2)]
+    assert [source.canonical_url for source in publication.sources] == [
+        "https://example.com/report"
+    ]
+
+
+def test_publication_v5_uses_duplicate_extraction_checkpoint_as_content_proof() -> None:
+    publication, _, _, _ = _build_publication_for_content_variants(
+        ("d" * 64,), shared_duplicate_checkpoint=True
+    )
+
+    assert [item.source_document_id for item in publication.references] == [UUID(int=2)]
+
+
+def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_order() -> None:
+    hashes = ("c" * 64, "c" * 64, "c" * 64)
+    first, _, _, _ = _build_publication_for_content_variants(hashes)
+    reversed_input, _, _, _ = _build_publication_for_content_variants(hashes, reverse_sources=True)
+
+    assert len(first.references) == 1
+    assert len(reversed_input.references) == 1
+    assert first.references == reversed_input.references
+    assert first.sources == reversed_input.sources
+    assert first.references[0].source_document_id == UUID(int=2)
+
+
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == (
+        "9-content-identity-reference-deduplication"
+    )
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
@@ -754,7 +999,9 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         ProductionArtifactStore.canonical_json_bytes(payload)
     ).hexdigest()
     legacy_hash = hashlib.sha256(
-        ProductionArtifactStore.canonical_json_bytes({**payload, "assembly_policy_version": "1"})
+        ProductionArtifactStore.canonical_json_bytes(
+            {**payload, "assembly_policy_version": "8-adaptive-synthesis-section-headings"}
+        )
     ).hexdigest()
     assert expected_hash != legacy_hash
     assert (

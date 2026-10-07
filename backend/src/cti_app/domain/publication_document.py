@@ -1172,6 +1172,11 @@ class PublicationDocumentV5:
         reference_source_ids = {item.source_document_id for item in self.references}
         if len(reference_source_ids) != len(self.references):
             raise ValueError("Publication source references must not repeat sources")
+        reference_evidence_source_ids = {
+            ref.source_document_id for item in self.references for ref in item.evidence_refs
+        }
+        if not reference_evidence_source_ids.issubset(sources_by_id):
+            raise ValueError("Publication reference evidence identifies an unknown source")
         for source_id in reference_source_ids:
             source = sources_by_id.get(source_id)
             if (
@@ -1200,11 +1205,14 @@ class PublicationDocumentV5:
             original_values
         ):
             raise ValueError("Publication IOCs must be deduplicated across both groups")
-        if self.document.additional_source_ids != reference_source_ids | indicator_source_ids(
-            self.original_indicators
+        if self.document.additional_source_ids != (
+            reference_source_ids
+            | reference_evidence_source_ids
+            | indicator_source_ids(self.original_indicators)
         ):
             raise ValueError(
-                "Publication source identities do not match references and original IOCs"
+                "Publication source identities do not match references, their evidence, "
+                "and original IOCs"
             )
 
         references = order_publication_references(self.references, self.document.sources)
@@ -1272,6 +1280,9 @@ class PublicationDocumentV5:
             for raw in json_array(document["original_indicators"], "Original IOC groups")
         )
         additional_source_ids = {item.source_document_id for item in references}
+        additional_source_ids.update(
+            ref.source_document_id for item in references for ref in item.evidence_refs
+        )
         additional_source_ids |= indicator_source_ids(original_indicators)
         base_payload = dict(document)
         for key in ("references", "original_indicators", "rich_text"):

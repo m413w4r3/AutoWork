@@ -215,7 +215,7 @@ class PublicationTimelineEntryV1:
 
 @dataclass(frozen=True, slots=True)
 class PublicationReferenceEntryV1:
-    """A dated source publication note linked to its canonical source record."""
+    """A reader-facing source note with evidence retained from its duplicate group."""
 
     source_document_id: UUID
     text: str
@@ -232,8 +232,6 @@ class PublicationReferenceEntryV1:
             raise ValueError("Publication reference evidence refs have an invalid type")
         if len(set(self.evidence_refs)) != len(self.evidence_refs):
             raise ValueError("Publication reference must not repeat evidence refs")
-        if any(ref.source_document_id != self.source_document_id for ref in self.evidence_refs):
-            raise ValueError("Publication reference evidence must belong to its source")
         object.__setattr__(
             self,
             "evidence_refs",
