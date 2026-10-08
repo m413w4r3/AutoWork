@@ -50,14 +50,25 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.editions import Edition
 from cti_app.domain.production import (
+    ExtractionProfile,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionRepairAction,
     ProductionRepairDecision,
     ProductionRepairIssueKind,
+    ProductionRun,
     ProductionRunStatus,
     RepairDecisionApplicationState,
+)
+from cti_app.domain.production_extraction import (
+    EXTRACTION_PROFILE_POLICY_VERSION,
+    ExtractionReuseState,
+    ProductionExtractionOmissionReason,
+    ProductionExtractionOmissionV1,
+    ProductionExtractionV1,
+    ProductionSourceExtractionV1,
+    production_extraction_to_json,
 )
 from cti_app.domain.production_pipeline import downstream_artifacts_from_artifact_stage
 from cti_app.domain.production_references import (
@@ -221,13 +232,15 @@ class _Uow:
         )
 
     async def _get_run(self, run_id: UUID) -> Any:
-        return self._state.run if run_id == self._state.run.id else None
+        return next((run for run in self._state.runs if run.id == run_id), None)
 
     async def _current_run(self, subject_id: UUID) -> Any:
-        return self._state.run if subject_id == SUBJECT_ID else None
+        if subject_id != SUBJECT_ID:
+            return None
+        return max(self._state.runs, key=lambda run: getattr(run, "run_number", 1))
 
     async def _runs_for_edition(self, edition_id: UUID) -> list[Any]:
-        return [self._state.run] if edition_id == EDITION_ID else []
+        return [run for run in self._state.runs if run.edition_id == edition_id]
 
     async def _edition(self, _edition_id: UUID) -> Edition:
         return _edition()
@@ -260,10 +273,13 @@ class _State:
         artifacts: list[ProductionArtifact],
         run: Any,
         row: EditionReviewReadItem,
+        *,
+        runs: list[Any] | None = None,
     ) -> None:
         self.artifacts = _Artifacts(artifacts)
         self.decisions = _Decisions()
         self.run = run
+        self.runs = runs or [run]
         self.row = row
         self.commits = 0
 
@@ -292,6 +308,16 @@ def _run() -> SimpleNamespace:
         requires_reconciliation=False,
         pipeline_generation=0,
         research_date=date(2026, 8, 15),
+    )
+
+
+def _production_run(*, run_number: int, pipeline_generation: int) -> ProductionRun:
+    return ProductionRun(
+        subject_id=SUBJECT_ID,
+        edition_id=EDITION_ID,
+        status=ProductionRunStatus.READY,
+        run_number=run_number,
+        pipeline_generation=pipeline_generation,
     )
 
 
@@ -328,7 +354,10 @@ def _entry(value: str, *, reason_code: str = "source_evidence_missing") -> dict[
 
 
 async def _extraction(
-    store: ProductionArtifactStore, entries: list[dict[str, Any]]
+    store: ProductionArtifactStore,
+    entries: list[dict[str, Any]],
+    *,
+    production_run_id: UUID = RUN_ID,
 ) -> ProductionArtifact:
     evidence_id = await store.put_repair_evidence(build_repair_evidence_pack(entries))
     canonical_id = await store.put_json(
@@ -336,7 +365,7 @@ async def _extraction(
         bucket="production-artifacts-canonical",
     )
     return ProductionArtifact(
-        production_run_id=RUN_ID,
+        production_run_id=production_run_id,
         subject_id=SUBJECT_ID,
         stage=ProductionArtifactStage.EXTRACTION,
         version=1,
@@ -1042,6 +1071,294 @@ async def test_waived_source_that_is_finally_archived_owes_a_references_rebuild(
 
 def replace_namespace(value: SimpleNamespace, **changes: Any) -> SimpleNamespace:
     return SimpleNamespace(**(vars(value) | changes))
+
+
+async def _supplemental_source_artifact(
+    store: ProductionArtifactStore, production_run_id: UUID
+) -> ProductionArtifact:
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=SUBJECT_ID,
+        research_date=date(2026, 8, 15),
+        production_input_hash="c" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(
+            ProductionReferenceSourceV1(
+                canonical_url=SOURCE_URL,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.INDEPENDENT,
+                title="Missing report",
+                publisher="Publisher",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=None,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.FAILED_TERMINAL,
+                content_sha256=None,
+                relevance_reason="Adds context to the core report",
+                proposed_by_model=True,
+                eligible_for_extraction=False,
+            ),
+        ),
+        warnings=(),
+    )
+    _, canonical_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(corpus)
+    )
+    return ProductionArtifact(
+        production_run_id=production_run_id,
+        subject_id=SUBJECT_ID,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="c" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=canonical_blob_id,
+    )
+
+
+async def _source_failure_artifacts(
+    store: ProductionArtifactStore, production_run_id: UUID
+) -> tuple[ProductionArtifact, ProductionArtifact]:
+    core_document_id = uuid4()
+    failed_document_id = uuid4()
+    core_url = "https://lot25.example/core"
+    core_reference = ProductionReferenceSourceV1(
+        canonical_url=core_url,
+        tier=ProductionReferenceTier.CORE,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.PRIMARY,
+        title="Core report",
+        publisher="Publisher",
+        published_at=None,
+        source_collection_id=core_document_id,
+        source_document_id=core_document_id,
+        discovery_candidate_ids=(),
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256="a" * 64,
+        relevance_reason=None,
+        proposed_by_model=False,
+        eligible_for_extraction=True,
+    )
+    failed_reference = ProductionReferenceSourceV1(
+        canonical_url=SOURCE_URL,
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.INDEPENDENT,
+        title="Supporting report",
+        publisher="Publisher",
+        published_at=None,
+        source_collection_id=failed_document_id,
+        source_document_id=failed_document_id,
+        discovery_candidate_ids=(),
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256="b" * 64,
+        relevance_reason="Adds supporting context",
+        proposed_by_model=True,
+        eligible_for_extraction=True,
+    )
+    corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=SUBJECT_ID,
+        research_date=date(2026, 8, 15),
+        production_input_hash="c" * 64,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(core_reference, failed_reference),
+        warnings=(),
+    )
+    extraction = ProductionExtractionV1(
+        schema_version=1,
+        subject_id=SUBJECT_ID,
+        production_input_hash="c" * 64,
+        references_corpus_hash="d" * 64,
+        profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+        sources=(
+            ProductionSourceExtractionV1(
+                source_document_id=core_document_id,
+                canonical_url=core_url,
+                content_sha256="a" * 64,
+                tier=ProductionReferenceTier.CORE,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                profile=ExtractionProfile.FULL,
+                checkpoint_id=uuid4(),
+                reuse_state=ExtractionReuseState.FRESH,
+                facts=(),
+                events=(),
+                indicators=(),
+                rules=(),
+                uncertainties=(),
+            ),
+        ),
+        omitted_sources=(
+            ProductionExtractionOmissionV1(
+                canonical_url=SOURCE_URL,
+                tier=ProductionReferenceTier.SUPPORTING,
+                collection_state=CollectionState.ARCHIVED,
+                reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+                error_code="q2_no_payload",
+            ),
+        ),
+        warnings=("q2_parse_error:q2_no_payload",),
+    )
+    _, references_blob_id, _ = await store.store_stage_payloads(
+        canonical=production_reference_corpus_to_json(corpus)
+    )
+    extraction_blob_id = await store.put_json(
+        production_extraction_to_json(extraction), bucket="production-artifacts-canonical"
+    )
+    return (
+        ProductionArtifact(
+            production_run_id=production_run_id,
+            subject_id=SUBJECT_ID,
+            stage=ProductionArtifactStage.REFERENCES,
+            version=1,
+            input_hash="c" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=references_blob_id,
+        ),
+        ProductionArtifact(
+            production_run_id=production_run_id,
+            subject_id=SUBJECT_ID,
+            stage=ProductionArtifactStage.EXTRACTION,
+            version=1,
+            input_hash="d" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=extraction_blob_id,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_issue_detail_resolves_duplicate_repair_key_from_current_run() -> None:
+    store = ProductionArtifactStore(_BlobCatalog())  # type: ignore[arg-type]
+    old_run = _production_run(run_number=1, pipeline_generation=3)
+    current_run = _production_run(run_number=2, pipeline_generation=2)
+    old_artifact = await _extraction(store, [_entry(GOOD_VALUE)], production_run_id=old_run.id)
+    current_artifact = await _extraction(
+        store, [_entry(GOOD_VALUE)], production_run_id=current_run.id
+    )
+    state = _State(
+        [old_artifact, current_artifact],
+        current_run,
+        replace(_row(), run_id=current_run.id, pipeline_generation=2),
+        runs=[old_run, current_run],
+    )
+    issues = ProductionRepairIssueService(state.factory(), store)
+
+    detail = await issues.get_issue(EDITION_ID, GOOD_KEY, SUBJECT_ID)
+    views = await issues.list_issue_views(EDITION_ID, SUBJECT_ID)
+
+    assert detail is not None
+    assert detail.issue.production_run_id == current_run.id
+    assert detail.issue.observed_artifact_id == current_artifact.id
+    assert len(views) == 1
+    assert views[0].production_run_id == current_run.id
+
+
+@pytest.mark.asyncio
+async def test_source_extraction_failure_getter_only_returns_current_run() -> None:
+    store = ProductionArtifactStore(_BlobCatalog())  # type: ignore[arg-type]
+    old_run = _production_run(run_number=1, pipeline_generation=3)
+    current_run = _production_run(run_number=2, pipeline_generation=2)
+    old_artifacts = await _source_failure_artifacts(store, old_run.id)
+    current_artifacts = await _source_failure_artifacts(store, current_run.id)
+    state = _State(
+        [*old_artifacts, *current_artifacts],
+        current_run,
+        replace(_row(), run_id=current_run.id, pipeline_generation=2),
+        runs=[old_run, current_run],
+    )
+    issues = ProductionRepairIssueService(state.factory(), store)
+
+    failures = await issues.list_source_extraction_failure_issues(EDITION_ID, SUBJECT_ID)
+    assert len(failures) == 1
+    current_failure = failures[0]
+    assert current_failure.production_run_id == current_run.id
+    assert current_failure.observed_artifact_id == current_artifacts[1].id
+    assert (
+        await issues.get_source_extraction_failure_issue(
+            EDITION_ID, current_failure.repair_key, SUBJECT_ID
+        )
+        == current_failure
+    )
+
+
+@pytest.mark.asyncio
+async def test_source_decision_targets_current_run_and_hides_older_issue() -> None:
+    store = ProductionArtifactStore(_BlobCatalog())  # type: ignore[arg-type]
+    old_run = _production_run(run_number=1, pipeline_generation=3)
+    current_run = _production_run(run_number=2, pipeline_generation=2)
+    old_artifact = await _supplemental_source_artifact(store, old_run.id)
+    current_artifact = await _supplemental_source_artifact(store, current_run.id)
+    state = _State(
+        [old_artifact, current_artifact],
+        current_run,
+        replace(_row(), run_id=current_run.id, pipeline_generation=2),
+        runs=[old_run, current_run],
+    )
+    factory = state.factory()
+    issues = ProductionRepairIssueService(factory, store)
+    adjudication = ProductionRepairAdjudicationService(factory, issues)
+    (current_issue,) = await issues.list_supplemental_source_issues(EDITION_ID, SUBJECT_ID)
+    old_decision = ProductionRepairDecision(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        production_run_id=old_run.id,
+        observed_artifact_id=old_artifact.id,
+        observed_pipeline_generation=3,
+        repair_key=current_issue.repair_key,
+        issue_kind=ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+        action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        actor_id="analyst",
+        reason="previous run was published without the source",
+    )
+    await state.decisions.append(old_decision)
+
+    current_issue = await issues.get_supplemental_source_issue(
+        EDITION_ID, current_issue.repair_key, SUBJECT_ID
+    )
+    assert current_issue is not None
+    assert current_issue.production_run_id == current_run.id
+    assert current_issue.observed_artifact_id == current_artifact.id
+    assert current_issue.effective_decision is None
+
+    with pytest.raises(ValueError, match="production_repair_stale"):
+        await adjudication.decide_current_issue(
+            edition_id=EDITION_ID,
+            subject_id=SUBJECT_ID,
+            repair_key=current_issue.repair_key,
+            action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+            observed_artifact_id=current_artifact.id,
+            observed_pipeline_generation=2,
+            expected_effective_decision_id=None,
+            actor_id="analyst",
+            reason="current run review",
+            observed_run_id=old_run.id,
+        )
+
+    decision = await adjudication.decide_current_issue(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        repair_key=current_issue.repair_key,
+        action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        observed_artifact_id=current_artifact.id,
+        observed_pipeline_generation=2,
+        expected_effective_decision_id=None,
+        actor_id="analyst",
+        reason="current run review",
+    )
+
+    assert decision.production_run_id == current_run.id
+    history = await issues.decision_history(EDITION_ID, current_issue.repair_key, SUBJECT_ID)
+    assert {item.id for item in history} == {old_decision.id, decision.id}
+    async with _client(_application(state, store)) as client:
+        response = await client.get(f"/api/subjects/{SUBJECT_ID}/production/repairs")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["production_run_id"] == str(current_run.id)
+    assert len(payload["issues"]) == 1
+    assert payload["issues"][0]["production_run_id"] == str(current_run.id)
 
 
 # ---------------------------------------------------------------------------

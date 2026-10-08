@@ -64,3 +64,45 @@ reste refusée par son propre résultat d'extraction. La restauration
 d'enrichissements périmés réutilise des blocs historiques vérifiés et les
 revalide contre les preuves courantes; elle ne passe pas par la garde de
 génération d'une révision ciblée de SYNTHESIS.
+
+## Résolution des issues entre runs
+
+Le même audit a révélé que la clé `31b64959…` du sujet 3 avait deux
+projections `supplemental_source_unarchived` : l'issue ouverte observée sur le
+run courant `c515deef` (artifact `293a9b9b`, génération 2) et l'issue résolue
+du run antérieur `7c42069c` (artifact `e09741e5`, génération 3). Le lecteur
+des issues parcourait tous les runs de l'édition et projetait leur artifact
+courant. La clé supplemental étant stable entre les runs, son getter par clé
+et `get_issue` pouvaient retourner la première observation historique avant
+la courante ; `_prepare` comparait alors le mauvais artifact et la mauvaise
+génération aux fences du client, puis refusait la décision courante avec
+`production_repair_stale`. Les clés extraction-failure incluent l'artifact
+EXTRACTION observé et distinguent donc déjà les runs, mais leurs anciennes
+issues restaient exposées par les listes comme des actions disponibles.
+
+Le read model de revue expose le run du dernier batch de l'édition, mais
+`EditionReviewService` agrège les réparations par sujet. Il dépend donc du
+lecteur d'issues pour ne lui transmettre que les réparations de ce run.
+L'endpoint sujet sélectionne déjà son run via
+`get_current_for_subject`; avant ce correctif, le lecteur appelé ensuite
+réintroduisait les projections plus anciennes de la même édition.
+
+Les trois lecteurs (`_records`, sources supplemental et échecs d'extraction)
+ne projettent maintenant que le run au plus grand `run_number` par sujet dans
+l'édition. Les getters par clé résolvent ainsi cette observation unique, et
+les listes de l'API sujet et de la revue d'édition n'exposent plus les issues
+de runs antérieurs comme actions disponibles. Pour les décisions de source, le
+run, l'artifact et la génération définissent l'observation à laquelle la
+réponse s'applique. `expected_effective_decision_id` reste la garde optimiste
+de cette observation : une décision d'un artifact précédent ne masque pas une
+première décision de source du run courant, et la révision d'une décision de
+l'observation courante exige toujours l'identifiant attendu. Un
+`observed_run_id` historique est refusé comme périmé. Les décisions des autres
+types de réparation gardent leur résolution existante par clé de réparation.
+
+Le journal append-only n'est pas filtré : le détail d'une issue courante
+continue de renvoyer tout `decision_history` de cette clé, y compris les
+décisions des runs précédents. Les tests de régression couvrent le détail
+extraction, les issues supplemental et extraction-failure, l'adjudication
+courante avec et sans `observed_run_id`, le refus du run précédent et la
+conservation des deux décisions dans l'historique.

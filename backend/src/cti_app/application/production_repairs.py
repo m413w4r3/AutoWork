@@ -723,7 +723,15 @@ class ProductionRepairDecisionService:
             if edition is None or edition.state is not EditionStatus.OPEN:
                 raise ProductionRepairStatusError("edition_archived")
             effective = await _effective_decisions_for_reader(uow, edition_id, subject_id)
-            current = _effective_decision_for_key(effective, subject_id, repair_key)
+            current = _effective_decision_for_observation(
+                effective,
+                subject_id=subject_id,
+                repair_key=repair_key,
+                issue_kind=issue_kind,
+                production_run_id=production_run_id,
+                observed_artifact_id=observed_artifact_id,
+                observed_pipeline_generation=observed_pipeline_generation,
+            )
             if (
                 current is not None
                 and _enum_value(current.action) == _enum_value(action)
@@ -738,6 +746,10 @@ class ProductionRepairDecisionService:
                 effective,
                 subject_id=subject_id,
                 repair_key=repair_key,
+                issue_kind=issue_kind,
+                production_run_id=production_run_id,
+                observed_artifact_id=observed_artifact_id,
+                observed_pipeline_generation=observed_pipeline_generation,
                 expected_effective_decision_id=expected_effective_decision_id,
             )
 
@@ -886,7 +898,15 @@ class ProductionRepairDecisionService:
             )
 
             for item, _event in zip(decisions, events, strict=True):
-                current = _effective_decision_for_key(effective, item.subject_id, item.repair_key)
+                current = _effective_decision_for_observation(
+                    effective,
+                    subject_id=item.subject_id,
+                    repair_key=item.repair_key,
+                    issue_kind=item.issue_kind,
+                    production_run_id=item.production_run_id,
+                    observed_artifact_id=item.observed_artifact_id,
+                    observed_pipeline_generation=item.observed_pipeline_generation,
+                )
                 if (
                     current is not None
                     and _enum_value(current.action) == _enum_value(item.action)
@@ -901,6 +921,10 @@ class ProductionRepairDecisionService:
                     effective,
                     subject_id=item.subject_id,
                     repair_key=item.repair_key,
+                    issue_kind=item.issue_kind,
+                    production_run_id=item.production_run_id,
+                    observed_artifact_id=item.observed_artifact_id,
+                    observed_pipeline_generation=item.observed_pipeline_generation,
                     expected_effective_decision_id=item.expected_effective_decision_id,
                 )
                 run = await _get_for_update(uow.production_runs, item.production_run_id)
@@ -1000,6 +1024,10 @@ def _require_decision_fence(
     *,
     subject_id: UUID,
     repair_key: str,
+    issue_kind: ProductionRepairIssueKind,
+    production_run_id: UUID,
+    observed_artifact_id: UUID,
+    observed_pipeline_generation: int,
     expected_effective_decision_id: UUID | None,
 ) -> None:
     """Refuse a revision written over an answer the caller never observed.
@@ -1008,7 +1036,15 @@ def _require_decision_fence(
     A retried HTTP request therefore fails unambiguously after its first
     append instead of silently appending the same event twice.
     """
-    current = _effective_decision_for_key(effective, subject_id, repair_key)
+    current = _effective_decision_for_observation(
+        effective,
+        subject_id=subject_id,
+        repair_key=repair_key,
+        issue_kind=issue_kind,
+        production_run_id=production_run_id,
+        observed_artifact_id=observed_artifact_id,
+        observed_pipeline_generation=observed_pipeline_generation,
+    )
     current_id = current.id if current is not None else None
     if current_id != expected_effective_decision_id:
         raise ProductionRepairDecisionChangedError(ProductionRepairDecisionChangedError.code)
@@ -1025,6 +1061,32 @@ def _effective_decision_for_key(
         ),
         None,
     )
+
+
+def _effective_decision_for_observation(
+    effective: Sequence[ProductionRepairDecision],
+    *,
+    subject_id: UUID,
+    repair_key: str,
+    issue_kind: ProductionRepairIssueKind,
+    production_run_id: UUID,
+    observed_artifact_id: UUID,
+    observed_pipeline_generation: int,
+) -> ProductionRepairDecision | None:
+    """Treat a decision from another run observation as history, not current."""
+    decision = _effective_decision_for_key(effective, subject_id, repair_key)
+    if decision is None or issue_kind not in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+    }:
+        return decision
+    if (
+        decision.production_run_id != production_run_id
+        or decision.observed_artifact_id != observed_artifact_id
+        or decision.observed_pipeline_generation != observed_pipeline_generation
+    ):
+        return None
+    return decision
 
 
 @dataclass(frozen=True, slots=True)
@@ -1350,18 +1412,27 @@ def _decision_for_current_source_issue(
     criticality_policy_version: str = PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
 ) -> ProductionRepairDecision | None:
     """Do not apply a source waiver to a different observation generation."""
+    decision = _decision_for_current_observation(decision, run, artifact)
     if decision is None:
-        return None
-    if getattr(decision, "observed_artifact_id", None) != getattr(artifact, "id", None):
-        return None
-    if getattr(decision, "observed_pipeline_generation", None) != getattr(
-        run, "pipeline_generation", None
-    ):
         return None
     recorded_policy_version = getattr(decision, "criticality_policy_version", None)
     if (
         recorded_policy_version is not None
         and recorded_policy_version != criticality_policy_version
+    ):
+        return None
+    return decision
+
+
+def _decision_for_current_observation(
+    decision: ProductionRepairDecision | None, run: Any, artifact: Any
+) -> ProductionRepairDecision | None:
+    """Only an answer made against this run, artifact and generation is current."""
+    if decision is None or (
+        getattr(decision, "production_run_id", None) != getattr(run, "id", None)
+        or getattr(decision, "observed_artifact_id", None) != getattr(artifact, "id", None)
+        or getattr(decision, "observed_pipeline_generation", None)
+        != getattr(run, "pipeline_generation", None)
     ):
         return None
     return decision
@@ -1828,19 +1899,21 @@ class ProductionRepairIssueService:
 
         async with self._uow_factory() as uow:
             runs = await uow.production_runs.list_for_edition(edition_id)
+            runs_by_subject = _current_runs_by_subject(runs)
+            current_runs = tuple(runs_by_subject.values())
             references_by_run = await _current_artifacts_by_run(
                 uow,
                 edition_id,
                 ProductionArtifactStage.REFERENCES.value,
-                runs,
+                current_runs,
             )
             extraction_by_run = await _current_artifacts_by_run(
                 uow,
                 edition_id,
                 ProductionArtifactStage.EXTRACTION.value,
-                runs,
+                current_runs,
             )
-            subject_ids = {run.subject_id for run in runs}
+            subject_ids = set(runs_by_subject)
             collections_by_subject: dict[UUID, list[Any]] = {}
             collection_repository = getattr(uow, "source_collections", None)
             bulk_collections = getattr(collection_repository, "list_for_subjects", None)
@@ -1854,7 +1927,7 @@ class ProductionRepairIssueService:
                         current_subject_id
                     ] = await collection_repository.list_for_subject(current_subject_id)
             contexts: list[tuple[Any, Any, Sequence[Any], _ReferenceSourceView]] = []
-            for run in runs:
+            for run in current_runs:
                 if subject_id is not None and run.subject_id != subject_id:
                     continue
                 artifact = references_by_run.get(run.id)
@@ -1997,11 +2070,13 @@ class ProductionRepairIssueService:
 
         async with self._uow_factory() as uow:
             runs = await uow.production_runs.list_for_edition(edition_id)
+            runs_by_subject = _current_runs_by_subject(runs)
+            current_runs = tuple(runs_by_subject.values())
             references_by_run = await _current_artifacts_by_run(
-                uow, edition_id, ProductionArtifactStage.REFERENCES.value, runs
+                uow, edition_id, ProductionArtifactStage.REFERENCES.value, current_runs
             )
             extraction_by_run = await _current_artifacts_by_run(
-                uow, edition_id, ProductionArtifactStage.EXTRACTION.value, runs
+                uow, edition_id, ProductionArtifactStage.EXTRACTION.value, current_runs
             )
             decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
 
@@ -2009,7 +2084,7 @@ class ProductionRepairIssueService:
             (decision.subject_id, decision.repair_key): decision for decision in decisions
         }
         issues: list[SourceExtractionFailureIssue] = []
-        for run in runs:
+        for run in current_runs:
             if subject_id is not None and run.subject_id != subject_id:
                 continue
             extraction_artifact = extraction_by_run.get(run.id)
@@ -2278,14 +2353,15 @@ class ProductionRepairIssueService:
     ) -> list[tuple[ProductionRepairIssueView, str | None, Mapping[str, Any]]]:
         async with self._uow_factory() as uow:
             runs = await uow.production_runs.list_for_edition(edition_id)
+            current_runs = tuple(_current_runs_by_subject(runs).values())
             artifacts_by_run = await _current_artifacts_by_run(
                 uow,
                 edition_id,
                 ProductionArtifactStage.EXTRACTION.value,
-                runs,
+                current_runs,
             )
             contexts: list[_RepairContext] = []
-            for run in runs:
+            for run in current_runs:
                 if subject_id is not None and run.subject_id != subject_id:
                     continue
                 artifact = artifacts_by_run.get(run.id)
@@ -5721,6 +5797,29 @@ async def _effective_decisions_for_reader(
         )
     history = await repository.list_for_edition(edition_id, subject_id)
     return _effective_from_history(history)
+
+
+def _current_runs_by_subject(runs: Sequence[Any]) -> dict[UUID, Any]:
+    """Select the same latest run as ``get_current_for_subject`` per subject."""
+    current: dict[UUID, Any] = {}
+    for run in runs:
+        selected = current.get(run.subject_id)
+        run_order = (
+            int(getattr(run, "run_number", 0) or 0),
+            str(getattr(run, "created_at", "")),
+            str(getattr(run, "id", "")),
+        )
+        if selected is None:
+            current[run.subject_id] = run
+            continue
+        selected_order = (
+            int(getattr(selected, "run_number", 0) or 0),
+            str(getattr(selected, "created_at", "")),
+            str(getattr(selected, "id", "")),
+        )
+        if run_order > selected_order:
+            current[run.subject_id] = run
+    return current
 
 
 async def _current_artifacts_by_run(
