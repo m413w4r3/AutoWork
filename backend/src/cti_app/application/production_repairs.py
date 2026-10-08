@@ -126,13 +126,19 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     ExtractionRuleV1,
+    ProductionExtractionOmissionReason,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
     production_extraction_from_json,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
     ProductionReferenceCorpusV1,
+    ProductionReferenceSourceV1,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+    production_source_criticality,
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
@@ -260,6 +266,35 @@ def repair_key_for_supplemental_source(
         "subject_id": str(subject_id),
         "kind": ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value,
         "source_url": canonicalize_http_url(source_url),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def repair_key_for_source_extraction_failure(
+    *,
+    edition_id: UUID,
+    subject_id: UUID,
+    source_url: str,
+    observed_artifact_id: UUID,
+    observed_references_artifact_id: UUID | None,
+    failure_code: str,
+) -> str:
+    """Return the versioned identity of one artifact-bound source loss."""
+    payload = {
+        "version": "1",
+        "edition_id": str(edition_id),
+        "subject_id": str(subject_id),
+        "kind": ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value,
+        "source_url": canonicalize_http_url(source_url),
+        "observed_artifact_id": str(observed_artifact_id),
+        "observed_references_artifact_id": (
+            str(observed_references_artifact_id)
+            if observed_references_artifact_id is not None
+            else None
+        ),
+        "failure_code": failure_code,
+        "criticality_policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -396,6 +431,12 @@ class ProductionRepairAuditReasonRequiredError(ValueError):
     """An unverified analyst override must explain why it was forced."""
 
     code = "production_repair_audit_reason_required"
+
+
+class ProductionRepairSourceDiagnosticRequiredError(ValueError):
+    """A source waiver must freeze the diagnostic that was shown to the analyst."""
+
+    code = "production_repair_source_diagnostic_required"
 
 
 @dataclass(frozen=True, slots=True)
@@ -580,6 +621,10 @@ class ProductionRepairDecisionInput:
     issue_kind: ProductionRepairIssueKind
     action: ProductionRepairAction
     correction: ProductionRepairCorrection | None = None
+    source_criticality: ProductionSourceCriticality | None = None
+    criticality_reason: ProductionSourceCriticalityReason | None = None
+    failure_code: str | None = None
+    criticality_policy_version: str | None = None
     # Optimistic fence: the effective decision the caller was looking at, or
     # ``None`` for a first decision.  Recomputed under the transaction.
     expected_effective_decision_id: UUID | None = None
@@ -604,10 +649,34 @@ class ProductionRepairDecisionService:
         action: ProductionRepairAction,
         actor_id: str,
         reason: str | None = None,
+        source_criticality: ProductionSourceCriticality | None = None,
+        criticality_reason: ProductionSourceCriticalityReason | None = None,
+        failure_code: str | None = None,
+        criticality_policy_version: str | None = None,
         expected_effective_decision_id: UUID | None = None,
         correction: ProductionRepairCorrection | None = None,
     ) -> ProductionRepairDecision:
         # Construct first so pure invariants fail before opening a transaction.
+        if action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE and not (reason or "").strip():
+            raise ProductionRepairAuditReasonRequiredError(
+                ProductionRepairAuditReasonRequiredError.code
+            )
+        if (
+            issue_kind
+            in {
+                ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+                ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+            }
+            and action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            and (
+                source_criticality is None
+                or criticality_reason is None
+                or not criticality_policy_version
+            )
+        ):
+            raise ProductionRepairSourceDiagnosticRequiredError(
+                ProductionRepairSourceDiagnosticRequiredError.code
+            )
         decision = ProductionRepairDecision(
             edition_id=edition_id,
             subject_id=subject_id,
@@ -619,6 +688,10 @@ class ProductionRepairDecisionService:
             action=action,
             actor_id=actor_id,
             reason=reason,
+            source_criticality=source_criticality,
+            criticality_reason=criticality_reason,
+            failure_code=failure_code,
+            criticality_policy_version=criticality_policy_version,
             correction_id=correction.id if correction is not None else None,
         )
         if action is ProductionRepairAction.REPLACE and correction is None:
@@ -736,6 +809,30 @@ class ProductionRepairDecisionService:
             raise ValueError("production_repair_bulk_empty")
         if len(decisions) > 200:
             raise ValueError("production_repair_bulk_limit_exceeded")
+        if (
+            any(item.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE for item in decisions)
+            and not (reason or "").strip()
+        ):
+            raise ProductionRepairAuditReasonRequiredError(
+                ProductionRepairAuditReasonRequiredError.code
+            )
+        if any(
+            item.issue_kind
+            in {
+                ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+                ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+            }
+            and item.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            and (
+                item.source_criticality is None
+                or item.criticality_reason is None
+                or not item.criticality_policy_version
+            )
+            for item in decisions
+        ):
+            raise ProductionRepairSourceDiagnosticRequiredError(
+                ProductionRepairSourceDiagnosticRequiredError.code
+            )
         identities = [(item.subject_id, item.repair_key) for item in decisions]
         if len(set(identities)) != len(identities):
             raise ValueError("production_repair_duplicate")
@@ -752,6 +849,10 @@ class ProductionRepairDecisionService:
                 action=item.action,
                 actor_id=actor_id,
                 reason=reason,
+                source_criticality=item.source_criticality,
+                criticality_reason=item.criticality_reason,
+                failure_code=item.failure_code,
+                criticality_policy_version=item.criticality_policy_version,
                 correction_id=(item.correction.id if item.correction is not None else None),
             )
             for item in decisions
@@ -1008,6 +1109,35 @@ class SupplementalSourceRepairIssue:
     expected_q2_calls: int = 0
     expected_q2_reuses: int = 0
     reuse_unknown_count: int = 0
+    source_criticality: ProductionSourceCriticality = ProductionSourceCriticality.CRITICAL
+    criticality_reason: ProductionSourceCriticalityReason = (
+        ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+    )
+    failure_code: str | None = None
+    criticality_policy_version: str = PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION
+
+
+@dataclass(frozen=True, slots=True)
+class SourceExtractionFailureIssue:
+    """One source-local Q2 failure joined to its canonical REFERENCES record."""
+
+    repair_key: str
+    kind: ProductionRepairIssueKind
+    source_id: str
+    source_title: str
+    source_url: str
+    publisher: str | None
+    failure_code: str
+    extraction_warnings: tuple[str, ...]
+    source_criticality: ProductionSourceCriticality
+    criticality_reason: ProductionSourceCriticalityReason
+    production_run_id: UUID
+    observed_artifact_id: UUID
+    observed_artifact_version: int
+    observed_pipeline_generation: int
+    effective_decision: ProductionRepairDecision | None = None
+    subject_id: UUID | None = None
+    criticality_policy_version: str = PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION
 
 
 _NO_DELIVERABLE_OUTPUTS = frozenset[ProductionDerivedOutput]()
@@ -1193,6 +1323,46 @@ def _decision_action(decision: ProductionRepairDecision | None) -> Any:
     return _projection_enum_value(getattr(decision, "action", None))
 
 
+def _source_waiver_has_analyst_reason(decision: ProductionRepairDecision | None) -> bool:
+    """A reasoned legacy waiver remains explicit; a reasonless one does not.
+
+    Legacy source decisions have no criticality fields. Their actor and reason
+    remain readable and can authorize a critical loss when the observation
+    fence matches. A reasonless legacy waiver is accepted only when the
+    current source is demonstrably secondary and its loss diagnostic is shown.
+    """
+    return _decision_action(
+        decision
+    ) == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value and bool(
+        (getattr(decision, "reason", None) or "").strip()
+    )
+
+
+def _decision_for_current_source_issue(
+    decision: ProductionRepairDecision | None,
+    run: Any,
+    artifact: Any,
+    *,
+    criticality_policy_version: str = PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+) -> ProductionRepairDecision | None:
+    """Do not apply a source waiver to a different observation generation."""
+    if decision is None:
+        return None
+    if getattr(decision, "observed_artifact_id", None) != getattr(artifact, "id", None):
+        return None
+    if getattr(decision, "observed_pipeline_generation", None) != getattr(
+        run, "pipeline_generation", None
+    ):
+        return None
+    recorded_policy_version = getattr(decision, "criticality_policy_version", None)
+    if (
+        recorded_policy_version is not None
+        and recorded_policy_version != criticality_policy_version
+    ):
+        return None
+    return decision
+
+
 def _exclude_revises_projected_content(
     issue: ProductionRepairIssueView,
     decision: ProductionRepairDecision,
@@ -1285,8 +1455,20 @@ def classify_repair_impact(
                 reuse_unknown_count=preview["reuse_unknown_count"],
             )
         if repair_state == SupplementalSourceRepairState.COLLECTION_MISSING.value:
+            if _source_waiver_has_analyst_reason(decision) or _secondary_source_loss_is_diagnosed(
+                issue
+            ):
+                return _repair_impact(
+                    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                    _NO_DELIVERABLE_OUTPUTS,
+                    model_call_required=False,
+                    reason=(
+                        "The source loss is accepted with an explicit waiver or visible diagnosis."
+                    ),
+                )
             # There is nothing to reintegrate yet: the plan describes real
-            # work but no rebuild can run before the source is prepared.
+            # work but no rebuild can run before the source is prepared. A
+            # critical loss still needs an analyst decision before sign-off.
             return _repair_impact(
                 ProductionRepairImpactKind.SOURCE_CORPUS,
                 _SOURCE_CORPUS_OUTPUTS,
@@ -1297,7 +1479,31 @@ def classify_repair_impact(
                 expected_q2_reuses=preview["expected_q2_reuses"],
                 reuse_unknown_count=preview["reuse_unknown_count"],
             )
+        if repair_state == SupplementalSourceRepairState.CONTINUED_WITH_DIAGNOSTIC.value:
+            return _repair_impact(
+                ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                _NO_DELIVERABLE_OUTPUTS,
+                model_call_required=False,
+                reason=(
+                    "The secondary source loss is retained in the diagnostic and does not "
+                    "change covered findings."
+                ),
+            )
         if action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value:
+            if not (
+                _source_waiver_has_analyst_reason(decision)
+                or _secondary_source_loss_is_diagnosed(issue)
+            ):
+                return _repair_impact(
+                    ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+                    _NO_DELIVERABLE_OUTPUTS,
+                    model_call_required=False,
+                    ready_to_apply=False,
+                    reason=(
+                        "This legacy waiver has no analyst reason; a critical source loss "
+                        "needs a new decision."
+                    ),
+                )
             return _repair_impact(
                 ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
                 _NO_DELIVERABLE_OUTPUTS,
@@ -1320,6 +1526,28 @@ def classify_repair_impact(
             _NO_DELIVERABLE_OUTPUTS,
             model_call_required=False,
             reason="The supplemental source has no materialized deliverable change.",
+        )
+
+    if issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED:
+        continue_with_diagnostic = _secondary_source_loss_is_diagnosed(issue)
+        has_audited_waiver = (
+            action == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
+            and bool((getattr(decision, "reason", None) or "").strip())
+        )
+        return _repair_impact(
+            ProductionRepairImpactKind.NO_DELIVERABLE_CHANGE,
+            _NO_DELIVERABLE_OUTPUTS,
+            model_call_required=False,
+            ready_to_apply=has_audited_waiver or continue_with_diagnostic,
+            reason=(
+                "The source loss remains visible; the analyst recorded why production "
+                "continues without it."
+                if has_audited_waiver
+                else "The secondary source loss remains visible in the extraction diagnostic."
+                if continue_with_diagnostic
+                else "The failed source remains a blocking review item until an analyst "
+                "records a reason to continue."
+            ),
         )
 
     if decision is None:
@@ -1394,6 +1622,18 @@ def repair_issue_pending_references(issue: Any) -> bool:
     )
 
 
+def _secondary_source_loss_is_diagnosed(issue: Any) -> bool:
+    """Allow a redundant source loss through only while its failure is visible."""
+    if (
+        _projection_enum_value(getattr(issue, "source_criticality", None))
+        != ProductionSourceCriticality.SECONDARY.value
+    ):
+        return False
+    failure_code = getattr(issue, "failure_code", None)
+    extraction_warnings = getattr(issue, "extraction_warnings", ())
+    return bool((failure_code or "").strip() or extraction_warnings)
+
+
 def repair_issue_execution_state(
     issue: Any,
     decision: ProductionRepairDecision | None = None,
@@ -1412,17 +1652,23 @@ def repair_issue_execution_state(
     owes a synthesis rebuild.
     """
     effective = decision if decision is not None else getattr(issue, "effective_decision", None)
-    is_source = (
-        _repair_kind(getattr(issue, "kind", ""))
-        is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED
-    )
+    issue_kind = _repair_kind(getattr(issue, "kind", ""))
+    is_source = issue_kind in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+    }
+    audited_source_waiver = _source_waiver_has_analyst_reason(effective)
     pending_references = repair_issue_pending_references(issue)
     application_state = repair_issue_application_state(issue, effective)
     impact = classify_repair_impact(issue, effective)
     blocking = repair_issue_blocks_signoff(issue, effective)
     # An archived source no longer needs an arbitration: what it owes the
     # edition is a REFERENCES reconciliation, tracked as a rebuild debt.
-    resolved = effective is not None or pending_references
+    resolved = (
+        (audited_source_waiver or _secondary_source_loss_is_diagnosed(issue) or pending_references)
+        if is_source
+        else effective is not None or pending_references
+    )
 
     if is_source and pending_references:
         # The content exists; only the deterministic REFERENCES rebuild is
@@ -1432,9 +1678,14 @@ def repair_issue_execution_state(
         recommended_stage: str | None = "rebuild_references"
     elif is_source:
         rebuild_required = False
-        # The source still needs an explicit archive/waive decision before the
-        # deterministic REFERENCES reconciliation can run.
-        recommended_stage = "none" if resolved else "rebuild_references"
+        if resolved:
+            recommended_stage = "none"
+        elif issue_kind is ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED:
+            recommended_stage = "review_source_loss"
+        else:
+            # A critical collection failure cannot be signed off as a no-op.
+            # The decision endpoint is the actionable review path.
+            recommended_stage = "revise_decision"
     elif application_state is RepairDecisionApplicationState.UNRESOLVED:
         rebuild_required = False
         recommended_stage = None
@@ -1579,6 +1830,12 @@ class ProductionRepairIssueService:
                 ProductionArtifactStage.REFERENCES.value,
                 runs,
             )
+            extraction_by_run = await _current_artifacts_by_run(
+                uow,
+                edition_id,
+                ProductionArtifactStage.EXTRACTION.value,
+                runs,
+            )
             subject_ids = {run.subject_id for run in runs}
             collections_by_subject: dict[UUID, list[Any]] = {}
             collection_repository = getattr(uow, "source_collections", None)
@@ -1602,8 +1859,13 @@ class ProductionRepairIssueService:
                 ):
                     continue
                 collections = collections_by_subject.get(run.subject_id, ())
+                covered_source_urls = await self._successful_extraction_source_urls(
+                    extraction_by_run.get(run.id)
+                )
                 view = await self._reference_source_view(
-                    artifact, getattr(run, "research_date", None)
+                    artifact,
+                    getattr(run, "research_date", None),
+                    covered_source_urls=covered_source_urls,
                 )
                 if view is None:
                     continue
@@ -1645,8 +1907,24 @@ class ProductionRepairIssueService:
                     subject_id=run.subject_id,
                     source_url=source_url,
                 )
-                decision = decisions_by_key.get((run.subject_id, repair_key))
-                repair_state, recommended_action = _supplemental_repair_state(collection, decision)
+                decision = _decision_for_current_source_issue(
+                    decisions_by_key.get((run.subject_id, repair_key)),
+                    run,
+                    artifact,
+                    criticality_policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                )
+                failure_code = _enum_value(
+                    getattr(collection, "failure_reason_code", None)
+                ) or getattr(collection, "error_reason", None)
+                continue_with_diagnostic = (
+                    candidate.criticality is ProductionSourceCriticality.SECONDARY
+                    and bool((failure_code or "").strip())
+                )
+                repair_state, recommended_action = _supplemental_repair_state(
+                    collection,
+                    decision,
+                    continue_with_diagnostic=continue_with_diagnostic,
+                )
                 preview = (
                     q2_previews.get(run.id, {})
                     if (
@@ -1691,12 +1969,189 @@ class ProductionRepairIssueService:
                         expected_q2_calls=int(preview.get("expected_q2_calls", 0)),
                         expected_q2_reuses=int(preview.get("expected_q2_reuses", 0)),
                         reuse_unknown_count=int(preview.get("reuse_unknown_count", 0)),
+                        source_criticality=candidate.criticality,
+                        criticality_reason=candidate.criticality_reason,
+                        failure_code=failure_code,
                     )
                 )
         return tuple(sorted(issues, key=lambda item: (item.source_url, item.source_id)))
 
+    async def list_source_extraction_failure_issues(
+        self, edition_id: UUID, subject_id: UUID | None = None
+    ) -> tuple[SourceExtractionFailureIssue, ...]:
+        """Project every source-local extraction loss from canonical artifacts.
+
+        The EXTRACTION artifact owns its failure code; the matching REFERENCES
+        corpus owns the title, role, tier, and extraction coverage used by the
+        deterministic criticality policy. If either legacy payload cannot be
+        joined, the source remains visible and receives the conservative
+        ``critical/coverage_unknown`` assessment.
+        """
+        store = self._artifact_store
+        if store is None:
+            return ()
+
+        async with self._uow_factory() as uow:
+            runs = await uow.production_runs.list_for_edition(edition_id)
+            references_by_run = await _current_artifacts_by_run(
+                uow, edition_id, ProductionArtifactStage.REFERENCES.value, runs
+            )
+            extraction_by_run = await _current_artifacts_by_run(
+                uow, edition_id, ProductionArtifactStage.EXTRACTION.value, runs
+            )
+            decisions = await _effective_decisions_for_reader(uow, edition_id, subject_id)
+
+        decisions_by_key = {
+            (decision.subject_id, decision.repair_key): decision for decision in decisions
+        }
+        issues: list[SourceExtractionFailureIssue] = []
+        for run in runs:
+            if subject_id is not None and run.subject_id != subject_id:
+                continue
+            extraction_artifact = extraction_by_run.get(run.id)
+            if extraction_artifact is None or extraction_artifact.canonical_blob_id is None:
+                continue
+            try:
+                extraction_payload = await store.read_json(extraction_artifact.canonical_blob_id)
+                extraction = production_extraction_from_json(extraction_payload)
+            except Exception:
+                # A broken artifact remains the canonical repair/reconciliation
+                # error; this diagnostic projection must not hide other issues.
+                continue
+
+            references_artifact = references_by_run.get(run.id)
+            corpus: ProductionReferenceCorpusV1 | None = None
+            if (
+                references_artifact is not None
+                and references_artifact.canonical_blob_id is not None
+            ):
+                try:
+                    references_payload = await store.read_json(
+                        references_artifact.canonical_blob_id
+                    )
+                    corpus = production_reference_corpus_from_json(references_payload)
+                except Exception:
+                    corpus = None
+            covered_source_urls = (
+                frozenset(source.canonical_url for source in extraction.sources)
+                if _enum_value(extraction_artifact.status)
+                == ProductionArtifactStatus.VERIFIED.value
+                else frozenset()
+            )
+            sources_by_url = (
+                {source.canonical_url: source for source in corpus.sources}
+                if corpus is not None
+                else {}
+            )
+
+            for omission in extraction.omitted_sources:
+                if (
+                    omission.reason
+                    is not ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+                    or omission.error_code is None
+                ):
+                    continue
+                source = sources_by_url.get(omission.canonical_url)
+                if source is None or corpus is None:
+                    criticality = ProductionSourceCriticality.CRITICAL
+                    criticality_reason = ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+                    source_id = omission.canonical_url
+                    source_title = ""
+                    publisher = None
+                else:
+                    criticality, criticality_reason = production_source_criticality(
+                        source,
+                        sources=tuple(
+                            candidate
+                            for candidate in corpus.sources
+                            if candidate.canonical_url in covered_source_urls
+                        ),
+                    )
+                    source_id = (
+                        str(source.source_document_id)
+                        if source.source_document_id is not None
+                        else omission.canonical_url
+                    )
+                    source_title = source.title or ""
+                    publisher = source.publisher
+                repair_key = repair_key_for_source_extraction_failure(
+                    edition_id=edition_id,
+                    subject_id=run.subject_id,
+                    source_url=omission.canonical_url,
+                    observed_artifact_id=extraction_artifact.id,
+                    observed_references_artifact_id=(
+                        references_artifact.id if references_artifact is not None else None
+                    ),
+                    failure_code=omission.error_code,
+                )
+                issues.append(
+                    SourceExtractionFailureIssue(
+                        repair_key=repair_key,
+                        kind=ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+                        source_id=source_id,
+                        source_title=source_title,
+                        source_url=omission.canonical_url,
+                        publisher=publisher,
+                        failure_code=omission.error_code,
+                        extraction_warnings=tuple(
+                            warning
+                            for warning in extraction.warnings
+                            if omission.canonical_url in warning
+                            or warning.startswith("q2_parse_error:")
+                        ),
+                        source_criticality=criticality,
+                        criticality_reason=criticality_reason,
+                        production_run_id=run.id,
+                        observed_artifact_id=extraction_artifact.id,
+                        observed_artifact_version=extraction_artifact.version,
+                        observed_pipeline_generation=run.pipeline_generation,
+                        effective_decision=_decision_for_current_source_issue(
+                            decisions_by_key.get((run.subject_id, repair_key)),
+                            run,
+                            extraction_artifact,
+                            criticality_policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                        ),
+                        subject_id=run.subject_id,
+                    )
+                )
+        return tuple(sorted(issues, key=lambda item: (item.source_url, item.source_id)))
+
+    async def get_source_extraction_failure_issue(
+        self, edition_id: UUID, repair_key: str, subject_id: UUID | None = None
+    ) -> SourceExtractionFailureIssue | None:
+        return next(
+            (
+                issue
+                for issue in await self.list_source_extraction_failure_issues(
+                    edition_id, subject_id
+                )
+                if issue.repair_key == repair_key
+            ),
+            None,
+        )
+
+    async def _successful_extraction_source_urls(self, artifact: Any | None) -> frozenset[str]:
+        store = self._artifact_store
+        if (
+            store is None
+            or artifact is None
+            or artifact.canonical_blob_id is None
+            or _enum_value(artifact.status) != ProductionArtifactStatus.VERIFIED.value
+        ):
+            return frozenset()
+        try:
+            payload = await store.read_json(artifact.canonical_blob_id)
+            extraction = production_extraction_from_json(payload)
+        except Exception:
+            return frozenset()
+        return frozenset(source.canonical_url for source in extraction.sources)
+
     async def _reference_source_view(
-        self, artifact: Any, research_date: date | None
+        self,
+        artifact: Any,
+        research_date: date | None,
+        *,
+        covered_source_urls: frozenset[str],
     ) -> _ReferenceSourceView | None:
         """Read one REFERENCES artifact as its canonical source list.
 
@@ -1724,11 +2179,11 @@ class ProductionRepairIssueService:
         labels = await self._raw_reference_labels(artifact, research_date)
         return _ReferenceSourceView(
             candidates=tuple(
-                _ReferenceCandidateSource(
-                    canonical_url=source.canonical_url,
-                    identity=labels.get(source.canonical_url) or source.tier.value,
-                    title=source.title,
-                    publisher=source.publisher,
+                _reference_candidate_source(
+                    source,
+                    corpus.sources,
+                    labels.get(source.canonical_url) or source.tier.value,
+                    covered_source_urls=covered_source_urls,
                 )
                 for source in corpus.sources
                 if not source.eligible_for_extraction
@@ -1969,6 +2424,10 @@ class ProductionRepairAdjudicationService:
             action=prepared.action,
             actor_id=actor_id,
             reason=reason,
+            source_criticality=prepared.source_criticality,
+            criticality_reason=prepared.criticality_reason,
+            failure_code=prepared.failure_code,
+            criticality_policy_version=prepared.criticality_policy_version,
             expected_effective_decision_id=prepared.expected_effective_decision_id,
             correction=prepared.correction,
         )
@@ -2013,11 +2472,18 @@ class ProductionRepairAdjudicationService:
         reason: str | None = None,
     ) -> ProductionRepairDecisionInput:
         detail: ProductionRepairIssueDetail | None = None
-        source: SupplementalSourceRepairIssue | None = None
+        source: SupplementalSourceRepairIssue | SourceExtractionFailureIssue | None = None
         if request.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE:
             source = await self._issues.get_supplemental_source_issue(
                 edition_id, request.repair_key, request.subject_id
             )
+            if source is None:
+                failure_getter = getattr(self._issues, "get_source_extraction_failure_issue", None)
+                source = (
+                    await failure_getter(edition_id, request.repair_key, request.subject_id)
+                    if callable(failure_getter)
+                    else None
+                )
             issue: Any = source
         else:
             detail = await self._issues.get_issue(
@@ -2030,6 +2496,13 @@ class ProductionRepairAdjudicationService:
         kind = _repair_kind(_enum_value(issue.kind))
         if not _repair_action_is_compatible(kind, request.action):
             raise ProductionRepairActionInvalidError(ProductionRepairActionInvalidError.code)
+        if (
+            request.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            and not (reason or "").strip()
+        ):
+            raise ProductionRepairAuditReasonRequiredError(
+                ProductionRepairAuditReasonRequiredError.code
+            )
         if (
             issue.observed_artifact_id != request.observed_artifact_id
             or issue.observed_pipeline_generation != request.observed_pipeline_generation
@@ -2064,6 +2537,16 @@ class ProductionRepairAdjudicationService:
             issue_kind=kind,
             action=request.action,
             correction=correction,
+            source_criticality=(
+                getattr(issue, "source_criticality", None) if source is not None else None
+            ),
+            criticality_reason=(
+                getattr(issue, "criticality_reason", None) if source is not None else None
+            ),
+            failure_code=(getattr(issue, "failure_code", None) if source is not None else None),
+            criticality_policy_version=(
+                getattr(issue, "criticality_policy_version", None) if source is not None else None
+            ),
             expected_effective_decision_id=request.expected_effective_decision_id,
         )
 
@@ -2434,7 +2917,10 @@ def _repair_action_is_compatible(
     kind: ProductionRepairIssueKind, action: ProductionRepairAction
 ) -> bool:
     """Mirror the domain compatibility rule before a decision is built."""
-    if kind is ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED:
+    if kind in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+    }:
         return action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
     return action in {
         ProductionRepairAction.INCLUDE,
@@ -5011,13 +5497,30 @@ def repair_decision_application_state(
     but an EXCLUDE that revises an applied INCLUDE must produce a projection
     that removes it -- and symmetrically for INCLUDE after EXCLUDE.
     """
+    kind_value = _enum_value(getattr(issue, "kind", None))
+    if kind_value in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value,
+    }:
+        # A waived source owes a REFERENCES reconciliation, never an
+        # extraction projection; the source's durable loss remains visible in
+        # its canonical artifact and its analyst reason in the decision. An
+        # archived source with pending REFERENCES is already supplied; that
+        # rebuild debt is independent of an older waiver's audit reason.
+        archived_source_has_recorded_waiver = (
+            repair_issue_pending_references(issue)
+            and _decision_action(effective_decision)
+            == ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value
+        )
+        return (
+            RepairDecisionApplicationState.ALREADY_EFFECTIVE
+            if archived_source_has_recorded_waiver
+            or _source_waiver_has_analyst_reason(effective_decision)
+            or _secondary_source_loss_is_diagnosed(issue)
+            else RepairDecisionApplicationState.UNRESOLVED
+        )
     if effective_decision is None:
         return RepairDecisionApplicationState.UNRESOLVED
-    kind_value = _enum_value(getattr(issue, "kind", None))
-    if kind_value == ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED.value:
-        # A waived source owes a REFERENCES reconciliation, never an
-        # extraction projection; that debt is tracked by its repair state.
-        return RepairDecisionApplicationState.ALREADY_EFFECTIVE
     repair_key = str(getattr(issue, "repair_key", ""))
     decision_id = str(effective_decision.id)
     if any(
@@ -5087,6 +5590,16 @@ def repair_issue_blocks_signoff(
     """
     if repair_issue_pending_references(issue):
         return True
+    issue_kind = _repair_kind(getattr(issue, "kind", ""))
+    if issue_kind in {
+        ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
+        ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+    }:
+        decision = effective_decision or getattr(issue, "effective_decision", None)
+        return not (
+            _source_waiver_has_analyst_reason(decision)
+            or _secondary_source_loss_is_diagnosed(issue)
+        )
     return repair_issue_application_state(issue, effective_decision) in {
         RepairDecisionApplicationState.PROJECTION_REQUIRED,
         RepairDecisionApplicationState.UNBUILDABLE,
@@ -5259,7 +5772,10 @@ async def _require_publication_rebuild(uow: Any, run: Any, *, retry_stage: str) 
 
 
 def _supplemental_repair_state(
-    collection: Any, decision: ProductionRepairDecision | None
+    collection: Any,
+    decision: ProductionRepairDecision | None,
+    *,
+    continue_with_diagnostic: bool = False,
 ) -> tuple[SupplementalSourceRepairState, str]:
     """Derive the durable state of a Q1 proposal missing from the canonical.
 
@@ -5275,8 +5791,17 @@ def _supplemental_repair_state(
             SupplementalSourceRepairState.ARCHIVED_PENDING_REFERENCES,
             "rebuild_references",
         )
-    if decision is not None and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE:
+    if (
+        decision is not None
+        and decision.action is ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+        and bool((decision.reason or "").strip())
+    ):
         return SupplementalSourceRepairState.UNARCHIVED, "continue_without_source"
+    if continue_with_diagnostic:
+        return (
+            SupplementalSourceRepairState.CONTINUED_WITH_DIAGNOSTIC,
+            "continue_without_source",
+        )
     return SupplementalSourceRepairState.UNARCHIVED, "archive_manual_content"
 
 
@@ -5298,6 +5823,31 @@ class _ReferenceCandidateSource:
     identity: str
     title: str | None
     publisher: str | None
+    criticality: ProductionSourceCriticality = ProductionSourceCriticality.CRITICAL
+    criticality_reason: ProductionSourceCriticalityReason = (
+        ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+    )
+
+
+def _reference_candidate_source(
+    source: ProductionReferenceSourceV1,
+    sources: Sequence[ProductionReferenceSourceV1],
+    identity: str,
+    *,
+    covered_source_urls: frozenset[str],
+) -> _ReferenceCandidateSource:
+    coverage_sources = tuple(
+        candidate for candidate in sources if candidate.canonical_url in covered_source_urls
+    )
+    criticality, reason = production_source_criticality(source, sources=coverage_sources)
+    return _ReferenceCandidateSource(
+        canonical_url=source.canonical_url,
+        identity=identity,
+        title=source.title,
+        publisher=source.publisher,
+        criticality=criticality,
+        criticality_reason=reason,
+    )
 
 
 @dataclass(frozen=True, slots=True)

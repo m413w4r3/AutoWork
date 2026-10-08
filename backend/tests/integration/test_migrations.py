@@ -15,7 +15,7 @@ This module validates, against a real (temporary) PostgreSQL database:
 5. the *behaviour* of the two guard families (TLP-downgrade prevention and
    append-only enforcement), not just their catalog presence;
 6. that a database with no tables and no Alembic history upgrades directly
-   to the sole ``0001_baseline`` head, and that repeating ``upgrade head``
+   to the current Alembic head, and that repeating ``upgrade head``
    leaves the schema and trigger definitions unchanged;
 7. a full ``upgrade head`` -> ``downgrade base`` -> ``upgrade head`` cycle,
    asserting tables/functions/triggers are completely gone after the full
@@ -338,6 +338,20 @@ def _actual_check_constraint_names(inspector: Any, table_name: str) -> set[str]:
     return {cc["name"] for cc in inspector.get_check_constraints(table_name)}
 
 
+async def _check_constraint_definitions(database_url: str, table_name: str) -> dict[str, str]:
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.connect() as connection:
+            return await connection.run_sync(
+                lambda sync: {
+                    str(check["name"]): str(check["sqltext"])
+                    for check in inspect(sync).get_check_constraints(table_name)
+                }
+            )
+    finally:
+        await engine.dispose()
+
+
 def _actual_indexes(inspector: Any, table_name: str) -> set[IndexShape]:
     shapes: set[IndexShape] = set()
     for idx in inspector.get_indexes(table_name):
@@ -523,6 +537,36 @@ def test_orm_table_matches_migrated_schema(
     assert actual["indexes"] == _expected_indexes(table)
 
 
+def test_production_repair_decision_source_loss_contract_is_in_fresh_schema(
+    migrated_postgres_url: str,
+    schema_snapshot: dict[str, dict[str, Any]],
+) -> None:
+    decision_schema = schema_snapshot[_REPAIR_TABLE]
+    assert {
+        "source_criticality",
+        "criticality_reason",
+        "failure_code",
+        "criticality_policy_version",
+    } <= set(decision_schema["columns"])
+    assert {
+        "ck_production_repair_issue_kind",
+        "ck_production_repair_action_compatibility",
+        "ck_production_repair_source_criticality",
+        "ck_production_repair_criticality_reason",
+        "ck_production_repair_source_criticality_pair",
+        "ck_production_repair_criticality_policy_version",
+        "ck_production_repair_source_extraction_diagnostic",
+    } <= decision_schema["checks"]
+
+    checks = asyncio.run(_check_constraint_definitions(migrated_postgres_url, _REPAIR_TABLE))
+    assert "source_extraction_failed" in checks["ck_production_repair_issue_kind"].lower()
+    assert "continue_without_source" in checks["ck_production_repair_action_compatibility"].lower()
+    assert (
+        "failure_code is not null"
+        in checks["ck_production_repair_source_extraction_diagnostic"].lower()
+    )
+
+
 def test_fusion_schema_uses_canonical_candidate_identity(
     schema_snapshot: dict[str, dict[str, Any]],
 ) -> None:
@@ -694,8 +738,8 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     assert asyncio.run(_table_names(temporary_postgres_url)) == set()
     command.upgrade(config, "head")
     command.current(config)
-    assert asyncio.run(_alembic_version(temporary_postgres_url)) == "0001_baseline"
-    assert _head_revision() == "0001_baseline"
+    assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
+    assert _head_revision() == "0002_production_batch_pause"
 
     tables = asyncio.run(_table_names(temporary_postgres_url))
     assert _REPAIR_TABLE in tables
@@ -747,8 +791,8 @@ def test_fresh_install_and_repeated_upgrade_are_conflict_free(
     }
     trigger_definitions = asyncio.run(_trigger_definitions(temporary_postgres_url))
 
-    # The single mutable baseline is idempotent: repeating the upgrade is a
-    # no-op for the schema and trigger definitions.
+    # The migration chain is idempotent: repeating the upgrade is a no-op for
+    # the schema and trigger definitions.
     command.upgrade(config, "head")
     assert asyncio.run(_alembic_version(temporary_postgres_url)) == _head_revision()
     assert asyncio.run(_table_names(temporary_postgres_url)) == tables

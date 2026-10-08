@@ -41,7 +41,10 @@ from cti_app.application.production_parsers import (
     Q2SourceOutput,
 )
 from cti_app.application.production_references import production_reference_corpus_to_json
-from cti_app.application.production_workflow import _canonical_extraction_progress
+from cti_app.application.production_workflow import (
+    _canonical_extraction_progress,
+    _source_loss_diagnostics,
+)
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
@@ -2050,6 +2053,43 @@ async def test_non_core_failure_is_a_controlled_omission() -> None:
             error_code="extraction_source_output_invalid",
         ),
     )
+    assert _source_loss_diagnostics(execution.plan, execution.extraction) == [
+        {
+            "source_id": str(support_document),
+            "source_title": f"Archived {SUPPORT_URL}",
+            "source_url": SUPPORT_URL,
+            "failure_code": "extraction_source_output_invalid",
+            "extraction_warnings": [
+                "q2_parse_error:empty_response",
+                f"extraction_source_skipped:{SUPPORT_URL}:extraction_source_output_invalid",
+            ],
+            "tier": "supporting",
+            "role": "primary",
+            "editorial_role": "context",
+            "source_criticality": "critical",
+            "criticality_reason": "primary_role",
+            "criticality_policy_version": "source-criticality-v1",
+        }
+    ]
+    progress = _canonical_extraction_progress(execution.plan, extraction=execution.extraction)
+    failed_progress = next(
+        entry for entry in progress["sources"] if entry["canonical_url"] == SUPPORT_URL
+    )
+    assert failed_progress["failure_code"] == "extraction_source_output_invalid"
+    assert failed_progress["source_criticality"] == "critical"
+    assert failed_progress["criticality_reason"] == "primary_role"
+
+    failed_stage_progress = _canonical_extraction_progress(
+        execution.plan,
+        failed_source_id=str(core_document),
+        failure_code="core_source_extraction_failed",
+    )
+    failed_core = next(
+        entry for entry in failed_stage_progress["sources"] if entry["canonical_url"] == CORE_URL
+    )
+    assert failed_core["status"] == "failed"
+    assert failed_core["source_criticality"] == "critical"
+    assert failed_core["failure_code"] == "core_source_extraction_failed"
 
 
 async def test_do_not_submit_policy_is_never_overridden() -> None:

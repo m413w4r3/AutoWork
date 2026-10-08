@@ -1115,6 +1115,7 @@ async def test_audit7_waived_source_stays_unarchived_but_signed_off() -> None:
                 key,
                 ProductionRepairIssueKind.SUPPLEMENTAL_SOURCE_UNARCHIVED,
                 ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+                artifact_id=references.id,
             )
         ],
     )

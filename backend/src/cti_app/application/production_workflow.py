@@ -119,7 +119,13 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
     production_extraction_from_json,
 )
-from cti_app.domain.production_references import ProductionReferenceCorpusV1
+from cti_app.domain.production_references import (
+    PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    ProductionReferenceCorpusV1,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
+    production_source_criticality,
+)
 from cti_app.domain.production_relevance import relevance_projection_from_json
 from cti_app.domain.production_synthesis import production_synthesis_from_json
 from cti_app.domain.publication import is_publication_ioc_artifact_type
@@ -278,6 +284,7 @@ def _canonical_extraction_progress(
     extraction: ProductionExtractionV1 | None = None,
     model_calls: int = 0,
     failed_source_id: str | None = None,
+    failure_code: str | None = None,
 ) -> dict[str, Any]:
     """Publish the canonical per-source verdict the desk and resume planner read.
 
@@ -296,6 +303,17 @@ def _canonical_extraction_progress(
         for omission in (extraction.omitted_sources if extraction is not None else ())
         if omission.reason is ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
     }
+    failures_by_url = {
+        omission.canonical_url: omission
+        for omission in (extraction.omitted_sources if extraction is not None else ())
+        if omission.reason is ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+    }
+    covered_source_urls = (
+        {source.canonical_url for source in extraction.sources} if extraction is not None else set()
+    )
+    coverage_sources = tuple(
+        source for source in plan.sources if source.canonical_url in covered_source_urls
+    )
     sources: list[dict[str, Any]] = []
     for planned in plan.sources:
         source = produced.get(planned.source_document_id)
@@ -314,36 +332,50 @@ def _canonical_extraction_progress(
             status = "failed"
         else:
             status = "pending"
-        sources.append(
-            {
-                "source_id": str(planned.source_document_id),
-                "title": planned.title,
-                "canonical_url": planned.canonical_url,
-                "tier": planned.tier.value,
-                "profile": planned.profile.value,
-                "editorial_role": planned.editorial_role.value,
-                "profile_reason_code": planned.profile_reason_code.value,
-                "status": status,
-                "reuse_state": source.reuse_state.value if source is not None else None,
-                "ioc_count": len(source.indicators) if source is not None else 0,
-                "rule_count": len(source.rules) if source is not None else 0,
-                "scope": (
-                    {
-                        "kind": planned.scope.kind.value,
-                        "case_id": planned.scope.case_id,
-                        "kept_sections": planned.scope.kept_sections,
-                        "total_sections": planned.scope.total_sections,
-                        "kept_chars": planned.scope.kept_chars,
-                        "total_chars": planned.scope.total_chars,
-                    }
-                    if planned.scope is not None
-                    else None
-                ),
-                "chunks_done": 0,
-                "chunks_total": None,
-                "chunks_total_is_estimate": False,
-            }
-        )
+        entry: dict[str, Any] = {
+            "source_id": str(planned.source_document_id),
+            "title": planned.title,
+            "canonical_url": planned.canonical_url,
+            "tier": planned.tier.value,
+            "profile": planned.profile.value,
+            "editorial_role": planned.editorial_role.value,
+            "profile_reason_code": planned.profile_reason_code.value,
+            "status": status,
+            "reuse_state": source.reuse_state.value if source is not None else None,
+            "ioc_count": len(source.indicators) if source is not None else 0,
+            "rule_count": len(source.rules) if source is not None else 0,
+            "scope": (
+                {
+                    "kind": planned.scope.kind.value,
+                    "case_id": planned.scope.case_id,
+                    "kept_sections": planned.scope.kept_sections,
+                    "total_sections": planned.scope.total_sections,
+                    "kept_chars": planned.scope.kept_chars,
+                    "total_chars": planned.scope.total_chars,
+                }
+                if planned.scope is not None
+                else None
+            ),
+            "chunks_done": 0,
+            "chunks_total": None,
+            "chunks_total_is_estimate": False,
+        }
+        failure = failures_by_url.get(planned.canonical_url)
+        failed_source = str(planned.source_document_id) == failed_source_id
+        if failure is not None or failed_source:
+            criticality, criticality_reason = production_source_criticality(
+                planned, sources=coverage_sources
+            )
+            if failure is not None or failure_code is not None:
+                entry["failure_code"] = failure.error_code if failure is not None else failure_code
+            entry.update(
+                {
+                    "source_criticality": criticality.value,
+                    "criticality_reason": criticality_reason.value,
+                    "criticality_policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                }
+            )
+        sources.append(entry)
     for omitted in plan.omitted_sources:
         sources.append(
             {
@@ -395,7 +427,67 @@ def _canonical_extraction_progress(
         "sources": sources,
         "profile_policy_version": plan.profile_policy_version,
         "references_corpus_hash": plan.references_corpus_hash,
+        "source_criticality_policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
     }
+
+
+def _source_loss_diagnostics(
+    plan: ExtractionPlan,
+    extraction: ProductionExtractionV1,
+) -> list[dict[str, Any]]:
+    """Join durable Q2 failure codes to their planned source criticality."""
+    planned_by_url = {source.canonical_url: source for source in plan.sources}
+    covered_source_urls = {source.canonical_url for source in extraction.sources}
+    coverage_sources = tuple(
+        source for source in plan.sources if source.canonical_url in covered_source_urls
+    )
+    diagnostics: list[dict[str, Any]] = []
+    for omission in extraction.omitted_sources:
+        if (
+            omission.reason is not ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED
+            or omission.error_code is None
+        ):
+            continue
+        planned = planned_by_url.get(omission.canonical_url)
+        if planned is None:
+            criticality = ProductionSourceCriticality.CRITICAL
+            criticality_reason = (
+                ProductionSourceCriticalityReason.CORE_TIER
+                if omission.tier.value == "core"
+                else ProductionSourceCriticalityReason.COVERAGE_UNKNOWN
+            )
+            source_id = None
+            title = None
+            role = None
+            editorial_role = None
+        else:
+            criticality, criticality_reason = production_source_criticality(
+                planned, sources=coverage_sources
+            )
+            source_id = str(planned.source_document_id)
+            title = planned.title
+            role = planned.role.value
+            editorial_role = planned.editorial_role.value
+        diagnostics.append(
+            {
+                "source_id": source_id,
+                "source_title": title,
+                "source_url": omission.canonical_url,
+                "failure_code": omission.error_code,
+                "extraction_warnings": [
+                    warning
+                    for warning in extraction.warnings
+                    if omission.canonical_url in warning or warning.startswith("q2_parse_error:")
+                ],
+                "tier": omission.tier.value,
+                "role": role,
+                "editorial_role": editorial_role,
+                "source_criticality": criticality.value,
+                "criticality_reason": criticality_reason.value,
+                "criticality_policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+            }
+        )
+    return diagnostics
 
 
 def _merge_live_extraction_progress(canonical: dict[str, Any], live: dict[str, Any]) -> None:
@@ -1429,7 +1521,16 @@ class ProductionWorkflowOrchestrator:
                 plan,
                 model_calls=execution.model_calls,
                 failed_source_id=(failed_source_id if isinstance(failed_source_id, str) else None),
+                failure_code=execution.error_code,
             )
+            source_loss_diagnostics = [
+                entry
+                for entry in final_progress["sources"]
+                if isinstance(entry, dict)
+                and entry.get("status") == "failed"
+                and entry.get("source_criticality") is not None
+            ]
+            final_progress["source_loss_diagnostics"] = source_loss_diagnostics
             _merge_live_extraction_progress(final_progress, progress)
             await persist_best_effort(final_progress)
             return {
@@ -1438,10 +1539,12 @@ class ProductionWorkflowOrchestrator:
                 "error_code": execution.error_code,
                 "error": execution.error,
                 "details": dict(execution.details),
+                "source_loss_diagnostics": source_loss_diagnostics,
             }
 
         await self._check_cancellation(run.id, context)
         repair_entries, rejection_diagnostics = _repair_evidence(run, execution.rejections)
+        source_loss_diagnostics = _source_loss_diagnostics(plan, extraction)
         rejected_rules = [
             entry for entry in rejection_diagnostics if entry["proposal_kind"] == "rule"
         ]
@@ -1468,6 +1571,8 @@ class ProductionWorkflowOrchestrator:
                     for entry in rejection_diagnostics
                     if entry["proposal_kind"] == "artifact"
                 ),
+                "source_loss_diagnostic_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+                "source_loss_diagnostics": source_loss_diagnostics,
             },
             repair_evidence_blob_id=repair_evidence_blob_id,
             repair_evidence_entry_count=len(repair_entries),
@@ -1516,6 +1621,7 @@ class ProductionWorkflowOrchestrator:
             "artifact_id": str(artifact.id),
             "effective_artifact_id": effective_artifact_id,
             **production_extraction_metadata(extraction),
+            "source_loss_diagnostics": source_loss_diagnostics,
             "model_calls": execution.model_calls,
             "references_corpus_hash": extraction.references_corpus_hash,
         }
