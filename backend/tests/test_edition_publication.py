@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import shutil
+import zipfile
 from dataclasses import fields, replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -169,13 +171,13 @@ def _successful_edition_render(
         id=uuid4(),
         edition_release_id=release_id,
         renderer="typst",
-        renderer_version="edition-v2-typst-v2-semantic-annotation-coverage",
+        renderer_version="edition-v3-typst-v3-ioc-index-briefs",
         template_version="chp-edition-v1",
         template_sha256="a" * 64,
         compiler="typst",
         compiler_version="0.15.1",
         font_bundle_version="fonts-v1",
-        render_policy_version="typst-edition-v2-v1",
+        render_policy_version="typst-edition-v3-v1",
         format=TypstRenderFormat.PDF,
         input_hash="b" * 64,
         source_blob_id=uuid4(),
@@ -1824,6 +1826,47 @@ async def test_release_pdf_route_returns_404_409_and_verified_pdf() -> None:
 
 
 @pytest.mark.asyncio
+async def test_release_ioc_zip_reads_only_the_immutable_edition_document() -> None:
+    blobs = _BlobStore()
+    uow = _Uow(_edition(), [_single_article_row()], blobs)
+    publication = EditionPublicationService(lambda: uow, blobs)  # type: ignore[arg-type]
+    application = FastAPI()
+    application.include_router(publication_router)
+    application.state.edition_publication_service = publication
+    application.state.identity_provider = LocalIdentityProvider()
+    url = f"/api/editions/{EDITION_ID}/release/iocs.zip"
+
+    async with AsyncClient(
+        transport=ASGITransport(app=application), base_url="http://test"
+    ) as client:
+        assert (await client.get(url)).status_code == 404
+        accepted = await publication.accept(EDITION_ID, actor_id="analyst")
+        release = await EditionAssemblyService(lambda: uow, blobs).assemble(  # type: ignore[arg-type]
+            accepted.manifest.id
+        )
+
+        source_artifact = uow.production_artifacts.artifacts[ARTIFACT_A]
+        assert source_artifact.canonical_blob_id is not None
+        blobs.blobs[source_artifact.canonical_blob_id] = json.dumps(
+            publication_document_v4_to_json(_document("Changed after freeze"))
+        ).encode("utf-8")
+
+        response = await client.get(url)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-disposition"] == 'attachment; filename="iocs_FR2608.zip"'
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        csv_name = next(name for name in archive.namelist() if name.endswith("article.csv"))
+        csv = archive.read(csv_name).decode("utf-8")
+        assert "[|Alpha||]" in csv
+        assert "Changed after freeze" not in csv
+        assert "legacy_iocs_FR2608.txt" in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["edition_sha256"] == release.edition_document_sha256
+
+
+@pytest.mark.asyncio
 async def test_retry_render_is_idempotent_and_published_at_comes_from_render() -> None:
     row = EditionReviewReadItem(
         position=1,
@@ -1889,13 +1932,13 @@ async def test_retry_render_is_idempotent_and_published_at_comes_from_render() -
             id=uuid4(),
             edition_release_id=release.id,
             renderer="typst",
-            renderer_version="edition-v2-typst-v2-semantic-annotation-coverage",
+            renderer_version="edition-v3-typst-v3-ioc-index-briefs",
             template_version="chp-edition-v1",
             template_sha256="a" * 64,
             compiler="typst",
             compiler_version="0.15.1",
             font_bundle_version="fonts-v1",
-            render_policy_version="typst-edition-v2-v1",
+            render_policy_version="typst-edition-v3-v1",
             format=TypstRenderFormat.PDF,
             input_hash="b" * 64,
             source_blob_id=None,

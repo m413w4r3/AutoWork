@@ -51,8 +51,8 @@ def _render(**overrides: object) -> EditionRender:
 
 def test_edition_render_has_the_specified_frozen_slotted_contract() -> None:
     assert EDITION_RENDERER == "typst"
-    assert EDITION_RENDERER_VERSION == "edition-v2-typst-v2-semantic-annotation-coverage"
-    assert EDITION_RENDER_POLICY_VERSION == "typst-edition-v2-v1"
+    assert EDITION_RENDERER_VERSION == "edition-v3-typst-v3-ioc-index-briefs"
+    assert EDITION_RENDER_POLICY_VERSION == "typst-edition-v3-v1"
     assert [field.name for field in fields(EditionRender)] == [
         "id",
         "edition_release_id",

@@ -28,6 +28,7 @@ from cti_app.application.edition_publication import (
     EditionReleaseStatus,
     PublicationAcceptanceError,
     PublicationManifestNotFoundError,
+    ReleaseIOCArchiveUnreadableError,
     ReleasePdfNotAvailableError,
     ReleasePdfUnreadableError,
 )
@@ -1552,6 +1553,24 @@ async def download_edition_pdf(edition_id: UUID, request: Request) -> Response:
     )
 
 
+@router.get("/editions/{edition_id}/release/iocs.zip")
+async def download_edition_iocs(edition_id: UUID, request: Request) -> Response:
+    """Return CSV IOC files, legacy text, and export manifest from the frozen release."""
+    try:
+        archive = await _publication_service(request).read_release_ioc_archive(edition_id)
+    except Exception as exc:
+        _raise_publication_error(exc)
+    return Response(
+        content=archive.content,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{archive.filename}"',
+            "X-IOC-Count": str(archive.ioc_count),
+            "X-Publication-Count": str(archive.article_count),
+        },
+    )
+
+
 @router.get("/editions/{edition_id}/release/rules")
 async def download_edition_rules(edition_id: UUID, request: Request) -> Response:
     """Return every detection rule published by the edition, as one ZIP."""
@@ -1877,6 +1896,15 @@ def _raise_publication_error(exc: Exception) -> NoReturn:
             status_code=(
                 status.HTTP_503_SERVICE_UNAVAILABLE
                 if exc.code == "release_pdf_storage_error"
+                else status.HTTP_500_INTERNAL_SERVER_ERROR
+            ),
+            detail={"code": exc.code},
+        ) from exc
+    if isinstance(exc, ReleaseIOCArchiveUnreadableError):
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if exc.code == "release_ioc_archive_storage_error"
                 else status.HTTP_500_INTERNAL_SERVER_ERROR
             ),
             detail={"code": exc.code},
