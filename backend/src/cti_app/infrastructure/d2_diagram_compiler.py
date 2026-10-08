@@ -31,7 +31,6 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
-    diagram_requires_vertical_layout,
 )
 
 D2_COMPILER = "d2"
@@ -41,6 +40,10 @@ D2_MEDIA_TYPE = "image/svg+xml"
 D2_LAYOUT = "elk"
 D2_LAYOUT_OPTIONS = ("--pad=8", "--elk-nodeNodeBetweenLayers=15")
 D2_COMPILER_VERSION = "0.9.0"
+# These are rendering constraints. Keep them separate from enrichment's
+# normalization policy, whose thresholds are part of the stored artifact contract.
+D2_VERTICAL_AFTER_NODES = 8
+D2_VERTICAL_AFTER_LABEL_CHARACTERS = 44
 D2_COMPILATION_TIMEOUT_SECONDS = 10
 D2_MAX_STDOUT_BYTES = 2 * 1024 * 1024
 D2_MAX_STDERR_BYTES = 64 * 1024
@@ -200,6 +203,13 @@ def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple
     return 18, 16, 12
 
 
+def _d2_requires_vertical_layout(node_count: int, labels: Sequence[str]) -> bool:
+    """Keep dense or very verbose graphs readable in the publication column."""
+    return node_count > D2_VERTICAL_AFTER_NODES or any(
+        len(label) > D2_VERTICAL_AFTER_LABEL_CHARACTERS for label in labels
+    )
+
+
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
     node_references = _node_references(diagram)
@@ -208,7 +218,7 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     graph_labels = [node.label for node in diagram.nodes]
     graph_labels.extend(edge.label or "" for edge in diagram.edges)
     graph_labels.extend(group.label for group in diagram.groups)
-    force_vertical = diagram_requires_vertical_layout(len(diagram.nodes), graph_labels)
+    force_vertical = _d2_requires_vertical_layout(len(diagram.nodes), graph_labels)
     node_font_size, edge_font_size, node_wrap_width = _layout_font_sizes(
         diagram, force_vertical=force_vertical
     )

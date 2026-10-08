@@ -349,10 +349,10 @@ class EnrichmentDiagramDirection(StrEnum):
     TOP_TO_BOTTOM = "top_to_bottom"
 
 
-# Keep compact flows horizontal; long labels and larger graphs use a vertical layout
-# so the rendered figure keeps readable text in the publication column.
-DIAGRAM_VERTICAL_AFTER_NODES = 8
-DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS = 44
+# A wide strip of boxes is scaled down to the page width and its text becomes unreadable:
+# beyond these budgets a diagram is laid out top to bottom whatever direction was asked.
+DIAGRAM_VERTICAL_AFTER_NODES = 3
+DIAGRAM_VERTICAL_AFTER_LABEL_CHARACTERS = 30
 
 
 def diagram_requires_vertical_layout(node_count: int, labels: Iterable[str]) -> bool:
