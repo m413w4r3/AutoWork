@@ -1071,7 +1071,7 @@ def test_output_invalid_carries_a_diagnosable_reason():
 def test_synthesis_policy_versions_pin_validator_and_wire_diagnostics() -> None:
     assert SYNTHESIS_POLICY_VERSION == "production-synthesis-v7-source-domain-grounding"
     assert synthesis_module.SYNTHESIS_VALIDATOR_VERSION == (
-        "synthesis-validator-v6-grounded-section-headings"
+        "synthesis-validator-v7-grounded-section-heading-facts"
     )
     assert synthesis_module.SYNTHESIS_PROMPT_VERSION == (
         "synthesis-draft-v11-adaptive-section-headings"
@@ -2814,10 +2814,6 @@ def test_wire_parser_preserves_optional_section_headings():
         ("Pipeline interne", "synthesis_section_heading_dropped_invalid"),
         ("Synthesis parser", "synthesis_section_heading_dropped_invalid"),
         ("A" * 91, "synthesis_section_heading_dropped_invalid"),
-        (
-            "Infrastructure et protocole C2",
-            "synthesis_section_heading_dropped_invalid",
-        ),
         ("", "synthesis_section_heading_dropped_empty"),
     ),
 )
@@ -4499,7 +4495,7 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
             sections=(
                 SynthesisSectionProposalV1(
                     kind=SynthesisSectionKind.OVERVIEW,
-                    heading="NanoDump",
+                    heading="",
                     claims=(
                         SynthesisClaimProposalV1(
                             text=(
@@ -6172,6 +6168,83 @@ def test_rename_section_accepts_plain_labeled_and_block_after(
     assert revised_payload["sections"][1]["heading"] == "Observed facts"
 
 
+@pytest.mark.parametrize(
+    ("heading", "claim_text", "accepted"),
+    (
+        (
+            "Infrastructure et protocole C2",
+            "Les opérateurs assurent le command-and-control via une infrastructure relais.",
+            True,
+        ),
+        (
+            "Communications C2 via CloudFront",
+            "L'infrastructure command-and-control passe par CloudFront.",
+            True,
+        ),
+        (
+            "Communications C2 via CloudFront",
+            "Les opérateurs assurent le command-and-control par un relais web.",
+            False,
+        ),
+    ),
+)
+def test_rename_section_grounds_case_specific_terms_but_allows_generic_c2(
+    heading: str, claim_text: str, accepted: bool
+) -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    section = base.sections[1]
+    base = replace(
+        base,
+        sections=(
+            *base.sections[:1],
+            replace(
+                section,
+                paragraphs=(replace(section.paragraphs[0], text=claim_text),),
+            ),
+            *base.sections[2:],
+        ),
+    )
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(payload["sections"][1]),),
+    )
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        TargetedEditorialRevisionOperation.RENAME_SECTION,
+        heading,
+    )
+
+    if accepted:
+        revised, _, _ = synthesis_revision_module._apply_wire_patch(
+            base_synthesis=base,
+            base_payload=payload,
+            target=target,
+            operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+            patch=patch,
+            evidence_pack=evidence_pack,
+            extraction=world.extraction,
+            snapshot=world.snapshot,
+        )
+        assert revised.sections[1].heading == heading
+    else:
+        with pytest.raises(
+            synthesis_revision_module.TargetedSynthesisRevisionValidationError
+        ) as error:
+            synthesis_revision_module._apply_wire_patch(
+                base_synthesis=base,
+                base_payload=payload,
+                target=target,
+                operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+                patch=patch,
+                evidence_pack=evidence_pack,
+                extraction=world.extraction,
+                snapshot=world.snapshot,
+            )
+        assert error.value.reason_code == "synthesis_section_heading_invalid"
+
+
 @pytest.mark.parametrize("after", ["", "HEADING:", "@@HEADING@@\n@@END HEADING@@"])
 def test_rename_section_rejects_empty_after_or_heading(after: str) -> None:
     world, base, evidence_pack, _ = _targeted_revision_fixture()
@@ -6341,6 +6414,11 @@ def test_revision_prompt_specifies_plain_heading_after_format() -> None:
 
     assert "one non-empty line containing only the replacement section heading" in prompt
     assert "@@AFTER@@\nA concise evidence-grounded heading" in prompt
+    assert "Generic CTI terms such as C2, S3" in prompt
+    assert "grounded in the section claims" in prompt
+    assert synthesis_revision_module.SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION == (
+        "synthesis-targeted-revision-v4-grounded-heading-terms"
+    )
 
 
 def test_revision_prompt_defines_after_format_for_every_synthesis_operation() -> None:

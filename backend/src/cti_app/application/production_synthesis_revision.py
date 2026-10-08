@@ -2648,7 +2648,12 @@ class ProductionSynthesisRevisionService:
         elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
             after_format = (
                 "AFTER format: one non-empty line containing only the replacement section "
-                "heading. Do not include claims or a section wrapper."
+                "heading. Do not include claims or a section wrapper. Generic CTI terms such "
+                "as C2, S3, IPv4/IPv6, x64/x86, SHA-1/SHA-256/MD5, HTTP/2, OAuth2, and Web3 "
+                "may describe the claims without appearing literally in them; C&C and 2FA/MFA "
+                "are also generic terms. Keep numbers, "
+                "indicators, and case-specific product, actor, campaign, or family names "
+                "grounded in the section claims."
             )
         elif operation in {
             TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,

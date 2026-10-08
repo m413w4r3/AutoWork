@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
-from pydantic import BaseModel, ConfigDict, PrivateAttr, StrictStr, field_validator
+from pydantic import BaseModel, ConfigDict, PrivateAttr, StrictStr, field_validator, model_validator
 
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.model_gateway import (
@@ -118,7 +118,7 @@ SYNTHESIS_EVIDENCE_PACK_POLICY_VERSION = "synthesis-evidence-pack-v9-source-publ
 SYNTHESIS_TIMELINE_POLICY_VERSION = "synthesis-timeline-v4-direct-corroboration-only"
 SYNTHESIS_EVIDENCE_PACK_SCHEMA_VERSION = 3
 SYNTHESIS_ACCESS_POLICY_VERSION = "synthesis-access-policy-v2-document-collection"
-SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v6-grounded-section-headings"
+SYNTHESIS_VALIDATOR_VERSION = "synthesis-validator-v7-grounded-section-heading-facts"
 MAX_SYNTHESIS_UNCERTAINTIES = 10
 SYNTHESIS_MODEL_POLICY_VERSION = "synthesis-model-policy-v1"
 SYNTHESIS_ROUTING_POLICY_VERSION = "synthesis-routing-policy-v1"
@@ -172,11 +172,6 @@ class SynthesisSectionProposalV1(_StrictProposalModel):
     heading: StrictStr = ""
     claims: tuple[SynthesisClaimProposalV1, ...]
 
-    @field_validator("heading")
-    @classmethod
-    def _valid_heading_text(cls, value: str) -> str:
-        return validate_synthesis_section_heading(value)
-
     @field_validator("claims")
     @classmethod
     def _nonempty_claims(
@@ -185,6 +180,15 @@ class SynthesisSectionProposalV1(_StrictProposalModel):
         if not value:
             raise ValueError("Section claims must be a non-empty tuple")
         return value
+
+    @model_validator(mode="after")
+    def _valid_heading_against_claims(self) -> SynthesisSectionProposalV1:
+        normalized = validate_synthesis_section_heading(
+            self.heading,
+            (claim.text for claim in self.claims),
+        )
+        object.__setattr__(self, "heading", normalized)
+        return self
 
 
 class SynthesisSourceNoteProposalV1(_StrictProposalModel):

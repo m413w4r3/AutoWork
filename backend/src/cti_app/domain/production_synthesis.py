@@ -41,8 +41,18 @@ _SECTION_HEADING_INTERNAL_JARGON = re.compile(
     re.IGNORECASE,
 )
 _SECTION_HEADING_NUMBERED_FACT = re.compile(
-    r"(?<![\w])(?:[A-Za-z][A-Za-z0-9_.-]*\d[A-Za-z0-9_.-]*|"
+    r"(?<![\w])(?:(?=[A-Za-z0-9_.-]*\d)(?=[A-Za-z0-9_.-]*[A-Za-z])"
+    r"[A-Za-z0-9][A-Za-z0-9_.-]*|"
     r"\d+(?:[.,]\d+)*(?:[-/]\d+(?:[.,]\d+)*)*)(?![\w])"
+)
+# These are the numbered CTI terms this matcher would otherwise reject. C&C
+# and MFA contain no digits, so they need no exception.
+_SECTION_HEADING_GENERIC_TECHNICAL_TERM = re.compile(
+    r"(?<![\w])(?:C2|S3|IPv4|IPv6|x64|x86|SHA-1|SHA-256|MD5|HTTP/2|OAuth2|Web3|2FA)(?![\w])",
+    re.IGNORECASE,
+)
+_SECTION_HEADING_CASED_NAME = re.compile(
+    r"(?<!\w)(?:[A-Z][a-z0-9]+[A-Z][A-Za-z0-9]*|[a-z]+[A-Z][A-Za-z0-9]*|\.NET)(?!\w)"
 )
 _SECTION_HEADING_IOC = re.compile(
     r"https?://[^\s,;()\[\]]+|"
@@ -87,10 +97,24 @@ def validate_synthesis_section_heading(
     if any(not isinstance(text, str) for text in claims):
         raise ValueError("Synthesis section claims must be text")
     folded_claims = tuple(unicodedata.normalize("NFKC", text).casefold() for text in claims)
+    generic_term_spans = tuple(
+        match.span() for match in _SECTION_HEADING_GENERIC_TECHNICAL_TERM.finditer(normalized)
+    )
+    fact_matches = (
+        match
+        for pattern in (
+            _SECTION_HEADING_NUMBERED_FACT,
+            _SECTION_HEADING_IOC,
+            _SECTION_HEADING_CASED_NAME,
+        )
+        for match in pattern.finditer(normalized)
+    )
     facts = {
         match.group(0).casefold()
-        for pattern in (_SECTION_HEADING_NUMBERED_FACT, _SECTION_HEADING_IOC)
-        for match in pattern.finditer(normalized)
+        for match in fact_matches
+        if not any(
+            start <= match.start() and match.end() <= end for start, end in generic_term_spans
+        )
     }
     if any(not any(fact in text for text in folded_claims) for fact in facts):
         raise ValueError("Synthesis section heading contains a fact absent from its claims")

@@ -23,6 +23,7 @@ from cti_app.domain.production_synthesis import (
     production_synthesis_from_json,
     production_synthesis_to_json,
     validate_synthesis_lineage,
+    validate_synthesis_section_heading,
 )
 
 _HASH_A = "a" * 64
@@ -119,7 +120,6 @@ def test_legacy_synthesis_without_heading_field_remains_readable() -> None:
     "heading",
     (
         "E001 Accès initial",
-        "Infrastructure et protocole C2",
         "Pipeline interne",
         "A" * 91,
     ),
@@ -131,6 +131,97 @@ def test_synthesis_section_rejects_invalid_headings(heading: str) -> None:
             heading,
             (SynthesisParagraphV1("The activity affected several systems.", (_ref(),)),),
         )
+
+
+def test_generic_c2_heading_does_not_need_the_literal_in_claims() -> None:
+    assert (
+        validate_synthesis_section_heading(
+            "Infrastructure et protocole C2",
+            (
+                "Les opérateurs communiquent par command-and-control via une "
+                "infrastructure opérateur.",
+            ),
+        )
+        == "Infrastructure et protocole C2"
+    )
+
+
+@pytest.mark.parametrize(
+    "heading",
+    (
+        "Communications C2",
+        "Stockage S3",
+        "Trafic IPv4 et IPv6",
+        "Exécution x64 et x86",
+        "Empreintes SHA-1, SHA-256 et MD5",
+        "Échanges HTTP/2 et OAuth2",
+        "Applications Web3",
+    ),
+)
+def test_generic_numbered_technical_terms_are_allowed_without_literal_claims(
+    heading: str,
+) -> None:
+    assert validate_synthesis_section_heading(heading, ("Les opérateurs communiquent.",)) == heading
+
+
+@pytest.mark.parametrize("heading", ("Communications C&C", "Authentification 2FA/MFA"))
+def test_generic_terms_without_numbered_fact_matches_need_no_exception(heading: str) -> None:
+    assert validate_synthesis_section_heading(heading, ("Les opérateurs communiquent.",)) == heading
+
+
+@pytest.mark.parametrize(
+    ("heading", "claim"),
+    (
+        ("Campagne 2025", "Les opérateurs ont lancé une campagne."),
+        ("Protocole version 1.2.3", "Le protocole a évolué récemment."),
+        ("Exploitation CVE-2025-12345", "Une faille a été exploitée."),
+        ("Connexion 198.51.100.42", "La connexion cible un serveur externe."),
+        ("Domaine evil.example", "Le domaine n'est pas documenté."),
+        ("Activité GTG-30004", "L'activité est attribuée à un groupe."),
+        ("Technique 3CX", "La technique est décrite dans le rapport."),
+        (
+            "Communications C2 via CloudFront",
+            "Les opérateurs utilisent une infrastructure de command-and-control.",
+        ),
+    ),
+)
+def test_heading_rejects_unsubstantiated_numbers_indicators_and_names(
+    heading: str, claim: str
+) -> None:
+    with pytest.raises(ValueError, match="fact absent from its claims"):
+        validate_synthesis_section_heading(heading, (claim,))
+
+
+def test_cloudfront_heading_is_allowed_only_when_named_in_its_claims() -> None:
+    heading = "Communications C2 via CloudFront"
+
+    assert (
+        validate_synthesis_section_heading(
+            heading,
+            (
+                "Les opérateurs utilisent CloudFront pour leur infrastructure de "
+                "command-and-control.",
+            ),
+        )
+        == heading
+    )
+
+
+@pytest.mark.parametrize(
+    ("heading", "claim"),
+    (
+        ("Node.js", "Le rapport décrit l'exécution de Node.js."),
+        ("back.js", "Le fichier back.js a été récupéré."),
+        ("Cloud.Run", "Le service Cloud.Run héberge le relais."),
+        (".NET", "Le binaire .NET a été analysé."),
+    ),
+)
+def test_domain_like_and_technology_names_are_grounded_without_false_positives(
+    heading: str, claim: str
+) -> None:
+    assert validate_synthesis_section_heading(heading, (claim,)) == heading
+    with pytest.raises(ValueError, match="fact absent from its claims"):
+        validate_synthesis_section_heading(heading, ("Le rapport décrit une activité réseau.",))
 
 
 def test_stored_synthesis_with_duplicate_headings_is_rejected() -> None:
