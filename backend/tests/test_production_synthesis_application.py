@@ -6920,7 +6920,10 @@ def test_targeted_revision_supports_legacy_sections_without_headings() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["title", "section_paragraph"])
+@pytest.mark.parametrize(
+    "change",
+    ["title", "legacy_anchor", "rename_section", "section_paragraph", "delete_section"],
+)
 async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependencies(
     change: str,
 ) -> None:
@@ -6941,8 +6944,22 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
         EnrichmentPlacementV1,
         editorial_enrichment_to_json,
     )
+    from cti_app.domain.semantic_annotation import SemanticAnnotationProposalV1, SemanticRole
 
     world, base, evidence_pack, handle = _targeted_revision_fixture()
+    if change == "legacy_anchor":
+        base = replace(
+            base,
+            sections=(
+                replace(base.sections[0], heading="FooRAT observations"),
+                replace(
+                    base.sections[1],
+                    heading="FooRAT activity",
+                    paragraphs=base.sections[0].paragraphs,
+                ),
+                *base.sections[2:],
+            ),
+        )
     artifact_store = _RevisionMemoryBlobStore()
     base_payload = production_synthesis_to_json(base)
     base_blob = artifact_store.add_json(base_payload)
@@ -6970,7 +6987,7 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
                 key="dependency-diagram",
                 kind=EnrichmentDiagramKind.CUSTOM,
                 title="FooRAT and the report",
-                caption=None,
+                caption="FooRAT command flow",
                 direction=EnrichmentDiagramDirection.LEFT_TO_RIGHT,
                 nodes=(
                     DiagramNodeV1("tool", "FooRAT", (evidence_ref,)),
@@ -6992,6 +7009,13 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
             ),
         ),
         source_figures=(),
+        annotations=(
+            SemanticAnnotationProposalV1(
+                role=SemanticRole.MALWARE,
+                paragraph_anchor="diagram:dependency-diagram:caption",
+                text="FooRAT",
+            ),
+        ),
         warnings=(),
     )
     enrichment_blob = artifact_store.add_json(editorial_enrichment_to_json(enrichment))
@@ -7044,11 +7068,25 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
         projection_artifact=None,
         publication_artifact=None,
     )
-    if change == "title":
+    if change in {"title", "legacy_anchor"}:
         operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
         target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
         expected_group = world.snapshot.actor_or_campaign
         after = f"@@TITLE@@\n[{expected_group}] Updated FooRAT activity\n@@END TITLE@@"
+    elif change == "rename_section":
+        operation = TargetedEditorialRevisionOperation.RENAME_SECTION
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(synthesis_revision_module._section_id(base_payload["sections"][1]),),
+        )
+        after = "@@HEADING@@\nFooRAT activity\n@@END HEADING@@"
+    elif change == "delete_section":
+        operation = TargetedEditorialRevisionOperation.DELETE_SECTION
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(synthesis_revision_module._section_id(base_payload["sections"][1]),),
+        )
+        after = "@@EMPTY@@"
     else:
         operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
         section = base_payload["sections"][1]
@@ -7107,8 +7145,11 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
     assert rebased_artifact is not None
     assert rebased is not None
     assert rebased_artifact.metadata["revision_rebase"]["model_call_count"] == 0
-    if change == "title":
+    if change in {"title", "legacy_anchor", "rename_section"}:
         assert [diagram.key for diagram in rebased.diagrams] == ["dependency-diagram"]
+        assert [item.paragraph_anchor for item in rebased.annotations] == [
+            "diagram:dependency-diagram:caption"
+        ]
         assert rebased_artifact.metadata["revision_rebase"]["stale_blocks"] == []
         assert rebased_artifact.metadata["revision_rebase"]["adopted_blocks"]["diagrams"] == [
             "dependency-diagram"
@@ -7120,5 +7161,13 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
                 "kind": "diagram",
                 "key": "dependency-diagram",
                 "reason": "section_anchor_changed",
-            }
+                "source_artifact_id": str(enrichment_artifact.id),
+            },
+            {
+                "kind": "annotation",
+                "key": "diagram:dependency-diagram:caption",
+                "reason": "paragraph_anchor_changed",
+                "source_artifact_id": str(enrichment_artifact.id),
+            },
         ]
+        assert rebased.annotations == ()

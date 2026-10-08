@@ -1558,6 +1558,69 @@ export async function reviseEditorialEnrichment(
   );
 }
 
+export interface StaleEnrichmentRestoreRequest {
+  base_artifact_id: string;
+  base_version: number;
+  base_input_hash: string;
+  base_canonical_sha256: string;
+}
+
+export interface StaleEnrichmentRestoreBlock {
+  kind: string;
+  key: string;
+  source_artifact_id: string;
+  reason?: string;
+  text?: string;
+}
+
+export interface StaleEnrichmentRestorePreview {
+  base_artifact_id: string;
+  base_version: number;
+  base_input_hash: string;
+  base_canonical_sha256: string;
+  restorable_blocks: StaleEnrichmentRestoreBlock[];
+  non_restorable_blocks: StaleEnrichmentRestoreBlock[];
+}
+
+export interface StaleEnrichmentRestoreResponse {
+  artifact_id: string;
+  artifact_version: number;
+  artifact_input_hash: string;
+  artifact_canonical_sha256: string;
+  publication_artifact_id: string;
+  publication_artifact_version: number;
+  revision: Record<string, unknown>;
+  restored_blocks: StaleEnrichmentRestoreBlock[];
+}
+
+export async function previewStaleEnrichmentRestore(
+  subjectId: string,
+  requestBody: StaleEnrichmentRestoreRequest,
+): Promise<StaleEnrichmentRestorePreview> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/editorial_enrichment/restore/preview`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    },
+  );
+}
+
+export async function restoreStaleEnrichment(
+  subjectId: string,
+  requestBody: StaleEnrichmentRestoreRequest,
+): Promise<StaleEnrichmentRestoreResponse> {
+  return request(
+    `/api/subjects/${subjectId}/production/artifacts/editorial_enrichment/restore`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requestBody),
+    },
+  );
+}
+
 export type TargetedEditorialRevisionOperation =
   | "rewrite_title"
   | "rewrite_lead"

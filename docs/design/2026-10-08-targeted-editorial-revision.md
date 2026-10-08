@@ -138,3 +138,25 @@ autres enrichissements restent inchangés. Le preview expose les fences de
 base, la zone visée, les stages conservés/invalidés et 0 appel modèle pour un
 delete, 1 pour un create/rewrite (0 si un ModelRun idempotent est déjà
 disponible). `allow_source_extension` conserve le refus typé E2a.
+
+## E2c — ancres de rebase et restauration des blocs stale
+
+Les IDs complets de section restent la référence des cibles de révision et
+continuent d'inclure le heading. Les placements d'enrichissement utilisent une
+ancre distincte calculée sur la section canonique sans son heading : les
+paragraphes, leurs preuves et le kind restent dans l'ancre. Un renommage peut
+donc conserver un bloc, tandis qu'une réécriture ou une suppression de la
+section l'invalide. Le lecteur accepte aussi le hash complet historique.
+
+Un bloc écarté par rebase reste absent de l'artifact courant, avec son
+`source_artifact_id`, sa clé et sa raison dans `revision_rebase.stale_blocks`.
+Le preview et l'application `restore_enrichment_blocks` parcourent les seuls
+ancêtres d'enrichissement vérifiés, rattachent les placements à la synthèse
+courante, puis réappliquent la validation des preuves, de la qualité IOC et des
+diagrammes avant d'append une nouvelle version. Les suppressions ciblées
+`delete_*` de la lignée interdisent la restauration de leur clé. L'application
+n'appelle aucun modèle, compare les fences CAS du courant et reconstruit la
+publication avec le rendu et QA existants.
+
+Les endpoints sont `POST .../editorial_enrichment/restore/preview` et
+`POST .../editorial_enrichment/restore`.
