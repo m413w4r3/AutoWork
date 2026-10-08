@@ -4397,6 +4397,7 @@ async def _revision_harness(
     include_second_figure: bool = False,
     include_target_annotations: bool = False,
     include_ioc_duplicate_table: bool = False,
+    legacy_v8_identity: bool = False,
 ) -> SimpleNamespace:
     from cti_app.application.publication_assembly import PublicationAssemblyService
 
@@ -4441,34 +4442,7 @@ async def _revision_harness(
         )
     inventory = _figure_inventory(world.extraction)
     if include_second_figure:
-        original = inventory.figures[0]
-        alternative_locator = SourceFigureLocatorV1(
-            page=3,
-            section="Network overview",
-            figure_label="Alternative ExampleRAT process map",
-            original_asset_url="https://cdn.example.test/example-rat-alternative.png",
-        )
-        alternative = original.model_copy(
-            update={
-                "figure_id": source_figure_id(
-                    source_document_id=original.source_document_id,
-                    sha256="e" * 64,
-                    source=original.source,
-                    locator=alternative_locator,
-                ),
-                "blob_id": UUID(int=602),
-                "sha256": "e" * 64,
-                "locator": alternative_locator,
-                "provenance": "archived alternative source figure",
-            },
-        )
-        metadata = dict(inventory.catalog_metadata)
-        metadata[alternative.figure_id] = next(iter(metadata.values()))
-        inventory = replace(
-            inventory,
-            figures=(*inventory.figures, alternative),
-            catalog_metadata=metadata,
-        )
+        inventory = _inventory_with_second_figure(inventory)
     inventory_state = SimpleNamespace(value=inventory)
 
     async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
@@ -4502,6 +4476,11 @@ async def _revision_harness(
         access_policy_hash=access_hash,
         source_figure_inventory_hash=inventory_hash,
     )
+    stored_input_hash = (
+        "c783bc042c9e7b1f67a287ff1a32169b3fe67b43da4e5043128d87a36fbf82f4"
+        if legacy_v8_identity
+        else input_hash
+    )
     fact_handle = next(
         str(record["handle"])
         for record in evidence_pack.narrative_evidence
@@ -4532,8 +4511,8 @@ async def _revision_harness(
             purpose=base_table.purpose,
         )
         enrichment = replace(enrichment, tables=(ioc_table,))
+    figure_catalog = build_editorial_figure_catalog(world.extraction, inventory)
     if include_figure:
-        figure_catalog = build_editorial_figure_catalog(world.extraction, inventory)
         figure_wire = _figure_wire(handle=figure_catalog[0].handle)
         parsed_figure = parse_editorial_enrichment_proposal_wire(
             figure_wire, evidence_pack, figure_catalog=figure_catalog
@@ -4574,13 +4553,33 @@ async def _revision_harness(
         subject_id=world.snapshot.subject_id,
         stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
         version=1,
-        input_hash=input_hash,
+        input_hash=stored_input_hash,
         canonical_blob_id=world.store.put(base_payload),
         metadata={
             "evidence_pack_hash": evidence_pack_hash,
             "access_policy_hash": access_hash,
             "source_figure_inventory_hash": inventory_hash,
-            "routing_policy_version": "routing-v1",
+            "source_figure_provenance_version": (
+                enrichment_module.SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+            ),
+            "source_figure_provenance_diagnostics": (
+                enrichment_module.build_source_figure_provenance_diagnostics(
+                    inventory, figure_catalog, enrichment
+                )
+            ),
+            "generator_version": (
+                "model-text-blocks-v8-editorial-tables"
+                if legacy_v8_identity
+                else enrichment_module.EDITORIAL_ENRICHMENT_GENERATOR_VERSION
+            ),
+            "extraction_hash": canonical_extraction_hash(world.extraction),
+            "synthesis_hash": canonical_synthesis_hash(world.synthesis),
+            "relevance_projection_hash": None,
+            "routing_policy_version": (
+                "editorial-enrichment-routing-policy-v2-resource-search-off"
+                if legacy_v8_identity
+                else "routing-v1"
+            ),
         },
     )
     reference_artifact = ProductionArtifact(
@@ -4677,9 +4676,59 @@ async def _revision_harness(
         base_sha256=hashlib.sha256(
             await world.store.read_bytes(base.canonical_blob_id)
         ).hexdigest(),
-        input_hash=input_hash,
+        input_hash=stored_input_hash,
+        current_input_hash=input_hash,
+        stored_input_hash=stored_input_hash,
         assembled=assembled,
         rendered=rendered,
+    )
+
+
+def _inventory_with_second_figure(
+    inventory: SourceFigureInventoryResult,
+) -> SourceFigureInventoryResult:
+    original = inventory.figures[0]
+    alternative_locator = SourceFigureLocatorV1(
+        page=3,
+        section="Network overview",
+        figure_label="Alternative ExampleRAT process map",
+        original_asset_url="https://cdn.example.test/example-rat-alternative.png",
+    )
+    alternative = original.model_copy(
+        update={
+            "figure_id": source_figure_id(
+                source_document_id=original.source_document_id,
+                sha256="e" * 64,
+                source=original.source,
+                locator=alternative_locator,
+            ),
+            "blob_id": UUID(int=602),
+            "sha256": "e" * 64,
+            "locator": alternative_locator,
+            "provenance": "archived alternative source figure",
+        },
+    )
+    metadata = dict(inventory.catalog_metadata)
+    metadata[alternative.figure_id] = next(iter(metadata.values()))
+    return replace(
+        inventory,
+        figures=(*inventory.figures, alternative),
+        catalog_metadata=metadata,
+        provenance_diagnostics=(
+            *inventory.provenance_diagnostics,
+            SourceFigureProvenanceDiagnostic(
+                stage=SourceFigureProvenanceStage.DISCOVERED,
+                source_document_id=alternative.source_document_id,
+                figure_id=alternative.figure_id,
+            ),
+            SourceFigureProvenanceDiagnostic(
+                stage=SourceFigureProvenanceStage.ARCHIVED,
+                source_document_id=alternative.source_document_id,
+                figure_id=alternative.figure_id,
+                blob_id=alternative.blob_id,
+                sha256=alternative.sha256,
+            ),
+        ),
     )
 
 
@@ -4948,6 +4997,47 @@ async def test_revision_api_maps_stale_base_to_http_409(
 
     assert conflict.value.status_code == 409
     assert conflict.value.detail["code"] == "editorial_enrichment_stale_base"  # type: ignore[index]
+
+
+def test_revision_service_factory_reuses_collection_media_archiver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import cti_app.config as config_module
+
+    media_archiver = object()
+    state = SimpleNamespace(
+        production_artifact_store=object(),
+        publication_render_service=object(),
+        uow_factory=object(),
+        model_gateway=object(),
+        collection_service=SimpleNamespace(source_media_archiver=media_archiver),
+    )
+
+    class _CapturingEnrichmentService:
+        def __init__(self, **kwargs: Any) -> None:
+            self.source_media_archiver = kwargs["source_media_archiver"]
+
+    monkeypatch.setattr(
+        config_module,
+        "get_settings",
+        lambda: SimpleNamespace(production_editorial_resource_search_enabled=False),
+    )
+    monkeypatch.setattr(
+        production_api, "ProductionEditorialEnrichmentService", _CapturingEnrichmentService
+    )
+    monkeypatch.setattr(production_api, "EditorialEnrichmentService", lambda *_args: object())
+    monkeypatch.setattr(production_api, "D2DiagramCompiler", lambda: object())
+    monkeypatch.setattr(production_api, "AnalyticChartRenderer", lambda: object())
+    monkeypatch.setattr(
+        production_api,
+        "ProductionEditorialEnrichmentRevisionService",
+        lambda **kwargs: SimpleNamespace(enrichment_service=kwargs["enrichment_service"]),
+    )
+
+    request = cast(Any, SimpleNamespace(app=SimpleNamespace(state=state)))
+    revision_service = production_api._production_enrichment_revision_service(request)
+
+    assert revision_service.enrichment_service.source_media_archiver is media_archiver
 
 
 @pytest.mark.asyncio
@@ -5939,6 +6029,199 @@ def _common_enrichment_request(
         mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
         requester="test-analyst",
     )
+
+
+@pytest.mark.asyncio
+async def test_common_revision_accepts_additive_inventory_without_rebasing_base_hash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        include_figure=True,
+        legacy_v8_identity=True,
+    )
+    original_inventory = harness.inventory_state.value
+    stored_inventory_hash = harness.base.metadata["source_figure_inventory_hash"]
+    expanded_inventory = _inventory_with_second_figure(original_inventory)
+    harness.inventory_state.value = expanded_inventory
+
+    assert stored_inventory_hash == original_inventory.functional_hash()
+    assert expanded_inventory.functional_hash() != stored_inventory_hash
+
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        element_key="tools_table",
+    )
+    service = _common_revision_service(harness)
+    preview = await harness.service.preview_targeted(request)
+    result = await service.revise(request)
+    replay = await service.revise(request)
+
+    assert preview.base_input_hash == harness.base.input_hash
+    assert result.refusal is None and result.artifact is not None
+    assert replay.artifact is not None and replay.artifact.id == result.artifact.id
+    assert result.artifact.input_hash == harness.current_input_hash
+    assert harness.base.input_hash == harness.stored_input_hash
+    assert result.artifact.metadata["revision"]["base_input_hash"] == harness.stored_input_hash
+    assert len(harness.world.gateway.calls) == 1
+    assert result.artifact.metadata["source_figure_inventory_hash"] == stored_inventory_hash
+    catalogued_ids = {
+        record["figure_id"]
+        for record in result.artifact.metadata["source_figure_provenance_diagnostics"]
+        if record["stage"] == "catalogued"
+    }
+    assert catalogued_ids == {str(original_inventory.figures[0].figure_id)}
+    assert str(expanded_inventory.figures[1].figure_id) not in catalogued_ids
+
+
+@pytest.mark.parametrize("change", ["modified", "disappeared"])
+@pytest.mark.asyncio
+async def test_common_revision_conflicts_when_an_admitted_figure_changes_or_disappears(
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        include_figure=True,
+        legacy_v8_identity=True,
+    )
+    original_inventory = harness.inventory_state.value
+    if change == "modified":
+        changed_figure = original_inventory.figures[0].model_copy(update={"sha256": "a" * 64})
+        harness.inventory_state.value = replace(original_inventory, figures=(changed_figure,))
+    else:
+        harness.inventory_state.value = replace(original_inventory, figures=())
+
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        element_key="tools_table",
+    )
+    service = _common_revision_service(harness)
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await harness.service.preview_targeted(request)
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await service.revise(request)
+
+    assert harness.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_common_revision_cannot_choose_a_figure_added_after_its_base_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def choose_late_figure(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        assert len(prompt["figure_catalog"]) == 1
+        assert prompt["figure_catalog"][0]["handle"] == "F001"
+        assert prompt["figure_catalog"][0]["figure_label"] != ("Alternative ExampleRAT process map")
+        return _succeeded_text(
+            request,
+            _figure_wire(handle="F002", caption="Unadmitted late figure"),
+        )
+
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(choose_late_figure),
+        include_figure=True,
+        legacy_v8_identity=True,
+    )
+    harness.inventory_state.value = _inventory_with_second_figure(harness.inventory_state.value)
+    original = harness.base_payload["source_figures"][0]
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.FIGURE,
+        operation=TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+        element_key=original["key"],
+    )
+
+    result = await _common_revision_service(harness).revise(request)
+
+    assert result.artifact is None
+    assert result.refusal is not None
+    assert len(harness.world.gateway.calls) == 1
+
+
+@pytest.mark.parametrize("changed_input", ["extraction", "synthesis", "evidence"])
+@pytest.mark.asyncio
+async def test_common_revision_keeps_existing_extraction_synthesis_and_evidence_fences(
+    monkeypatch: pytest.MonkeyPatch,
+    changed_input: str,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        legacy_v8_identity=True,
+    )
+    if changed_input == "extraction":
+        changed_source = cast(
+            ProductionSourceExtractionV1,
+            replace(harness.world.extraction.sources[0], content_sha256="c" * 64),
+        )
+        changed_extraction = cast(
+            ProductionExtractionV1,
+            replace(harness.world.extraction, sources=(changed_source,)),
+        )
+        changed_synthesis = cast(
+            ProductionSynthesisV1,
+            replace(
+                harness.world.synthesis,
+                extraction_hash=canonical_extraction_hash(changed_extraction),
+            ),
+        )
+
+        async def load_changed_extraction(*_args: object) -> ProductionExtractionV1:
+            return changed_extraction
+
+        async def load_changed_synthesis(*_args: object) -> ProductionSynthesisV1:
+            return changed_synthesis
+
+        monkeypatch.setattr(harness.world.service, "_load_extraction", load_changed_extraction)
+        monkeypatch.setattr(harness.world.service, "_load_synthesis", load_changed_synthesis)
+    elif changed_input == "synthesis":
+        changed_synthesis = cast(
+            ProductionSynthesisV1,
+            replace(harness.world.synthesis, title="A changed synthesis title"),
+        )
+
+        async def load_changed_synthesis(*_args: object) -> ProductionSynthesisV1:
+            return changed_synthesis
+
+        monkeypatch.setattr(harness.world.service, "_load_synthesis", load_changed_synthesis)
+    else:
+        original_builder = revision_module.build_editorial_enrichment_evidence_pack
+
+        def build_changed_evidence_pack(
+            *args: Any, **kwargs: Any
+        ) -> EditorialEnrichmentEvidencePackV1:
+            pack = original_builder(*args, **kwargs)
+            changed_synthesis_payload = dict(pack.current_synthesis)
+            changed_synthesis_payload["title"] = "Changed admitted evidence"
+            return replace(pack, current_synthesis=changed_synthesis_payload)
+
+        monkeypatch.setattr(
+            revision_module,
+            "build_editorial_enrichment_evidence_pack",
+            build_changed_evidence_pack,
+        )
+
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.REWRITE_TABLE,
+        element_key="tools_table",
+    )
+    service = _common_revision_service(harness)
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await harness.service.preview_targeted(request)
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await service.revise(request)
+    assert harness.world.gateway.calls == []
 
 
 def test_synthesis_revision_target_json_keeps_e1_identity_shape() -> None:

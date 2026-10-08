@@ -24,6 +24,7 @@ from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_model_request,
     build_editorial_figure_catalog,
     build_source_figure_provenance_diagnostics,
+    canonical_synthesis_hash,
     compute_editorial_enrichment_input_hash,
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_output_contract_example,
@@ -42,6 +43,7 @@ from cti_app.application.production_references import production_reference_corpu
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
+    canonical_extraction_hash,
     synthesis_access_policy_hash,
 )
 from cti_app.application.production_synthesis_revision import (
@@ -86,6 +88,10 @@ from cti_app.domain.production_synthesis import (
 )
 
 MAX_EDITORIAL_REVISION_INSTRUCTION_LENGTH = 2000
+_LEGACY_EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v8-editorial-tables"
+_LEGACY_EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION = (
+    "editorial-enrichment-routing-policy-v2-resource-search-off"
+)
 
 
 class EditorialEnrichmentRevisionValidationError(RuntimeError):
@@ -105,6 +111,38 @@ class EditorialEnrichmentRevisionResult:
     previous_publication_artifact_id: UUID | None
 
 
+@dataclass(frozen=True, slots=True)
+class _EditorialEnrichmentRevisionFence:
+    access_policy: Any
+    inventory: Any
+    figure_catalog: tuple[Any, ...]
+    evidence_pack: Any
+    evidence_pack_hash: str
+    inventory_hash: str | None
+    input_hash: str
+
+
+class _StoredSourceMediaArchiver:
+    """Expose already persisted media candidates without collecting new media."""
+
+    def __init__(self, uow_factory: Any, delegate: Any) -> None:
+        self._uow_factory = uow_factory
+        self._delegate = delegate
+
+    @property
+    def policy_sha256(self) -> str:
+        return cast(str, self._delegate.policy_sha256)
+
+    async def collect(self, subject_id: UUID, sources: tuple[Any, ...]) -> tuple[Any, ...]:
+        del sources
+        async with self._uow_factory() as uow:
+            return tuple(
+                await uow.source_media_candidates.list_for_subject_policy(
+                    subject_id, self.policy_sha256
+                )
+            )
+
+
 class ProductionEditorialEnrichmentRevisionService:
     """Draft one replacement element against the exact proofs admitted by its base."""
 
@@ -118,6 +156,229 @@ class ProductionEditorialEnrichmentRevisionService:
         self._enrichment = enrichment_service
         self._persistence = persistence_service
         self._publication_render_service = publication_render_service
+
+    async def _validate_input_fence(
+        self,
+        *,
+        snapshot: ProductionInputSnapshot,
+        base_artifact: ProductionArtifact,
+        extraction: Any,
+        projection: Any,
+        synthesis: Any,
+        read_only_media: bool = False,
+    ) -> _EditorialEnrichmentRevisionFence:
+        media_archiver: Any = self._enrichment._source_media_archiver
+        if read_only_media and media_archiver is not None:
+            media_archiver = _StoredSourceMediaArchiver(
+                self._enrichment._uow_factory, media_archiver
+            )
+        async with self._enrichment._uow_factory() as uow:
+            access_policy = await build_synthesis_access_policy(
+                snapshot,
+                extraction,
+                uow.source_documents,
+                uow.source_collections,
+            )
+            inventory = await load_archived_source_figure_inventory(
+                subject_id=snapshot.subject_id,
+                extraction_sources=extraction.sources,
+                source_document_repository=uow.source_documents,
+                blob_repository=uow.blobs,
+                artifact_store=self._enrichment._artifact_store,
+                media_archiver=media_archiver,
+            )
+
+        if synthesis_access_policy_hash(access_policy) != base_artifact.metadata.get(
+            "access_policy_hash"
+        ):
+            raise EditorialEnrichmentRevisionConflictError(
+                "The access policy no longer matches the base artifact"
+            )
+
+        evidence_pack = build_editorial_enrichment_evidence_pack(
+            snapshot, extraction, synthesis, projection
+        )
+        evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+        if base_artifact.metadata.get("evidence_pack_hash") != evidence_pack_hash:
+            raise EditorialEnrichmentRevisionConflictError(
+                "The admitted evidence pack no longer matches the base artifact"
+            )
+
+        figure_catalog, inventory_hash = self._catalog_for_base_artifact(
+            base_artifact=base_artifact,
+            extraction=extraction,
+            inventory=inventory,
+        )
+        input_hash = compute_editorial_enrichment_input_hash(
+            extraction=extraction,
+            synthesis=synthesis,
+            evidence_pack_hash=evidence_pack_hash,
+            access_policy_hash=base_artifact.metadata["access_policy_hash"],
+            projection_hash=projection.projection_hash if projection is not None else None,
+            source_figure_inventory_hash=inventory_hash,
+            resource_search_enabled=self._enrichment._resource_search_enabled,
+        )
+        if input_hash != base_artifact.input_hash:
+            if not self._legacy_input_fence_matches(
+                base_artifact=base_artifact,
+                extraction=extraction,
+                synthesis=synthesis,
+                projection=projection,
+                resource_search_enabled=self._enrichment._resource_search_enabled,
+            ):
+                raise EditorialEnrichmentRevisionConflictError(
+                    "The Editorial Enrichment inputs no longer match the base artifact"
+                )
+
+        return _EditorialEnrichmentRevisionFence(
+            access_policy=access_policy,
+            inventory=inventory,
+            figure_catalog=figure_catalog,
+            evidence_pack=evidence_pack,
+            evidence_pack_hash=evidence_pack_hash,
+            inventory_hash=inventory_hash,
+            input_hash=input_hash,
+        )
+
+    @staticmethod
+    def _legacy_input_fence_matches(
+        *,
+        base_artifact: ProductionArtifact,
+        extraction: Any,
+        synthesis: Any,
+        projection: Any,
+        resource_search_enabled: bool,
+    ) -> bool:
+        """Allow known v8 identities only when every admitted data input is unchanged."""
+        metadata = base_artifact.metadata
+        return (
+            metadata.get("source_figure_provenance_version")
+            == SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+            and metadata.get("generator_version") == _LEGACY_EDITORIAL_ENRICHMENT_GENERATOR_VERSION
+            and metadata.get("routing_policy_version")
+            == _LEGACY_EDITORIAL_ENRICHMENT_ROUTING_POLICY_VERSION
+            and not resource_search_enabled
+            and metadata.get("extraction_hash") == canonical_extraction_hash(extraction)
+            and metadata.get("synthesis_hash") == canonical_synthesis_hash(synthesis)
+            and metadata.get("relevance_projection_hash")
+            == (projection.projection_hash if projection is not None else None)
+        )
+
+    @staticmethod
+    def _catalog_for_base_artifact(
+        *, base_artifact: ProductionArtifact, extraction: Any, inventory: Any
+    ) -> tuple[tuple[Any, ...], str | None]:
+        stored_hash = base_artifact.metadata.get("source_figure_inventory_hash")
+        current_hash = inventory.functional_hash()
+        if stored_hash is None or stored_hash == current_hash:
+            return build_editorial_figure_catalog(extraction, inventory), current_hash
+
+        conflict_message = "The admitted figure catalog no longer matches the base artifact"
+        diagnostics = base_artifact.metadata.get("source_figure_provenance_diagnostics")
+        if (
+            base_artifact.metadata.get("source_figure_provenance_version")
+            != SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION
+            or not isinstance(stored_hash, str)
+            or not isinstance(diagnostics, list)
+        ):
+            raise EditorialEnrichmentRevisionConflictError(conflict_message)
+
+        def diagnostic_signature(records: list[Any], figure_id: str) -> list[tuple[str, ...]]:
+            signature: list[tuple[str, ...]] = []
+            for record in records:
+                if not isinstance(record, dict) or record.get("figure_id") != figure_id:
+                    continue
+                stage = record.get("stage")
+                if stage in {"catalogued", "selected", "published"}:
+                    continue
+                if not isinstance(stage, str):
+                    raise EditorialEnrichmentRevisionConflictError(conflict_message)
+                signature.append(
+                    (
+                        stage,
+                        str(record.get("source_document_id") or ""),
+                        str(record.get("blob_id") or ""),
+                        str(record.get("sha256") or ""),
+                        str(record.get("reason_code") or ""),
+                    )
+                )
+            return sorted(signature)
+
+        admitted: dict[str, dict[str, Any]] = {}
+        discovered_ids: set[str] = set()
+        for record in diagnostics:
+            if not isinstance(record, dict):
+                raise EditorialEnrichmentRevisionConflictError(conflict_message)
+            figure_id = record.get("figure_id")
+            stage = record.get("stage")
+            if stage == "discovered":
+                if not isinstance(figure_id, str):
+                    raise EditorialEnrichmentRevisionConflictError(conflict_message)
+                discovered_ids.add(figure_id)
+            if stage != "catalogued":
+                continue
+            if (
+                not isinstance(figure_id, str)
+                or not isinstance(record.get("source_document_id"), str)
+                or not isinstance(record.get("figure_handle"), str)
+                or figure_id in admitted
+            ):
+                raise EditorialEnrichmentRevisionConflictError(conflict_message)
+            admitted[figure_id] = record
+
+        current_by_id = {str(figure.figure_id): figure for figure in inventory.figures}
+        if not set(admitted).issubset(discovered_ids) or not set(admitted).issubset(current_by_id):
+            raise EditorialEnrichmentRevisionConflictError(conflict_message)
+        for figure_id in admitted:
+            if diagnostic_signature(diagnostics, figure_id) != diagnostic_signature(
+                [record.to_json() for record in inventory.provenance_diagnostics], figure_id
+            ):
+                raise EditorialEnrichmentRevisionConflictError(conflict_message)
+
+        admitted_ids = set(admitted)
+        scoped_inventory = replace(
+            inventory,
+            figures=tuple(
+                figure for figure in inventory.figures if str(figure.figure_id) in admitted_ids
+            ),
+            catalog_metadata={
+                figure_id: metadata
+                for figure_id, metadata in inventory.catalog_metadata.items()
+                if str(figure_id) in admitted_ids
+            },
+        )
+        figure_catalog = build_editorial_figure_catalog(extraction, scoped_inventory)
+        current_catalog = {str(entry.figure.figure_id): entry for entry in figure_catalog}
+        if set(current_catalog) != admitted_ids:
+            raise EditorialEnrichmentRevisionConflictError(conflict_message)
+
+        for figure_id, expected in admitted.items():
+            entry = current_catalog[figure_id]
+            figure = entry.figure
+            expected_blob_id = expected.get("blob_id")
+            expected_sha256 = expected.get("sha256")
+            if (
+                entry.handle != expected["figure_handle"]
+                or str(figure.source_document_id) != expected["source_document_id"]
+                or (expected_blob_id is None) != (expected_sha256 is None)
+            ):
+                raise EditorialEnrichmentRevisionConflictError(conflict_message)
+            if expected_blob_id is not None:
+                if (
+                    figure.decision.value != "accepted"
+                    or str(figure.blob_id) != expected_blob_id
+                    or figure.sha256 != expected_sha256
+                ):
+                    raise EditorialEnrichmentRevisionConflictError(conflict_message)
+            elif figure.decision.value == "accepted" or figure.decision_reason != expected.get(
+                "reason_code"
+            ):
+                raise EditorialEnrichmentRevisionConflictError(conflict_message)
+
+        # Legacy provenance v1 stores per-figure events but not a snapshot of the
+        # inventory hash inputs. Keep the base catalog fenced: every admitted
+        # figure and its archive decision must remain unchanged.
+        return figure_catalog, stored_hash
 
     async def preview_targeted(
         self, request: TargetedEditorialRevisionRequest
@@ -138,17 +399,41 @@ class ProductionEditorialEnrichmentRevisionService:
 
             raise TargetedEditorialRevisionConflictError(str(exc)) from exc
         (
-            _run,
-            _snapshot,
+            run,
+            snapshot,
             base_artifact,
             _base_payload,
             _base_enrichment,
             references_artifact,
             extraction_artifact,
-            _projection_artifact,
-            _synthesis_artifact,
+            projection_artifact,
+            synthesis_artifact,
             _previous_publication,
         ) = context
+        extraction = await self._enrichment._load_extraction(run, snapshot, extraction_artifact)
+        projection = (
+            await self._enrichment._load_projection(run, snapshot, extraction, projection_artifact)
+            if projection_artifact is not None
+            else None
+        )
+        synthesis = await self._enrichment._load_synthesis(
+            run, snapshot, synthesis_artifact, extraction
+        )
+        try:
+            await self._validate_input_fence(
+                snapshot=snapshot,
+                base_artifact=base_artifact,
+                extraction=extraction,
+                projection=projection,
+                synthesis=synthesis,
+                read_only_media=True,
+            )
+        except EditorialEnrichmentRevisionConflictError as exc:
+            from cti_app.domain.production_editorial_revision import (
+                TargetedEditorialRevisionConflictError,
+            )
+
+            raise TargetedEditorialRevisionConflictError(str(exc)) from exc
         identity = self._targeted_request_identity(request)
         operation = request.operation
         is_delete = operation in {
@@ -159,9 +444,6 @@ class ProductionEditorialEnrichmentRevisionService:
         }
         calls = 0
         if request.mode is TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY and not is_delete:
-            extraction = await self._enrichment._load_extraction(
-                _run, _snapshot, extraction_artifact
-            )
             references_blob_id = references_artifact.canonical_blob_id
             if references_blob_id is None:
                 raise EditorialEnrichmentRevisionConflictError(
@@ -464,21 +746,20 @@ class ProductionEditorialEnrichmentRevisionService:
                     ProductionStage.EXTRACTION,
                 )
 
-        async with self._enrichment._uow_factory() as uow:
-            access_policy = await build_synthesis_access_policy(
-                snapshot,
-                extraction,
-                uow.source_documents,
-                uow.source_collections,
-            )
-            inventory = await load_archived_source_figure_inventory(
-                subject_id=subject_id,
-                extraction_sources=extraction.sources,
-                source_document_repository=uow.source_documents,
-                blob_repository=uow.blobs,
-                artifact_store=self._enrichment._artifact_store,
-                media_archiver=self._enrichment._source_media_archiver,
-            )
+        fence = await self._validate_input_fence(
+            snapshot=snapshot,
+            base_artifact=base_artifact,
+            extraction=extraction,
+            projection=projection,
+            synthesis=synthesis,
+        )
+        access_policy = fence.access_policy
+        inventory = fence.inventory
+        figure_catalog = fence.figure_catalog
+        evidence_pack = fence.evidence_pack
+        evidence_pack_hash = fence.evidence_pack_hash
+        inventory_hash = fence.inventory_hash
+        input_hash = fence.input_hash
         if (access_policy.do_not_submit or not access_policy.external_llm_allowed) and not (
             is_targeted_delete
         ):
@@ -488,43 +769,6 @@ class ProductionEditorialEnrichmentRevisionService:
                     None,
                 )
             raise ValueError("editorial_enrichment_revision_policy_blocked")
-        if synthesis_access_policy_hash(access_policy) != base_artifact.metadata.get(
-            "access_policy_hash"
-        ):
-            raise EditorialEnrichmentRevisionConflictError(
-                "The access policy no longer matches the base artifact"
-            )
-
-        figure_catalog = build_editorial_figure_catalog(extraction, inventory)
-        evidence_pack = build_editorial_enrichment_evidence_pack(
-            snapshot, extraction, synthesis, projection
-        )
-        evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
-        stored_evidence_hash = base_artifact.metadata.get("evidence_pack_hash")
-        if stored_evidence_hash != evidence_pack_hash:
-            raise EditorialEnrichmentRevisionConflictError(
-                "The admitted evidence pack no longer matches the base artifact"
-            )
-        inventory_hash = inventory.functional_hash()
-        stored_inventory_hash = base_artifact.metadata.get("source_figure_inventory_hash")
-        if stored_inventory_hash is not None and stored_inventory_hash != inventory_hash:
-            raise EditorialEnrichmentRevisionConflictError(
-                "The admitted figure catalog no longer matches the base artifact"
-            )
-        input_hash = compute_editorial_enrichment_input_hash(
-            extraction=extraction,
-            synthesis=synthesis,
-            evidence_pack_hash=evidence_pack_hash,
-            access_policy_hash=base_artifact.metadata["access_policy_hash"],
-            projection_hash=projection.projection_hash if projection is not None else None,
-            source_figure_inventory_hash=inventory_hash,
-            resource_search_enabled=self._enrichment._resource_search_enabled,
-        )
-        if input_hash != base_artifact.input_hash:
-            raise EditorialEnrichmentRevisionConflictError(
-                "The Editorial Enrichment inputs no longer match the base artifact"
-            )
-
         list_name = {
             EditorialEnrichmentElementKind.TABLE: "tables",
             EditorialEnrichmentElementKind.DIAGRAM: "diagrams",
@@ -1028,6 +1272,10 @@ class ProductionEditorialEnrichmentRevisionService:
             projection_hash=projection.projection_hash if projection is not None else None,
             source_figure_inventory_hash=inventory_hash,
             metadata_extra={
+                "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+                "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
+                    inventory, figure_catalog, revised_enrichment
+                ),
                 "revision": revision_data,
                 **(
                     {"element_provenance": element_provenance}
@@ -1037,6 +1285,7 @@ class ProductionEditorialEnrichmentRevisionService:
             },
             artifact_id=revision_artifact_id,
             expected_current_artifact_id=base_artifact.id,
+            expected_current_input_hash=base_artifact.input_hash,
             expected_current_canonical_sha256=base_canonical_sha256,
             canonical_payload=final_payload,
         )

@@ -626,6 +626,7 @@ def _production_enrichment_revision_service(
     from cti_app.config import get_settings
 
     uow_factory = request.app.state.uow_factory
+    collection_service = getattr(request.app.state, "collection_service", None)
     enrichment_service = ProductionEditorialEnrichmentService(
         uow_factory=uow_factory,
         artifact_store=artifact_store,
@@ -634,6 +635,7 @@ def _production_enrichment_revision_service(
         media_asset_store=getattr(request.app.state, "media_asset_store", None),
         diagram_compiler=D2DiagramCompiler(),
         chart_compiler=AnalyticChartRenderer(),
+        source_media_archiver=getattr(collection_service, "source_media_archiver", None),
         resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
     return ProductionEditorialEnrichmentRevisionService(
