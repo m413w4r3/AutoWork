@@ -51,6 +51,8 @@ from cti_app.application.production_synthesis_revision import (
     TargetedSynthesisRevisionPreview,
     TargetedSynthesisRevisionResult,
     TargetedSynthesisRevisionValidationError,
+    _critical_extraction_assessment,
+    _effective_decisions_for_reader,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
@@ -178,6 +180,28 @@ class ProductionEditorialEnrichmentRevisionService:
         self._enrichment = enrichment_service
         self._persistence = persistence_service
         self._publication_render_service = publication_render_service
+
+    async def _critical_source_assessment(
+        self,
+        context: tuple[Any, ...],
+        extraction: Any,
+        references: Any,
+    ) -> tuple[tuple[Any, ...], tuple[dict[str, Any], ...]]:
+        run = context[0]
+        references_artifact = context[5]
+        extraction_artifact = context[6]
+        async with self._enrichment._uow_factory() as uow:
+            effective_decisions = await _effective_decisions_for_reader(
+                uow, run.edition_id, run.subject_id
+            )
+        return _critical_extraction_assessment(
+            extraction,
+            references,
+            run=run,
+            extraction_artifact=extraction_artifact,
+            references_artifact=references_artifact,
+            effective_repair_decisions=effective_decisions,
+        )
 
     async def _validate_input_fence(
         self,
@@ -541,11 +565,10 @@ class ProductionEditorialEnrichmentRevisionService:
             references = production_reference_corpus_from_json(
                 await self._enrichment._artifact_store.read_json(references_blob_id)
             )
-            from cti_app.application.production_synthesis_revision import (
-                _critical_extraction_failures,
+            critical_failures, _ = await self._critical_source_assessment(
+                context, extraction, references
             )
-
-            if not _critical_extraction_failures(extraction, references):
+            if not critical_failures:
                 run_id = uuid5(
                     NAMESPACE_URL,
                     f"production-editorial-enrichment-revision-model:{identity}",
@@ -1422,6 +1445,7 @@ class ProductionEditorialEnrichmentRevisionService:
             run, snapshot, synthesis_artifact, extraction
         )
 
+        critical_source_waivers: tuple[dict[str, Any], ...] = ()
         if targeted_request is not None and not is_targeted_delete:
             references_blob_id = references_artifact.canonical_blob_id
             if references_blob_id is None:
@@ -1432,13 +1456,13 @@ class ProductionEditorialEnrichmentRevisionService:
                 references_blob_id
             )
             references = production_reference_corpus_from_json(references_payload)
-            from cti_app.application.production_synthesis_revision import (
-                _critical_extraction_failures,
+            critical_failures, critical_source_waivers = await self._critical_source_assessment(
+                context, extraction, references
             )
-
-            if _critical_extraction_failures(extraction, references):
+            if critical_failures:
                 return self._targeted_refusal(
-                    "A critical source has an extraction failure; repair the evidence first.",
+                    "A critical source has an extraction failure without a current, reasoned "
+                    "analyst waiver; repair or waive the source first.",
                     ProductionStage.EXTRACTION,
                 )
 
@@ -1875,6 +1899,8 @@ class ProductionEditorialEnrichmentRevisionService:
                 {"validator": "l8_enrichment_grounding", "status": "passed"},
                 {"validator": "canonical_enrichment", "status": "passed"},
             ],
+            "criticality_gate_version": "critical-source-waiver-v1",
+            "critical_source_waivers": [dict(item) for item in critical_source_waivers],
             "validator_rejections": validator_rejections,
             "parse_identity": parse_identity,
             "previous_publication_artifact_id": (
@@ -1930,7 +1956,7 @@ class ProductionEditorialEnrichmentRevisionService:
                     "editorial_contract_prompt_version": EDITORIAL_ENRICHMENT_PROMPT_VERSION,
                     "editorial_contract_version": EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION,
                     "parser_version": "editorial-enrichment-wire-parser-v1",
-                    "validator_version": "editorial-enrichment-validator-v1",
+                    "validator_version": "editorial-enrichment-validator-v2-source-waiver",
                     "evidence_refs": evidence_refs,
                     "evidence_handles": element_evidence_handles,
                     "source_additions": [],

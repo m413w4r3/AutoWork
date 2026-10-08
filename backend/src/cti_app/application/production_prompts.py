@@ -219,7 +219,7 @@ EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
     "editorial-enrichment-revision-v5-ioc-and-diagram-value"
 )
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v5-remove-element"
+    "editorial-enrichment-revision-contract-v6-critical-source-waiver"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

@@ -77,6 +77,23 @@ les changements de scope, la réparation d’extraction, le changement d’acteu
 sans preuve, la source critique absente, le contournement QA, les faits sans
 preuve ou la refonte complète. Les refus du modèle passent par le même type.
 
+## Criticité des échecs d'extraction
+
+Une omission `source_extraction_failed` critique bloque les révisions ciblées
+de SYNTHESIS et d'EDITORIAL_ENRICHMENT tant qu'elle n'a pas une décision
+effective `continue_without_source`. Le waiver suit la même règle que les
+réparations: raison analyste non vide, identité exacte de l'échec, artifact
+EXTRACTION observé et génération du pipeline courants. Une décision plus
+récente pour la même clé remplace l'ancienne; une décision périmée ou sans
+raison ne lève pas le blocage. Cette règle s'applique aussi au mode d'extension
+de sources, après promotion des artifacts.
+
+Chaque waiver utilisé est copié dans `metadata.revision.critical_source_waivers`
+et dans la réponse/lineage de la révision avec la clé de réparation, l'ID de la
+décision, l'acteur, la raison, l'URL, le code d'échec et les fences observées.
+Le changement de garde est versionné par le contrat et le validateur de
+révision ciblée.
+
 ## Ancrage v3 des claims de révision
 
 Un terme distinctif d’un claim est ancré s’il apparaît dans un handle cité ou

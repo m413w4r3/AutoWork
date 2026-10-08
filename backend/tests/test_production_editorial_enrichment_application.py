@@ -71,6 +71,7 @@ from cti_app.application.production_enrichment_revision import (
 )
 from cti_app.application.production_prompts import EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
 from cti_app.application.production_relevance import build_relevance_projection
+from cti_app.application.production_repairs import repair_key_for_source_extraction_failure
 from cti_app.application.production_stages import EditorialEnrichmentService, compute_input_hash
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
@@ -88,7 +89,7 @@ from cti_app.application.source_figure_inventory import (
     SourceFigureInventoryResult,
 )
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import SourceCollection
+from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
@@ -100,6 +101,9 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
+    ProductionRepairAction,
+    ProductionRepairDecision,
+    ProductionRepairIssueKind,
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
@@ -144,14 +148,22 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ExtractionIndicatorV1,
     ExtractionReuseState,
+    ProductionExtractionOmissionReason,
+    ProductionExtractionOmissionV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
     ProductionEditorialRole,
+    ProductionReferenceCorpusV1,
     ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
     ProductionReferenceTier,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
 )
 from cti_app.domain.production_relevance import (
     RelevanceSourcePairRelation,
@@ -4360,6 +4372,7 @@ class _RevisionUow:
         source_documents: _MemorySourceDocuments,
         artifacts: _RevisionArtifactRepository,
         source_collections: _MemorySourceCollections,
+        repair_decisions: tuple[ProductionRepairDecision, ...] = (),
     ) -> None:
         self.production_runs = SimpleNamespace(get_current_for_subject=self._current_run)
         self.production_input_snapshots = SimpleNamespace(get_by_run=self._snapshot_for_run)
@@ -4367,6 +4380,16 @@ class _RevisionUow:
         self.source_collections = source_collections
         self.blobs = _MemoryBlobs()
         self.production_artifacts = artifacts
+
+        async def effective_decisions(edition_id: UUID, subject_id: UUID | None) -> tuple[Any, ...]:
+            return tuple(
+                decision
+                for decision in repair_decisions
+                if decision.edition_id == edition_id
+                and (subject_id is None or decision.subject_id == subject_id)
+            )
+
+        self.production_repair_decisions = SimpleNamespace(effective_decisions=effective_decisions)
         self._run = run
         self._snapshot = snapshot
 
@@ -4615,6 +4638,7 @@ async def _revision_harness(
             publication_artifact,
         ]
     )
+    effective_repair_decisions: list[ProductionRepairDecision] = []
 
     def uow_factory() -> _RevisionUow:
         return _RevisionUow(
@@ -4623,6 +4647,7 @@ async def _revision_harness(
             source_documents=source_documents,
             artifacts=artifacts,
             source_collections=source_collections,
+            repair_decisions=tuple(effective_repair_decisions),
         )
 
     world.service._uow_factory = uow_factory  # type: ignore[assignment]
@@ -4673,6 +4698,8 @@ async def _revision_harness(
         service=service,
         inventory_state=inventory_state,
         artifacts=artifacts,
+        effective_repair_decisions=effective_repair_decisions,
+        reference_artifact=reference_artifact,
         base=base,
         base_payload=base_payload,
         evidence_pack=evidence_pack,
@@ -6709,6 +6736,116 @@ def _replace_rebased_base_metadata(harness: SimpleNamespace, **updates: Any) -> 
         updated if item.id == base.id else item for item in harness.artifacts.artifacts
     ]
     harness.base = updated
+
+
+@pytest.mark.asyncio
+async def test_enrichment_revision_uses_only_current_reasoned_source_waivers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    world = harness.world
+    source_url = "https://example.test/failed-counter-analysis"
+    failure_code = "extraction_source_output_invalid"
+    extraction = replace(
+        world.extraction,
+        omitted_sources=(
+            ProductionExtractionOmissionV1(
+                canonical_url=source_url,
+                tier=ProductionReferenceTier.SUPPORTING,
+                collection_state=CollectionState.ARCHIVED,
+                reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+                error_code=failure_code,
+            ),
+        ),
+    )
+    reference_source = ProductionReferenceSourceV1(
+        canonical_url=source_url,
+        tier=ProductionReferenceTier.SUPPORTING,
+        kind=ProductionReferenceKind.PUBLICATION,
+        role=SourceRole.PRIMARY,
+        title="Failed counter analysis",
+        publisher="Test publisher",
+        published_at=None,
+        source_collection_id=None,
+        source_document_id=uuid4(),
+        discovery_candidate_ids=(),
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256="f" * 64,
+        relevance_reason=None,
+        proposed_by_model=False,
+        eligible_for_extraction=True,
+        editorial_role=ProductionEditorialRole.COUNTER_ANALYSIS,
+    )
+    references = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=world.snapshot.subject_id,
+        research_date=world.snapshot.research_date,
+        production_input_hash=world.snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=(reference_source,),
+        warnings=(),
+    )
+    context = (
+        world.run,
+        world.snapshot,
+        harness.base,
+        harness.base_payload,
+        None,
+        harness.reference_artifact,
+        world.extraction_artifact,
+        None,
+        world.synthesis_artifact,
+        None,
+    )
+    failures, waivers = await harness.service._critical_source_assessment(
+        context, extraction, references
+    )
+    assert failures == (extraction.omitted_sources[0],)
+    assert waivers == ()
+
+    repair_key = repair_key_for_source_extraction_failure(
+        edition_id=world.run.edition_id,
+        subject_id=world.run.subject_id,
+        source_url=source_url,
+        observed_artifact_id=world.extraction_artifact.id,
+        observed_references_artifact_id=harness.reference_artifact.id,
+        failure_code=failure_code,
+    )
+    current_waiver = ProductionRepairDecision(
+        edition_id=world.run.edition_id,
+        subject_id=world.run.subject_id,
+        production_run_id=world.run.id,
+        observed_artifact_id=world.extraction_artifact.id,
+        observed_pipeline_generation=world.run.pipeline_generation,
+        repair_key=repair_key,
+        issue_kind=ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+        action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        actor_id="test-analyst",
+        reason="The failed counter analysis is acknowledged for this revision.",
+        source_criticality=ProductionSourceCriticality.CRITICAL,
+        criticality_reason=ProductionSourceCriticalityReason.COUNTER_ANALYSIS,
+        failure_code=failure_code,
+        criticality_policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    )
+    harness.effective_repair_decisions[:] = [current_waiver]
+    failures, waivers = await harness.service._critical_source_assessment(
+        context, extraction, references
+    )
+    assert failures == ()
+    assert waivers[0]["decision_id"] == str(current_waiver.id)
+    assert waivers[0]["reason"] == current_waiver.reason
+
+    harness.effective_repair_decisions[:] = [
+        replace(current_waiver, observed_pipeline_generation=world.run.pipeline_generation + 1)
+    ]
+    failures, waivers = await harness.service._critical_source_assessment(
+        context, extraction, references
+    )
+    assert failures == (extraction.omitted_sources[0],)
+    assert waivers == ()
 
 
 @pytest.mark.asyncio

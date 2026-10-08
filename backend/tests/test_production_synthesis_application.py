@@ -32,6 +32,7 @@ from cti_app.application.production_editorial_enrichment import (
 )
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
+from cti_app.application.production_repairs import repair_key_for_source_extraction_failure
 from cti_app.application.production_synthesis import (
     MAX_SYNTHESIS_UNCERTAINTIES,
     MAX_TECHNICAL_EVIDENCE_V1,
@@ -84,6 +85,9 @@ from cti_app.domain.production import (
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
     ProductionInputSource,
+    ProductionRepairAction,
+    ProductionRepairDecision,
+    ProductionRepairIssueKind,
     ProductionRun,
     ProductionStage,
     SynthesisMode,
@@ -106,6 +110,8 @@ from cti_app.domain.production_extraction import (
     ExtractionProfileReasonCode,
     ExtractionReuseState,
     ExtractionRuleV1,
+    ProductionExtractionOmissionReason,
+    ProductionExtractionOmissionV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
     is_production_extraction_hash,
@@ -114,12 +120,15 @@ from cti_app.domain.production_extraction import (
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
+    PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
     ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
@@ -5527,6 +5536,7 @@ class _RevisionMemoryUow:
         snapshot: ProductionInputSnapshot,
         artifacts: _RevisionArtifactRepository,
         documents: MemorySourceDocuments,
+        repair_decisions: tuple[ProductionRepairDecision, ...] = (),
     ) -> None:
         self.production_runs = SimpleNamespace(
             get_current_for_subject=lambda subject_id: _async_value(
@@ -5537,6 +5547,16 @@ class _RevisionMemoryUow:
             get_by_run=lambda run_id: _async_value(snapshot if run_id == run.id else None)
         )
         self.production_artifacts = artifacts
+        self.production_repair_decisions = SimpleNamespace(
+            effective_decisions=lambda edition_id, subject_id: _async_value(
+                tuple(
+                    decision
+                    for decision in repair_decisions
+                    if decision.edition_id == edition_id
+                    and (subject_id is None or decision.subject_id == subject_id)
+                )
+            )
+        )
         self.source_documents = documents
         self.source_collections = MemorySourceCollections()
 
@@ -5655,6 +5675,21 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     )
 
     world, base, _, _ = _targeted_revision_fixture()
+    failed_source_url = "https://example.com/failed-counter-analysis"
+    failed_source_error = "extraction_source_output_invalid"
+    world.extraction = replace(
+        world.extraction,
+        omitted_sources=(
+            ProductionExtractionOmissionV1(
+                canonical_url=failed_source_url,
+                tier=ProductionReferenceTier.SUPPORTING,
+                collection_state=CollectionState.ARCHIVED,
+                reason=ProductionExtractionOmissionReason.SOURCE_EXTRACTION_FAILED,
+                error_code=failed_source_error,
+            ),
+        ),
+    )
+    base = replace(base, extraction_hash=canonical_extraction_hash(world.extraction))
     base_payload = production_synthesis_to_json(base)
     artifact_store = _RevisionMemoryBlobStore()
     extraction_blob = artifact_store.add_json(production_extraction_to_json(world.extraction))
@@ -5665,26 +5700,46 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         research_date=world.snapshot.research_date,
         production_input_hash=world.snapshot.input_hash,
         research_status=ProductionReferenceResearchStatus.COMPLETED,
-        sources=tuple(
+        sources=(
+            *(
+                ProductionReferenceSourceV1(
+                    canonical_url=source.canonical_url,
+                    tier=source.tier,
+                    kind=source.kind,
+                    role=source.role,
+                    title="Archived test source",
+                    publisher="Test publisher",
+                    published_at=None,
+                    source_collection_id=None,
+                    source_document_id=source.source_document_id,
+                    discovery_candidate_ids=(),
+                    collection_state=CollectionState.ARCHIVED,
+                    content_sha256=source.content_sha256,
+                    relevance_reason=None,
+                    proposed_by_model=False,
+                    eligible_for_extraction=True,
+                    editorial_role=source.editorial_role,
+                )
+                for source in world.extraction.sources
+            ),
             ProductionReferenceSourceV1(
-                canonical_url=source.canonical_url,
-                tier=source.tier,
-                kind=source.kind,
-                role=source.role,
-                title="Archived test source",
+                canonical_url=failed_source_url,
+                tier=ProductionReferenceTier.SUPPORTING,
+                kind=ProductionReferenceKind.PUBLICATION,
+                role=SourceRole.PRIMARY,
+                title="Counter analysis",
                 publisher="Test publisher",
                 published_at=None,
                 source_collection_id=None,
-                source_document_id=source.source_document_id,
+                source_document_id=uuid4(),
                 discovery_candidate_ids=(),
                 collection_state=CollectionState.ARCHIVED,
-                content_sha256=source.content_sha256,
+                content_sha256="e" * 64,
                 relevance_reason=None,
                 proposed_by_model=False,
                 eligible_for_extraction=True,
-                editorial_role=source.editorial_role,
-            )
-            for source in world.extraction.sources
+                editorial_role=ProductionEditorialRole.COUNTER_ANALYSIS,
+            ),
         ),
         warnings=(),
     )
@@ -5716,6 +5771,31 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         status=ProductionArtifactStatus.VERIFIED,
         canonical_blob_id=synthesis_blob,
     )
+    repair_key = repair_key_for_source_extraction_failure(
+        edition_id=world.run.edition_id,
+        subject_id=world.run.subject_id,
+        source_url=failed_source_url,
+        observed_artifact_id=extraction_artifact.id,
+        observed_references_artifact_id=references_artifact.id,
+        failure_code=failed_source_error,
+    )
+    effective_repair_decisions: list[ProductionRepairDecision] = []
+    valid_waiver = ProductionRepairDecision(
+        edition_id=world.run.edition_id,
+        subject_id=world.run.subject_id,
+        production_run_id=world.run.id,
+        observed_artifact_id=extraction_artifact.id,
+        observed_pipeline_generation=world.run.pipeline_generation,
+        repair_key=repair_key,
+        issue_kind=ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED,
+        action=ProductionRepairAction.CONTINUE_WITHOUT_SOURCE,
+        actor_id="test-analyst",
+        reason="The failed source is acknowledged for this synthesis revision.",
+        source_criticality=ProductionSourceCriticality.CRITICAL,
+        criticality_reason=ProductionSourceCriticalityReason.COUNTER_ANALYSIS,
+        failure_code=failed_source_error,
+        criticality_policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+    )
     repository = _RevisionArtifactRepository(
         (references_artifact, extraction_artifact, base_artifact)
     )
@@ -5726,6 +5806,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
             snapshot=world.snapshot,
             artifacts=repository,
             documents=world.docs,
+            repair_decisions=tuple(effective_repair_decisions),
         )
 
     policy = await build_synthesis_access_policy(
@@ -5799,6 +5880,50 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         requester="test-analyst",
     )
 
+    preview_without_waiver = await revision_service.preview(request)
+    assert preview_without_waiver.expected_model_calls == 0
+    refused_without_waiver = await revision_service.revise(request)
+    assert refused_without_waiver.refusal is not None
+    assert refused_without_waiver.refusal.recommended_restart_stage is ProductionStage.EXTRACTION
+    assert not gateway.calls
+    extension_without_waiver = await revision_service.preview(
+        replace(request, mode=TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION)
+    )
+    assert extension_without_waiver.refusal is not None
+    assert extension_without_waiver.refusal.recommended_restart_stage is ProductionStage.EXTRACTION
+
+    # This row shape cannot be created by today's domain constructor, but older
+    # or corrupt persisted rows still must not authorize a source waiver.
+    reasonless_decision = object.__new__(ProductionRepairDecision)
+    for field_name in ProductionRepairDecision.__dataclass_fields__:
+        object.__setattr__(
+            reasonless_decision, field_name, getattr(valid_waiver, field_name)
+        )
+    object.__setattr__(reasonless_decision, "reason", None)
+    effective_repair_decisions[:] = [reasonless_decision]
+    refused_without_reason = await revision_service.revise(request)
+    assert refused_without_reason.refusal is not None
+    assert refused_without_reason.refusal.recommended_restart_stage is ProductionStage.EXTRACTION
+    assert not gateway.calls
+
+    effective_repair_decisions[:] = [
+        replace(
+            valid_waiver,
+            observed_pipeline_generation=world.run.pipeline_generation + 1,
+        )
+    ]
+    refused_stale_generation = await revision_service.revise(request)
+    assert refused_stale_generation.refusal is not None
+    assert refused_stale_generation.refusal.recommended_restart_stage is ProductionStage.EXTRACTION
+    assert not gateway.calls
+
+    effective_repair_decisions[:] = [replace(valid_waiver, observed_artifact_id=uuid4())]
+    refused_stale_artifact = await revision_service.revise(request)
+    assert refused_stale_artifact.refusal is not None
+    assert refused_stale_artifact.refusal.recommended_restart_stage is ProductionStage.EXTRACTION
+    assert not gateway.calls
+
+    effective_repair_decisions[:] = [valid_waiver]
     preview = await revision_service.preview(request)
     assert preview.expected_model_calls == 1
     assert preview.stages_preserved == ("references", "extraction", "relevance_projection")
@@ -5835,9 +5960,32 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     assert len(gateway.calls) == 1
     assert result.revision["model_run_id"] == str(gateway.calls[0][0].run_id)
     assert result.revision["source_additions"] == []
+    assert result.revision["critical_source_waivers"] == [
+        {
+            "repair_key": repair_key,
+            "decision_id": str(valid_waiver.id),
+            "issue_kind": ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED.value,
+            "action": ProductionRepairAction.CONTINUE_WITHOUT_SOURCE.value,
+            "actor": "test-analyst",
+            "reason": valid_waiver.reason,
+            "source_url": failed_source_url,
+            "failure_code": failed_source_error,
+            "observed_artifact_id": str(extraction_artifact.id),
+            "observed_pipeline_generation": world.run.pipeline_generation,
+            "criticality_policy_version": PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
+        }
+    ]
     lineage = await revision_service.lineage(result.artifact.id)
     assert len(lineage["revisions"]) == 1
     assert lineage["revisions"][0]["actor"] == "test-analyst"
+    assert (
+        lineage["revisions"][0]["critical_source_waivers"]
+        == (result.revision["critical_source_waivers"])
+    )
+    assert (
+        result.artifact.metadata["revision"]["critical_source_waivers"]
+        == (result.revision["critical_source_waivers"])
+    )
     assert result.artifact.metadata["paragraph_provenance"]
 
     replay = await revision_service.revise(request)
@@ -7563,6 +7711,7 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
         extraction_artifact=extraction_artifact,
         projection_artifact=None,
         publication_artifact=None,
+        effective_repair_decisions=(),
     )
     if change in {"title", "legacy_anchor"}:
         operation = TargetedEditorialRevisionOperation.REWRITE_TITLE

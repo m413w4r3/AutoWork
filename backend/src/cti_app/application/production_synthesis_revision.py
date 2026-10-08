@@ -32,6 +32,12 @@ from cti_app.application.production_prompts import (
     SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
+from cti_app.application.production_repairs import (
+    _decision_for_current_source_issue,
+    _effective_decisions_for_reader,
+    _source_waiver_has_analyst_reason,
+    repair_key_for_source_extraction_failure,
+)
 from cti_app.application.production_source_additions import (
     SourceAdditionConflictError,
     SourceAdditionError,
@@ -62,6 +68,9 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionInputSnapshot,
+    ProductionRepairAction,
+    ProductionRepairDecision,
+    ProductionRepairIssueKind,
     ProductionRun,
     ProductionStage,
     SynthesisMode,
@@ -112,9 +121,9 @@ from cti_app.domain.production_synthesis import (
 
 TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v4-optional-lead"
 # The revision contract includes validator-owned evidence grounding behavior.
-SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v5-no-lead-validation"
+SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v6-source-waivers"
 TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = (
-    "targeted-synthesis-patch-validator-v5-no-lead-validation"
+    "targeted-synthesis-patch-validator-v6-source-waivers"
 )
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -186,6 +195,7 @@ class _RevisionContext:
     extraction_artifact: ProductionArtifact
     projection_artifact: ProductionArtifact | None
     publication_artifact: ProductionArtifact | None
+    effective_repair_decisions: tuple[ProductionRepairDecision, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1860,9 +1870,26 @@ class ProductionSynthesisRevisionService:
         context = await self._load_context(request)
         resolved = _resolve_target(context.base_payload, request.target, request.operation)
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
+            extraction, _ = await self._synthesis._load_extraction(
+                context.run, context.snapshot, context.extraction_artifact
+            )
+            critical_failures, _ = await self._critical_extraction_assessment(context, extraction)
             addition_preview = None
             preview_refusal = None
-            if self._source_addition_service is None or request.source_addition_request_id is None:
+            missing_addition_request = (
+                self._source_addition_service is None or request.source_addition_request_id is None
+            )
+            if critical_failures:
+                preview_refusal = TargetedEditorialRevisionRefusal(
+                    code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+                    recommended_restart_stage=ProductionStage.EXTRACTION,
+                    reason=(
+                        "A critical source has a source_extraction_failed issue without a "
+                        "current, reasoned analyst waiver; repair or waive the source "
+                        "before revising the synthesis."
+                    ),
+                )
+            elif missing_addition_request:
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                     recommended_restart_stage=ProductionStage.REFERENCES,
@@ -1915,7 +1942,11 @@ class ProductionSynthesisRevisionService:
                 calls += revision_calls
             else:
                 calls_by_stage["synthesis_revision"] = {"made": 0, "remaining": 0}
-            if addition_preview is not None and addition_preview.blockers:
+            if (
+                preview_refusal is None
+                and addition_preview is not None
+                and addition_preview.blockers
+            ):
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                     recommended_restart_stage=ProductionStage.REFERENCES,
@@ -1925,7 +1956,9 @@ class ProductionSynthesisRevisionService:
                     ),
                 )
             elif (
-                addition_preview is not None and not addition_preview.ready and not preview_refusal
+                preview_refusal is None
+                and addition_preview is not None
+                and not addition_preview.ready
             ):
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
@@ -1935,6 +1968,11 @@ class ProductionSynthesisRevisionService:
                         "et l'extraction."
                     ),
                 )
+            if critical_failures:
+                calls = 0
+                calls_by_stage = {
+                    key: {**value, "remaining": 0} for key, value in calls_by_stage.items()
+                }
             return TargetedSynthesisRevisionPreview(
                 base_artifact_id=context.base_artifact.id,
                 base_version=context.base_artifact.version,
@@ -1993,7 +2031,8 @@ class ProductionSynthesisRevisionService:
             extraction, _ = await self._synthesis._load_extraction(
                 context.run, context.snapshot, context.extraction_artifact
             )
-            if await self._critical_extraction_failures(context, extraction):
+            critical_failures, _ = await self._critical_extraction_assessment(context, extraction)
+            if critical_failures:
                 calls = 0
             else:
                 access_policy = await self._synthesis._load_access_policy(
@@ -2025,15 +2064,22 @@ class ProductionSynthesisRevisionService:
             before_hash=resolved.before_hash,
         )
 
-    async def _critical_extraction_failures(
+    async def _critical_extraction_assessment(
         self, context: _RevisionContext, extraction: ProductionExtractionV1
-    ) -> tuple[Any, ...]:
+    ) -> tuple[tuple[Any, ...], tuple[dict[str, Any], ...]]:
         references_blob_id = context.references_artifact.canonical_blob_id
         if references_blob_id is None:
             raise TargetedSynthesisRevisionValidationError("references_artifact_blob_missing")
         references_payload = await self._synthesis._artifact_store.read_json(references_blob_id)
         reference_corpus = production_reference_corpus_from_json(references_payload)
-        return _critical_extraction_failures(extraction, reference_corpus)
+        return _critical_extraction_assessment(
+            extraction,
+            reference_corpus,
+            run=context.run,
+            extraction_artifact=context.extraction_artifact,
+            references_artifact=context.references_artifact,
+            effective_repair_decisions=context.effective_repair_decisions,
+        )
 
     async def revise(
         self, request: TargetedEditorialRevisionRequest
@@ -2436,6 +2482,7 @@ class ProductionSynthesisRevisionService:
         extraction, extraction_hash = await self._synthesis._load_extraction(
             context.run, context.snapshot, context.extraction_artifact
         )
+        critical_source_waivers: tuple[dict[str, Any], ...] = ()
         if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION:
             base_synthesis_for_apply = replace(
                 base_synthesis, extraction_hash=canonical_extraction_hash(extraction)
@@ -2448,10 +2495,10 @@ class ProductionSynthesisRevisionService:
                 raise TargetedEditorialRevisionConflictError(
                     "The synthesis base does not reference its current extraction artifact"
                 )
-        if (
-            request.mode is not TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
-            and await self._critical_extraction_failures(context, extraction)
-        ):
+        critical_failures, critical_source_waivers = await self._critical_extraction_assessment(
+            context, extraction
+        )
+        if critical_failures:
             return TargetedSynthesisRevisionResult(
                 artifact=None,
                 publication_artifact=None,
@@ -2460,8 +2507,9 @@ class ProductionSynthesisRevisionService:
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                     recommended_restart_stage=ProductionStage.EXTRACTION,
                     reason=(
-                        "A critical source has a source_extraction_failed issue; repair the "
-                        "source evidence before revising the synthesis."
+                        "A critical source has a source_extraction_failed issue without a "
+                        "current, reasoned analyst waiver; repair or waive the source "
+                        "before revising the synthesis."
                     ),
                 ),
             )
@@ -2652,6 +2700,7 @@ class ProductionSynthesisRevisionService:
             ),
             "source_additions": [dict(item) for item in source_additions],
             "source_additions_hash": request.source_additions_hash,
+            "critical_source_waivers": [dict(item) for item in critical_source_waivers],
             "before_hash": before_hash,
             "after_hash": _sha256(revised_payload),
             "rationale": wire_patch.rationale,
@@ -2967,6 +3016,9 @@ class ProductionSynthesisRevisionService:
         payload = json.loads(base_bytes)
         if not isinstance(payload, dict):
             raise ValueError("targeted_synthesis_revision_base_invalid")
+        effective_repair_decisions = await _effective_decisions_for_reader(
+            uow, run.edition_id, run.subject_id
+        )
         return _RevisionContext(
             run=run,
             snapshot=snapshot,
@@ -2976,6 +3028,7 @@ class ProductionSynthesisRevisionService:
             extraction_artifact=extraction,
             projection_artifact=projection,
             publication_artifact=publication,
+            effective_repair_decisions=tuple(effective_repair_decisions),
         )
 
     @staticmethod
@@ -3609,3 +3662,64 @@ def _critical_extraction_failures(
         if criticality is ProductionSourceCriticality.CRITICAL:
             critical_failures.append(omission)
     return tuple(critical_failures)
+
+
+def _critical_extraction_assessment(
+    extraction: ProductionExtractionV1,
+    reference_corpus: ProductionReferenceCorpusV1,
+    *,
+    run: ProductionRun,
+    extraction_artifact: ProductionArtifact,
+    references_artifact: ProductionArtifact,
+    effective_repair_decisions: Sequence[ProductionRepairDecision],
+) -> tuple[tuple[Any, ...], tuple[dict[str, Any], ...]]:
+    """Keep critical losses blocking unless their current analyst waiver is effective."""
+    critical_failures = _critical_extraction_failures(extraction, reference_corpus)
+    decisions_by_repair_key = {
+        decision.repair_key: decision for decision in effective_repair_decisions
+    }
+    unwaived_failures = []
+    source_waivers = []
+    for omission in critical_failures:
+        if omission.error_code is None:
+            unwaived_failures.append(omission)
+            continue
+        repair_key = repair_key_for_source_extraction_failure(
+            edition_id=run.edition_id,
+            subject_id=run.subject_id,
+            source_url=omission.canonical_url,
+            observed_artifact_id=extraction_artifact.id,
+            observed_references_artifact_id=references_artifact.id,
+            failure_code=omission.error_code,
+        )
+        # effective_repair_decisions contains the latest decision per repair key;
+        # the observation fence rejects waivers from older generations/artifacts.
+        decision = decisions_by_repair_key.get(repair_key)
+        decision = _decision_for_current_source_issue(decision, run, extraction_artifact)
+        if (
+            decision is None
+            or decision.production_run_id != run.id
+            or decision.edition_id != run.edition_id
+            or decision.subject_id != run.subject_id
+            or decision.issue_kind is not ProductionRepairIssueKind.SOURCE_EXTRACTION_FAILED
+            or decision.action is not ProductionRepairAction.CONTINUE_WITHOUT_SOURCE
+            or not _source_waiver_has_analyst_reason(decision)
+        ):
+            unwaived_failures.append(omission)
+            continue
+        source_waivers.append(
+            {
+                "repair_key": repair_key,
+                "decision_id": str(decision.id),
+                "issue_kind": decision.issue_kind.value,
+                "action": decision.action.value,
+                "actor": decision.actor_id,
+                "reason": decision.reason,
+                "source_url": omission.canonical_url,
+                "failure_code": omission.error_code,
+                "observed_artifact_id": str(decision.observed_artifact_id),
+                "observed_pipeline_generation": decision.observed_pipeline_generation,
+                "criticality_policy_version": decision.criticality_policy_version,
+            }
+        )
+    return tuple(unwaived_failures), tuple(source_waivers)

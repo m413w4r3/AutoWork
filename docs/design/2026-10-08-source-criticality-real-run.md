@@ -34,3 +34,33 @@ Date de vérification : 2026-10-08. Politique exécutée : `source-criticality-v
 - La décision S7 est bien liée par son `repair_key` à l'URL IranWire, mais son texte mentionne le CSV Anthropic. Le code livré ne peut contrôler le sens d'un motif libre ; il voit une action analyste explicite avec motif non vide. Il faut corriger cette justification par une nouvelle décision analyste si l'on veut une justification fidèle, sans réécrire l'historique.
 - L'artifact EXTRACTION de S9 contient aussi un avertissement `q2_parse_error:q2_no_payload` sans URL ni entrée `omitted_sources` correspondante. Il ne permet donc pas d'identifier une source et de calculer sa criticité ; je ne l'attribue pas aux deux IranWire. Cet avertissement reste une limite de traçabilité à investiguer.
 - Les artifacts et décisions historiques n'ont pas été modifiés. L'évaluation est une projection du code livré sur les observations/artifacts archivés.
+
+## Révision ciblée après waiver du run courant
+
+Après cet audit, le sujet S5 (`bb2701a1-777c-405a-b2bd-0f097e648fd3`) a reçu
+via l'API deux décisions analyste `continue_without_source` avec raison pour
+l'échec NCSC `extraction_source_output_invalid`. Les deux décisions sont
+effectives pour l'artifact et la génération courants; l'API Repairs les expose
+`resolved=true`, `blocking=false` et `application_state=already_effective`.
+
+Une révision ciblée de SYNTHESIS restait pourtant refusée. La garde consultait
+uniquement les omissions d'extraction et leur criticité, sans lire les
+décisions effectives. Le refus est corrigé: chaque omission critique est
+comparée à sa clé de réparation et ne bloque plus si la décision effective est
+un `continue_without_source` avec raison analyste et fences d'artifact et de
+génération courantes. Sans waiver, avec une raison absente ou avec un waiver
+périmé, le refus d'extraction reste en place.
+
+Les révisions de SYNTHESIS et d'EDITORIAL_ENRICHMENT tracent les waivers
+utilisés dans `metadata.revision.critical_source_waivers` et dans la lineage.
+Le contrat et le validateur de révision ciblée sont versionnés pour ce
+changement. Les prévisualisations d'extension de sources appliquent également
+la garde; la promotion est revalidée contre l'artifact EXTRACTION courant.
+
+Les autres chemins vérifiés ont une portée distincte: l'ajout de sources
+utilise déjà les décisions effectives reasonnées pour lever ses blockers de
+sources critiques non archivées; une extraction échouée sur la source ajoutée
+reste refusée par son propre résultat d'extraction. La restauration
+d'enrichissements périmés réutilise des blocs historiques vérifiés et les
+revalide contre les preuves courantes; elle ne passe pas par la garde de
+génération d'une révision ciblée de SYNTHESIS.
