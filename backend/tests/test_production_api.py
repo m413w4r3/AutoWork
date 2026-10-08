@@ -2216,7 +2216,9 @@ async def test_synthesis_artifact_exposes_server_derived_revision_targets(
     title_target = next(item for item in payload["revision_targets"] if item["label"] == "Titre")
     assert title_target["operations"] == ["rewrite_title"]
     paragraph = next(
-        item for item in payload["revision_targets"] if item["label"].startswith("Paragraphe · Contexte")
+        item
+        for item in payload["revision_targets"]
+        if item["label"].startswith("Paragraphe · Contexte")
     )
     assert len(paragraph["target"]["stable_ids"][0]) == 64
 

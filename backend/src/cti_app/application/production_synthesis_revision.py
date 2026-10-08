@@ -76,11 +76,11 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionConflictError,
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionRefusal,
     TargetedEditorialRevisionRefusalCode,
     TargetedEditorialRevisionRequest,
-    TargetedEditorialRevisionPlacement,
-    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -254,9 +254,7 @@ def build_targeted_revision_target_catalog(
                     TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
                 ),
                 summary=" ".join(
-                    str(item.get("text", ""))
-                    for item in lead
-                    if isinstance(item, Mapping)
+                    str(item.get("text", "")) for item in lead if isinstance(item, Mapping)
                 ),
             ),
             option(
@@ -339,9 +337,7 @@ def build_targeted_revision_target_catalog(
                 )
         lead_target = TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH
         lead_ids = [
-            _paragraph_id(paragraph)
-            for paragraph in lead
-            if isinstance(paragraph, Mapping)
+            _paragraph_id(paragraph) for paragraph in lead if isinstance(paragraph, Mapping)
         ]
         unique_lead_ids = {identity for identity, count in Counter(lead_ids).items() if count == 1}
         for paragraph in lead:
