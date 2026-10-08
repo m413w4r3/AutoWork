@@ -48,7 +48,11 @@ from cti_app.application.production_repairs import (
 from cti_app.application.production_synthesis import (
     canonical_extraction_hash,
 )
-from cti_app.domain.collection import CollectionFailureReason, CollectionState
+from cti_app.domain.collection import (
+    CollectionFailureReason,
+    CollectionState,
+    SourceOriginKind,
+)
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
@@ -915,6 +919,11 @@ class SourceAdditionService:
                 )
             collection = refreshed_collection
             document = await uow.source_documents.get(document_id)
+            manual_attempt = (
+                await self._manual_archive_attempt(uow, collection)
+                if collection.origin_kind is SourceOriginKind.MANUAL
+                else None
+            )
         if document is None or document.subject_id != addition.subject_id:
             return None, SourceAdditionRefusal(
                 code=SourceAdditionRefusalCode.ARCHIVE_RECEIPT_INCOMPLETE,
@@ -949,9 +958,22 @@ class SourceAdditionService:
                 recommended_restart_stage=ProductionStage.REFERENCES,
                 reason="L'archive ne fournit pas les deux empreintes SHA-256 requises.",
             )
-        policy_snapshot_id = getattr(collection, "fetch_policy_snapshot_id", None) or getattr(
-            self._collection_service.policy_snapshot, "id", None
-        )
+        if collection.origin_kind is SourceOriginKind.MANUAL:
+            if (
+                manual_attempt is None
+                or manual_attempt.encoded_sha256 != encoded_sha
+                or manual_attempt.decoded_sha256 != decoded_sha
+            ):
+                return None, SourceAdditionRefusal(
+                    code=SourceAdditionRefusalCode.ARCHIVE_RECEIPT_INCOMPLETE,
+                    recommended_restart_stage=ProductionStage.REFERENCES,
+                    reason="La tentative d'archive manuelle ne correspond pas au document archivé.",
+                )
+            policy_snapshot_id = manual_attempt.policy_snapshot_id
+        else:
+            policy_snapshot_id = getattr(collection, "fetch_policy_snapshot_id", None) or getattr(
+                self._collection_service.policy_snapshot, "id", None
+            )
         if not policy_snapshot_id:
             return None, SourceAdditionRefusal(
                 code=SourceAdditionRefusalCode.ARCHIVE_RECEIPT_INCOMPLETE,
@@ -1380,6 +1402,20 @@ class SourceAdditionService:
         )
         collection = await uow.source_collections.get(addition.collection_id)
         document = await uow.source_documents.get(addition.source_document_id)
+        manual_attempt = (
+            await self._manual_archive_attempt(uow, collection)
+            if collection is not None and collection.origin_kind is SourceOriginKind.MANUAL
+            else None
+        )
+        policy_snapshot_matches = (
+            manual_attempt is not None
+            and manual_attempt.policy_snapshot_id == addition.collection_policy_snapshot_id
+            and manual_attempt.encoded_sha256 == addition.encoded_sha256
+            and manual_attempt.decoded_sha256 == addition.decoded_sha256
+            if collection is not None and collection.origin_kind is SourceOriginKind.MANUAL
+            else collection is not None
+            and collection.fetch_policy_snapshot_id == addition.collection_policy_snapshot_id
+        )
         mismatch = (
             reference is None
             or collection is None
@@ -1395,7 +1431,7 @@ class SourceAdditionService:
             or document.source_collection_id != addition.collection_id
             or document.encoded_sha256 != addition.encoded_sha256
             or document.decoded_sha256 != addition.decoded_sha256
-            or collection.fetch_policy_snapshot_id != addition.collection_policy_snapshot_id
+            or not policy_snapshot_matches
         )
         if mismatch:
             return SourceAdditionRefusal(
@@ -1424,6 +1460,25 @@ class SourceAdditionService:
                 reason="La politique d'accès interdit de soumettre cette archive à l'extracteur.",
             )
         return None
+
+    @staticmethod
+    async def _manual_archive_attempt(uow: Any, collection: Any) -> Any | None:
+        """Return the exact persisted manual attempt for an archived collection."""
+        attempt_id = getattr(collection, "latest_attempt_id", None)
+        if attempt_id is None:
+            return None
+        attempts = await uow.collection_attempts.list_for_collection(collection.id)
+        return next(
+            (
+                attempt
+                for attempt in attempts
+                if attempt.id == attempt_id
+                and attempt.collection_id == collection.id
+                and attempt.manual_lease_id is not None
+                and attempt.job_id is None
+            ),
+            None,
+        )
 
     async def _critical_source_blockers(
         self,
