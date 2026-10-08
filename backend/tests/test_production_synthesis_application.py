@@ -4186,6 +4186,27 @@ def test_targeted_revision_rejects_unknown_evidence_and_unsupported_claim() -> N
 def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity() -> None:
     world, _, _, _ = _targeted_revision_fixture()
     added_source_id = uuid4()
+    corroboration_source_id = uuid4()
+    corroboration_source = make_source(
+        corroboration_source_id,
+        tier=ProductionReferenceTier.SUPPORTING,
+        role=SourceRole.UNKNOWN,
+        editorial_role=ProductionEditorialRole.CORROBORATION,
+        indicators=(
+            ExtractionIndicatorV1(
+                value="corroboration.example",
+                artifact_type=ArtifactType.DOMAIN,
+                indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+                context="Example actor used FooRAT infrastructure at corroboration.example.",
+                evidence_quote=(
+                    "Example actor used FooRAT infrastructure at corroboration.example."
+                ),
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(corroboration_source_id,),
+            ),
+        ),
+        url_suffix="nanodump-corroboration",
+    )
     added_source = make_source(
         added_source_id,
         tier=ProductionReferenceTier.TECHNICAL,
@@ -4204,7 +4225,12 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
         ),
         url_suffix="nanodump-context",
     )
-    extraction = _matched_extraction(world.snapshot, world.extraction.sources[0], added_source)
+    extraction = _matched_extraction(
+        world.snapshot,
+        world.extraction.sources[0],
+        corroboration_source,
+        added_source,
+    )
     projection = build_relevance_projection(world.snapshot, extraction)
     evidence_pack = build_synthesis_evidence_pack(world.snapshot, extraction, projection)
     assert any(
@@ -4216,6 +4242,16 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
         for item in projection.classifications
         if item.evidence_ref.source_document_id == added_source_id
     ] == [RelevanceClassification.CONTEXT]
+    assert any(
+        item.evidence_ref.source_document_id == world.source_id
+        and item.classification is RelevanceClassification.DIRECT
+        for item in projection.classifications
+    )
+    assert any(
+        item.evidence_ref.source_document_id == corroboration_source_id
+        and item.classification is RelevanceClassification.CORROBORATION
+        for item in projection.classifications
+    )
     context_handle = next(
         handle
         for handle, ref in evidence_pack._handle_to_ref.items()
@@ -4226,6 +4262,14 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
         for handle, ref in evidence_pack._handle_to_ref.items()
         if ref.source_document_id == world.source_id and ref.kind is EvidenceKind.FACT
     )
+    corroboration_handle = next(
+        handle
+        for handle, ref in evidence_pack._handle_to_ref.items()
+        if ref.source_document_id == corroboration_source_id and ref.kind is EvidenceKind.INDICATOR
+    )
+    assert subject_handle in evidence_pack._subject_scoped_handles
+    assert corroboration_handle in evidence_pack._subject_scoped_handles
+    assert context_handle not in evidence_pack._subject_scoped_handles
 
     def proposal(scope: str, handle: str) -> SynthesisProposalV1:
         return SynthesisProposalV1(
@@ -4239,6 +4283,8 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
                             text=(
                                 "NanoDump is a memory dumper and credential recovery utility."
                                 if handle == context_handle
+                                else "Example actor used corroboration.example."
+                                if handle == corroboration_handle
                                 else "FooRAT."
                             ),
                             evidence_handles=(handle,),
@@ -4280,6 +4326,13 @@ def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity
         )
     synthesis_revision_module._assert_claim_handles_and_relations_supported(
         proposal("actor_activity", subject_handle),
+        evidence_pack,
+        extraction=extraction,
+        source_addition_document_ids=frozenset({added_source_id}),
+        require_claim_scopes=True,
+    )
+    synthesis_revision_module._assert_claim_handles_and_relations_supported(
+        proposal("actor_activity", corroboration_handle),
         evidence_pack,
         extraction=extraction,
         source_addition_document_ids=frozenset({added_source_id}),
@@ -4633,7 +4686,13 @@ class _SynthesisResultWriter(Protocol):
 
 
 @pytest.mark.asyncio
-async def test_synthesis_revision_recovers_existing_model_run_without_resubmission() -> None:
+async def test_synthesis_revision_recovers_existing_model_run_without_resubmission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from cti_app.application.production_source_additions import (
+        SourceAdditionArtifactPreview,
+        SourceAdditionPreview,
+    )
     from cti_app.application.production_stages import (
         EditorialEnrichmentService,
         SynthesisService,
@@ -4844,6 +4903,117 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     with pytest.raises(TargetedEditorialRevisionConflictError):
         await revision_service.revise(conflicting_request)
 
+    repository.artifacts[:] = [
+        references_artifact,
+        extraction_artifact,
+        base_artifact,
+        previous_publication,
+    ]
+    source_request_id = uuid4()
+    additions_hash = "a" * 64
+    addition_manifest = {
+        "addition_id": str(uuid4()),
+        "url": "https://example.test/nanodump",
+        "source_document_id": str(uuid4()),
+        "content_sha256": "b" * 64,
+        "editorial_role": "context",
+        "selection_criterion": "Reference for generic tool description",
+    }
+    projected_artifacts = tuple(
+        SourceAdditionArtifactPreview(
+            stage=stage,
+            artifact_id=uuid4(),
+            version=2,
+            input_hash="c" * 64,
+            canonical_sha256="d" * 64,
+        )
+        for stage in (
+            ProductionArtifactStage.REFERENCES,
+            ProductionArtifactStage.EXTRACTION,
+            ProductionArtifactStage.RELEVANCE_PROJECTION,
+        )
+    )
+    addition_preview = SourceAdditionPreview(
+        production_run_id=world.run.id,
+        request_id=source_request_id,
+        pipeline_generation=world.run.pipeline_generation,
+        source_additions=(addition_manifest,),
+        source_additions_hash=additions_hash,
+        base_artifacts=(),
+        projected_artifacts=projected_artifacts,
+        stages_preserved=("old_source_checkpoints",),
+        stages_rebased=("references", "extraction", "relevance_projection"),
+        stages_requiring_followup=("synthesis", "publication"),
+        blockers=(),
+        model_calls={"addition_extraction": {"made": 0, "remaining": 1}},
+        ready=True,
+    )
+
+    class ReadySourceAdditionService:
+        result = addition_preview
+
+        async def preview(self, *, production_run_id: UUID, request_id: UUID):
+            assert production_run_id == world.run.id
+            assert request_id == source_request_id
+            return self.result
+
+    revision_service._source_addition_service = ReadySourceAdditionService()  # type: ignore[assignment]
+    ready_request = replace(
+        extension_request,
+        source_addition_request_id=source_request_id,
+        source_additions_hash=additions_hash,
+        before_hash=before_hash,
+    )
+    ready_preview = await revision_service.preview(ready_request)
+    assert ready_preview.refusal is None
+    assert ready_preview.source_addition_ready is True
+    assert ready_preview.source_additions == (addition_manifest,)
+    assert ready_preview.source_additions_hash == additions_hash
+    assert ready_preview.expected_model_calls == 2
+    assert ready_preview.expected_model_calls_by_stage == {
+        "addition_extraction": {"made": 0, "remaining": 1},
+        "synthesis_revision": {"made": 0, "remaining": 1},
+    }
+    assert ready_preview.stages_rebased == (
+        "references",
+        "extraction",
+        "relevance_projection",
+    )
+    assert ready_preview.stages_invalidated == ("publication",)
+    assert ready_preview.historical_artifacts_preserved is True
+    identity = revision_service._request_identity_payload(ready_request)
+    assert identity["source_additions_hash"] == additions_hash
+    assert identity["before_hash"] == before_hash
+
+    changed_manifest_preview = await revision_service.preview(
+        replace(ready_request, source_additions_hash="e" * 64)
+    )
+    assert changed_manifest_preview.refusal is not None
+    assert changed_manifest_preview.refusal.recommended_restart_stage is ProductionStage.REFERENCES
+    assert changed_manifest_preview.expected_model_calls == 1
+    changed_target_preview = await revision_service.preview(
+        replace(ready_request, before_hash="f" * 64)
+    )
+    assert changed_target_preview.refusal is not None
+    assert changed_target_preview.refusal.recommended_restart_stage is ProductionStage.SYNTHESIS
+    assert changed_target_preview.expected_model_calls == 1
+
+    revision_service._source_addition_service.result = replace(
+        addition_preview,
+        model_calls={"addition_extraction": {"made": 1, "remaining": 0}},
+    )
+
+    async def existing_model_run(_run_id: UUID) -> object:
+        return object()
+
+    monkeypatch.setattr(gateway, "get_run", existing_model_run)
+    cached_preview = await revision_service.preview(ready_request)
+    assert cached_preview.expected_model_calls == 0
+    assert cached_preview.expected_model_calls_by_stage == {
+        "addition_extraction": {"made": 1, "remaining": 0},
+        "synthesis_revision": {"made": 0, "remaining": 0},
+    }
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_after_write", (False, True))
@@ -4982,6 +5152,32 @@ async def test_source_extension_uses_one_uow_and_rolls_back_promotion_on_revisio
         ]
     )
     assert committed == ([] if fail_after_write else uows[1].pending)
+
+    if fail_after_write:
+        fence_service = ProductionSynthesisRevisionService(
+            synthesis_service=SimpleNamespace(_uow_factory=uow_factory),  # type: ignore[arg-type]
+            synthesis_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+            enrichment_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+            publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+        )
+        fence_uow = uow_factory()
+        mismatched_promotion = SourceAdditionPromotionResult(
+            production_run_id=world.run.id,
+            request_id=request.source_addition_request_id or uuid4(),
+            artifacts=(),
+            source_additions_hash="e" * 64,
+            already_promoted=False,
+        )
+        fenced = await fence_service.revise_in_uow(
+            fence_uow,
+            request,
+            source_addition_promotion=mismatched_promotion,
+        )
+        assert fenced.refusal is not None
+        assert fenced.refusal.code.value == "revision_not_applicable"
+        assert fence_uow.commit_calls == 0
+        assert fence_uow.rollback_calls == 1
+        assert fence_uow.pending == []
 
 
 @pytest.mark.asyncio
@@ -5182,6 +5378,176 @@ async def test_targeted_revision_lineage_walks_title_section_attribution_chain()
     assert final_payload["sections"][2]["paragraphs"][0]["text"] == (
         "Attribution remains uncertain."
     )
+
+
+@pytest.mark.asyncio
+async def test_source_extension_lineage_v1_to_v2_to_v3_keeps_source_provenance() -> None:
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+    )
+
+    world, base, _, _ = _targeted_revision_fixture()
+    added_source_id = uuid4()
+    added_source = make_source(
+        added_source_id,
+        tier=ProductionReferenceTier.TECHNICAL,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        indicators=(
+            ExtractionIndicatorV1(
+                value="NanoDump",
+                artifact_type=ArtifactType.OTHER,
+                indicator_status=ExtractionIndicatorStatus.CONTEXTUAL,
+                context="NanoDump is a memory dumper.",
+                evidence_quote="NanoDump is a memory dumper.",
+                evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                source_document_ids=(added_source_id,),
+            ),
+        ),
+        url_suffix="nanodump-lineage",
+    )
+    extraction = _matched_extraction(world.snapshot, world.extraction.sources[0], added_source)
+    source_ref = next(
+        item
+        for item in extraction_evidence_refs_v1(extraction)
+        if item.source_document_id == added_source_id and item.kind is EvidenceKind.INDICATOR
+    )
+    synthesis_v2 = replace(
+        base,
+        extraction_hash=canonical_extraction_hash(extraction),
+        sections=(
+            *base.sections,
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.TECHNICAL,
+                heading="Description de NanoDump",
+                paragraphs=(
+                    SynthesisParagraphV1(
+                        text="NanoDump est un outil de dump mémoire.",
+                        evidence_refs=(source_ref,),
+                    ),
+                ),
+            ),
+        ),
+    )
+    manifest_entry = {
+        "addition_id": str(uuid4()),
+        "url": "https://example.test/nanodump",
+        "archive_sha256": "a" * 64,
+        "collection_id": str(uuid4()),
+        "source_document_id": str(added_source_id),
+        "checkpoint_id": str(uuid4()),
+        "extraction_id": str(uuid4()),
+        "evidence_handles_added": [str(source_ref.evidence_key)],
+        "selection_criterion": "Open reference for generic tool description",
+        "selected_by": "test-analyst",
+        "policy_versions": {"source_addition": "source-addition-v1"},
+    }
+    artifact_store = _RevisionMemoryBlobStore()
+    payload_v1 = production_synthesis_to_json(base)
+    payload_v2 = production_synthesis_to_json(synthesis_v2)
+    artifact_v1 = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="1" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(payload_v1),
+    )
+    artifact_v2_id = uuid4()
+    revision_v2 = {
+        "revision_id": str(artifact_v2_id),
+        "base_artifact_id": str(artifact_v1.id),
+        "mode": TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION.value,
+        "operation": "insert_section",
+        "source_additions": [manifest_entry],
+    }
+    provenance_v2 = ProductionSynthesisRevisionService._paragraph_provenance(
+        artifact_v1,
+        payload_v1,
+        payload_v2,
+        artifact_v2_id,
+        source_addition_document_ids=frozenset({added_source_id}),
+    )
+    artifact_v2 = ProductionArtifact(
+        id=artifact_v2_id,
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=2,
+        input_hash="2" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(payload_v2),
+        metadata={"revision": revision_v2, "paragraph_provenance": provenance_v2},
+    )
+
+    synthesis_v3 = replace(
+        synthesis_v2,
+        title=(
+            f"[{synthesis_module._editorial_title_group(world.snapshot, extraction)}] "
+            "FooRAT and NanoDump reference"
+        ),
+    )
+    payload_v3 = production_synthesis_to_json(synthesis_v3)
+    artifact_v3_id = uuid4()
+    revision_v3 = {
+        "revision_id": str(artifact_v3_id),
+        "base_artifact_id": str(artifact_v2.id),
+        "mode": TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY.value,
+        "operation": "rewrite_title",
+        "source_additions": [],
+    }
+    artifact_v3 = ProductionArtifact(
+        id=artifact_v3_id,
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=3,
+        input_hash="3" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=artifact_store.add_json(payload_v3),
+        metadata={
+            "revision": revision_v3,
+            "paragraph_provenance": ProductionSynthesisRevisionService._paragraph_provenance(
+                artifact_v2, payload_v2, payload_v3, artifact_v3_id
+            ),
+        },
+    )
+    repository = _RevisionArtifactRepository((artifact_v1, artifact_v2, artifact_v3))
+
+    def uow_factory() -> _RevisionMemoryUow:
+        return _RevisionMemoryUow(
+            run=world.run,
+            snapshot=world.snapshot,
+            artifacts=repository,
+            documents=world.docs,
+        )
+
+    service = ProductionSynthesisRevisionService(
+        synthesis_service=SimpleNamespace(_uow_factory=uow_factory),  # type: ignore[arg-type]
+        synthesis_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        enrichment_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    lineage = await service.lineage(artifact_v3.id)
+
+    assert [artifact_v1.version, artifact_v2.version, artifact_v3.version] == [1, 2, 3]
+    assert [item["operation"] for item in lineage["revisions"]] == [
+        "rewrite_title",
+        "insert_section",
+    ]
+    assert lineage["revisions"][1]["source_additions"] == [manifest_entry]
+    assert lineage["revisions"][0]["source_additions"] == []
+    nano_paragraph = payload_v3["sections"][-1]["paragraphs"][0]
+    provenance = lineage["paragraph_provenance"][
+        synthesis_revision_module._paragraph_id(nano_paragraph)
+    ]
+    assert provenance == {
+        "origin": "revision",
+        "artifact_id": str(artifact_v2.id),
+        "revision_id": str(artifact_v2.id),
+        "source_document_ids": [str(added_source_id)],
+    }
 
 
 def _targeted_operation_case(

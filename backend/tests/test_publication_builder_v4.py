@@ -90,6 +90,8 @@ from cti_app.domain.production_references import (
     ProductionReferenceResearchStatus,
     ProductionReferenceSourceV1,
     ProductionReferenceTier,
+    ProductionSourceCriticality,
+    ProductionSourceCriticalityReason,
 )
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
@@ -977,9 +979,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == (
-        "9-content-identity-reference-deduplication"
-    )
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "10-context-source-provenance"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
@@ -1980,6 +1980,11 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
                 tier=reference_a.tier,
                 kind=reference_a.kind,
                 role=reference_a.role,
+                editorial_role=ProductionEditorialRole.PRIMARY,
+                source_criticality=ProductionSourceCriticality.CRITICAL,
+                criticality_reason=ProductionSourceCriticalityReason.CORE_TIER,
+                source_collection_id=reference_a.source_collection_id,
+                content_sha256=reference_a.content_sha256,
             ),
             PublicationSourceV1(
                 source_document_id=source_b_id,
@@ -1990,6 +1995,11 @@ def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources
                 tier=reference_b.tier,
                 kind=reference_b.kind,
                 role=reference_b.role,
+                editorial_role=ProductionEditorialRole.PRIMARY,
+                source_criticality=ProductionSourceCriticality.CRITICAL,
+                criticality_reason=ProductionSourceCriticalityReason.CORE_TIER,
+                source_collection_id=reference_b.source_collection_id,
+                content_sha256=reference_b.content_sha256,
             ),
         ),
         uncertainties=(),

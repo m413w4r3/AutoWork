@@ -146,29 +146,63 @@ async def test_source_addition_and_promotion_artifact_rollback_in_one_postgres_u
         tier=ProductionReferenceTier.TECHNICAL,
         kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
     )
-    promoted_references = ProductionArtifact(
-        production_run_id=run.id,
-        subject_id=subject.id,
-        stage=ProductionArtifactStage.REFERENCES,
-        version=1,
-        input_hash="a" * 64,
-        metadata={"source_additions_hash": "b" * 64},
+    source_additions_hash_value = "b" * 64
+    manifest = [
+        {
+            "request_id": str(request_id),
+            "url": addition.canonical_url,
+            "source_document_id": str(uuid4()),
+            "content_sha256": "c" * 64,
+        }
+    ]
+    promoted_artifacts = tuple(
+        ProductionArtifact(
+            production_run_id=run.id,
+            subject_id=subject.id,
+            stage=stage,
+            version=1,
+            input_hash=("d", "e", "f", "0")[index] * 64,
+            metadata={
+                "source_additions_hash": source_additions_hash_value,
+                "source_additions": manifest,
+                **(
+                    {"revision": {"source_additions": manifest}}
+                    if stage is ProductionArtifactStage.SYNTHESIS
+                    else {}
+                ),
+            },
+        )
+        for index, stage in enumerate(
+            (
+                ProductionArtifactStage.REFERENCES,
+                ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
+                ProductionArtifactStage.SYNTHESIS,
+            )
+        )
     )
     with pytest.raises(RuntimeError, match="revision failed after promotion"):
         async with uow_factory() as uow:
             await uow.production_source_additions.append(
                 SourceAdditionJournalEntryV1(addition=addition, version=1)
             )
-            await uow.production_artifacts.append(promoted_references)
+            for artifact in promoted_artifacts:
+                await uow.production_artifacts.append(artifact)
             raise RuntimeError("revision failed after promotion")
 
     async with uow_factory() as uow:
         latest = await uow.production_source_additions.get_latest_for_identity(
             run.id, request_id, source_addition_source_key(addition.canonical_url)
         )
-        artifact = await uow.production_artifacts.get_current(
-            run.id, ProductionArtifactStage.REFERENCES.value
-        )
+        artifacts = {
+            stage: await uow.production_artifacts.get_current(run.id, stage.value)
+            for stage in (
+                ProductionArtifactStage.REFERENCES,
+                ProductionArtifactStage.EXTRACTION,
+                ProductionArtifactStage.RELEVANCE_PROJECTION,
+                ProductionArtifactStage.SYNTHESIS,
+            )
+        }
 
     assert latest is None
-    assert artifact is None
+    assert all(artifact is None for artifact in artifacts.values())

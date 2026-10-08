@@ -36,10 +36,15 @@ from cti_app.domain.production_synthesis import (
     SynthesisSectionV1,
     extraction_evidence_refs_v1,
 )
-from cti_app.domain.publication import ArtifactType, PublicationSectionKind, PublicationSectionV1
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationSectionKind,
+    PublicationSectionV1,
+)
 from cti_app.domain.publication_document import (
     PublicationDocumentV4,
     PublicationDocumentV5,
+    PublicationSourceV1,
     PublicationUncertaintyV1,
     parse_publication_document,
     serialize_publication_document,
@@ -249,6 +254,7 @@ def test_context_source_round_trip_qa_and_typst_projection() -> None:
     )
 
     source = next(item for item in publication.sources if item.source_document_id == context_id)
+    assert isinstance(source, PublicationSourceV1)
     assert source.editorial_role is ProductionEditorialRole.CONTEXT
     assert source.source_collection_id == UUID(int=123)
     assert source.content_sha256 == content_sha256

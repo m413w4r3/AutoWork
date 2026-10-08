@@ -1315,6 +1315,27 @@ async def test_promotion_is_idempotent_fenced_and_rolls_back_with_downstream_fai
         assert not conflict_uow.pending_artifacts
 
     run.pipeline_generation -= 1
+    for changed_base in (
+        replace(base_artifacts[0], version=base_artifacts[0].version + 1),
+        replace(base_artifacts[1], input_hash="9" * 64),
+    ):
+        changed_artifacts = tuple(
+            changed_base if item.stage is changed_base.stage else item for item in base_artifacts
+        )
+        fenced_factory = _TransactionFactory(run, entry, changed_artifacts, snapshot)
+        fenced_service = _service(fenced_factory, artifact_store=store)
+        fenced_service._read_references = lambda _artifact: _async_value(corpus)
+        fenced_service._critical_source_blockers = lambda *_args: _async_value(())
+        fenced_service._effective_repair_decisions = lambda *_args: _async_value(())
+        async with fenced_factory() as fenced_uow:
+            with pytest.raises(SourceAdditionConflictError, match="base_artifact_changed"):
+                await fenced_service.promote_in_uow(
+                    fenced_uow,
+                    production_run_id=run.id,
+                    request_id=entry.addition.request_id,
+                )
+            assert not fenced_uow.pending_artifacts
+
     rollback_factory = _TransactionFactory(run, entry, base_artifacts, snapshot)
     rollback_service = _service(rollback_factory, artifact_store=store)
     rollback_service._read_references = lambda _artifact: _async_value(corpus)

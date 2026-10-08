@@ -75,6 +75,38 @@ from cti_app.domain.semantic_annotation import (
 
 PUBLICATION_DOCUMENT_V4_SCHEMA_VERSION = "4"
 PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION = "5"
+_PUBLICATION_SOURCE_REQUIRED_FIELDS = frozenset(
+    {
+        "source_document_id",
+        "canonical_url",
+        "title",
+        "publisher",
+        "published_at",
+        "tier",
+        "kind",
+        "role",
+    }
+)
+_PUBLICATION_SOURCE_PROVENANCE_FIELDS = frozenset(
+    {
+        "editorial_role",
+        "source_criticality",
+        "criticality_reason",
+        "source_collection_id",
+        "content_sha256",
+    }
+)
+
+
+def _publication_source_object(raw: Any) -> Mapping[str, Any]:
+    """Read legacy source rows and rows with optional provenance fields."""
+    if isinstance(raw, Mapping):
+        keys = set(raw)
+        if _PUBLICATION_SOURCE_REQUIRED_FIELDS <= keys and keys <= (
+            _PUBLICATION_SOURCE_REQUIRED_FIELDS | _PUBLICATION_SOURCE_PROVENANCE_FIELDS
+        ):
+            return raw
+    return json_object(raw, _PUBLICATION_SOURCE_REQUIRED_FIELDS, "Publication source")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1083,27 +1115,7 @@ class PublicationDocumentV4:
                 ),
             )
             for item in (
-                json_object(
-                    raw,
-                    frozenset(
-                        {
-                            "source_document_id",
-                            "canonical_url",
-                            "title",
-                            "publisher",
-                            "published_at",
-                            "tier",
-                            "kind",
-                            "role",
-                            "editorial_role",
-                            "source_criticality",
-                            "criticality_reason",
-                            "source_collection_id",
-                            "content_sha256",
-                        }
-                    ),
-                    "Publication source",
-                )
+                _publication_source_object(raw)
                 for raw in json_array(document["sources"], "Sources")
             )
         )

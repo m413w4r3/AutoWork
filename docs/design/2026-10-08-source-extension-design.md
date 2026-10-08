@@ -172,11 +172,14 @@ La source ajoutée porte tier TECHNICAL, kind TECHNICAL_RESOURCE et
 editorial_role CONTEXT; chaque fait garde son source_document_id et son
 handle. Ajouter EvidenceUseScope(StrEnum): TOOL_CONTEXT est dérivé
 déterministement de la source CONTEXT; ACTOR_ACTIVITY exige une preuve
-subject-scoped. Le wire du patch déclare claim_scope; le prompt réserve la
-nouvelle source aux descriptions génériques de l’outil. Le validateur refuse
-qu’un handle TOOL_CONTEXT soutienne une claim actor_activity; une affirmation
-sur l’acteur exige le passage Anthropic archivé. URL proposée, recherche et
-critère de sélection ne sont jamais des evidence.
+subject-scoped : le scope suit une décision `DIRECT` ou `CORROBORATION` de la
+projection de pertinence. Les handles classés `CONTEXT` en sont exclus, y
+compris ceux de la source ajoutée. Le wire du patch déclare claim_scope; le
+prompt réserve la nouvelle source aux descriptions génériques de l’outil. Le
+validateur refuse qu’un handle TOOL_CONTEXT soutienne une claim actor_activity;
+une affirmation sur l’acteur exige au moins un handle issu d’une preuve du
+Subject. URL proposée, recherche et critère de sélection ne sont jamais des
+evidence.
 
 Règle: « contexte sur NanoDump ≠ preuve que l’acteur a exécuté une chaîne non
 décrite par la source ». Conserver la séparation des flux parallèles; ne pas

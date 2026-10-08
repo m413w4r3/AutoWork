@@ -1548,6 +1548,9 @@ def build_synthesis_evidence_pack(
         )
         for relation in (projection.source_pair_relations if projection is not None else ())
     )
+    # A handle is subject-scoped only when the canonical relevance projection
+    # classifies it DIRECT or CORROBORATION. CONTEXT evidence never establishes
+    # actor activity, even when it describes the same tool or campaign.
     subject_scoped_refs = {
         item.evidence_ref
         for item in (projection.classifications if projection is not None else ())
