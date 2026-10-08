@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-article-v15-synthesis-section-headings",
+  "template_version": "chp-article-v16-cited-technical-context-references",
   "files": [
     "RENDERER/publication.typ",
     "RENDERER/publication_helpers.typ",

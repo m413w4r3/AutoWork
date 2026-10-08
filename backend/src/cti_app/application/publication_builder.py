@@ -44,6 +44,7 @@ from cti_app.domain.production_extraction import (
     is_production_extraction_hash,
 )
 from cti_app.domain.production_references import (
+    ProductionEditorialRole,
     ProductionReferenceCorpusV1,
     ProductionReferenceKind,
     ProductionReferenceSourceV1,
@@ -398,9 +399,9 @@ def _validate_publication_lineage(
             )
 
 
-# V9 changes only PUBLICATION presentation: identical archived content now has
-# one deterministic reader-facing source entry. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "10-context-source-provenance"
+# V11 changes only PUBLICATION: cited technical context sources now receive a
+# reader-facing reference entry. Upstream artifacts remain valid.
+ASSEMBLY_POLICY_VERSION: Final[str] = "11-cited-technical-context-references"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -501,7 +502,13 @@ def _reference_fallback_text(source: ProductionReferenceSourceV1) -> str:
     publisher = (source.publisher or "").strip() or (
         urlsplit(source.canonical_url).hostname or "Publication"
     ).removeprefix("www.")
-    return f"{publisher} publie « {(source.title or '').strip() or source.canonical_url} »."
+    title = (source.title or "").strip() or source.canonical_url
+    if (
+        source.kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+        and source.editorial_role is ProductionEditorialRole.CONTEXT
+    ):
+        return f"{publisher} : {title} — ressource technique de contexte."
+    return f"{publisher} publie « {title} »."
 
 
 def _publication_reference_source_order(source: ProductionReferenceSourceV1) -> tuple[Any, ...]:
@@ -526,7 +533,7 @@ def _publication_reference_groups(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
 ) -> tuple[tuple[ProductionReferenceSourceV1, ...], ...]:
-    """Group cited/full-read publication sources only when identity is proven.
+    """Group reader-facing publications and cited technical context by proven identity.
 
     Equal archive SHA-256 values are sufficient proof. Extraction's
     ``duplicate_content`` state can also connect rows that share the same
@@ -539,7 +546,8 @@ def _publication_reference_groups(
             corpus_sources_by_id[source.source_document_id].append(source)
     extraction_by_id = {source.source_document_id: source for source in extraction.sources}
 
-    candidate_ids = {ref.source_document_id for ref in synthesis_evidence_refs(synthesis)}
+    cited_source_ids = {ref.source_document_id for ref in synthesis_evidence_refs(synthesis)}
+    candidate_ids = set(cited_source_ids)
     candidate_ids.update(
         source.source_document_id
         for source in extraction.sources
@@ -552,10 +560,17 @@ def _publication_reference_groups(
         if not matching_sources:
             continue
         source = min(matching_sources, key=_publication_reference_source_order)
-        if source.kind is ProductionReferenceKind.PUBLICATION and source.tier in {
-            ProductionReferenceTier.CORE,
-            ProductionReferenceTier.SUPPORTING,
-        }:
+        is_reader_facing_publication = (
+            source.kind is ProductionReferenceKind.PUBLICATION
+            and source.tier in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
+        )
+        is_cited_technical_context = (
+            source_id in cited_source_ids
+            and source.kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+            and source.tier is ProductionReferenceTier.TECHNICAL
+            and source.editorial_role is ProductionEditorialRole.CONTEXT
+        )
+        if is_reader_facing_publication or is_cited_technical_context:
             candidates[source_id] = source
 
     parent_by_id = {source_id: source_id for source_id in candidates}
@@ -623,7 +638,7 @@ def _project_publication_references(
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
 ) -> tuple[PublicationReferenceEntryV1, ...]:
-    """One entry per core/supporting publication cited by the synthesis or read in full.
+    """Project cited technical context and core/supporting publications cited or read in full.
 
     A representative's synthesis note wins; otherwise the first note in stable
     representative order supplies the text. Evidence refs from every note in the

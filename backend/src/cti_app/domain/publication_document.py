@@ -1264,14 +1264,20 @@ class PublicationDocumentV5:
             raise ValueError("Publication reference evidence identifies an unknown source")
         for source_id in reference_source_ids:
             source = sources_by_id.get(source_id)
-            if (
-                source is None
-                or source.kind is not ProductionReferenceKind.PUBLICATION
-                or source.tier
-                not in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
-            ):
+            is_reader_facing_publication = source is not None and (
+                source.kind is ProductionReferenceKind.PUBLICATION
+                and source.tier
+                in {ProductionReferenceTier.CORE, ProductionReferenceTier.SUPPORTING}
+            )
+            is_cited_technical_context = source is not None and (
+                source.kind is ProductionReferenceKind.TECHNICAL_RESOURCE
+                and source.tier is ProductionReferenceTier.TECHNICAL
+                and source.editorial_role is ProductionEditorialRole.CONTEXT
+            )
+            if not (is_reader_facing_publication or is_cited_technical_context):
                 raise ValueError(
-                    "Publication reference must identify a core/supporting publication"
+                    "Publication reference must identify a core/supporting publication "
+                    "or technical context source"
                 )
         original_types = [group.artifact_type for group in self.original_indicators]
         if len(original_types) != len(set(original_types)):

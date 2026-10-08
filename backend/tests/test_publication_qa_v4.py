@@ -260,6 +260,12 @@ def test_context_source_round_trip_qa_and_typst_projection() -> None:
     assert source.content_sha256 == content_sha256
     assert source.source_criticality is not None
     assert source.criticality_reason is not None
+    reference = next(
+        item for item in publication.references if item.source_document_id == context_id
+    )
+    assert reference.text == (
+        "Technical Feed : NanoDump reference — ressource technique de contexte."
+    )
     qa = qa_publication_v5(
         snapshot=snapshot,
         references=references,
@@ -284,6 +290,13 @@ def test_context_source_round_trip_qa_and_typst_projection() -> None:
         if item["url"] == context_source.canonical_url
     )
     assert source_row["publisher"] == "Contexte · Technical Feed"
+    reference_row = next(
+        item
+        for item in render_model.content_sections[0]["timeline"]
+        if item["source_urls"] == [context_source.canonical_url]
+    )
+    assert reference_row["role_label"] == "Contexte technique"
+    assert reference_row["display_date"] == "Date de publication non précisée"
 
 
 def test_table_cell_and_diagram_asset_tampering_fail() -> None:

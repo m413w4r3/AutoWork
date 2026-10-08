@@ -16,7 +16,7 @@ from cti_app.domain.typst_render import (
     validate_typst_render_record,
 )
 
-PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v5-context-source-provenance"
+PUBLICATION_RENDER_POLICY_VERSION = "typst-publication-v6-cited-technical-context-reference"
 
 
 class PublicationPreviewStatus(StrEnum):

@@ -8,12 +8,22 @@
 })
 
 #let publication-timeline-events(events) = {
-  events.map(event => (
-    event.display_date,
-    event.text,
-    unique-urls(event.source_urls),
-    event.at("semantic_spans", default: none),
-  ))
+  events.map(event => {
+    let role-label = event.at("role_label", default: none)
+    let body = [
+      #if has-text(role-label) [
+        #text(size: 8pt, fill: grey)[#role-label]
+        #linebreak()
+      ]
+      #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
+    ]
+    (
+      event.display_date,
+      body,
+      unique-urls(event.source_urls),
+      none,
+    )
+  })
 }
 
 #let render-publication-timeline(events) = {
