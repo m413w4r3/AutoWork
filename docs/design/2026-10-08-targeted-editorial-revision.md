@@ -47,6 +47,12 @@ input hash et SHA-256 canonique ; toute divergence produit un conflit explicite.
 Le template est une identité texte libre dans le schéma actuel : aucune
 migration n’est requise.
 
+Les artifacts d’extraction historiques antérieurs au champ facultatif `scope`
+restent vérifiables par leur hash canonique exact (sérialiseur courant ou
+ancienne forme sans ce champ). Le blob antérieur et son hash enregistré ne sont
+jamais normalisés ou réécrits ; les nouveaux artifacts utilisent le hash
+courant.
+
 ## Application, impact et invalidation
 
 Le service applique le patch au JSON canonique en remplaçant seulement la

@@ -11,7 +11,10 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.domain.production import ExtractionProfile
-from cti_app.domain.production_extraction import ProductionExtractionV1
+from cti_app.domain.production_extraction import (
+    ProductionExtractionV1,
+    production_extraction_hashes,
+)
 from cti_app.domain.production_synthesis import (
     EvidenceKind,
     ExtractionEvidenceRefV1,
@@ -566,7 +569,8 @@ def validate_relevance_projection_lineage(
         raise ValueError("Projection subject does not match canonical extraction")
     if projection.production_input_hash != extraction.production_input_hash:
         raise ValueError("Projection input does not match canonical extraction")
-    if projection.extraction_hash != extraction_hash:
+    accepted_hashes = production_extraction_hashes(extraction)
+    if extraction_hash not in accepted_hashes or projection.extraction_hash not in accepted_hashes:
         raise ValueError("Projection extraction hash does not match canonical extraction")
     if set(projection.extraction_evidence_refs) != set(extraction_evidence_refs_v1(extraction)):
         raise ValueError("Projection lineage references differ from canonical extraction")

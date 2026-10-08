@@ -18,6 +18,8 @@ CANONICAL_IOC_RULES_PROMPT_VERSION = "archive-ioc-rules-v3"
 CANONICAL_IOC_RULES_BATCH_PROMPT_VERSION = "archive-ioc-rules-batch-v3"
 SYNTHESIS_PROMPT_VERSION = "synthesis-draft-v11-adaptive-section-headings"
 SYNTHESIS_PROPOSAL_CONTRACT_VERSION = "synthesis-text-blocks-v4-optional-section-headings"
+SYNTHESIS_TARGETED_REVISION_PROMPT_VERSION = "synthesis-targeted-revision-v1-existing-evidence"
+SYNTHESIS_TARGETED_REVISION_CONTRACT_VERSION = "synthesis-targeted-patch-v1"
 SYNTHESIS_WIRE_PARSER_VERSION = "synthesis-text-parser-v6-heading-warning-recovery"
 
 SYNTHESIS_EDITORIAL_CONTRACT_V5 = """EDITORIAL CONTRACT

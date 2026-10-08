@@ -5,11 +5,11 @@ import binascii
 import hashlib
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any, Literal, NoReturn, cast
+from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID
 
 from fastapi import APIRouter, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, StrictStr
 
 from cti_app.application.identity import IdentityProvider
 from cti_app.application.jobs import (
@@ -83,12 +83,17 @@ from cti_app.application.production_stage_status import (
     build_stage_statuses,
     completed_stage_count,
 )
-from cti_app.application.production_stages import EditorialEnrichmentService
+from cti_app.application.production_stages import EditorialEnrichmentService, SynthesisService
 from cti_app.application.production_state import (
     ProductionStateError,
     ProductionStateImportResult,
     ProductionStateService,
     ProductionStateSnapshotV5,
+)
+from cti_app.application.production_synthesis import ProductionSynthesisService
+from cti_app.application.production_synthesis_revision import (
+    ProductionSynthesisRevisionService,
+    TargetedSynthesisRevisionValidationError,
 )
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
@@ -122,6 +127,14 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
     EditorialEnrichmentRevisionAction,
+)
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionConflictError,
+    TargetedEditorialRevisionMode,
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionRequest,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
 )
 from cti_app.domain.production_pipeline import production_artifact_stages
 from cti_app.domain.publication import is_publication_ioc_artifact_type
@@ -160,6 +173,64 @@ class EditorialEnrichmentRevisionResponse(BaseModel):
     publication_artifact_version: int | None
     previous_publication_artifact_id: UUID | None
     revision: dict[str, Any]
+
+
+_Sha256String = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
+
+
+class TargetedEditorialRevisionTargetRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: TargetedEditorialRevisionTargetKind
+    stable_ids: list[_Sha256String] = Field(default_factory=list)
+    parent_id: _Sha256String | None = None
+    anchor_id: _Sha256String | None = None
+    insert_after: StrictBool = False
+
+
+class TargetedEditorialRevisionRequestBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_artifact_id: UUID
+    base_version: StrictInt = Field(ge=1)
+    base_input_hash: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    base_canonical_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    target: TargetedEditorialRevisionTargetRequest
+    operation: TargetedEditorialRevisionOperation
+    instruction: StrictStr = Field(min_length=1, max_length=2000)
+    mode: TargetedEditorialRevisionMode = TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY
+
+
+class TargetedEditorialRevisionPreviewResponse(BaseModel):
+    base_artifact_id: UUID
+    base_version: int
+    base_input_hash: str
+    base_canonical_sha256: str
+    target_path: str
+    stages_preserved: list[str]
+    stages_invalidated: list[str]
+    stages_conditionally_rebased: list[str]
+    source_extension: bool
+    expected_model_calls: int
+    enrichment_rebase: str
+
+
+class TargetedEditorialRevisionResponse(BaseModel):
+    request_identity: str | None
+    artifact_id: UUID | None
+    artifact_version: int | None
+    artifact_input_hash: str | None
+    artifact_canonical_sha256: str | None
+    publication_artifact_id: UUID | None
+    revision: dict[str, Any] | None
+    refusal: dict[str, Any] | None
+
+
+class TargetedEditorialRevisionLineageResponse(BaseModel):
+    artifact_id: str
+    production_run_id: str
+    revisions: list[dict[str, Any]]
+    paragraph_provenance: dict[str, Any]
 
 
 class StartEditionProductionRequest(BaseModel):
@@ -494,6 +565,36 @@ def _production_enrichment_revision_service(
         enrichment_service=enrichment_service,
         persistence_service=EditorialEnrichmentService(uow_factory, artifact_store),
         publication_render_service=render_service,
+    )
+
+
+def _production_synthesis_revision_service(
+    request: Request,
+) -> ProductionSynthesisRevisionService:
+    artifact_store = getattr(request.app.state, "production_artifact_store", None)
+    render_service = getattr(request.app.state, "publication_render_service", None)
+    model_gateway = getattr(request.app.state, "model_gateway", None)
+    if artifact_store is None or render_service is None or model_gateway is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "targeted_synthesis_revision_unavailable"},
+        )
+    from cti_app.config import get_settings
+
+    uow_factory = request.app.state.uow_factory
+    synthesis_persistence = SynthesisService(uow_factory, artifact_store)
+    synthesis_service = ProductionSynthesisService(
+        uow_factory=uow_factory,
+        artifact_store=artifact_store,
+        model_gateway=model_gateway,
+        synthesis_service=synthesis_persistence,
+    )
+    return ProductionSynthesisRevisionService(
+        synthesis_service=synthesis_service,
+        synthesis_persistence=synthesis_persistence,
+        enrichment_persistence=EditorialEnrichmentService(uow_factory, artifact_store),
+        publication_render_service=render_service,
+        resource_search_enabled=get_settings().production_editorial_resource_search_enabled,
     )
 
 
@@ -2831,6 +2932,153 @@ async def revise_editorial_enrichment_artifact(
         previous_publication_artifact_id=result.previous_publication_artifact_id,
         revision=result.revision,
     )
+
+
+def _targeted_revision_domain_request(
+    subject_id: UUID,
+    payload: TargetedEditorialRevisionRequestBody,
+    requester: str,
+) -> TargetedEditorialRevisionRequest:
+    return TargetedEditorialRevisionRequest(
+        subject_id=subject_id,
+        base_artifact_id=payload.base_artifact_id,
+        base_version=payload.base_version,
+        base_input_hash=payload.base_input_hash,
+        base_canonical_sha256=payload.base_canonical_sha256,
+        target=TargetedEditorialRevisionTarget(
+            kind=payload.target.kind,
+            stable_ids=tuple(payload.target.stable_ids),
+            parent_id=payload.target.parent_id,
+            anchor_id=payload.target.anchor_id,
+            insert_after=payload.target.insert_after,
+        ),
+        operation=payload.operation,
+        instruction=payload.instruction,
+        mode=payload.mode,
+        requester=requester,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/production/artifacts/synthesis/revisions/preview",
+    response_model=TargetedEditorialRevisionPreviewResponse,
+)
+async def preview_targeted_synthesis_revision(
+    subject_id: UUID,
+    payload: TargetedEditorialRevisionRequestBody,
+    request: Request,
+) -> TargetedEditorialRevisionPreviewResponse:
+    service = _production_synthesis_revision_service(request)
+    domain_request = _targeted_revision_domain_request(
+        subject_id, payload, await _actor_id(request)
+    )
+    try:
+        preview = await service.preview(domain_request)
+    except TargetedEditorialRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "targeted_synthesis_revision_invalid"},
+        ) from exc
+    return TargetedEditorialRevisionPreviewResponse(
+        base_artifact_id=preview.base_artifact_id,
+        base_version=preview.base_version,
+        base_input_hash=preview.base_input_hash,
+        base_canonical_sha256=preview.base_canonical_sha256,
+        target_path=preview.target_path,
+        stages_preserved=list(preview.stages_preserved),
+        stages_invalidated=list(preview.stages_invalidated),
+        stages_conditionally_rebased=list(preview.stages_conditionally_rebased),
+        source_extension=preview.source_extension,
+        expected_model_calls=preview.expected_model_calls,
+        enrichment_rebase=preview.enrichment_rebase,
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/production/artifacts/synthesis/revisions",
+    response_model=TargetedEditorialRevisionResponse,
+)
+async def revise_synthesis_artifact(
+    subject_id: UUID,
+    payload: TargetedEditorialRevisionRequestBody,
+    request: Request,
+) -> TargetedEditorialRevisionResponse:
+    service = _production_synthesis_revision_service(request)
+    domain_request = _targeted_revision_domain_request(
+        subject_id, payload, await _actor_id(request)
+    )
+    try:
+        result = await service.revise(domain_request)
+    except TargetedEditorialRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except TargetedSynthesisRevisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "reason_code": exc.reason_code, **exc.details},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "targeted_synthesis_revision_invalid"},
+        ) from exc
+
+    artifact = result.artifact
+    canonical_hash = None
+    if artifact is not None:
+        if artifact.canonical_blob_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail={"code": "targeted_synthesis_revision_artifact_missing"},
+            )
+        canonical = await request.app.state.production_artifact_store.read_bytes(
+            artifact.canonical_blob_id
+        )
+        canonical_hash = hashlib.sha256(canonical).hexdigest()
+    return TargetedEditorialRevisionResponse(
+        request_identity=(
+            str(result.revision["request_identity"]) if result.revision is not None else None
+        ),
+        artifact_id=artifact.id if artifact is not None else None,
+        artifact_version=artifact.version if artifact is not None else None,
+        artifact_input_hash=artifact.input_hash if artifact is not None else None,
+        artifact_canonical_sha256=canonical_hash,
+        publication_artifact_id=(
+            result.publication_artifact.id if result.publication_artifact is not None else None
+        ),
+        revision=result.revision,
+        refusal=result.refusal.to_json() if result.refusal is not None else None,
+    )
+
+
+@router.get(
+    "/production/artifacts/{artifact_id}/revision-lineage",
+    response_model=TargetedEditorialRevisionLineageResponse,
+)
+async def get_targeted_synthesis_revision_lineage(
+    artifact_id: UUID, request: Request
+) -> TargetedEditorialRevisionLineageResponse:
+    service = _production_synthesis_revision_service(request)
+    try:
+        lineage = await service.lineage(artifact_id)
+    except ValueError as exc:
+        code = str(exc) or "targeted_synthesis_revision_lineage_invalid"
+        raise HTTPException(
+            status_code=(
+                status.HTTP_404_NOT_FOUND
+                if code == "targeted_synthesis_revision_artifact_not_found"
+                else status.HTTP_422_UNPROCESSABLE_CONTENT
+            ),
+            detail={"code": code},
+        ) from exc
+    return TargetedEditorialRevisionLineageResponse(**lineage)
 
 
 @router.get("/subjects/{subject_id}/production/artifacts/publication")

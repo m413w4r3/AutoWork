@@ -68,7 +68,7 @@ from cti_app.domain.production_extraction import (
     PRODUCTION_EXTRACTION_SCHEMA_VERSION,
     ProductionExtractionV1,
     production_extraction_from_json,
-    production_extraction_to_json,
+    production_extraction_hashes,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -1006,8 +1006,7 @@ def _canonical_json_bytes(payload: Any) -> bytes:
 
 def canonical_extraction_hash(extraction: ProductionExtractionV1) -> str:
     """Hash the canonical extraction serialization with stable JSON encoding."""
-    encoded = _canonical_json_bytes(production_extraction_to_json(extraction))
-    return hashlib.sha256(encoded).hexdigest()
+    return production_extraction_hashes(extraction)[0]
 
 
 def synthesis_access_policy_hash(policy: SynthesisAccessPolicyV1) -> str:

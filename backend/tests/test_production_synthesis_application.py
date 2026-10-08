@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -14,6 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 import cti_app.application.production_synthesis as synthesis_module
+import cti_app.application.production_synthesis_revision as synthesis_revision_module
 from cti_app.application.blob_storage import BlobReadLimitExceededError
 from cti_app.application.model_gateway import (
     ExternalModelBlockedError,
@@ -27,6 +29,7 @@ from cti_app.application.production_artifact_reuse import ProductionArtifactReus
 from cti_app.application.production_editorial_enrichment import (
     build_editorial_enrichment_evidence_pack,
 )
+from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_synthesis import (
     MAX_SYNTHESIS_UNCERTAINTIES,
@@ -66,7 +69,7 @@ from cti_app.application.production_synthesis import (
 )
 from cti_app.application.production_workflow import ProductionWorkflowOrchestrator
 from cti_app.domain.classification import TLP
-from cti_app.domain.collection import SourceCollection
+from cti_app.domain.collection import CollectionState, SourceCollection
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.entities import SourceDocument
 from cti_app.domain.model_runs import ModelProvider, ModelRole, ModelRun, ModelUsage
@@ -82,6 +85,13 @@ from cti_app.domain.production import (
     ProductionRun,
     SynthesisMode,
 )
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionMode,
+    TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionRequest,
+    TargetedEditorialRevisionTarget,
+    TargetedEditorialRevisionTargetKind,
+)
 from cti_app.domain.production_extraction import (
     EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionEventV1,
@@ -93,11 +103,17 @@ from cti_app.domain.production_extraction import (
     ExtractionRuleV1,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    is_production_extraction_hash,
+    production_extraction_from_json,
+    production_extraction_hashes,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
+    ProductionReferenceCorpusV1,
     ProductionReferenceKind,
+    ProductionReferenceResearchStatus,
+    ProductionReferenceSourceV1,
     ProductionReferenceTier,
 )
 from cti_app.domain.production_relevance import (
@@ -106,12 +122,14 @@ from cti_app.domain.production_relevance import (
     RelevanceSourcePairRelationV1,
 )
 from cti_app.domain.production_synthesis import (
+    PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
     SYNTHESIS_POLICY_VERSION,
     EvidenceKind,
     ExtractionEvidenceRefV1,
     ProductionSynthesisV1,
     SynthesisParagraphV1,
     SynthesisSectionKind,
+    SynthesisSectionV1,
     extraction_evidence_refs_v1,
     is_valid_editorial_title,
     production_synthesis_to_json,
@@ -4003,3 +4021,659 @@ def test_timeline_resolves_half_year_and_season_wording(
     wording: str, expected: date | None
 ) -> None:
     assert resolve_timeline_date_text(wording) == expected
+
+
+def _targeted_revision_fixture() -> tuple[
+    SimpleNamespace,
+    ProductionSynthesisV1,
+    SynthesisEvidencePackV1,
+    str,
+]:
+    world = _fresh_setup()
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, world.extraction)
+    handle = next(
+        str(item["handle"])
+        for item in evidence_pack.narrative_evidence
+        if item.get("kind") == EvidenceKind.FACT.value
+    )
+    ref = evidence_pack.resolve_handle(handle)
+    sections = tuple(
+        SynthesisSectionV1(
+            kind=SynthesisSectionKind.OVERVIEW,
+            heading="",
+            paragraphs=(
+                SynthesisParagraphV1(
+                    text=f"The report records FooRAT in paragraph {index}.",
+                    evidence_refs=(ref,),
+                ),
+            ),
+        )
+        for index in (1, 2, 3)
+    )
+    synthesis = ProductionSynthesisV1(
+        schema_version=PRODUCTION_SYNTHESIS_SCHEMA_VERSION,
+        subject_id=world.snapshot.subject_id,
+        production_input_hash=world.snapshot.input_hash,
+        extraction_hash=canonical_extraction_hash(world.extraction),
+        publication_language=world.snapshot.publication_language,
+        synthesis_policy_version=SYNTHESIS_POLICY_VERSION,
+        title=(
+            f"[{synthesis_module._editorial_title_group(world.snapshot, world.extraction)}] "
+            "FooRAT activity"
+        ),
+        lead=(
+            SynthesisParagraphV1(text="FooRAT was identified in the report.", evidence_refs=(ref,)),
+        ),
+        sections=sections,
+        timeline=build_synthesis_timeline(world.extraction),
+        uncertainties=build_synthesis_uncertainties(world.extraction),
+        warnings=(),
+    )
+    return world, synthesis, evidence_pack, handle
+
+
+def test_extraction_hash_recognizes_legacy_payload_without_optional_scope() -> None:
+    world = _fresh_setup()
+    payload = production_extraction_to_json(world.extraction)
+    for source in payload["sources"]:
+        source.pop("scope")
+    legacy_extraction = production_extraction_from_json(payload)
+    legacy_hash = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+    assert production_extraction_hashes(legacy_extraction)[0] == canonical_extraction_hash(
+        legacy_extraction
+    )
+    assert legacy_hash in production_extraction_hashes(legacy_extraction)
+    assert is_production_extraction_hash(legacy_extraction, legacy_hash)
+
+
+def _targeted_wire_patch(
+    payload: dict[str, object],
+    target: TargetedEditorialRevisionTarget,
+    operation: TargetedEditorialRevisionOperation,
+    after: str,
+) -> synthesis_revision_module._WirePatch:
+    resolved = synthesis_revision_module._resolve_target(payload, target, operation)
+    return synthesis_revision_module._WirePatch(
+        target=resolved.path,
+        action=operation,
+        base_artifact_hash=synthesis_revision_module._sha256(payload),
+        before_hash=resolved.before_hash,
+        after=after,
+        rationale="The requested wording is supported by the admitted report.",
+    )
+
+
+def test_targeted_revision_rewrites_only_paragraph_in_middle_section() -> None:
+    world, base, evidence_pack, handle = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][1]
+    section_id = synthesis_revision_module._section_id(section)
+    paragraph_id = synthesis_revision_module._paragraph_id(section["paragraphs"][0])
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(paragraph_id,),
+        parent_id=section_id,
+    )
+    operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        operation,
+        "@@SECTION overview S001@@\n"
+        "@@CLAIM C001@@\n"
+        f"EVIDENCE: {handle}\n"
+        "TEXT: FooRAT was identified in the report.\n"
+        "@@END SECTION@@",
+    )
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+    )
+
+    assert revised.sections[0] == base.sections[0]
+    assert revised.sections[2] == base.sections[2]
+    assert revised.sections[1].heading == base.sections[1].heading
+    assert revised_payload["sections"][0] == payload["sections"][0]
+    assert revised_payload["sections"][2] == payload["sections"][2]
+    assert revised.sections[1].paragraphs[0].text == "FooRAT was identified in the report."
+
+
+def test_targeted_revision_rejects_unknown_evidence_and_unsupported_claim() -> None:
+    world, base, evidence_pack, handle = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][1]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+    operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    for unsupported_claim in (
+        "EVIDENCE: E999\nTEXT: FooRAT was identified in the report.",
+        f"EVIDENCE: {handle}\nTEXT: FooRAT controlled every network worldwide.",
+    ):
+        patch = _targeted_wire_patch(
+            payload,
+            target,
+            operation,
+            f"@@SECTION overview S001@@\n@@CLAIM C001@@\n{unsupported_claim}\n@@END SECTION@@",
+        )
+        with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError):
+            synthesis_revision_module._apply_wire_patch(
+                base_synthesis=base,
+                base_payload=payload,
+                target=target,
+                operation=operation,
+                patch=patch,
+                evidence_pack=evidence_pack,
+                extraction=world.extraction,
+                snapshot=world.snapshot,
+            )
+
+
+def test_targeted_title_revision_preserves_legacy_sections_byte_for_byte() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
+    operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
+    expected_title = (
+        f"[{synthesis_module._editorial_title_group(world.snapshot, world.extraction)}] "
+        "Updated FooRAT activity"
+    )
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        operation,
+        f"@@TITLE@@\n{expected_title}\n@@END TITLE@@",
+    )
+    _, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+    )
+
+    assert revised_payload["title"] == expected_title
+    assert synthesis_revision_module._canonical_bytes(revised_payload["sections"]) == (
+        synthesis_revision_module._canonical_bytes(payload["sections"])
+    )
+    assert revised_payload["timeline"] == payload["timeline"]
+    assert revised_payload["source_notes"] == payload["source_notes"]
+    assert revised_payload["uncertainties"] == payload["uncertainties"]
+
+
+def test_targeted_revision_wire_parses_typed_refusal_and_rejects_bad_hash() -> None:
+    refusal = synthesis_revision_module._parse_wire_patch(
+        "@@REFUSAL@@\n"
+        "code: revision_not_applicable\n"
+        "recommended_restart_stage: SYNTHESIS\n"
+        "reason: The request requires a different source scope.\n"
+        "@@END@@"
+    )
+    assert refusal.refusal is not None
+    assert refusal.refusal.code.value == "revision_not_applicable"
+    assert refusal.refusal.recommended_restart_stage.value == "synthesis"
+
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError):
+        synthesis_revision_module._parse_wire_patch(
+            "@@TARGET@@\nsynthesis.title\n@@ACTION@@\nrewrite_title\n"
+            "@@BASE_ARTIFACT_HASH@@\ninvalid\n@@BEFORE_HASH@@\n"
+            f"{'a' * 64}\n@@AFTER@@\nTITLE: changed\n@@RATIONALE@@\nreason"
+        )
+
+
+class _RevisionMemoryBlobStore:
+    def __init__(self) -> None:
+        self.payloads: dict[UUID, dict[str, object]] = {}
+        self.bytes: dict[UUID, bytes] = {}
+
+    def add_json(self, payload: dict[str, object]) -> UUID:
+        blob_id = uuid4()
+        self.payloads[blob_id] = payload
+        self.bytes[blob_id] = synthesis_revision_module._canonical_bytes(payload)
+        return blob_id
+
+    async def read_json(self, blob_id: UUID) -> dict[str, object]:
+        return self.payloads[blob_id]
+
+    async def read_bytes(self, blob_id: UUID, **kwargs: object) -> bytes:
+        del kwargs
+        return self.bytes[blob_id]
+
+    async def store_stage_payloads(
+        self,
+        *,
+        raw: str | None = None,
+        canonical: dict[str, object] | None = None,
+        rendered: str | None = None,
+    ) -> tuple[UUID | None, UUID | None, UUID | None]:
+        raw_id = uuid4() if raw is not None else None
+        if raw_id is not None:
+            self.bytes[raw_id] = raw.encode("utf-8")
+        canonical_id = self.add_json(canonical) if canonical is not None else None
+        rendered_id = uuid4() if rendered is not None else None
+        if rendered_id is not None:
+            self.bytes[rendered_id] = rendered.encode("utf-8")
+        return raw_id, canonical_id, rendered_id
+
+
+class _RevisionArtifactRepository:
+    def __init__(self, artifacts: tuple[ProductionArtifact, ...]) -> None:
+        self.artifacts = list(artifacts)
+
+    async def get(self, artifact_id: UUID) -> ProductionArtifact | None:
+        return next((item for item in self.artifacts if item.id == artifact_id), None)
+
+    async def list_for_run(self, run_id: UUID) -> list[ProductionArtifact]:
+        return [item for item in self.artifacts if item.production_run_id == run_id]
+
+    async def get_current(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        candidates = [
+            item
+            for item in self.artifacts
+            if item.production_run_id == run_id
+            and item.stage.value == stage
+            and item.status is ProductionArtifactStatus.VERIFIED
+        ]
+        return max(candidates, key=lambda item: item.version, default=None)
+
+    async def get_current_for_revision(self, run_id: UUID, stage: str) -> ProductionArtifact | None:
+        return await self.get_current(run_id, stage)
+
+    async def append(self, artifact: ProductionArtifact) -> None:
+        self.artifacts.append(artifact)
+
+    async def mark_stages_stale(self, run_id: UUID, stages: set[str]) -> list[str]:
+        changed: list[str] = []
+        self.artifacts = [
+            replace(item, status=ProductionArtifactStatus.STALE)
+            if item.production_run_id == run_id
+            and item.stage.value in stages
+            and item.status is ProductionArtifactStatus.VERIFIED
+            else item
+            for item in self.artifacts
+        ]
+        changed.extend(sorted(stages))
+        return changed
+
+    async def mark_downstream_stale(self, run_id: UUID, stage: str) -> None:
+        del run_id, stage
+
+
+class _RevisionMemoryUow:
+    def __init__(
+        self,
+        *,
+        run: ProductionRun,
+        snapshot: ProductionInputSnapshot,
+        artifacts: _RevisionArtifactRepository,
+        documents: MemorySourceDocuments,
+    ) -> None:
+        self.production_runs = SimpleNamespace(
+            get_current_for_subject=lambda subject_id: _async_value(
+                run if subject_id == run.subject_id else None
+            )
+        )
+        self.production_input_snapshots = SimpleNamespace(
+            get_by_run=lambda run_id: _async_value(snapshot if run_id == run.id else None)
+        )
+        self.production_artifacts = artifacts
+        self.source_documents = documents
+        self.source_collections = MemorySourceCollections()
+
+    async def __aenter__(self) -> _RevisionMemoryUow:
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+
+    async def commit(self) -> None:
+        return None
+
+
+async def _async_value(value: object) -> object:
+    return value
+
+
+class _FailOnceSynthesisWriter:
+    def __init__(self, delegate: object) -> None:
+        self.delegate = delegate
+        self.calls = 0
+
+    async def store_synthesis_result(self, **kwargs: object) -> ProductionArtifact:
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("simulated interruption after archived model response")
+        return await self.delegate.store_synthesis_result(**kwargs)  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_synthesis_revision_recovers_existing_model_run_without_resubmission() -> None:
+    from cti_app.application.production_stages import (
+        EditorialEnrichmentService,
+        SynthesisService,
+    )
+    from cti_app.application.production_synthesis import ProductionSynthesisService
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+    )
+    from cti_app.domain.production_editorial_revision import (
+        TargetedEditorialRevisionConflictError,
+    )
+
+    world, base, _, _ = _targeted_revision_fixture()
+    base_payload = production_synthesis_to_json(base)
+    artifact_store = _RevisionMemoryBlobStore()
+    extraction_blob = artifact_store.add_json(production_extraction_to_json(world.extraction))
+    synthesis_blob = artifact_store.add_json(base_payload)
+    reference_corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=world.snapshot.subject_id,
+        research_date=world.snapshot.research_date,
+        production_input_hash=world.snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=tuple(
+            ProductionReferenceSourceV1(
+                canonical_url=source.canonical_url,
+                tier=source.tier,
+                kind=source.kind,
+                role=source.role,
+                title="Archived test source",
+                publisher="Test publisher",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=source.source_document_id,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=source.content_sha256,
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+                editorial_role=source.editorial_role,
+            )
+            for source in world.extraction.sources
+        ),
+        warnings=(),
+    )
+    references_blob = artifact_store.add_json(production_reference_corpus_to_json(reference_corpus))
+    references_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="c" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=references_blob,
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=EXTRACTION_ARTIFACT_HASH,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=extraction_blob,
+    )
+    base_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="0" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=synthesis_blob,
+    )
+    repository = _RevisionArtifactRepository(
+        (references_artifact, extraction_artifact, base_artifact)
+    )
+
+    def uow_factory() -> _RevisionMemoryUow:
+        return _RevisionMemoryUow(
+            run=world.run,
+            snapshot=world.snapshot,
+            artifacts=repository,
+            documents=world.docs,
+        )
+
+    policy = await build_synthesis_access_policy(
+        world.snapshot, world.extraction, world.docs, MemorySourceCollections()
+    )
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, world.extraction)
+    input_hash = synthesis_input_hash(
+        world.snapshot,
+        world.extraction,
+        evidence_pack,
+        synthesis_access_policy_hash(policy),
+    )
+    base_artifact = replace(base_artifact, input_hash=input_hash)
+    repository.artifacts[-1] = base_artifact
+    base_hash = hashlib.sha256(artifact_store.bytes[synthesis_blob]).hexdigest()
+    before_hash = synthesis_revision_module._sha256(base.title)
+    target_path = "synthesis.title"
+    expected_title = (
+        f"[{synthesis_module._editorial_title_group(world.snapshot, world.extraction)}] "
+        "Updated FooRAT activity"
+    )
+    wire = (
+        "@@TARGET@@\n"
+        f"{target_path}\n"
+        "@@ACTION@@\nrewrite_title\n"
+        "@@BASE_ARTIFACT_HASH@@\n"
+        f"{base_hash}\n"
+        "@@BEFORE_HASH@@\n"
+        f"{before_hash}\n"
+        "@@AFTER@@\n@@TITLE@@\n"
+        f"{expected_title}\n"
+        "@@END TITLE@@\n"
+        "@@RATIONALE@@\nThe title retains the evidenced publisher group.\n"
+        "@@END@@"
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
+    persistence = SynthesisService(uow_factory, artifact_store)  # type: ignore[arg-type]
+    writer = _FailOnceSynthesisWriter(persistence)
+    synthesis_service = ProductionSynthesisService(
+        uow_factory=uow_factory,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
+        model_gateway=gateway,  # type: ignore[arg-type]
+        synthesis_service=writer,  # type: ignore[arg-type]
+    )
+    revision_service = ProductionSynthesisRevisionService(
+        synthesis_service=synthesis_service,
+        synthesis_persistence=writer,  # type: ignore[arg-type]
+        enrichment_persistence=EditorialEnrichmentService(
+            uow_factory,
+            artifact_store,  # type: ignore[arg-type]
+        ),
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    request = TargetedEditorialRevisionRequest(
+        subject_id=world.snapshot.subject_id,
+        base_artifact_id=base_artifact.id,
+        base_version=base_artifact.version,
+        base_input_hash=base_artifact.input_hash,
+        base_canonical_sha256=base_hash,
+        target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
+        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
+        instruction="Correct the title to match the publisher group.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+
+    preview = await revision_service.preview(request)
+    assert preview.expected_model_calls == 1
+    assert not gateway.calls
+    extension_request = replace(request, mode=TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION)
+    refused = await revision_service.revise(extension_request)
+    assert refused.refusal is not None
+    assert refused.refusal.code.value == "source_extension_not_available_yet"
+    assert not gateway.calls
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        await revision_service.revise(request)
+    assert len(gateway.calls) == 1
+
+    result = await revision_service.revise(request)
+    assert result.artifact is not None
+    assert result.revision is not None
+    assert len(gateway.calls) == 1
+    assert result.revision["model_run_id"] == str(gateway.calls[0][0].run_id)
+    lineage = await revision_service.lineage(result.artifact.id)
+    assert len(lineage["revisions"]) == 1
+    assert lineage["revisions"][0]["actor"] == "test-analyst"
+    assert result.artifact.metadata["paragraph_provenance"]
+
+    replay = await revision_service.revise(request)
+    assert replay.artifact is not None
+    assert replay.artifact.id == result.artifact.id
+    assert len(gateway.calls) == 1
+
+    conflicting_request = replace(request, instruction="A different edit from the stale base.")
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await revision_service.revise(conflicting_request)
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_lineage_walks_title_section_attribution_chain() -> None:
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+    )
+
+    world, _, _, _ = _targeted_revision_fixture()
+    artifact_store = _RevisionMemoryBlobStore()
+    payloads = [
+        {"version": 1, "title": "Initial"},
+        {"version": 2, "title": "Corrected"},
+        {"version": 3, "heading": "Activity"},
+        {"version": 4, "paragraph": "The report records FooRAT."},
+    ]
+    artifacts: list[ProductionArtifact] = []
+    prior: ProductionArtifact | None = None
+    operations = ("rewrite_title", "rename_section", "rewrite_paragraph")
+    target_paths = (
+        "synthesis.title",
+        "synthesis.section[section-id]",
+        "synthesis.section[section-id].paragraph[paragraph-id]",
+    )
+    for version, payload in enumerate(payloads, start=1):
+        blob_id = artifact_store.add_json(payload)
+        artifact_id = uuid4()
+        metadata: dict[str, object] = {}
+        if prior is not None:
+            revision_id = uuid4()
+            revision = {
+                "revision_id": str(revision_id),
+                "base_artifact_id": str(prior.id),
+                "base_artifact_hash": hashlib.sha256(
+                    artifact_store.bytes[prior.canonical_blob_id]
+                ).hexdigest(),
+                "target": {"kind": "title" if version == 2 else "section"},
+                "target_path": target_paths[version - 2],
+                "operation": operations[version - 2],
+                "request": f"Apply revision {version}",
+                "mode": "existing_evidence_only",
+                "actor": "test-analyst",
+                "model_run_id": str(uuid4()),
+                "prompt_version": "prompt-v1",
+                "contract_version": "contract-v1",
+                "parser_version": "parser-v1",
+                "validator_version": "validator-v1",
+                "evidence_refs": [],
+                "source_additions": [],
+                "created_at": f"2026-10-08T00:00:0{version}Z",
+                "result_artifact_id": str(artifact_id),
+            }
+            metadata = {
+                "revision": revision,
+                "paragraph_provenance": {
+                    "initial-paragraph": {
+                        "origin": "initial",
+                        "artifact_id": str(artifacts[0].id),
+                        "revision_id": None,
+                    },
+                    "attribution-paragraph": {
+                        "origin": "revision",
+                        "artifact_id": str(artifact_id),
+                        "revision_id": str(revision_id),
+                    },
+                },
+            }
+        artifact = ProductionArtifact(
+            id=artifact_id,
+            production_run_id=world.run.id,
+            subject_id=world.snapshot.subject_id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=version,
+            input_hash="d" * 64,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=blob_id,
+            metadata=metadata,
+        )
+        artifacts.append(artifact)
+        prior = artifact
+
+    repository = _RevisionArtifactRepository(tuple(artifacts))
+
+    def uow_factory() -> _RevisionMemoryUow:
+        return _RevisionMemoryUow(
+            run=world.run,
+            snapshot=world.snapshot,
+            artifacts=repository,
+            documents=world.docs,
+        )
+
+    service = ProductionSynthesisRevisionService(
+        synthesis_service=SimpleNamespace(_uow_factory=uow_factory),  # type: ignore[arg-type]
+        synthesis_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        enrichment_persistence=SimpleNamespace(),  # type: ignore[arg-type]
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+
+    lineage = await service.lineage(artifacts[-1].id)
+
+    assert [item["operation"] for item in lineage["revisions"]] == [
+        "rewrite_paragraph",
+        "rename_section",
+        "rewrite_title",
+    ]
+    assert [item["base_artifact_id"] for item in lineage["revisions"]] == [
+        str(artifacts[2].id),
+        str(artifacts[1].id),
+        str(artifacts[0].id),
+    ]
+    assert all(
+        {
+            "revision_id",
+            "base_artifact_hash",
+            "target",
+            "request",
+            "mode",
+            "actor",
+            "model_run_id",
+            "prompt_version",
+            "contract_version",
+            "parser_version",
+            "validator_version",
+            "evidence_refs",
+            "source_additions",
+            "created_at",
+            "result_artifact_id",
+        }
+        <= item.keys()
+        for item in lineage["revisions"]
+    )
+    assert lineage["paragraph_provenance"]["initial-paragraph"]["origin"] == "initial"
+    assert lineage["paragraph_provenance"]["attribution-paragraph"]["origin"] == "revision"

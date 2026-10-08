@@ -41,6 +41,7 @@ from cti_app.domain.production_extraction import (
     ExtractionReuseState,
     ProductionExtractionV1,
     decode_indicator_section_paths,
+    is_production_extraction_hash,
 )
 from cti_app.domain.production_references import (
     ProductionReferenceCorpusV1,
@@ -372,7 +373,7 @@ def _validate_publication_lineage(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
             "Synthesis does not match the production input snapshot",
         )
-    if synthesis.extraction_hash != canonical_extraction_hash(extraction):
+    if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
         raise PublicationAssemblyValidationError(
             PublicationAssemblyErrorCode.INPUTS_MISMATCH,
             "Synthesis does not match the canonical extraction",

@@ -997,6 +997,44 @@ def production_extraction_to_json(extraction: ProductionExtractionV1) -> dict[st
     }
 
 
+def production_extraction_hashes(extraction: ProductionExtractionV1) -> tuple[str, ...]:
+    """Return current and accepted pre-scope hashes for one extraction.
+
+    The optional per-source ``scope`` field was added after canonical
+    extraction artifacts were already persisted. When every scope is absent,
+    the former serializer omitted that field. Keep that exact historical hash
+    verifiable while preserving the current hash as the primary identity.
+    """
+    payload = production_extraction_to_json(extraction)
+
+    def digest(value: dict[str, Any]) -> str:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    current = digest(payload)
+    if not all(source.get("scope") is None for source in payload["sources"]):
+        return (current,)
+    legacy_payload = {
+        **payload,
+        "sources": [
+            {key: value for key, value in source.items() if key != "scope"}
+            for source in payload["sources"]
+        ],
+    }
+    legacy = digest(legacy_payload)
+    return (current, legacy) if legacy != current else (current,)
+
+
+def is_production_extraction_hash(extraction: ProductionExtractionV1, value: str) -> bool:
+    """Check a stored extraction digest against current or supported legacy form."""
+    return value in production_extraction_hashes(extraction)
+
+
 def _require_mapping(raw: Any, keys: frozenset[str], label: str) -> Mapping[str, Any]:
     if not isinstance(raw, Mapping) or set(raw) != keys:
         raise ValueError(f"{label} has an invalid shape")

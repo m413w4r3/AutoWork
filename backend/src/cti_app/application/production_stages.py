@@ -27,7 +27,6 @@ from cti_app.application.production_references import (
     production_reference_corpus_to_json,
 )
 from cti_app.application.production_synthesis import (
-    canonical_extraction_hash,
     render_synthesis_markdown,
 )
 from cti_app.domain.production import (
@@ -40,8 +39,12 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentV1,
     editorial_enrichment_to_json,
 )
+from cti_app.domain.production_editorial_revision import (
+    TargetedEditorialRevisionConflictError,
+)
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
+    is_production_extraction_hash,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -381,8 +384,10 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
         metadata_extra: Mapping[str, Any] | None = None,
         artifact_id: UUID | None = None,
         expected_current_artifact_id: UUID | None = None,
+        expected_current_input_hash: str | None = None,
         expected_current_canonical_sha256: str | None = None,
         canonical_payload: dict[str, Any] | None = None,
+        resource_search_enabled: bool = False,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("editorial_enrichment_inputs_missing")
@@ -396,6 +401,7 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
             access_policy_hash=access_policy_hash,
             projection_hash=projection_hash,
             source_figure_inventory_hash=source_figure_inventory_hash,
+            resource_search_enabled=resource_search_enabled,
         ):
             raise ValueError("editorial_enrichment_lineage_mismatch")
         payload = canonical_payload or editorial_enrichment_to_json(enrichment)
@@ -421,7 +427,9 @@ class EditorialEnrichmentService(_ArtifactPayloadMixin):
                     "The Editorial Enrichment base is no longer current"
                 )
             if expected_current_artifact_id is not None:
-                if current is None or current.input_hash != input_hash:
+                if current is None or current.input_hash != (
+                    expected_current_input_hash or input_hash
+                ):
                     raise EditorialEnrichmentRevisionConflictError(
                         "The Editorial Enrichment base hash changed"
                     )
@@ -516,12 +524,18 @@ class SynthesisService(_ArtifactPayloadMixin):
         routing_policy_version: str = "",
         projection_hash: str | None = None,
         diagnostics: Mapping[str, Any] | None = None,
+        metadata_extra: Mapping[str, Any] | None = None,
+        artifact_id: UUID | None = None,
+        expected_current_artifact_id: UUID | None = None,
+        expected_current_input_hash: str | None = None,
+        expected_current_canonical_sha256: str | None = None,
+        stale_stages: set[str] | None = None,
     ) -> ProductionArtifact:
         if self._artifact_store is None:
             raise ValueError("Canonical synthesis requires an artifact store")
         if synthesis.subject_id != subject_id or extraction.subject_id != subject_id:
             raise ValueError("Synthesis subject does not match artifact subject")
-        if synthesis.extraction_hash != canonical_extraction_hash(extraction):
+        if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
             raise ValueError("Synthesis extraction hash does not match canonical extraction")
         cited_refs = synthesis_evidence_refs(synthesis)
         if not cited_refs <= set(extraction_evidence_refs_v1(extraction)):
@@ -552,12 +566,42 @@ class SynthesisService(_ArtifactPayloadMixin):
             "synthesis_policy_version": synthesis.synthesis_policy_version,
             "diagnostics": dict(diagnostics or {}),
         }
+        if metadata_extra is not None:
+            metadata.update(dict(metadata_extra))
         async with self._uow_factory() as uow:
             # Not get_current: a synthesis retry stales every prior synthesis
             # artifact first, and get_current excludes STALE rows — using it
             # here would restart numbering at 1 and collide with the
             # (production_run_id, stage, version) uniqueness of the original.
             existing = await uow.production_artifacts.list_for_run(run_id)
+            if expected_current_artifact_id is not None:
+                current = await uow.production_artifacts.get_current(
+                    run_id, ProductionArtifactStage.SYNTHESIS.value
+                )
+                if current is None or current.id != expected_current_artifact_id:
+                    raise TargetedEditorialRevisionConflictError(
+                        "The synthesis revision base is no longer current"
+                    )
+                if (
+                    expected_current_input_hash is not None
+                    and current.input_hash != expected_current_input_hash
+                ):
+                    raise TargetedEditorialRevisionConflictError(
+                        "The synthesis revision base input hash changed"
+                    )
+                if expected_current_canonical_sha256 is not None:
+                    if current.canonical_blob_id is None:
+                        raise TargetedEditorialRevisionConflictError(
+                            "The synthesis revision base has no canonical body"
+                        )
+                    current_bytes = await self._artifact_store.read_bytes(current.canonical_blob_id)
+                    if (
+                        hashlib.sha256(current_bytes).hexdigest()
+                        != expected_current_canonical_sha256
+                    ):
+                        raise TargetedEditorialRevisionConflictError(
+                            "The synthesis revision base content hash changed"
+                        )
             prior_versions = [
                 artifact.version
                 for artifact in existing
@@ -571,6 +615,7 @@ class SynthesisService(_ArtifactPayloadMixin):
             if canonical_id is None:
                 raise ValueError("Canonical synthesis blob was not stored")
             artifact = ProductionArtifact(
+                id=artifact_id or uuid4(),
                 production_run_id=run_id,
                 subject_id=subject_id,
                 stage=ProductionArtifactStage.SYNTHESIS,
@@ -585,9 +630,12 @@ class SynthesisService(_ArtifactPayloadMixin):
             )
             await uow.production_artifacts.append(artifact)
 
-            await uow.production_artifacts.mark_downstream_stale(
-                run_id, ProductionArtifactStage.SYNTHESIS.value
-            )
+            if stale_stages is None:
+                await uow.production_artifacts.mark_downstream_stale(
+                    run_id, ProductionArtifactStage.SYNTHESIS.value
+                )
+            elif stale_stages:
+                await uow.production_artifacts.mark_stages_stale(run_id, stale_stages)
 
             await uow.commit()
             return artifact

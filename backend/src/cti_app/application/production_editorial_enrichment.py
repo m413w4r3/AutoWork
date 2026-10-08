@@ -151,6 +151,7 @@ from cti_app.domain.production_extraction import (
     ExtractionIndicatorStatus,
     ProductionExtractionV1,
     decode_indicator_section_paths,
+    is_production_extraction_hash,
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
@@ -4424,7 +4425,7 @@ def build_editorial_enrichment_evidence_pack(
         and snapshot.input_hash
         == extraction.production_input_hash
         == synthesis.production_input_hash
-        and synthesis.extraction_hash == canonical_extraction_hash(extraction)
+        and is_production_extraction_hash(extraction, synthesis.extraction_hash)
         and synthesis.publication_language == snapshot.publication_language
     ):
         raise ValueError("Editorial enrichment evidence inputs have mismatched lineage")
@@ -7424,7 +7425,9 @@ class ProductionEditorialEnrichmentService:
         try:
             payload = await self._artifact_store.read_json(artifact.canonical_blob_id)
             synthesis = production_synthesis_from_json(payload)
-            validate_synthesis_lineage(synthesis, snapshot, canonical_extraction_hash(extraction))
+            if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
+                raise ValueError("Synthesis extraction hash does not match canonical extraction")
+            validate_synthesis_lineage(synthesis, snapshot, synthesis.extraction_hash)
         except ProductionReuseStorageUnavailableError:
             raise
         except Exception as exc:
