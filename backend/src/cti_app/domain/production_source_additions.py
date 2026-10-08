@@ -13,7 +13,11 @@ from typing import Any
 from uuid import UUID
 
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
-from cti_app.domain.production import ExtractionProfile, ProductionArtifactStage
+from cti_app.domain.production import (
+    ExtractionProfile,
+    ProductionArtifactStage,
+    SourceAdditionExtractionIntent,
+)
 from cti_app.domain.production_extraction import (
     ExtractionProfileReasonCode,
     ExtractionReuseState,
@@ -174,6 +178,9 @@ class SourceAdditionV1:
     tier: ProductionReferenceTier = ProductionReferenceTier.TECHNICAL
     kind: ProductionReferenceKind = ProductionReferenceKind.TECHNICAL_RESOURCE
     role: SourceRole = SourceRole.UNKNOWN
+    extraction_intent: SourceAdditionExtractionIntent = (
+        SourceAdditionExtractionIntent.INDICATORS_ONLY
+    )
     editorial_role: ProductionEditorialRole = ProductionEditorialRole.CONTEXT
     criticality: ProductionSourceCriticality | None = None
     criticality_reason: ProductionSourceCriticalityReason | None = None
@@ -220,6 +227,8 @@ class SourceAdditionV1:
             raise ValueError("source_addition_kind_invalid")
         if not isinstance(self.role, SourceRole):
             raise ValueError("source_addition_role_invalid")
+        if not isinstance(self.extraction_intent, SourceAdditionExtractionIntent):
+            raise ValueError("source_addition_extraction_intent_invalid")
         if self.editorial_role is not ProductionEditorialRole.CONTEXT:
             raise ValueError("source_addition_editorial_role_must_be_context")
         if self.kind is ProductionReferenceKind.PUBLICATION:
@@ -372,6 +381,7 @@ def source_addition_manifest(additions: Sequence[SourceAdditionV1]) -> tuple[dic
             "tier": item.tier.value,
             "kind": item.kind.value,
             "role": item.role.value,
+            "extraction_intent": item.extraction_intent.value,
             "editorial_role": item.editorial_role.value,
             "criticality": item.criticality.value if item.criticality else None,
             "criticality_reason": (
@@ -435,6 +445,7 @@ def source_addition_to_json(addition: SourceAdditionV1) -> dict[str, Any]:
         "tier": addition.tier.value,
         "kind": addition.kind.value,
         "role": addition.role.value,
+        "extraction_intent": addition.extraction_intent.value,
         "editorial_role": addition.editorial_role.value,
         "criticality": addition.criticality.value if addition.criticality else None,
         "criticality_reason": (
@@ -530,6 +541,14 @@ def source_addition_from_json(payload: Any) -> SourceAdditionV1:
         tier=ProductionReferenceTier(str(payload["tier"])),
         kind=ProductionReferenceKind(str(payload["kind"])),
         role=SourceRole(str(payload["role"])),
+        extraction_intent=SourceAdditionExtractionIntent(
+            str(
+                payload.get(
+                    "extraction_intent",
+                    SourceAdditionExtractionIntent.INDICATORS_ONLY.value,
+                )
+            )
+        ),
         editorial_role=ProductionEditorialRole(str(payload["editorial_role"])),
         criticality=optional_enum(ProductionSourceCriticality, "criticality"),
         criticality_reason=optional_enum(ProductionSourceCriticalityReason, "criticality_reason"),

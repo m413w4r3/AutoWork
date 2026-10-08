@@ -19,7 +19,9 @@ from cti_app.domain.collection import CollectionState
 from cti_app.domain.discovery import SourceRole
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
+    SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION,
     ExtractionProfile,
+    SourceAdditionExtractionIntent,
 )
 from cti_app.domain.production_extraction import (
     ExtractionProfileReasonCode,
@@ -345,6 +347,47 @@ def test_policy_version_participates_in_the_plan() -> None:
     plan = build_extraction_plan(corpus)
 
     assert plan.profile_policy_version == EXTRACTION_PROFILE_POLICY_VERSION
+
+
+def test_descriptive_context_intent_is_scoped_and_versions_its_profile_decision() -> None:
+    document_id = uuid4()
+    corpus = _lone_core_corpus(
+        _record(
+            "https://example.test/nanodump",
+            tier=ProductionReferenceTier.TECHNICAL,
+            role=SourceRole.UNKNOWN,
+            document_id=document_id,
+            sha256="d" * 64,
+            kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+            editorial_role=ProductionEditorialRole.CONTEXT,
+        )
+    )
+
+    default_plan = build_extraction_plan(corpus)
+    descriptive_plan = build_extraction_plan(
+        corpus,
+        source_profile_intents={document_id: SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS},
+    )
+    default_source = next(
+        source for source in default_plan.sources if source.source_document_id == document_id
+    )
+    descriptive_source = next(
+        source for source in descriptive_plan.sources if source.source_document_id == document_id
+    )
+
+    assert default_source.profile is ExtractionProfile.IOC_RULES
+    assert default_source.profile_reason_code is ExtractionProfileReasonCode.TECHNICAL_ANNEX
+    assert default_source.profile_policy_version == EXTRACTION_PROFILE_POLICY_VERSION
+    assert descriptive_source.profile is ExtractionProfile.FULL
+    assert (
+        descriptive_source.profile_reason_code
+        is ExtractionProfileReasonCode.OPERATOR_DESCRIPTIVE_CONTEXT
+    )
+    assert (
+        descriptive_source.profile_policy_version
+        == SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION
+    )
+    assert descriptive_plan.input_hash != default_plan.input_hash
 
 
 def test_policy_version_change_invalidates_source_checkpoint_identity(

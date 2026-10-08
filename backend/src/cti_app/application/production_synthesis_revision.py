@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from itertools import pairwise
 from typing import Any, cast
 from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -206,6 +207,18 @@ def _paragraph_id(payload: Mapping[str, Any]) -> str:
 
 def _section_id(payload: Mapping[str, Any]) -> str:
     return _sha256(payload)
+
+
+def _enrichment_section_anchor_id(payload: Mapping[str, Any]) -> str:
+    """Identify a synthesis section for enrichment without binding its heading.
+
+    Section IDs used by targeted editorial requests intentionally include the
+    heading. Enrichment placements need a separate identity: changing a title
+    must not invalidate evidence anchored to the section's paragraphs.
+    """
+    anchor_payload = dict(payload)
+    anchor_payload.pop("heading", None)
+    return _sha256(anchor_payload)
 
 
 def build_targeted_revision_target_catalog(
@@ -844,6 +857,159 @@ def _grounding_token(value: str) -> str:
     return token
 
 
+_GROUNDING_WORD = re.compile(r"[\w-]+", flags=re.UNICODE)
+_GROUNDING_SCOPE_MARKERS = frozenset(
+    """
+    all every each entire whole only worldwide globally tout toute tous toutes chaque jamais
+    toujours seulement uniquement mondialement partout
+    """.split()
+)
+_DISTINCTIVE_LITERAL = re.compile(
+    r"(?<![\w])(?:"
+    r"--[A-Za-z0-9][A-Za-z0-9_-]*|"
+    r"(?:https?://|www\.)[^\s,;)>\]]+|"
+    r"(?:[A-Za-z]:)?[\\/](?:[\w.-]+[\\/])*[\w.-]+|"
+    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+(?:/[^\s,;)>\]]*)?|"
+    r"[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+|"
+    r"(?:\d{1,3}\.){3}\d{1,3}|"
+    r"[A-Fa-f0-9]{32,64}|"
+    r"(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}|"
+    r"[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*"
+    r")(?![\w])",
+    flags=re.IGNORECASE | re.UNICODE,
+)
+
+
+def _grounding_match_token(value: str) -> str:
+    """Normalize a distinctive token for case, accent, and common plural matches."""
+    token = unicodedata.normalize("NFKC", value).casefold().replace("\u2019", "'").strip()
+    is_digest = re.fullmatch(r"[a-f0-9]{32,64}", token) is not None
+    if (
+        not is_digest
+        and not any(character.isdigit() for character in token)
+        and not any(character in token for character in "._/\\")
+        and not token.startswith("-")
+    ):
+        token = _grounding_token(token)
+    decomposed = unicodedata.normalize("NFKD", token)
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def _is_sentence_initial(text: str, start: int) -> bool:
+    prefix = text[:start]
+    return re.search(r"(?:^|[.!?])\s*[^\w\s]*\s*$", prefix) is not None
+
+
+def _distinctive_grounding_terms(text: str) -> tuple[str, ...]:
+    """Return only claim tokens that can introduce a specific, verifiable fact.
+
+    Numbers, identifiers, technical literals, IOC-like values, CamelCase names,
+    acronyms, and non-initial capitalized names are checked against cited
+    evidence. Absolute quantifiers and scope modifiers are checked because they
+    change the factual reach of a claim. Ordinary editorial prose remains free
+    to paraphrase.
+    """
+    terms: dict[str, str] = {}
+    current_run: list[re.Match[str]] = []
+
+    def add(value: str, *, force: bool = False) -> None:
+        cleaned = value.strip(".,:;!?()[]{}\"'").strip("\u201c\u201d\u2018\u2019")
+        if not cleaned:
+            return
+        key = _grounding_match_token(cleaned)
+        if key and (force or key not in _GROUNDING_STOP_WORDS):
+            terms.setdefault(key, cleaned)
+
+    def add_current_run() -> None:
+        if len(current_run) > 1:
+            add(" ".join(part.group() for part in current_run))
+        current_run.clear()
+
+    for match in _DISTINCTIVE_LITERAL.finditer(text):
+        add(match.group())
+
+    words = list(_GROUNDING_WORD.finditer(text))
+    for index, match in enumerate(words):
+        if current_run:
+            separator = text[current_run[-1].end() : match.start()]
+            if any(not character.isspace() or character in "\r\n" for character in separator):
+                add_current_run()
+
+        value = match.group()
+        letters = [character for character in value if character.isalpha()]
+        is_camel_case = any(left.islower() and right.isupper() for left, right in pairwise(value))
+        is_acronym = len(letters) > 1 and value.isupper()
+        is_title_case = bool(letters) and value[0].isupper() and value[1:].islower()
+        is_explicit_identifier = any(character in value for character in "._-")
+        is_sentence_initial = is_title_case and _is_sentence_initial(text, match.start())
+
+        scope_marker = unicodedata.normalize("NFKC", value).casefold()
+        next_word = words[index + 1].group().casefold() if index < len(words) - 1 else ""
+        if scope_marker in _GROUNDING_SCOPE_MARKERS and not (
+            scope_marker == "tout" and next_word == "en"
+        ):
+            add(value, force=True)
+        if (
+            any(character.isdigit() for character in value)
+            or is_camel_case
+            or is_acronym
+            or is_explicit_identifier
+        ):
+            add(value)
+
+        # A French editorial opener such as "Ces" or "Selon" must not become
+        # part of a named sequence just because it starts a sentence. A real
+        # capitalized sequence after it (for example, "Cobalt Strike") remains
+        # eligible for grounding.
+        initial_stop_word = (
+            is_sentence_initial and _grounding_match_token(value) in _GROUNDING_STOP_WORDS
+        )
+        if is_title_case and not initial_stop_word:
+            current_run.append(match)
+        else:
+            add_current_run()
+
+        if is_title_case and not is_sentence_initial:
+            add(value)
+
+    add_current_run()
+
+    return tuple(terms[key] for key in sorted(terms))
+
+
+def _unsupported_distinctive_claim_terms(claim_text: str, evidence_text: str) -> tuple[str, ...]:
+    """Find unsupported names and literals; multiword names need sequence evidence."""
+    supported = {
+        _grounding_match_token(term) for term in _distinctive_grounding_terms(evidence_text)
+    }
+    unsupported: dict[str, str] = {}
+    for term in _distinctive_grounding_terms(claim_text):
+        key = _grounding_match_token(term)
+        if key not in supported:
+            unsupported.setdefault(key, term)
+    return tuple(unsupported[key] for key in sorted(unsupported))
+
+
+def _bounded_claim_grounding_details(details: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only a bounded claim identifier and distinctive unsupported terms."""
+    safe: dict[str, Any] = {}
+    claim_code = details.get("claim_code")
+    if isinstance(claim_code, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,40}", claim_code):
+        safe["claim_code"] = claim_code
+    unsupported_terms = details.get("unsupported_terms")
+    if isinstance(unsupported_terms, (list, tuple)):
+        terms = [
+            term
+            for term in unsupported_terms
+            if isinstance(term, str)
+            and 0 < len(term) <= 80
+            and not any(ord(character) < 32 for character in term)
+        ][:12]
+        if terms:
+            safe["unsupported_terms"] = terms
+    return safe
+
+
 def _normalized_editorial_title_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
@@ -1024,7 +1190,7 @@ def _assert_claim_handles_and_relations_supported(
         if extraction is not None
         else {}
     )
-    for claim in claims:
+    for claim_index, claim in enumerate(claims, start=1):
         if any(handle not in evidence_pack._handle_to_ref for handle in claim.evidence_handles):
             raise TargetedSynthesisRevisionValidationError("synthesis_unknown_evidence")
         if require_claim_scopes:
@@ -1074,19 +1240,15 @@ def _assert_claim_handles_and_relations_supported(
             if key not in {"handle", "source_label", "source_role", "editorial_role"}
             and isinstance(value, str)
         )
-        supported = {
-            _grounding_token(token)
-            for token in re.findall(r"[\w-]+", evidence_text, flags=re.UNICODE)
-        }
-        unsupported = {
-            _grounding_token(token)
-            for token in re.findall(r"[\w-]+", claim.text, flags=re.UNICODE)
-            if len(token) >= 4 and token.casefold() not in _GROUNDING_STOP_WORDS
-        } - supported
+        unsupported = _unsupported_distinctive_claim_terms(claim.text, evidence_text)
         if unsupported:
+            claim_code = claim._block_id or f"C{claim_index:03d}"
             raise TargetedSynthesisRevisionValidationError(
                 "synthesis_relation_not_evidenced",
-                details={"unsupported_terms": sorted(unsupported)[:12]},
+                details={
+                    "claim_code": claim_code[:40],
+                    "unsupported_terms": list(unsupported[:12]),
+                },
             )
 
 
@@ -1810,6 +1972,7 @@ class ProductionSynthesisRevisionService:
                     if "extraction" in exc.reason_code or "lineage" in exc.reason_code
                     else ProductionStage.SYNTHESIS
                 )
+                refusal_details = _bounded_claim_grounding_details(exc.details)
                 return TargetedSynthesisRevisionResult(
                     artifact=None,
                     publication_artifact=None,
@@ -1821,6 +1984,7 @@ class ProductionSynthesisRevisionService:
                             "Le patch de révision n'est pas étayé par les preuves autorisées. "
                             f"Détail: {exc.reason_code}."
                         ),
+                        details=refusal_details,
                     ),
                 )
             if result.refusal is None:
@@ -2987,10 +3151,29 @@ class ProductionSynthesisRevisionService:
             raw_payload = json.loads(current_bytes)
             enrichment = editorial_enrichment_from_json(raw_payload)
             base_synthesis = production_synthesis_from_json(context.base_payload)
-            before_sections = production_synthesis_to_json(base_synthesis)["sections"]
+            raw_before_sections = context.base_payload.get("sections")
+            before_sections = (
+                raw_before_sections
+                if isinstance(raw_before_sections, list)
+                else production_synthesis_to_json(base_synthesis)["sections"]
+            )
             after_sections = production_synthesis_to_json(revised_synthesis)["sections"]
+            after_anchor_indexes: dict[str, list[int]] = {}
+            after_legacy_indexes: dict[str, list[int]] = {}
+            for index, section in enumerate(after_sections):
+                if isinstance(section, Mapping):
+                    # The heading-insensitive anchor is the current format.
+                    after_anchor_indexes.setdefault(
+                        _enrichment_section_anchor_id(section), []
+                    ).append(index)
+                    # Keep the full canonical ID as a compatibility path for
+                    # old artifacts and unchanged legacy sections.
+                    after_legacy_indexes.setdefault(_section_id(section), []).append(index)
             after_section_indexes = {
-                _section_id(section): index for index, section in enumerate(after_sections)
+                identity: indexes[0]
+                for identities in (after_anchor_indexes, after_legacy_indexes)
+                for identity, indexes in identities.items()
+                if len(indexes) == 1
             }
             stale_blocks: list[dict[str, str]] = []
 
@@ -3002,14 +3185,29 @@ class ProductionSynthesisRevisionService:
                         index = placement.section_index
                         if index is None or index >= len(before_sections):
                             stale_blocks.append(
-                                {"kind": kind, "key": item.key, "reason": "anchor_missing"}
+                                {
+                                    "kind": kind,
+                                    "key": item.key,
+                                    "reason": "anchor_missing",
+                                    "source_artifact_id": str(enrichment_artifact.id),
+                                }
                             )
                             continue
-                        section_identity = _section_id(before_sections[index])
+                        before_section = before_sections[index]
+                        section_identity = _enrichment_section_anchor_id(before_section)
                         new_index = after_section_indexes.get(section_identity)
                         if new_index is None:
+                            # Read placements from artifacts created before
+                            # heading-insensitive anchors existed.
+                            new_index = after_section_indexes.get(_section_id(before_section))
+                        if new_index is None:
                             stale_blocks.append(
-                                {"kind": kind, "key": item.key, "reason": "section_anchor_changed"}
+                                {
+                                    "kind": kind,
+                                    "key": item.key,
+                                    "reason": "section_anchor_changed",
+                                    "source_artifact_id": str(enrichment_artifact.id),
+                                }
                             )
                             continue
                         if new_index != index:
@@ -3063,6 +3261,7 @@ class ProductionSynthesisRevisionService:
                             "kind": "annotation",
                             "key": annotation.paragraph_anchor,
                             "reason": "paragraph_anchor_changed",
+                            "source_artifact_id": str(enrichment_artifact.id),
                         }
                     )
                     continue

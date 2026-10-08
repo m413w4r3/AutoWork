@@ -25,6 +25,7 @@ from cti_app.domain.production import (
     DetectionRuleType,
     ExtractionProfile,
     ProductionEvidenceBasis,
+    SourceAdditionExtractionIntent,
 )
 from cti_app.domain.production_references import (
     ProductionEditorialRole,
@@ -220,6 +221,8 @@ class ExtractionProfileReasonCode(StrEnum):
     SUPPORTING_CONTEXT = "supporting_context"
     #: A TECHNICAL resource contributes IOCs/rules with their context only.
     TECHNICAL_ANNEX = "technical_annex"
+    #: An operator explicitly requested descriptive extraction for a context source addition.
+    OPERATOR_DESCRIPTIVE_CONTEXT = "operator_descriptive_context"
     #: The only CORE article is complemented by one SUPPORTING publication read in full.
     #: Its evidence reinforces the CORE angle; it never becomes the subject's angle.
     COMPLEMENTARY_FULL_SOURCE = "complementary_full_source"
@@ -237,15 +240,21 @@ def extraction_profile_decision(
     tier: ProductionReferenceTier,
     kind: ProductionReferenceKind,
     editorial_role: ProductionEditorialRole,
+    extraction_intent: SourceAdditionExtractionIntent | None = None,
 ) -> tuple[ExtractionProfile, ExtractionProfileReasonCode]:
     """Select the analysis depth from the frozen reference tier.
 
-    Only CORE sources (the publications of the studied period) are the main
-    subject of an article and receive FULL extraction. SUPPORTING and TECHNICAL
-    sources only add IOCs, rules and their context (IOC_RULES). The editorial
-    role stays available for ordering and review but never raises the depth.
+    The frozen tier policy gives FULL to CORE publications and IOC_RULES to
+    SUPPORTING/TECHNICAL sources. A descriptive source addition may explicitly
+    request FULL while retaining its CONTEXT editorial role.
     """
-    del editorial_role
+    if extraction_intent is SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS:
+        if (
+            tier is ProductionReferenceTier.CORE
+            or editorial_role is not ProductionEditorialRole.CONTEXT
+        ):
+            raise ValueError("Descriptive extraction intent is only valid for context additions")
+        return ExtractionProfile.FULL, ExtractionProfileReasonCode.OPERATOR_DESCRIPTIVE_CONTEXT
     if tier is ProductionReferenceTier.CORE:
         return ExtractionProfile.FULL, ExtractionProfileReasonCode.CORE_PRIMARY_SOURCE
     if kind is ProductionReferenceKind.TECHNICAL_RESOURCE:
@@ -662,6 +671,19 @@ class ProductionExtractionV1:
                 if source in complementary:
                     continue
                 assert source.editorial_role is not None
+                if (
+                    source.profile_reason_code
+                    is ExtractionProfileReasonCode.OPERATOR_DESCRIPTIVE_CONTEXT
+                ):
+                    if (
+                        source.profile is not ExtractionProfile.FULL
+                        or source.tier is ProductionReferenceTier.CORE
+                        or source.editorial_role is not ProductionEditorialRole.CONTEXT
+                    ):
+                        raise ValueError(
+                            "Operator descriptive extraction requires a FULL context source"
+                        )
+                    continue
                 expected_profile, _ = extraction_profile_decision(
                     tier=source.tier,
                     kind=source.kind,

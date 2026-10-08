@@ -132,6 +132,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
     ProductionSubmissionReconciliation,
+    SourceAdditionExtractionIntent,
 )
 from cti_app.domain.production_editorial_enrichment import (
     EditorialEnrichmentElementKind,
@@ -189,6 +190,35 @@ class EditorialEnrichmentRevisionResponse(BaseModel):
     publication_artifact_version: int | None
     previous_publication_artifact_id: UUID | None
     revision: dict[str, Any]
+
+
+class StaleEnrichmentRestoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    base_artifact_id: UUID
+    base_version: StrictInt = Field(ge=1)
+    base_input_hash: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    base_canonical_sha256: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class StaleEnrichmentRestorePreviewResponse(BaseModel):
+    base_artifact_id: UUID
+    base_version: int
+    base_input_hash: str
+    base_canonical_sha256: str
+    restorable_blocks: list[dict[str, Any]]
+    non_restorable_blocks: list[dict[str, Any]]
+
+
+class StaleEnrichmentRestoreResponse(BaseModel):
+    artifact_id: UUID
+    artifact_version: int
+    artifact_input_hash: str
+    artifact_canonical_sha256: str
+    publication_artifact_id: UUID
+    publication_artifact_version: int
+    revision: dict[str, Any]
+    restored_blocks: list[dict[str, Any]]
 
 
 _Sha256String = Annotated[StrictStr, Field(pattern=r"^[0-9a-f]{64}$")]
@@ -265,6 +295,9 @@ class SourceAdditionCandidateRequest(BaseModel):
     published_at: date | None = None
     kind: ProductionReferenceKind = ProductionReferenceKind.TECHNICAL_RESOURCE
     role: SourceRole = SourceRole.UNKNOWN
+    extraction_intent: SourceAdditionExtractionIntent = (
+        SourceAdditionExtractionIntent.INDICATORS_ONLY
+    )
 
 
 class SourceAdditionSelectionRequest(BaseModel):
@@ -3052,6 +3085,103 @@ async def revise_editorial_enrichment_artifact(
     )
 
 
+@router.post(
+    "/subjects/{subject_id}/production/artifacts/editorial_enrichment/restore/preview",
+    response_model=StaleEnrichmentRestorePreviewResponse,
+)
+async def preview_restore_stale_editorial_enrichment_blocks(
+    subject_id: UUID,
+    payload: StaleEnrichmentRestoreRequest,
+    request: Request,
+) -> StaleEnrichmentRestorePreviewResponse:
+    service = _production_enrichment_revision_service(request)
+    try:
+        preview = await service.preview_restore_stale_enrichment_blocks(
+            subject_id=subject_id,
+            base_artifact_id=payload.base_artifact_id,
+            base_version=payload.base_version,
+            base_input_hash=payload.base_input_hash,
+            base_canonical_sha256=payload.base_canonical_sha256,
+        )
+    except EditorialEnrichmentRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "editorial_enrichment_revision_conflict", "message": str(exc)},
+        ) from exc
+    except EditorialEnrichmentRevisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "rejections": exc.rejections},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "editorial_enrichment_restore_invalid"},
+        ) from exc
+    return StaleEnrichmentRestorePreviewResponse(
+        base_artifact_id=preview.base_artifact_id,
+        base_version=preview.base_version,
+        base_input_hash=preview.base_input_hash,
+        base_canonical_sha256=preview.base_canonical_sha256,
+        restorable_blocks=[dict(item) for item in preview.restorable_blocks],
+        non_restorable_blocks=[dict(item) for item in preview.non_restorable_blocks],
+    )
+
+
+@router.post(
+    "/subjects/{subject_id}/production/artifacts/editorial_enrichment/restore",
+    response_model=StaleEnrichmentRestoreResponse,
+)
+async def restore_stale_editorial_enrichment_blocks(
+    subject_id: UUID,
+    payload: StaleEnrichmentRestoreRequest,
+    request: Request,
+) -> StaleEnrichmentRestoreResponse:
+    service = _production_enrichment_revision_service(request)
+    try:
+        result = await service.restore_stale_enrichment_blocks(
+            subject_id=subject_id,
+            base_artifact_id=payload.base_artifact_id,
+            base_version=payload.base_version,
+            base_input_hash=payload.base_input_hash,
+            base_canonical_sha256=payload.base_canonical_sha256,
+            actor=await _actor_id(request),
+        )
+    except EditorialEnrichmentRevisionConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "editorial_enrichment_revision_conflict", "message": str(exc)},
+        ) from exc
+    except EditorialEnrichmentRevisionValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": exc.code, "rejections": exc.rejections},
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"code": str(exc) or "editorial_enrichment_restore_invalid"},
+        ) from exc
+    if result.artifact.canonical_blob_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={"code": "editorial_enrichment_restore_artifact_missing"},
+        )
+    canonical_bytes = await request.app.state.production_artifact_store.read_bytes(
+        result.artifact.canonical_blob_id
+    )
+    return StaleEnrichmentRestoreResponse(
+        artifact_id=result.artifact.id,
+        artifact_version=result.artifact.version,
+        artifact_input_hash=result.artifact.input_hash,
+        artifact_canonical_sha256=hashlib.sha256(canonical_bytes).hexdigest(),
+        publication_artifact_id=result.publication_artifact.id,
+        publication_artifact_version=result.publication_artifact.version,
+        revision=result.revision,
+        restored_blocks=[dict(item) for item in result.restorable_blocks],
+    )
+
+
 def _targeted_revision_domain_request(
     subject_id: UUID,
     payload: TargetedEditorialRevisionRequestBody,
@@ -3123,6 +3253,7 @@ async def record_source_addition_candidate(
             published_at=payload.published_at,
             kind=payload.kind,
             role=payload.role,
+            extraction_intent=payload.extraction_intent,
         )
     except SourceAdditionConflictError as exc:
         raise HTTPException(

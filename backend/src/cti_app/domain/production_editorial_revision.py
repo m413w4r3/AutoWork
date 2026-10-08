@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 from uuid import UUID
@@ -227,9 +228,10 @@ class TargetedEditorialRevisionRefusal:
     code: TargetedEditorialRevisionRefusalCode
     recommended_restart_stage: ProductionStage | None
     reason: str
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "code": self.code.value,
             "recommended_restart_stage": (
                 self.recommended_restart_stage.value
@@ -238,3 +240,6 @@ class TargetedEditorialRevisionRefusal:
             ),
             "reason": self.reason,
         }
+        if self.details:
+            payload["details"] = dict(self.details)
+        return payload

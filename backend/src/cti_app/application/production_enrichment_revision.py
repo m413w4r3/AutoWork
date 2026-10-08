@@ -29,6 +29,7 @@ from cti_app.application.production_editorial_enrichment import (
     editorial_enrichment_evidence_pack_hash,
     editorial_enrichment_output_contract_example,
     parse_editorial_enrichment_proposal_wire,
+    revalidate_editorial_enrichment_quality,
     semantic_annotation_anchor_texts,
     validate_editorial_enrichment,
     validate_editorial_enrichment_proposal,
@@ -70,6 +71,7 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialResourceNeedV1,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
+    editorial_enrichment_evidence_refs,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
 )
@@ -84,6 +86,8 @@ from cti_app.domain.production_editorial_revision import (
 )
 from cti_app.domain.production_synthesis import (
     ExtractionEvidenceRefV1,
+    ProductionSynthesisV1,
+    production_synthesis_from_json,
     production_synthesis_to_json,
 )
 
@@ -109,6 +113,24 @@ class EditorialEnrichmentRevisionResult:
     revision: dict[str, Any]
     publication_artifact: ProductionArtifact | None
     previous_publication_artifact_id: UUID | None
+
+
+@dataclass(frozen=True, slots=True)
+class StaleEnrichmentRestorePreview:
+    base_artifact_id: UUID
+    base_version: int
+    base_input_hash: str
+    base_canonical_sha256: str
+    restorable_blocks: tuple[dict[str, Any], ...]
+    non_restorable_blocks: tuple[dict[str, Any], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StaleEnrichmentRestoreResult:
+    artifact: ProductionArtifact
+    revision: dict[str, Any]
+    publication_artifact: ProductionArtifact
+    restorable_blocks: tuple[dict[str, Any], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +537,607 @@ class ProductionEditorialEnrichmentRevisionService:
                 "editorial_enrichment_revision_rejected",
                 details={"rejections": exc.rejections},
             ) from exc
+
+    async def preview_restore_stale_enrichment_blocks(
+        self,
+        *,
+        subject_id: UUID,
+        base_artifact_id: UUID,
+        base_version: int,
+        base_input_hash: str,
+        base_canonical_sha256: str,
+    ) -> StaleEnrichmentRestorePreview:
+        context = await self._load_context(
+            subject_id=subject_id,
+            base_artifact_id=base_artifact_id,
+            base_version=base_version,
+            base_input_hash=base_input_hash,
+            base_canonical_sha256=base_canonical_sha256,
+        )
+        evaluation = await self._evaluate_stale_enrichment_restore(context)
+        base_artifact = context[2]
+        return StaleEnrichmentRestorePreview(
+            base_artifact_id=base_artifact.id,
+            base_version=base_artifact.version,
+            base_input_hash=base_artifact.input_hash,
+            base_canonical_sha256=base_canonical_sha256,
+            restorable_blocks=tuple(evaluation[1]),
+            non_restorable_blocks=tuple(evaluation[2]),
+        )
+
+    async def restore_stale_enrichment_blocks(
+        self,
+        *,
+        subject_id: UUID,
+        base_artifact_id: UUID,
+        base_version: int,
+        base_input_hash: str,
+        base_canonical_sha256: str,
+        actor: str,
+    ) -> StaleEnrichmentRestoreResult:
+        context = await self._load_context(
+            subject_id=subject_id,
+            base_artifact_id=base_artifact_id,
+            base_version=base_version,
+            base_input_hash=base_input_hash,
+            base_canonical_sha256=base_canonical_sha256,
+        )
+        evaluation = await self._evaluate_stale_enrichment_restore(context)
+        (
+            run,
+            snapshot,
+            base_artifact,
+            _base_payload,
+            base_enrichment,
+            references_artifact,
+            extraction_artifact,
+            projection_artifact,
+            synthesis_artifact,
+            previous_publication,
+        ) = context
+        restored_enrichment, restored_blocks, non_restorable = evaluation
+        if not restored_blocks:
+            raise EditorialEnrichmentRevisionValidationError(
+                [
+                    {
+                        "block_id": "restore",
+                        "reason_code": "no_stale_enrichment_blocks_to_restore",
+                    }
+                ]
+            )
+
+        extraction = await self._enrichment._load_extraction(run, snapshot, extraction_artifact)
+        projection = (
+            await self._enrichment._load_projection(run, snapshot, extraction, projection_artifact)
+            if projection_artifact is not None
+            else None
+        )
+        synthesis = await self._enrichment._load_synthesis(
+            run, snapshot, synthesis_artifact, extraction
+        )
+        fence = await self._validate_input_fence(
+            snapshot=snapshot,
+            base_artifact=base_artifact,
+            extraction=extraction,
+            projection=projection,
+            synthesis=synthesis,
+            read_only_media=True,
+        )
+
+        before_refs = editorial_enrichment_evidence_refs(base_enrichment)
+        restored_refs = editorial_enrichment_evidence_refs(restored_enrichment) - before_refs
+        handles_by_ref = {ref: handle for handle, ref in fence.evidence_pack._handle_to_ref.items()}
+        evidence_handles = sorted(
+            handles_by_ref[ref] for ref in restored_refs if ref in handles_by_ref
+        )
+        evidence_refs = [
+            {
+                "handle": handles_by_ref[ref],
+                "ref": {
+                    "source_document_id": str(ref.source_document_id),
+                    "kind": ref.kind.value,
+                    "evidence_key": ref.evidence_key,
+                },
+            }
+            for ref in sorted(
+                restored_refs,
+                key=lambda item: (str(item.source_document_id), item.kind.value, item.evidence_key),
+            )
+            if ref in handles_by_ref
+        ]
+        restored_identities = [dict(item) for item in restored_blocks]
+        request_identity_payload = {
+            "subject_id": str(subject_id),
+            "base_artifact_id": str(base_artifact.id),
+            "base_version": base_artifact.version,
+            "base_input_hash": base_artifact.input_hash,
+            "base_canonical_sha256": base_canonical_sha256,
+            "operation": "restore_enrichment_blocks",
+            "actor": actor,
+            "restored_blocks": restored_identities,
+            "contract_version": "restore-stale-enrichment-v1",
+        }
+        request_identity = hashlib.sha256(
+            ProductionArtifactStore.canonical_json_bytes(request_identity_payload)
+        ).hexdigest()
+        revision_artifact_id = uuid5(
+            NAMESPACE_URL, f"targeted-editorial-enrichment-restore:{request_identity}"
+        )
+        final_payload = editorial_enrichment_to_json(restored_enrichment)
+        revision_data = {
+            "revision_id": str(revision_artifact_id),
+            "request_identity": request_identity,
+            "base_artifact_id": str(base_artifact.id),
+            "base_version": base_artifact.version,
+            "base_artifact_version": base_artifact.version,
+            "base_input_hash": base_artifact.input_hash,
+            "base_artifact_hash": base_canonical_sha256,
+            "base_canonical_sha256": base_canonical_sha256,
+            "target": {"kind": "editorial_enrichment", "block_keys": restored_identities},
+            "target_path": "editorial_enrichment.restore",
+            "operation": "restore_enrichment_blocks",
+            "outcome": "restored",
+            "request": "Restore verified stale enrichment blocks",
+            "mode": TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY.value,
+            "actor": actor,
+            "model_run_id": None,
+            "prompt_version": "none",
+            "contract_version": "restore-stale-enrichment-v1",
+            "parser_version": "not_applicable",
+            "validator_version": "editorial-enrichment-quality-validator-v1",
+            "validator_results": [
+                {"validator": "enrichment_anchor_validation", "status": "passed"},
+                {"validator": "current_evidence_pack", "status": "passed"},
+                {"validator": "editorial_enrichment_quality", "status": "passed"},
+            ],
+            "validator_rejections": [],
+            "evidence_refs": evidence_refs,
+            "evidence_handles": evidence_handles,
+            "source_additions": [],
+            "before_hash": base_canonical_sha256,
+            "after_hash": hashlib.sha256(
+                ProductionArtifactStore.canonical_json_bytes(final_payload)
+            ).hexdigest(),
+            "rationale": "Blocks restored from verified enrichment history after revalidation.",
+            "created_at": datetime.now(UTC).isoformat(),
+            "result_artifact_id": str(revision_artifact_id),
+            "restored_blocks": restored_identities,
+            "non_restorable_blocks": [dict(item) for item in non_restorable],
+            "model_call_count": 0,
+            "previous_publication_artifact_id": (
+                str(previous_publication.id) if previous_publication is not None else None
+            ),
+        }
+        artifact = await self._persistence.store_editorial_enrichment_result(
+            run_id=run.id,
+            subject_id=subject_id,
+            input_hash=fence.input_hash,
+            enrichment=restored_enrichment,
+            extraction=extraction,
+            synthesis=synthesis,
+            raw_result=None,
+            model_run_id=None,
+            evidence_pack_hash=fence.evidence_pack_hash,
+            access_policy_hash=synthesis_access_policy_hash(fence.access_policy),
+            model_policy_version=EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION,
+            routing_policy_version=str(base_artifact.metadata.get("routing_policy_version", "")),
+            projection_hash=projection.projection_hash if projection is not None else None,
+            source_figure_inventory_hash=fence.inventory_hash,
+            metadata_extra={
+                "source_figure_provenance_version": SOURCE_FIGURE_PROVENANCE_DIAGNOSTICS_VERSION,
+                "source_figure_provenance_diagnostics": build_source_figure_provenance_diagnostics(
+                    fence.inventory, fence.figure_catalog, restored_enrichment
+                ),
+                "revision": revision_data,
+                "revision_restore": {
+                    "from_artifact_id": str(base_artifact.id),
+                    "restored_blocks": restored_identities,
+                    "non_restorable_blocks": [dict(item) for item in non_restorable],
+                    "model_call_count": 0,
+                },
+            },
+            artifact_id=revision_artifact_id,
+            expected_current_artifact_id=base_artifact.id,
+            expected_current_input_hash=base_artifact.input_hash,
+            expected_current_canonical_sha256=base_canonical_sha256,
+            canonical_payload=final_payload,
+            resource_search_enabled=self._enrichment._resource_search_enabled,
+        )
+        references_blob_id = references_artifact.canonical_blob_id
+        if references_blob_id is None:
+            raise EditorialEnrichmentRevisionConflictError(
+                "The current References artifact has no canonical payload"
+            )
+        references = production_reference_corpus_from_json(
+            await self._enrichment._artifact_store.read_json(references_blob_id)
+        )
+        publication = await self._assemble_and_render(
+            run=run,
+            snapshot=snapshot,
+            references_artifact=references_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            synthesis_artifact=synthesis_artifact,
+            enrichment_artifact=artifact,
+            references=references,
+            extraction=extraction,
+            projection=projection,
+            synthesis=synthesis,
+            enrichment=restored_enrichment,
+        )
+        return StaleEnrichmentRestoreResult(
+            artifact=artifact,
+            revision=revision_data,
+            publication_artifact=publication,
+            restorable_blocks=tuple(restored_identities),
+        )
+
+    async def _evaluate_stale_enrichment_restore(
+        self, context: tuple[Any, ...]
+    ) -> tuple[EditorialEnrichmentV1, list[dict[str, Any]], list[dict[str, Any]]]:
+        from cti_app.application.production_synthesis_revision import (
+            _enrichment_section_anchor_id,
+        )
+        from cti_app.domain.production import ProductionArtifactStatus
+
+        (
+            run,
+            snapshot,
+            base_artifact,
+            _base_payload,
+            base_enrichment,
+            _references_artifact,
+            extraction_artifact,
+            projection_artifact,
+            synthesis_artifact,
+            _previous_publication,
+        ) = context
+        extraction = await self._enrichment._load_extraction(run, snapshot, extraction_artifact)
+        projection = (
+            await self._enrichment._load_projection(run, snapshot, extraction, projection_artifact)
+            if projection_artifact is not None
+            else None
+        )
+        synthesis = await self._enrichment._load_synthesis(
+            run, snapshot, synthesis_artifact, extraction
+        )
+        fence = await self._validate_input_fence(
+            snapshot=snapshot,
+            base_artifact=base_artifact,
+            extraction=extraction,
+            projection=projection,
+            synthesis=synthesis,
+            read_only_media=True,
+        )
+
+        async with self._enrichment._uow_factory() as uow:
+            artifacts = tuple(await uow.production_artifacts.list_for_run(run.id))
+        by_id = {item.id: item for item in artifacts}
+
+        def parent_id(artifact: ProductionArtifact) -> UUID | None:
+            revision = artifact.metadata.get("revision")
+            rebased = artifact.metadata.get("revision_rebase")
+            value = (
+                revision.get("base_artifact_id")
+                if isinstance(revision, dict)
+                else rebased.get("from_artifact_id")
+                if isinstance(rebased, dict)
+                else None
+            )
+            try:
+                return UUID(str(value)) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        chain: list[ProductionArtifact] = []
+        seen: set[UUID] = set()
+        cursor: ProductionArtifact | None = base_artifact
+        while cursor is not None and cursor.id not in seen:
+            seen.add(cursor.id)
+            chain.append(cursor)
+            ancestor_id = parent_id(cursor)
+            cursor = by_id.get(ancestor_id) if ancestor_id is not None else None
+
+        def delete_target(artifact: ProductionArtifact) -> tuple[str, str] | None:
+            revision = artifact.metadata.get("revision")
+            if not isinstance(revision, dict):
+                return None
+            operation = str(revision.get("operation", ""))
+            kind_by_operation = {
+                "delete_table": "table",
+                "delete_diagram": "diagram",
+                "delete_chart": "chart",
+                "delete_source_figure": "source_figure",
+            }
+            kind = kind_by_operation.get(operation)
+            target = revision.get("target")
+            if kind is None and revision.get("action") == "remove_element":
+                raw_kind = revision.get("element_kind")
+                kind = "source_figure" if raw_kind == "figure" else str(raw_kind or "")
+            key = target.get("element_key") if isinstance(target, dict) else None
+            if key is None:
+                key = revision.get("element_key")
+            if (kind is None or not isinstance(key, str)) and isinstance(
+                revision.get("target_path"), str
+            ):
+                import re
+
+                matched = re.fullmatch(
+                    r"editorial_enrichment\.(table|diagram|chart|figure|source_figure)\[([^\]]+)\]",
+                    str(revision["target_path"]),
+                )
+                if matched is not None:
+                    raw_kind, key = matched.groups()
+                    kind = "source_figure" if raw_kind == "figure" else raw_kind
+            if kind and isinstance(key, str):
+                return kind, key
+            return None
+
+        deleted_after_source: list[tuple[int, tuple[str, str]]] = [
+            (index, target)
+            for index, artifact in enumerate(chain)
+            if (target := delete_target(artifact)) is not None
+        ]
+        synthesis_by_hash: dict[str, ProductionSynthesisV1] = {}
+        for artifact in artifacts:
+            if (
+                artifact.stage is not ProductionArtifactStage.SYNTHESIS
+                or artifact.status is not ProductionArtifactStatus.VERIFIED
+                or artifact.canonical_blob_id is None
+            ):
+                continue
+            try:
+                source_synthesis = production_synthesis_from_json(
+                    await self._enrichment._artifact_store.read_json(artifact.canonical_blob_id)
+                )
+            except (ValueError, TypeError, KeyError):
+                continue
+            synthesis_by_hash[canonical_synthesis_hash(source_synthesis)] = source_synthesis
+
+        source_enrichments: list[tuple[int, ProductionArtifact, EditorialEnrichmentV1]] = []
+        for index, artifact in enumerate(chain):
+            if (
+                index == 0
+                or artifact.stage is not ProductionArtifactStage.EDITORIAL_ENRICHMENT
+                or artifact.status is not ProductionArtifactStatus.VERIFIED
+                or artifact.canonical_blob_id is None
+            ):
+                continue
+            try:
+                source_payload = await self._enrichment._artifact_store.read_json(
+                    artifact.canonical_blob_id
+                )
+                source_enrichment = editorial_enrichment_from_json(source_payload)
+            except (ValueError, TypeError, KeyError):
+                continue
+            source_enrichments.append((index, artifact, source_enrichment))
+
+        list_for_kind = {
+            "table": "tables",
+            "diagram": "diagrams",
+            "chart": "charts",
+            "source_figure": "source_figures",
+        }
+        current_keys = {
+            (kind, item.key)
+            for kind, attribute in list_for_kind.items()
+            for item in getattr(base_enrichment, attribute)
+        }
+        block_candidates: dict[
+            tuple[str, str],
+            list[tuple[int, ProductionArtifact, Any, EditorialEnrichmentV1]],
+        ] = {}
+        annotation_candidates: dict[
+            tuple[str, str, str], list[tuple[int, ProductionArtifact, Any, EditorialEnrichmentV1]]
+        ] = {}
+        for source_index, source_artifact, source_enrichment in source_enrichments:
+            for kind, attribute in list_for_kind.items():
+                for item in getattr(source_enrichment, attribute):
+                    block_identity = (kind, item.key)
+                    if block_identity not in current_keys:
+                        block_candidates.setdefault(block_identity, []).append(
+                            (source_index, source_artifact, item, source_enrichment)
+                        )
+            for annotation in source_enrichment.annotations:
+                annotation_identity = (
+                    annotation.paragraph_anchor,
+                    annotation.role.value,
+                    annotation.text,
+                )
+                if annotation not in base_enrichment.annotations:
+                    annotation_candidates.setdefault(annotation_identity, []).append(
+                        (source_index, source_artifact, annotation, source_enrichment)
+                    )
+
+        current_section_payloads = production_synthesis_to_json(synthesis)["sections"]
+        allowed_refs = set(fence.evidence_pack._handle_to_ref.values())
+
+        def with_current_hashes(value: EditorialEnrichmentV1) -> EditorialEnrichmentV1:
+            return replace(
+                value,
+                extraction_hash=canonical_extraction_hash(extraction),
+                synthesis_hash=canonical_synthesis_hash(synthesis),
+            )
+
+        def translate_item(
+            item: Any, source_enrichment: EditorialEnrichmentV1
+        ) -> tuple[Any | None, str | None]:
+            placement = item.placement
+            if placement.kind is not EnrichmentPlacementKind.AFTER_SECTION:
+                return item, None
+            source_synthesis = synthesis_by_hash.get(source_enrichment.synthesis_hash)
+            if source_synthesis is None:
+                return None, "source_synthesis_missing"
+            source_sections = production_synthesis_to_json(source_synthesis)["sections"]
+            source_index = placement.section_index
+            if source_index is None or source_index >= len(source_sections):
+                return None, "anchor_missing"
+            source_identity = _enrichment_section_anchor_id(source_sections[source_index])
+            matches = [
+                index
+                for index, section in enumerate(current_section_payloads)
+                if _enrichment_section_anchor_id(section) == source_identity
+            ]
+            if len(matches) != 1:
+                return None, "section_anchor_changed" if not matches else "section_anchor_ambiguous"
+            if matches[0] == source_index:
+                return item, None
+            return replace(item, placement=replace(placement, section_index=matches[0])), None
+
+        def validate_candidate(value: EditorialEnrichmentV1, *, kind: str, key: str) -> str | None:
+            value = with_current_hashes(value)
+            try:
+                validate_editorial_enrichment(value, extraction=extraction, synthesis=synthesis)
+            except (ValueError, TypeError, KeyError) as exc:
+                return str(exc) or "editorial_enrichment_validation_failed"
+            if not editorial_enrichment_evidence_refs(value) <= allowed_refs:
+                return "evidence_not_in_current_pack"
+            try:
+                quality_rejections = revalidate_editorial_enrichment_quality(
+                    value,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    projection=projection,
+                    expected_projection_hash=(
+                        projection.projection_hash if projection is not None else None
+                    ),
+                )
+            except (ValueError, TypeError, KeyError) as exc:
+                return str(exc) or "editorial_enrichment_quality_validation_failed"
+            candidate_rejection = next(
+                (
+                    rejection.reason_code
+                    for rejection in quality_rejections
+                    if rejection.block_id == key
+                    and rejection.kind.casefold()
+                    in {kind, "figure" if kind == "source_figure" else kind}
+                ),
+                None,
+            )
+            return candidate_rejection
+
+        restored = base_enrichment
+        restored_blocks: list[dict[str, Any]] = []
+        non_restorable: list[dict[str, Any]] = []
+        for (kind, key), candidates in sorted(block_candidates.items()):
+            latest_reason = "block_validation_failed"
+            latest_source = candidates[0][1]
+            accepted = False
+            for source_index, source_artifact, original_item, source_enrichment in candidates:
+                latest_source = source_artifact
+                if any(
+                    deleted_target == (kind, key) and delete_index < source_index
+                    for delete_index, deleted_target in deleted_after_source
+                ):
+                    latest_reason = "deleted_by_targeted_revision"
+                    continue
+                item, anchor_error = translate_item(original_item, source_enrichment)
+                if item is None:
+                    latest_reason = anchor_error or "anchor_invalid"
+                    continue
+                attribute = list_for_kind[kind]
+                values = tuple((*getattr(restored, attribute), item))
+                updates: dict[str, Any] = {attribute: values}
+                if kind == "source_figure" and item.resolved_figure is not None:
+                    figure_id = item.resolved_figure.figure_id
+                    decisions = [
+                        *restored.figure_decisions,
+                        *(
+                            decision
+                            for decision in source_enrichment.figure_decisions
+                            if decision.figure_id == figure_id
+                            and decision not in restored.figure_decisions
+                        ),
+                    ]
+                    updates["figure_decisions"] = tuple(decisions)
+                candidate_enrichment = with_current_hashes(replace(restored, **updates))
+                latest_reason = validate_candidate(candidate_enrichment, kind=kind, key=key) or ""
+                if latest_reason:
+                    continue
+                if kind == "source_figure" and item.resolved_figure is not None:
+                    catalog_entry = next(
+                        (
+                            entry
+                            for entry in fence.figure_catalog
+                            if entry.figure.figure_id == item.resolved_figure.figure_id
+                        ),
+                        None,
+                    )
+                    if (
+                        catalog_entry is None
+                        or catalog_entry.figure.sha256 != item.resolved_figure.sha256
+                        or catalog_entry.figure.blob_id != item.resolved_figure.blob_id
+                        or catalog_entry.figure.source_document_id
+                        != item.resolved_figure.source_document_id
+                        or catalog_entry.figure.locator != item.resolved_figure.locator
+                    ):
+                        latest_reason = "source_figure_not_in_current_inventory"
+                        continue
+                restored = candidate_enrichment
+                restored_blocks.append(
+                    {
+                        "kind": kind,
+                        "key": key,
+                        "source_artifact_id": str(source_artifact.id),
+                    }
+                )
+                accepted = True
+                break
+            if not accepted:
+                non_restorable.append(
+                    {
+                        "kind": kind,
+                        "key": key,
+                        "source_artifact_id": str(latest_source.id),
+                        "reason": latest_reason,
+                    }
+                )
+
+        restored_annotation_ids = {
+            (item.paragraph_anchor, item.role.value, item.text) for item in restored.annotations
+        }
+        for annotation_identity, candidates in sorted(annotation_candidates.items()):
+            if annotation_identity in restored_annotation_ids:
+                continue
+            latest_reason = "annotation_validation_failed"
+            latest_source = candidates[0][1]
+            accepted = False
+            for _source_index, source_artifact, annotation, _source_enrichment in candidates:
+                latest_source = source_artifact
+                value = with_current_hashes(
+                    replace(restored, annotations=(*restored.annotations, annotation))
+                )
+                latest_reason = (
+                    validate_candidate(value, kind="annotation", key=annotation.paragraph_anchor)
+                    or ""
+                )
+                if latest_reason:
+                    continue
+                restored = value
+                restored_blocks.append(
+                    {
+                        "kind": "annotation",
+                        "key": annotation.paragraph_anchor,
+                        "text": annotation.text,
+                        "source_artifact_id": str(source_artifact.id),
+                    }
+                )
+                restored_annotation_ids.add(annotation_identity)
+                accepted = True
+                break
+            if not accepted:
+                non_restorable.append(
+                    {
+                        "kind": "annotation",
+                        "key": annotation_identity[0],
+                        "text": annotation_identity[2],
+                        "source_artifact_id": str(latest_source.id),
+                        "reason": latest_reason,
+                    }
+                )
+        if restored_blocks:
+            restored = with_current_hashes(restored)
+        return restored, restored_blocks, non_restorable
 
     @staticmethod
     def _targeted_request_identity_payload(

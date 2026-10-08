@@ -9,6 +9,7 @@ import {
   recordSourceAdditionCandidate,
   selectSourceAddition,
   type ArtifactResponse,
+  type SourceAdditionExtractionIntent,
   type TargetedEditorialRevisionLineage,
   type TargetedEditorialRevisionMode,
   type TargetedEditorialRevisionOperation,
@@ -48,11 +49,15 @@ function refusalMessage(refusal: {
   code: string;
   reason: string;
   recommended_restart_stage: string | null;
+  details?: { claim_code?: string; unsupported_terms?: string[] };
 }): string {
   const restart = refusal.recommended_restart_stage
     ? ` Reprise recommandée : ${refusal.recommended_restart_stage}.`
     : "";
-  return `${refusal.code} — ${refusal.reason}${restart}`;
+  const groundingDetails = refusal.details?.unsupported_terms?.length
+    ? ` Claim ${refusal.details.claim_code ?? ""} : termes non ancrés — ${refusal.details.unsupported_terms.join(", ")}.`
+    : "";
+  return `${refusal.code} — ${refusal.reason}${groundingDetails}${restart}`;
 }
 
 function apiErrorMessage(error: unknown): string {
@@ -222,6 +227,8 @@ export function TargetedEditorialRevisionPanel({
     "existing_evidence_only",
   );
   const [sourceUrl, setSourceUrl] = useState("");
+  const [sourceExtractionIntent, setSourceExtractionIntent] =
+    useState<SourceAdditionExtractionIntent>("indicators_only");
   const [sourceCriterion, setSourceCriterion] = useState(
     "Source fournie par l’opérateur",
   );
@@ -255,6 +262,7 @@ export function TargetedEditorialRevisionPanel({
         production_run_id: artifact.production_run_id,
         request_id: requestId,
         url: sourceUrl.trim(),
+        extraction_intent: sourceExtractionIntent,
       };
       await recordSourceAdditionCandidate(subjectId, {
         ...body,
@@ -458,6 +466,24 @@ export function TargetedEditorialRevisionPanel({
                   clearPreview();
                 }}
               />
+            </label>
+            <label>
+              Intention d’extraction
+              <select
+                aria-label="Intention d’extraction de la source"
+                value={sourceExtractionIntent}
+                onChange={(event) => {
+                  setSourceExtractionIntent(
+                    event.target.value as SourceAdditionExtractionIntent,
+                  );
+                  setSourceRequestId(null);
+                  sourceMutation.reset();
+                  clearPreview();
+                }}
+              >
+                <option value="indicators_only">Indicateurs uniquement</option>
+                <option value="descriptive_facts">Faits descriptifs</option>
+              </select>
             </label>
             <label>
               Motif de sélection

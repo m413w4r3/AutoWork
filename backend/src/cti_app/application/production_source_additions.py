@@ -56,6 +56,7 @@ from cti_app.domain.collection import (
 from cti_app.domain.discovery import SourceRole, canonicalize_http_url
 from cti_app.domain.production import (
     EXTRACTION_PROFILE_POLICY_VERSION,
+    SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION,
     ProductionArtifact,
     ProductionArtifactStage,
     ProductionArtifactStatus,
@@ -64,6 +65,7 @@ from cti_app.domain.production import (
     ProductionRun,
     ProductionRunStatus,
     ProductionStage,
+    SourceAdditionExtractionIntent,
     SourceExtractionStatus,
 )
 from cti_app.domain.production_extraction import (
@@ -258,6 +260,9 @@ class SourceAdditionService:
         published_at: date | None = None,
         kind: ProductionReferenceKind = ProductionReferenceKind.TECHNICAL_RESOURCE,
         role: SourceRole = SourceRole.UNKNOWN,
+        extraction_intent: SourceAdditionExtractionIntent = (
+            SourceAdditionExtractionIntent.INDICATORS_ONLY
+        ),
     ) -> SourceAdditionV1:
         """Persist one candidate; callers pass bounded discovery proposals as candidates.
 
@@ -285,6 +290,7 @@ class SourceAdditionService:
                     addition.canonical_url != canonical_url
                     or addition.origin is not origin
                     or addition.kind is not kind
+                    or addition.extraction_intent is not extraction_intent
                 ):
                     raise SourceAdditionConflictError("source_addition_request_identity_changed")
                 return addition
@@ -306,6 +312,7 @@ class SourceAdditionService:
                 tier=tier,
                 kind=kind,
                 role=role,
+                extraction_intent=extraction_intent,
                 editorial_role=ProductionEditorialRole.CONTEXT,
             )
             await uow.production_source_additions.append(
@@ -1051,12 +1058,18 @@ class SourceAdditionService:
         )
         if not addition_documents:
             raise SourceAdditionError("source_addition_document_missing")
+        source_profile_intents = {
+            item.addition.source_document_id: item.addition.extraction_intent
+            for item in entries
+            if item.addition.source_document_id is not None
+        }
         try:
             plan = await self._extraction_service.plan_for_corpus(
                 run=context.run,
                 snapshot=context.snapshot,
                 corpus=refreshed_corpus,
                 source_document_ids=addition_documents,
+                source_profile_intents=source_profile_intents,
             )
             execution = await self._extraction_service.execute(
                 run=context.run,
@@ -1163,7 +1176,12 @@ class SourceAdditionService:
                 criticality_policy_version=PRODUCTION_SOURCE_CRITICALITY_POLICY_VERSION,
                 extraction_profile=extracted.profile,
                 profile_reason_code=extracted.profile_reason_code,
-                extraction_profile_policy_version=EXTRACTION_PROFILE_POLICY_VERSION,
+                extraction_profile_policy_version=(
+                    SOURCE_ADDITION_EXTRACTION_PROFILE_POLICY_VERSION
+                    if addition.extraction_intent
+                    is SourceAdditionExtractionIntent.DESCRIPTIVE_FACTS
+                    else EXTRACTION_PROFILE_POLICY_VERSION
+                ),
                 checkpoint_contract_version=checkpoint.contract_version,
                 checkpoint_prompt_version=checkpoint.prompt_version,
                 checkpoint_parser_version=checkpoint.parser_version,
