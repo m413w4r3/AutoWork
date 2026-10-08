@@ -5232,6 +5232,157 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
 
 
 @pytest.mark.asyncio
+async def test_canonical_no_change_archives_model_run_without_creating_artifacts() -> None:
+    from cti_app.application.production_stages import EditorialEnrichmentService
+    from cti_app.application.production_synthesis import ProductionSynthesisService
+    from cti_app.application.production_synthesis_revision import (
+        ProductionSynthesisRevisionService,
+        TargetedSynthesisRevisionValidationError,
+    )
+
+    world, base, _, _ = _targeted_revision_fixture()
+    base = replace(base, title=f"[{world.snapshot.actor_or_campaign}] FooRAT activity")
+    artifact_store = _RevisionMemoryBlobStore()
+    extraction_blob = artifact_store.add_json(production_extraction_to_json(world.extraction))
+    synthesis_blob = artifact_store.add_json(production_synthesis_to_json(base))
+    reference_corpus = ProductionReferenceCorpusV1(
+        schema_version=1,
+        subject_id=world.snapshot.subject_id,
+        research_date=world.snapshot.research_date,
+        production_input_hash=world.snapshot.input_hash,
+        research_status=ProductionReferenceResearchStatus.COMPLETED,
+        sources=tuple(
+            ProductionReferenceSourceV1(
+                canonical_url=source.canonical_url,
+                tier=source.tier,
+                kind=source.kind,
+                role=source.role,
+                title="Archived test source",
+                publisher="Test publisher",
+                published_at=None,
+                source_collection_id=None,
+                source_document_id=source.source_document_id,
+                discovery_candidate_ids=(),
+                collection_state=CollectionState.ARCHIVED,
+                content_sha256=source.content_sha256,
+                relevance_reason=None,
+                proposed_by_model=False,
+                eligible_for_extraction=True,
+                editorial_role=source.editorial_role,
+            )
+            for source in world.extraction.sources
+        ),
+        warnings=(),
+    )
+    references_blob = artifact_store.add_json(production_reference_corpus_to_json(reference_corpus))
+    references_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.REFERENCES,
+        version=1,
+        input_hash="c" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=references_blob,
+    )
+    extraction_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.EXTRACTION,
+        version=1,
+        input_hash=EXTRACTION_ARTIFACT_HASH,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=extraction_blob,
+    )
+    base_artifact = ProductionArtifact(
+        production_run_id=world.run.id,
+        subject_id=world.snapshot.subject_id,
+        stage=ProductionArtifactStage.SYNTHESIS,
+        version=1,
+        input_hash="0" * 64,
+        status=ProductionArtifactStatus.VERIFIED,
+        canonical_blob_id=synthesis_blob,
+    )
+    repository = _RevisionArtifactRepository(
+        (references_artifact, extraction_artifact, base_artifact)
+    )
+
+    def uow_factory() -> _RevisionMemoryUow:
+        return _RevisionMemoryUow(
+            run=world.run,
+            snapshot=world.snapshot,
+            artifacts=repository,
+            documents=world.docs,
+        )
+
+    policy = await build_synthesis_access_policy(
+        world.snapshot, world.extraction, world.docs, MemorySourceCollections()
+    )
+    evidence_pack = build_synthesis_evidence_pack(world.snapshot, world.extraction)
+    input_hash = synthesis_input_hash(
+        world.snapshot,
+        world.extraction,
+        evidence_pack,
+        synthesis_access_policy_hash(policy),
+    )
+    base_artifact = replace(
+        base_artifact,
+        input_hash=input_hash,
+        metadata={"access_policy_hash": synthesis_access_policy_hash(policy)},
+    )
+    repository.artifacts[-1] = base_artifact
+    base_hash = hashlib.sha256(artifact_store.bytes[synthesis_blob]).hexdigest()
+    wire = (
+        "@@TARGET@@\nsynthesis.title\n"
+        "@@ACTION@@\nrewrite_title\n"
+        f"@@BASE_ARTIFACT_HASH@@\n{base_hash}\n"
+        f"@@BEFORE_HASH@@\n{synthesis_revision_module._sha256(base.title)}\n"
+        f"@@AFTER@@\n{base.title}\n"
+        "@@RATIONALE@@\nKeep the existing evidence-grounded title.\n@@END@@"
+    )
+    gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
+    writer = _RecordingSynthesisWriter()
+    synthesis_service = ProductionSynthesisService(
+        uow_factory=uow_factory,  # type: ignore[arg-type]
+        artifact_store=artifact_store,  # type: ignore[arg-type]
+        model_gateway=gateway,  # type: ignore[arg-type]
+        synthesis_service=writer,  # type: ignore[arg-type]
+    )
+    revision_service = ProductionSynthesisRevisionService(
+        synthesis_service=synthesis_service,
+        synthesis_persistence=writer,  # type: ignore[arg-type]
+        enrichment_persistence=EditorialEnrichmentService(
+            uow_factory,
+            artifact_store,  # type: ignore[arg-type]
+        ),
+        publication_render_service=SimpleNamespace(),  # type: ignore[arg-type]
+    )
+    request = TargetedEditorialRevisionRequest(
+        subject_id=world.snapshot.subject_id,
+        base_artifact_id=base_artifact.id,
+        base_version=base_artifact.version,
+        base_input_hash=input_hash,
+        base_canonical_sha256=base_hash,
+        target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
+        operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
+        instruction="Keep the title unchanged.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+    before_artifact_ids = {artifact.id for artifact in repository.artifacts}
+
+    with pytest.raises(TargetedSynthesisRevisionValidationError) as error:
+        await revision_service.revise(request)
+
+    assert error.value.reason_code == "revision_no_change"
+    assert {artifact.id for artifact in repository.artifacts} == before_artifact_ids
+    assert writer.calls == []
+    assert len(gateway.runs) == 1
+    model_run = next(iter(gateway.runs.values()))
+    assert model_run.raw_output_reference in gateway.outputs
+    assert all(artifact.model_run_id != model_run.id for artifact in repository.artifacts)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fail_after_write", (False, True))
 async def test_source_extension_uses_one_uow_and_rolls_back_promotion_on_revision_failure(
     monkeypatch: pytest.MonkeyPatch,
@@ -5903,7 +6054,7 @@ def _targeted_operation_case(
                 kind=TargetedEditorialRevisionTargetKind.SECTION,
                 stable_ids=(section_ids[1],),
             ),
-            "@@HEADING@@\nObserved facts\n@@END HEADING@@",
+            "Observed facts",
         )
     raise AssertionError(f"Unhandled synthesis revision operation: {operation}")
 
@@ -5975,6 +6126,383 @@ def test_targeted_revision_applies_every_synthesis_operation(
         assert len(revised.sections[1].paragraphs) == len(base.sections[1].paragraphs) + 1
     elif operation is TargetedEditorialRevisionOperation.DELETE_PARAGRAPH:
         assert len(revised.sections[1].paragraphs) == 1
+
+
+@pytest.mark.parametrize(
+    "after",
+    [
+        "Observed facts",
+        "HEADING: Observed facts",
+        "@@HEADING@@\nObserved facts\n@@END HEADING@@",
+    ],
+)
+def test_rename_section_accepts_plain_labeled_and_block_after(
+    after: str,
+) -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    base = replace(
+        base,
+        sections=(
+            *base.sections[:1],
+            replace(base.sections[1], heading="FooRAT activity"),
+            *base.sections[2:],
+        ),
+    )
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(payload["sections"][1]),),
+    )
+    patch = _targeted_wire_patch(
+        payload, target, TargetedEditorialRevisionOperation.RENAME_SECTION, after
+    )
+
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+    )
+
+    assert revised.sections[1].heading == "Observed facts"
+    assert revised_payload["sections"][1]["heading"] == "Observed facts"
+
+
+@pytest.mark.parametrize("after", ["", "HEADING:", "@@HEADING@@\n@@END HEADING@@"])
+def test_rename_section_rejects_empty_after_or_heading(after: str) -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(payload["sections"][1]),),
+    )
+    patch = _targeted_wire_patch(
+        payload, target, TargetedEditorialRevisionOperation.RENAME_SECTION, after
+    )
+
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError) as error:
+        synthesis_revision_module._apply_wire_patch(
+            base_synthesis=base,
+            base_payload=payload,
+            target=target,
+            operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+            patch=patch,
+            evidence_pack=evidence_pack,
+            extraction=world.extraction,
+            snapshot=world.snapshot,
+        )
+
+    assert error.value.reason_code == "revision_after_heading_missing"
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        TargetedEditorialRevisionOperation.REWRITE_TITLE,
+        TargetedEditorialRevisionOperation.REWRITE_LEAD,
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        TargetedEditorialRevisionOperation.REWRITE_SECTION,
+        TargetedEditorialRevisionOperation.RENAME_SECTION,
+    ],
+)
+def test_targeted_revision_rejects_canonical_no_change(
+    operation: TargetedEditorialRevisionOperation,
+) -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+        base = replace(base, title=f"[{world.snapshot.actor_or_campaign}] FooRAT activity")
+    if operation in {
+        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+        TargetedEditorialRevisionOperation.REWRITE_SECTION,
+    }:
+        section = base.sections[1]
+        paragraph = replace(section.paragraphs[0], text="The report identifies FooRAT.")
+        base = replace(
+            base,
+            sections=(
+                *base.sections[:1],
+                replace(section, paragraphs=(paragraph,)),
+                *base.sections[2:],
+            ),
+        )
+    if operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
+        base = replace(
+            base,
+            sections=(
+                *base.sections[:1],
+                replace(base.sections[1], heading="Observed facts"),
+                *base.sections[2:],
+            ),
+        )
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][1]
+    section_id = synthesis_revision_module._section_id(section)
+
+    def claim_wire(paragraph: SynthesisParagraphV1, claim_id: str) -> str:
+        handles = [evidence_pack.handle_for(ref) for ref in paragraph.evidence_refs]
+        assert all(handle is not None for handle in handles)
+        return (
+            f"@@CLAIM {claim_id}@@\n"
+            f"EVIDENCE: {', '.join(handle for handle in handles if handle is not None)}\n"
+            f"TEXT: {paragraph.text}\n@@END CLAIM@@"
+        )
+
+    if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+        target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
+        after = base.title
+    elif operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
+        target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.LEAD)
+        after = "@@LEAD@@\n" + "\n".join(
+            claim_wire(paragraph, f"L{index:03d}")
+            for index, paragraph in enumerate(base.lead, start=1)
+        )
+    elif operation is TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH:
+        paragraph = base.sections[1].paragraphs[0]
+        paragraph_id = synthesis_revision_module._paragraph_id(section["paragraphs"][0])
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+            stable_ids=(paragraph_id,),
+            parent_id=section_id,
+        )
+        after = (
+            f"@@SECTION {base.sections[1].kind.value} S001@@\n"
+            f"{claim_wire(paragraph, 'C001')}\n@@END SECTION@@"
+        )
+    elif operation is TargetedEditorialRevisionOperation.REWRITE_SECTION:
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(section_id,),
+        )
+        heading = f"HEADING: {base.sections[1].heading}\n" if base.sections[1].heading else ""
+        after = (
+            f"@@SECTION {base.sections[1].kind.value} S001@@\n"
+            f"{heading}"
+            + "\n".join(
+                claim_wire(paragraph, f"C{index:03d}")
+                for index, paragraph in enumerate(base.sections[1].paragraphs, start=1)
+            )
+            + "\n@@END SECTION@@"
+        )
+    else:
+        target = TargetedEditorialRevisionTarget(
+            kind=TargetedEditorialRevisionTargetKind.SECTION,
+            stable_ids=(section_id,),
+        )
+        after = base.sections[1].heading
+
+    patch = _targeted_wire_patch(payload, target, operation, after)
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError) as error:
+        synthesis_revision_module._apply_wire_patch(
+            base_synthesis=base,
+            base_payload=payload,
+            target=target,
+            operation=operation,
+            patch=patch,
+            evidence_pack=evidence_pack,
+            extraction=world.extraction,
+            snapshot=world.snapshot,
+        )
+
+    assert error.value.reason_code == "revision_no_change"
+
+
+def test_revision_prompt_specifies_plain_heading_after_format() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION,
+        stable_ids=(synthesis_revision_module._section_id(payload["sections"][1]),),
+    )
+    request = TargetedEditorialRevisionRequest(
+        subject_id=world.snapshot.subject_id,
+        base_artifact_id=uuid4(),
+        base_version=1,
+        base_input_hash="a" * 64,
+        base_canonical_sha256="b" * 64,
+        target=target,
+        operation=TargetedEditorialRevisionOperation.RENAME_SECTION,
+        instruction="Name this section.",
+        mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+        requester="test-analyst",
+    )
+
+    prompt = synthesis_revision_module.ProductionSynthesisRevisionService._revision_prompt(
+        request=request,
+        target_path="synthesis.section[example]",
+        base_hash="b" * 64,
+        before_hash="c" * 64,
+        current_payload=payload,
+        evidence_pack=evidence_pack,
+    )
+
+    assert "one non-empty line containing only the replacement section heading" in prompt
+    assert "@@AFTER@@\nA concise evidence-grounded heading" in prompt
+
+
+def test_revision_prompt_defines_after_format_for_every_synthesis_operation() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    cases = (
+        (
+            TargetedEditorialRevisionOperation.REWRITE_TITLE,
+            TargetedEditorialRevisionTargetKind.TITLE,
+            "one line containing only the replacement title",
+            "A concise evidence-grounded title",
+        ),
+        (
+            TargetedEditorialRevisionOperation.RENAME_SECTION,
+            TargetedEditorialRevisionTargetKind.SECTION,
+            "one non-empty line containing only the replacement section heading",
+            "A concise evidence-grounded heading",
+        ),
+        (
+            TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+            TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+            "the exact literal EMPTY",
+            "EMPTY",
+        ),
+        (
+            TargetedEditorialRevisionOperation.DELETE_SECTION,
+            TargetedEditorialRevisionTargetKind.SECTION,
+            "the exact literal EMPTY",
+            "EMPTY",
+        ),
+        (
+            TargetedEditorialRevisionOperation.REWRITE_LEAD,
+            TargetedEditorialRevisionTargetKind.LEAD,
+            "a LEAD block containing one or more CLAIM blocks",
+            "@@LEAD@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+            TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+            "exactly one CLAIM block inside a SECTION using the current section kind block",
+            "@@SECTION overview S001@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+            TargetedEditorialRevisionTargetKind.LEAD,
+            "exactly one CLAIM block inside a LEAD block",
+            "@@LEAD@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.REWRITE_SECTION,
+            TargetedEditorialRevisionTargetKind.SECTION,
+            "exactly one SECTION block using the target section's current kind",
+            "@@SECTION overview S001@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.INSERT_SECTION,
+            TargetedEditorialRevisionTargetKind.SECTIONS,
+            "one SECTION block whose kind fits the inserted section's claims",
+            "@@SECTION overview S001@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.MERGE_SECTIONS,
+            TargetedEditorialRevisionTargetKind.SECTIONS,
+            "one SECTION block using the shared current kind of the target sections",
+            "@@SECTION overview S001@@\n@@CLAIM C001@@",
+        ),
+        (
+            TargetedEditorialRevisionOperation.SPLIT_SECTION,
+            TargetedEditorialRevisionTargetKind.SECTION,
+            "exactly two SECTION blocks, each using the current section kind",
+            "@@SECTION overview S001@@\n@@CLAIM C001@@",
+        ),
+    )
+
+    for operation, target_kind, format_fragment, example_prefix in cases:
+        target = TargetedEditorialRevisionTarget(
+            kind=target_kind,
+            stable_ids=(
+                ("a" * 64, "b" * 64)
+                if operation is TargetedEditorialRevisionOperation.MERGE_SECTIONS
+                else ("c" * 64,)
+                if target_kind is TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH
+                else ("a" * 64,)
+                if target_kind is TargetedEditorialRevisionTargetKind.SECTION
+                else ()
+            ),
+            parent_id=(
+                "a" * 64
+                if target_kind is TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH
+                else None
+            ),
+        )
+        request = TargetedEditorialRevisionRequest(
+            subject_id=world.snapshot.subject_id,
+            base_artifact_id=uuid4(),
+            base_version=1,
+            base_input_hash="a" * 64,
+            base_canonical_sha256="b" * 64,
+            target=target,
+            operation=operation,
+            instruction="Apply the requested revision.",
+            mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
+            requester="test-analyst",
+        )
+        prompt = synthesis_revision_module.ProductionSynthesisRevisionService._revision_prompt(
+            request=request,
+            target_path=f"synthesis.{operation.value}",
+            base_hash="b" * 64,
+            before_hash="c" * 64,
+            current_payload=payload,
+            evidence_pack=evidence_pack,
+        )
+        after_example = prompt.split("@@AFTER@@\n", maxsplit=1)[1].split(
+            "\n@@RATIONALE@@", maxsplit=1
+        )[0]
+
+        assert format_fragment in prompt, operation.value
+        assert after_example.startswith(example_prefix), operation.value
+        if operation not in {
+            TargetedEditorialRevisionOperation.REWRITE_TITLE,
+            TargetedEditorialRevisionOperation.RENAME_SECTION,
+            TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+            TargetedEditorialRevisionOperation.DELETE_SECTION,
+        }:
+            assert "EVIDENCE: E001" in after_example, operation.value
+            assert "TEXT: Replacement prose." in after_example, operation.value
+
+
+def test_targeted_claim_parser_accepts_unlabeled_claim_id_and_bare_fields() -> None:
+    world, base, evidence_pack, handle = _targeted_revision_fixture()
+    payload = production_synthesis_to_json(base)
+    section = payload["sections"][1]
+    target = TargetedEditorialRevisionTarget(
+        kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+        stable_ids=(synthesis_revision_module._paragraph_id(section["paragraphs"][0]),),
+        parent_id=synthesis_revision_module._section_id(section),
+    )
+    operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        operation,
+        "SECTION overview\n"
+        "CLAIM\n"
+        f"EVIDENCE {handle}\n"
+        "TEXT The report identifies FooRAT.\n"
+        "END CLAIM\n"
+        "END SECTION",
+    )
+
+    revised, _, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=world.snapshot,
+    )
+
+    assert revised.sections[1].paragraphs[0].text == "The report identifies FooRAT."
 
 
 def test_targeted_revision_rejects_unknown_evidence_handle() -> None:

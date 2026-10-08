@@ -109,8 +109,8 @@ from cti_app.domain.production_synthesis import (
     validate_synthesis_section_headings,
 )
 
-TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v2-claim-scope"
-TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v2-source-scope"
+TARGETED_SYNTHESIS_REVISION_PARSER_VERSION = "targeted-synthesis-patch-parser-v3-heading-after-text"
+TARGETED_SYNTHESIS_REVISION_VALIDATOR_VERSION = "targeted-synthesis-patch-validator-v3-no-change"
 MAX_TARGETED_REVISION_INSTRUCTION_LENGTH = 2000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _OUTER_WIRE_BLOCK = re.compile(
@@ -770,7 +770,7 @@ def _extract_after_text(raw: str, name: str) -> str:
     match = inline.search(raw)
     if match is not None:
         return match.group(1).strip()
-    if name == "TITLE" and raw.strip() and "@@" not in raw:
+    if name in {"TITLE", "HEADING"} and raw.strip() and "@@" not in raw:
         return raw.strip()
     return ""
 
@@ -1321,6 +1321,8 @@ def _apply_wire_patch(
             raise TargetedSynthesisRevisionValidationError("synthesis_title_actor_ungrounded")
     elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
         heading = _extract_after_text(raw_after, "HEADING")
+        if not heading.strip():
+            raise TargetedSynthesisRevisionValidationError("revision_after_heading_missing")
         section_index = resolved.indexes[0]
         current = sections[section_index]
         try:
@@ -1466,6 +1468,8 @@ def _apply_wire_patch(
         raise TargetedSynthesisRevisionValidationError("synthesis_lineage_invalid") from exc
     revised_payload = production_synthesis_to_json(revised)
     _assert_non_target_unchanged(base_payload, revised_payload, target, operation, resolved)
+    if _canonical_bytes(base_payload) == _canonical_bytes(revised_payload):
+        raise TargetedSynthesisRevisionValidationError("revision_no_change")
     return revised, revised_payload, resolved.before_hash
 
 
@@ -2638,6 +2642,106 @@ class ProductionSynthesisRevisionService:
             *evidence_pack.technical_evidence,
             *evidence_pack.reserve_evidence,
         ]
+        operation = request.operation
+        if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+            after_format = "AFTER format: one line containing only the replacement title."
+        elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
+            after_format = (
+                "AFTER format: one non-empty line containing only the replacement section "
+                "heading. Do not include claims or a section wrapper."
+            )
+        elif operation in {
+            TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+            TargetedEditorialRevisionOperation.DELETE_SECTION,
+        }:
+            after_format = "AFTER format: the exact literal EMPTY."
+        elif operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
+            after_format = (
+                "AFTER format: a LEAD block containing one or more CLAIM blocks. Each CLAIM "
+                "must contain EVIDENCE: with admitted handles and TEXT: with the prose. Claim "
+                "IDs are optional."
+            )
+        elif operation in {
+            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+            TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+        }:
+            lead_target = request.target.kind in {
+                TargetedEditorialRevisionTargetKind.LEAD,
+                TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH,
+            }
+            group = "LEAD" if lead_target else "SECTION using the current section kind"
+            after_format = (
+                f"AFTER format: exactly one CLAIM block inside a {group} block. The CLAIM "
+                "must contain EVIDENCE: with admitted handles and TEXT: with the prose. Claim "
+                "IDs are optional."
+            )
+        elif operation is TargetedEditorialRevisionOperation.SPLIT_SECTION:
+            after_format = (
+                "AFTER format: exactly two SECTION blocks, each using the current section kind "
+                "and containing one or more CLAIM blocks. Each CLAIM must contain EVIDENCE: "
+                "with admitted handles and TEXT: with the prose. Claim IDs are optional."
+            )
+        elif operation is TargetedEditorialRevisionOperation.REWRITE_SECTION:
+            after_format = (
+                "AFTER format: exactly one SECTION block using the target section's current "
+                "kind and containing one or more CLAIM blocks. HEADING is optional. Each CLAIM "
+                "must contain EVIDENCE: with admitted handles and TEXT: with the prose. Claim "
+                "IDs are optional."
+            )
+        elif operation is TargetedEditorialRevisionOperation.MERGE_SECTIONS:
+            after_format = (
+                "AFTER format: exactly one SECTION block using the shared current kind of the "
+                "target sections and containing one or more CLAIM blocks. HEADING is optional. "
+                "Each CLAIM must contain EVIDENCE: with admitted handles and TEXT: with the "
+                "prose. Claim IDs are optional."
+            )
+        else:
+            after_format = (
+                "AFTER format: exactly one SECTION block whose kind fits the inserted section's "
+                "claims and containing one or more CLAIM blocks. HEADING is optional. Each CLAIM "
+                "must contain EVIDENCE: with admitted handles and TEXT: with the prose. Claim "
+                "IDs are optional."
+            )
+        claim_scope_example = (
+            "CLAIM_SCOPE: tool_context\n"
+            if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
+            else ""
+        )
+        claim_example = (
+            "@@CLAIM C001@@\n"
+            f"{claim_scope_example}EVIDENCE: E001\nTEXT: Replacement prose.\n@@END CLAIM@@"
+        )
+        if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
+            after_example = "A concise evidence-grounded title"
+        elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
+            after_example = "A concise evidence-grounded heading"
+        elif operation in {
+            TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+            TargetedEditorialRevisionOperation.DELETE_SECTION,
+        }:
+            after_example = "EMPTY"
+        elif operation is TargetedEditorialRevisionOperation.REWRITE_LEAD:
+            after_example = f"@@LEAD@@\n{claim_example}\n@@END LEAD@@"
+        elif operation in {
+            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+            TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+        }:
+            lead_target = request.target.kind in {
+                TargetedEditorialRevisionTargetKind.LEAD,
+                TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH,
+            }
+            if lead_target:
+                after_example = f"@@LEAD@@\n{claim_example}\n@@END LEAD@@"
+            else:
+                after_example = f"@@SECTION overview S001@@\n{claim_example}\n@@END SECTION@@"
+        elif operation is TargetedEditorialRevisionOperation.SPLIT_SECTION:
+            after_example = (
+                f"@@SECTION overview S001@@\n{claim_example}\n@@END SECTION@@\n"
+                f"@@SECTION overview S002@@\n{claim_example.replace('C001', 'C002')}\n"
+                "@@END SECTION@@"
+            )
+        else:
+            after_example = f"@@SECTION overview S001@@\n{claim_example}\n@@END SECTION@@"
         return "\n".join(
             (
                 "TASK: Apply exactly one targeted synthesis revision patch.",
@@ -2681,11 +2785,7 @@ class ProductionSynthesisRevisionService:
                     "QA bypass, return REFUSAL revision_not_applicable with restart stage "
                     "and reason."
                 ),
-                (
-                    "Return only the wire envelope. AFTER must contain only the bounded "
-                    "replacement "
-                    "claims/heading/title, or EMPTY for a delete."
-                ),
+                "Return only the wire envelope. " + after_format,
                 "",
                 "WIRE:",
                 "@@TARGET@@",
@@ -2697,13 +2797,7 @@ class ProductionSynthesisRevisionService:
                 "@@BEFORE_HASH@@",
                 before_hash,
                 "@@AFTER@@",
-                (
-                    "SECTION: analytical\nHEADING: ...\nCLAIM C001\n"
-                    "CLAIM_SCOPE: tool_context\nEVIDENCE: E001\nTEXT: ...\nEND CLAIM\n"
-                    "END SECTION"
-                    if request.mode is TargetedEditorialRevisionMode.ALLOW_SOURCE_EXTENSION
-                    else "...bounded replacement..."
-                ),
+                after_example,
                 "@@RATIONALE@@",
                 "Short evidence-based reason.",
                 "@@END@@",
