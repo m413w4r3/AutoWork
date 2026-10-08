@@ -174,6 +174,15 @@ class _ManualCollectionService:
         self.body = body
         self.manual_calls: list[tuple[bytes, str, str]] = []
         self.fetch_calls = 0
+        self.attempt = SimpleNamespace(
+            id=uuid4(),
+            collection_id=collection.id,
+            manual_lease_id=uuid4(),
+            job_id=None,
+            policy_snapshot_id="policy-v1",
+            encoded_sha256=hashlib.sha256(body).hexdigest(),
+            decoded_sha256=hashlib.sha256(body).hexdigest(),
+        )
 
     async def ensure_supplemental_source(self, _subject_id: UUID, _source: object):
         return self.collection
@@ -197,7 +206,9 @@ class _ManualCollectionService:
         self.collection.state = CollectionState.ARCHIVED
         self.collection.failure_reason_code = None
         self.collection.source_document_id = self.document.id
-        self.collection.fetch_policy_snapshot_id = "policy-v1"
+        self.collection.origin_kind = SourceOriginKind.MANUAL
+        self.collection.fetch_policy_snapshot_id = None
+        self.collection.latest_attempt_id = self.attempt.id
         receipt = SimpleNamespace(
             encoded_sha256=hashlib.sha256(content).hexdigest(),
             decoded_sha256=hashlib.sha256(content).hexdigest(),
@@ -209,11 +220,22 @@ class _ManualCollectionService:
 
 
 class _ArchiveUow:
-    def __init__(self, run: ProductionRun, collection: SourceCollection, document: object) -> None:
+    def __init__(
+        self,
+        run: ProductionRun,
+        collection: SourceCollection,
+        document: object,
+        attempt: object | None = None,
+    ) -> None:
         self.production_runs = _RunRepository(run)
         self.production_artifacts = SimpleNamespace(get_current=self._no_artifact)
         self.source_collections = SimpleNamespace(get=self._collection)
         self.source_documents = SimpleNamespace(get=self._document)
+        self.collection_attempts = SimpleNamespace(
+            list_for_collection=lambda _collection_id: _async_value(
+                (attempt,) if attempt is not None else ()
+            )
+        )
         self._collection_row = collection
         self._document_row = document
 
@@ -472,7 +494,7 @@ async def test_403_uses_only_operator_bytes_and_recovery_does_not_archive_twice(
         decoded_sha256=hashlib.sha256(body).hexdigest(),
     )
     collection_service = _ManualCollectionService(collection, document, body)
-    uow = _ArchiveUow(run, collection, document)
+    uow = _ArchiveUow(run, collection, document, collection_service.attempt)
     service = _service(_Factory(uow), collection_service)
     selected = replace(
         _ready_addition(run_id=run.id, subject_id=subject_id, request_id=uuid4()),
@@ -518,6 +540,8 @@ async def test_403_uses_only_operator_bytes_and_recovery_does_not_archive_twice(
     assert archived.state is SourceAdditionState.ARCHIVED
     assert archived.canonical_url == "https://example.test/added"
     assert archived.final_url == "https://example.test/final"
+    assert archived.collection_policy_snapshot_id == "policy-v1"
+    assert collection.fetch_policy_snapshot_id is None
     assert collection_service.manual_calls == [(body, "text/html", "analyst@example.test")]
 
     resumed, resumed_refusal = await service._archive_selected(
@@ -600,7 +624,103 @@ async def test_archived_resume_rejects_a_different_document_or_hash_for_same_url
         is None
     )
 
+    collection.fetch_policy_snapshot_id = None
+    refusal = await service._archived_receipt_refusal(
+        uow, run, SimpleNamespace(sources=(reference,)), addition
+    )
+    assert refusal is not None
+    assert refusal.code is SourceAdditionRefusalCode.ARCHIVE_RECEIPT_INCOMPLETE
+    collection.fetch_policy_snapshot_id = addition.collection_policy_snapshot_id
+
     document.decoded_sha256 = "d" * 64
+    refusal = await service._archived_receipt_refusal(
+        uow, run, SimpleNamespace(sources=(reference,)), addition
+    )
+    assert refusal is not None
+    assert refusal.code is SourceAdditionRefusalCode.ARCHIVE_RECEIPT_INCOMPLETE
+
+
+@pytest.mark.asyncio
+async def test_manual_archive_resume_uses_its_persisted_attempt_policy_snapshot() -> None:
+    subject_id, request_id = uuid4(), uuid4()
+    run = ProductionRun(
+        subject_id=subject_id,
+        edition_id=uuid4(),
+        status=ProductionRunStatus.READY,
+        current_stage=ProductionStage.ASSEMBLY,
+        research_date=date(2026, 8, 1),
+    )
+    addition = _ready_addition(run_id=run.id, subject_id=subject_id, request_id=request_id)
+    collection = SourceCollection(
+        subject_id=subject_id,
+        edition_id=run.edition_id,
+        requested_url=addition.canonical_url,
+        canonical_url=addition.canonical_url,
+        proposed_role=SourceRole.UNKNOWN,
+        origin_kind=SourceOriginKind.MANUAL,
+        id=addition.collection_id,
+        state=CollectionState.ARCHIVED,
+        source_document_id=addition.source_document_id,
+        fetch_policy_snapshot_id=None,
+        latest_attempt_id=uuid4(),
+        source_tlp=TLP.AMBER,
+    )
+    document = SimpleNamespace(
+        id=addition.source_document_id,
+        subject_id=subject_id,
+        source_collection_id=addition.collection_id,
+        encoded_sha256=addition.encoded_sha256,
+        decoded_sha256=addition.decoded_sha256,
+        final_url=addition.final_url,
+        published_at=None,
+        do_not_submit=False,
+        external_llm_allowed=True,
+        tlp=TLP.AMBER,
+    )
+    attempt = SimpleNamespace(
+        id=collection.latest_attempt_id,
+        collection_id=collection.id,
+        manual_lease_id=uuid4(),
+        job_id=None,
+        policy_snapshot_id=addition.collection_policy_snapshot_id,
+        encoded_sha256=addition.encoded_sha256,
+        decoded_sha256=addition.decoded_sha256,
+    )
+    reference = ProductionReferenceSourceV1(
+        canonical_url=addition.canonical_url,
+        tier=addition.tier,
+        kind=addition.kind,
+        role=addition.role,
+        title=addition.title,
+        publisher=addition.publisher,
+        published_at=None,
+        source_collection_id=addition.collection_id,
+        source_document_id=addition.source_document_id,
+        discovery_candidate_ids=(),
+        collection_state=CollectionState.ARCHIVED,
+        content_sha256=addition.decoded_sha256,
+        relevance_reason=addition.selection_criterion,
+        proposed_by_model=False,
+        eligible_for_extraction=True,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+    )
+    uow = SimpleNamespace(
+        source_collections=SimpleNamespace(get=lambda _id: _async_value(collection)),
+        source_documents=SimpleNamespace(get=lambda _id: _async_value(document)),
+        collection_attempts=SimpleNamespace(
+            list_for_collection=lambda _id: _async_value((attempt,))
+        ),
+    )
+    service = _service(_Factory(_JournalUow(run)))
+
+    assert (
+        await service._archived_receipt_refusal(
+            uow, run, SimpleNamespace(sources=(reference,)), addition
+        )
+        is None
+    )
+
+    attempt.policy_snapshot_id = "different-policy"
     refusal = await service._archived_receipt_refusal(
         uow, run, SimpleNamespace(sources=(reference,)), addition
     )
