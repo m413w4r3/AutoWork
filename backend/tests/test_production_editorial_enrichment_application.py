@@ -3120,7 +3120,7 @@ def test_validator_version_changes_artifact_identity_without_changing_invocation
     artifact_after = compute_editorial_enrichment_input_hash(**common)
 
     assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
-        "editorial-enrichment-validator-v19-shared-diagram-attestation"
+        "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
     )
     assert invocation_before == invocation_after
     assert artifact_before != artifact_after

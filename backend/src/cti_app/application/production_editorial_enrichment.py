@@ -199,7 +199,7 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
 )
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
-    "editorial-enrichment-validator-v19-shared-diagram-attestation"
+    "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
 )
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v6-ioc-republication-diagram-value"
