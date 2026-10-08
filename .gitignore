@@ -83,6 +83,3 @@ chatGPT_Answers/
 scripts/ctx/
 nimbalyst-local/
 
-# Typst fonts are copied from the local source checkout for rendering only.
-chpTypst/CascadiaCode/
-chpTypst/HankenGrotesk/
