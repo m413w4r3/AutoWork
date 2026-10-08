@@ -160,3 +160,37 @@ publication avec le rendu et QA existants.
 
 Les endpoints sont `POST .../editorial_enrichment/restore/preview` et
 `POST .../editorial_enrichment/restore`.
+
+## Enrichissements rebasés après réparations
+
+Une réparation peut conserver l'enrichissement éditorial après avoir validé
+que chacune de ses références de preuve existe toujours et reste admissible
+selon la projection de pertinence. Elle met alors à jour les hashes
+d'extraction, de synthèse et de projection, ainsi que les IDs des artifacts
+courants. Elle conserve `evidence_pack_hash` et `input_hash` d'origine : le
+chemin de réparation n'a pas chargé la politique d'accès ni reconstruit
+l'inventaire d'images requis pour produire une nouvelle identité complète.
+Ces anciens hashes décrivent donc l'admission antérieure, et non les entrées
+courantes de la révision.
+
+Pour `metadata.lineage_rebased = true` seulement, la fence de révision vérifie
+que `metadata.input_artifacts` désigne exactement les artifacts courants
+EXTRACTION, RELEVANCE_PROJECTION et SYNTHESIS. Elle compare ensuite les trois
+hashes canoniques stockés aux contenus courants, puis exige une égalité exacte
+de `access_policy_hash` et du hash fonctionnel de l'inventaire de figures.
+Toute divergence reste un conflit typé. Les artifacts sans ce marqueur gardent
+la comparaison stricte du EvidencePack et de `input_hash`.
+
+Une fois cette lignée vérifiée, la révision reconstruit le EvidencePack depuis
+les artifacts courants et calcule à nouveau `evidence_pack_hash` et
+`input_hash`. Le nouvel artifact stocke ces valeurs. Les révisions suivantes
+utilisent alors la fence stricte normale, sans exception de rebase.
+
+Cette tolérance ne réutilise pas l'ancien EvidencePack et ne contourne pas la
+validation des preuves : le rebase a déjà refusé toute référence conservée
+absente ou classée hors périmètre/indéterminée; la révision construit un pack
+neuf à partir des artifacts courants et vérifie les handles et références de
+toute proposition contre ce pack. Les IDs, hashes, politique d'accès et
+inventaire empêchent que des entrées remplacées ou modifiées profitent de
+l'exception. L'exception est limitée au marqueur écrit par le chemin de
+réparation; aucune nouvelle version de politique n'est nécessaire.

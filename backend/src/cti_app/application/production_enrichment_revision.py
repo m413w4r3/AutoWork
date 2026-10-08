@@ -184,6 +184,9 @@ class ProductionEditorialEnrichmentRevisionService:
         *,
         snapshot: ProductionInputSnapshot,
         base_artifact: ProductionArtifact,
+        extraction_artifact: ProductionArtifact,
+        projection_artifact: ProductionArtifact | None,
+        synthesis_artifact: ProductionArtifact,
         extraction: Any,
         projection: Any,
         synthesis: Any,
@@ -210,6 +213,23 @@ class ProductionEditorialEnrichmentRevisionService:
                 media_archiver=media_archiver,
             )
 
+        lineage_rebased = base_artifact.metadata.get("lineage_rebased") is True
+        extraction_hash = canonical_extraction_hash(extraction)
+        synthesis_hash = canonical_synthesis_hash(synthesis)
+        projection_hash = projection.projection_hash if projection is not None else None
+        if lineage_rebased and not self._rebased_lineage_matches(
+            base_artifact=base_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            synthesis_artifact=synthesis_artifact,
+            extraction_hash=extraction_hash,
+            synthesis_hash=synthesis_hash,
+            projection_hash=projection_hash,
+        ):
+            raise EditorialEnrichmentRevisionConflictError(
+                "The rebased input lineage no longer matches the base artifact"
+            )
+
         if synthesis_access_policy_hash(access_policy) != base_artifact.metadata.get(
             "access_policy_hash"
         ):
@@ -221,11 +241,21 @@ class ProductionEditorialEnrichmentRevisionService:
             snapshot, extraction, synthesis, projection
         )
         evidence_pack_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
-        if base_artifact.metadata.get("evidence_pack_hash") != evidence_pack_hash:
+        if not lineage_rebased and base_artifact.metadata.get("evidence_pack_hash") != (
+            evidence_pack_hash
+        ):
             raise EditorialEnrichmentRevisionConflictError(
                 "The admitted evidence pack no longer matches the base artifact"
             )
 
+        if (
+            lineage_rebased
+            and base_artifact.metadata.get("source_figure_inventory_hash")
+            != inventory.functional_hash()
+        ):
+            raise EditorialEnrichmentRevisionConflictError(
+                "The admitted figure catalog no longer matches the base artifact"
+            )
         figure_catalog, inventory_hash = self._catalog_for_base_artifact(
             base_artifact=base_artifact,
             extraction=extraction,
@@ -236,11 +266,11 @@ class ProductionEditorialEnrichmentRevisionService:
             synthesis=synthesis,
             evidence_pack_hash=evidence_pack_hash,
             access_policy_hash=base_artifact.metadata["access_policy_hash"],
-            projection_hash=projection.projection_hash if projection is not None else None,
+            projection_hash=projection_hash,
             source_figure_inventory_hash=inventory_hash,
             resource_search_enabled=self._enrichment._resource_search_enabled,
         )
-        if input_hash != base_artifact.input_hash:
+        if input_hash != base_artifact.input_hash and not lineage_rebased:
             if not self._legacy_input_fence_matches(
                 base_artifact=base_artifact,
                 extraction=extraction,
@@ -260,6 +290,40 @@ class ProductionEditorialEnrichmentRevisionService:
             evidence_pack_hash=evidence_pack_hash,
             inventory_hash=inventory_hash,
             input_hash=input_hash,
+        )
+
+    @staticmethod
+    def _rebased_lineage_matches(
+        *,
+        base_artifact: ProductionArtifact,
+        extraction_artifact: ProductionArtifact,
+        projection_artifact: ProductionArtifact | None,
+        synthesis_artifact: ProductionArtifact,
+        extraction_hash: str,
+        synthesis_hash: str,
+        projection_hash: str | None,
+    ) -> bool:
+        """Fence the narrowly rebased identity to its verified current inputs."""
+        metadata = base_artifact.metadata
+        input_artifacts = metadata.get("input_artifacts")
+        if not isinstance(input_artifacts, dict):
+            return False
+        expected_artifacts = {
+            "extraction_artifact_id": str(extraction_artifact.id),
+            "relevance_projection_artifact_id": (
+                str(projection_artifact.id) if projection_artifact is not None else None
+            ),
+            "synthesis_artifact_id": str(synthesis_artifact.id),
+        }
+        if any(
+            key not in input_artifacts or input_artifacts[key] != value
+            for key, value in expected_artifacts.items()
+        ):
+            return False
+        return (
+            metadata.get("extraction_hash") == extraction_hash
+            and metadata.get("synthesis_hash") == synthesis_hash
+            and metadata.get("relevance_projection_hash") == projection_hash
         )
 
     @staticmethod
@@ -445,6 +509,9 @@ class ProductionEditorialEnrichmentRevisionService:
             await self._validate_input_fence(
                 snapshot=snapshot,
                 base_artifact=base_artifact,
+                extraction_artifact=extraction_artifact,
+                projection_artifact=projection_artifact,
+                synthesis_artifact=synthesis_artifact,
                 extraction=extraction,
                 projection=projection,
                 synthesis=synthesis,
@@ -618,6 +685,9 @@ class ProductionEditorialEnrichmentRevisionService:
         fence = await self._validate_input_fence(
             snapshot=snapshot,
             base_artifact=base_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            synthesis_artifact=synthesis_artifact,
             extraction=extraction,
             projection=projection,
             synthesis=synthesis,
@@ -804,6 +874,9 @@ class ProductionEditorialEnrichmentRevisionService:
         fence = await self._validate_input_fence(
             snapshot=snapshot,
             base_artifact=base_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            synthesis_artifact=synthesis_artifact,
             extraction=extraction,
             projection=projection,
             synthesis=synthesis,
@@ -1372,6 +1445,9 @@ class ProductionEditorialEnrichmentRevisionService:
         fence = await self._validate_input_fence(
             snapshot=snapshot,
             base_artifact=base_artifact,
+            extraction_artifact=extraction_artifact,
+            projection_artifact=projection_artifact,
+            synthesis_artifact=synthesis_artifact,
             extraction=extraction,
             projection=projection,
             synthesis=synthesis,

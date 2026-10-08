@@ -9,7 +9,13 @@ import pytest
 
 from cti_app.application.diagnostics import DiagnosticsLog
 from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_editorial_enrichment import (
+    build_editorial_enrichment_evidence_pack,
+    canonical_synthesis_hash,
+    editorial_enrichment_evidence_pack_hash,
+)
 from cti_app.application.production_references import production_reference_corpus_to_json
+from cti_app.application.production_relevance import build_relevance_projection
 from cti_app.application.production_repairs import (
     ProductionRepairMaterializationService,
     ProductionRepairProjectionError,
@@ -23,12 +29,14 @@ from cti_app.domain.production import (
     ProductionArtifactStage,
     ProductionArtifactStatus,
     ProductionDerivedOutput,
+    ProductionEvidenceBasis,
     ProductionRepairImpact,
     ProductionRepairImpactKind,
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
 from cti_app.domain.production_extraction import (
+    ExtractionFactV1,
     production_extraction_from_json,
     production_extraction_hashes,
     production_extraction_to_json,
@@ -443,3 +451,111 @@ async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> N
     assert len(rebased) == 1
     rebased_synthesis = production_synthesis_from_json(store.payloads[rebased[0].canonical_blob_id])
     assert rebased_synthesis.extraction_hash == current_hash
+
+
+@pytest.mark.asyncio
+async def test_repair_rebases_enrichment_lineage_but_keeps_its_admitted_pack_hash() -> None:
+    service, uow, projection_service, store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY
+    )
+    snapshot = await uow.production_input_snapshots.get_by_run(RUN_ID)
+    original_extraction = production_extraction_from_json(store.payloads[UUID(int=11)])
+    original_synthesis = production_synthesis_from_json(store.payloads[UUID(int=12)])
+    original_projection = build_relevance_projection(snapshot, original_extraction)
+    original_pack_hash = editorial_enrichment_evidence_pack_hash(
+        build_editorial_enrichment_evidence_pack(
+            snapshot, original_extraction, original_synthesis, original_projection
+        )
+    )
+    original_enrichment_artifact = next(
+        item
+        for item in uow.artifacts.items
+        if item.stage is ProductionArtifactStage.EDITORIAL_ENRICHMENT
+    )
+    original_enrichment_artifact.metadata.update(
+        {
+            "evidence_pack_hash": original_pack_hash,
+            "access_policy_hash": "a" * 64,
+            "source_figure_inventory_hash": "b" * 64,
+            "extraction_hash": canonical_extraction_hash(original_extraction),
+            "synthesis_hash": canonical_synthesis_hash(original_synthesis),
+            "relevance_projection_hash": original_projection.projection_hash,
+        }
+    )
+
+    source = original_extraction.sources[0]
+    contextless_fact = ExtractionFactV1(
+        category="infection_chain",
+        value="IOC repair added a source-backed extraction item",
+        attack_id=None,
+        context="",
+        evidence_quote="The repaired source evidence still has no surrounding context.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    repaired_extraction = replace(
+        original_extraction,
+        sources=(
+            replace(source, facts=(*source.facts, contextless_fact)),
+            *original_extraction.sources[1:],
+        ),
+    )
+    repaired_extraction_blob_id = UUID(int=15)
+    store.payloads[repaired_extraction_blob_id] = production_extraction_to_json(repaired_extraction)
+    original_extraction_artifact = next(
+        item for item in uow.artifacts.items if item.stage is ProductionArtifactStage.EXTRACTION
+    )
+    projection_service.result = replace(
+        projection_service.result,
+        artifact=replace(
+            original_extraction_artifact,
+            id=UUID(int=115),
+            version=2,
+            input_hash=canonical_extraction_hash(repaired_extraction),
+            canonical_blob_id=repaired_extraction_blob_id,
+        ),
+    )
+
+    result = await service.apply(
+        edition_id=EDITION_ID,
+        subject_id=SUBJECT_ID,
+        actor_id="analyst",
+    )
+
+    assert result.action == "publication_reassembled"
+    rebased = await uow.artifacts.get_current(
+        RUN_ID, ProductionArtifactStage.EDITORIAL_ENRICHMENT.value
+    )
+    assert rebased is not None
+    assert rebased.metadata["lineage_rebased"] is True
+    assert rebased.metadata["evidence_pack_hash"] == original_pack_hash
+    current_extraction_artifact = await uow.artifacts.get_current(
+        RUN_ID, ProductionArtifactStage.EXTRACTION.value
+    )
+    current_synthesis_artifact = await uow.artifacts.get_current(
+        RUN_ID, ProductionArtifactStage.SYNTHESIS.value
+    )
+    current_projection_artifact = await uow.artifacts.get_current(
+        RUN_ID, ProductionArtifactStage.RELEVANCE_PROJECTION.value
+    )
+    assert current_extraction_artifact is not None
+    assert current_synthesis_artifact is not None
+    assert current_projection_artifact is not None
+    assert rebased.metadata["input_artifacts"] == {
+        "extraction_artifact_id": str(current_extraction_artifact.id),
+        "relevance_projection_artifact_id": str(current_projection_artifact.id),
+        "synthesis_artifact_id": str(current_synthesis_artifact.id),
+    }
+    current_extraction = production_extraction_from_json(
+        store.payloads[current_extraction_artifact.canonical_blob_id]
+    )
+    current_synthesis = production_synthesis_from_json(
+        store.payloads[current_synthesis_artifact.canonical_blob_id]
+    )
+    current_projection = build_relevance_projection(snapshot, current_extraction)
+    current_pack_hash = editorial_enrichment_evidence_pack_hash(
+        build_editorial_enrichment_evidence_pack(
+            snapshot, current_extraction, current_synthesis, current_projection
+        )
+    )
+    assert current_pack_hash != rebased.metadata["evidence_pack_hash"]

@@ -71,7 +71,7 @@ from cti_app.application.production_enrichment_revision import (
 )
 from cti_app.application.production_prompts import EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
 from cti_app.application.production_relevance import build_relevance_projection
-from cti_app.application.production_stages import EditorialEnrichmentService
+from cti_app.application.production_stages import EditorialEnrichmentService, compute_input_hash
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
     canonical_extraction_hash,
@@ -6594,6 +6594,253 @@ def _common_enrichment_request(
         mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
         requester="test-analyst",
     )
+
+
+def _simulate_repair_rebase_with_uncontextualized_fact(harness: SimpleNamespace) -> None:
+    """Model the verified artifacts emitted by an IOC repair that grows extraction."""
+    world = harness.world
+    previous_base = harness.base
+    previous_extraction_artifact = world.extraction_artifact
+    previous_synthesis_artifact = world.synthesis_artifact
+
+    source = world.extraction.sources[0]
+    added_fact = ExtractionFactV1(
+        category="infection_chain",
+        value="Additional repaired extraction item",
+        attack_id=None,
+        context="",
+        evidence_quote="Additional source-backed extraction quote.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    world.extraction = replace(
+        world.extraction,
+        sources=(replace(source, facts=(*source.facts, added_fact)), *world.extraction.sources[1:]),
+    )
+    extraction_hash = canonical_extraction_hash(world.extraction)
+    world.synthesis = replace(world.synthesis, extraction_hash=extraction_hash)
+    world.extraction_artifact = replace(
+        previous_extraction_artifact,
+        id=uuid4(),
+        version=previous_extraction_artifact.version + 1,
+        input_hash=extraction_hash,
+        canonical_blob_id=world.store.put(production_extraction_to_json(world.extraction)),
+    )
+    world.synthesis_artifact = replace(
+        previous_synthesis_artifact,
+        id=uuid4(),
+        version=previous_synthesis_artifact.version + 1,
+        input_hash=extraction_hash,
+        canonical_blob_id=world.store.put(production_synthesis_to_json(world.synthesis)),
+    )
+
+    rebased_enrichment = replace(
+        editorial_enrichment_from_json(harness.base_payload),
+        production_input_hash=world.synthesis.production_input_hash,
+        extraction_hash=extraction_hash,
+        synthesis_hash=canonical_synthesis_hash(world.synthesis),
+    )
+    rebased_payload = editorial_enrichment_to_json(rebased_enrichment)
+    rebased_input_hash = compute_input_hash(
+        {
+            "policy": "editorial-enrichment-lineage-rebase-v1",
+            "source_input_hash": previous_base.input_hash,
+            "extraction_hash": extraction_hash,
+            "synthesis_hash": canonical_synthesis_hash(world.synthesis),
+            "relevance_projection_hash": None,
+        }
+    )
+    rebased_base = replace(
+        previous_base,
+        id=uuid4(),
+        version=previous_base.version + 1,
+        input_hash=rebased_input_hash,
+        canonical_blob_id=world.store.put(rebased_payload),
+        metadata={
+            **previous_base.metadata,
+            "extraction_hash": extraction_hash,
+            "synthesis_hash": canonical_synthesis_hash(world.synthesis),
+            "relevance_projection_hash": None,
+            "lineage_rebased": True,
+            "input_artifacts": {
+                "extraction_artifact_id": str(world.extraction_artifact.id),
+                "relevance_projection_artifact_id": None,
+                "synthesis_artifact_id": str(world.synthesis_artifact.id),
+            },
+        },
+    )
+    replaced_ids = {
+        previous_extraction_artifact.id: world.extraction_artifact,
+        previous_synthesis_artifact.id: world.synthesis_artifact,
+        previous_base.id: rebased_base,
+    }
+    harness.artifacts.artifacts = [
+        replaced_ids.get(artifact.id, artifact) for artifact in harness.artifacts.artifacts
+    ]
+    harness.base = rebased_base
+    harness.base_payload = rebased_payload
+    harness.input_hash = rebased_base.input_hash
+    harness.stored_input_hash = rebased_base.input_hash
+    harness.base_sha256 = hashlib.sha256(
+        ProductionArtifactStore.canonical_json_bytes(rebased_payload)
+    ).hexdigest()
+
+    current_pack = build_editorial_enrichment_evidence_pack(
+        world.snapshot, world.extraction, world.synthesis
+    )
+    harness.current_evidence_pack_hash = editorial_enrichment_evidence_pack_hash(current_pack)
+    harness.current_input_hash = compute_editorial_enrichment_input_hash(
+        extraction=world.extraction,
+        synthesis=world.synthesis,
+        evidence_pack_hash=harness.current_evidence_pack_hash,
+        access_policy_hash=str(rebased_base.metadata["access_policy_hash"]),
+        projection_hash=None,
+        source_figure_inventory_hash=str(rebased_base.metadata["source_figure_inventory_hash"]),
+    )
+
+
+def _replace_rebased_base_metadata(harness: SimpleNamespace, **updates: Any) -> None:
+    base = harness.base
+    updated = replace(base, metadata={**base.metadata, **updates})
+    harness.artifacts.artifacts = [
+        updated if item.id == base.id else item for item in harness.artifacts.artifacts
+    ]
+    harness.base = updated
+
+
+@pytest.mark.asyncio
+async def test_rebased_enrichment_revision_reseals_current_hashes_for_followup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    assert harness.current_evidence_pack_hash != harness.base.metadata["evidence_pack_hash"]
+
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        element_key="tools_table",
+    )
+    service = _common_revision_service(harness)
+    result = await service.revise(request)
+
+    assert result.refusal is None and result.artifact is not None
+    assert result.artifact.input_hash == harness.current_input_hash
+    assert result.artifact.metadata["evidence_pack_hash"] == harness.current_evidence_pack_hash
+    assert result.artifact.metadata.get("lineage_rebased") is not True
+    assert harness.world.gateway.calls == []
+
+    harness.base = result.artifact
+    harness.base_payload = editorial_enrichment_to_json(
+        editorial_enrichment_from_json(
+            await harness.world.store.read_json(result.artifact.canonical_blob_id)
+        )
+    )
+    harness.base_sha256 = hashlib.sha256(
+        await harness.world.store.read_bytes(result.artifact.canonical_blob_id)
+    ).hexdigest()
+    harness.input_hash = result.artifact.input_hash
+    next_diagram_key = editorial_enrichment_from_json(harness.base_payload).diagrams[0].key
+    next_request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.DIAGRAM,
+        operation=TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        element_key=next_diagram_key,
+    )
+    preview = await harness.service.preview_targeted(next_request)
+    assert preview.base_input_hash == result.artifact.input_hash
+
+
+@pytest.mark.parametrize(
+    "divergence",
+    [
+        "extraction_artifact_id",
+        "projection_artifact_id",
+        "extraction_hash",
+        "synthesis_hash",
+        "projection_hash",
+        "access_policy_hash",
+        "figure_inventory_hash",
+    ],
+)
+@pytest.mark.asyncio
+async def test_rebased_enrichment_revision_conflicts_on_real_lineage_divergence(
+    monkeypatch: pytest.MonkeyPatch,
+    divergence: str,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+        include_figure=divergence == "figure_inventory_hash",
+    )
+    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    if divergence == "extraction_artifact_id":
+        _replace_rebased_base_metadata(
+            harness,
+            input_artifacts={
+                **harness.base.metadata["input_artifacts"],
+                "extraction_artifact_id": str(uuid4()),
+            },
+        )
+    elif divergence == "projection_artifact_id":
+        _replace_rebased_base_metadata(
+            harness,
+            input_artifacts={
+                **harness.base.metadata["input_artifacts"],
+                "relevance_projection_artifact_id": str(uuid4()),
+            },
+        )
+    elif divergence == "extraction_hash":
+        _replace_rebased_base_metadata(harness, extraction_hash="0" * 64)
+    elif divergence == "synthesis_hash":
+        _replace_rebased_base_metadata(harness, synthesis_hash="0" * 64)
+    elif divergence == "projection_hash":
+        _replace_rebased_base_metadata(harness, relevance_projection_hash="0" * 64)
+    elif divergence == "access_policy_hash":
+        _replace_rebased_base_metadata(harness, access_policy_hash="0" * 64)
+    else:
+        harness.inventory_state.value = _inventory_with_second_figure(harness.inventory_state.value)
+
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        element_key="tools_table",
+    )
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await harness.service.preview_targeted(request)
+    assert harness.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_non_rebased_enrichment_keeps_strict_evidence_pack_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, _table_revision_wire())),
+    )
+    _simulate_repair_rebase_with_uncontextualized_fact(harness)
+    assert harness.current_input_hash != harness.base.input_hash
+    _replace_rebased_base_metadata(
+        harness,
+        lineage_rebased=False,
+        evidence_pack_hash=harness.current_evidence_pack_hash,
+    )
+    request = _common_enrichment_request(
+        harness,
+        element_kind=EditorialEnrichmentElementKind.TABLE,
+        operation=TargetedEditorialRevisionOperation.DELETE_TABLE,
+        element_key="tools_table",
+    )
+
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await harness.service.preview_targeted(request)
+    assert harness.world.gateway.calls == []
 
 
 @pytest.mark.asyncio
