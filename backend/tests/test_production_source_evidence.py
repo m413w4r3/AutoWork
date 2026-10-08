@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from cti_app.application.extraction import parse_document
+from cti_app.application.production_artifact_verification import (
+    Q2ProposalSubmission,
+    verify_q2_proposals,
+)
 from cti_app.application.production_parsers import (
     Q2ArtifactProposal,
     Q2FactProposal,
@@ -11,6 +15,7 @@ from cti_app.application.production_parsers import (
 from cti_app.application.production_source_evidence import (
     SOURCE_EVIDENCE_VERSION,
     SourceEvidenceSpanKind,
+    artifact_source_verification_method,
     scope_source_evidence_document,
     source_evidence_context_for_artifact,
     source_evidence_document_from_html,
@@ -39,7 +44,7 @@ def test_version_and_ioc_from_same_source_are_kept_with_value_only() -> None:
 
     result = verify_ioc_rules_output_against_source(output, "The domain is evil.com.")
 
-    assert SOURCE_EVIDENCE_VERSION == "11"
+    assert SOURCE_EVIDENCE_VERSION == "12"
     assert result.output.artifacts[0].value == "evil[.]com"
     assert result.output.artifacts[0].context == ""
     # The quote is the local source area, never the model-supplied quote.
@@ -446,8 +451,136 @@ def test_wrapped_domain_is_kept_with_unwrap_warning() -> None:
     )
 
     assert len(result.output.artifacts) == 1
-    assert "artifact_proven_after_unwrap" in result.warnings
+    assert "artifact_verification_whitespace_canonicalized" in result.warnings
     assert result.rejections == ()
+
+
+def test_pdf_layout_breaks_inside_paths_and_filenames_are_canonicalized() -> None:
+    cases = (
+        (
+            r"C:\ProgramData\Drivers\MicDriver_*_mic.wav",
+            "C:\\ProgramData\\Drivers\\MicDriver_\n*\x00_\u00admic.wav",
+            "filepath",
+        ),
+        (
+            r"C:\ProgramData\Drivers\Whatsapp\User Data\EBWebView\Default\IndexedDB"
+            r"\https_web.whatsapp.com_0.indexeddb.leveldb",
+            "C:\\ProgramData\\Drivers\\Whatsapp\\User\nData\\EBWebView\\Default\\IndexedDB\\https_web.whatsapp.com_0.\nindexeddb.leveldb",
+            "filepath",
+        ),
+        (
+            "payload-namepart2.rar",
+            "payload-name-\npart2.rar",
+            "filename",
+        ),
+    )
+
+    for value, source, artifact_type in cases:
+        proposal = _artifact(value, artifact_type)
+        assert artifact_source_verification_method(proposal, source) == ("whitespace_canonicalized")
+        result = verify_ioc_rules_output_against_source(
+            Q2SourceOutput(artifacts=[proposal]), source
+        )
+        assert len(result.output.artifacts) == 1
+        assert "artifact_verification_whitespace_canonicalized" in result.warnings
+        assert result.rejections == ()
+
+
+def test_layout_canonicalization_keeps_boundaries_and_source_scope() -> None:
+    value = r"C:\ProgramData\Drivers\MicDriver_*_mic.wav"
+    proposal = _artifact(value, "filepath")
+    nonmatches = (
+        "Only the filename MicDriver_*_mic.wav is reported.",
+        f"prefix{value}suffix",
+        "C:\\ProgramData\\Drivers\\MicDriver_\n\n*_mic.wav",
+    )
+
+    for source in nonmatches:
+        assert artifact_source_verification_method(proposal, source) is None
+        result = verify_ioc_rules_output_against_source(
+            Q2SourceOutput(artifacts=[proposal]), source
+        )
+        assert result.output.artifacts == []
+        assert result.rejections[0].reason_code == "source_evidence_missing"
+
+
+def test_unicode_casefold_expansion_keeps_original_source_boundaries() -> None:
+    assert (
+        artifact_source_verification_method(_artifact("evil.com", "domain"), "ß!\x00evil.\ncom")
+        == "whitespace_canonicalized"
+    )
+
+
+def test_filepath_case_remains_sensitive_and_only_paths_accept_wildcards() -> None:
+    lowercase_path = r"C:\ProgramData\Drivers\micdriver\recording.wav"
+    uppercase_source = r"C:\PROGRAMDATA\DRIVERS\MICDRIVER\RECORDING.WAV"
+    assert (
+        artifact_source_verification_method(_artifact(lowercase_path, "filepath"), uppercase_source)
+        is None
+    )
+
+    path_pattern = r"C:\ProgramData\Drivers\MicDriver\recording_*.wav"
+    assert (
+        artifact_source_verification_method(_artifact(path_pattern, "filepath"), path_pattern)
+        == "literal"
+    )
+    assert (
+        artifact_source_verification_method(_artifact("mic*.example", "domain"), "mic*.example")
+        is None
+    )
+
+
+def test_filename_sentence_punctuation_is_allowed_but_extensions_stay_anchored() -> None:
+    value = "ZP_20250701070035810028043324.part2.rar"
+    assert (
+        artifact_source_verification_method(
+            _artifact(value, "filename"), f"The second archive was {value}."
+        )
+        == "literal"
+    )
+    assert (
+        artifact_source_verification_method(
+            _artifact(value, "filename"), f"The archive was {value}.exe"
+        )
+        is None
+    )
+
+
+def test_wildcards_are_valid_only_as_filepath_or_filename_hunt_patterns() -> None:
+    pattern = r"C:\ProgramData\Drivers\MicDriver\recording_*.wav"
+    evidence = verify_ioc_rules_output_against_source(
+        Q2SourceOutput(artifacts=[_artifact(pattern, "filepath")]),
+        f"The source reports {pattern}.",
+    )
+    assert len(evidence.output.artifacts) == 1
+    accepted = verify_q2_proposals(
+        [Q2ProposalSubmission(output=evidence.output, source_ids=("S1",))]
+    )
+    assert len(accepted.canonical.items) == 1
+
+    invalid_domain = verify_q2_proposals(
+        [
+            Q2ProposalSubmission(
+                output=Q2SourceOutput(artifacts=[_artifact("evil*.example", "domain")]),
+                source_ids=("S1",),
+            )
+        ]
+    )
+    assert invalid_domain.canonical.items == ()
+    assert invalid_domain.rejected[0].reason_code == "invalid_domain"
+
+
+def test_line_hyphenated_url_is_verified_after_layout_canonicalization() -> None:
+    value = "http://ams1.vultrobjects.com/desktop-va0r68j-ppmppnf12uyt4r5tifjdfh-tron5"
+    proposal = _artifact(value, "url")
+    source = (
+        "PUT request to http://ams1.vultrobjects.com/desktop-va0r68j-"
+        "ppmppnf12uyt4r5tifjdfh-\ntron5."
+    )
+
+    assert artifact_source_verification_method(proposal, source) == ("whitespace_canonicalized")
+    result = verify_ioc_rules_output_against_source(Q2SourceOutput(artifacts=[proposal]), source)
+    assert len(result.output.artifacts) == 1
 
 
 def test_chatgpt_markdown_autolinks_are_unwrapped_before_literal_url_proof() -> None:

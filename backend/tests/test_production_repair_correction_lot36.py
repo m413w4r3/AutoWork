@@ -196,8 +196,9 @@ class _Catalog:
 
 
 class _ArchiveUow:
-    def __init__(self, blob_id: UUID, content: bytes) -> None:
+    def __init__(self, blob_id: UUID, content: bytes, *, mime_type: str = "text/html") -> None:
         self.blob_id = blob_id
+        self.mime_type = mime_type
         self.source_collections = SimpleNamespace(
             list_for_subject=lambda _subject_id: self._collections()
         )
@@ -217,14 +218,13 @@ class _ArchiveUow:
         return SimpleNamespace(
             decoded_blob_id=self.blob_id,
             decoded_sha256=None,
-            detected_mime_type="text/html",
+            detected_mime_type=self.mime_type,
         )
 
-    @staticmethod
-    async def _blob(blob_id: UUID, content: bytes) -> object:
+    async def _blob(self, blob_id: UUID, content: bytes) -> object:
         return SimpleNamespace(
             id=blob_id,
-            descriptor=SimpleNamespace(sha256=_sha256(content.decode()), mime_type="text/html"),
+            descriptor=SimpleNamespace(sha256=_sha256(content.decode()), mime_type=self.mime_type),
         )
 
     async def __aenter__(self) -> _ArchiveUow:
@@ -289,6 +289,32 @@ async def test_source_verified_replacement_and_explicit_override_policy() -> Non
             actor_id="analyst",
             reason=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_replacement_verification_reports_layout_canonicalization() -> None:
+    replacement = r"C:\ProgramData\Drivers\MicDriver_*_mic.wav"
+    content = "C:\\ProgramData\\Drivers\\MicDriver_\n*\x00_\u00admic.wav".encode()
+    catalog = _Catalog(content)
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    uow = _ArchiveUow(catalog.blob_id, content, mime_type="text/plain")
+    service = ProductionRepairAdjudicationService(lambda: uow, artifact_store=store)
+    issue = replace(
+        _issue(),
+        artifact_type="filepath",
+        value_sha256=_sha256("missing.wav"),
+        preview="missing.wav",
+    )
+
+    verification = await service._validate_replacement(
+        issue=issue,
+        value=replacement,
+        require_source=True,
+    )
+
+    assert verification.format_valid is True
+    assert verification.verified is True
+    assert verification.verification_method == "whitespace_canonicalized"
 
 
 def _rule_issue(value: str) -> ProductionRepairIssueView:

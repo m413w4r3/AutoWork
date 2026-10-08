@@ -2412,6 +2412,7 @@ async def verify_subject_production_replacement(
             if verification.verification_state is not None
             else None
         ),
+        "verification_method": verification.verification_method,
         "context_spans": [
             {"kind": span.kind.value, "text": span.text} for span in verification.context_spans
         ],

@@ -71,6 +71,7 @@ from cti_app.application.production_source_evidence import (
     SourceEvidenceDocument,
     SourceEvidenceSpan,
     SourceEvidenceSpanKind,
+    artifact_source_verification_method,
     source_evidence_context_for_artifact,
     source_evidence_context_for_rule,
     source_evidence_document_from_html,
@@ -453,6 +454,7 @@ class ProductionRepairCorrectionVerification:
     reason_code: str | None = None
     context_spans: tuple[SourceEvidenceSpan, ...] = ()
     verification_state: ProductionRepairVerificationState | None = None
+    verification_method: str | None = None
 
 
 class ProductionRepairProjectionError(ValueError):
@@ -2826,6 +2828,15 @@ class ProductionRepairAdjudicationService:
             context_spans=context_spans,
             verification_state=(
                 ProductionRepairVerificationState.SOURCE_VERIFIED if source_verified else None
+            ),
+            verification_method=(
+                artifact_source_verification_method(
+                    artifact_proposal,
+                    document.parsed_text,
+                    allow_layout_canonicalization=not document.decoded_source_view,
+                )
+                if source_verified and artifact_proposal is not None
+                else None
             ),
         )
 

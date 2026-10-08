@@ -37,14 +37,17 @@ from cti_app.domain.production_extraction import (
 from cti_app.domain.production_references import ProductionReferenceKind
 from cti_app.domain.publication import ArtifactType
 
-SOURCE_EVIDENCE_VERSION = "11"
+SOURCE_EVIDENCE_VERSION = "12"
 
 _NBSP = "\u00a0"
 _NARROW_NBSP = "\u202f"
 # Zero-width and soft-hyphen characters are inserted by publishing pipelines to
 # allow long IOC cells to wrap. They carry no value and must never decide
 # whether a published indicator can be proven in its own source.
-_INVISIBLE = str.maketrans(dict.fromkeys("\u00ad\u200b\u200c\u200d\u2060\ufeff"))
+# Keep soft hyphens for the layout-aware verifier below so a proof that needs
+# to remove one is reported as canonicalized. The other zero-width characters
+# remain transport-only noise in the comparison view.
+_INVISIBLE = str.maketrans(dict.fromkeys("\u200b\u200c\u200d\u2060\ufeff"))
 _DOT = re.compile(r"\[\.\]|\(\.\)|\{\.\}", re.IGNORECASE)
 _COLON = re.compile(r"\[:\]", re.IGNORECASE)
 _AT = re.compile(r"\[(?:at|@)\]|\((?:at|@)\)", re.IGNORECASE)
@@ -839,17 +842,8 @@ def _verify_output_against_source(
         if isinstance(source_text, SourceEvidenceDocument)
         else SourceEvidenceDocument(parsed_text=source_text)
     )
-    # Only the exact canonical text hashed and sent to the model can establish
+    # Only the exact archived text hashed and sent to the model can establish
     # proof. The parallel safe HTML projection supplies structural paths only.
-    base_source_views = (
-        (_artifact_comparison_view(evidence_document.parsed_text),)
-        if evidence_document.parsed_text
-        else ()
-    )
-    # Un IOC publié dans une cellule de tableau est souvent replié : le rendu
-    # texte insère un saut de ligne ou une suite d'espaces au milieu du token.
-    # La vue compactée retire seulement ces coupures, sans rien réécrire.
-    unwrapped_source_views = tuple(_artifact_unwrapped_view(value) for value in base_source_views)
     text_source_views = (
         (_text_comparison_view(evidence_document.parsed_text),)
         if evidence_document.parsed_text
@@ -917,13 +911,14 @@ def _verify_output_against_source(
         if unwrapped_value is not None:
             artifact = artifact.model_copy(update={"value": unwrapped_value})
             warnings.append("artifact_markdown_autolink_unwrapped")
-        proven = any(_artifact_is_proven(artifact, source) for source in base_source_views)
-        if not proven and any(
-            _artifact_is_proven(artifact, source) for source in unwrapped_source_views
-        ):
-            warnings.append("artifact_proven_after_unwrap")
-            proven = True
-        if proven:
+        verification_method = artifact_source_verification_method(
+            artifact,
+            evidence_document.parsed_text,
+            allow_layout_canonicalization=not evidence_document.decoded_source_view,
+        )
+        if verification_method == "whitespace_canonicalized":
+            warnings.append("artifact_verification_whitespace_canonicalized")
+        if verification_method is not None:
             artifacts.append(
                 artifact.model_copy(
                     update={
@@ -1046,15 +1041,19 @@ def _http_url_identity(value: str) -> tuple[str, str, str, str, str] | None:
     return scheme, parsed.netloc.casefold(), path, parsed.query, parsed.fragment
 
 
-_ARTIFACT_WRAP = re.compile(r"[ \t]*\n[ \t]*")
+_ARTIFACT_WRAP = re.compile(r"(?<!\n)[ \t]*\n[ \t]*(?!\n)")
+_ARTIFACT_HARD_PARAGRAPH_BREAK = re.compile(r"(?:\r?\n[ \t]*){2,}|\f+")
+_ARTIFACT_LINE_HYPHENATION = re.compile(
+    r"(?<=[A-Za-z0-9])-[ \t]*(?:\r\n|\r|\n)[ \t]*(?=[A-Za-z0-9])"
+)
+_ARTIFACT_LAYOUT_INVISIBLES = frozenset("\x00\u00ad\u200b\u200c\u200d\u2060\ufeff")
 
 
 def _artifact_unwrapped_view(view: str) -> str:
     """Remove renderer line wrapping inside an indicator token.
 
-    Only whitespace surrounding a newline is removed. No character of the
-    indicator is added, removed or rewritten, so a value proven in this view
-    is still literally present in the source.
+    A single line wrap is removed, but blank lines and form feeds remain hard
+    paragraph boundaries. No visible character is changed.
     """
     return _ARTIFACT_WRAP.sub("", view)
 
@@ -1095,6 +1094,12 @@ def _artifact_is_proven(artifact: Q2ArtifactProposal, source: str) -> bool:
     except ValueError:
         return False
 
+    if "*" in artifact.value and artifact_type not in {
+        ArtifactType.FILEPATH,
+        ArtifactType.FILENAME,
+    }:
+        return False
+
     candidate = _artifact_comparison_view(artifact.value)
     if artifact_type is ArtifactType.DOMAIN:
         return _contains_domain(source, candidate.casefold())
@@ -1111,7 +1116,208 @@ def _artifact_is_proven(artifact: Q2ArtifactProposal, source: str) -> bool:
         return _contains_email(source, candidate)
     if artifact_type is ArtifactType.URL:
         return _contains_url(source, candidate)
+    if artifact_type in {ArtifactType.FILEPATH, ArtifactType.FILENAME}:
+        return _contains_path_token(source, candidate, _continuation_for(artifact_type))
     return _contains_bounded(source, candidate, _continuation_for(artifact_type))
+
+
+def artifact_source_verification_method(
+    artifact: Q2ArtifactProposal,
+    source_text: str,
+    *,
+    allow_layout_canonicalization: bool = True,
+) -> str | None:
+    """Return how one IOC value is proven in its own archived source.
+
+    ``literal`` is the existing type-aware comparison. ``whitespace_canonicalized``
+    is used only when proof needs renderer whitespace or a line-end hyphen
+    removed. Canonical matching is paragraph-local and still requires the
+    artifact type's normal token boundaries, so it cannot glue through another
+    character, cross a paragraph, or match a value embedded in a longer token.
+    Filepaths and filenames remain case-sensitive, following the existing gate.
+    Wildcard patterns are allowed only for those two path artifact types.
+    """
+    source_view = _artifact_comparison_view(source_text)
+    if _artifact_is_proven(artifact, source_view):
+        return "literal"
+    if _artifact_is_proven(artifact, _artifact_unwrapped_view(source_view)):
+        return "whitespace_canonicalized"
+    if allow_layout_canonicalization and _artifact_layout_match(artifact, source_text):
+        return "whitespace_canonicalized"
+    return None
+
+
+def _artifact_layout_match(artifact: Q2ArtifactProposal, source_text: str) -> bool:
+    try:
+        artifact_type = ArtifactType(artifact.artifact_type)
+    except ValueError:
+        return False
+    if "*" in artifact.value and artifact_type not in {
+        ArtifactType.FILEPATH,
+        ArtifactType.FILENAME,
+    }:
+        return False
+
+    candidate_views = tuple(
+        dict.fromkeys(
+            view
+            for drop_hyphen in (False, True)
+            if (
+                view := _compact_artifact_layout(
+                    _artifact_comparison_view(artifact.value), drop_hyphen=drop_hyphen
+                )[0]
+            )
+        )
+    )
+    if not candidate_views:
+        return False
+
+    source_view = _artifact_comparison_view(source_text)
+    for paragraph, paragraph_start in _artifact_paragraphs(source_view):
+        for drop_hyphen in (False, True):
+            compact_source, source_offsets = _compact_artifact_layout(
+                paragraph, base_offset=paragraph_start, drop_hyphen=drop_hyphen
+            )
+            if not compact_source:
+                continue
+            for candidate in candidate_views:
+                if _artifact_layout_occurs(
+                    artifact_type,
+                    candidate,
+                    compact_source,
+                    source_view,
+                    source_offsets,
+                ):
+                    return True
+    return False
+
+
+def _compact_artifact_layout(
+    value: str,
+    *,
+    base_offset: int = 0,
+    drop_hyphen: bool = False,
+) -> tuple[str, tuple[int, ...]]:
+    characters: list[str] = []
+    offsets: list[int] = []
+    position = 0
+    while position < len(value):
+        hyphenation = _ARTIFACT_LINE_HYPHENATION.match(value, position) if drop_hyphen else None
+        if hyphenation is not None:
+            position = hyphenation.end() - 1
+            continue
+        character = value[position]
+        if character not in _ARTIFACT_LAYOUT_INVISIBLES and not character.isspace():
+            characters.append(character)
+            offsets.append(base_offset + position)
+        position += 1
+    return "".join(characters), tuple(offsets)
+
+
+def _artifact_paragraphs(source: str) -> tuple[tuple[str, int], ...]:
+    """Split source at blank paragraphs and page breaks, preserving offsets."""
+    paragraphs: list[tuple[str, int]] = []
+    start = 0
+    for boundary in _ARTIFACT_HARD_PARAGRAPH_BREAK.finditer(source):
+        if boundary.start() > start:
+            paragraphs.append((source[start : boundary.start()], start))
+        start = boundary.end()
+    if start < len(source):
+        paragraphs.append((source[start:], start))
+    return tuple(paragraphs)
+
+
+def _artifact_layout_occurs(
+    artifact_type: ArtifactType,
+    candidate: str,
+    compact_source: str,
+    source_text: str,
+    source_offsets: tuple[int, ...],
+) -> bool:
+    searchable_source = compact_source
+    searchable_candidate = candidate
+    searchable_offsets = source_offsets
+    if artifact_type in {ArtifactType.DOMAIN, ArtifactType.HASH, ArtifactType.CVE}:
+        searchable_source, searchable_offsets = _casefold_with_offsets(
+            compact_source, source_offsets
+        )
+        searchable_candidate = candidate.casefold()
+
+    if artifact_type is ArtifactType.EMAIL and "@" in candidate:
+        local, _, domain = candidate.rpartition("@")
+        prefix = f"{local}@"
+        start = compact_source.find(prefix)
+        while start >= 0:
+            end = start + len(candidate)
+            actual_domain = compact_source[start + len(prefix) : end]
+            if actual_domain.casefold() == domain.casefold() and _artifact_layout_boundaries(
+                artifact_type,
+                source_text,
+                candidate,
+                searchable_offsets,
+                start,
+                end,
+            ):
+                return True
+            start = compact_source.find(prefix, start + 1)
+        return False
+
+    start = searchable_source.find(searchable_candidate)
+    while start >= 0:
+        end = start + len(searchable_candidate)
+        if _artifact_layout_boundaries(
+            artifact_type,
+            source_text,
+            candidate,
+            searchable_offsets,
+            start,
+            end,
+        ):
+            return True
+        start = searchable_source.find(searchable_candidate, start + 1)
+    return False
+
+
+def _casefold_with_offsets(value: str, offsets: tuple[int, ...]) -> tuple[str, tuple[int, ...]]:
+    folded: list[str] = []
+    folded_offsets: list[int] = []
+    for character, offset in zip(value, offsets, strict=True):
+        lowered = character.casefold()
+        folded.append(lowered)
+        folded_offsets.extend((offset,) * len(lowered))
+    return "".join(folded), tuple(folded_offsets)
+
+
+def _artifact_layout_boundaries(
+    artifact_type: ArtifactType,
+    source_text: str,
+    candidate: str,
+    source_offsets: tuple[int, ...],
+    compact_start: int,
+    compact_end: int,
+) -> bool:
+    start = source_offsets[compact_start]
+    end = source_offsets[compact_end - 1] + 1
+    if artifact_type is ArtifactType.DOMAIN:
+        return _has_domain_boundaries(source_text, start, end)
+    if artifact_type is ArtifactType.HASH:
+        return _has_token_boundaries(source_text, start, end, _HASH_CONTINUATION)
+    if artifact_type is ArtifactType.CVE:
+        return _has_token_boundaries(source_text, start, end, _CVE_CONTINUATION)
+    if artifact_type is ArtifactType.IP:
+        return _has_ip_boundaries(source_text, candidate, start, end)
+    if artifact_type is ArtifactType.EMAIL:
+        return _has_email_boundaries(source_text, start, end)
+    if artifact_type is ArtifactType.URL:
+        return _has_url_boundaries(source_text, start, end)
+    if artifact_type in {ArtifactType.FILEPATH, ArtifactType.FILENAME}:
+        return _has_path_token_boundaries(source_text, start, end, _continuation_for(artifact_type))
+    return _has_token_boundaries(
+        source_text,
+        start,
+        end,
+        _continuation_for(artifact_type),
+    )
 
 
 def source_evidence_context_for_artifact(
@@ -1133,9 +1339,13 @@ def source_evidence_context_for_artifact(
     for span in document.spans:
         if span.kind is SourceEvidenceSpanKind.VISUAL_UNLOCATED or not span.text:
             continue
-        comparison = _artifact_comparison_view(span.text)
-        if _artifact_is_proven(artifact, comparison) or _artifact_is_proven(
-            artifact, _artifact_unwrapped_view(comparison)
+        if (
+            artifact_source_verification_method(
+                artifact,
+                span.text,
+                allow_layout_canonicalization=not document.decoded_source_view,
+            )
+            is not None
         ):
             matches.append(span)
     return tuple(matches)
@@ -1247,6 +1457,31 @@ def _contains_bounded(
             return True
         start = comparable_source.find(candidate, start + 1)
     return False
+
+
+def _contains_path_token(source: str, candidate: str, continuation: str) -> bool:
+    if not candidate:
+        return False
+    start = source.find(candidate)
+    while start >= 0:
+        end = start + len(candidate)
+        if _has_path_token_boundaries(source, start, end, continuation):
+            return True
+        start = source.find(candidate, start + 1)
+    return False
+
+
+def _has_path_token_boundaries(source: str, start: int, end: int, continuation: str) -> bool:
+    before = source[start - 1] if start else ""
+    opening_quote = before if before in _QUOTE_DELIMITERS else ""
+    if _is_continuation(before, continuation) and not opening_quote:
+        return False
+    after = source[end] if end < len(source) else ""
+    if after == ".":
+        following = source[end + 1] if end + 1 < len(source) else ""
+        if not following or following.isspace() or following in ")]}>!,;:?":
+            return True
+    return _has_trailing_boundary(source, end, continuation, opening_quote)
 
 
 def _has_token_boundaries(source: str, start: int, end: int, continuation: str) -> bool:
