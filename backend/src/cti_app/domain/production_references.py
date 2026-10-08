@@ -70,6 +70,9 @@ _TIER_ORDER = {
 
 class _CriticalitySource(Protocol):
     @property
+    def canonical_url(self) -> str: ...
+
+    @property
     def tier(self) -> ProductionReferenceTier: ...
 
     @property
@@ -113,7 +116,9 @@ def production_source_criticality(
     ):
         return ProductionSourceCriticality.CRITICAL, ProductionSourceCriticalityReason.PRIMARY_ROLE
 
-    other_sources = tuple(candidate for candidate in sources if candidate is not source)
+    other_sources = tuple(
+        candidate for candidate in sources if candidate.canonical_url != source.canonical_url
+    )
     primary_coverage_exists = any(
         getattr(candidate, "eligible_for_extraction", True)
         and (

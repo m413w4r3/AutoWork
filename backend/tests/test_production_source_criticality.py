@@ -168,6 +168,10 @@ def test_criticality_requires_explicit_redundancy_evidence() -> None:
         ProductionSourceCriticality.SECONDARY,
         ProductionSourceCriticalityReason.CONTENT_DUPLICATE,
     )
+    assert production_source_criticality(duplicate, sources=(replace(duplicate),)) == (
+        ProductionSourceCriticality.CRITICAL,
+        ProductionSourceCriticalityReason.COVERAGE_UNKNOWN,
+    )
 
 
 def test_source_failure_decision_is_allowed_by_the_database_contract() -> None:
