@@ -28,9 +28,16 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import editorial_enrichment_to_json
-from cti_app.domain.production_extraction import production_extraction_to_json
+from cti_app.domain.production_extraction import (
+    production_extraction_from_json,
+    production_extraction_hashes,
+    production_extraction_to_json,
+)
 from cti_app.domain.production_pipeline import production_artifact_stages
-from cti_app.domain.production_synthesis import production_synthesis_to_json
+from cti_app.domain.production_synthesis import (
+    production_synthesis_from_json,
+    production_synthesis_to_json,
+)
 from cti_app.domain.publication_document import serialize_publication_document
 from tests.editorial_enrichment_support import build_empty_editorial_enrichment
 from tests.test_publication_builder_v4 import _canonical_inputs
@@ -411,3 +418,28 @@ async def test_repair_diagnostics_record_the_canonical_outcome(tmp_path) -> None
     applied = next(event for event in events if event["event"] == "production.repair.applied")
     assert applied["action"] == "publication_reassembled"
     assert applied["projection_changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_repair_rebases_synthesis_built_on_a_legacy_extraction_hash() -> None:
+    service, uow, _projection, store, _checkpoint = _service(
+        ProductionRepairImpactKind.PUBLICATION_ONLY
+    )
+    extraction = production_extraction_from_json(store.payloads[UUID(int=11)])
+    current_hash, legacy_hash = production_extraction_hashes(extraction)
+    synthesis = production_synthesis_from_json(store.payloads[UUID(int=12)])
+    store.payloads[UUID(int=12)] = production_synthesis_to_json(
+        replace(synthesis, extraction_hash=legacy_hash)
+    )
+
+    result = await service.apply(edition_id=EDITION_ID, subject_id=SUBJECT_ID, actor_id="analyst")
+
+    assert result.action == "publication_reassembled"
+    rebased = [
+        item
+        for item in uow.artifacts.items
+        if item.stage is ProductionArtifactStage.SYNTHESIS and item.metadata.get("lineage_rebased")
+    ]
+    assert len(rebased) == 1
+    rebased_synthesis = production_synthesis_from_json(store.payloads[rebased[0].canonical_blob_id])
+    assert rebased_synthesis.extraction_hash == current_hash

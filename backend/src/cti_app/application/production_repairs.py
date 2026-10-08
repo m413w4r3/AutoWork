@@ -131,6 +131,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionOmissionReason,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    is_production_extraction_hash,
     production_extraction_from_json,
     production_extraction_to_json,
 )
@@ -4652,7 +4653,7 @@ class ProductionRepairMaterializationService:
                         previous = production_extraction_from_json(
                             await store.read_json(cast(UUID, prior.canonical_blob_id))
                         )
-                        if canonical_extraction_hash(previous) == synthesis.extraction_hash:
+                        if is_production_extraction_hash(previous, synthesis.extraction_hash):
                             lineage_found = True
                             break
                     if not lineage_found:
