@@ -177,6 +177,44 @@ async def test_enrichment_workflow_maps_canonical_service_result() -> None:
     }
 
 
+def test_empty_successful_enrichment_is_a_successful_workflow_stage() -> None:
+    run_id, subject_id = uuid4(), uuid4()
+    input_hash = "b" * 64
+    artifact = ProductionArtifact(
+        production_run_id=run_id,
+        subject_id=subject_id,
+        stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+        version=1,
+        input_hash=input_hash,
+        canonical_blob_id=uuid4(),
+    )
+    execution = SimpleNamespace(
+        status=EditorialEnrichmentExecutionStatus.SUCCEEDED,
+        input_hash=input_hash,
+        artifact=artifact,
+        model_run_id=None,
+        model_calls=2,
+        table_count=0,
+        chart_count=0,
+        diagram_count=0,
+        source_figure_count=0,
+        warnings=(),
+        details={},
+    )
+
+    result = ProductionWorkflowOrchestrator._editorial_enrichment_execution_result(execution)
+
+    assert result["status"] == "success"
+    assert result["artifact_id"] == str(artifact.id)
+    assert (result["tables"], result["charts"], result["diagrams"], result["source_figures"]) == (
+        0,
+        0,
+        0,
+        0,
+    )
+    assert "error" not in result
+
+
 def test_editorial_enrichment_cross_run_reuse_is_exposed_as_success() -> None:
     run_id, subject_id = uuid4(), uuid4()
     source_artifact_id = uuid4()

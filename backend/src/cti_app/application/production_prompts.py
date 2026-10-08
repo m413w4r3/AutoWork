@@ -196,12 +196,14 @@ only for concrete missing-coverage observations, never for publication prose:
 MISSING COVERAGE: <theme absent from the supplied evidence>
 @@END DIAGNOSTICS@@
 """
-EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v18-editorial-tables"
+# Editorial-only prompt changes preserve REFERENCES, EXTRACTION, RELEVANCE_PROJECTION,
+# and SYNTHESIS; only EDITORIAL_ENRICHMENT and its downstream PUBLICATION need rebuilding.
+EDITORIAL_ENRICHMENT_PROMPT_VERSION = "editorial-enrichment-text-blocks-v19-ioc-and-diagram-value"
 EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION = (
     "editorial-enrichment-block-contract-v13-editorial-tables"
 )
 EDITORIAL_ENRICHMENT_WIRE_PARSER_VERSION = "editorial-enrichment-wire-v14-atomic-diagram-relations"
-EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v6-editorial-tables"
+EDITORIAL_ENRICHMENT_REPAIR_PROMPT_VERSION = "editorial-enrichment-repair-v7-ioc-and-diagram-value"
 EDITORIAL_ENRICHMENT_REPAIR_CONTRACT_VERSION = (
     "editorial-enrichment-repair-contract-v6-editorial-tables"
 )
@@ -211,9 +213,11 @@ SEMANTIC_ANNOTATION_WIRE_PARSER_VERSION = "semantic-annotation-wire-v3-no-title"
 EDITORIAL_RESOURCE_PROPOSAL_PROMPT_VERSION = "editorial-resource-proposal-v1-bounded-web-search"
 EDITORIAL_RESOURCE_PROPOSAL_CONTRACT_VERSION = "editorial-resource-proposal-blocks-v1"
 EDITORIAL_RESOURCE_PROPOSAL_WIRE_PARSER_VERSION = "editorial-resource-proposal-wire-v1"
-EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = "editorial-enrichment-revision-v4-editorial-tables"
+EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION = (
+    "editorial-enrichment-revision-v5-ioc-and-diagram-value"
+)
 EDITORIAL_ENRICHMENT_REVISION_CONTRACT_VERSION = (
-    "editorial-enrichment-revision-contract-v4-editorial-tables"
+    "editorial-enrichment-revision-contract-v5-remove-element"
 )
 RELEVANCE_CLASSIFIER_PROMPT_VERSION = "subject-relevance-classifier-v5-other-case-out-of-scope"
 RELEVANCE_CLASSIFIER_CONTRACT_VERSION = "subject-relevance-text-blocks-v3-other-case-out-of-scope"

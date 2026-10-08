@@ -61,6 +61,7 @@ from cti_app.application.production_editorial_enrichment import (
     editorial_enrichment_model_run_id,
     editorial_enrichment_output_contract_example,
     parse_editorial_enrichment_proposal_wire,
+    revalidate_editorial_enrichment_quality,
     semantic_annotation_anchor_texts,
     validate_editorial_enrichment_proposal,
 )
@@ -99,7 +100,9 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
     DiagramNodeRole,
+    DiagramNodeV1,
     DiagramProfile,
     DiagramRelationDirection,
     DiagramRelationType,
@@ -109,10 +112,12 @@ from cti_app.domain.production_editorial_enrichment import (
     EditorialMediaType,
     EnrichmentDiagramDirection,
     EnrichmentPlacementKind,
+    EnrichmentPlacementV1,
     EnrichmentTableKind,
     ResolvedSourceFigureV1,
     SourceFigureDecision,
     SourceFigureLocatorV1,
+    TableRowV1,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
     source_figure_id,
@@ -292,6 +297,84 @@ def _synthesis(extraction: ProductionExtractionV1) -> ProductionSynthesisV1:
         uncertainties=(),
         warnings=(),
     )
+
+
+def _synthesis_with_anchor(
+    extraction: ProductionExtractionV1, sentence: str
+) -> ProductionSynthesisV1:
+    fact_refs = tuple(
+        ref for ref in extraction_evidence_refs_v1(extraction) if ref.kind is EvidenceKind.FACT
+    )
+    return replace(
+        _synthesis(extraction),
+        sections=(
+            SynthesisSectionV1(
+                SynthesisSectionKind.OVERVIEW,
+                "Overview",
+                (SynthesisParagraphV1(sentence, fact_refs),),
+            ),
+        ),
+    )
+
+
+def _confirmed_ioc(
+    value: str,
+    context: str,
+    artifact_type: ArtifactType = ArtifactType.IP,
+) -> ExtractionIndicatorV1:
+    return ExtractionIndicatorV1(
+        value=value,
+        artifact_type=artifact_type,
+        indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+        context=context,
+        evidence_quote=context,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+
+
+def _quality_inputs(
+    anchor: str = "The loader downloads the payload and starts execution.",
+    indicators: tuple[ExtractionIndicatorV1, ...] | None = None,
+) -> tuple[
+    ProductionInputSnapshot,
+    ProductionExtractionV1,
+    ProductionSynthesisV1,
+    EditorialEnrichmentEvidencePackV1,
+]:
+    snapshot = _snapshot()
+    facts = (
+        ExtractionFactV1(
+            category="malware",
+            value="ExampleRAT",
+            attack_id=None,
+            context="ExampleRAT launches execution.",
+            evidence_quote="ExampleRAT launches execution.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        ),
+        ExtractionFactV1(
+            category="infection_chain",
+            value=anchor,
+            attack_id=None,
+            context=anchor,
+            evidence_quote=anchor,
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        ),
+    )
+    confirmed_indicators = indicators or (
+        _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+        _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+    )
+    extraction = _extraction(
+        input_hash=snapshot.input_hash,
+        sources=(_source(facts=facts, indicators=confirmed_indicators),),
+    )
+    synthesis = _synthesis_with_anchor(extraction, anchor)
+    projection = build_relevance_projection(snapshot, extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis, projection)
+    return snapshot, extraction, synthesis, pack
 
 
 def _figure_inventory(
@@ -764,7 +847,7 @@ def test_invalid_diagram_groups_are_output_invalid_not_a_raw_domain_error(
     proposal = _proposal("E001").model_dump(mode="json")
     proposal["diagrams"][0]["groups"] = groups
 
-    validation_rejections = []
+    validation_rejections: list[enrichment_module.EditorialEnrichmentValidationRejection] = []
     enrichment = validate_editorial_enrichment_proposal(
         proposal,
         pack,
@@ -1459,6 +1542,417 @@ def test_single_row_table_is_rejected_with_code_and_warning() -> None:
         item.reason_code for item in parsed.rejections
     }
     assert "editorial_enrichment_table_single_row:T001" in parsed.warnings
+
+
+def test_projected_ioc_only_table_is_rejected_and_valid_sibling_survives() -> None:
+    _snapshot_value, _extraction_value, _synthesis_value, pack = _quality_inputs()
+    ioc_handles = {
+        str(record["value"]): str(record["handle"])
+        for record in pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record.get("value") == "ExampleRAT"
+    )
+    ioc_wire = _ioc_table_wire(
+        (
+            ("203.0.113[.]5", "IP", ioc_handles["203.0.113.5"]),
+            ("198.51.100[.]7", "IP", ioc_handles["198.51.100.7"]),
+        )
+    )
+    valid_sibling = _top_wire_block(_proposal_to_wire(_proposal(fact_handle)), "TABLE T001")
+
+    parsed = parse_editorial_enrichment_proposal_wire(f"{ioc_wire}\n\n{valid_sibling}", pack)
+
+    assert parsed.error_code is None
+    assert parsed.proposal is not None
+    assert [table.key for table in parsed.proposal.tables] == ["tools_table"]
+    rejection = next(item for item in parsed.rejected_blocks if item.block_id == "T900")
+    assert rejection.reason_codes == ("editorial_enrichment_table_ioc_republication",)
+    assert any(
+        item.reason_code == "editorial_enrichment_table_ioc_republication"
+        for item in parsed.rejections
+    )
+
+
+def test_defanged_projected_iocs_match_across_indicator_types() -> None:
+    values = (
+        ("evil[.]test", "Domain", ArtifactType.DOMAIN),
+        ("hxxps://cdn[.]evil[.]test/update", "URL", ArtifactType.URL),
+        ("A" * 64, "SHA-256", ArtifactType.HASH),
+        ("analyst[at]evil[.]test", "Email", ArtifactType.EMAIL),
+        ("203.0.113[.]5", "IP", ArtifactType.IP),
+    )
+    indicators = tuple(
+        _confirmed_ioc(value, f"Observed indicator {value}", artifact_type)
+        for value, _label, artifact_type in values
+    )
+    snapshot, extraction, synthesis, _projected_pack = _quality_inputs(indicators=indicators)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    handles = {
+        str(record["value"]): str(record["handle"])
+        for record in pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    wire = _ioc_table_wire(
+        tuple((value, label, handles[value]) for value, label, _artifact_type in values)
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.proposal is None
+    assert parsed.rejections[0].reason_code == "editorial_enrichment_table_ioc_republication"
+
+
+def test_projected_ioc_table_with_varying_analytic_attribute_is_accepted() -> None:
+    _snapshot_value, _extraction_value, _synthesis_value, pack = _quality_inputs()
+    ioc_handles = {
+        str(record["value"]): str(record["handle"])
+        for record in pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    wire = _ioc_table_wire(
+        (
+            ("203.0.113.5", "C2 endpoint", ioc_handles["203.0.113.5"]),
+            ("198.51.100.7", "Update server", ioc_handles["198.51.100.7"]),
+        ),
+        attribute_label="Role",
+    )
+
+    parsed = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert parsed.error_code is None
+    assert parsed.proposal is not None
+    assert [table.key for table in parsed.proposal.tables] == ["projected_iocs"]
+    assert "editorial_enrichment_table_ioc_republication" not in {
+        item.reason_code for item in parsed.rejections
+    }
+
+
+def test_direct_validation_drops_ioc_republication_as_one_block() -> None:
+    _snapshot_value, extraction, synthesis, pack = _quality_inputs()
+    ioc_handles = {
+        str(record["value"]): str(record["handle"])
+        for record in pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    table = _proposal(
+        next(
+            str(record["handle"])
+            for record in pack.narrative_evidence
+            if record.get("value") == "ExampleRAT"
+        )
+    ).tables[0]
+    ioc_table = table.model_copy(
+        update={
+            "rows": (
+                TableRowProposalV1(
+                    cells=("203.0.113.5", "IP"),
+                    evidence_handles=(ioc_handles["203.0.113.5"],),
+                ),
+                TableRowProposalV1(
+                    cells=("198.51.100.7", "IP"),
+                    evidence_handles=(ioc_handles["198.51.100.7"],),
+                ),
+            )
+        }
+    )
+    proposal = EditorialEnrichmentProposalV1(tables=(ioc_table,))
+    validation_rejections = []
+
+    enrichment = validate_editorial_enrichment_proposal(
+        proposal,
+        pack,
+        extraction,
+        synthesis,
+        validation_rejections=validation_rejections,
+    )
+
+    assert enrichment.tables == ()
+    assert len(validation_rejections) == 1
+    assert validation_rejections[0].reason_code == "editorial_enrichment_table_ioc_republication"
+
+
+def test_trivial_single_assertion_diagram_is_rejected_without_dropping_table() -> None:
+    anchor = "The loader downloads the payload and starts execution."
+    _snapshot_value, _extraction_value, _synthesis_value, pack = _quality_inputs(anchor)
+    evidence_handle = next(
+        str(record["handle"]) for record in pack.narrative_evidence if record.get("value") == anchor
+    )
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record.get("value") == "ExampleRAT"
+    )
+    trivial = _diagram_wire_for_quality(
+        (
+            ("loader", "Loader", "unknown"),
+            ("payload", "Payload", "unknown"),
+            ("execution", "Execution", "unknown"),
+        ),
+        (("loader", "payload", "downloads"), ("payload", "execution", "starts")),
+        evidence_handle=evidence_handle,
+    )
+    valid_sibling = _top_wire_block(_proposal_to_wire(_proposal(fact_handle)), "TABLE T001")
+
+    parsed = parse_editorial_enrichment_proposal_wire(f"{trivial}\n\n{valid_sibling}", pack)
+
+    assert parsed.error_code is None
+    assert parsed.proposal is not None
+    assert parsed.proposal.diagrams == ()
+    assert [table.key for table in parsed.proposal.tables] == ["tools_table"]
+    rejection = next(item for item in parsed.rejected_blocks if item.block_id == "D900")
+    assert rejection.reason_codes == ("editorial_enrichment_diagram_trivial",)
+
+
+def test_branch_and_role_distinct_pipeline_diagrams_are_accepted() -> None:
+    branch_anchor = "The loader downloads the payload, starts execution, and writes configuration."
+    _snapshot_value, _extraction_value, _synthesis_value, branch_pack = _quality_inputs(
+        branch_anchor
+    )
+    branch_handle = next(
+        str(record["handle"])
+        for record in branch_pack.narrative_evidence
+        if record.get("value") == branch_anchor
+    )
+    branch_wire = _diagram_wire_for_quality(
+        (
+            ("loader", "Loader", "unknown"),
+            ("payload", "Payload", "unknown"),
+            ("execution", "Execution", "unknown"),
+            ("configuration", "Configuration", "unknown"),
+        ),
+        (
+            ("loader", "payload", "downloads"),
+            ("loader", "execution", "starts"),
+            ("execution", "configuration", "writes"),
+        ),
+        evidence_handle=branch_handle,
+        key="branching_flow",
+    )
+    branch_result = parse_editorial_enrichment_proposal_wire(branch_wire, branch_pack)
+
+    assert branch_result.proposal is not None
+    assert [diagram.key for diagram in branch_result.proposal.diagrams] == ["branching_flow"]
+    assert "editorial_enrichment_diagram_trivial" not in {
+        item.reason_code for item in branch_result.rejections
+    }
+
+    pipeline_anchor = "The operator deploys a loader that contacts C2 and exfiltrates data."
+    _snapshot_value, _extraction_value, _synthesis_value, pipeline_pack = _quality_inputs(
+        pipeline_anchor
+    )
+    pipeline_handle = next(
+        str(record["handle"])
+        for record in pipeline_pack.narrative_evidence
+        if record.get("value") == pipeline_anchor
+    )
+    pipeline_wire = _diagram_wire_for_quality(
+        (
+            ("operator", "Operator", "actor"),
+            ("loader", "Loader", "malware_tool"),
+            ("c2", "C2", "infrastructure"),
+            ("data", "Data", "data_artifact"),
+        ),
+        (
+            ("operator", "loader", "deploys"),
+            ("loader", "c2", "contacts"),
+            ("c2", "data", "exfiltrates"),
+        ),
+        evidence_handle=pipeline_handle,
+        key="documented_pipeline",
+    )
+    pipeline_result = parse_editorial_enrichment_proposal_wire(pipeline_wire, pipeline_pack)
+
+    assert pipeline_result.proposal is not None
+    assert [diagram.key for diagram in pipeline_result.proposal.diagrams] == ["documented_pipeline"]
+
+    convergence_anchor = (
+        "The Qom unit builds a collection interface that sends records to central Arman. "
+        "The Sabzevar unit routes its interface through a relay before that relay feeds "
+        "central Arman."
+    )
+    _snapshot_value, _extraction_value, _synthesis_value, convergence_pack = _quality_inputs(
+        convergence_anchor
+    )
+    convergence_handle = next(
+        str(record["handle"])
+        for record in convergence_pack.narrative_evidence
+        if record.get("value") == convergence_anchor
+    )
+    convergence_wire = _diagram_wire_for_quality(
+        (
+            ("unit_one", "Qom unit", "unknown"),
+            ("qom_interface", "Qom collection interface", "unknown"),
+            ("unit_two", "Sabzevar unit", "unknown"),
+            ("sabzevar_interface", "Sabzevar interface", "unknown"),
+            ("relay", "Relay", "unknown"),
+            ("arman", "Central Arman system", "unknown"),
+        ),
+        (
+            ("unit_one", "qom_interface", "builds"),
+            ("qom_interface", "arman", "sends records to"),
+            ("unit_two", "sabzevar_interface", "routes"),
+            ("sabzevar_interface", "relay", "through"),
+            ("relay", "arman", "feeds"),
+        ),
+        evidence_handle=convergence_handle,
+        key="shared_architecture",
+    )
+    convergence_result = parse_editorial_enrichment_proposal_wire(
+        convergence_wire, convergence_pack
+    )
+
+    assert convergence_result.proposal is not None
+    assert [diagram.key for diagram in convergence_result.proposal.diagrams] == [
+        "shared_architecture"
+    ]
+
+
+def test_single_hop_branch_and_convergence_that_repeat_anchor_are_rejected() -> None:
+    branch_anchor = "The actor directs the OSINT team and leads a parallel malware effort."
+    _snapshot_value, _extraction_value, _synthesis_value, branch_pack = _quality_inputs(
+        branch_anchor
+    )
+    branch_handle = next(
+        str(record["handle"])
+        for record in branch_pack.narrative_evidence
+        if record.get("value") == branch_anchor
+    )
+    branch_wire = _diagram_wire_for_quality(
+        (
+            ("actor", "The actor", "actor"),
+            ("osint", "OSINT team", "technique_step"),
+            ("malware", "Malware effort", "malware_tool"),
+        ),
+        (
+            ("actor", "osint", "directs"),
+            ("actor", "malware", "leads in parallel"),
+        ),
+        evidence_handle=branch_handle,
+        key="repeated_branch",
+    )
+    parsed_branch = parse_editorial_enrichment_proposal_wire(branch_wire, branch_pack)
+
+    convergence_anchor = "The Qom unit and Sabzevar unit build interfaces for central Arman."
+    _snapshot_value, _extraction_value, _synthesis_value, convergence_pack = _quality_inputs(
+        convergence_anchor
+    )
+    convergence_handle = next(
+        str(record["handle"])
+        for record in convergence_pack.narrative_evidence
+        if record.get("value") == convergence_anchor
+    )
+    convergence_wire = _diagram_wire_for_quality(
+        (
+            ("qom", "Qom unit", "actor"),
+            ("sabzevar", "Sabzevar unit", "actor"),
+            ("arman", "Central Arman", "infrastructure"),
+        ),
+        (
+            ("qom", "arman", "builds interfaces for"),
+            ("sabzevar", "arman", "builds interfaces for"),
+        ),
+        evidence_handle=convergence_handle,
+        key="repeated_convergence",
+    )
+    parsed_convergence = parse_editorial_enrichment_proposal_wire(
+        convergence_wire, convergence_pack
+    )
+
+    assert parsed_branch.proposal is None
+    assert parsed_branch.rejections[0].reason_code == "editorial_enrichment_diagram_trivial"
+    assert parsed_convergence.proposal is None
+    assert parsed_convergence.rejections[0].reason_code == "editorial_enrichment_diagram_trivial"
+
+
+def test_existing_enrichment_quality_revalidation_is_read_only_and_model_free() -> None:
+    snapshot, extraction, synthesis, pack = _quality_inputs()
+    projection = build_relevance_projection(snapshot, extraction)
+    fact_handle = next(
+        str(record["handle"])
+        for record in pack.narrative_evidence
+        if record.get("value") == "ExampleRAT"
+    )
+    enrichment = validate_editorial_enrichment_proposal(
+        _proposal(fact_handle), pack, extraction, synthesis
+    )
+    ioc_ref_by_value = {
+        str(record["value"]): pack.resolve_handle(str(record["handle"]))
+        for record in pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    table = replace(
+        enrichment.tables[0],
+        key="ioc_republication",
+        rows=(
+            TableRowV1(
+                cells=("203.0.113.5", "IP"),
+                evidence_refs=(ioc_ref_by_value["203.0.113.5"],),
+            ),
+            TableRowV1(
+                cells=("198.51.100.7", "IP"),
+                evidence_refs=(ioc_ref_by_value["198.51.100.7"],),
+            ),
+        ),
+    )
+    fact_ref = enrichment.diagrams[0].nodes[0].evidence_refs[0]
+    graph = replace(
+        enrichment.diagrams[0],
+        key="trivial_graph",
+        nodes=(
+            DiagramNodeV1("loader", "Loader", (fact_ref,)),
+            DiagramNodeV1("payload", "Payload", (fact_ref,)),
+            DiagramNodeV1("execution", "Execution", (fact_ref,)),
+        ),
+        edges=(
+            DiagramEdgeV1(
+                "loader",
+                "payload",
+                "downloads",
+                (fact_ref,),
+                DiagramRelationType.FACTUAL,
+                DiagramRelationDirection.DIRECTED,
+            ),
+            DiagramEdgeV1(
+                "payload",
+                "execution",
+                "starts",
+                (fact_ref,),
+                DiagramRelationType.FACTUAL,
+                DiagramRelationDirection.DIRECTED,
+            ),
+        ),
+        groups=(),
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.AFTER_SECTION, 0),
+    )
+    existing_artifact = replace(enrichment, tables=(table,), diagrams=(graph,))
+    before = json.dumps(editorial_enrichment_to_json(existing_artifact), sort_keys=True)
+
+    rejections = revalidate_editorial_enrichment_quality(
+        existing_artifact,
+        extraction=extraction,
+        synthesis=synthesis,
+        projection=projection,
+    )
+    stored_lineage_rejections = revalidate_editorial_enrichment_quality(
+        existing_artifact,
+        extraction=extraction,
+        synthesis=synthesis,
+        projection=projection,
+        expected_extraction_hash=enrichment.extraction_hash,
+        expected_projection_hash=projection.projection_hash,
+        expected_synthesis_hash=enrichment.synthesis_hash,
+    )
+
+    assert {(item.kind, item.block_id, item.reason_code) for item in rejections} == {
+        ("TABLE", "ioc_republication", "editorial_enrichment_table_ioc_republication"),
+        ("DIAGRAM", "trivial_graph", "editorial_enrichment_diagram_trivial"),
+    }
+    assert stored_lineage_rejections == rejections
+    assert json.dumps(editorial_enrichment_to_json(existing_artifact), sort_keys=True) == before
 
 
 def test_fixture_e_trivial_prose_accepts_nothing() -> None:
@@ -2371,7 +2865,7 @@ def test_model_request_is_stateless_versioned_and_uses_exact_route() -> None:
     assert "ExampleRAT execution architecture" in request.text
     assert "blob_id" not in request.text
     assert "RELATION_TYPE: factual | inference | comparison" in request.text
-    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v8-editorial-tables"
+    assert EDITORIAL_ENRICHMENT_GENERATOR_VERSION == "model-text-blocks-v9-analytic-value"
     assert EDITORIAL_ENRICHMENT_PROPOSAL_CONTRACT_VERSION == (
         "editorial-enrichment-block-contract-v13-editorial-tables"
     )
@@ -2479,7 +2973,7 @@ def test_validator_version_changes_artifact_identity_without_changing_invocation
     artifact_after = compute_editorial_enrichment_input_hash(**common)
 
     assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
-        "editorial-enrichment-validator-v17-www-domain-aliases"
+        "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
     )
     assert invocation_before == invocation_after
     assert artifact_before != artifact_after
@@ -2893,6 +3387,103 @@ def _proposal_to_wire(proposal: EditorialEnrichmentProposalV1) -> str:
     return "\n".join(lines) if lines else "NO USEFUL ENRICHMENT"
 
 
+def _ioc_table_wire(
+    rows: tuple[tuple[str, str, str], ...],
+    *,
+    attribute_label: str = "Type",
+    table_key: str = "projected_iocs",
+) -> str:
+    handles = tuple(sorted({handle for _value, _attribute, handle in rows}))
+    lines = [
+        "TABLE T900",
+        f"KEY: {table_key}",
+        "KIND: infrastructure",
+        "TITLE: Projected IOC values",
+        "PURPOSE: Which listed endpoints are documented?",
+        "DATA: The projected indicators and their table attributes.",
+        "GAIN: A row-by-row mapping makes the documented attribute visible.",
+        "SCOPE: Only confirmed indicators admitted by the relevance projection.",
+        f"PURPOSE_EVIDENCE: {', '.join(handles)}",
+        "LIMITS: No additional infrastructure relationship is asserted.",
+        "PLACEMENT: after_section",
+        "SECTION_INDEX: 0",
+        "PLACEMENT_REASON: Beside the paragraph that introduces the endpoints.",
+        "COLUMN C900_001",
+        "KEY: indicator",
+        "LABEL: Indicator",
+        "END COLUMN",
+        "COLUMN C900_002",
+        "KEY: attribute",
+        f"LABEL: {attribute_label}",
+        "END COLUMN",
+    ]
+    for index, (value, attribute, handle) in enumerate(rows, start=1):
+        lines.extend(
+            (
+                f"ROW R900_{index:03d}",
+                f"CELL: {value}",
+                f"CELL: {attribute}",
+                f"EVIDENCE: {handle}",
+                "END ROW",
+            )
+        )
+    lines.append("END TABLE")
+    return "\n".join(lines)
+
+
+def _diagram_wire_for_quality(
+    nodes: tuple[tuple[str, str, str], ...],
+    edges: tuple[tuple[str, str, str], ...],
+    *,
+    evidence_handle: str,
+    key: str = "quality_graph",
+) -> str:
+    lines = [
+        "DIAGRAM D900",
+        f"KEY: {key}",
+        "KIND: execution_sequence",
+        "PROFILE: flow",
+        "TITLE: Documented process",
+        "CAPTION: Stages documented by the cited source.",
+        "PURPOSE: How does the documented process proceed?",
+        "DATA: The steps stated in the cited sentence.",
+        "GAIN: The structure makes the process relationships visible.",
+        "SCOPE: Only steps stated in the cited sentence.",
+        f"PURPOSE_EVIDENCE: {evidence_handle}",
+        "LIMITS: No later stages are inferred.",
+        "DIRECTION: left_to_right",
+        "PLACEMENT: after_section",
+        "SECTION_INDEX: 0",
+        "PLACEMENT_REASON: Beside the sentence describing the process.",
+    ]
+    for index, (node_id, label, role) in enumerate(nodes, start=1):
+        lines.extend(
+            (
+                f"NODE N900_{index:03d}",
+                f"ID: {node_id}",
+                f"ROLE: {role}",
+                f"LABEL: {label}",
+                f"EVIDENCE: {evidence_handle}",
+                "END NODE",
+            )
+        )
+    for index, (source, target, label) in enumerate(edges, start=1):
+        lines.extend(
+            (
+                f"RELATION L900_{index:03d}",
+                f"FROM: {source}",
+                f"TO: {target}",
+                "RELATION_TYPE: factual",
+                "DIRECTION: directed",
+                f"LABEL: {label}",
+                f"EVIDENCE: {evidence_handle}",
+                "END RELATION",
+            )
+        )
+    lines.append("END DIAGRAM")
+    return "\n".join(lines)
+
+
 def _document(*, do_not_submit: bool = False) -> SourceDocument:
     return SourceDocument(
         id=_DOCUMENT_ID,
@@ -3166,6 +3757,101 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
     assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
     assert (result.table_count, result.diagram_count, result.model_calls) == (0, 0, 2)
     assert len(world.writer.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_rejecting_every_quality_block_can_store_an_empty_success() -> None:
+    anchor = "ExampleRAT downloads the payload and starts execution."
+    wire_payload = {"value": ""}
+
+    def respond(request: ModelRequest) -> ModelExecution:
+        if request.prompt_template_id == "production-editorial-enrichment-repair":
+            return _succeeded_text(request, "NO USEFUL ENRICHMENT")
+        return _succeeded_text(request, wire_payload["value"])
+
+    world = _world(_RecordingGateway(respond))
+    existing_fact = world.extraction.sources[0].facts[0]
+    anchor_fact = ExtractionFactV1(
+        category="infection_chain",
+        value=anchor,
+        attack_id=None,
+        context=anchor,
+        evidence_quote=anchor,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    indicators = (
+        _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+        _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+    )
+    extraction = _extraction(
+        subject_id=world.snapshot.subject_id,
+        input_hash=world.snapshot.input_hash,
+        sources=(_source(facts=(existing_fact, anchor_fact), indicators=indicators),),
+    )
+    synthesis = _synthesis_with_anchor(extraction, anchor)
+    world.extraction = extraction
+    world.synthesis = synthesis
+    world.extraction_artifact = replace(
+        world.extraction_artifact,
+        canonical_blob_id=world.store.put(production_extraction_to_json(extraction)),
+    )
+    world.synthesis_artifact = replace(
+        world.synthesis_artifact,
+        canonical_blob_id=world.store.put(production_synthesis_to_json(synthesis)),
+    )
+
+    evidence_pack = build_editorial_enrichment_evidence_pack(world.snapshot, extraction, synthesis)
+    ioc_handles = {
+        str(record["value"]): str(record["handle"])
+        for record in evidence_pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    ioc_wire = _ioc_table_wire(
+        (
+            ("203.0.113[.]5", "IP", ioc_handles["203.0.113.5"]),
+            ("198.51.100[.]7", "IP", ioc_handles["198.51.100.7"]),
+        )
+    )
+    anchor_handle = next(
+        str(record["handle"])
+        for record in evidence_pack.narrative_evidence
+        if record.get("value") == anchor
+    )
+    trivial_diagram = _diagram_wire_for_quality(
+        (
+            ("malware", "ExampleRAT", "unknown"),
+            ("payload", "Payload", "unknown"),
+            ("execution", "Execution", "unknown"),
+        ),
+        (("malware", "payload", "downloads"), ("payload", "execution", "starts")),
+        evidence_handle=anchor_handle,
+    )
+
+    wire_payload["value"] = f"{ioc_wire}\n\n{trivial_diagram}"
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.error_code is None
+    assert (result.table_count, result.diagram_count, result.source_figure_count) == (0, 0, 0)
+    assert len(world.writer.calls) == 1
+    stored = world.writer.calls[0]["enrichment"]
+    assert stored.tables == stored.diagrams == ()  # type: ignore[attr-defined]
+    metadata = world.writer.calls[0]["metadata_extra"]
+    wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+    rejection_codes = {item["reason_code"] for item in wire_details["final_rejections"]}
+    assert rejection_codes == {
+        "editorial_enrichment_table_ioc_republication",
+        "editorial_enrichment_diagram_trivial",
+    }
+    request_ids = [request.prompt_template_id for request, _schema in world.gateway.calls]
+    assert request_ids.count("production-editorial-enrichment-repair") == 1
+    assert request_ids.count("production-editorial-enrichment") == 1
+    assert set(request_ids) <= {
+        "production-editorial-enrichment",
+        "production-editorial-enrichment-repair",
+        "production-semantic-annotation",
+    }
 
 
 @pytest.mark.asyncio
@@ -3690,10 +4376,50 @@ async def _revision_harness(
     gateway: _RecordingGateway,
     *,
     collection: SourceCollection | None = None,
+    indicators: tuple[ExtractionIndicatorV1, ...] = (),
+    anchor: str | None = None,
 ) -> SimpleNamespace:
     from cti_app.application.publication_assembly import PublicationAssemblyService
 
     world = _world(gateway)
+    if indicators or anchor is not None:
+        source = world.extraction.sources[0]
+        facts = source.facts
+        if anchor is not None:
+            facts = (
+                *facts,
+                ExtractionFactV1(
+                    category="infection_chain",
+                    value=anchor,
+                    attack_id=None,
+                    context=anchor,
+                    evidence_quote=anchor,
+                    evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                    source_document_ids=(_DOCUMENT_ID,),
+                ),
+            )
+        source = replace(
+            source,
+            facts=facts,
+            indicators=indicators if indicators else source.indicators,
+        )
+        world.extraction = replace(world.extraction, sources=(source,))
+        world.synthesis = (
+            _synthesis_with_anchor(world.extraction, anchor)
+            if anchor is not None
+            else replace(
+                world.synthesis,
+                extraction_hash=canonical_extraction_hash(world.extraction),
+            )
+        )
+        world.extraction_artifact = replace(
+            world.extraction_artifact,
+            canonical_blob_id=world.store.put(production_extraction_to_json(world.extraction)),
+        )
+        world.synthesis_artifact = replace(
+            world.synthesis_artifact,
+            canonical_blob_id=world.store.put(production_synthesis_to_json(world.synthesis)),
+        )
     inventory = _figure_inventory(world.extraction)
 
     async def load_inventory(**_kwargs: object) -> SourceFigureInventoryResult:
@@ -3727,8 +4453,13 @@ async def _revision_harness(
         access_policy_hash=access_hash,
         source_figure_inventory_hash=inventory_hash,
     )
+    fact_handle = next(
+        str(record["handle"])
+        for record in evidence_pack.narrative_evidence
+        if record.get("value") == "ExampleRAT"
+    )
     enrichment = validate_editorial_enrichment_proposal(
-        _proposal("E001"), evidence_pack, world.extraction, world.synthesis
+        _proposal(fact_handle), evidence_pack, world.extraction, world.synthesis
     )
     base_payload = editorial_enrichment_to_json(enrichment)
     base = ProductionArtifact(
@@ -3834,6 +4565,7 @@ async def _revision_harness(
         artifacts=artifacts,
         base=base,
         base_payload=base_payload,
+        evidence_pack=evidence_pack,
         base_sha256=hashlib.sha256(
             await world.store.read_bytes(base.canonical_blob_id)
         ).hexdigest(),
@@ -3883,6 +4615,10 @@ async def test_element_revision_appends_one_version_carries_other_elements_and_i
     request = world.world.gateway.calls[0][0]
     assert request.prompt_template_id == "production-editorial-enrichment"
     assert request.prompt_template_version == EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+    assert (
+        "Qu'est-ce que le lecteur comprend mieux grâce à cet élément ?"
+        in json.loads(request.text)["instructions"]
+    )
     assert request.parameters["contract_version"].startswith(
         "editorial-enrichment-revision-contract-"
     )
@@ -3911,6 +4647,106 @@ async def test_element_revision_appends_one_version_carries_other_elements_and_i
         result.artifact.metadata["evidence_pack_hash"] == world.base.metadata["evidence_pack_hash"]
     )
     assert result.previous_publication_artifact_id is not None
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_can_remove_one_table_and_keep_its_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT")),
+    )
+    args = _revision_args(world)
+    args["action"] = EditorialEnrichmentRevisionAction.REMOVE_ELEMENT
+    args["instruction"] = "Remove this table because it adds no analytic value."
+
+    result = await world.service.revise(**args)
+    assert result.artifact.canonical_blob_id is not None
+    revised_payload = await world.world.store.read_json(result.artifact.canonical_blob_id)
+
+    assert result.outcome is EditorialEnrichmentRevisionOutcome.REVISED
+    assert result.revision["element_after"] is None
+    assert revised_payload["tables"] == []
+    assert len(revised_payload["diagrams"]) == 1
+    assert len(world.world.gateway.calls) == 1
+    request = world.world.gateway.calls[0][0]
+    assert request.prompt_template_version == EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION
+    assert "remove_element" in json.loads(request.text)["instructions"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_revision_can_remove_one_diagram_and_keep_its_siblings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "NO USEFUL ENRICHMENT")),
+    )
+    args = _revision_args(world)
+    args.update(
+        {
+            "element_kind": EditorialEnrichmentElementKind.DIAGRAM,
+            "element_key": "infection_chain",
+            "action": EditorialEnrichmentRevisionAction.REMOVE_ELEMENT,
+        }
+    )
+
+    result = await world.service.revise(**args)
+    revised_payload = await world.world.store.read_json(result.artifact.canonical_blob_id)
+
+    assert result.outcome is EditorialEnrichmentRevisionOutcome.REVISED
+    assert result.revision["element_after"] is None
+    assert len(revised_payload["tables"]) == 1
+    assert revised_payload["diagrams"] == []
+
+
+@pytest.mark.asyncio
+async def test_revision_rejects_trivial_diagram_through_shared_block_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    anchor = "ExampleRAT downloads the payload and starts execution."
+
+    def propose_trivial_diagram(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        fact = next(
+            record
+            for record in prompt["admitted_evidence_pack"]["narrative_evidence"]
+            if record.get("value") == anchor
+        )
+        wire = _diagram_wire_for_quality(
+            (
+                ("rat", "ExampleRAT", "unknown"),
+                ("payload", "Payload", "unknown"),
+                ("execution", "Execution", "unknown"),
+            ),
+            (("rat", "payload", "downloads"), ("payload", "execution", "starts")),
+            evidence_handle=str(fact["handle"]),
+            key="infection_chain",
+        )
+        return _succeeded_text(request, wire)
+
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(propose_trivial_diagram),
+        anchor=anchor,
+    )
+    args = _revision_args(world)
+    args.update(
+        {
+            "element_kind": EditorialEnrichmentElementKind.DIAGRAM,
+            "element_key": "infection_chain",
+            "action": EditorialEnrichmentRevisionAction.DETAIL_DIAGRAM,
+        }
+    )
+
+    with pytest.raises(EditorialEnrichmentRevisionValidationError) as rejected:
+        await world.service.revise(**args)
+
+    assert any(
+        item["reason_code"] == "editorial_enrichment_diagram_trivial"
+        for item in rejected.value.rejections
+    )
 
 
 @pytest.mark.asyncio
@@ -4054,6 +4890,46 @@ async def test_revision_surfaces_validator_rejections_and_rejects_oversized_inst
     with pytest.raises(ValueError, match="editorial_enrichment_revision_instruction_invalid"):
         await oversized.service.revise(**args)
     assert oversized.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_revision_rejects_ioc_republication_through_shared_block_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def propose_ioc_list(request: ModelRequest) -> ModelExecution:
+        prompt = json.loads(request.text)
+        technical = prompt["admitted_evidence_pack"]["technical_evidence"]
+        handles = {
+            str(record["value"]): str(record["handle"])
+            for record in technical
+            if record.get("kind") == EvidenceKind.INDICATOR.value
+        }
+        wire = _ioc_table_wire(
+            (
+                ("203.0.113.5", "IP", handles["203.0.113.5"]),
+                ("198.51.100.7", "IP", handles["198.51.100.7"]),
+            ),
+            table_key="tools_table",
+        )
+        return _succeeded_text(request, wire)
+
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(propose_ioc_list),
+        indicators=(
+            _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+            _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+        ),
+    )
+
+    with pytest.raises(EditorialEnrichmentRevisionValidationError) as rejected:
+        await world.service.revise(**_revision_args(world))
+
+    assert any(
+        item["reason_code"] == "editorial_enrichment_table_ioc_republication"
+        for item in rejected.value.rejections
+    )
+    assert len(world.world.gateway.calls) == 1
 
 
 def _real_run_evidence_pack() -> EditorialEnrichmentEvidencePackV1:
@@ -4772,6 +5648,10 @@ async def test_enrichment_and_repair_prompts_keep_the_text_block_contract() -> N
     prompt = json.loads(request.text)
     assert "ne produis pas de bloc QUESTION" in prompt["instructions"]
     assert "Do not return JSON" in prompt["instructions"]
+    assert (
+        "Qu'est-ce que le lecteur comprend mieux grâce à cet élément ?" in prompt["output_contract"]
+    )
+    assert "projected IOC values" in prompt["output_contract"]
     rejected_block = enrichment_module.EditorialEnrichmentRejectedBlock(
         kind="DIAGRAM",
         block_id="D001",
@@ -4790,6 +5670,10 @@ async def test_enrichment_and_repair_prompts_keep_the_text_block_contract() -> N
     assert "END NODE" in repair_prompt["instructions"]
     assert "END RELATION" in repair_prompt["instructions"]
     assert "END DIAGRAM" in repair_prompt["instructions"]
+    assert (
+        "Qu'est-ce que le lecteur comprend mieux grâce à cet élément ?"
+        in repair_prompt["instructions"]
+    )
 
     for prompt_text in (
         prompt["instructions"] + prompt["output_contract"],
