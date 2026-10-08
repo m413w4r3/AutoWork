@@ -255,8 +255,11 @@ endpoint. Les relations d'infection gardent leur exigence de séquence
 documentée; les indications de contre-preuve et les relations de projection
 inter-sources restent bloquantes.
 
-Cette règle est versionnée par `editorial-enrichment-v12-shared-diagram-attestation`
-et le validateur `editorial-enrichment-validator-v19-shared-diagram-attestation`.
+Cette règle est versionnée par le seul validateur
+`editorial-enrichment-validator-v19-shared-diagram-attestation`. La version de
+politique du schéma (`editorial-enrichment-v11-editorial-tables`) reste inchangée :
+la forme des artifacts stockés n'évolue pas, et la changer rendrait tous les
+enrichissements existants « non supportés » (régression constatée puis corrigée).
 
 ## Correctif — validation d'un patch sans chapeau
 
