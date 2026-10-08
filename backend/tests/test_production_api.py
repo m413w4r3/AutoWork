@@ -2185,6 +2185,42 @@ async def test_legacy_synthesis_artifact_keeps_rendered_content(
     assert response.json()["rendered_content"] == "legacy synthesis text"
 
 
+async def test_synthesis_artifact_exposes_server_derived_revision_targets(
+    api: AsyncClient,
+    uow: _Uow,
+    production_app: FastAPI,
+) -> None:
+    subject_id = uuid4()
+    run = _terminal_run(uuid4(), subject_id, status=ProductionRunStatus.FAILED)
+    await uow.production_runs.add(run)
+    artifact = _artifact(run, ProductionArtifactStage.SYNTHESIS)
+    canonical_blob_id = uuid4()
+    artifact.canonical_blob_id = canonical_blob_id
+    production_app.state.production_artifact_store.payloads[canonical_blob_id] = {
+        "title": "Titre initial",
+        "lead": [{"text": "Ouverture", "evidence_refs": []}],
+        "sections": [
+            {
+                "heading": "Contexte",
+                "paragraphs": [{"text": "Premier fait", "evidence_refs": []}],
+            }
+        ],
+    }
+    await uow.production_artifacts.append(artifact)
+
+    response = await api.get(f"/api/subjects/{subject_id}/production/artifacts/synthesis")
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["production_run_id"] == str(run.id)
+    title_target = next(item for item in payload["revision_targets"] if item["label"] == "Titre")
+    assert title_target["operations"] == ["rewrite_title"]
+    paragraph = next(
+        item for item in payload["revision_targets"] if item["label"].startswith("Paragraphe · Contexte")
+    )
+    assert len(paragraph["target"]["stable_ids"][0]) == 64
+
+
 async def test_retry_by_run_changes_only_the_requested_run(
     api: AsyncClient,
     uow: _Uow,

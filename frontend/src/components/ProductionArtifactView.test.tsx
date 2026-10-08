@@ -72,10 +72,41 @@ function synthesisArtifact(
 ) {
   return {
     artifact_id: "synthesis-1",
+    production_run_id: "run-1",
     stage: "synthesis",
     version: 1,
     status: "verified",
+    input_hash: "a".repeat(64),
+    canonical_sha256: "b".repeat(64),
     metadata: { mode: "fresh", language: "fr" },
+    revision_targets: [
+      {
+        id: "title-target",
+        label: "Titre",
+        summary: "Campagne Cavern Manticore",
+        target: {
+          kind: "title",
+          stable_ids: [],
+          parent_id: null,
+          anchor_id: null,
+          insert_after: false,
+        },
+        operations: ["rewrite_title"],
+      },
+      {
+        id: "paragraph-target",
+        label: "Paragraphe · Chaîne observée",
+        summary: "Le leurre déclenche une chaîne PowerShell.",
+        target: {
+          kind: "section_paragraph",
+          stable_ids: ["d".repeat(64)],
+          parent_id: "e".repeat(64),
+          anchor_id: null,
+          insert_after: false,
+        },
+        operations: ["rewrite_paragraph", "delete_paragraph"],
+      },
+    ],
     rendered_content: null,
     canonical_content: {
       schema_version: 2,
@@ -204,12 +235,47 @@ function renderArtifact(
 function revisionBaseArtifact(version = 2) {
   return {
     artifact_id: "editorial-enrichment-base",
+    production_run_id: "run-1",
     stage: "editorial_enrichment",
     version,
     status: "verified",
     input_hash: "a".repeat(64),
     canonical_sha256: "b".repeat(64),
     metadata: {},
+    revision_targets: [
+      {
+        id: "table-target",
+        label: "Tableau · Outils observés",
+        summary: "Outils observés",
+        target: {
+          kind: "enrichment_element",
+          stable_ids: [],
+          parent_id: null,
+          anchor_id: null,
+          insert_after: false,
+          element_kind: "table",
+          element_key: "tools_table",
+          placement: null,
+        },
+        operations: ["rewrite_table", "delete_table"],
+      },
+      {
+        id: "chart-create-target",
+        label: "Graphique · créer",
+        summary: "Nouvel élément placé après le chapeau",
+        target: {
+          kind: "enrichment_element",
+          stable_ids: [],
+          parent_id: null,
+          anchor_id: null,
+          insert_after: false,
+          element_kind: "chart",
+          element_key: null,
+          placement: { kind: "after_lead", section_id: null },
+        },
+        operations: ["create_chart"],
+      },
+    ],
     canonical_content: {
       tables: [
         {
@@ -219,107 +285,169 @@ function revisionBaseArtifact(version = 2) {
         },
       ],
       diagrams: [{ key: "infection_chain", title: "Séquence observée" }],
+      charts: [],
       source_figures: [],
     },
   };
 }
 
-function revisionResponse(outcome: "revised" | "needs_new_evidence") {
+function targetedPreview(overrides: Record<string, unknown> = {}) {
   return {
-    outcome,
-    request_identity: "revision-request-identity",
-    artifact_id: "editorial-enrichment-revision",
-    artifact_version: 3,
-    artifact_input_hash: "a".repeat(64),
-    artifact_canonical_sha256: "c".repeat(64),
-    publication_artifact_id: "publication-revision",
-    publication_artifact_version: 2,
-    previous_publication_artifact_id: "publication-previous",
-    revision: {
-      request_identity: "revision-request-identity",
-      outcome,
-      element_kind: "table",
-      element_key: "tools_table",
-      action: "improve_table",
-      instruction: "Clarifier la table sans ajouter de faits.",
-      base_artifact_id: "editorial-enrichment-base",
-      base_version: 2,
-      element_evidence_handles: ["E001"],
-      admitted_evidence_handles: ["E001", "E002"],
-      element_before: { title: "Outils observés" },
-      element_after: { title: "Outils documentés" },
-      validator_results: [
-        { validator: "l8_enrichment_grounding", status: "passed" },
-      ],
-      validator_rejections: [],
-      parse_identity: "parse-identity",
-      previous_publication_artifact_id: "publication-previous",
-      resource_need:
-        outcome === "needs_new_evidence"
-          ? {
-              key: "N001",
-              kind: "TECHNICAL_ANALYSIS",
-              reason: "Le détail demandé est absent des preuves admises.",
-              query_hint: "ExampleRAT détail protocole",
-            }
-          : null,
-    },
+    base_artifact_id: "synthesis-1",
+    base_version: 1,
+    base_input_hash: "a".repeat(64),
+    base_canonical_sha256: "b".repeat(64),
+    target_path: "synthesis.title",
+    stages_preserved: ["references", "extraction"],
+    stages_invalidated: ["publication"],
+    stages_conditionally_rebased: ["editorial_enrichment"],
+    source_extension: false,
+    expected_model_calls: 1,
+    enrichment_rebase: "revalidate_anchors_and_evidence",
+    before_hash: "c".repeat(64),
+    source_additions: [],
+    source_additions_hash: null,
+    source_addition_ready: null,
+    source_addition_blockers: [],
+    expected_model_calls_by_stage: { synthesis_revision: { remaining: 1 } },
+    stages_rebased: [],
+    historical_artifacts_preserved: true,
+    refusal: null,
+    ...overrides,
   };
 }
 
-function stubRevisionFetch(
-  revision: ReturnType<typeof revisionResponse> | null,
-  revisionStatus = 200,
-  errorDetail: Record<string, unknown> = {
-    code: "editorial_enrichment_stale_base",
-    message: "L'artifact de base a changé.",
-  },
+function lineageResponse(artifactId: string) {
+  return {
+    artifact_id: artifactId,
+    production_run_id: "run-1",
+    revisions:
+      artifactId === "revision-result"
+        ? [
+            {
+              revision_id: "revision-1",
+              request_identity: "request-1",
+              base_artifact_id: "synthesis-1",
+              base_artifact_hash: "b".repeat(64),
+              target: {
+                kind: "title",
+                stable_ids: [],
+                parent_id: null,
+                anchor_id: null,
+                insert_after: false,
+              },
+              target_path: "synthesis.title",
+              operation: "rewrite_title",
+              request: "Corrige uniquement le titre.",
+              mode: "existing_evidence_only",
+              actor: "test-operator",
+              model_run_id: "model-run-1",
+              prompt_version: "prompt-1",
+              contract_version: "contract-1",
+              parser_version: "parser-1",
+              validator_version: "validator-1",
+              evidence_refs: [],
+              evidence_handles: ["E001"],
+              source_additions: [],
+              before_hash: "c".repeat(64),
+              after_hash: "d".repeat(64),
+              rationale: "Clarification demandée.",
+              created_at: "2026-10-08T10:00:00Z",
+              result_artifact_id: artifactId,
+              previous_publication_artifact_id: null,
+            },
+          ]
+        : [],
+    paragraph_provenance: {
+      paragraph_1: {
+        origin: "initial",
+        artifact_id: artifactId,
+        revision_id: null,
+      },
+    },
+    element_provenance: {},
+  };
+}
+
+function stubTargetedFetch(
+  options: {
+    preview?: Record<string, unknown>;
+    applyStatus?: number;
+    applyDetail?: Record<string, unknown>;
+  } = {},
 ) {
-  const currentArtifact = revisionBaseArtifact();
+  const postBodies: Array<{ url: string; body: Record<string, unknown> }> = [];
   const fetchMock = vi.fn(
     (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
       const url = urlOf(input);
+      if (init?.method === "POST" && init.body) {
+        const body =
+          typeof init.body === "string"
+            ? (JSON.parse(init.body) as Record<string, unknown>)
+            : {};
+        postBodies.push({ url, body });
+      }
+      if (url.endsWith("/production/artifacts/synthesis")) {
+        return Promise.resolve(Response.json(synthesisArtifact()));
+      }
       if (url.endsWith("/production/artifacts/editorial_enrichment")) {
-        return Promise.resolve(Response.json(currentArtifact));
+        return Promise.resolve(Response.json(revisionBaseArtifact()));
       }
-      if (
-        url.includes("/production/artifacts/editorial_enrichment/revisions")
-      ) {
-        if (revisionStatus !== 200) {
-          return Promise.resolve(
-            new Response(JSON.stringify({ detail: errorDetail }), {
-              status: revisionStatus,
-              headers: { "Content-Type": "application/json" },
-            }),
-          );
-        }
-        expect(init?.method).toBe("POST");
-        if (revision?.outcome === "revised") {
-          currentArtifact.artifact_id = revision.artifact_id;
-          currentArtifact.version = revision.artifact_version;
-          currentArtifact.canonical_sha256 = revision.artifact_canonical_sha256;
-        }
-        return Promise.resolve(Response.json(revision));
+      if (url.endsWith("/production/artifacts/extraction")) {
+        return Promise.resolve(Response.json(extractionArtifact([])));
       }
-      if (url.includes("/production/artifacts/editorial_enrichment/")) {
+      if (url.includes("/revision-lineage")) {
+        const artifactId =
+          url.split("/production/artifacts/")[1]?.split("/")[0] ?? "unknown";
+        return Promise.resolve(Response.json(lineageResponse(artifactId)));
+      }
+      if (url.endsWith("/source-additions/candidates")) {
         return Promise.resolve(
-          Response.json({
-            ...revisionBaseArtifact(),
-            artifact_id: "editorial-enrichment-base",
-            canonical_content: { history_label: "Ancienne version conservée" },
-          }),
+          Response.json({ addition: { state: "candidate" } }),
         );
       }
-      if (url.includes("/publication/preview")) {
+      if (url.endsWith("/source-additions/select")) {
+        return Promise.resolve(
+          Response.json({ addition: { state: "selected" } }),
+        );
+      }
+      if (url.endsWith("/source-additions/acquire")) {
+        return Promise.resolve(
+          Response.json({ addition: { state: "ready" }, refusal: null }),
+        );
+      }
+      if (url.endsWith("/artifacts/synthesis/revisions/preview")) {
+        return Promise.resolve(
+          Response.json(options.preview ?? targetedPreview()),
+        );
+      }
+      if (url.endsWith("/artifacts/synthesis/revisions")) {
+        if (options.applyStatus && options.applyStatus !== 200) {
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                detail: options.applyDetail ?? {
+                  code: "targeted_editorial_revision_conflict",
+                  message: "Les fences ne correspondent plus.",
+                },
+              }),
+              {
+                status: options.applyStatus,
+                headers: { "Content-Type": "application/json" },
+              },
+            ),
+          );
+        }
         return Promise.resolve(
           Response.json({
-            status: "FAILED",
-            artifact_id: new URL(url, "http://localhost").searchParams.get(
-              "artifact_id",
-            ),
-            artifact_version: 1,
-            error_code: "preview_not_ready",
-            pdf_url: null,
+            request_identity: "request-1",
+            artifact_id: "revision-result",
+            artifact_version: 2,
+            artifact_input_hash: "e".repeat(64),
+            artifact_canonical_sha256: "f".repeat(64),
+            publication_artifact_id: "publication-2",
+            revision: null,
+            refusal: null,
           }),
         );
       }
@@ -327,90 +455,182 @@ function stubRevisionFetch(
     },
   );
   vi.stubGlobal("fetch", fetchMock);
-  return fetchMock;
+  return { fetchMock, postBodies };
 }
 
-function clickFirstRevisionButton() {
-  const [button] = screen.getAllByRole("button", {
-    name: "Réviser cet élément",
-  });
-  if (!button) throw new Error("Revision action button is missing");
-  fireEvent.click(button);
-}
+it("rend les cibles et opérations fournies par l’API selon l’artifact", async () => {
+  stubTargetedFetch();
+  const synthesisView = renderArtifact("synthesis");
 
-it("submits a targeted element revision and shows its comparison and previous version", async () => {
-  const fetchMock = stubRevisionFetch(revisionResponse("revised"));
+  const targetSelect = await screen.findByLabelText("Cible de révision");
+  expect(
+    within(targetSelect).getByRole("option", { name: "Titre" }),
+  ).toBeInTheDocument();
+  expect(
+    within(targetSelect).getByRole("option", { name: /Paragraphe ·/ }),
+  ).toBeInTheDocument();
+  fireEvent.change(targetSelect, { target: { value: "paragraph-target" } });
+  expect(screen.getByLabelText("Opération de révision")).toHaveValue(
+    "rewrite_paragraph",
+  );
+  expect(
+    within(screen.getByLabelText("Opération de révision")).getByRole("option", {
+      name: "Supprimer le paragraphe",
+    }),
+  ).toBeInTheDocument();
+
+  synthesisView.unmount();
+  stubTargetedFetch();
   renderArtifact("editorial_enrichment");
-
+  const enrichmentTarget = await screen.findByLabelText("Cible de révision");
   expect(
-    await screen.findByRole("heading", { name: "Outils observés" }),
+    within(enrichmentTarget).getByRole("option", {
+      name: "Tableau · Outils observés",
+    }),
   ).toBeInTheDocument();
-  fireEvent.change(screen.getByLabelText("Instruction pour Outils observés"), {
-    target: { value: "Clarifier la table sans ajouter de faits." },
+  fireEvent.change(enrichmentTarget, {
+    target: { value: "chart-create-target" },
   });
-  clickFirstRevisionButton();
-
-  expect(await screen.findByText("Nouvelle version 3")).toBeInTheDocument();
-  expect(
-    await screen.findByText(/Ancienne version conservée/),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("PDF de la publication précédente"),
-  ).toBeInTheDocument();
-  expect(
-    screen.getByText("PDF de la nouvelle publication 2"),
-  ).toBeInTheDocument();
-  expect(
-    fetchMock.mock.calls.some(
-      ([input, init]) =>
-        urlOf(input).includes("/editorial_enrichment/revisions") &&
-        init?.method === "POST",
-    ),
-  ).toBe(true);
+  expect(screen.getByLabelText("Opération de révision")).toHaveValue(
+    "create_chart",
+  );
 });
 
-it("explains when a revision needs new evidence", async () => {
-  stubRevisionFetch(revisionResponse("needs_new_evidence"));
-  renderArtifact("editorial_enrichment");
-
-  await screen.findAllByRole("button", { name: "Réviser cet élément" });
-  clickFirstRevisionButton();
-
-  expect(
-    await screen.findByText(/Relancez la collecte et la production/),
-  ).toBeInTheDocument();
-  expect(screen.getByText(/ExampleRAT détail protocole/)).toBeInTheDocument();
-});
-
-it("shows a clear stale-base conflict when the server returns 409", async () => {
-  stubRevisionFetch(null, 409);
-  renderArtifact("editorial_enrichment");
-
-  await screen.findAllByRole("button", { name: "Réviser cet élément" });
-  clickFirstRevisionButton();
+it("affiche le preview API puis applique avec ses fences et lit le lineage", async () => {
+  const { postBodies } = stubTargetedFetch();
+  renderArtifact("synthesis");
+  fireEvent.change(await screen.findByLabelText("Instruction de révision"), {
+    target: { value: "Corrige uniquement le titre." },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Prévisualiser l’impact" }),
+  );
 
   expect(
     await screen.findByText(
-      "Cette base est obsolète. Rechargez l’enrichissement et réessayez.",
+      "synthesis.title · hash avant cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
     ),
+  ).toBeInTheDocument();
+  expect(
+    screen.getByText(/Stages invalidés : publication/),
+  ).toBeInTheDocument();
+  fireEvent.click(
+    screen.getByRole("button", { name: "Appliquer cette révision" }),
+  );
+
+  expect(
+    await screen.findByText("Révision appliquée · version 2"),
+  ).toBeInTheDocument();
+  const applyBody = postBodies.find(({ url }) =>
+    url.endsWith("/artifacts/synthesis/revisions"),
+  )?.body;
+  expect(applyBody?.base_artifact_id).toBe("synthesis-1");
+  expect(applyBody?.before_hash).toBe("c".repeat(64));
+  expect(
+    await screen.findByText("Instruction : Corrige uniquement le titre."),
+  ).toBeInTheDocument();
+  expect(
+    within(
+      screen.getByRole("region", { name: "Résultat de la révision" }),
+    ).getByText(/revision_id/),
   ).toBeInTheDocument();
 });
 
-it("surfaces validator rejections returned for an invalid revision", async () => {
-  stubRevisionFetch(null, 422, {
-    code: "editorial_enrichment_revision_rejected",
-    rejections: [
-      { block_id: "tools_table", reason_code: "unsupported_evidence_claim" },
-    ],
+it("montre les bloqueurs et le refus typé du preview sans proposer l’application", async () => {
+  stubTargetedFetch({
+    preview: targetedPreview({
+      source_extension: true,
+      source_addition_blockers: [
+        {
+          source_url: "https://critical.example/report",
+          repair_key: "critical-source",
+          criticality: "CORE",
+          criticality_reason: "required_counter_analysis",
+          failure_code: "access_blocked",
+          reason: "La source critique reste bloquée.",
+        },
+      ],
+      refusal: {
+        code: "revision_not_applicable",
+        recommended_restart_stage: "references",
+        reason: "Archivez ou réparez la source critique.",
+      },
+    }),
   });
-  renderArtifact("editorial_enrichment");
-
-  await screen.findAllByRole("button", { name: "Réviser cet élément" });
-  clickFirstRevisionButton();
+  renderArtifact("synthesis");
+  fireEvent.change(await screen.findByLabelText("Instruction de révision"), {
+    target: { value: "Ajoute une section sur NanoDump." },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Prévisualiser l’impact" }),
+  );
 
   expect(
-    await screen.findByText("tools_table : unsupported_evidence_claim"),
+    await screen.findByText(/La source critique reste bloquée/),
   ).toBeInTheDocument();
+  expect(screen.getByText(/revision_not_applicable/)).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "Appliquer cette révision" }),
+  ).not.toBeInTheDocument();
+});
+
+it("explique explicitement le conflit de version à l’application", async () => {
+  stubTargetedFetch({ applyStatus: 409 });
+  renderArtifact("synthesis");
+  fireEvent.change(await screen.findByLabelText("Instruction de révision"), {
+    target: { value: "Corrige uniquement le titre." },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Prévisualiser l’impact" }),
+  );
+  fireEvent.click(
+    await screen.findByRole("button", { name: "Appliquer cette révision" }),
+  );
+  expect(await screen.findByText(/Conflit de version/)).toBeInTheDocument();
+});
+
+it("prépare une URL opérateur en mode source étendue avant le preview", async () => {
+  vi.stubGlobal("crypto", {
+    randomUUID: () => "44444444-4444-4444-8444-444444444444",
+  });
+  const { postBodies } = stubTargetedFetch({
+    preview: targetedPreview({
+      source_extension: true,
+      source_addition_ready: true,
+    }),
+  });
+  renderArtifact("synthesis");
+  fireEvent.click(
+    await screen.findByLabelText("Autoriser l’extension de sources"),
+  );
+  fireEvent.change(await screen.findByLabelText("URL de la source opérateur"), {
+    target: { value: "https://vendor.example/nanodump" },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Archiver et préparer la source" }),
+  );
+  expect(await screen.findByText(/État source · ready/)).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("Instruction de révision"), {
+    target: { value: "Ajoute une section sur NanoDump." },
+  });
+  fireEvent.click(
+    screen.getByRole("button", { name: "Prévisualiser l’impact" }),
+  );
+  expect(
+    await screen.findByText("Oui", { selector: "dd" }),
+  ).toBeInTheDocument();
+
+  const candidate = postBodies.find(({ url }) =>
+    url.endsWith("/source-additions/candidates"),
+  )?.body;
+  const preview = postBodies.find(({ url }) =>
+    url.endsWith("/artifacts/synthesis/revisions/preview"),
+  )?.body;
+  expect(candidate?.url).toBe("https://vendor.example/nanodump");
+  expect(preview?.mode).toBe("allow_source_extension");
+  expect(preview?.source_addition_request_id).toBe(
+    "44444444-4444-4444-8444-444444444444",
+  );
 });
 
 it("keeps ambiguous relevance decisions visible with their reasons", async () => {

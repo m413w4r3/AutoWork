@@ -333,6 +333,7 @@ export interface ProductionBatchControlResponse {
 
 export interface ArtifactResponse {
   artifact_id: string;
+  production_run_id?: string;
   stage: string;
   version: number;
   input_hash: string;
@@ -342,6 +343,7 @@ export interface ArtifactResponse {
   reused_from_artifact_id?: string | null;
   reused_from_created_at?: string | null;
   metadata: Record<string, unknown>;
+  revision_targets?: TargetedEditorialRevisionTargetOption[];
   /** Legacy rendered text; never present for the PUBLICATION stage. */
   rendered_content?: string | null;
   canonical_content:
@@ -1487,10 +1489,7 @@ export async function getEditorialEnrichmentArtifact(
 }
 
 export type EditorialEnrichmentElementKind =
-  | "table"
-  | "diagram"
-  | "chart"
-  | "figure";
+  "table" | "diagram" | "chart" | "figure";
 export type EditorialEnrichmentRevisionAction =
   | "improve_table"
   | "detail_diagram"
@@ -1585,19 +1584,23 @@ export type TargetedEditorialRevisionOperation =
   | "replace_source_figure"
   | "delete_source_figure";
 
+export interface TargetedEditorialRevisionTargetOption {
+  id: string;
+  label: string;
+  summary: string;
+  target: TargetedEditorialRevisionTarget;
+  operations: TargetedEditorialRevisionOperation[];
+}
+
 export type TargetedEditorialRevisionMode =
   "existing_evidence_only" | "allow_source_extension";
 
 export type EvidenceUseScope = "tool_context" | "actor_activity";
 
-export type SourceAdditionOrigin = "discovery" | "operator_url" | "manual_archive";
+export type SourceAdditionOrigin =
+  "discovery" | "operator_url" | "manual_archive";
 export type SourceAdditionState =
-  | "candidate"
-  | "selected"
-  | "archived"
-  | "extracted"
-  | "ready"
-  | "refused";
+  "candidate" | "selected" | "archived" | "extracted" | "ready" | "refused";
 
 export interface SourceAdditionManifestEntry {
   addition_id: string;
@@ -1704,9 +1707,7 @@ export type TargetedEditorialRevisionTargetKind =
   | "enrichment_element";
 
 export type TargetedEditorialRevisionPlacementKind =
-  | "after_lead"
-  | "after_section"
-  | "after_timeline";
+  "after_lead" | "after_section" | "after_timeline";
 
 export interface TargetedEditorialRevisionPlacement {
   kind: TargetedEditorialRevisionPlacementKind;
@@ -1834,33 +1835,42 @@ export async function recordSourceAdditionCandidate(
   subjectId: string,
   body: SourceAdditionCandidateRequest,
 ): Promise<SourceAdditionOperationResponse> {
-  return request(`/api/subjects/${subjectId}/production/source-additions/candidates`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return request(
+    `/api/subjects/${subjectId}/production/source-additions/candidates`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 export async function selectSourceAddition(
   subjectId: string,
   body: SourceAdditionSelectionRequest,
 ): Promise<SourceAdditionOperationResponse> {
-  return request(`/api/subjects/${subjectId}/production/source-additions/select`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return request(
+    `/api/subjects/${subjectId}/production/source-additions/select`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 export async function acquireSourceAddition(
   subjectId: string,
   body: SourceAdditionAcquireRequest,
 ): Promise<SourceAdditionOperationResponse> {
-  return request(`/api/subjects/${subjectId}/production/source-additions/acquire`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  return request(
+    `/api/subjects/${subjectId}/production/source-additions/acquire`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
 }
 
 export async function previewTargetedEditorialRevision(

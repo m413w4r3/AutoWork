@@ -101,6 +101,7 @@ from cti_app.application.production_synthesis import ProductionSynthesisService
 from cti_app.application.production_synthesis_revision import (
     ProductionSynthesisRevisionService,
     TargetedSynthesisRevisionValidationError,
+    build_targeted_revision_target_catalog,
 )
 from cti_app.application.subject_production import (
     EditionProductionBatchNotFoundError,
@@ -2887,6 +2888,7 @@ async def _artifact_view_for_run(
 
         response = {
             "artifact_id": str(artifact.id),
+            "production_run_id": str(run.id),
             "stage": artifact.stage.value,
             "version": artifact.version,
             "input_hash": artifact.input_hash,
@@ -2901,6 +2903,9 @@ async def _artifact_view_for_run(
             "reused_from_created_at": artifact.metadata.get("reused_from_created_at"),
             "metadata": artifact.metadata,
             "canonical_content": canonical,
+            "revision_targets": build_targeted_revision_target_catalog(
+                artifact.stage.value, canonical
+            ),
         }
         if artifact.stage is not ProductionArtifactStage.PUBLICATION:
             response["rendered_content"] = rendered

@@ -1478,6 +1478,50 @@ h1 {
   background: #fff;
 }
 
+.targeted-revision-panel {
+  display: grid;
+  gap: 1rem;
+  margin-block: 1.5rem;
+  padding: 1.25rem;
+  border: 1px solid #c8d7cd;
+  border-radius: 0.75rem;
+  background: #fff;
+}
+
+.targeted-revision-panel form,
+.targeted-revision-panel fieldset,
+.targeted-revision-impact,
+.targeted-revision-lineage,
+.targeted-revision-source-extension {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.targeted-revision-panel label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.targeted-revision-panel textarea {
+  min-height: 6rem;
+}
+
+.targeted-revision-panel dt {
+  font-weight: 650;
+}
+
+.targeted-revision-panel dd {
+  margin: 0 0 0.5rem;
+  overflow-wrap: anywhere;
+}
+
+.targeted-revision-panel pre {
+  max-height: 22rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .production-panel__heading {
   display: flex;
   flex-wrap: wrap;

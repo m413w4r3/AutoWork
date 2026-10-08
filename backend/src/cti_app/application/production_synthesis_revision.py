@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -65,6 +66,7 @@ from cti_app.domain.production import (
     SynthesisMode,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    EditorialEnrichmentElementKind,
     EditorialEnrichmentV1,
     editorial_enrichment_from_json,
     editorial_enrichment_to_json,
@@ -77,6 +79,8 @@ from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionRefusal,
     TargetedEditorialRevisionRefusalCode,
     TargetedEditorialRevisionRequest,
+    TargetedEditorialRevisionPlacement,
+    TargetedEditorialRevisionPlacementKind,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
 )
@@ -201,6 +205,262 @@ def _paragraph_id(payload: Mapping[str, Any]) -> str:
 
 def _section_id(payload: Mapping[str, Any]) -> str:
     return _sha256(payload)
+
+
+def build_targeted_revision_target_catalog(
+    stage: str, canonical_content: Any
+) -> list[dict[str, Any]]:
+    """Expose stable, server-derived targets and valid operations for the UI."""
+    if not isinstance(canonical_content, Mapping):
+        return []
+
+    def option(
+        *,
+        label: str,
+        target: TargetedEditorialRevisionTarget,
+        operations: Sequence[TargetedEditorialRevisionOperation],
+        summary: str,
+    ) -> dict[str, Any]:
+        payload = target.to_json()
+        return {
+            "id": _sha256(payload),
+            "label": label,
+            "summary": summary,
+            "target": payload,
+            "operations": [item.value for item in operations],
+        }
+
+    if stage == ProductionArtifactStage.SYNTHESIS.value:
+        lead = canonical_content.get("lead")
+        sections = canonical_content.get("sections")
+        if not isinstance(lead, list) or not isinstance(sections, list):
+            return []
+        options = [
+            option(
+                label="Titre",
+                target=TargetedEditorialRevisionTarget(
+                    kind=TargetedEditorialRevisionTargetKind.TITLE
+                ),
+                operations=(TargetedEditorialRevisionOperation.REWRITE_TITLE,),
+                summary=str(canonical_content.get("title", "")),
+            ),
+            option(
+                label="Chapeau",
+                target=TargetedEditorialRevisionTarget(
+                    kind=TargetedEditorialRevisionTargetKind.LEAD
+                ),
+                operations=(
+                    TargetedEditorialRevisionOperation.REWRITE_LEAD,
+                    TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+                ),
+                summary=" ".join(
+                    str(item.get("text", ""))
+                    for item in lead
+                    if isinstance(item, Mapping)
+                ),
+            ),
+            option(
+                label="Sections · créer une section",
+                target=TargetedEditorialRevisionTarget(
+                    kind=TargetedEditorialRevisionTargetKind.SECTIONS
+                ),
+                operations=(TargetedEditorialRevisionOperation.INSERT_SECTION,),
+                summary=f"{len(sections)} section(s)",
+            ),
+        ]
+        raw_section_ids = [
+            _section_id(section) for section in sections if isinstance(section, Mapping)
+        ]
+        unique_section_ids = {
+            identity for identity, count in Counter(raw_section_ids).items() if count == 1
+        }
+        section_ids_by_index: dict[int, str] = {}
+        for section_index, section in enumerate(sections):
+            if not isinstance(section, Mapping):
+                continue
+            section_id = _section_id(section)
+            if section_id not in unique_section_ids:
+                continue
+            section_ids_by_index[section_index] = section_id
+            heading = str(section.get("heading", "Section"))
+            paragraphs = section.get("paragraphs")
+            if not isinstance(paragraphs, list):
+                paragraphs = []
+            paragraph_ids = [
+                _paragraph_id(paragraph)
+                for paragraph in paragraphs
+                if isinstance(paragraph, Mapping)
+            ]
+            unique_paragraph_ids = {
+                identity for identity, count in Counter(paragraph_ids).items() if count == 1
+            }
+            options.append(
+                option(
+                    label=f"Section · {heading}",
+                    target=TargetedEditorialRevisionTarget(
+                        kind=TargetedEditorialRevisionTargetKind.SECTION,
+                        stable_ids=(section_id,),
+                    ),
+                    operations=(
+                        TargetedEditorialRevisionOperation.REWRITE_SECTION,
+                        TargetedEditorialRevisionOperation.DELETE_SECTION,
+                        TargetedEditorialRevisionOperation.SPLIT_SECTION,
+                        TargetedEditorialRevisionOperation.RENAME_SECTION,
+                        TargetedEditorialRevisionOperation.INSERT_PARAGRAPH,
+                    ),
+                    summary=" ".join(
+                        str(item.get("text", ""))
+                        for item in paragraphs
+                        if isinstance(item, Mapping)
+                    ),
+                )
+            )
+            for paragraph in paragraphs:
+                if not isinstance(paragraph, Mapping):
+                    continue
+                paragraph_id = _paragraph_id(paragraph)
+                if paragraph_id not in unique_paragraph_ids:
+                    continue
+                text = str(paragraph.get("text", ""))
+                options.append(
+                    option(
+                        label=f"Paragraphe · {heading} · {text[:100]}",
+                        target=TargetedEditorialRevisionTarget(
+                            kind=TargetedEditorialRevisionTargetKind.SECTION_PARAGRAPH,
+                            stable_ids=(paragraph_id,),
+                            parent_id=section_id,
+                        ),
+                        operations=(
+                            TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+                            TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+                        ),
+                        summary=text,
+                    )
+                )
+        lead_target = TargetedEditorialRevisionTargetKind.LEAD_PARAGRAPH
+        lead_ids = [
+            _paragraph_id(paragraph)
+            for paragraph in lead
+            if isinstance(paragraph, Mapping)
+        ]
+        unique_lead_ids = {identity for identity, count in Counter(lead_ids).items() if count == 1}
+        for paragraph in lead:
+            if not isinstance(paragraph, Mapping):
+                continue
+            if _paragraph_id(paragraph) not in unique_lead_ids:
+                continue
+            text = str(paragraph.get("text", ""))
+            options.append(
+                option(
+                    label=f"Paragraphe du chapeau · {text[:100]}",
+                    target=TargetedEditorialRevisionTarget(
+                        kind=lead_target,
+                        stable_ids=(_paragraph_id(paragraph),),
+                    ),
+                    operations=(
+                        TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH,
+                        TargetedEditorialRevisionOperation.DELETE_PARAGRAPH,
+                    ),
+                    summary=text,
+                )
+            )
+        for index in range(len(sections) - 1):
+            first = sections[index]
+            second = sections[index + 1]
+            if (
+                not isinstance(first, Mapping)
+                or not isinstance(second, Mapping)
+                or index not in section_ids_by_index
+                or index + 1 not in section_ids_by_index
+            ):
+                continue
+            options.append(
+                option(
+                    label=(
+                        "Fusionner · "
+                        f"{first.get('heading', 'Section')} + "
+                        f"{second.get('heading', 'Section')}"
+                    ),
+                    target=TargetedEditorialRevisionTarget(
+                        kind=TargetedEditorialRevisionTargetKind.SECTIONS,
+                        stable_ids=(section_ids_by_index[index], section_ids_by_index[index + 1]),
+                    ),
+                    operations=(TargetedEditorialRevisionOperation.MERGE_SECTIONS,),
+                    summary="Deux sections adjacentes",
+                )
+            )
+        return options
+
+    if stage != ProductionArtifactStage.EDITORIAL_ENRICHMENT.value:
+        return []
+
+    family_specs = (
+        ("tables", EditorialEnrichmentElementKind.TABLE, "Tableau"),
+        ("diagrams", EditorialEnrichmentElementKind.DIAGRAM, "Diagramme"),
+        ("charts", EditorialEnrichmentElementKind.CHART, "Graphique"),
+        ("source_figures", EditorialEnrichmentElementKind.FIGURE, "Figure source"),
+    )
+    options = []
+    operation_by_kind = {
+        EditorialEnrichmentElementKind.TABLE: (
+            TargetedEditorialRevisionOperation.REWRITE_TABLE,
+            TargetedEditorialRevisionOperation.DELETE_TABLE,
+        ),
+        EditorialEnrichmentElementKind.DIAGRAM: (
+            TargetedEditorialRevisionOperation.REWRITE_DIAGRAM,
+            TargetedEditorialRevisionOperation.DELETE_DIAGRAM,
+        ),
+        EditorialEnrichmentElementKind.CHART: (
+            TargetedEditorialRevisionOperation.REWRITE_CHART,
+            TargetedEditorialRevisionOperation.DELETE_CHART,
+        ),
+        EditorialEnrichmentElementKind.FIGURE: (
+            TargetedEditorialRevisionOperation.REWRITE_SOURCE_FIGURE,
+            TargetedEditorialRevisionOperation.REPLACE_SOURCE_FIGURE,
+            TargetedEditorialRevisionOperation.DELETE_SOURCE_FIGURE,
+        ),
+    }
+    create_operation_by_kind = {
+        EditorialEnrichmentElementKind.TABLE: TargetedEditorialRevisionOperation.CREATE_TABLE,
+        EditorialEnrichmentElementKind.DIAGRAM: TargetedEditorialRevisionOperation.CREATE_DIAGRAM,
+        EditorialEnrichmentElementKind.CHART: TargetedEditorialRevisionOperation.CREATE_CHART,
+    }
+    for field_name, element_kind, family_label in family_specs:
+        raw_elements = canonical_content.get(field_name)
+        elements = raw_elements if isinstance(raw_elements, list) else []
+        for element in elements:
+            if not isinstance(element, Mapping) or not isinstance(element.get("key"), str):
+                continue
+            element_key = str(element["key"])
+            summary = str(element.get("title") or element.get("caption") or element_key)
+            options.append(
+                option(
+                    label=f"{family_label} · {summary}",
+                    target=TargetedEditorialRevisionTarget(
+                        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+                        element_kind=element_kind,
+                        element_key=element_key,
+                    ),
+                    operations=operation_by_kind[element_kind],
+                    summary=summary,
+                )
+            )
+        if element_kind in create_operation_by_kind:
+            options.append(
+                option(
+                    label=f"{family_label} · créer",
+                    target=TargetedEditorialRevisionTarget(
+                        kind=TargetedEditorialRevisionTargetKind.ENRICHMENT_ELEMENT,
+                        element_kind=element_kind,
+                        placement=TargetedEditorialRevisionPlacement(
+                            kind=TargetedEditorialRevisionPlacementKind.AFTER_LEAD
+                        ),
+                    ),
+                    operations=(create_operation_by_kind[element_kind],),
+                    summary="Nouvel élément placé après le chapeau",
+                )
+            )
+    return options
 
 
 def _indexed_unique(
