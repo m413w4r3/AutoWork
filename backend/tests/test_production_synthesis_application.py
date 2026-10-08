@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, date, datetime
@@ -90,6 +91,8 @@ from cti_app.domain.production import (
 from cti_app.domain.production_editorial_revision import (
     TargetedEditorialRevisionMode,
     TargetedEditorialRevisionOperation,
+    TargetedEditorialRevisionRefusal,
+    TargetedEditorialRevisionRefusalCode,
     TargetedEditorialRevisionRequest,
     TargetedEditorialRevisionTarget,
     TargetedEditorialRevisionTargetKind,
@@ -4399,6 +4402,241 @@ def test_targeted_revision_rejects_unknown_evidence_and_unsupported_claim() -> N
                 extraction=world.extraction,
                 snapshot=world.snapshot,
             )
+
+
+def _nanodump_revision_case(
+    *, first_claim_suffix: str = ""
+) -> tuple[SynthesisEvidencePackV1, SynthesisProposalV1]:
+    _, _, base_pack, _ = _targeted_revision_fixture()
+    evidence_texts = {
+        "E1001": (
+            "Le dépôt Fortra présente NanoDump comme un utilitaire d'extraction mémoire et "
+            "décrit la génération d'un minidump du processus LSASS."
+        ),
+        "E1008": (
+            "Le module est utilisable depuis Beacon de Cobalt Strike. La documentation détaille "
+            "la restauration de la signature de WerFault.exe et précise que l'option --valid "
+            "est inutile avec cette méthode."
+        ),
+        "E1021": (
+            "Le projet décrit les mécanismes de vidage du processus et les méthodes de collecte "
+            "des informations d'authentification."
+        ),
+        "E999": (
+            "Le code utilise l'API PssNtCaptureSnapshot pour obtenir un instantané du processus "
+            "ciblé, puis crée un clone isolé."
+        ),
+        "E1004": "L'implémentation ouvre le processus de référence et duplique son handle.",
+        "E1014": ("Cette duplication permet de lire les données de la mémoire du processus copié."),
+        "E249": (
+            "Le rapport de l'incident attribue à l'acteur l'emploi de NanoDump lors de "
+            "l'intrusion. Il ne permet pas de conclure que toutes les capacités décrites dans le "
+            "code ont été utilisées."
+        ),
+    }
+    handles = tuple(evidence_texts)
+    refs = {
+        handle: ExtractionEvidenceRefV1(
+            source_document_id=uuid4(),
+            kind=EvidenceKind.FACT,
+            evidence_key=hashlib.sha256(handle.encode("utf-8")).hexdigest(),
+        )
+        for handle in handles
+    }
+    records = tuple(
+        {
+            "handle": handle,
+            "kind": EvidenceKind.FACT.value,
+            "source_label": "Fortra NanoDump README",
+            "source_role": "technical",
+            "editorial_role": "context",
+            "type": EvidenceKind.FACT.value,
+            "name": "NanoDump documentation fact",
+            "context": source_text,
+            "evidence": source_text,
+        }
+        for handle, source_text in evidence_texts.items()
+    )
+    evidence_pack = replace(
+        base_pack,
+        narrative_evidence=records,
+        technical_evidence=(),
+        reserve_evidence=(),
+        _handle_to_ref=refs,
+        _handle_for_ref={ref: handle for handle, ref in refs.items()},
+        _subject_scoped_handles=frozenset({"E249"}),
+    )
+    assert isinstance(evidence_pack, SynthesisEvidencePackV1)
+
+    claim_specs = (
+        (
+            "C001",
+            "NanoDump permet de générer un minidump de LSASS et de s'intégrer à Beacon ; "
+            "une méthode restaure la signature de WerFault.exe sans l'option --valid."
+            + first_claim_suffix,
+            ("E1001", "E1008", "E1021"),
+            "tool_context",
+        ),
+        (
+            "C002",
+            "La méthode permet de cloner le processus ciblé avec PssNtCaptureSnapshot, puis de "
+            "dupliquer un handle pour lire les données de sa mémoire.",
+            ("E999", "E1004", "E1014"),
+            "tool_context",
+        ),
+        (
+            "C003",
+            "Le rapport attribue à l'acteur l'utilisation de NanoDump ; cette observation ne "
+            "permet pas d'inférer l'emploi de toutes les fonctionnalités génériques du programme.",
+            ("E249",),
+            "actor_activity",
+        ),
+    )
+    claims = []
+    for claim_code, text, evidence_handles, scope in claim_specs:
+        claim = SynthesisClaimProposalV1(
+            text=text,
+            evidence_handles=evidence_handles,
+            claim_scope=scope,
+        )
+        claim._block_id = claim_code
+        claims.append(claim)
+    proposal = SynthesisProposalV1(
+        lead=(),
+        sections=(
+            SynthesisSectionProposalV1(
+                kind=SynthesisSectionKind.OVERVIEW,
+                heading="",
+                claims=tuple(claims),
+            ),
+        ),
+    )
+    return evidence_pack, proposal
+
+
+def test_nano_dump_claims_allow_french_prose_but_keep_distinctive_facts_anchored() -> None:
+    evidence_pack, proposal = _nanodump_revision_case()
+    first_claim = proposal.sections[0].claims[0]
+    records = {str(record["handle"]): record for record in evidence_pack.narrative_evidence}
+    evidence_text = " ".join(
+        str(value)
+        for handle in first_claim.evidence_handles
+        for key, value in records[handle].items()
+        if key not in {"handle", "source_label", "source_role", "editorial_role"}
+        and isinstance(value, str)
+    )
+    legacy_supported = {
+        synthesis_revision_module._grounding_token(token)
+        for token in re.findall(r"[\w-]+", evidence_text, flags=re.UNICODE)
+    }
+    legacy_unsupported = {
+        synthesis_revision_module._grounding_token(token)
+        for token in re.findall(r"[\w-]+", first_claim.text, flags=re.UNICODE)
+        if len(token) >= 4
+        and token.casefold() not in synthesis_revision_module._GROUNDING_STOP_WORDS
+    } - legacy_supported
+    assert "permet" in legacy_unsupported
+
+    synthesis_revision_module._assert_claim_handles_and_relations_supported(
+        proposal,
+        evidence_pack,
+    )
+
+
+@pytest.mark.parametrize(
+    ("suffix", "unsupported_term"),
+    (
+        (" Un composant GhostNanoDump complète cette méthode.", "GhostNanoDump"),
+        (" Elle cible aussi 8443 processus.", "8443"),
+        (" Elle accepte l'option --stealth-collection.", "--stealth-collection"),
+        (" Elle lance nanodump.injected.exe.", "nanodump.injected.exe"),
+        (" Elle appelle PssNtCaptureSnapshotPlus.", "PssNtCaptureSnapshotPlus"),
+    ),
+)
+def test_nano_dump_claims_reject_invented_distinctive_terms(
+    suffix: str, unsupported_term: str
+) -> None:
+    evidence_pack, proposal = _nanodump_revision_case(first_claim_suffix=suffix)
+
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="synthesis_relation_not_evidenced",
+    ) as error:
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal,
+            evidence_pack,
+        )
+
+    assert error.value.details["claim_code"] == "C001"
+    assert unsupported_term in error.value.details["unsupported_terms"]
+    assert len(error.value.details["unsupported_terms"]) <= 12
+
+
+def test_distinctive_grounding_normalizes_accents_and_plurals_without_matching_prose() -> None:
+    assert "CaféRATs" in synthesis_revision_module._distinctive_grounding_terms(
+        "L'outil CaféRATs appelle PROCESS_VM_READ."
+    )
+    assert (
+        synthesis_revision_module._unsupported_distinctive_claim_terms(
+            "L'outil CaféRATs appelle PROCESS_VM_READ.",
+            "La variante CafeRAT utilise process_vm_read.",
+        )
+        == ()
+    )
+    assert (
+        synthesis_revision_module._unsupported_distinctive_claim_terms(
+            "Selon la documentation publique, l'outil restaure les protections courantes.",
+            "Le rapport décrit un outil et ses protections.",
+        )
+        == ()
+    )
+    assert (
+        synthesis_revision_module._unsupported_distinctive_claim_terms(
+            "L'outil, tout en réduisant la latence, préserve les observations.",
+            "Le logiciel améliore la vitesse et conserve les résultats.",
+        )
+        == ()
+    )
+    assert synthesis_revision_module._unsupported_distinctive_claim_terms(
+        "L'option --valid est activée.",
+        "Le paramètre valid est activé.",
+    ) == ("--valid",)
+    unsupported_iocs = synthesis_revision_module._unsupported_distinctive_claim_terms(
+        "Beacon contacte evil.example à 192.0.2.8 et 2001:db8::2, empreinte "
+        "abcdefabcdefabcdefabcdefabcdefab.",
+        "Beacon contacte safe.example à 192.0.2.9 et 2001:db8::1, empreinte "
+        "abcdefabcdefabcdefabcdefabcdefac.",
+    )
+    assert "evil.example" in unsupported_iocs
+    assert "192.0.2.8" in unsupported_iocs
+    assert "2001:db8::2" in unsupported_iocs
+    assert "abcdefabcdefabcdefabcdefabcdefab" in unsupported_iocs
+    long_url = "https://evil.example/" + "a" * 100
+    assert synthesis_revision_module._unsupported_distinctive_claim_terms(
+        f"La requête utilise {long_url}.",
+        "Le rapport décrit une requête HTTPS.",
+    ) == (long_url,)
+
+
+def test_claim_grounding_refusal_details_are_bounded_and_exclude_claim_content() -> None:
+    raw_details = {
+        "claim_code": "C001",
+        "unsupported_terms": [f"Term{index}" for index in range(14)] + [""],
+        "claim_text": "private sentence must not be exposed",
+    }
+    safe_details = synthesis_revision_module._bounded_claim_grounding_details(raw_details)
+    refusal = TargetedEditorialRevisionRefusal(
+        code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
+        recommended_restart_stage=ProductionStage.SYNTHESIS,
+        reason="La révision n'est pas étayée.",
+        details=safe_details,
+    )
+
+    serialized = refusal.to_json()
+    assert serialized["details"]["claim_code"] == "C001"
+    assert len(serialized["details"]["unsupported_terms"]) == 12
+    assert "claim_text" not in serialized["details"]
+    assert "private sentence" not in str(serialized)
 
 
 def test_source_extension_claim_scopes_separate_tool_context_from_actor_activity() -> None:

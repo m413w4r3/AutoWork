@@ -49,11 +49,15 @@ function refusalMessage(refusal: {
   code: string;
   reason: string;
   recommended_restart_stage: string | null;
+  details?: { claim_code?: string; unsupported_terms?: string[] };
 }): string {
   const restart = refusal.recommended_restart_stage
     ? ` Reprise recommandée : ${refusal.recommended_restart_stage}.`
     : "";
-  return `${refusal.code} — ${refusal.reason}${restart}`;
+  const groundingDetails = refusal.details?.unsupported_terms?.length
+    ? ` Claim ${refusal.details.claim_code ?? ""} : termes non ancrés — ${refusal.details.unsupported_terms.join(", ")}.`
+    : "";
+  return `${refusal.code} — ${refusal.reason}${groundingDetails}${restart}`;
 }
 
 function apiErrorMessage(error: unknown): string {

@@ -1776,6 +1776,10 @@ export interface TargetedEditorialRevisionRefusal {
   code: TargetedEditorialRevisionRefusalCode;
   recommended_restart_stage: ProductionStage | null;
   reason: string;
+  details?: {
+    claim_code?: string;
+    unsupported_terms?: string[];
+  };
 }
 
 export interface TargetedEditorialRevisionLineageEntry {
