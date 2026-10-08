@@ -24,6 +24,7 @@ from cti_app.application.semantic_annotation import (
     SemanticAnnotator,
     semantic_entities_from_extraction,
 )
+from cti_app.domain.legitimate_services import LEGITIMATE_SERVICES_POLICY_VERSION
 from cti_app.domain.media_assets import media_asset_id
 from cti_app.domain.production import ExtractionProfile, ProductionInputSnapshot
 from cti_app.domain.production_editorial_enrichment import (
@@ -103,6 +104,7 @@ from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_SCHEMA_VERSION,
     SemanticTextV1,
 )
+from cti_app.infrastructure.legitimate_services import load_legitimate_services
 
 
 class PublicationAssemblyValidationError(ValueError):
@@ -267,6 +269,7 @@ def _project_publication_iocs(
     }
     main: _IocOccurrences = defaultdict(set)
     original: _IocOccurrences = defaultdict(set)
+    legitimate_services = load_legitimate_services()
     for source in extraction.sources:
         for item in source.indicators:
             if (
@@ -315,6 +318,8 @@ def _project_publication_iocs(
                     f"{item.artifact_type.value} from {source.source_document_id}",
                 ) from exc
             if item.artifact_type is ArtifactType.HASH and not _HASH_VALUE.fullmatch(value):
+                continue
+            if legitimate_services.match_indicator(item.artifact_type, value) is not None:
                 continue
             destination[(item.artifact_type, value)].update(item.source_document_ids)
     for identity in main:
@@ -399,9 +404,9 @@ def _validate_publication_lineage(
             )
 
 
-# V11 changes only PUBLICATION: cited technical context sources now receive a
-# reader-facing reference entry. Upstream artifacts remain valid.
-ASSEMBLY_POLICY_VERSION: Final[str] = "11-cited-technical-context-references"
+# V12 changes only PUBLICATION: generic legitimate-service hosts are filtered
+# from IOC groups. Upstream artifacts remain valid.
+ASSEMBLY_POLICY_VERSION: Final[str] = "12-legitimate-service-ioc-filter"
 
 
 def _canonical_digest(payload: dict[str, Any]) -> str:
@@ -429,6 +434,7 @@ def compute_assembly_input_hash(
         ),
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
         "assembly_policy_version": ASSEMBLY_POLICY_VERSION,
+        "legitimate_services_policy_version": LEGITIMATE_SERVICES_POLICY_VERSION,
         "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
     }
     return _canonical_digest(payload)

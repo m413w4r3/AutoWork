@@ -231,6 +231,96 @@ def test_projection_maps_hashes_deduplicates_and_excludes_unsupported_types() ->
     assert all(not any(char in row.value for char in ",|\r\n") for row in projection.rows)
 
 
+def test_frozen_edition_export_defensively_excludes_generic_service_hosts() -> None:
+    base = _full_document()
+    source_id = base.sources[0].source_document_id
+    document = replace(
+        base,
+        indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.DOMAIN,
+                (
+                    PublicationIndicatorV1(
+                        "api.telegram.org",
+                        "api.telegram.org",
+                        ArtifactType.DOMAIN,
+                        (source_id,),
+                    ),
+                    PublicationIndicatorV1(
+                        "micbucket.ams1.vultrobjects.com",
+                        "micbucket.ams1.vultrobjects.com",
+                        ArtifactType.DOMAIN,
+                        (source_id,),
+                    ),
+                ),
+            ),
+            PublicationIndicatorGroupV1(
+                ArtifactType.URL,
+                (
+                    PublicationIndicatorV1(
+                        "https://api.telegram.org/",
+                        "https://api.telegram.org/",
+                        ArtifactType.URL,
+                        (source_id,),
+                    ),
+                    PublicationIndicatorV1(
+                        "https://ams1.vultrobjects.com:443/",
+                        "https://ams1.vultrobjects.com:443/",
+                        ArtifactType.URL,
+                        (source_id,),
+                    ),
+                    PublicationIndicatorV1(
+                        "https://api.telegram.org/bot123:secret/sendMessage",
+                        "https://api.telegram.org/bot123:secret/sendMessage",
+                        ArtifactType.URL,
+                        (source_id,),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    projection = project_publication_iocs(document)
+
+    assert [(row.type, row.value) for row in projection.rows] == [
+        ("domain", "micbucket.ams1.vultrobjects.com"),
+        ("url", "https://api.telegram.org/bot123:secret/sendMessage"),
+    ]
+    assert [(item.type, item.value, item.reason) for item in projection.excluded] == [
+        ("domain", "api.telegram.org", "legitimate_service"),
+        ("url", "https://ams1.vultrobjects.com:443/", "legitimate_service"),
+        ("url", "https://api.telegram.org/", "legitimate_service"),
+    ]
+
+    edition = EditionDocumentV2(
+        edition={
+            "id": "11111111-1111-4111-8111-111111111111",
+            "country_code": "FR",
+            "period_start": "2026-08-01",
+        },
+        publications=(EditionPublicationV2(position=1, subject_id=UUID(int=1), document=document),),
+    )
+    archive = build_edition_ioc_archive(edition, edition_sha256="a" * 64)
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+        manifest = json.loads(zipped.read("manifest.json"))
+        csv = zipped.read("articles/article01/article.csv").decode("utf-8")
+
+    assert manifest["publications"][0]["counts"] == {
+        "ip": 0,
+        "domain": 1,
+        "url": 1,
+        "file": 0,
+    }
+    assert [item["reason"] for item in manifest["publications"][0]["excluded"]] == [
+        "legitimate_service",
+        "legitimate_service",
+        "legitimate_service",
+    ]
+    assert "0,domain,api.telegram.org\n" not in csv
+    assert "0,url,https://ams1.vultrobjects.com:443/\n" not in csv
+    assert "0,url,https://api.telegram.org/bot123:secret/sendMessage\n" in csv
+
+
 def test_v5_publication_projects_indicators_and_original_indicators() -> None:
     document = _v5_publication_with_original_hash()
     assert isinstance(document, PublicationDocumentV5)

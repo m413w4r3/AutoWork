@@ -1,0 +1,210 @@
+{
+  "schema_version": "legitimate-services-v1",
+  "entries": [
+    {
+      "hostname": "api.telegram.org",
+      "category": "messaging_api",
+      "reason": "API publique de messagerie Telegram ; l'hôte seul ne désigne pas un canal ou un bot acteur."
+    },
+    {
+      "hostname": "telegram.org",
+      "category": "messaging",
+      "reason": "Domaine générique du service de messagerie Telegram."
+    },
+    {
+      "hostname": "telegram.me",
+      "category": "messaging",
+      "reason": "Domaine générique de liens Telegram."
+    },
+    {
+      "hostname": "discord.com",
+      "category": "messaging",
+      "reason": "Hôte générique du service de messagerie Discord."
+    },
+    {
+      "hostname": "discordapp.com",
+      "category": "messaging",
+      "reason": "Ancien domaine générique du service de messagerie Discord."
+    },
+    {
+      "hostname": "gofile.io",
+      "category": "file_sharing",
+      "reason": "Service public de partage de fichiers ; l'hôte seul n'identifie pas un dépôt acteur."
+    },
+    {
+      "hostname": "outlook.office.com",
+      "category": "cloud_messaging",
+      "reason": "Hôte générique de la messagerie Microsoft 365."
+    },
+    {
+      "hostname": "outlook.office365.com",
+      "category": "cloud_messaging",
+      "reason": "Hôte générique de la messagerie Microsoft 365."
+    },
+    {
+      "hostname": "outlook.live.com",
+      "category": "cloud_messaging",
+      "reason": "Hôte générique de la messagerie Outlook grand public."
+    },
+    {
+      "hostname": "login.microsoftonline.com",
+      "category": "cloud_identity",
+      "reason": "Point d'authentification Microsoft générique, sans tenant dans l'hôte."
+    },
+    {
+      "hostname": "login.live.com",
+      "category": "cloud_identity",
+      "reason": "Point d'authentification Microsoft grand public générique."
+    },
+    {
+      "hostname": "graph.microsoft.com",
+      "category": "messaging_api",
+      "reason": "API Microsoft Graph générique ; l'hôte seul ne désigne aucune ressource acteur."
+    },
+    {
+      "hostname": "teams.microsoft.com",
+      "category": "cloud_messaging",
+      "reason": "Hôte générique du service de collaboration et de messagerie Microsoft Teams."
+    },
+    {
+      "hostname": "ams1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "sgp1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "ewr1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "fra1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "lax1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "sjc1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "sea1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "syd1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "icn1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "del1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "blr1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "mex1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "tor1.vultrobjects.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès régional générique Vultr Object Storage, sans nom de bucket."
+    },
+    {
+      "hostname": "api.github.com",
+      "category": "messaging_api",
+      "reason": "API GitHub générique ; l'hôte seul ne désigne pas un dépôt ou une ressource acteur."
+    },
+    {
+      "hostname": "github.com",
+      "category": "code_hosting",
+      "reason": "Hôte générique GitHub ; les chemins de dépôts et de fichiers restent spécifiques."
+    },
+    {
+      "hostname": "raw.githubusercontent.com",
+      "category": "code_hosting",
+      "reason": "Hôte générique de contenu brut GitHub ; un chemin de dépôt reste spécifique."
+    },
+    {
+      "hostname": "www.google.com",
+      "category": "cloud_productivity",
+      "reason": "Hôte générique du site Google, sans ressource identifiée."
+    },
+    {
+      "hostname": "drive.google.com",
+      "category": "cloud_storage",
+      "reason": "Hôte générique Google Drive ; un chemin ou identifiant de fichier reste spécifique."
+    },
+    {
+      "hostname": "docs.google.com",
+      "category": "cloud_productivity",
+      "reason": "Hôte générique Google Docs ; un chemin ou identifiant de document reste spécifique."
+    },
+    {
+      "hostname": "dropbox.com",
+      "category": "cloud_storage",
+      "reason": "Hôte générique Dropbox ; un chemin partagé reste spécifique."
+    },
+    {
+      "hostname": "api.dropboxapi.com",
+      "category": "messaging_api",
+      "reason": "API Dropbox générique, sans ressource acteur dans l'hôte."
+    },
+    {
+      "hostname": "content.dropboxapi.com",
+      "category": "cloud_storage",
+      "reason": "Hôte générique de contenu Dropbox, sans ressource acteur dans l'hôte."
+    },
+    {
+      "hostname": "onedrive.live.com",
+      "category": "cloud_storage",
+      "reason": "Hôte générique OneDrive ; un chemin partagé reste spécifique."
+    },
+    {
+      "hostname": "1drv.ms",
+      "category": "cloud_storage",
+      "reason": "Hôte générique de liens courts OneDrive ; les chemins de partage restent spécifiques."
+    },
+    {
+      "hostname": "storage.googleapis.com",
+      "category": "cloud_storage",
+      "reason": "Hôte générique de Google Cloud Storage ; les noms de buckets restent spécifiques."
+    },
+    {
+      "hostname": "s3.amazonaws.com",
+      "category": "generic_object_hosting",
+      "reason": "Point d'accès générique Amazon S3 ; un nom de bucket reste spécifique."
+    },
+    {
+      "hostname": "pastebin.com",
+      "category": "paste_service",
+      "reason": "Service public de publication de texte ; l'hôte seul ne désigne pas un paste acteur."
+    },
+    {
+      "hostname": "transfer.sh",
+      "category": "file_transfer",
+      "reason": "Service public de transfert de fichiers ; un chemin de fichier reste spécifique."
+    }
+  ]
+}

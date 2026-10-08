@@ -28,6 +28,39 @@ ancre PDF. Le numéro de bulletin reprend `edition.version`; l’identifiant est
 règle Suricata n’est projetée. STIX et Excel restent délégués en aval; le
 tableau de garde décrit l’export IOC joint.
 
+## Services légitimes
+
+La politique versionnée `backend/src/cti_app/data/legitimate_services_v1.json`
+répertorie des hôtes génériques de messagerie et API, partage de fichiers,
+messagerie cloud, identité, hébergement objet, code, stockage, productivité,
+paste et transfert. Chaque hôte porte une catégorie et une raison. La liste
+est volontairement explicite : un domaine n’est retiré que si son hôte est
+égal à une entrée. Une URL n’est retirée que si son hôte est égal à une entrée,
+son chemin est vide ou `/`, et qu’elle n’a ni requête ni fragment. La casse,
+un port et le slash final d’une URL ne rendent pas l’hôte générique plus
+spécifique.
+Aucun suffixe ni domaine parent n’est utilisé pour la correspondance.
+
+Ainsi, `api.telegram.org`, `https://api.telegram.org/` et
+`https://ams1.vultrobjects.com` seuls sont exclus des groupes IOC publiés.
+Un chemin de bot Telegram, un dépôt GitHub, un bucket S3 nommé, un chemin de
+fichier ou un sous-domaine propre à un acteur reste publiable. En particulier,
+`micbucket.ams1.vultrobjects.com` et
+`https://micbucket.ams1.vultrobjects.com/MSCache.exe` ne correspondent pas à
+l’entrée régionale générique `ams1.vultrobjects.com`. Les valeurs restent dans
+l’extraction et la synthèse narrative; seul leur statut d’IOC publié est
+filtré.
+
+Le filtre principal vit dans la sélection des indicateurs de
+`publication_builder`, avant QA et rendu PDF. L’export CSV applique le même
+registre comme défense pour les anciens documents d’édition figés; les valeurs
+exclues y portent la raison `legitimate_service` dans `manifest.json` et ne
+comptent pas dans les totaux. La politique d’assemblage passe à
+`12-legitimate-service-ioc-filter` et le hash d’assemblage inclut
+`legitimate-services-v1`. Les publications existantes deviennent donc
+obsolètes et se reconstruisent à l’étape d’assemblage à partir des artefacts
+amont conservés, sans appel modèle.
+
 Les changements de modèle, manifeste et politique Typst invalident le rendu
 du bulletin: reconstruire le rendu d’édition depuis le document figé, sans
 appel modèle. Les publications par sujet restent valides. Les polices

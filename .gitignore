@@ -40,6 +40,8 @@ frontend/playwright-report/
 # Local application data and generated outputs
 docs/references/
 data/
+!backend/src/cti_app/data/
+!backend/src/cti_app/data/legitimate_services_v1.json
 work/
 /var/workspaces/subjects/
 /var/workspaces/editions/
@@ -82,4 +84,3 @@ chatGPT_Answers/
 
 scripts/ctx/
 nimbalyst-local/
-

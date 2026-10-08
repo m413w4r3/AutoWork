@@ -15,6 +15,7 @@ from cti_app.application.edition_classification import classify_edition_publicat
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
 from cti_app.domain.publication import ArtifactType
 from cti_app.domain.publication_document import CanonicalPublicationDocument
+from cti_app.infrastructure.legitimate_services import load_legitimate_services
 
 _HASH_ALGORITHMS = {
     32: "MD5",
@@ -138,6 +139,7 @@ def project_publication_iocs(document: CanonicalPublicationDocument) -> Publicat
     """Map frozen V4/V5 publication indicator groups into supported CSV rows."""
     candidates: dict[tuple[int, str, str], IOCRow] = {}
     excluded: dict[tuple[int, str, str, str], ExcludedIOC] = {}
+    legitimate_services = load_legitimate_services()
     groups = [(0, group) for group in document.indicators]
     groups.extend((1, group) for group in getattr(document, "original_indicators", ()))
 
@@ -155,6 +157,18 @@ def project_publication_iocs(document: CanonicalPublicationDocument) -> Publicat
                 )
                 excluded[(is_new, artifact_type, raw_value, result)] = item
                 continue
+
+            if artifact_type in {ArtifactType.DOMAIN.value, ArtifactType.URL.value}:
+                policy_type = ArtifactType(artifact_type)
+                if legitimate_services.match_indicator(policy_type, projected_value) is not None:
+                    item = ExcludedIOC(
+                        is_new=is_new,
+                        type=artifact_type,
+                        value=raw_value,
+                        reason="legitimate_service",
+                    )
+                    excluded[(is_new, artifact_type, raw_value, item.reason)] = item
+                    continue
 
             ioc_type = result
             normalized_raw = str(getattr(indicator, "normalized_value", raw_value))

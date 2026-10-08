@@ -1249,7 +1249,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == "11-cited-technical-context-references"
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "12-legitimate-service-ioc-filter"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,
@@ -1262,6 +1262,7 @@ def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
         "relevance_projection_hash": None,
         "publication_document_schema_version": PUBLICATION_DOCUMENT_V5_SCHEMA_VERSION,
         "assembly_policy_version": publication_builder.ASSEMBLY_POLICY_VERSION,
+        "legitimate_services_policy_version": "legitimate-services-v1",
         "semantic_annotation_policy_version": SEMANTIC_ANNOTATION_POLICY_VERSION,
     }
 
@@ -2079,6 +2080,66 @@ def test_publication_ioc_projection_normalizes_deduplicates_and_merges_provenanc
         )
         == projection
     )
+
+
+def test_publication_ioc_projection_removes_generic_services_only() -> None:
+    _, _, extraction, synthesis = _canonical_inputs()
+    source = extraction.sources[0]
+
+    def indicator(value: str, artifact_type: ArtifactType) -> ExtractionIndicatorV1:
+        return ExtractionIndicatorV1(
+            value=value,
+            artifact_type=artifact_type,
+            indicator_status=ExtractionIndicatorStatus.CONFIRMED_IOC,
+            context="",
+            evidence_quote=f"The source identifies {value}.",
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(source.source_document_id,),
+        )
+
+    cases = (
+        ("api.telegram.org", ArtifactType.DOMAIN),
+        ("gofile.io", ArtifactType.DOMAIN),
+        ("outlook.office.com", ArtifactType.DOMAIN),
+        ("ams1.vultrobjects.com", ArtifactType.DOMAIN),
+        ("https://API.TELEGRAM.ORG:443/", ArtifactType.URL),
+        ("https://ams1.vultrobjects.com", ArtifactType.URL),
+        ("https://api.telegram.org/bot123:secret/sendMessage", ArtifactType.URL),
+        ("https://github.com/org/repo/tree/main", ArtifactType.URL),
+        ("https://micbucket.ams1.vultrobjects.com/MSCache.exe", ArtifactType.URL),
+        ("micbucket.ams1.vultrobjects.com", ArtifactType.DOMAIN),
+        ("oracle-challenge.s3.amazonaws.com", ArtifactType.DOMAIN),
+        ("sample.azurewebsites.net", ArtifactType.DOMAIN),
+        ("attacker.api.telegram.org", ArtifactType.DOMAIN),
+    )
+    changed_source = replace(source, indicators=tuple(indicator(*case) for case in cases))
+    changed_extraction = replace(extraction, sources=(changed_source, *extraction.sources[1:]))
+    narrative = _project_synthesis_publication(
+        extraction=changed_extraction,
+        synthesis=synthesis,
+    )
+
+    projection = _project_publication_iocs(
+        extraction=changed_extraction,
+        narrative=narrative,
+    )
+
+    published = {
+        (group.artifact_type, indicator.value)
+        for group in projection.indicators
+        for indicator in group.indicators
+    }
+    assert published == {
+        (ArtifactType.URL, "https://api.telegram.org/bot123:secret/sendMessage"),
+        (ArtifactType.URL, "https://github.com/org/repo/tree/main"),
+        (ArtifactType.URL, "https://micbucket.ams1.vultrobjects.com/MSCache.exe"),
+        (ArtifactType.DOMAIN, "micbucket.ams1.vultrobjects.com"),
+        (ArtifactType.DOMAIN, "oracle-challenge.s3.amazonaws.com"),
+        (ArtifactType.DOMAIN, "sample.azurewebsites.net"),
+        (ArtifactType.DOMAIN, "attacker.api.telegram.org"),
+    }
+    assert any(item.value == "api.telegram.org" for item in changed_source.indicators)
+    assert projection.sections == narrative.sections
 
 
 def test_publication_v4_builder_is_exact_deterministic_and_resolves_used_sources() -> None:
