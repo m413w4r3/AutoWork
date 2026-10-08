@@ -9,7 +9,11 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.blob_storage import BlobReadLimitExceededError
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
 from cti_app.application.production_parsers import TechnicalExtraction
 from cti_app.application.production_repairs import (
     EffectiveExtractionProjector,
@@ -192,7 +196,10 @@ class _Catalog:
         return SimpleNamespace(id=blob_id)
 
     async def read(self, blob_id: UUID, *, max_bytes: int) -> bytes:
-        return self.contents[blob_id][:max_bytes]
+        content = self.contents[blob_id]
+        if len(content) > max_bytes:
+            raise BlobReadLimitExceededError(size_bytes=len(content), max_bytes=max_bytes)
+        return content
 
 
 class _ArchiveUow:
@@ -315,6 +322,33 @@ async def test_replacement_verification_reports_layout_canonicalization() -> Non
     assert verification.format_valid is True
     assert verification.verified is True
     assert verification.verification_method == "whitespace_canonicalized"
+
+
+@pytest.mark.asyncio
+async def test_replacement_verification_reads_archived_source_above_artifact_limit() -> None:
+    replacement = r"C:\ProgramData\Drivers\MicDriver_*_mic.wav"
+    # 3-byte characters keep the text under the parser limit while the blob exceeds the
+    # default artifact read limit, like a large archived PDF.
+    content = (replacement + "\n" + "\u20ac" * 1_900_000).encode()
+    assert len(content) > MAX_ARTIFACT_BYTES
+    catalog = _Catalog(content)
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    uow = _ArchiveUow(catalog.blob_id, content, mime_type="text/plain")
+    service = ProductionRepairAdjudicationService(lambda: uow, artifact_store=store)
+    issue = replace(
+        _issue(),
+        artifact_type="filepath",
+        value_sha256=_sha256("missing.wav"),
+        preview="missing.wav",
+    )
+
+    verification = await service._validate_replacement(
+        issue=issue,
+        value=replacement,
+        require_source=True,
+    )
+
+    assert verification.verified is True
 
 
 def _rule_issue(value: str) -> ProductionRepairIssueView:

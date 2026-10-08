@@ -29,6 +29,7 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import (
+    MAX_ARCHIVED_SOURCE_BYTES,
     extraction_compatibility_view,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
@@ -2881,7 +2882,7 @@ class ProductionRepairAdjudicationService:
         if not callable(reader):
             return None
         try:
-            content = await reader(blob_id)
+            content = await reader(blob_id, max_bytes=MAX_ARCHIVED_SOURCE_BYTES)
             if expected_sha256 and hashlib.sha256(content).hexdigest() != expected_sha256:
                 return None
             detected = DetectedMimeType(
