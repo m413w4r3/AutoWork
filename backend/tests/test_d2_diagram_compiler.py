@@ -103,7 +103,7 @@ def _diagram(**overrides: object) -> DiagramSpecV1:
     ("direction", "d2_direction"),
     (
         (EnrichmentDiagramDirection.LEFT_TO_RIGHT, "right"),
-        (EnrichmentDiagramDirection.TOP_TO_BOTTOM, "down"),
+        (EnrichmentDiagramDirection.TOP_TO_BOTTOM, "right"),
     ),
 )
 def test_encodes_each_direction_and_ends_with_one_lf(
@@ -235,7 +235,7 @@ def test_comparison_relation_changes_rendering_identity() -> None:
     assert diagram_semantic_sha256(comparison) != diagram_semantic_sha256(factual)
 
 
-def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
+def test_node_roles_use_unified_print_safe_shape_and_malware_accent() -> None:
     diagram = _diagram(
         nodes=(
             _node("actor", "Threat actor", DiagramNodeRole.ACTOR),
@@ -245,11 +245,15 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
     )
 
     source = encode_d2_source(diagram).decode()
-    assert "shape: person" in source
-    assert "shape: cylinder" in source
-    assert 'fill: "#FBE3E6"' in source
-    assert 'fill: "#DFF3E1"' in source
+    assert source.count("shape: rectangle") == 2
+    assert 'fill: "#FFFFFF"' in source
+    assert 'stroke: "#C2410C"' not in source
     assert "direction: right" in source
+    malware_diagram = replace(
+        diagram,
+        nodes=(diagram.nodes[0], replace(diagram.nodes[1], role=DiagramNodeRole.MALWARE_TOOL)),
+    )
+    assert 'stroke: "#C2410C"' in encode_d2_source(malware_diagram).decode()
     assert diagram_semantic_sha256(
         replace(
             diagram,
@@ -258,7 +262,7 @@ def test_node_role_selects_deterministic_print_safe_shape_and_colour() -> None:
     ) != diagram_semantic_sha256(diagram)
 
 
-def test_multiline_actor_uses_text_containing_shape_and_keeps_actor_colour() -> None:
+def test_multiline_actor_uses_the_unified_white_rounded_rectangle() -> None:
     diagram = _diagram(
         nodes=(
             _node(
@@ -276,7 +280,8 @@ def test_multiline_actor_uses_text_containing_shape_and_keeps_actor_colour() -> 
     actor_block = source.split("n002:", maxsplit=1)[0]
     assert 'n001: "Acteurs soupçonnés liés\\nà l\u2019Iran" {' in actor_block
     assert "shape: rectangle" in actor_block
-    assert 'fill: "#FBE3E6"' in actor_block
+    assert 'fill: "#FFFFFF"' in actor_block
+    assert 'stroke: "#52616B"' in actor_block
     assert "shape: person" not in actor_block
     assert 'n001 -> n002: "écrivent données C2"' in source
 
@@ -296,9 +301,9 @@ def test_profile_and_relation_direction_change_semantic_identity() -> None:
 
 @pytest.mark.parametrize(
     ("node_count", "expected_direction"),
-    ((3, "right"), (4, "down")),
+    ((3, "right"), (5, "right"), (7, "right"), (8, "right"), (9, "down")),
 )
-def test_node_count_selects_vertical_layout_after_three_nodes(
+def test_node_count_selects_vertical_layout_only_after_eight_nodes(
     node_count: int, expected_direction: str
 ) -> None:
     nodes = tuple(_node(f"node-{index}") for index in range(node_count))
@@ -317,9 +322,9 @@ def test_node_count_selects_vertical_layout_after_three_nodes(
 
 @pytest.mark.parametrize(
     ("label_length", "expected_direction"),
-    ((30, "right"), (31, "down")),
+    ((44, "right"), (45, "down")),
 )
-def test_label_length_selects_vertical_layout_after_thirty_characters(
+def test_label_length_selects_vertical_layout_after_forty_four_characters(
     label_length: int, expected_direction: str
 ) -> None:
     diagram = _diagram(
@@ -333,7 +338,7 @@ def test_label_length_selects_vertical_layout_after_thirty_characters(
 
 @pytest.mark.parametrize("label_kind", ("relation", "group"))
 def test_long_relation_and_group_labels_force_vertical_layout(label_kind: str) -> None:
-    label = "x" * 31
+    label = "x" * 45
     overrides: dict[str, object] = {}
     if label_kind == "relation":
         overrides["edges"] = (_edge("source", "target", label),)
@@ -364,7 +369,7 @@ def test_d2_tool_lock_matches_compiler_version() -> None:
 
 
 def test_diagram_compilation_policy_version_was_incremented() -> None:
-    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v7-elk-compact"
+    assert DIAGRAM_COMPILATION_POLICY_VERSION == "diagram-d2-svg-v8-chapsvision"
 
 
 @dataclass(frozen=True, slots=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import concurrent.futures
 import hashlib
 import json
@@ -12,7 +13,7 @@ import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from xml.etree import ElementTree
 
 from cti_app.application.diagram_compilation import (
@@ -30,7 +31,6 @@ from cti_app.domain.production_editorial_enrichment import (
     DiagramRelationDirection,
     DiagramRelationType,
     DiagramSpecV1,
-    EnrichmentDiagramDirection,
     diagram_requires_vertical_layout,
 )
 
@@ -81,28 +81,23 @@ _CSS_PRESENTATION_ATTRIBUTES = frozenset(
     }
 )
 
-_D2_DIRECTION_BY_V1 = {
-    EnrichmentDiagramDirection.LEFT_TO_RIGHT: "right",
-    EnrichmentDiagramDirection.TOP_TO_BOTTOM: "down",
+_NODE_STROKE_BY_ROLE = {
+    DiagramNodeRole.ACTOR: "#52616B",
+    DiagramNodeRole.VICTIM: "#52616B",
+    DiagramNodeRole.MALWARE_TOOL: "#C2410C",
+    DiagramNodeRole.INFRASTRUCTURE: "#52616B",
+    DiagramNodeRole.DATA_ARTIFACT: "#52616B",
+    DiagramNodeRole.TECHNIQUE_STEP: "#52616B",
+    DiagramNodeRole.UNKNOWN: "#667085",
 }
-# One print-safe hue per role (light fill, dark stroke) so a reader tells actors, tooling,
-# infrastructure and data apart at a glance; the shape is a second, colour-blind-safe cue.
-_NODE_STYLE_BY_ROLE = {
-    DiagramNodeRole.ACTOR: ("person", "#FBE3E6", "#B3243B"),
-    DiagramNodeRole.VICTIM: ("rectangle", "#FFF1C9", "#9A6B00"),
-    DiagramNodeRole.MALWARE_TOOL: ("hexagon", "#FFE4D1", "#C2410C"),
-    DiagramNodeRole.INFRASTRUCTURE: ("cloud", "#DCEAF9", "#1D4E89"),
-    DiagramNodeRole.DATA_ARTIFACT: ("cylinder", "#DFF3E1", "#2E7D32"),
-    DiagramNodeRole.TECHNIQUE_STEP: ("rectangle", "#EAE3F6", "#5B3E96"),
-    DiagramNodeRole.UNKNOWN: ("rectangle", "#F1F1EF", "#667085"),
-}
-_EDGE_COLOR_BY_RELATION = {
-    DiagramRelationType.FACTUAL: "#2F3B3C",
-    DiagramRelationType.INFERENCE: "#5B3E96",
-    DiagramRelationType.COMPARISON: "#667085",
-}
-_NODE_FONT_SIZE = 30
-_EDGE_FONT_SIZE = 24
+_NODE_FILL = "#FFFFFF"
+_NODE_FONT_SIZE = 12
+_EDGE_FONT_SIZE = 11
+_GROUP_FONT_SIZE = 11
+_GROUP_TAB_FILL = "#D0E0F0"
+_GROUP_STROKE = "#718096"
+_DARK_TEXT = "#1F2937"
+_EDGE_COLOR = "#111827"
 # D2 double-quoted strings decode these escapes; ``$`` must be escaped so that
 # ``${...}`` in canonical content is never resolved as a D2 variable.
 _LABEL_ESCAPES = {
@@ -192,16 +187,32 @@ def _node_references(diagram: DiagramSpecV1) -> dict[str, str]:
     return references
 
 
+def _layout_font_sizes(diagram: DiagramSpecV1, *, force_vertical: bool) -> tuple[int, int, int]:
+    """Keep small graphs close to body size and scale denser horizontal graphs up."""
+    if force_vertical or len(diagram.nodes) <= 3:
+        return _NODE_FONT_SIZE, _EDGE_FONT_SIZE, 24
+    if len(diagram.nodes) == 4:
+        if any(len(node.label) > 20 for node in diagram.nodes) or any(
+            len(edge.label or "") > 18 for edge in diagram.edges
+        ):
+            return 16, 14, 12
+        return 14, 12, 16
+    return 18, 16, 12
+
+
 def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
     """Encode the canonical graph using only synthetic D2 identifiers."""
     node_references = _node_references(diagram)
-    # Keep graphs vertical when node count or long labels make horizontal layout
-    # hard to read. Otherwise preserve the model's direction.
+    # Treat stored vertical directions from older enrichment versions as derived
+    # layout choices. Compact graphs now use the print-safe horizontal default.
     graph_labels = [node.label for node in diagram.nodes]
     graph_labels.extend(edge.label or "" for edge in diagram.edges)
     graph_labels.extend(group.label for group in diagram.groups)
     force_vertical = diagram_requires_vertical_layout(len(diagram.nodes), graph_labels)
-    direction = "down" if force_vertical else _D2_DIRECTION_BY_V1[diagram.direction]
+    node_font_size, edge_font_size, node_wrap_width = _layout_font_sizes(
+        diagram, force_vertical=force_vertical
+    )
+    direction = "down" if force_vertical else "right"
     lines = [f"direction: {direction}"]
 
     for group_index, group in enumerate(diagram.groups, 1):
@@ -209,32 +220,34 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             (
                 f"g{group_index:03d}: {_escape_d2_label(_wrap_d2_label(group.label))} {{",
                 "  style: {",
-                '    fill: "#E8F0F0"',
-                '    stroke: "#93AFB0"',
+                f'    fill: "{_NODE_FILL}"',
+                f'    stroke: "{_GROUP_STROKE}"',
                 "    stroke-width: 1",
+                "    stroke-dash: 5",
+                "    border-radius: 12",
+                f'    font-color: "{_DARK_TEXT}"',
+                f"    font-size: {_GROUP_FONT_SIZE}",
+                "    bold: true",
                 "  }",
                 "}",
             )
         )
 
     for node in diagram.nodes:
-        shape, fill, stroke = _NODE_STYLE_BY_ROLE[node.role]
-        label = _wrap_d2_label(node.label)
-        # D2 places person labels below the icon. Switch text-heavy actors to
-        # a filled rectangle so wrapped text sits inside the node boundary.
-        if node.role is DiagramNodeRole.ACTOR and "\n" in label:
-            shape = "rectangle"
+        stroke = _NODE_STROKE_BY_ROLE[node.role]
+        label = _wrap_d2_label(node.label, width=node_wrap_width)
         lines.extend(
             (
                 f"{node_references[node.node_id]}: {_escape_d2_label(label)} {{",
-                f"  shape: {shape}",
+                "  shape: rectangle",
                 "  style: {",
-                f'    fill: "{fill}"',
+                f'    fill: "{_NODE_FILL}"',
                 f'    stroke: "{stroke}"',
-                '    font-color: "#17202A"',
-                "    stroke-width: 2",
+                f'    font-color: "{_DARK_TEXT}"',
+                "    stroke-width: 1",
                 "    border-radius: 8",
-                f"    font-size: {_NODE_FONT_SIZE}",
+                f"    font-size: {node_font_size}",
+                "    bold: true",
                 "  }",
                 "}",
             )
@@ -251,15 +264,18 @@ def encode_d2_source(diagram: DiagramSpecV1) -> bytes:
             f"{node_references[edge.source_node_id]} {connector} "
             f"{node_references[edge.target_node_id]}"
         )
-        label = _wrap_d2_label(edge.label or "")
+        edge_wrap_width = 12 if edge_font_size > _EDGE_FONT_SIZE else 24
+        label = _wrap_d2_label(edge.label or "", width=edge_wrap_width)
         if label:
             line += f": {_escape_d2_label(label)}"
         edge_lines = [
             line + " {",
             "  style: {",
-            f'    stroke: "{_EDGE_COLOR_BY_RELATION[edge.relation_type]}"',
-            "    stroke-width: 2",
-            f"    font-size: {_EDGE_FONT_SIZE}",
+            f'    stroke: "{_EDGE_COLOR}"',
+            "    stroke-width: 1",
+            f"    font-size: {edge_font_size}",
+            f'    font-color: "{_EDGE_COLOR}"',
+            "    italic: false",
         ]
         if edge.relation_type is DiagramRelationType.INFERENCE:
             edge_lines.append("    stroke-dash: 5")
@@ -286,6 +302,85 @@ def _wrap_d2_label(value: str, width: int = 24) -> str:
     if current:
         lines.append(current)
     return "\n".join(lines)
+
+
+def _add_group_label_tabs(svg_bytes: bytes, diagram: DiagramSpecV1) -> bytes:
+    """Give D2's group titles a small blue tab over their dashed frame."""
+    if not diagram.groups:
+        return svg_bytes
+
+    root = ElementTree.fromstring(svg_bytes)
+    for group_index, group in enumerate(diagram.groups, 1):
+        reference_class = base64.b64encode(f"g{group_index:03d}".encode()).decode()
+        group_element = next(
+            (
+                element
+                for element in root.iter()
+                if element.tag.rsplit("}", 1)[-1] == "g"
+                and reference_class in element.attrib.get("class", "").split()
+            ),
+            None,
+        )
+        if group_element is None:
+            continue
+        shape_group = next(
+            (
+                child
+                for child in group_element
+                if child.tag.rsplit("}", 1)[-1] == "g"
+                and "shape" in child.attrib.get("class", "").split()
+            ),
+            None,
+        )
+        group_rect = (
+            next(
+                (
+                    element
+                    for element in shape_group.iter()
+                    if element.tag.rsplit("}", 1)[-1] == "rect"
+                ),
+                None,
+            )
+            if shape_group is not None
+            else None
+        )
+        label = next(
+            (child for child in group_element if child.tag.rsplit("}", 1)[-1] == "text"),
+            None,
+        )
+        if group_rect is None or label is None:
+            continue
+
+        font_size = 12.0
+        style = label.attrib.get("style", "")
+        match = re.search(r"(?:^|;)\s*font-size\s*:\s*([0-9.]+)px", style)
+        if match is not None:
+            font_size = float(match.group(1))
+        lines = _wrap_d2_label(group.label).splitlines() or [group.label]
+        longest_line = max((len(line) for line in lines), default=0)
+        label_width = max(52.0, longest_line * font_size * 0.62 + 16)
+        label_height = max(font_size * 1.8, len(lines) * font_size * 1.35 + 4)
+        center_x = float(label.attrib.get("x", "0"))
+        baseline_y = float(label.attrib.get("y", "0"))
+        tab = ElementTree.Element(
+            "{http://www.w3.org/2000/svg}rect",
+            {
+                "class": "group-label-tab",
+                "x": f"{center_x - label_width / 2:.2f}",
+                "y": f"{baseline_y - label_height * 0.72:.2f}",
+                "width": f"{label_width:.2f}",
+                "height": f"{label_height:.2f}",
+                "rx": "4",
+                "fill": _GROUP_TAB_FILL,
+                "stroke": _GROUP_STROKE,
+                "style": "stroke-width:1;",
+            },
+        )
+        group_element.insert(list(group_element).index(label), tab)
+
+    ElementTree.register_namespace("", "http://www.w3.org/2000/svg")
+    ElementTree.register_namespace("xlink", "http://www.w3.org/1999/xlink")
+    return cast(bytes, ElementTree.tostring(root, encoding="utf-8", xml_declaration=True))
 
 
 class D2ProcessStatus(StrEnum):
@@ -598,14 +693,16 @@ class D2DiagramCompiler:
         )
         _raise_process_failure(result)
         validate_d2_svg(result.stdout)
+        rendered_svg = _add_group_label_tabs(result.stdout, diagram)
+        validate_d2_svg(rendered_svg)
         return CompiledDiagram(
             diagram_key=diagram.key,
             source_format=D2_SOURCE_FORMAT,
             source_bytes=source_bytes,
             source_sha256=source_sha256,
             media_type=D2_MEDIA_TYPE,
-            media_bytes=result.stdout,
-            media_sha256=hashlib.sha256(result.stdout).hexdigest(),
+            media_bytes=rendered_svg,
+            media_sha256=hashlib.sha256(rendered_svg).hexdigest(),
             compiler=D2_COMPILER,
             compiler_version=D2_COMPILER_VERSION,
             compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,

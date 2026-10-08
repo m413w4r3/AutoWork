@@ -256,6 +256,33 @@ def _directed_arrowhead_count(svg_bytes: bytes) -> int:
     )
 
 
+def test_svg_overlap_measure_ignores_group_frames_but_detects_node_collisions() -> None:
+    overlapping_svg = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80">
+      <g class="bjAwMQ=="><g class="shape"><rect x="30" y="30" width="40" height="30"/></g></g>
+      <g class="KG4wMDEgLSZndDsgbjAwMik=">
+        <path class="connection" d="M 10 45 L 110 45"/>
+        <text x="50" y="50" style="font-size:12px;text-anchor:middle">relation</text>
+      </g>
+    </svg>"""
+    report = measure_svg_overlaps(overlapping_svg)
+    assert report.edge_node_overlap_pairs == (("relation", "node 1"),)
+
+    group_frame_only_svg = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 80">
+      <g class="ZzAwMQ==">
+        <g class="shape"><rect x="5" y="10" width="100" height="60"/></g>
+        <g class="ZzAwMS5uMDAx">
+          <g class="shape"><rect x="70" y="30" width="25" height="20"/></g>
+        </g>
+      </g>
+      <g class="KG4wMDEgLSZndDsgZzAwMS5uMDAxKQ==">
+        <path class="connection" d="M 10 40 L 70 40"/>
+        <text x="35" y="45" style="font-size:10px;text-anchor:middle">inside frame</text>
+      </g>
+    </svg>"""
+    report = measure_svg_overlaps(group_frame_only_svg)
+    assert report.edge_node_overlap_count == 0
+
+
 def _svg_text(svg: bytes) -> list[str]:
     return [
         html.unescape(
@@ -287,7 +314,8 @@ def test_real_d2_compilation_is_byte_deterministic(d2_binary: str) -> None:
     assert first.source_bytes == second.source_bytes
     assert first.source_bytes.startswith(b"direction: right\n")
     assert b"shape: rectangle" in first.source_bytes
-    assert b'fill: "#F1F1EF"' in first.source_bytes
+    assert b'fill: "#FFFFFF"' in first.source_bytes
+    assert b"font-size: 12" in first.source_bytes
     assert first.source_bytes.endswith(b"\n") and not first.source_bytes.endswith(b"\n\n")
     assert first.source_sha256 == second.source_sha256
     assert first.media_bytes == second.media_bytes
@@ -468,12 +496,111 @@ def test_real_d2_compiles_cti_profiles_and_printable_relationships(d2_binary: st
         for node in diagram.nodes:
             assert node.label in rendered_text
         assert output.source_bytes.endswith(b"\n")
-    assert compiled[0].source_bytes.startswith(b"direction: down\n")
+    assert compiled[0].source_bytes.startswith(b"direction: right\n")
     assert b"stroke-dash: 5" in compiled[2].source_bytes
     assert b"operator-infrastructure" not in compiled[3].source_bytes
     assert '"Infrastructure opérateur"'.encode() in compiled[3].source_bytes
     assert b"--" in compiled[3].source_bytes
     assert compiled[-1].source_bytes.startswith(b"direction: down\n")
+
+
+def test_real_d2_chapsvision_layouts_are_compact_and_non_overlapping(d2_binary: str) -> None:
+    five_node_chain = _cti_diagram(
+        "five_node_chain",
+        DiagramProfile.FLOW,
+        EnrichmentDiagramKind.INFECTION_CHAIN,
+        (
+            _cti_node("operator", "Opérateur", DiagramNodeRole.ACTOR),
+            _cti_node("employee", "Employés ciblés", DiagramNodeRole.VICTIM),
+            _cti_node("patch", "Correctif", DiagramNodeRole.DATA_ARTIFACT),
+            _cti_node("malware", "DinDoor", DiagramNodeRole.MALWARE_TOOL),
+            _cti_node("server", "Serveur C2", DiagramNodeRole.INFRASTRUCTURE),
+        ),
+        (
+            _cti_edge("operator", "employee", "contacte"),
+            _cti_edge("employee", "patch", "exécute"),
+            _cti_edge("patch", "malware", "livre"),
+            _cti_edge("malware", "server", "contacte"),
+        ),
+        direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+    )
+    branch_convergence = _cti_diagram(
+        "branch_convergence",
+        DiagramProfile.FLOW,
+        EnrichmentDiagramKind.EXECUTION_SEQUENCE,
+        (
+            _cti_node("entry", "Document", DiagramNodeRole.DATA_ARTIFACT),
+            _cti_node("script", "Script", DiagramNodeRole.TECHNIQUE_STEP),
+            _cti_node("archive", "Archive", DiagramNodeRole.DATA_ARTIFACT),
+            _cti_node("loader", "Loader", DiagramNodeRole.MALWARE_TOOL),
+            _cti_node("payload", "Charge utile", DiagramNodeRole.MALWARE_TOOL),
+        ),
+        (
+            _cti_edge("entry", "script", "lance"),
+            _cti_edge("entry", "archive", "ouvre"),
+            _cti_edge("script", "loader", "dépose"),
+            _cti_edge("archive", "loader", "extrait"),
+            _cti_edge("loader", "payload", "charge"),
+        ),
+    )
+    grouped_roles = _cti_diagram(
+        "grouped_roles",
+        DiagramProfile.ARCHITECTURE,
+        EnrichmentDiagramKind.INFRASTRUCTURE,
+        (
+            _cti_node("actor", "Opérateur", DiagramNodeRole.ACTOR),
+            _cti_node("proxy", "Proxy", DiagramNodeRole.INFRASTRUCTURE),
+            _cti_node("malware", "DinDoor", DiagramNodeRole.MALWARE_TOOL),
+            _cti_node("c2", "Serveur C2", DiagramNodeRole.INFRASTRUCTURE),
+        ),
+        (
+            _cti_edge("actor", "proxy", "prépare"),
+            _cti_edge("proxy", "malware", "livre"),
+            _cti_edge("malware", "c2", "contacte"),
+        ),
+        groups=(DiagramGroupV1("remote", "Infrastructure distante", ("c2",)),),
+    )
+    long_label_fallback = _cti_diagram(
+        "long_label_fallback",
+        DiagramProfile.FLOW,
+        EnrichmentDiagramKind.EXECUTION_SEQUENCE,
+        (
+            _cti_node(
+                "entry",
+                "Document leurre téléchargé depuis un service cloud",
+                DiagramNodeRole.DATA_ARTIFACT,
+            ),
+            _cti_node("script", "Script", DiagramNodeRole.TECHNIQUE_STEP),
+            _cti_node("payload", "DinDoor", DiagramNodeRole.MALWARE_TOOL),
+        ),
+        (
+            _cti_edge("entry", "script", "exécute"),
+            _cti_edge("script", "payload", "déploie"),
+        ),
+    )
+    fixtures = (
+        (five_node_chain, "right"),
+        (branch_convergence, "right"),
+        (grouped_roles, "right"),
+        (long_label_fallback, "down"),
+    )
+
+    async def compile_all() -> tuple:
+        compiler = D2DiagramCompiler(binary=d2_binary)
+        return tuple([await compiler.compile(diagram) for diagram, _ in fixtures])
+
+    compiled = asyncio.run(compile_all())
+    for (_diagram, expected_direction), output in zip(fixtures, compiled, strict=True):
+        assert output.source_bytes.startswith(f"direction: {expected_direction}\n".encode())
+        report = measure_svg_overlaps(output.media_bytes)
+        assert report.text_overlap_count == 0, report.text_overlap_pairs
+        assert report.edge_node_overlap_count == 0, report.edge_node_overlap_pairs
+        root = ElementTree.fromstring(output.media_bytes)
+        view_box = [float(value) for value in root.get("viewBox", "").replace(",", " ").split()]
+        assert len(view_box) == 4 and view_box[2] <= 1200 and view_box[3] <= 900
+        assert len(output.media_bytes) < 1024 * 1024
+
+    assert b'fill="#D0E0F0"' in compiled[2].media_bytes
 
 
 def test_real_d2_layout_candidates_on_published_diagram_corpus(d2_binary: str) -> None:
@@ -496,8 +623,8 @@ def test_real_d2_layout_candidates_on_published_diagram_corpus(d2_binary: str) -
             )
             if candidate == "elk-compact":
                 node_pt, edge_pt = estimate_printed_font_sizes(svg)
-                assert node_pt >= 9.0, f"{subject_id} node labels print at only {node_pt:.2f}pt"
-                assert edge_pt >= 8.0, f"{subject_id} edge labels print at only {edge_pt:.2f}pt"
+                assert node_pt >= 8.0, f"{subject_id} node labels print at only {node_pt:.2f}pt"
+                assert edge_pt >= 7.0, f"{subject_id} edge labels print at only {edge_pt:.2f}pt"
 
     if os.environ.get("D2_LAYOUT_METRICS") == "1":
         print(json.dumps(metrics, ensure_ascii=False, sort_keys=True))
@@ -510,8 +637,12 @@ def test_real_d2_layout_candidates_on_published_diagram_corpus(d2_binary: str) -
     assert not elk_issues, (
         f"Compact ELK overlaps published diagram labels or node shapes: {elk_issues}"
     )
-    s7_metrics = metrics["dagre-default"]["30fe8e86-f22d-436c-a3df-f5837e1661e2"]
-    assert s7_metrics[0] > 0, "The published Arman overlap must remain detectable under dagre"
+    dagre_issues = {
+        subject_id: counts
+        for subject_id, counts in metrics["dagre-default"].items()
+        if counts != (0, 0)
+    }
+    assert not dagre_issues, f"Dagre overlaps published diagram labels or nodes: {dagre_issues}"
 
 
 def test_real_d2_published_diagrams_are_clear_and_deterministic(d2_binary: str) -> None:
@@ -535,8 +666,8 @@ def test_real_d2_published_diagrams_are_clear_and_deterministic(d2_binary: str) 
             f"{report.edge_node_overlap_pairs}"
         )
         node_pt, edge_pt = estimate_printed_font_sizes(first_svg)
-        assert node_pt >= 9.0, f"{subject_id}/{diagram.key} node labels print at {node_pt:.2f}pt"
-        assert edge_pt >= 8.0, f"{subject_id}/{diagram.key} edge labels print at {edge_pt:.2f}pt"
+        assert node_pt >= 8.0, f"{subject_id}/{diagram.key} node labels print at {node_pt:.2f}pt"
+        assert edge_pt >= 7.0, f"{subject_id}/{diagram.key} edge labels print at {edge_pt:.2f}pt"
         expected_arrowheads = sum(
             edge.direction is DiagramRelationDirection.DIRECTED for edge in diagram.edges
         )

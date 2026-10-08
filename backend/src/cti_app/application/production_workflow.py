@@ -734,6 +734,8 @@ class ProductionWorkflowOrchestrator:
             else None
         )
         self._seed_enrichment = seed_enrichment
+        self._media_asset_store = media_asset_store
+        self._diagram_compiler = diagram_compiler
         self._pacing = pacing or ProductionPacingPolicy.zero()
         self._settings = get_settings()
 
@@ -2033,7 +2035,10 @@ class ProductionWorkflowOrchestrator:
                     synthesis=canonical_synthesis,
                 )
                 publication = await PublicationAssemblyService(
-                    self._artifact_store, uow.production_artifacts
+                    self._artifact_store,
+                    uow.production_artifacts,
+                    media_asset_store=self._media_asset_store,
+                    diagram_compiler=self._diagram_compiler,
                 ).assemble_publication(
                     run=run,
                     snapshot=snapshot,
