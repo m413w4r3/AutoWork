@@ -8,6 +8,11 @@ from datetime import date
 from typing import Any
 from uuid import UUID
 
+from cti_app.application.edition_classification import classify_edition_publications
+from cti_app.application.edition_ioc_export import (
+    edition_identifier,
+    project_publication_iocs,
+)
 from cti_app.application.typst_rendering import (
     TemplateBundleInvalidError,
     TypstMediaRef,
@@ -18,7 +23,7 @@ from cti_app.application.typst_rendering import (
 from cti_app.domain.edition_publication import EditionDocumentV2
 from cti_app.domain.publication_document import PublicationDocumentV4, PublicationDocumentV5
 
-_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v17-synthesis-section-headings"
+_EDITION_RENDER_DATA_SCHEMA_VERSION = "typst-edition-model-v18-cover-index-ioc-briefs"
 _FRENCH_MONTH_NAMES = (
     "janvier",
     "février",
@@ -96,13 +101,23 @@ class EditionTypstRenderer:
             country.strip() if isinstance(country, str) and country.strip() else None
         )
         edition["bulletin_period"] = _period_label(edition)
+        edition["bulletin_title"] = "Bulletin de veille CTI"
+        edition["bulletin_number"] = str(edition.get("version") or 1)
+        edition["bulletin_identifier"] = edition_identifier(edition)
+        if any(
+            not isinstance(
+                publication.document,
+                (PublicationDocumentV4, PublicationDocumentV5),
+            )
+            for publication in document.publications
+        ):
+            raise EditionRenderPublicationSchemaUnsupportedError(
+                "Edition Typst rendering requires every publication to use a supported schema"
+            )
         publications: list[dict[str, Any]] = []
         media_refs_by_id: dict[UUID, TypstMediaRef] = {}
-        for publication in sorted(document.publications, key=lambda item: item.position):
-            if not isinstance(publication.document, (PublicationDocumentV4, PublicationDocumentV5)):
-                raise EditionRenderPublicationSchemaUnsupportedError(
-                    "Edition Typst rendering requires every publication to use a supported schema"
-                )
+        for classified in classify_edition_publications(document.publications):
+            publication = classified.publication
             model = project_publication_to_typst_model(publication.document)
             for media_ref in model.media_refs:
                 existing = media_refs_by_id.get(media_ref.asset_id)
@@ -115,6 +130,10 @@ class EditionTypstRenderer:
                 "position": publication.position,
                 "subject_id": str(publication.subject_id),
                 "title": model.title,
+                "kind": classified.kind,
+                "number": classified.number,
+                "anchor": classified.anchor,
+                "file_ioc_count": project_publication_iocs(publication.document).counts["file"],
                 "content_sections": model.content_sections,
             }
             publications.append(item)
@@ -123,6 +142,7 @@ class EditionTypstRenderer:
             "schema_version": _EDITION_RENDER_DATA_SCHEMA_VERSION,
             "edition": edition,
             "publications": publications,
+            "file_ioc_count": sum(item["file_ioc_count"] for item in publications),
         }
         render_data_bytes = json.dumps(
             render_data,

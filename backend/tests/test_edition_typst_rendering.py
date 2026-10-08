@@ -155,7 +155,7 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
 
     assert source.entrypoint_relative_path == "RENDERER/edition.typ"
     assert source.render_data_relative_path == "RENDERER/edition-render-data.json"
-    assert data["schema_version"] == ("typst-edition-model-v17-synthesis-section-headings")
+    assert data["schema_version"] == ("typst-edition-model-v18-cover-index-ioc-briefs")
     assert data["edition"] == {
         "id": str(_EDITION_ID),
         "country": "Iran",
@@ -167,8 +167,15 @@ def test_renders_one_article_with_edition_metadata_and_private_entrypoint(tmp_pa
         "version": 4,
         "bulletin_country": "Iran",
         "bulletin_period": "septembre 2026",
+        "bulletin_title": "Bulletin de veille CTI",
+        "bulletin_number": "4",
+        "bulletin_identifier": "IR2609",
     }
     assert [item["title"] for item in data["publications"]] == ["Single article"]
+    assert data["publications"][0]["kind"] == "article"
+    assert data["publications"][0]["number"] == "01"
+    assert data["publications"][0]["anchor"] == "article01"
+    assert data["file_ioc_count"] == data["publications"][0]["file_ioc_count"]
 
 
 def test_edition_keeps_v6_title_dated_references_and_ioc_groups(tmp_path: Path) -> None:
@@ -542,7 +549,7 @@ def test_shared_publication_projection_is_pure_and_complete(tmp_path: Path) -> N
 def test_repository_edition_manifest_snapshots_expected_assets() -> None:
     bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
 
-    assert bundle.template_version == "chp-edition-v14-synthesis-section-headings"
+    assert bundle.template_version == "chp-edition-v15-cover-ioc-index-briefs"
     assert {file.relative_path for file in bundle.files} == {
         "RENDERER/edition.typ",
         "RENDERER/edition_helpers.typ",

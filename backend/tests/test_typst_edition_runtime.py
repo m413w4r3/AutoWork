@@ -125,6 +125,107 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
         "Display ip",
     ):
         assert expected in text
+
+
+@pytest.mark.asyncio
+async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    base = _full_document()
+    brief = replace(
+        base,
+        subject_id=UUID(int=3),
+        title="Short operational update",
+        lead=(replace(base.lead[0], text="Brief body without titled sections."),),
+        sections=(),
+        timeline=(),
+        indicators=(),
+        uncertainties=(),
+        tables=(),
+        diagrams=(),
+        figures=(),
+        charts=(),
+        additional_source_ids=frozenset(),
+    )
+    document = EditionDocumentV2(
+        edition={
+            "id": "00000000-0000-4000-8000-000000000030",
+            "country": "Iran",
+            "country_code": "IR",
+            "period_start": "2026-09-01",
+            "period_end": "2026-09-30",
+            "tlp": "GREEN",
+            "languages": ["fr"],
+            "version": 5,
+        },
+        publications=(
+            EditionPublicationV2(
+                position=1,
+                subject_id=base.subject_id,
+                document=replace(base, title="Article with titled synthesis"),
+            ),
+            EditionPublicationV2(
+                position=2,
+                subject_id=brief.subject_id,
+                document=brief,
+            ),
+        ),
+    )
+    bundle = load_template_bundle(_CHP_TYPST_ROOT, manifest_name=_EDITION_MANIFEST)
+    source = EditionTypstRenderer().render(document, bundle)
+    render_data = json.loads(source.render_data_bytes)
+    workspace_root = tmp_path / "workspace"
+    _build_workspace(
+        workspace_root,
+        bundle_files=bundle.files,
+        render_data_bytes=source.render_data_bytes,
+        media_refs=source.media_refs,
+    )
+    (workspace_root / "RENDERER" / "render-data.json").unlink()
+    (workspace_root / source.render_data_relative_path).write_bytes(source.render_data_bytes)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "font-snapshot"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path=source.entrypoint_relative_path,
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    text, _ = _normalized_pdf_text(reader)
+    links = [
+        annotation.get_object()
+        for annotation in (reader.pages[0].get("/Annots") or [])
+        if annotation.get_object().get("/Subtype") == "/Link"
+    ]
+    internal_links = [
+        annotation
+        for annotation in links
+        if annotation.get("/Dest") is not None or annotation.get("/A", {}).get("/S") == "/GoTo"
+    ]
+
+    assert [item["kind"] for item in render_data["publications"]] == ["article", "brief"]
+    assert [item["number"] for item in render_data["publications"]] == ["01", "02"]
+    assert len(internal_links) >= 2
+    for expected in (
+        "Résumé de l\u2019actualité",
+        "Autres brèves relevées",
+        "Short operational update",
+        "Règles Suricata",
+        "Échantillons relevés",
+        "Article CSV",
+        "STIX",
+        "Excel",
+    ):
+        assert expected in text
+    assert "Chronologie" not in text
+    assert "Vue d'ensemble" not in text
+    assert "Note de l'analyste" not in text
     # The reader sees a source note, never the internal provenance string.
     assert "Figure 1 from the source publication" not in text
     assert "Provenance :" not in text
@@ -132,7 +233,7 @@ async def test_real_typst_compiles_multi_article_edition_in_one_pass(
     assert "Attribution remains uncertain" not in text
     assert text.count("RÉFÉRENCES") >= 1
     assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
-    assert text.index("Alpha first article") < text.index("Zulu second article")
+    assert text.index("Article with titled synthesis") < text.index("Short operational update")
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
     for placeholder in (
         "Bulletin-CODE",

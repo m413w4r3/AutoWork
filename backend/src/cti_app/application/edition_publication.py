@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -14,6 +16,10 @@ from cti_app.application.edition_document import (
     EditionDocumentArtifactRef,
     EditionDocumentBuildError,
     build_edition_document,
+)
+from cti_app.application.edition_ioc_export import (
+    EditionIOCArchive,
+    build_edition_ioc_archive,
 )
 from cti_app.application.edition_release_materialization import (
     EditionReleaseRematerializationService,
@@ -36,7 +42,11 @@ from cti_app.application.jobs import (
     JobService,
 )
 from cti_app.application.persistence import JobUnitOfWorkFactory, ProductionUnitOfWorkFactory
-from cti_app.application.production_artifact_store import ProductionArtifactStore
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+    ProductionReuseStorageUnavailableError,
+)
 from cti_app.application.production_repairs import (
     publication_is_compatible_with_current_effective_inputs,
 )
@@ -46,6 +56,7 @@ from cti_app.application.typst_render_output import (
     read_verified_render_pdf,
 )
 from cti_app.domain.edition_publication import (
+    EditionDocumentV2,
     EditionRelease,
     PublicationManifestEntryV1,
     PublicationManifestExclusionV1,
@@ -86,6 +97,14 @@ class ReleasePdfNotAvailableError(PublicationError):
 
 class ReleasePdfUnreadableError(PublicationError):
     """The rendered PDF recorded for the release cannot be served."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class ReleaseIOCArchiveUnreadableError(PublicationError):
+    """The immutable edition document cannot be safely exported."""
 
     def __init__(self, code: str) -> None:
         super().__init__(code)
@@ -405,6 +424,45 @@ class EditionPublicationService:
         except TypstRenderOutputIntegrityError as exc:
             raise ReleasePdfUnreadableError("release_pdf_integrity_mismatch") from exc
         return EditionReleasePdf(content=content, filename=edition.bulletin_pdf_filename())
+
+    async def read_release_ioc_archive(self, edition_id: UUID) -> EditionIOCArchive:
+        """Export IOC values only from the document pinned by the latest release."""
+        async with self._uow_factory() as uow:
+            manifest = await uow.publication_manifests.get_latest_for_edition(edition_id)
+            release = (
+                await uow.edition_releases.get_by_manifest(manifest.id)
+                if manifest is not None
+                else None
+            )
+            await uow.commit()
+        if release is None or release.edition_id != edition_id:
+            raise PublicationManifestNotFoundError("edition_release_not_found")
+
+        try:
+            content = await self._artifact_store.read_bytes(
+                release.edition_document_blob_id,
+                max_bytes=MAX_ARTIFACT_BYTES,
+            )
+        except ProductionReuseStorageUnavailableError as exc:
+            raise ReleaseIOCArchiveUnreadableError("release_ioc_archive_storage_error") from exc
+        if hashlib.sha256(content).hexdigest() != release.edition_document_sha256:
+            raise ReleaseIOCArchiveUnreadableError("release_ioc_archive_integrity_mismatch")
+        try:
+            payload = json.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("edition document must be a JSON object")
+            document = EditionDocumentV2.from_json(payload)
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise ReleaseIOCArchiveUnreadableError("release_ioc_archive_document_invalid") from exc
+        if str(document.edition.get("id")) != str(edition_id):
+            raise ReleaseIOCArchiveUnreadableError("release_ioc_archive_edition_mismatch")
+        try:
+            return build_edition_ioc_archive(
+                document,
+                edition_sha256=release.edition_document_sha256,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ReleaseIOCArchiveUnreadableError("release_ioc_archive_document_invalid") from exc
 
     async def retry_render(
         self,

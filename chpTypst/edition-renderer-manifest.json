@@ -1,5 +1,5 @@
 {
-  "template_version": "chp-edition-v14-synthesis-section-headings",
+  "template_version": "chp-edition-v15-cover-ioc-index-briefs",
   "files": [
     "RENDERER/edition.typ",
     "RENDERER/edition_helpers.typ",
