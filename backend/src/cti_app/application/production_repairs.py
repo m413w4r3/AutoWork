@@ -29,6 +29,7 @@ from cti_app.application.production_editorial_enrichment import (
     validate_editorial_enrichment,
 )
 from cti_app.application.production_extraction import (
+    MAX_ARCHIVED_SOURCE_BYTES,
     extraction_compatibility_view,
 )
 from cti_app.application.production_normalization import canonical_indicator_key
@@ -71,6 +72,7 @@ from cti_app.application.production_source_evidence import (
     SourceEvidenceDocument,
     SourceEvidenceSpan,
     SourceEvidenceSpanKind,
+    artifact_source_verification_method,
     source_evidence_context_for_artifact,
     source_evidence_context_for_rule,
     source_evidence_document_from_html,
@@ -129,6 +131,7 @@ from cti_app.domain.production_extraction import (
     ProductionExtractionOmissionReason,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    is_production_extraction_hash,
     production_extraction_from_json,
     production_extraction_to_json,
 )
@@ -453,6 +456,7 @@ class ProductionRepairCorrectionVerification:
     reason_code: str | None = None
     context_spans: tuple[SourceEvidenceSpan, ...] = ()
     verification_state: ProductionRepairVerificationState | None = None
+    verification_method: str | None = None
 
 
 class ProductionRepairProjectionError(ValueError):
@@ -2827,6 +2831,15 @@ class ProductionRepairAdjudicationService:
             verification_state=(
                 ProductionRepairVerificationState.SOURCE_VERIFIED if source_verified else None
             ),
+            verification_method=(
+                artifact_source_verification_method(
+                    artifact_proposal,
+                    document.parsed_text,
+                    allow_layout_canonicalization=not document.decoded_source_view,
+                )
+                if source_verified and artifact_proposal is not None
+                else None
+            ),
         )
 
     async def _archived_source_document(
@@ -2870,7 +2883,7 @@ class ProductionRepairAdjudicationService:
         if not callable(reader):
             return None
         try:
-            content = await reader(blob_id)
+            content = await reader(blob_id, max_bytes=MAX_ARCHIVED_SOURCE_BYTES)
             if expected_sha256 and hashlib.sha256(content).hexdigest() != expected_sha256:
                 return None
             detected = DetectedMimeType(
@@ -4640,7 +4653,7 @@ class ProductionRepairMaterializationService:
                         previous = production_extraction_from_json(
                             await store.read_json(cast(UUID, prior.canonical_blob_id))
                         )
-                        if canonical_extraction_hash(previous) == synthesis.extraction_hash:
+                        if is_production_extraction_hash(previous, synthesis.extraction_hash):
                             lineage_found = True
                             break
                     if not lineage_found:
@@ -5610,8 +5623,14 @@ def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
     if item.artifact_type is None:
         return item.category, item.value.casefold()
     artifact_type = ArtifactType(item.artifact_type)
-    normalized = item.normalized_value or canonical_indicator_key(item.value, artifact_type)
-    return artifact_type.value, normalized
+    if item.normalized_value:
+        return artifact_type.value, item.normalized_value
+    try:
+        return artifact_type.value, canonical_indicator_key(item.value, artifact_type)
+    except ValueError:
+        # A malformed literal already present in the base extraction (for instance an
+        # ``ip:port``) must not block the repair projection: key it by its raw value.
+        return artifact_type.value, item.value.casefold()
 
 
 def _prefer_projection_object[T](

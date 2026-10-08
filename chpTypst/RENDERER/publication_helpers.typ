@@ -1,4 +1,4 @@
-#import "../UTILS/helpers.typ": section-title, timeline, styled-table, ioc-list, semantic-text, semantic-or-plain
+#import "../UTILS/helpers.typ": section-title, timeline, ioc-list, semantic-text, semantic-or-plain
 #import "../UTILS/colors.typ": grey
 
 #let has-text(value) = value != none and value != ""
@@ -8,16 +8,78 @@
 })
 
 #let publication-timeline-events(events) = {
-  events.map(event => (
-    event.display_date,
-    event.text,
-    unique-urls(event.source_urls),
-    event.at("semantic_spans", default: none),
-  ))
+  events.map(event => {
+    let role-label = event.at("role_label", default: none)
+    let body = [
+      #if has-text(role-label) [
+        #text(size: 8pt, fill: grey)[#role-label]
+        #linebreak()
+      ]
+      #semantic-or-plain(event.text, event.at("semantic_spans", default: none))
+    ]
+    (
+      event.display_date,
+      body,
+      unique-urls(event.source_urls),
+      none,
+    )
+  })
 }
 
 #let render-publication-timeline(events) = {
   timeline(publication-timeline-events(events))
+}
+
+#let publication-styled-table(columns, cell-align: auto, title: none, ..content) = {
+  let cells = content.pos()
+  let column-count = columns.len()
+  let header-cells = cells.slice(0, column-count).map(cell => [
+    #set text(weight: "bold", fill: white)
+    #cell
+  ])
+  let body-cells = cells.slice(column-count).enumerate().map(((index, cell)) => {
+    let row = calc.floor(index / column-count)
+    if calc.rem(row, 2) == 0 {
+      [#block(sticky: true, breakable: false, above: 0pt, below: 0pt)[#cell]]
+    } else {
+      [#block(breakable: false, above: 0pt, below: 0pt)[#cell]]
+    }
+  })
+  let body-row-count = calc.floor((cells.len() - column-count) / column-count)
+
+  set text(size: 8pt)
+  let rendered-table = align(center, table(
+    columns: columns,
+    inset: (x: 4pt, y: 3pt),
+    align: (x, y) => {
+      if y == 0 { left } else { cell-align.at(x) }
+    },
+    fill: (_, y) => if y == 0 { rgb("#5D7374") } else { none },
+    stroke: 0.4pt + rgb("#AEB7C0"),
+    table.header(repeat: true, ..header-cells),
+    ..body-cells,
+  ))
+
+  if body-row-count <= 12 {
+    block(
+      breakable: false,
+      above: if title == none { 0pt } else { 6pt },
+    )[
+      #if title != none [
+        #title
+        #v(4pt)
+      ]
+      #rendered-table
+    ]
+  } else {
+    if title != none [
+      #block(sticky: true, above: 6pt)[
+        #title
+        #v(4pt)
+      ]
+    ]
+    rendered-table
+  }
 }
 
 #let render-table(item) = {
@@ -41,7 +103,7 @@
       if semantic-cells == none { none } else { semantic-cells.at(index) },
     )
   ])
-  styled-table(
+  publication-styled-table(
     widths,
     cell-align: cell-alignments,
     title: title,
@@ -58,7 +120,11 @@
 
 #let render-figure-caption(number, caption, semantic-spans) = block(
   above: 0pt,
-  text(size: 9pt, fill: grey)[Figure #number : #semantic-or-plain(caption, semantic-spans)],
+  align(center)[
+    #text(size: 9pt, fill: grey, style: "italic")[
+      Figure #number : #semantic-or-plain(caption, semantic-spans)
+    ]
+  ],
 )
 
 // Preserve intrinsic dimensions and scale down to the printable frame before
@@ -102,7 +168,7 @@
   } else {
     none
   }
-  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.55)
+  render-publication-image(item.media_path, caption-content, max-height-fraction: 0.35)
 }
 
 #let render-figure(item) = {

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -56,6 +57,17 @@ def _local_name(tag: str) -> str:
 
 def _class_tokens(element: ElementTree.Element) -> set[str]:
     return set(element.attrib.get("class", "").split())
+
+
+def _is_group_container(element: ElementTree.Element) -> bool:
+    for token in _class_tokens(element):
+        try:
+            decoded = base64.b64decode(token, validate=True).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if re.fullmatch(r"g\d{3}", decoded):
+            return True
+    return False
 
 
 def _number(value: str | None, default: float = 0.0) -> float:
@@ -323,7 +335,7 @@ def measure_svg_overlaps(svg_bytes: bytes) -> SvgOverlapReport:
         if _local_name(element.tag) != "g":
             continue
         children = list(element)
-        if any(
+        if not _is_group_container(element) and any(
             _local_name(child.tag) == "g" and "shape" in _class_tokens(child) for child in children
         ):
             node_groups.add(element)
@@ -388,12 +400,12 @@ def estimate_printed_font_sizes(
     *,
     printable_width_pt: float = 450.0,
     printable_height_pt: float = 660.0,
-    max_height_fraction: float = 0.55,
+    max_height_fraction: float = 0.35,
 ) -> tuple[float, float]:
     """Estimate minimum node/edge font sizes after the publication image is fitted.
 
     The fit mirrors Typst's publication helper: SVG CSS pixels convert at 0.75 pt,
-    then the image is scaled to the smaller of printable width and 55% of the
+    then the image is scaled to the smaller of printable width and 35% of the
     available height. The page area defaults are deliberately tighter than A4's
     margin-only dimensions to leave room for its header and footer.
     """
@@ -414,7 +426,7 @@ def estimate_printed_font_sizes(
         if _local_name(element.tag) != "g":
             continue
         children = list(element)
-        if any(
+        if not _is_group_container(element) and any(
             _local_name(child.tag) == "g" and "shape" in _class_tokens(child) for child in children
         ):
             node_groups.add(element)

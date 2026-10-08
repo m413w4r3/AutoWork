@@ -131,6 +131,7 @@ from cti_app.domain.publication_document import (
     PublicationDiagramV1,
     PublicationDocumentV4,
     PublicationDocumentV5,
+    parse_publication_document,
     publication_document_v4_to_json,
     publication_document_v5_from_json,
     publication_document_v5_to_json,
@@ -312,6 +313,275 @@ def _with_extra_source(snapshot, references, extraction, synthesis):
     )
     synthesis = replace(synthesis, extraction_hash=canonical_extraction_hash(extraction))
     return snapshot, references, extraction, synthesis, source_url
+
+
+def _cited_technical_context_case():
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    context_id = UUID(int=23)
+    context_url = "https://github.com/fortra/nanodump"
+    context_hash = "f" * 64
+    base_extraction_source = extraction.sources[0]
+    context_fact = replace(
+        base_extraction_source.facts[0],
+        category="tools",
+        value="NanoDump",
+        evidence_quote="NanoDump is a memory dumper.",
+        source_document_ids=(context_id,),
+    )
+    context_extraction_source = replace(
+        base_extraction_source,
+        source_document_id=context_id,
+        canonical_url=context_url,
+        content_sha256=context_hash,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        role=SourceRole.UNKNOWN,
+        profile=ExtractionProfile.FULL,
+        facts=(context_fact,),
+        events=(),
+        indicators=(),
+        rules=(),
+        uncertainties=(),
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        profile_reason_code=ExtractionProfileReasonCode.OPERATOR_DESCRIPTIVE_CONTEXT,
+    )
+    core_reference = replace(references.sources[0], published_at=date(2025, 1, 10))
+    context_reference = replace(
+        references.sources[0],
+        canonical_url=context_url,
+        title="NanoDump tool reference",
+        publisher="Fortra",
+        published_at=None,
+        tier=ProductionReferenceTier.TECHNICAL,
+        kind=ProductionReferenceKind.TECHNICAL_RESOURCE,
+        role=SourceRole.UNKNOWN,
+        editorial_role=ProductionEditorialRole.CONTEXT,
+        source_collection_id=UUID(int=123),
+        source_document_id=context_id,
+        content_sha256=context_hash,
+    )
+    references = replace(references, sources=(core_reference, context_reference))
+    extraction = replace(
+        extraction,
+        references_corpus_hash=references_corpus_hash(references),
+        sources=(*extraction.sources, context_extraction_source),
+    )
+    context_evidence = next(
+        ref
+        for ref in extraction_evidence_refs_v1(extraction)
+        if ref.source_document_id == context_id and ref.kind is EvidenceKind.FACT
+    )
+    synthesis = replace(
+        synthesis,
+        extraction_hash=canonical_extraction_hash(extraction),
+        sections=(
+            SynthesisSectionV1(
+                kind=SynthesisSectionKind.TECHNICAL,
+                heading="NanoDump",
+                paragraphs=(
+                    SynthesisParagraphV1("NanoDump is a memory dumper.", (context_evidence,)),
+                ),
+            ),
+        ),
+        source_notes=(),
+    )
+    projection = build_relevance_projection(snapshot, extraction)
+    enrichment = _enrichment_with(extraction=extraction, synthesis=synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    return (
+        snapshot,
+        references,
+        extraction,
+        projection,
+        synthesis,
+        enrichment,
+        publication,
+        context_id,
+        context_evidence,
+    )
+
+
+def test_cited_technical_context_is_a_dated_ordered_reader_reference() -> None:
+    (
+        snapshot,
+        references,
+        extraction,
+        projection,
+        synthesis,
+        enrichment,
+        publication,
+        context_id,
+        context_evidence,
+    ) = _cited_technical_context_case()
+
+    assert isinstance(publication, PublicationDocumentV5)
+    assert [item.source_document_id for item in publication.references] == [
+        references.sources[0].source_document_id,
+        context_id,
+    ]
+    context_reference = publication.references[1]
+    assert context_reference.text == (
+        "Fortra : NanoDump tool reference — ressource technique de contexte."
+    )
+    context_source = next(
+        item for item in publication.sources if item.source_document_id == context_id
+    )
+    assert context_source.editorial_role is ProductionEditorialRole.CONTEXT
+    assert context_source.source_collection_id == UUID(int=123)
+    assert context_source.content_sha256 == "f" * 64
+    assert context_source.source_criticality is not None
+    assert any(
+        ref.source_document_id == context_id
+        for ref in synthesis.sections[0].paragraphs[0].evidence_refs
+    )
+    assert context_evidence.source_document_id == context_id
+
+    from cti_app.application.publication_qa import qa_publication_v5
+
+    qa = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+        publication=publication,
+    )
+    assert qa["passed"] is True
+    assert qa["checks"]["source_provenance"] is True
+
+    restored = publication_document_v5_from_json(publication_document_v5_to_json(publication))
+    assert restored == publication
+    from cti_app.application.typst_rendering import project_publication_to_typst_model
+
+    render_model = project_publication_to_typst_model(publication)
+    rendered_reference = next(
+        item
+        for item in render_model.content_sections[0]["timeline"]
+        if item["source_urls"] == ["https://github.com/fortra/nanodump"]
+    )
+    assert rendered_reference["display_date"] == "Date de publication non précisée"
+    assert rendered_reference["role_label"] == "Contexte technique"
+    assert rendered_reference["text"] == context_reference.text
+
+    # A source note, when supplied by Synthesis, remains authoritative.
+    noted_synthesis = replace(
+        synthesis,
+        source_notes=(
+            SynthesisSourceNoteV1(
+                source_document_id=context_id,
+                text="Note de synthèse conservée pour le contexte technique.",
+                evidence_refs=(context_evidence,),
+            ),
+        ),
+    )
+    noted_enrichment = _enrichment_with(extraction=extraction, synthesis=noted_synthesis)
+    noted_publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=noted_synthesis,
+        editorial_enrichment=noted_enrichment,
+    )
+    assert (
+        next(
+            item.text
+            for item in noted_publication.references
+            if item.source_document_id == context_id
+        )
+        == "Note de synthèse conservée pour le contexte technique."
+    )
+
+
+def test_uncited_full_technical_resource_stays_out_of_reader_references() -> None:
+    (
+        snapshot,
+        references,
+        extraction,
+        projection,
+        synthesis,
+        _enrichment,
+        _publication,
+        context_id,
+        _context_evidence,
+    ) = _cited_technical_context_case()
+    uncited_synthesis = replace(synthesis, sections=(), source_notes=())
+    enrichment = _enrichment_with(extraction=extraction, synthesis=uncited_synthesis)
+    publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=uncited_synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert extraction.sources[-1].profile is ExtractionProfile.FULL
+    assert context_id not in {item.source_document_id for item in publication.references}
+    assert context_id not in {item.source_document_id for item in publication.sources}
+    from cti_app.application.publication_qa import qa_publication_v5
+
+    qa = qa_publication_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        relevance_projection=projection,
+        synthesis=uncited_synthesis,
+        editorial_enrichment=enrichment,
+        publication=publication,
+    )
+    assert qa["passed"] is True
+
+
+def test_legacy_v5_publication_remains_readable_and_rebuildable() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
+    legacy_publication = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    restored = publication_document_v5_from_json(
+        publication_document_v5_to_json(legacy_publication)
+    )
+    rebuilt = build_publication_document_v5(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    assert restored == legacy_publication
+    assert rebuilt == legacy_publication
+
+    legacy_v4 = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    restored_v4 = parse_publication_document(publication_document_v4_to_json(legacy_v4))
+    rebuilt_v4 = build_publication_document_v4(
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+    assert restored_v4 == legacy_v4
+    assert rebuilt_v4 == legacy_v4
 
 
 def _build_v4(enrichment=None):
@@ -979,7 +1249,7 @@ def test_publication_v5_deduplication_is_stable_for_three_duplicates_and_input_o
 
 def test_assembly_input_hash_uses_exact_canonical_functional_payload() -> None:
     snapshot, references, extraction, synthesis = _canonical_inputs()
-    assert publication_builder.ASSEMBLY_POLICY_VERSION == "10-context-source-provenance"
+    assert publication_builder.ASSEMBLY_POLICY_VERSION == "11-cited-technical-context-references"
     enrichment = build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis)
     payload = {
         "snapshot_input_hash": snapshot.input_hash,

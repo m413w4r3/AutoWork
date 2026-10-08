@@ -160,7 +160,7 @@ EXTRACTION_RESPONSE_PARSER_VERSION = Q2_MARKDOWN_PARSER_VERSION
 #: Deterministic archived-text transform. Chunking is a pure function of the
 #: archived content, the transformers' versions, the maximum size and the
 #: overlap, so it never depends on the provider that answers.
-SOURCE_TEXT_CONTRACT_VERSION = "archived-text-v2"
+SOURCE_TEXT_CONTRACT_VERSION = "archived-text-v3"
 SOURCE_TEXT_CHUNKER_VERSION = "chunker-v2"
 SOURCE_CHUNK_MAX_CHARS = 24_000
 SOURCE_CHUNK_OVERLAP_CHARS = 400

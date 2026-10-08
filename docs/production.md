@@ -35,6 +35,11 @@ le V5 côté frontend ; son PDF est produit par le rendu AW-019 `PublicationRend
 Synthesis ni Editorial Enrichment.
 La QA canonique passée, le run devient `READY`, indépendamment du rendu.
 
+Une évolution de `ASSEMBLY_POLICY_VERSION` qui ne change que la projection de publication
+nécessite de reconstruire `PUBLICATION` uniquement. `REFERENCES`, `EXTRACTION`,
+`RELEVANCE_PROJECTION`, `SYNTHESIS` et `EDITORIAL_ENRICHMENT` restent valides, sans appel modèle.
+Le PDF d'aperçu est ensuite rendu à nouveau si la version du renderer ou du template change.
+
 ## Rendu de publication et de bulletin
 
 La publication d'un Subject et le bulletin d'édition ont des rendus séparés :

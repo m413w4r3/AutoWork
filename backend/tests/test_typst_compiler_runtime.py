@@ -32,6 +32,7 @@ from cti_app.domain.publication import (
     PublicationIndicatorV1,
 )
 from cti_app.infrastructure.typst_compiler import TypstSubprocessCompiler
+from tests.test_publication_builder_v4 import _cited_technical_context_case
 from tests.test_publication_v4 import _SOURCE_ID
 from tests.test_typst_rendering import _full_document, _table
 
@@ -352,6 +353,46 @@ async def test_real_typst_article_preserves_copyable_technical_literals(
     assert "IOC" in extracted
     assert "Narrow hash column" in extracted
     assert "Registre Windows" in extracted
+    assert len(reader.pages) >= 1
+
+
+@pytest.mark.asyncio
+async def test_real_typst_article_renders_cited_technical_context_reference(
+    tmp_path: Path,
+    typst_binary: str,
+    font_bundle_root: Path,
+) -> None:
+    publication = _cited_technical_context_case()[6]
+    typst_root = _REPOSITORY_ROOT / "chpTypst"
+    bundle = load_template_bundle(typst_root)
+    source = TypstRenderer().render(publication, bundle)
+    render_data = json.loads(source.render_data_bytes)
+    workspace_root = tmp_path / "technical-context-reference-workspace"
+    _build_runtime_workspace(_REPOSITORY_ROOT, workspace_root, render_data=render_data)
+    font_snapshot = load_font_bundle_snapshot(font_bundle_root, _FONT_BUNDLE_LOCK)
+    font_root = tmp_path / "technical-context-reference-fonts"
+    font_root.mkdir()
+    compiled = await TypstSubprocessCompiler(binary=typst_binary).compile(
+        TypstCompileRequest(
+            workspace_root=workspace_root,
+            entrypoint_relative_path="RENDERER/publication.typ",
+            font_paths=materialize_font_bundle(font_snapshot, font_root),
+        )
+    )
+
+    reader = PdfReader(BytesIO(compiled.content), strict=True)
+    extracted = _assert_exact_copyable_pdf_text(
+        reader,
+        (
+            "Contexte technique",
+            "NanoDump tool reference",
+            "Date de publication non précisée",
+        ),
+    )
+    compact_text = "".join(extracted.split())
+    assert "Fortra:NanoDumptoolreference—ressourcetechniquedecontexte." in compact_text
+    assert "https://github.com/fortra/nanodump" in compact_text
+    assert "2https://github.com/fortra/nanodump" in compact_text
     assert len(reader.pages) >= 1
 
 

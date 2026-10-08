@@ -827,7 +827,6 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert production_helpers_imports[shared_helpers] >= {
         "section-title",
         "timeline",
-        "styled-table",
         "ioc-list",
     }
     assert "source-list" not in production_helpers_imports[shared_helpers]
@@ -848,6 +847,14 @@ def test_direct_v4_composition_is_deliberate_and_shares_chp_visual_modules() -> 
     assert re.search(r"#let article\s*\(.*?fill:\s*purple", helper_source, re.DOTALL)
     assert re.search(r"#let section-title\s*\(.*?fill:\s*purple", helper_source, re.DOTALL)
     assert re.search(r"#let purple\s*=\s*rgb\(\"#[0-9A-Fa-f]{6}\"\)", color_source)
+    assert "#let publication-styled-table" in production_helpers_source
+    assert "set text(size: 8pt)" in production_helpers_source
+    assert 'rgb("#5D7374")' in production_helpers_source
+    assert "fill: white" in production_helpers_source
+    assert 'stroke: 0.4pt + rgb("#AEB7C0")' in production_helpers_source
+    assert "max-height-fraction: 0.35" in production_helpers_source
+    assert "align(center)[" in production_helpers_source
+    assert 'style: "italic"' in production_helpers_source
 
 
 @pytest.mark.asyncio

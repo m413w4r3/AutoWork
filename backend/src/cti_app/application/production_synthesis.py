@@ -67,6 +67,7 @@ from cti_app.domain.production import (
 from cti_app.domain.production_extraction import (
     PRODUCTION_EXTRACTION_SCHEMA_VERSION,
     ProductionExtractionV1,
+    is_production_extraction_hash,
     production_extraction_from_json,
     production_extraction_hashes,
 )
@@ -2874,8 +2875,9 @@ class SynthesisRevisionContextV1:
             raise ValueError("Revision context requires a synthesis evidence delta")
         if (
             self.previous_synthesis.subject_id != self.previous_extraction.subject_id
-            or self.previous_synthesis.extraction_hash
-            != canonical_extraction_hash(self.previous_extraction)
+            or not is_production_extraction_hash(
+                self.previous_extraction, self.previous_synthesis.extraction_hash
+            )
         ):
             raise ValueError("Revision context previous synthesis lineage is inconsistent")
 
@@ -3620,7 +3622,7 @@ class ProductionSynthesisService:
                 raise
             except Exception:
                 continue
-            if canonical_extraction_hash(candidate) == extraction_hash:
+            if is_production_extraction_hash(candidate, extraction_hash):
                 return candidate
         return None
 

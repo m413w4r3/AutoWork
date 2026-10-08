@@ -38,7 +38,7 @@ from cti_app.domain.semantic_annotation import (
     timeline_anchor,
 )
 
-_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v18-context-source-label"
+_RENDER_DATA_SCHEMA_VERSION = "typst-publication-model-v19-cited-technical-context-reference"
 _PUBLICATION_RENDERER_MANIFEST = "renderer-manifest.json"
 _FRENCH_MONTH_NAMES = (
     "janvier",
@@ -480,6 +480,8 @@ def project_publication_to_typst_model(
             "text": reference.text,
             "source_urls": [source.canonical_url],
         }
+        if source.kind.value == "technical_resource":
+            item["role_label"] = "Contexte technique"
         spans = semantic_spans(f"reference:{index:04d}", reference.text)
         if spans is not None:
             item["semantic_spans"] = spans

@@ -1,3 +1,4 @@
+import hashlib
 from dataclasses import replace
 from datetime import date
 from inspect import signature
@@ -6,6 +7,10 @@ from uuid import UUID
 
 import pytest
 
+from cti_app.application.diagram_compilation import (
+    DIAGRAM_COMPILATION_POLICY_VERSION,
+    CompiledDiagram,
+)
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
@@ -37,8 +42,15 @@ from cti_app.domain.production import (
     ProductionRun,
 )
 from cti_app.domain.production_editorial_enrichment import (
+    DiagramEdgeV1,
+    DiagramNodeRole,
+    DiagramNodeV1,
+    DiagramProfile,
+    DiagramSpecV1,
     EditorialAnalyticPurposeV1,
     EditorialEnrichmentV1,
+    EnrichmentDiagramDirection,
+    EnrichmentDiagramKind,
     EnrichmentPlacementKind,
     EnrichmentPlacementV1,
     EnrichmentTableKind,
@@ -295,7 +307,115 @@ def _expected_diagnostics(
 
 def test_assembly_constructor_has_no_renderer_dependency() -> None:
     parameters = tuple(signature(PublicationAssemblyService).parameters)
-    assert parameters == ("artifact_store", "production_artifacts")
+    assert parameters[:2] == ("artifact_store", "production_artifacts")
+    assert set(parameters) == {
+        "artifact_store",
+        "production_artifacts",
+        "media_asset_store",
+        "diagram_compiler",
+    }
+
+
+class _StaleDiagramMediaStore:
+    def __init__(self) -> None:
+        self.old_asset_id = UUID(int=90)
+        self.new_asset_id = UUID(int=91)
+        self.stored_sources: list[str] = []
+
+    async def get(self, asset_id: UUID) -> SimpleNamespace:
+        assert asset_id == self.old_asset_id
+        return SimpleNamespace(policy_version="diagram-d2-svg-v7-elk-compact")
+
+    async def store_diagram(self, compiled: CompiledDiagram, *, source: str) -> SimpleNamespace:
+        assert compiled.compiler_policy_version == DIAGRAM_COMPILATION_POLICY_VERSION
+        self.stored_sources.append(source)
+        return SimpleNamespace(asset_id=self.new_asset_id)
+
+
+class _CurrentDiagramCompiler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def compile(self, diagram: DiagramSpecV1) -> CompiledDiagram:
+        self.calls += 1
+        source_bytes = b"direction: right\n"
+        media_bytes = b"<svg></svg>\n"
+        return CompiledDiagram(
+            diagram_key=diagram.key,
+            source_format="d2",
+            source_bytes=source_bytes,
+            source_sha256=hashlib.sha256(source_bytes).hexdigest(),
+            media_type="image/svg+xml",
+            media_bytes=media_bytes,
+            media_sha256=hashlib.sha256(media_bytes).hexdigest(),
+            compiler="d2",
+            compiler_version="0.9.0",
+            compiler_policy_version=DIAGRAM_COMPILATION_POLICY_VERSION,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publication_rebuilds_stale_diagram_svg_without_model_calls() -> None:
+    snapshot, references, extraction, synthesis = _canonical_inputs()
+    run = _run(snapshot)
+    catalog = _MemoryBlobCatalog()
+    artifacts = _RecordingArtifacts()
+    media_asset_store = _StaleDiagramMediaStore()
+    diagram_compiler = _CurrentDiagramCompiler()
+    service = PublicationAssemblyService(
+        ProductionArtifactStore(catalog),
+        artifacts,
+        media_asset_store=media_asset_store,  # type: ignore[arg-type]
+        diagram_compiler=diagram_compiler,
+    )
+    evidence = extraction_evidence_refs_v1(extraction)[0]
+    diagram = DiagramSpecV1(
+        key="stale-flow",
+        kind=EnrichmentDiagramKind.INFECTION_CHAIN,
+        title="Stale diagram",
+        caption="Actor delivers the malware",
+        direction=EnrichmentDiagramDirection.TOP_TO_BOTTOM,
+        nodes=(
+            DiagramNodeV1("actor", "Actor", (evidence,), DiagramNodeRole.ACTOR),
+            DiagramNodeV1("malware", "Malware", (evidence,), DiagramNodeRole.MALWARE_TOOL),
+        ),
+        edges=(DiagramEdgeV1("actor", "malware", "delivers", (evidence,)),),
+        groups=(),
+        placement=EnrichmentPlacementV1(EnrichmentPlacementKind.END),
+        compiled_asset_id=media_asset_store.old_asset_id,
+        profile=DiagramProfile.FLOW,
+        purpose=EditorialAnalyticPurposeV1(
+            question="How does the actor deliver the malware?",
+            available_data="The diagram has one actor and one malware node.",
+            comprehension_gain="The edge states the documented delivery relation.",
+            scope="Only the two diagram nodes and their edge.",
+            evidence_refs=(evidence,),
+            knowledge_limits="No other activity is represented.",
+            placement_reason="Place the flow after its supporting explanation.",
+        ),
+    )
+    enrichment = replace(
+        build_empty_editorial_enrichment(extraction=extraction, synthesis=synthesis),
+        diagrams=(diagram,),
+    )
+
+    publication = await service.assemble_publication(
+        run=run,
+        snapshot=snapshot,
+        references=references,
+        extraction=extraction,
+        synthesis=synthesis,
+        editorial_enrichment=enrichment,
+    )
+
+    assert publication.canonical_blob_id is not None
+    stored_document = parse_publication_document(
+        await ProductionArtifactStore(catalog).read_json(publication.canonical_blob_id)
+    )
+    assert diagram_compiler.calls == 1
+    assert media_asset_store.stored_sources == [f"production_run:{run.id}:diagram:{diagram.key}"]
+    assert stored_document.diagrams[0].asset_id == media_asset_store.new_asset_id
+    assert enrichment.diagrams[0].compiled_asset_id == media_asset_store.old_asset_id
 
 
 @pytest.mark.asyncio

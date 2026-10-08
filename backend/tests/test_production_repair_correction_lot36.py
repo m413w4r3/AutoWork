@@ -9,8 +9,12 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from cti_app.application.production_artifact_store import ProductionArtifactStore
-from cti_app.application.production_parsers import TechnicalExtraction
+from cti_app.application.blob_storage import BlobReadLimitExceededError
+from cti_app.application.production_artifact_store import (
+    MAX_ARTIFACT_BYTES,
+    ProductionArtifactStore,
+)
+from cti_app.application.production_parsers import ExtractionItem, TechnicalExtraction
 from cti_app.application.production_repairs import (
     EffectiveExtractionProjector,
     ProductionRepairAdjudicationService,
@@ -18,6 +22,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueDetail,
     ProductionRepairIssueView,
     ProductionRepairValueNotVerifiableError,
+    _item_projection_key,
     classify_repair_impact,
     production_repair_correction_identity,
 )
@@ -30,6 +35,7 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRepairVerificationState,
 )
+from cti_app.domain.publication import ArtifactType
 
 EDITION_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUBJECT_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -192,12 +198,16 @@ class _Catalog:
         return SimpleNamespace(id=blob_id)
 
     async def read(self, blob_id: UUID, *, max_bytes: int) -> bytes:
-        return self.contents[blob_id][:max_bytes]
+        content = self.contents[blob_id]
+        if len(content) > max_bytes:
+            raise BlobReadLimitExceededError(size_bytes=len(content), max_bytes=max_bytes)
+        return content
 
 
 class _ArchiveUow:
-    def __init__(self, blob_id: UUID, content: bytes) -> None:
+    def __init__(self, blob_id: UUID, content: bytes, *, mime_type: str = "text/html") -> None:
         self.blob_id = blob_id
+        self.mime_type = mime_type
         self.source_collections = SimpleNamespace(
             list_for_subject=lambda _subject_id: self._collections()
         )
@@ -217,14 +227,13 @@ class _ArchiveUow:
         return SimpleNamespace(
             decoded_blob_id=self.blob_id,
             decoded_sha256=None,
-            detected_mime_type="text/html",
+            detected_mime_type=self.mime_type,
         )
 
-    @staticmethod
-    async def _blob(blob_id: UUID, content: bytes) -> object:
+    async def _blob(self, blob_id: UUID, content: bytes) -> object:
         return SimpleNamespace(
             id=blob_id,
-            descriptor=SimpleNamespace(sha256=_sha256(content.decode()), mime_type="text/html"),
+            descriptor=SimpleNamespace(sha256=_sha256(content.decode()), mime_type=self.mime_type),
         )
 
     async def __aenter__(self) -> _ArchiveUow:
@@ -289,6 +298,75 @@ async def test_source_verified_replacement_and_explicit_override_policy() -> Non
             actor_id="analyst",
             reason=None,
         )
+
+
+@pytest.mark.asyncio
+async def test_replacement_verification_reports_layout_canonicalization() -> None:
+    replacement = r"C:\ProgramData\Drivers\MicDriver_*_mic.wav"
+    content = "C:\\ProgramData\\Drivers\\MicDriver_\n*\x00_\u00admic.wav".encode()
+    catalog = _Catalog(content)
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    uow = _ArchiveUow(catalog.blob_id, content, mime_type="text/plain")
+    service = ProductionRepairAdjudicationService(lambda: uow, artifact_store=store)
+    issue = replace(
+        _issue(),
+        artifact_type="filepath",
+        value_sha256=_sha256("missing.wav"),
+        preview="missing.wav",
+    )
+
+    verification = await service._validate_replacement(
+        issue=issue,
+        value=replacement,
+        require_source=True,
+    )
+
+    assert verification.format_valid is True
+    assert verification.verified is True
+    assert verification.verification_method == "whitespace_canonicalized"
+
+
+@pytest.mark.asyncio
+async def test_replacement_verification_reads_archived_source_above_artifact_limit() -> None:
+    replacement = r"C:\ProgramData\Drivers\MicDriver_*_mic.wav"
+    # 3-byte characters keep the text under the parser limit while the blob exceeds the
+    # default artifact read limit, like a large archived PDF.
+    content = (replacement + "\n" + "\u20ac" * 1_900_000).encode()
+    assert len(content) > MAX_ARTIFACT_BYTES
+    catalog = _Catalog(content)
+    store = ProductionArtifactStore(catalog)  # type: ignore[arg-type]
+    uow = _ArchiveUow(catalog.blob_id, content, mime_type="text/plain")
+    service = ProductionRepairAdjudicationService(lambda: uow, artifact_store=store)
+    issue = replace(
+        _issue(),
+        artifact_type="filepath",
+        value_sha256=_sha256("missing.wav"),
+        preview="missing.wav",
+    )
+
+    verification = await service._validate_replacement(
+        issue=issue,
+        value=replacement,
+        require_source=True,
+    )
+
+    assert verification.verified is True
+
+
+def test_projection_key_tolerates_a_malformed_literal_in_the_base_extraction() -> None:
+    item = ExtractionItem(
+        local_id="i1",
+        category="indicator",
+        value="127.0.0.1:48739",
+        context="",
+        artifact_type=ArtifactType.IP,
+        attack_id=None,
+        reference_ids=(),
+        source_ids=(),
+        supported=True,
+    )
+
+    assert _item_projection_key(item) == ("ip", "127.0.0.1:48739")
 
 
 def _rule_issue(value: str) -> ProductionRepairIssueView:

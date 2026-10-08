@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
+from uuid import UUID
 
+from cti_app.application.diagram_compilation import (
+    DIAGRAM_COMPILATION_POLICY_VERSION,
+    DiagramCompiler,
+)
+from cti_app.application.media_assets import MediaAssetStore, compile_and_store_diagrams
 from cti_app.application.persistence import ProductionArtifactRepository
 from cti_app.application.production_artifact_store import ProductionArtifactStore
 from cti_app.application.production_editorial_enrichment import (
@@ -44,9 +51,14 @@ class PublicationAssemblyService:
         self,
         artifact_store: ProductionArtifactStore,
         production_artifacts: ProductionArtifactRepository,
+        *,
+        media_asset_store: MediaAssetStore | None = None,
+        diagram_compiler: DiagramCompiler | None = None,
     ) -> None:
         self._artifact_store = artifact_store
         self._production_artifacts = production_artifacts
+        self._media_asset_store = media_asset_store
+        self._diagram_compiler = diagram_compiler
 
     async def assemble_publication(
         self,
@@ -83,6 +95,10 @@ class PublicationAssemblyService:
                 PublicationAssemblyErrorCode.INPUTS_MISMATCH,
                 "Editorial enrichment does not match the production input snapshot",
             )
+        editorial_enrichment = await self._refresh_diagram_assets(
+            editorial_enrichment,
+            production_run_id=run.id,
+        )
         document = build_publication_document_v5(
             snapshot=snapshot,
             references=references,
@@ -233,6 +249,53 @@ class PublicationAssemblyService:
         self._set_repair_result_id(artifact)
         await self._production_artifacts.append(artifact)
         return artifact
+
+    async def _refresh_diagram_assets(
+        self,
+        enrichment: EditorialEnrichmentV1,
+        *,
+        production_run_id: UUID,
+    ) -> EditorialEnrichmentV1:
+        """Recompile stale derived SVGs from saved specs without a model call."""
+        media_asset_store = self._media_asset_store
+        diagram_compiler = self._diagram_compiler
+        if not enrichment.diagrams or media_asset_store is None or diagram_compiler is None:
+            return enrichment
+
+        stale_diagrams = []
+        for diagram in enrichment.diagrams:
+            manifest = (
+                await media_asset_store.get(diagram.compiled_asset_id)
+                if diagram.compiled_asset_id is not None
+                else None
+            )
+            if manifest is None or manifest.policy_version != DIAGRAM_COMPILATION_POLICY_VERSION:
+                stale_diagrams.append(diagram)
+        if not stale_diagrams:
+            return enrichment
+
+        compilation = await compile_and_store_diagrams(
+            tuple(stale_diagrams),
+            compiler=diagram_compiler,
+            media_asset_store=media_asset_store,
+            production_run_id=production_run_id,
+        )
+        compiled_by_key = {diagram.key: diagram for diagram in compilation.diagrams}
+        if compilation.rejections or len(compiled_by_key) != len(stale_diagrams):
+            rejected_keys = [rejection.diagram_key for rejection in compilation.rejections]
+            if not rejected_keys:
+                rejected_keys = [
+                    diagram.key for diagram in stale_diagrams if diagram.key not in compiled_by_key
+                ]
+            raise PublicationAssemblyValidationError(
+                PublicationAssemblyErrorCode.DIAGRAM_ASSET_MISSING,
+                "Current diagram render assets could not be compiled: " + ",".join(rejected_keys),
+            )
+
+        diagrams = tuple(
+            compiled_by_key.get(diagram.key, diagram) for diagram in enrichment.diagrams
+        )
+        return replace(enrichment, diagrams=diagrams)
 
     @staticmethod
     def _set_repair_result_id(artifact: ProductionArtifact) -> None:
