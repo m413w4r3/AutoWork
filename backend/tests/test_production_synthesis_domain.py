@@ -224,6 +224,18 @@ def test_domain_like_and_technology_names_are_grounded_without_false_positives(
         validate_synthesis_section_heading(heading, ("Le rapport décrit une activité réseau.",))
 
 
+def test_heading_camel_case_grounding_does_not_join_across_sentence_punctuation() -> None:
+    heading = "PssNtCaptureSnapshot. Ces possibilités"
+
+    assert (
+        validate_synthesis_section_heading(
+            heading,
+            ("Le code appelle PssNtCaptureSnapshot pour capturer un processus.",),
+        )
+        == heading
+    )
+
+
 def test_stored_synthesis_with_duplicate_headings_is_rejected() -> None:
     payload = production_synthesis_to_json(_synthesis())
     payload["sections"].append(

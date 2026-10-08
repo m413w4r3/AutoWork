@@ -4474,7 +4474,7 @@ def _nanodump_revision_case(
             "NanoDump permet de générer un minidump de LSASS et de s'intégrer à Beacon ; "
             "une méthode restaure la signature de WerFault.exe sans l'option --valid."
             + first_claim_suffix,
-            ("E1001", "E1008", "E1021"),
+            ("E1001", "E1008", "E1021", "E999"),
             "tool_context",
         ),
         (
@@ -4515,8 +4515,18 @@ def _nanodump_revision_case(
 
 
 def test_nano_dump_claims_allow_french_prose_but_keep_distinctive_facts_anchored() -> None:
-    evidence_pack, proposal = _nanodump_revision_case()
+    evidence_pack, proposal = _nanodump_revision_case(
+        first_claim_suffix=(
+            " La méthode est utilisable depuis la console Beacon de Cobalt Strike. "
+            "Ces possibilités correspondent aux fonctionnalités génériques documentées. "
+            "Le code appelle PssNtCaptureSnapshot pour obtenir un instantané du processus."
+        )
+    )
     first_claim = proposal.sections[0].claims[0]
+    distinctive_terms = set(
+        synthesis_revision_module._distinctive_grounding_terms(first_claim.text)
+    )
+    assert {"Beacon", "Cobalt Strike", "WerFault.exe", "PssNtCaptureSnapshot"} <= distinctive_terms
     records = {str(record["handle"]): record for record in evidence_pack.narrative_evidence}
     evidence_text = " ".join(
         str(value)
@@ -4541,6 +4551,43 @@ def test_nano_dump_claims_allow_french_prose_but_keep_distinctive_facts_anchored
         proposal,
         evidence_pack,
     )
+
+
+def test_nano_dump_rejects_cobalt_strike_when_absent_from_cited_evidence() -> None:
+    evidence_pack, proposal = _nanodump_revision_case(
+        first_claim_suffix=(
+            " La méthode est utilisable depuis la console Beacon de Cobalt Strike. "
+            "Ces possibilités correspondent aux fonctionnalités génériques documentées."
+        )
+    )
+    records = tuple(
+        {
+            **record,
+            "context": (
+                "Le module est utilisable depuis Beacon. La documentation détaille la "
+                "restauration de WerFault.exe et l'option --valid."
+            ),
+            "evidence": (
+                "Le module est utilisable depuis Beacon. La documentation détaille la "
+                "restauration de WerFault.exe et l'option --valid."
+            ),
+        }
+        if record["handle"] == "E1008"
+        else record
+        for record in evidence_pack.narrative_evidence
+    )
+    evidence_without_product_name = replace(evidence_pack, narrative_evidence=records)
+
+    with pytest.raises(
+        synthesis_revision_module.TargetedSynthesisRevisionValidationError,
+        match="synthesis_relation_not_evidenced",
+    ) as error:
+        synthesis_revision_module._assert_claim_handles_and_relations_supported(
+            proposal,
+            evidence_without_product_name,
+        )
+
+    assert "Cobalt Strike" in error.value.details["unsupported_terms"]
 
 
 @pytest.mark.parametrize(
@@ -4616,6 +4663,77 @@ def test_distinctive_grounding_normalizes_accents_and_plurals_without_matching_p
         f"La requête utilise {long_url}.",
         "Le rapport décrit une requête HTTPS.",
     ) == (long_url,)
+
+
+@pytest.mark.parametrize(
+    "separator",
+    (
+        ". ",
+        "! ",
+        "? ",
+        "; ",
+        ": ",
+        ", ",
+        " (",
+        ") ",
+        " «",
+        " »",
+        " — ",
+        " \u2013 ",
+        "\n",
+        "\r\n",
+    ),
+)
+def test_distinctive_name_sequences_stop_at_punctuation_and_line_breaks(separator: str) -> None:
+    terms = synthesis_revision_module._distinctive_grounding_terms(
+        f"Beacon Cobalt{separator}Strike est documenté. Ces fonctionnalités sont génériques."
+    )
+
+    assert "Cobalt Strike" not in terms
+    assert "Beacon Cobalt Strike" not in terms
+    assert "Ces" not in terms
+
+
+def test_multitoken_name_requires_a_complete_evidence_sequence() -> None:
+    claim = "Le module Cobalt Strike est documenté."
+
+    assert (
+        synthesis_revision_module._unsupported_distinctive_claim_terms(
+            claim,
+            "Le module Cobalt Strike est documenté dans le rapport.",
+        )
+        == ()
+    )
+    assert synthesis_revision_module._unsupported_distinctive_claim_terms(
+        claim,
+        "Le rapport mentionne Cobalt séparément, puis décrit Strike comme un terme isolé.",
+    ) == ("Cobalt Strike",)
+    assert synthesis_revision_module._unsupported_distinctive_claim_terms(
+        claim,
+        "Le module appartient à un autre produit documenté.",
+    ) == ("Cobalt", "Cobalt Strike", "Strike")
+
+
+@pytest.mark.parametrize("opener", ("Ces", "Le", "Selon", "Cette", "Il", "Pour"))
+def test_sentence_initial_editorial_words_are_not_distinctive(opener: str) -> None:
+    terms = synthesis_revision_module._distinctive_grounding_terms(
+        f"La console Beacon est documentée. {opener} possibilités restent génériques."
+    )
+
+    assert opener not in terms
+    assert "Beacon" in terms
+
+
+@pytest.mark.parametrize(
+    "identifier",
+    ("API", "PssNtCaptureSnapshot", "NanoDump2", "Foo-bar", "foo_bar", "Foo.exe"),
+)
+def test_distinctive_identifiers_remain_distinctive_at_sentence_start(identifier: str) -> None:
+    terms = synthesis_revision_module._distinctive_grounding_terms(
+        f"{identifier} est documenté dans le rapport."
+    )
+
+    assert identifier in terms
 
 
 def test_claim_grounding_refusal_details_are_bounded_and_exclude_claim_content() -> None:
