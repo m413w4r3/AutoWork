@@ -4758,6 +4758,28 @@ async def test_element_revision_appends_one_version_carries_other_elements_and_i
 
 
 @pytest.mark.asyncio
+async def test_e2b_targeted_revision_currently_stores_identical_canonical_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Characterize the missing no-change guard without changing the E2b service."""
+    proposal = _proposal("E001")
+    targeted = proposal.model_copy(update={"tables": (proposal.tables[0],), "diagrams": ()})
+    wire = _proposal_to_wire(targeted)
+    world = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, wire)),
+    )
+
+    result = await world.service.revise(**_revision_args(world))
+    revised_payload = await world.world.store.read_json(result.artifact.canonical_blob_id)
+
+    assert result.artifact.id != world.base.id
+    assert ProductionArtifactStore.canonical_json_bytes(revised_payload) == (
+        ProductionArtifactStore.canonical_json_bytes(world.base_payload)
+    )
+
+
+@pytest.mark.asyncio
 async def test_targeted_revision_can_remove_one_table_and_keep_its_siblings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
