@@ -35,7 +35,6 @@ from cti_app.application.production_relevance import (
     persist_relevance_projection_in_uow,
 )
 from cti_app.application.production_repairs import repair_projection_decision_ids
-from cti_app.application.production_synthesis import canonical_extraction_hash
 from cti_app.application.subject_production import (
     _lock_open_edition,
     capture_production_input_snapshot,
@@ -55,6 +54,7 @@ from cti_app.domain.production_editorial_enrichment import (
 )
 from cti_app.domain.production_extraction import (
     ProductionExtractionV1,
+    is_production_extraction_hash,
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionReferenceCorpusV1
@@ -295,7 +295,7 @@ def _validate_canonical_artifacts_v5(
         if references_corpus_hash(references) != extraction.references_corpus_hash:
             raise ValueError("EXTRACTION references corpus hash does not match REFERENCES")
 
-        if canonical_extraction_hash(extraction) != synthesis.extraction_hash:
+        if not is_production_extraction_hash(extraction, synthesis.extraction_hash):
             raise ValueError("SYNTHESIS extraction hash does not match EXTRACTION")
         if extraction.production_input_hash != synthesis.production_input_hash:
             raise ValueError("EXTRACTION and SYNTHESIS production input hashes differ")
@@ -312,7 +312,12 @@ def _validate_canonical_artifacts_v5(
         ):
             raise ValueError("Canonical artifacts have different production input hashes")
 
-        validate_editorial_enrichment(enrichment, extraction=extraction, synthesis=synthesis)
+        validate_editorial_enrichment(
+            enrichment,
+            extraction=extraction,
+            synthesis=synthesis,
+            expected_extraction_hash=synthesis.extraction_hash,
+        )
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise _invalid("Production state canonical artifacts or lineage are invalid") from exc
     return references, extraction, synthesis, enrichment

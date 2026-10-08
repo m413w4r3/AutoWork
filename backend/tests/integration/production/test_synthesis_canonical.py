@@ -9,6 +9,7 @@ SYNTHESIS runs through ``ProductionSynthesisService``: one stateless
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -47,6 +48,7 @@ from cti_app.application.production_parsers import (
     Q2RuleProposal,
     Q2SourceOutput,
 )
+from cti_app.application.production_stages import SynthesisService
 from cti_app.application.production_synthesis import (
     SYNTHESIS_PROMPT_VERSION,
     build_synthesis_delta,
@@ -67,6 +69,7 @@ from cti_app.domain.production import (
     ProductionRunStatus,
     ProductionStage,
 )
+from cti_app.domain.production_editorial_revision import TargetedEditorialRevisionConflictError
 from cti_app.domain.production_extraction import (
     ExtractionFactV1,
     ProductionExtractionV1,
@@ -707,3 +710,93 @@ async def test_canonical_synthesis_revision_drops_removed_evidence(
     assert set(expected_delta.added_evidence) <= revised_refs
     assert revised_refs <= set(extraction_evidence_refs_v1(extraction_b))
     assert tripwire == []
+
+
+@pytest.mark.asyncio
+async def test_synthesis_revision_storage_checks_postgres_cas_fences(
+    production_scenario_factory: ScenarioFactory,
+) -> None:
+    scenario = _configure(production_scenario_factory(_sources()))
+    _install_canonical_synthesis(scenario)
+
+    await scenario.start()
+    run = await scenario.run_until_terminal()
+    assert run.status is ProductionRunStatus.READY, (
+        run.error_code,
+        run.error_message,
+        run.error_details,
+    )
+
+    async with scenario.uow_factory() as uow:
+        base_artifact = await uow.production_artifacts.get_current(run.id, "synthesis")
+        extraction_artifact = await uow.production_artifacts.get_current(run.id, "extraction")
+    assert base_artifact is not None and base_artifact.canonical_blob_id is not None
+    assert extraction_artifact is not None and extraction_artifact.canonical_blob_id is not None
+    extraction = production_extraction_from_json(
+        await scenario.artifact_store.read_json(extraction_artifact.canonical_blob_id)
+    )
+    base_synthesis = await _read_synthesis(scenario, base_artifact)
+    base_bytes = await scenario.artifact_store.read_bytes(base_artifact.canonical_blob_id)
+    base_sha256 = hashlib.sha256(base_bytes).hexdigest()
+    revised_synthesis = replace(base_synthesis, title=f"{base_synthesis.title} corrected")
+    persistence = SynthesisService(scenario.uow_factory, scenario.artifact_store)
+
+    async def store_revision(
+        *,
+        expected_artifact_id: UUID,
+        expected_input_hash: str,
+        expected_sha256: str,
+    ) -> ProductionArtifact:
+        return await persistence.store_synthesis_result(
+            run_id=run.id,
+            subject_id=base_artifact.subject_id,
+            input_hash=base_artifact.input_hash,
+            synthesis=revised_synthesis,
+            extraction=extraction,
+            raw_result=None,
+            model_run_id=base_artifact.model_run_id,
+            expected_current_artifact_id=expected_artifact_id,
+            expected_current_input_hash=expected_input_hash,
+            expected_current_canonical_sha256=expected_sha256,
+            stale_stages={ProductionArtifactStage.PUBLICATION.value},
+        )
+
+    revised_artifact = await store_revision(
+        expected_artifact_id=base_artifact.id,
+        expected_input_hash=base_artifact.input_hash,
+        expected_sha256=base_sha256,
+    )
+    assert revised_artifact.version == base_artifact.version + 1
+    assert await scenario.artifact_store.read_bytes(base_artifact.canonical_blob_id) == base_bytes
+
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await store_revision(
+            expected_artifact_id=base_artifact.id,
+            expected_input_hash=base_artifact.input_hash,
+            expected_sha256=base_sha256,
+        )
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await store_revision(
+            expected_artifact_id=revised_artifact.id,
+            expected_input_hash="e" * 64,
+            expected_sha256=hashlib.sha256(
+                await scenario.artifact_store.read_bytes(revised_artifact.canonical_blob_id)
+            ).hexdigest(),
+        )
+    with pytest.raises(TargetedEditorialRevisionConflictError):
+        await store_revision(
+            expected_artifact_id=revised_artifact.id,
+            expected_input_hash=revised_artifact.input_hash,
+            expected_sha256="f" * 64,
+        )
+
+    async with scenario.uow_factory() as uow:
+        persisted_versions = await uow.production_artifacts.list_for_run(run.id)
+        current = await uow.production_artifacts.get_current(run.id, "synthesis")
+    assert current is not None and current.id == revised_artifact.id
+    synthesis_versions = [
+        artifact.version
+        for artifact in persisted_versions
+        if artifact.stage is ProductionArtifactStage.SYNTHESIS
+    ]
+    assert sorted(synthesis_versions) == [base_artifact.version, revised_artifact.version]

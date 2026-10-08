@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from cti_app.application.production_artifact_store import MAX_ARTIFACT_BYTES
+from cti_app.application.production_editorial_enrichment import canonical_synthesis_hash
 from cti_app.application.production_extraction import references_corpus_hash
 from cti_app.application.production_references import production_reference_corpus_to_json
 from cti_app.application.production_state import (
@@ -21,7 +22,10 @@ from cti_app.application.production_state import (
     _validate_snapshot,
     compute_production_state_checksum,
 )
-from cti_app.application.production_synthesis import canonical_extraction_hash
+from cti_app.application.production_synthesis import (
+    canonical_extraction_hash,
+    production_synthesis_from_json,
+)
 from cti_app.application.subject_production import capture_production_input_snapshot
 from cti_app.domain.classification import TLP
 from cti_app.domain.collection import CollectionState
@@ -52,6 +56,8 @@ from cti_app.domain.production_extraction import (
     ExtractionReuseState,
     ProductionExtractionV1,
     ProductionSourceExtractionV1,
+    production_extraction_from_json,
+    production_extraction_hashes,
     production_extraction_to_json,
 )
 from cti_app.domain.production_references import (
@@ -697,6 +703,33 @@ def test_snapshot_rejects_canonical_artifacts_with_broken_lineage(
         _validate_snapshot(payload)
 
     assert exc_info.value.code == "production_state_invalid"
+
+
+def test_snapshot_accepts_pre_scope_extraction_hash_without_rewriting_blobs() -> None:
+    payload = _payload()
+    extraction_payload = payload["artifacts"]["extraction"]["canonical_content"]
+    for source in extraction_payload["sources"]:
+        source.pop("scope")
+    extraction = production_extraction_from_json(extraction_payload)
+    extraction_hashes = production_extraction_hashes(extraction)
+    assert len(extraction_hashes) == 2
+    legacy_hash = extraction_hashes[1]
+
+    synthesis_payload = payload["artifacts"]["synthesis"]["canonical_content"]
+    synthesis_payload["extraction_hash"] = legacy_hash
+    synthesis = production_synthesis_from_json(synthesis_payload)
+    enrichment_payload = payload["artifacts"]["editorial_enrichment"]["canonical_content"]
+    enrichment_payload["extraction_hash"] = legacy_hash
+    enrichment_payload["synthesis_hash"] = canonical_synthesis_hash(synthesis)
+    payload["content_sha256"] = canonical_checksum(payload)
+
+    snapshot = _validate_snapshot(payload)
+
+    assert snapshot.artifacts.extraction.canonical_content == extraction_payload
+    assert snapshot.artifacts.synthesis.canonical_content["extraction_hash"] == legacy_hash
+    assert snapshot.artifacts.editorial_enrichment.canonical_content["extraction_hash"] == (
+        legacy_hash
+    )
 
 
 def test_snapshot_rejects_enrichment_with_unknown_evidence_reference() -> None:
