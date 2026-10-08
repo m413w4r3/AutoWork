@@ -208,6 +208,18 @@ def _section_id(payload: Mapping[str, Any]) -> str:
     return _sha256(payload)
 
 
+def _enrichment_section_anchor_id(payload: Mapping[str, Any]) -> str:
+    """Identify a synthesis section for enrichment without binding its heading.
+
+    Section IDs used by targeted editorial requests intentionally include the
+    heading. Enrichment placements need a separate identity: changing a title
+    must not invalidate evidence anchored to the section's paragraphs.
+    """
+    anchor_payload = dict(payload)
+    anchor_payload.pop("heading", None)
+    return _sha256(anchor_payload)
+
+
 def build_targeted_revision_target_catalog(
     stage: str, canonical_content: Any
 ) -> list[dict[str, Any]]:
@@ -2987,10 +2999,29 @@ class ProductionSynthesisRevisionService:
             raw_payload = json.loads(current_bytes)
             enrichment = editorial_enrichment_from_json(raw_payload)
             base_synthesis = production_synthesis_from_json(context.base_payload)
-            before_sections = production_synthesis_to_json(base_synthesis)["sections"]
+            raw_before_sections = context.base_payload.get("sections")
+            before_sections = (
+                raw_before_sections
+                if isinstance(raw_before_sections, list)
+                else production_synthesis_to_json(base_synthesis)["sections"]
+            )
             after_sections = production_synthesis_to_json(revised_synthesis)["sections"]
+            after_anchor_indexes: dict[str, list[int]] = {}
+            after_legacy_indexes: dict[str, list[int]] = {}
+            for index, section in enumerate(after_sections):
+                if isinstance(section, Mapping):
+                    # The heading-insensitive anchor is the current format.
+                    after_anchor_indexes.setdefault(
+                        _enrichment_section_anchor_id(section), []
+                    ).append(index)
+                    # Keep the full canonical ID as a compatibility path for
+                    # old artifacts and unchanged legacy sections.
+                    after_legacy_indexes.setdefault(_section_id(section), []).append(index)
             after_section_indexes = {
-                _section_id(section): index for index, section in enumerate(after_sections)
+                identity: indexes[0]
+                for identities in (after_anchor_indexes, after_legacy_indexes)
+                for identity, indexes in identities.items()
+                if len(indexes) == 1
             }
             stale_blocks: list[dict[str, str]] = []
 
@@ -3002,14 +3033,29 @@ class ProductionSynthesisRevisionService:
                         index = placement.section_index
                         if index is None or index >= len(before_sections):
                             stale_blocks.append(
-                                {"kind": kind, "key": item.key, "reason": "anchor_missing"}
+                                {
+                                    "kind": kind,
+                                    "key": item.key,
+                                    "reason": "anchor_missing",
+                                    "source_artifact_id": str(enrichment_artifact.id),
+                                }
                             )
                             continue
-                        section_identity = _section_id(before_sections[index])
+                        before_section = before_sections[index]
+                        section_identity = _enrichment_section_anchor_id(before_section)
                         new_index = after_section_indexes.get(section_identity)
                         if new_index is None:
+                            # Read placements from artifacts created before
+                            # heading-insensitive anchors existed.
+                            new_index = after_section_indexes.get(_section_id(before_section))
+                        if new_index is None:
                             stale_blocks.append(
-                                {"kind": kind, "key": item.key, "reason": "section_anchor_changed"}
+                                {
+                                    "kind": kind,
+                                    "key": item.key,
+                                    "reason": "section_anchor_changed",
+                                    "source_artifact_id": str(enrichment_artifact.id),
+                                }
                             )
                             continue
                         if new_index != index:
@@ -3063,6 +3109,7 @@ class ProductionSynthesisRevisionService:
                             "kind": "annotation",
                             "key": annotation.paragraph_anchor,
                             "reason": "paragraph_anchor_changed",
+                            "source_artifact_id": str(enrichment_artifact.id),
                         }
                     )
                     continue

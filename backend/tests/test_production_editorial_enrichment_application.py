@@ -4684,6 +4684,549 @@ async def _revision_harness(
     )
 
 
+async def _install_stale_enrichment_restore_history(
+    harness: SimpleNamespace, *, mode: str = "renamed"
+) -> dict[str, ProductionArtifact]:
+    from cti_app.application.production_editorial_enrichment import (
+        build_editorial_figure_catalog,
+    )
+    from cti_app.domain.production_editorial_enrichment import (
+        ChartKind,
+        ChartPointV1,
+        ChartSpecV1,
+        EditorialAnalyticPurposeV1,
+    )
+
+    world = harness.world
+    original = editorial_enrichment_from_json(harness.base_payload)
+    section_placement = EnrichmentPlacementV1(
+        kind=EnrichmentPlacementKind.AFTER_SECTION,
+        section_index=0,
+    )
+    source_enrichment = replace(
+        original,
+        tables=tuple(replace(item, placement=section_placement) for item in original.tables),
+        diagrams=tuple(replace(item, placement=section_placement) for item in original.diagrams),
+        charts=tuple(replace(item, placement=section_placement) for item in original.charts),
+        source_figures=tuple(
+            replace(item, placement=section_placement) for item in original.source_figures
+        ),
+    )
+    if mode == "trivial":
+        diagram = source_enrichment.diagrams[0]
+        evidence_ref = diagram.nodes[0].evidence_refs[0]
+        source_enrichment = replace(
+            source_enrichment,
+            diagrams=(
+                replace(
+                    diagram,
+                    key="trivial_restore_candidate",
+                    nodes=(
+                        DiagramNodeV1("malware", "ExampleRAT", (evidence_ref,)),
+                        DiagramNodeV1("observation", "observed", (evidence_ref,)),
+                    ),
+                    edges=(
+                        DiagramEdgeV1(
+                            "malware",
+                            "observation",
+                            "was observed",
+                            (evidence_ref,),
+                            DiagramRelationType.FACTUAL,
+                            DiagramRelationDirection.DIRECTED,
+                        ),
+                    ),
+                    groups=(),
+                ),
+            ),
+        )
+    if mode == "renamed":
+        evidence_ref = next(
+            ref
+            for ref in extraction_evidence_refs_v1(world.extraction)
+            if ref.kind is EvidenceKind.FACT
+        )
+        source_enrichment = replace(
+            source_enrichment,
+            charts=(
+                *source_enrichment.charts,
+                ChartSpecV1(
+                    key="history_chart",
+                    kind=ChartKind.TIMELINE,
+                    title="ExampleRAT activity chronology",
+                    caption="Reported activity dates",
+                    placement=section_placement,
+                    purpose=EditorialAnalyticPurposeV1(
+                        question="How is the activity represented over time?",
+                        available_data="The source documents ExampleRAT activity.",
+                        comprehension_gain="A compact timeline organizes the report's dates.",
+                        scope="Only the activity described by this source.",
+                        evidence_refs=(evidence_ref,),
+                        knowledge_limits="The evidence gives no dates between observations.",
+                        placement_reason="Place alongside the section describing the activity.",
+                    ),
+                    points=(
+                        ChartPointV1(
+                            label="Reported activity",
+                            date="2026-08-25",
+                            series="ExampleRAT",
+                            evidence_refs=(evidence_ref,),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    original_base = harness.base
+    source_payload = editorial_enrichment_to_json(source_enrichment)
+    source_artifact = replace(
+        original_base,
+        canonical_blob_id=world.store.put(source_payload),
+        metadata={
+            **original_base.metadata,
+            "synthesis_hash": canonical_synthesis_hash(world.synthesis),
+            "extraction_hash": canonical_extraction_hash(world.extraction),
+        },
+    )
+    harness.artifacts.artifacts = [
+        source_artifact if item.id == original_base.id else item
+        for item in harness.artifacts.artifacts
+    ]
+
+    synthesis_chain = [world.synthesis]
+    if mode != "ioc":
+        title_revision = replace(world.synthesis, title=f"{world.synthesis.title} revised")
+        first_rename = replace(
+            title_revision,
+            sections=(replace(title_revision.sections[0], heading="Execution flow"),),
+        )
+        synthesis_chain.extend((title_revision, first_rename))
+        if mode in {"renamed", "trivial"}:
+            second_rename = replace(
+                first_rename,
+                sections=(replace(first_rename.sections[0], heading="Execution flow updated"),),
+            )
+            synthesis_chain.append(second_rename)
+
+    current_artifacts: dict[str, ProductionArtifact] = {"source": source_artifact}
+
+    def store_enrichment_version(
+        *,
+        version: int,
+        enrichment: Any,
+        synthesis: ProductionSynthesisV1,
+        parent: ProductionArtifact,
+        stale_blocks: list[dict[str, str]] | None = None,
+        revision: dict[str, Any] | None = None,
+    ) -> ProductionArtifact:
+        evidence_pack = build_editorial_enrichment_evidence_pack(
+            world.snapshot, world.extraction, synthesis
+        )
+        evidence_hash = editorial_enrichment_evidence_pack_hash(evidence_pack)
+        access_hash = str(original_base.metadata["access_policy_hash"])
+        inventory_hash = str(original_base.metadata["source_figure_inventory_hash"])
+        input_hash = compute_editorial_enrichment_input_hash(
+            extraction=world.extraction,
+            synthesis=synthesis,
+            evidence_pack_hash=evidence_hash,
+            access_policy_hash=access_hash,
+            projection_hash=None,
+            source_figure_inventory_hash=inventory_hash,
+        )
+        figure_catalog = build_editorial_figure_catalog(
+            world.extraction, harness.inventory_state.value
+        )
+        metadata: dict[str, Any] = {
+            **original_base.metadata,
+            "evidence_pack_hash": evidence_hash,
+            "extraction_hash": canonical_extraction_hash(world.extraction),
+            "synthesis_hash": canonical_synthesis_hash(synthesis),
+            "source_figure_provenance_diagnostics": (
+                enrichment_module.build_source_figure_provenance_diagnostics(
+                    harness.inventory_state.value, figure_catalog, enrichment
+                )
+            ),
+        }
+        if revision is not None:
+            metadata["revision"] = revision
+        else:
+            metadata["revision_rebase"] = {
+                "from_artifact_id": str(parent.id),
+                "stale_blocks": stale_blocks or [],
+                "adopted_blocks": {},
+                "model_call_count": 0,
+            }
+        return ProductionArtifact(
+            production_run_id=world.run.id,
+            subject_id=world.snapshot.subject_id,
+            stage=ProductionArtifactStage.EDITORIAL_ENRICHMENT,
+            version=version,
+            input_hash=input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=world.store.put(editorial_enrichment_to_json(enrichment)),
+            metadata=metadata,
+        )
+
+    def empty_for(synthesis: ProductionSynthesisV1, *, retain_non_diagram_annotations: bool) -> Any:
+        return replace(
+            source_enrichment,
+            extraction_hash=canonical_extraction_hash(world.extraction),
+            synthesis_hash=canonical_synthesis_hash(synthesis),
+            tables=(),
+            diagrams=(),
+            charts=(),
+            source_figures=(),
+            figure_decisions=(),
+            annotations=(
+                tuple(
+                    item
+                    for item in source_enrichment.annotations
+                    if item.paragraph_anchor.startswith("section:")
+                )
+                if retain_non_diagram_annotations
+                else ()
+            ),
+        )
+
+    if mode == "ioc":
+        current = store_enrichment_version(
+            version=2,
+            enrichment=empty_for(synthesis_chain[0], retain_non_diagram_annotations=False),
+            synthesis=synthesis_chain[0],
+            parent=source_artifact,
+            stale_blocks=[
+                {
+                    "kind": "table",
+                    "key": item.key,
+                    "reason": "section_anchor_changed",
+                    "source_artifact_id": str(source_artifact.id),
+                }
+                for item in source_enrichment.tables
+            ],
+        )
+        current_artifacts["current"] = current
+        current_synthesis = synthesis_chain[0]
+    elif mode == "deleted":
+        deleted_enrichment = replace(
+            source_enrichment,
+            diagrams=(),
+            annotations=tuple(
+                item
+                for item in source_enrichment.annotations
+                if not item.paragraph_anchor.startswith("diagram:")
+            ),
+            synthesis_hash=canonical_synthesis_hash(synthesis_chain[1]),
+        )
+        deleted = store_enrichment_version(
+            version=2,
+            enrichment=deleted_enrichment,
+            synthesis=synthesis_chain[1],
+            parent=source_artifact,
+            revision={
+                "operation": "delete_diagram",
+                "base_artifact_id": str(source_artifact.id),
+                "target": {
+                    "kind": "enrichment_element",
+                    "element_kind": "diagram",
+                    "element_key": source_enrichment.diagrams[0].key,
+                },
+            },
+        )
+        current_synthesis = synthesis_chain[2]
+        current = store_enrichment_version(
+            version=3,
+            enrichment=empty_for(current_synthesis, retain_non_diagram_annotations=True),
+            synthesis=current_synthesis,
+            parent=deleted,
+            stale_blocks=[
+                {
+                    "kind": kind,
+                    "key": item.key,
+                    "reason": "section_anchor_changed",
+                    "source_artifact_id": str(deleted.id),
+                }
+                for kind, items in (
+                    ("table", source_enrichment.tables),
+                    ("chart", source_enrichment.charts),
+                    ("source_figure", source_enrichment.source_figures),
+                )
+                for item in items
+            ],
+        )
+        current_artifacts["deleted"] = deleted
+        current_artifacts["current"] = current
+    else:
+        title_rebased = replace(
+            source_enrichment,
+            extraction_hash=canonical_extraction_hash(world.extraction),
+            synthesis_hash=canonical_synthesis_hash(synthesis_chain[1]),
+        )
+        after_title = store_enrichment_version(
+            version=2,
+            enrichment=title_rebased,
+            synthesis=synthesis_chain[1],
+            parent=source_artifact,
+        )
+        first_rename = synthesis_chain[2]
+        stale = [
+            {
+                "kind": kind,
+                "key": item.key,
+                "reason": "section_anchor_changed",
+                "source_artifact_id": str(after_title.id),
+            }
+            for kind, items in (
+                ("table", source_enrichment.tables),
+                ("diagram", source_enrichment.diagrams),
+                ("chart", source_enrichment.charts),
+                ("source_figure", source_enrichment.source_figures),
+            )
+            for item in items
+        ]
+        stale.extend(
+            {
+                "kind": "annotation",
+                "key": annotation.paragraph_anchor,
+                "reason": "paragraph_anchor_changed",
+                "source_artifact_id": str(after_title.id),
+            }
+            for annotation in source_enrichment.annotations
+            if annotation.paragraph_anchor.startswith("diagram:")
+        )
+        after_rename = store_enrichment_version(
+            version=3,
+            enrichment=empty_for(first_rename, retain_non_diagram_annotations=True),
+            synthesis=first_rename,
+            parent=after_title,
+            stale_blocks=stale,
+        )
+        current_synthesis = synthesis_chain[3]
+        current = store_enrichment_version(
+            version=4,
+            enrichment=empty_for(current_synthesis, retain_non_diagram_annotations=True),
+            synthesis=current_synthesis,
+            parent=after_rename,
+        )
+        current_artifacts["after_title"] = after_title
+        current_artifacts["after_rename"] = after_rename
+        current_artifacts["current"] = current
+
+    synthesis_artifacts = []
+    for version, synthesis in enumerate(synthesis_chain[1:], start=2):
+        artifact = ProductionArtifact(
+            production_run_id=world.run.id,
+            subject_id=world.snapshot.subject_id,
+            stage=ProductionArtifactStage.SYNTHESIS,
+            version=version,
+            input_hash=world.synthesis_artifact.input_hash,
+            status=ProductionArtifactStatus.VERIFIED,
+            canonical_blob_id=world.store.put(production_synthesis_to_json(synthesis)),
+        )
+        synthesis_artifacts.append(artifact)
+    harness.artifacts.artifacts.extend(
+        [
+            *synthesis_artifacts,
+            *(artifact for key, artifact in current_artifacts.items() if key != "source"),
+        ]
+    )
+    harness.base = current_artifacts["current"]
+    harness.base_payload = await world.store.read_json(harness.base.canonical_blob_id)
+    harness.input_hash = harness.base.input_hash
+    harness.current_input_hash = harness.base.input_hash
+    harness.stored_input_hash = harness.base.input_hash
+    harness.base_sha256 = hashlib.sha256(
+        await world.store.read_bytes(harness.base.canonical_blob_id)
+    ).hexdigest()
+    harness.world.synthesis = current_synthesis
+    if synthesis_artifacts:
+        harness.world.synthesis_artifact = synthesis_artifacts[-1]
+    return current_artifacts
+
+
+def _stale_enrichment_restore_args(harness: SimpleNamespace) -> dict[str, Any]:
+    return {
+        "subject_id": harness.world.snapshot.subject_id,
+        "base_artifact_id": harness.base.id,
+        "base_version": harness.base.version,
+        "base_input_hash": harness.base.input_hash,
+        "base_canonical_sha256": harness.base_sha256,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_enrichment_restore_recovers_verified_blocks_after_title_and_renames(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_figure=True,
+        include_target_annotations=True,
+    )
+    history = await _install_stale_enrichment_restore_history(harness)
+    original_count = len(harness.artifacts.artifacts)
+
+    preview = await harness.service.preview_restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(harness)
+    )
+
+    assert len(harness.artifacts.artifacts) == original_count
+    assert harness.world.gateway.calls == []
+    assert preview.non_restorable_blocks == ()
+    restored_keys = {(item["kind"], item["key"]) for item in preview.restorable_blocks}
+    source_payload = await harness.world.store.read_json(history["source"].canonical_blob_id)
+    assert {
+        ("table", "tools_table"),
+        ("diagram", "infection_chain"),
+        ("chart", "history_chart"),
+        ("source_figure", source_payload["source_figures"][0]["key"]),
+        ("annotation", "diagram:infection_chain:title"),
+    } <= restored_keys
+    assert history["after_rename"].metadata["revision_rebase"]["stale_blocks"]
+
+    result = await harness.service.restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(harness), actor="analyst@example.test"
+    )
+    restored = editorial_enrichment_from_json(
+        await harness.world.store.read_json(result.artifact.canonical_blob_id)
+    )
+    quality_rejections = revalidate_editorial_enrichment_quality(
+        restored,
+        extraction=harness.world.extraction,
+        synthesis=harness.world.synthesis,
+    )
+
+    assert result.artifact.version == harness.base.version + 1
+    assert result.revision["operation"] == "restore_enrichment_blocks"
+    assert result.revision["base_version"] == harness.base.version
+    assert result.revision["outcome"] == "restored"
+    assert result.revision["actor"] == "analyst@example.test"
+    assert result.revision["model_call_count"] == 0
+    assert len(restored.tables) == len(restored.diagrams) == len(restored.charts) == 1
+    assert len(restored.source_figures) == 1
+    assert {item.paragraph_anchor for item in restored.annotations} == {
+        "diagram:infection_chain:title",
+        "section:0:paragraph:0001",
+    }
+    assert quality_rejections == ()
+    assert (
+        result.artifact.metadata["evidence_pack_hash"]
+        == (harness.base.metadata["evidence_pack_hash"])
+    )
+    assert result.publication_artifact.status is ProductionArtifactStatus.VERIFIED
+    assert result.publication_artifact.metadata["input_artifacts"][
+        "editorial_enrichment_artifact_id"
+    ] == str(result.artifact.id)
+    assert harness.rendered[-1] == result.publication_artifact.id
+    assert harness.world.gateway.calls == []
+
+    harness.base = result.artifact
+    harness.base_sha256 = hashlib.sha256(
+        await harness.world.store.read_bytes(result.artifact.canonical_blob_id)
+    ).hexdigest()
+    count_after_restore = len(harness.artifacts.artifacts)
+    second_preview = await harness.service.preview_restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(harness)
+    )
+    assert second_preview.restorable_blocks == ()
+    with pytest.raises(EditorialEnrichmentRevisionValidationError) as no_change:
+        await harness.service.restore_stale_enrichment_blocks(
+            **_stale_enrichment_restore_args(harness), actor="analyst@example.test"
+        )
+    assert no_change.value.rejections[0]["reason_code"] == ("no_stale_enrichment_blocks_to_restore")
+    assert len(harness.artifacts.artifacts) == count_after_restore
+
+
+@pytest.mark.asyncio
+async def test_stale_enrichment_restore_respects_delete_lineage_and_rejects_c_quality_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deleted_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        include_target_annotations=True,
+    )
+    history = await _install_stale_enrichment_restore_history(deleted_harness, mode="deleted")
+    deleted_preview = await deleted_harness.service.preview_restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(deleted_harness)
+    )
+    deleted_diagram = next(
+        item
+        for item in deleted_preview.non_restorable_blocks
+        if item["kind"] == "diagram" and item["key"] == "infection_chain"
+    )
+    assert deleted_diagram["reason"] == "deleted_by_targeted_revision"
+    assert history["deleted"].metadata["revision"]["operation"] == "delete_diagram"
+    deleted_result = await deleted_harness.service.restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(deleted_harness), actor="analyst@example.test"
+    )
+    deleted_payload = await deleted_harness.world.store.read_json(
+        deleted_result.artifact.canonical_blob_id
+    )
+    assert deleted_payload["diagrams"] == []
+    assert all(
+        not item["paragraph_anchor"].startswith("diagram:")
+        for item in deleted_payload["annotations"]
+    )
+
+    quality_harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+        indicators=(
+            _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+            _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+        ),
+        include_ioc_duplicate_table=True,
+    )
+    await _install_stale_enrichment_restore_history(quality_harness, mode="trivial")
+    quality_preview = await quality_harness.service.preview_restore_stale_enrichment_blocks(
+        **_stale_enrichment_restore_args(quality_harness)
+    )
+    reasons = {
+        (item["kind"], item["key"]): item["reason"]
+        for item in quality_preview.non_restorable_blocks
+    }
+    assert reasons[("table", "tools_table")] == ("editorial_enrichment_table_ioc_republication")
+    assert reasons[("diagram", "trivial_restore_candidate")] == (
+        "editorial_enrichment_diagram_trivial"
+    )
+    assert quality_harness.world.gateway.calls == []
+
+
+@pytest.mark.asyncio
+async def test_stale_enrichment_restore_uses_compare_and_append_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = await _revision_harness(
+        monkeypatch,
+        _RecordingGateway(lambda request: _succeeded_text(request, "unexpected")),
+    )
+    await _install_stale_enrichment_restore_history(harness)
+    request = _stale_enrichment_restore_args(harness)
+    original_store = harness.service._persistence.store_editorial_enrichment_result
+
+    async def advance_current_artifact(**kwargs: Any) -> ProductionArtifact:
+        concurrent = replace(
+            harness.base,
+            id=uuid4(),
+            version=harness.base.version + 1,
+        )
+        harness.artifacts.artifacts.append(concurrent)
+        return cast(ProductionArtifact, await original_store(**kwargs))
+
+    monkeypatch.setattr(
+        harness.service._persistence,
+        "store_editorial_enrichment_result",
+        advance_current_artifact,
+    )
+    with pytest.raises(enrichment_module.EditorialEnrichmentRevisionConflictError):
+        await harness.service.restore_stale_enrichment_blocks(
+            **request, actor="analyst@example.test"
+        )
+    assert harness.assembled == []
+    assert harness.rendered == []
+    assert harness.world.gateway.calls == []
+
+
 def _inventory_with_second_figure(
     inventory: SourceFigureInventoryResult,
 ) -> SourceFigureInventoryResult:
