@@ -3760,6 +3760,101 @@ async def test_empty_model_decision_is_a_valid_stored_enrichment() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rejecting_every_quality_block_can_store_an_empty_success() -> None:
+    anchor = "ExampleRAT downloads the payload and starts execution."
+    wire_payload = {"value": ""}
+
+    def respond(request: ModelRequest) -> ModelExecution:
+        if request.prompt_template_id == "production-editorial-enrichment-repair":
+            return _succeeded_text(request, "NO USEFUL ENRICHMENT")
+        return _succeeded_text(request, wire_payload["value"])
+
+    world = _world(_RecordingGateway(respond))
+    existing_fact = world.extraction.sources[0].facts[0]
+    anchor_fact = ExtractionFactV1(
+        category="infection_chain",
+        value=anchor,
+        attack_id=None,
+        context=anchor,
+        evidence_quote=anchor,
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    indicators = (
+        _confirmed_ioc("203.0.113.5", "C2 endpoint 203.0.113.5"),
+        _confirmed_ioc("198.51.100.7", "Update server 198.51.100.7"),
+    )
+    extraction = _extraction(
+        subject_id=world.snapshot.subject_id,
+        input_hash=world.snapshot.input_hash,
+        sources=(_source(facts=(existing_fact, anchor_fact), indicators=indicators),),
+    )
+    synthesis = _synthesis_with_anchor(extraction, anchor)
+    world.extraction = extraction
+    world.synthesis = synthesis
+    world.extraction_artifact = replace(
+        world.extraction_artifact,
+        canonical_blob_id=world.store.put(production_extraction_to_json(extraction)),
+    )
+    world.synthesis_artifact = replace(
+        world.synthesis_artifact,
+        canonical_blob_id=world.store.put(production_synthesis_to_json(synthesis)),
+    )
+
+    evidence_pack = build_editorial_enrichment_evidence_pack(world.snapshot, extraction, synthesis)
+    ioc_handles = {
+        str(record["value"]): str(record["handle"])
+        for record in evidence_pack.technical_evidence
+        if record.get("kind") == EvidenceKind.INDICATOR.value
+    }
+    ioc_wire = _ioc_table_wire(
+        (
+            ("203.0.113[.]5", "IP", ioc_handles["203.0.113.5"]),
+            ("198.51.100[.]7", "IP", ioc_handles["198.51.100.7"]),
+        )
+    )
+    anchor_handle = next(
+        str(record["handle"])
+        for record in evidence_pack.narrative_evidence
+        if record.get("value") == anchor
+    )
+    trivial_diagram = _diagram_wire_for_quality(
+        (
+            ("malware", "ExampleRAT", "unknown"),
+            ("payload", "Payload", "unknown"),
+            ("execution", "Execution", "unknown"),
+        ),
+        (("malware", "payload", "downloads"), ("payload", "execution", "starts")),
+        evidence_handle=anchor_handle,
+    )
+
+    wire_payload["value"] = f"{ioc_wire}\n\n{trivial_diagram}"
+    result = await _execute(world)
+
+    assert result.status is EditorialEnrichmentExecutionStatus.SUCCEEDED
+    assert result.error_code is None
+    assert (result.table_count, result.diagram_count, result.source_figure_count) == (0, 0, 0)
+    assert len(world.writer.calls) == 1
+    stored = world.writer.calls[0]["enrichment"]
+    assert stored.tables == stored.diagrams == ()  # type: ignore[attr-defined]
+    metadata = world.writer.calls[0]["metadata_extra"]
+    wire_details = metadata["editorial_enrichment_wire_details"]  # type: ignore[index]
+    rejection_codes = {item["reason_code"] for item in wire_details["final_rejections"]}
+    assert rejection_codes == {
+        "editorial_enrichment_table_ioc_republication",
+        "editorial_enrichment_diagram_trivial",
+    }
+    request_ids = [request.prompt_template_id for request, _schema in world.gateway.calls]
+    assert request_ids.count("production-editorial-enrichment-repair") == 1
+    assert request_ids.count("production-editorial-enrichment") == 1
+    assert set(request_ids) <= {
+        "production-editorial-enrichment",
+        "production-editorial-enrichment-repair",
+        "production-semantic-annotation",
+    }
+
+
+@pytest.mark.asyncio
 async def test_resource_need_is_persisted_and_search_stays_off_by_default() -> None:
     needs_wire = (
         "NEEDS N001\nKIND: MEDIA\n"
