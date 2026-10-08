@@ -1876,9 +1876,8 @@ class ProductionSynthesisRevisionService:
             critical_failures, _ = await self._critical_extraction_assessment(context, extraction)
             addition_preview = None
             preview_refusal = None
-            missing_addition_request = (
-                self._source_addition_service is None or request.source_addition_request_id is None
-            )
+            source_addition_service = self._source_addition_service
+            source_addition_request_id = request.source_addition_request_id
             if critical_failures:
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
@@ -1889,16 +1888,16 @@ class ProductionSynthesisRevisionService:
                         "before revising the synthesis."
                     ),
                 )
-            elif missing_addition_request:
+            elif source_addition_service is None or source_addition_request_id is None:
                 preview_refusal = TargetedEditorialRevisionRefusal(
                     code=TargetedEditorialRevisionRefusalCode.REVISION_NOT_APPLICABLE,
                     recommended_restart_stage=ProductionStage.REFERENCES,
                     reason="A source addition request is required before extension preview.",
                 )
             else:
-                addition_preview = await self._source_addition_service.preview(
+                addition_preview = await source_addition_service.preview(
                     production_run_id=context.run.id,
-                    request_id=request.source_addition_request_id,
+                    request_id=source_addition_request_id,
                 )
                 if request.before_hash is not None and request.before_hash != resolved.before_hash:
                     preview_refusal = TargetedEditorialRevisionRefusal(

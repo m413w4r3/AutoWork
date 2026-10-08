@@ -41,6 +41,7 @@ from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_REVISION_PROMPT_VERSION,
 )
 from cti_app.application.production_references import production_reference_corpus_from_json
+from cti_app.application.production_repairs import _effective_decisions_for_reader
 from cti_app.application.production_stages import EditorialEnrichmentService
 from cti_app.application.production_synthesis import (
     build_synthesis_access_policy,
@@ -52,7 +53,6 @@ from cti_app.application.production_synthesis_revision import (
     TargetedSynthesisRevisionResult,
     TargetedSynthesisRevisionValidationError,
     _critical_extraction_assessment,
-    _effective_decisions_for_reader,
 )
 from cti_app.application.publication_rendering import PublicationRenderService
 from cti_app.application.source_figure_inventory import load_archived_source_figure_inventory
