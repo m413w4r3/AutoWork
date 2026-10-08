@@ -574,7 +574,8 @@ async def _assert_real_typst_keep_with_next_case(
     )
 
     async def compile_at(workspace: Path, data_path: Path, filler_count: int) -> PdfReader:
-        await anyio.Path(data_path).write_bytes(make_render_data(filler_count))
+        render_data = make_render_data(filler_count)
+        await anyio.Path(data_path).write_bytes(render_data)
         output_path = workspace / "keep-with-next.pdf"
         argv = [typst_binary, "compile", "--root", str(workspace)]
         for font_path in font_paths:
@@ -651,7 +652,8 @@ async def _assert_real_typst_keep_with_next_case(
         (
             page_index
             for page_index, page in enumerate(fixed_reader.pages)
-            if marker in (page.extract_text() or "")
+            if marker in (page_text := (page.extract_text() or ""))
+            and (target != "ioc" or all(item in page_text for item in following))
         ),
         None,
     )

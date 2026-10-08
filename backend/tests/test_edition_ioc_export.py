@@ -4,6 +4,7 @@ import io
 import json
 import subprocess
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -19,8 +20,27 @@ from cti_app.application.edition_ioc_export import (
     project_publication_iocs,
     refang,
 )
+from cti_app.application.edition_typst_rendering import EditionTypstRenderer
+from cti_app.application.typst_rendering import load_template_bundle
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
-from cti_app.domain.publication import ArtifactType
+from cti_app.domain.publication import (
+    ArtifactType,
+    PublicationIndicatorGroupV1,
+    PublicationIndicatorV1,
+)
+from cti_app.domain.publication_document import (
+    PublicationDocumentV5,
+    publication_document_text_anchors,
+)
+from cti_app.domain.semantic_annotation import (
+    SEMANTIC_ANNOTATION_POLICY_VERSION,
+    SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+    SemanticParagraphV1,
+    SemanticRole,
+    SemanticTextSpanV1,
+    SemanticTextV1,
+)
+from tests.test_typst_rendering import _full_document
 
 
 def _indicator(value: str, artifact_type: ArtifactType, normalized: str | None = None):
@@ -67,6 +87,41 @@ def _publication(
         indicators=indicators,
         original_indicators=originals,
         sources=(source,),
+    )
+
+
+def _v5_publication_with_original_hash() -> PublicationDocumentV5:
+    base = _full_document()
+    source_id = base.sources[0].source_document_id
+    base = replace(base, additional_source_ids=frozenset({source_id}))
+    semantic_text = SemanticTextV1(
+        schema_version=SEMANTIC_ANNOTATION_SCHEMA_VERSION,
+        policy_version=SEMANTIC_ANNOTATION_POLICY_VERSION,
+        paragraphs=tuple(
+            SemanticParagraphV1(
+                anchor=anchor,
+                spans=(SemanticTextSpanV1(SemanticRole.TEXT, text),),
+            )
+            for anchor, text in publication_document_text_anchors(base).items()
+        ),
+    )
+    original_hash = "e" * 64
+    return PublicationDocumentV5(
+        document=base,
+        semantic_text=semantic_text,
+        original_indicators=(
+            PublicationIndicatorGroupV1(
+                ArtifactType.HASH,
+                (
+                    PublicationIndicatorV1(
+                        value=original_hash,
+                        normalized_value=original_hash,
+                        artifact_type=ArtifactType.HASH,
+                        source_document_ids=(source_id,),
+                    ),
+                ),
+            ),
+        ),
     )
 
 
@@ -174,6 +229,49 @@ def test_projection_maps_hashes_deduplicates_and_excludes_unsupported_types() ->
         ("cve", "unsupported_type_by_article_csv_pipeline"),
     }
     assert all(not any(char in row.value for char in ",|\r\n") for row in projection.rows)
+
+
+def test_v5_publication_projects_indicators_and_original_indicators() -> None:
+    document = _v5_publication_with_original_hash()
+    assert isinstance(document, PublicationDocumentV5)
+
+    projection = project_publication_iocs(document)
+
+    assert (0, "ip", "Display ip") in {(row.is_new, row.type, row.value) for row in projection.rows}
+    assert (1, "file", "e" * 64) in {(row.is_new, row.type, row.value) for row in projection.rows}
+    edition = EditionDocumentV2(
+        edition={
+            "id": "11111111-1111-4111-8111-111111111111",
+            "country": "France",
+            "country_code": "FR",
+            "period_start": "2026-08-01",
+            "period_end": "2026-08-31",
+            "tlp": "GREEN",
+            "languages": ["fr"],
+            "version": 1,
+        },
+        publications=(
+            EditionPublicationV2(
+                position=1,
+                subject_id=document.subject_id,
+                document=document,
+            ),
+        ),
+    )
+    archive = build_edition_ioc_archive(edition, edition_sha256="a" * 64)
+    with zipfile.ZipFile(io.BytesIO(archive.content)) as zipped:
+        csv = zipped.read("articles/article01/article.csv").decode("utf-8")
+    assert "0,ip,Display ip\n" in csv
+    assert f"1,file,{'e' * 64}\n" in csv
+
+    bundle = load_template_bundle(
+        Path(__file__).resolve().parents[2] / "chpTypst",
+        manifest_name="edition-renderer-manifest.json",
+    )
+    render_source = EditionTypstRenderer().render(edition, bundle)
+    render_data = json.loads(render_source.render_data_bytes)
+    assert render_data["publications"][0]["file_ioc_count"] == 1
+    assert render_data["file_ioc_count"] == 1
 
 
 def test_article_csv_zip_manifest_legacy_replay_and_bytes_are_deterministic() -> None:

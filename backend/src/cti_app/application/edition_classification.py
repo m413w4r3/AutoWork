@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from cti_app.domain.edition_publication import EditionPublicationV2
-from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.publication_document import CanonicalPublicationDocument
 
 BRIEF_MAX_WORDS = 120
 _WORD = re.compile(r"\b[\w]+(?:['\u2019-][\w]+)*\b", re.UNICODE)
@@ -21,7 +21,7 @@ class ClassifiedEditionPublication:
     anchor: str
 
 
-def publication_word_count(document: PublicationDocumentV4) -> int:
+def publication_word_count(document: CanonicalPublicationDocument) -> int:
     """Count words in the synthesis body, excluding references and IOC annexes."""
     text = " ".join(
         [paragraph.text for paragraph in document.lead]
@@ -30,7 +30,7 @@ def publication_word_count(document: PublicationDocumentV4) -> int:
     return len(_WORD.findall(text))
 
 
-def is_brief(document: PublicationDocumentV4) -> bool:
+def is_brief(document: CanonicalPublicationDocument) -> bool:
     """A brief has no titled synthesis sections and contains at most 120 words."""
     return not any(section.heading.strip() for section in document.sections) and (
         publication_word_count(document) <= BRIEF_MAX_WORDS

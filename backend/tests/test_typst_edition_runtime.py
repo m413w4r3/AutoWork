@@ -233,7 +233,7 @@ async def test_real_typst_cover_has_internal_links_briefs_and_release_annexes(
     assert "Attribution remains uncertain" not in text
     assert text.count("RÉFÉRENCES") >= 1
     assert text.index("RÉFÉRENCES") < text.index("SYNTHÈSE")
-    assert text.index("Alpha first article") < text.index("Zulu second article")
+    assert text.index("Article with titled synthesis") < text.index("Short operational update")
     assert "Bulletin-Iran | Actualité des codes et infrastructures Iran | septembre 2026" in text
     for placeholder in (
         "Bulletin-CODE",

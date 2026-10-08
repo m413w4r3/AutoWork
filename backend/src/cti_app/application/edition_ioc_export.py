@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from cti_app.application.edition_classification import classify_edition_publications
 from cti_app.domain.edition_publication import EditionDocumentV2, EditionPublicationV2
 from cti_app.domain.publication import ArtifactType
-from cti_app.domain.publication_document import PublicationDocumentV4
+from cti_app.domain.publication_document import CanonicalPublicationDocument
 
 _HASH_ALGORITHMS = {
     32: "MD5",
@@ -134,7 +134,7 @@ def _project_value(artifact_type: str, value: str) -> tuple[str, str] | tuple[No
     return None, "unsupported_type_by_article_csv_pipeline"
 
 
-def project_publication_iocs(document: PublicationDocumentV4) -> PublicationIOCProjection:
+def project_publication_iocs(document: CanonicalPublicationDocument) -> PublicationIOCProjection:
     """Map frozen V4/V5 publication indicator groups into supported CSV rows."""
     candidates: dict[tuple[int, str, str], IOCRow] = {}
     excluded: dict[tuple[int, str, str, str], ExcludedIOC] = {}
@@ -198,7 +198,7 @@ def project_publication_iocs(document: PublicationDocumentV4) -> PublicationIOCP
     return PublicationIOCProjection(rows=rows, excluded=excluded_rows)
 
 
-def _metadata(document: PublicationDocumentV4) -> tuple[str, str]:
+def _metadata(document: CanonicalPublicationDocument) -> tuple[str, str]:
     match = _METADATA_GROUP.match(document.title)
     if match is None:
         group, title = "", document.title.strip()
