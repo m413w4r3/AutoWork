@@ -42,6 +42,7 @@ EDITORIAL_RESOURCE_PROPOSAL_POLICY_VERSION = "editorial-resource-proposal-v1"
 
 
 class EditorialEnrichmentRevisionAction(StrEnum):
+    REMOVE_ELEMENT = "remove_element"
     IMPROVE_TABLE = "improve_table"
     DETAIL_DIAGRAM = "detail_diagram"
     CHANGE_CAPTION_PLACEMENT = "change_caption_placement"

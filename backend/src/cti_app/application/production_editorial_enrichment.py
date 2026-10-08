@@ -51,6 +51,7 @@ from cti_app.application.production_artifact_store import (
     ProductionArtifactStore,
     ProductionReuseStorageUnavailableError,
 )
+from cti_app.application.production_normalization import canonical_indicator_key
 from cti_app.application.production_parsers import sanitize_bridge_output_text
 from cti_app.application.production_prompts import (
     EDITORIAL_ENRICHMENT_PROMPT_VERSION,
@@ -147,13 +148,16 @@ from cti_app.domain.production_editorial_enrichment import (
     validate_chart_date,
 )
 from cti_app.domain.production_extraction import (
+    ExtractionIndicatorStatus,
     ProductionExtractionV1,
+    decode_indicator_section_paths,
     production_extraction_from_json,
 )
 from cti_app.domain.production_references import ProductionEditorialRole, ProductionReferenceTier
 from cti_app.domain.production_relevance import (
     RelevanceClassification,
     RelevanceProjectionV1,
+    RelevanceReasonCode,
     relevance_projection_from_json,
     validate_relevance_projection_lineage,
 )
@@ -169,6 +173,7 @@ from cti_app.domain.production_synthesis import (
     synthesis_evidence_refs,
     validate_synthesis_lineage,
 )
+from cti_app.domain.publication import PUBLICATION_IOC_ARTIFACT_TYPES, ArtifactType
 from cti_app.domain.semantic_annotation import (
     SEMANTIC_ANNOTATION_POLICY_VERSION,
     SEMANTIC_ROLE_PRIORITY,
@@ -187,16 +192,20 @@ if TYPE_CHECKING:
     from cti_app.application.production_artifact_reuse import ProductionArtifactReuseService
     from cti_app.application.production_stages import EditorialEnrichmentService
 
-EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v8-editorial-tables"
+EDITORIAL_ENRICHMENT_GENERATOR_VERSION = "model-text-blocks-v9-analytic-value"
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_SCHEMA_VERSION = 5
 EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
 )
-EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = "editorial-enrichment-validator-v17-www-domain-aliases"
+EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
+    "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
+)
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
-    "editorial-enrichment-analytic-policy-v5-editorial-tables"
+    "editorial-enrichment-analytic-policy-v6-ioc-republication-diagram-value"
 )
 TABLE_PARAPHRASE_TOKEN_DICE_THRESHOLD = 0.80
+DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP = 0.50
+DIAGRAM_STAR_REDUNDANT_LABEL_RATIO = 0.80
 EDITORIAL_ENRICHMENT_MODEL_POLICY_VERSION = "editorial-enrichment-model-policy-v7-editorial-tables"
 _ENRICHMENT_MEDIA_TYPE_BY_BLOCK = {
     "FIGURE": EditorialMediaType.SOURCE_FIGURE,
@@ -777,6 +786,16 @@ class EditorialEnrichmentValidationRejection:
             "reason": self.reason,
             "raw_sha256": self.raw_sha256,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class EditorialEnrichmentQualityRejection:
+    """A deterministic content-quality rejection for an existing block."""
+
+    kind: str
+    block_id: str
+    proposal_key: str
+    reason_code: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1875,6 +1894,249 @@ def _reject_paraphrase_rows(
     return table
 
 
+_IOC_METADATA_VALUES = frozenset(
+    {
+        "address",
+        "cve",
+        "domain",
+        "domain name",
+        "email",
+        "email address",
+        "hash",
+        "indicator",
+        "ioc",
+        "ip",
+        "ip address",
+        "ipv4",
+        "ipv4 address",
+        "ipv6",
+        "ipv6 address",
+        "md5",
+        "sha 1",
+        "sha1",
+        "sha 256",
+        "sha256",
+        "type",
+        "url",
+        "uri",
+        "value",
+    }
+)
+
+
+def _table_republishes_projected_iocs(
+    table: TableProposalV1 | TableSpecV1,
+    projected_ioc_keys: frozenset[tuple[ArtifactType, str]],
+) -> bool:
+    """Reject a one-column IOC list when every other column adds no varying fact.
+
+    The rule is deliberately narrow: every row must carry a projected IOC in the
+    same column, and every other column must be constant or contain only generic
+    indicator-type labels. A varying role, family, date, technique, or other
+    analytical attribute keeps the table eligible.
+    """
+    if not projected_ioc_keys or len(table.rows) < 2 or len(table.columns) < 2:
+        return False
+    values_by_type: dict[ArtifactType, set[str]] = defaultdict(set)
+    for artifact_type, normalized in projected_ioc_keys:
+        values_by_type[artifact_type].add(normalized)
+
+    def is_projected_ioc(value: str) -> bool:
+        candidate = value.strip().strip("`\"'")
+        if not candidate:
+            return False
+        for artifact_type, normalized_values in values_by_type.items():
+            try:
+                if canonical_indicator_key(candidate, artifact_type) in normalized_values:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    rows = tuple(tuple(row.cells) for row in table.rows)
+    ioc_columns = [
+        column_index
+        for column_index in range(len(table.columns))
+        if all(
+            column_index < len(row)
+            and bool(row[column_index].strip())
+            and is_projected_ioc(row[column_index])
+            for row in rows
+        )
+    ]
+    if len(ioc_columns) != 1:
+        return False
+    ioc_column = ioc_columns[0]
+    if any(not any(is_projected_ioc(value) for value in row) for row in rows):
+        return False
+
+    for column_index in range(len(table.columns)):
+        if column_index == ioc_column:
+            continue
+        values = {
+            normalize_analytic_question(row[column_index])
+            for row in rows
+            if column_index < len(row) and row[column_index].strip()
+        }
+        if len(values) > 1 and not values <= _IOC_METADATA_VALUES:
+            return False
+    return True
+
+
+def _placement_anchor_sentences(
+    current_synthesis: Mapping[str, Any],
+    placement: EnrichmentPlacementProposalV1 | EnrichmentPlacementV1,
+) -> tuple[str, ...]:
+    kind = getattr(placement.kind, "value", placement.kind)
+    paragraphs: list[Mapping[str, Any]] = []
+    if kind == EnrichmentPlacementKind.AFTER_LEAD.value:
+        paragraphs.extend(
+            item for item in current_synthesis.get("lead", ()) if isinstance(item, Mapping)
+        )
+    elif kind == EnrichmentPlacementKind.AFTER_SECTION.value:
+        section_index = placement.section_index
+        paragraphs.extend(
+            paragraph
+            for section in current_synthesis.get("sections", ())
+            if isinstance(section, Mapping) and section.get("section_index") == section_index
+            for paragraph in section.get("paragraphs", ())
+            if isinstance(paragraph, Mapping)
+        )
+    elif kind == EnrichmentPlacementKind.AFTER_TIMELINE.value:
+        paragraphs.extend(
+            item for item in current_synthesis.get("timeline", ()) if isinstance(item, Mapping)
+        )
+    else:
+        paragraphs.extend(
+            item for item in current_synthesis.get("lead", ()) if isinstance(item, Mapping)
+        )
+        for section in current_synthesis.get("sections", ()):
+            if isinstance(section, Mapping):
+                paragraphs.extend(
+                    item for item in section.get("paragraphs", ()) if isinstance(item, Mapping)
+                )
+        paragraphs.extend(
+            item for item in current_synthesis.get("timeline", ()) if isinstance(item, Mapping)
+        )
+    return tuple(
+        sentence.strip()
+        for paragraph in paragraphs
+        if isinstance((value := paragraph.get("text")), str)
+        for sentence in re.split(r"(?<=[.!?])\s+", value)
+        if sentence.strip()
+    )
+
+
+def _diagram_repeats_one_anchor_assertion(
+    diagram: DiagramProposalV1 | DiagramSpecV1,
+    current_synthesis: Mapping[str, Any],
+) -> bool:
+    """Reject a text-repeating path or one-hop star with no added structure.
+
+    Paths are trivial only when all roles are homogeneous and every label is
+    copied from one anchor sentence. A one-hop branch/convergence is trivial
+    only when at least 80% of its node and edge labels each share at least half
+    their content terms with the placement text. Multi-step branches,
+    convergence, and pipelines retain their relationship structure. No
+    node-count threshold is used.
+    """
+    nodes_by_id = {node.node_id: node for node in diagram.nodes}
+    if (
+        diagram.groups
+        or len(nodes_by_id) != len(diagram.nodes)
+        or len(nodes_by_id) < 2
+        or len(diagram.edges) != len(diagram.nodes) - 1
+        or not diagram.edges
+        or any(edge.direction is not DiagramRelationDirection.DIRECTED for edge in diagram.edges)
+        or len({edge.relation_type for edge in diagram.edges}) != 1
+        or len({(edge.source_node_id, edge.target_node_id) for edge in diagram.edges})
+        != len(diagram.edges)
+    ):
+        return False
+
+    incoming = {node_id: 0 for node_id in nodes_by_id}
+    outgoing = {node_id: 0 for node_id in nodes_by_id}
+    undirected: dict[str, set[str]] = {node_id: set() for node_id in nodes_by_id}
+    for edge in diagram.edges:
+        if edge.source_node_id not in nodes_by_id or edge.target_node_id not in nodes_by_id:
+            return False
+        if edge.source_node_id == edge.target_node_id:
+            return False
+        outgoing[edge.source_node_id] += 1
+        incoming[edge.target_node_id] += 1
+        undirected[edge.source_node_id].add(edge.target_node_id)
+        undirected[edge.target_node_id].add(edge.source_node_id)
+
+    connected: set[str] = set()
+    frontier = [next(iter(nodes_by_id))]
+    while frontier:
+        node_id = frontier.pop()
+        if node_id in connected:
+            continue
+        connected.add(node_id)
+        frontier.extend(undirected[node_id] - connected)
+    if connected != nodes_by_id.keys():
+        return False
+
+    node_label_terms = tuple(_soft_tokens(node.label) for node in diagram.nodes)
+    edge_label_terms = tuple(
+        _soft_tokens(edge.label) for edge in diagram.edges if edge.label is not None
+    )
+    if any(not terms for terms in node_label_terms) or any(not terms for terms in edge_label_terms):
+        return False
+    label_terms = (*node_label_terms, *edge_label_terms)
+
+    is_one_hop_star = (
+        len({edge.source_node_id for edge in diagram.edges}) == 1
+        or len({edge.target_node_id for edge in diagram.edges}) == 1
+    )
+    if is_one_hop_star:
+        sentences = _placement_anchor_sentences(current_synthesis, diagram.placement)
+        if not sentences:
+            return False
+        repeated_labels = 0
+        for terms in label_terms:
+            overlap = max(
+                (len(terms & _soft_tokens(sentence)) / len(terms) for sentence in sentences),
+                default=0.0,
+            )
+            repeated_labels += overlap >= DIAGRAM_STAR_LABEL_ANCHOR_OVERLAP
+        return repeated_labels / len(label_terms) >= DIAGRAM_STAR_REDUNDANT_LABEL_RATIO
+
+    if any(count > 1 for count in incoming.values()) or any(
+        count > 1 for count in outgoing.values()
+    ):
+        return False
+    if len(edge_label_terms) != len(diagram.edges):
+        return False
+    known_roles = {node.role for node in diagram.nodes if node.role is not DiagramNodeRole.UNKNOWN}
+    if len(known_roles) > 1:
+        return False
+    starts = [node_id for node_id, count in incoming.items() if count == 0]
+    ends = [node_id for node_id, count in outgoing.items() if count == 0]
+    if len(starts) != 1 or len(ends) != 1:
+        return False
+    visited: set[str] = set()
+    current = starts[0]
+    while current not in visited:
+        visited.add(current)
+        next_ids = [edge.target_node_id for edge in diagram.edges if edge.source_node_id == current]
+        if not next_ids:
+            break
+        current = next_ids[0]
+    if current != ends[0] or visited != nodes_by_id.keys():
+        return False
+
+    for sentence in _placement_anchor_sentences(current_synthesis, diagram.placement):
+        sentence_terms = _soft_tokens(sentence)
+        if not sentence_terms or not all(terms <= sentence_terms for terms in label_terms):
+            continue
+        covered = set().union(*label_terms) & sentence_terms
+        if len(covered) / len(sentence_terms) >= 0.6:
+            return True
+    return False
+
+
 def _edge_projection_rejection(
     diagram: DiagramProposalV1,
     edge: DiagramEdgeProposalV1,
@@ -2464,6 +2726,15 @@ def parse_editorial_enrichment_proposal_wire(
             table = _parse_enrichment_wire_table(top, evidence_pack, rejections, warnings)
             if table is not None:
                 table = _reject_paraphrase_rows(top, table, evidence_pack, rejections, warnings)
+            if table is not None and _table_republishes_projected_iocs(
+                table, evidence_pack._projected_ioc_keys
+            ):
+                reject(top, EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION.value)
+                warnings.append(
+                    f"{EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION.value}:"
+                    f"{top.block_id}"
+                )
+                table = None
             if table is not None and len(table.rows) < 2:
                 reject(top, "editorial_enrichment_table_single_row")
                 warnings.append(f"editorial_enrichment_table_single_row:{top.block_id}")
@@ -2560,6 +2831,14 @@ def parse_editorial_enrichment_proposal_wire(
                 diagram = _filter_diagram_relations(
                     top, diagram, evidence_pack, rejections, warnings
                 )
+            if diagram is not None and _diagram_repeats_one_anchor_assertion(
+                diagram, evidence_pack.current_synthesis
+            ):
+                reject(top, EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL.value)
+                warnings.append(
+                    f"{EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL.value}:{top.block_id}"
+                )
+                diagram = None
             if diagram is not None:
                 question_key = normalize_analytic_question(diagram.purpose.question)
                 preferred_figure = source_figure_questions.get(question_key)
@@ -3711,6 +3990,9 @@ class EditorialEnrichmentEvidencePackV1:
     source_pair_relations: tuple[Mapping[str, Any], ...]
     projection_hash: str | None = None
     policy_version: str = EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION
+    _projected_ioc_keys: frozenset[tuple[ArtifactType, str]] = field(
+        default_factory=frozenset, repr=False, compare=False
+    )
     _handle_to_ref: Mapping[str, ExtractionEvidenceRefV1] = field(
         default_factory=dict, repr=False, compare=False
     )
@@ -3754,6 +4036,8 @@ class EditorialEnrichmentStageErrorCode(StrEnum):
     UNKNOWN_EVIDENCE = "editorial_enrichment_unknown_evidence"
     UNKNOWN_TECHNICAL_VALUE = "editorial_enrichment_unknown_technical_value"
     PLACEMENT_INVALID = "editorial_enrichment_placement_invalid"
+    TABLE_IOC_REPUBLICATION = "editorial_enrichment_table_ioc_republication"
+    DIAGRAM_TRIVIAL = "editorial_enrichment_diagram_trivial"
     REUSE_INVALID = "editorial_enrichment_reuse_invalid"
     MODEL_FAILED = "editorial_enrichment_model_failed"
     # The production state machine keys provider reconciliation on one shared
@@ -4055,6 +4339,73 @@ def _synthesis_prompt_projection(
     }
 
 
+def _projected_publication_ioc_keys(
+    extraction: ProductionExtractionV1,
+    projection: RelevanceProjectionV1 | None,
+) -> frozenset[tuple[ArtifactType, str]]:
+    """Return confirmed IOCs the publication builder would place in an IOC list."""
+    entries = _all_evidence_entries(extraction)
+    source_by_id = {source.source_document_id: source for source in extraction.sources}
+    projected: set[tuple[ArtifactType, str]] = set()
+    for ref, payload in entries.items():
+        if (
+            ref.kind is not EvidenceKind.INDICATOR
+            or payload.get("indicator_status") != ExtractionIndicatorStatus.CONFIRMED_IOC.value
+        ):
+            continue
+        artifact_type_value = payload.get("artifact_type")
+        if not isinstance(artifact_type_value, str):
+            continue
+        try:
+            artifact_type = ArtifactType(artifact_type_value)
+        except ValueError:
+            continue
+        if artifact_type not in PUBLICATION_IOC_ARTIFACT_TYPES:
+            continue
+        raw_value = payload.get("value")
+        if not isinstance(raw_value, str) or not raw_value.strip():
+            continue
+        if projection is not None:
+            decision = projection.classification_for(ref)
+            source = source_by_id[ref.source_document_id]
+            # Keep in sync with publication_builder's main and original IOC
+            # sections. Both lists are visible in the published artifact.
+            is_subject_ioc = decision.classification in {
+                RelevanceClassification.DIRECT,
+                RelevanceClassification.CORROBORATION,
+            } and decision.reason_code in {
+                RelevanceReasonCode.MALICIOUS_SUBJECT_RELATION,
+                RelevanceReasonCode.MALICIOUS_SUBJECT_CORROBORATION,
+            }
+            is_original_ioc = (
+                (
+                    source.tier is not ProductionReferenceTier.CORE
+                    or decode_indicator_section_paths(str(payload.get("context") or "")) is not None
+                )
+                and source.profile is ExtractionProfile.FULL
+                and decision.classification
+                in {RelevanceClassification.INDETERMINATE, RelevanceClassification.CONTEXT}
+                and decision.reason_code
+                in {
+                    RelevanceReasonCode.SUBJECT_LINK_NOT_DEMONSTRATED,
+                    RelevanceReasonCode.MALICIOUS_ROLE_NOT_DEMONSTRATED,
+                }
+            )
+            if not (is_subject_ioc or is_original_ioc):
+                continue
+        try:
+            normalized = canonical_indicator_key(raw_value, artifact_type)
+        except ValueError:
+            continue
+        if (
+            artifact_type is ArtifactType.HASH
+            and re.fullmatch(r"[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64}", normalized) is None
+        ):
+            continue
+        projected.add((artifact_type, normalized))
+    return frozenset(projected)
+
+
 def build_editorial_enrichment_evidence_pack(
     snapshot: ProductionInputSnapshot,
     extraction: ProductionExtractionV1,
@@ -4245,6 +4596,7 @@ def build_editorial_enrichment_evidence_pack(
         reserve_evidence=reserve_evidence,
         source_pair_relations=source_pair_relations,
         projection_hash=projection.projection_hash if projection is not None else None,
+        _projected_ioc_keys=_projected_publication_ioc_keys(extraction, projection),
         _handle_to_ref=MappingProxyType(handle_to_ref),
         _reserve_handle_to_ref=MappingProxyType(
             {handle: ref for ref, handle in reserve_handle_for_ref.items()}
@@ -4411,7 +4763,23 @@ Exemples de correspondances adaptées à un tableau :
 
 Un tableau doit contenir au moins deux lignes informatives. Rejette un tableau
 qui reprend simplement un paragraphe, qui duplique un CHART ou qui reconstruit
-ce qu'explique déjà une figure source.
+ce qu'explique déjà une figure source. Ne republie pas en tableau les IP,
+domaines, URL, hachés ou e-mails déjà projetés dans l'annexe IOC lorsque les
+autres colonnes sont seulement constantes ou répètent leur type (par exemple
+« IP » sur chaque ligne). Un tableau IOC reste adapté s'il met en relation
+chaque valeur avec un attribut analytique utile et documenté : rôle, famille,
+première observation, technique ou relation comparable.
+
+Un DIAGRAMME doit rendre visible une séquence, un pipeline, une architecture,
+une convergence, des branches, plusieurs relations, un contrôle-flow, une
+propagation ou un mapping complexe. Une branche ou convergence à un seul
+niveau autour d'un seul nœud ne suffit pas à elle seule : si les libellés des
+nœuds et relations répètent le passage d'ancrage sans montrer des étapes, des
+relations distinctes ou une correspondance plus riche, omets le diagramme.
+Un cas déterministe de répétition est atteint si au moins 80% de ces libellés
+reprennent au moins la moitié de leurs termes de contenu d'une phrase d'ancrage.
+Montre une structure qui aide à comprendre le contenu, pas seulement les mêmes
+noms reliés par des flèches. Aucun nombre minimal de nœuds ne s'applique.
 
 CHART accepte uniquement le KIND timeline. Chaque POINT doit citer une date ISO
 exacte, un LABEL et une SERIES présents dans ses preuves, plus au moins un
@@ -4424,9 +4792,12 @@ n'interpole aucun point. Le renderer choisit les couleurs.
 Aucun quota minimal de médias ne s'applique; RIEN est une décision valide.
 
 For each FIGURE, CHART, TABLE, and DIAGRAM, fill every typed analytic-purpose field:
-PURPOSE (the reader's question), DATA (what the evidence contains), GAIN (why
-this form is clearer than prose), SCOPE, PURPOSE_EVIDENCE, LIMITS, PLACEMENT,
-and PLACEMENT_REASON. Values and handles must be non-empty.
+PURPOSE (the reader's question), DATA (what the evidence contains), GAIN, SCOPE,
+PURPOSE_EVIDENCE, LIMITS, PLACEMENT, and PLACEMENT_REASON. Values and handles
+must be non-empty. In GAIN, answer this required question explicitly:
+« Qu'est-ce que le lecteur comprend mieux grâce à cet élément ? » Name the
+specific comparison, sequence, mapping, or relationship the element makes
+clearer. If you cannot give a concrete answer, omit the element.
 
 CHART C001
 KEY: domains_created_over_time
@@ -4532,6 +4903,20 @@ NO USEFUL ENRICHMENT
 Do not add rows, nodes, groups, or visual detail for decoration; no row or node target exists.
 A table that restates synthesis sentences is rejected.
 Include only data that answers the stated analytic question.
+Answer « Qu'est-ce que le lecteur comprend mieux grâce à cet élément ? » in
+GAIN for every proposed block. A claim such as « c'est plus lisible » alone is
+not a concrete gain.
+
+A TABLE must compare, map, or organize multiple useful attributes. A single
+column of projected IOC values with constant/type-only companion columns is
+not an enrichment. A DIAGRAM must reveal a relationship or process structure;
+omit an unbranched, role-homogeneous path when its node and edge labels merely
+repeat one sentence from the placement anchor. Also omit a one-hop branch or
+convergence around a single hub when at least 80% of its node and edge labels
+each reuse at least half of their content terms from an anchor sentence and add
+no multi-step path or distinct relationship mapping. A branch, convergence, or
+pipeline is useful when its structure exposes relationships beyond that direct
+restatement; no node-count target applies.
 
 Neutral intent examples (bracketed details are placeholders, not facts):
 - Compare a command with its documented effect: [command] produces [effect].
@@ -4923,7 +5308,15 @@ def build_editorial_enrichment_repair_request(
             "mechanism defines mappings, or several exact values need quick lookup. A repaired "
             "table needs at least two informative rows; reject a paragraph paraphrase or a table "
             "that duplicates a CHART or source FIGURE. For Domain | Date | Actor, use a table only "
-            "for exact-value lookup; use CHART to show temporal distribution. "
+            "for exact-value lookup; use CHART to show temporal distribution. Do not republish "
+            "projected IP, domain, URL, hash, or email values when all companion columns are "
+            "constant or only repeat their type; keep IOC tables when they map values to useful "
+            "documented analytical attributes. A DIAGRAM must clarify a sequence, pipeline, "
+            "architecture, branch, convergence, multiple relations, control-flow, propagation, "
+            "or complex mapping. Omit a role-homogeneous unbranched path whose labels only "
+            "repeat one sentence from its placement anchor. For every replacement, answer in "
+            "GAIN: « Qu'est-ce que le lecteur comprend mieux grâce à cet élément ? » Name the "
+            "specific gain; otherwise omit the block. "
             "Respect the source-figure priority and never make two repaired or existing blocks "
             "answer the same normalized analytic question. "
             "block kind and local header id. Use only the current synthesis, evidence pack, "
@@ -5113,6 +5506,8 @@ def validate_editorial_enrichment_proposal(
             EditorialEnrichmentStageErrorCode.OUTPUT_INVALID,
             EditorialEnrichmentStageErrorCode.UNKNOWN_TECHNICAL_VALUE,
             EditorialEnrichmentStageErrorCode.PLACEMENT_INVALID,
+            EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION,
+            EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL,
         }
         full_failure: EditorialEnrichmentProposalControlError | None = None
         try:
@@ -5190,7 +5585,13 @@ def validate_editorial_enrichment_proposal(
                             scope_id=scope_id,
                             proposal_key=proposal_key,
                             reason_code=(
-                                "editorial_enrichment_block_final_validation_failed:"
+                                block_error.code.value
+                                if block_error.code
+                                in {
+                                    EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION,
+                                    EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL,
+                                }
+                                else "editorial_enrichment_block_final_validation_failed:"
                                 f"{kind.casefold()}:{block_error.code.value}"
                             ),
                             reason=(f"{kind} {block_id} ({proposal_key}): {diagnostic}")[:300],
@@ -5231,6 +5632,19 @@ def validate_editorial_enrichment_proposal(
             accepted_blocks=accepted_blocks,
             _drop_invalid_blocks=False,
         )
+
+    for table in parsed.tables:
+        if _table_republishes_projected_iocs(table, evidence_pack._projected_ioc_keys):
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION,
+                message=EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION.value,
+            )
+    for diagram in parsed.diagrams:
+        if _diagram_repeats_one_anchor_assertion(diagram, evidence_pack.current_synthesis):
+            raise EditorialEnrichmentProposalControlError(
+                EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL,
+                message=EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL.value,
+            )
 
     entries = _all_evidence_entries(extraction)
     extraction_sources = {source.source_document_id: source for source in extraction.sources}
@@ -7347,7 +7761,20 @@ def validate_editorial_enrichment(
     *,
     extraction: ProductionExtractionV1,
     synthesis: ProductionSynthesisV1,
+    expected_extraction_hash: str | None = None,
+    expected_synthesis_hash: str | None = None,
 ) -> None:
+    """Validate the canonical enrichment and its exact source lineage.
+
+    ``expected_extraction_hash`` is for verified historical artifacts whose
+    stored extraction hash predates the current canonical serializer. The
+    caller must supply that hash from the verified artifact lineage; synthesis
+    and evidence-reference checks still bind the three typed artifacts.
+    ``expected_synthesis_hash`` has the same provenance requirement when an
+    older verified synthesis policy is decoded for read-only quality
+    revalidation. Normal generation and validation use the current canonical
+    synthesis hash.
+    """
     if not isinstance(enrichment, EditorialEnrichmentV1):
         raise ValueError("Expected an EditorialEnrichmentV1")
     if not isinstance(extraction, ProductionExtractionV1):
@@ -7372,12 +7799,36 @@ def validate_editorial_enrichment(
             "editorial_enrichment_lineage_mismatch",
             "Editorial enrichment production input does not match its extraction and synthesis",
         )
-    if enrichment.extraction_hash != canonical_extraction_hash(extraction):
+    resolved_extraction_hash = (
+        canonical_extraction_hash(extraction)
+        if expected_extraction_hash is None
+        else expected_extraction_hash
+    )
+    if (
+        _SHA256_RE.fullmatch(resolved_extraction_hash) is None
+        or enrichment.extraction_hash != resolved_extraction_hash
+    ):
         raise EditorialEnrichmentValidationError(
             "editorial_enrichment_lineage_mismatch",
             "Editorial enrichment extraction hash does not match the canonical extraction",
         )
-    if enrichment.synthesis_hash != canonical_synthesis_hash(synthesis):
+    if (
+        expected_extraction_hash is not None
+        and synthesis.extraction_hash != resolved_extraction_hash
+    ):
+        raise EditorialEnrichmentValidationError(
+            "editorial_enrichment_lineage_mismatch",
+            "Canonical synthesis does not reference the verified extraction hash",
+        )
+    resolved_synthesis_hash = (
+        canonical_synthesis_hash(synthesis)
+        if expected_synthesis_hash is None
+        else expected_synthesis_hash
+    )
+    if (
+        _SHA256_RE.fullmatch(resolved_synthesis_hash) is None
+        or enrichment.synthesis_hash != resolved_synthesis_hash
+    ):
         raise EditorialEnrichmentValidationError(
             "editorial_enrichment_lineage_mismatch",
             "Editorial enrichment synthesis hash does not match the canonical synthesis",
@@ -7471,3 +7922,74 @@ def validate_editorial_enrichment(
                 "editorial_enrichment_source_figure_invalid",
                 "A figure with a non-included decision cannot be assembled",
             )
+
+
+def revalidate_editorial_enrichment_quality(
+    enrichment: EditorialEnrichmentV1,
+    *,
+    extraction: ProductionExtractionV1,
+    synthesis: ProductionSynthesisV1,
+    projection: RelevanceProjectionV1 | None = None,
+    expected_extraction_hash: str | None = None,
+    expected_projection_hash: str | None = None,
+    expected_synthesis_hash: str | None = None,
+) -> tuple[EditorialEnrichmentQualityRejection, ...]:
+    """Inspect a stored enrichment without changing it or making model calls.
+
+    Rebuild the deterministic IOC set from canonical EXTRACTION and the optional
+    verified relevance projection, then apply the same table and diagram rules
+    used during proposal validation. Historical callers may pass extraction,
+    projection and synthesis hashes from verified artifact metadata when
+    current serializers no longer reproduce an older digest or policy. The
+    caller must verify supplied digests against immutable artifact metadata.
+    Projection, subject, input and evidence-reference lineage still agree.
+    The caller decides whether to report or replace any flagged blocks; this
+    function never persists or rewrites data.
+    """
+    validate_editorial_enrichment(
+        enrichment,
+        extraction=extraction,
+        synthesis=synthesis,
+        expected_extraction_hash=expected_extraction_hash,
+        expected_synthesis_hash=expected_synthesis_hash,
+    )
+    if projection is not None:
+        validate_relevance_projection_lineage(
+            projection,
+            extraction,
+            extraction_hash=(expected_extraction_hash or canonical_extraction_hash(extraction)),
+        )
+        if (
+            expected_projection_hash is not None
+            and projection.projection_hash != expected_projection_hash
+        ):
+            raise ValueError(
+                "Editorial relevance projection hash differs from its verified artifact"
+            )
+    elif expected_projection_hash is not None:
+        raise ValueError("Expected a relevance projection for its verified artifact hash")
+
+    projected_ioc_keys = _projected_publication_ioc_keys(extraction, projection)
+    current_synthesis = _synthesis_prompt_projection(synthesis, {})
+    rejections: list[EditorialEnrichmentQualityRejection] = []
+    for table in enrichment.tables:
+        if _table_republishes_projected_iocs(table, projected_ioc_keys):
+            rejections.append(
+                EditorialEnrichmentQualityRejection(
+                    kind="TABLE",
+                    block_id=table.key,
+                    proposal_key=table.key,
+                    reason_code=EditorialEnrichmentStageErrorCode.TABLE_IOC_REPUBLICATION.value,
+                )
+            )
+    for diagram in enrichment.diagrams:
+        if _diagram_repeats_one_anchor_assertion(diagram, current_synthesis):
+            rejections.append(
+                EditorialEnrichmentQualityRejection(
+                    kind="DIAGRAM",
+                    block_id=diagram.key,
+                    proposal_key=diagram.key,
+                    reason_code=EditorialEnrichmentStageErrorCode.DIAGRAM_TRIVIAL.value,
+                )
+            )
+    return tuple(rejections)

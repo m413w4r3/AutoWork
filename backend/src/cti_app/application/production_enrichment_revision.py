@@ -350,55 +350,89 @@ class ProductionEditorialEnrichmentRevisionService:
             }
             after_element = base_element
         else:
-            candidate = self._validate_target_proposal(
-                parsed,
-                element_kind=element_kind,
-                element_key=element_key,
-                evidence_pack=evidence_pack,
-                extraction=extraction,
-                synthesis=synthesis,
-                figure_catalog=figure_catalog,
-                validator_rejections=validator_rejections,
-            )
-            if (
-                element_kind is EditorialEnrichmentElementKind.FIGURE
-                and action is EditorialEnrichmentRevisionAction.CHOOSE_ANOTHER_FIGURE
-            ):
-                previous_figure = next(
-                    item for item in base_enrichment.source_figures if item.key == element_key
-                )
-                replacement_figure = candidate.source_figures[0]
-                previous_figure_id = (
-                    previous_figure.resolved_figure.figure_id
-                    if previous_figure.resolved_figure is not None
-                    else None
-                )
-                replacement_figure_id = (
-                    replacement_figure.resolved_figure.figure_id
-                    if replacement_figure.resolved_figure is not None
-                    else None
-                )
-                if previous_figure_id == replacement_figure_id:
+            if action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT:
+                if not parsed.explicit_empty:
                     raise EditorialEnrichmentRevisionValidationError(
                         [
+                            *validator_rejections,
                             {
                                 "block_id": element_key,
-                                "reason_code": "editorial_enrichment_figure_not_changed",
-                            }
+                                "reason_code": (
+                                    "editorial_enrichment_revision_remove_requires_empty_marker"
+                                ),
+                            },
                         ]
                     )
-            revised_enrichment = await self._replace_target(
-                base_enrichment,
-                candidate,
-                element_kind=element_kind,
-                element_key=element_key,
-                run_id=run.id,
-            )
-            validate_editorial_enrichment(
-                revised_enrichment, extraction=extraction, synthesis=synthesis
-            )
-            after_payload = editorial_enrichment_to_json(revised_enrichment)
-            after_element = after_payload[list_name][element_index]
+                if element_kind is EditorialEnrichmentElementKind.TABLE:
+                    revised_enrichment = replace(
+                        base_enrichment,
+                        tables=tuple(
+                            item for item in base_enrichment.tables if item.key != element_key
+                        ),
+                    )
+                elif element_kind is EditorialEnrichmentElementKind.DIAGRAM:
+                    revised_enrichment = replace(
+                        base_enrichment,
+                        diagrams=tuple(
+                            item for item in base_enrichment.diagrams if item.key != element_key
+                        ),
+                    )
+                else:
+                    raise ValueError("editorial_enrichment_revision_action_mismatch")
+                validate_editorial_enrichment(
+                    revised_enrichment, extraction=extraction, synthesis=synthesis
+                )
+                after_element = None
+            else:
+                candidate = self._validate_target_proposal(
+                    parsed,
+                    element_kind=element_kind,
+                    element_key=element_key,
+                    evidence_pack=evidence_pack,
+                    extraction=extraction,
+                    synthesis=synthesis,
+                    figure_catalog=figure_catalog,
+                    validator_rejections=validator_rejections,
+                )
+                if (
+                    element_kind is EditorialEnrichmentElementKind.FIGURE
+                    and action is EditorialEnrichmentRevisionAction.CHOOSE_ANOTHER_FIGURE
+                ):
+                    previous_figure = next(
+                        item for item in base_enrichment.source_figures if item.key == element_key
+                    )
+                    replacement_figure = candidate.source_figures[0]
+                    previous_figure_id = (
+                        previous_figure.resolved_figure.figure_id
+                        if previous_figure.resolved_figure is not None
+                        else None
+                    )
+                    replacement_figure_id = (
+                        replacement_figure.resolved_figure.figure_id
+                        if replacement_figure.resolved_figure is not None
+                        else None
+                    )
+                    if previous_figure_id == replacement_figure_id:
+                        raise EditorialEnrichmentRevisionValidationError(
+                            [
+                                {
+                                    "block_id": element_key,
+                                    "reason_code": "editorial_enrichment_figure_not_changed",
+                                }
+                            ]
+                        )
+                revised_enrichment = await self._replace_target(
+                    base_enrichment,
+                    candidate,
+                    element_kind=element_kind,
+                    element_key=element_key,
+                    run_id=run.id,
+                )
+                validate_editorial_enrichment(
+                    revised_enrichment, extraction=extraction, synthesis=synthesis
+                )
+                after_payload = editorial_enrichment_to_json(revised_enrichment)
+                after_element = after_payload[list_name][element_index]
 
         revised_payload = editorial_enrichment_to_json(revised_enrichment)
         # Preserve every untouched serialized element exactly as it appeared in
@@ -407,7 +441,10 @@ class ProductionEditorialEnrichmentRevisionService:
         final_payload = dict(base_payload)
         final_payload[list_name] = list(base_elements)
         if outcome is EditorialEnrichmentRevisionOutcome.REVISED:
-            final_payload[list_name][element_index] = after_element
+            if action is EditorialEnrichmentRevisionAction.REMOVE_ELEMENT:
+                final_payload[list_name].pop(element_index)
+            else:
+                final_payload[list_name][element_index] = after_element
         if "resource_needs" in revised_payload:
             final_payload["resource_needs"] = revised_payload["resource_needs"]
         before_publication_id = previous_publication.id if previous_publication else None
@@ -578,6 +615,10 @@ class ProductionEditorialEnrichmentRevisionService:
         action: EditorialEnrichmentRevisionAction,
     ) -> None:
         allowed = {
+            EditorialEnrichmentRevisionAction.REMOVE_ELEMENT: {
+                EditorialEnrichmentElementKind.TABLE,
+                EditorialEnrichmentElementKind.DIAGRAM,
+            },
             EditorialEnrichmentRevisionAction.IMPROVE_TABLE: {EditorialEnrichmentElementKind.TABLE},
             EditorialEnrichmentRevisionAction.DETAIL_DIAGRAM: {
                 EditorialEnrichmentElementKind.DIAGRAM
@@ -711,8 +752,10 @@ class ProductionEditorialEnrichmentRevisionService:
                 "recherche, aucun appel web, n'invente aucun fait et ne modifie pas la "
                 "narration. Si l'instruction exige une information absente des preuves, "
                 "émets uniquement un bloc NEEDS avec un motif et un query_hint, sans proposer "
-                "l'élément révisé. Retourne un seul bloc TABLE, DIAGRAM ou FIGURE selon le "
-                "type ciblé, en conservant sa clé pour TABLE/DIAGRAM. Respecte strictement "
+                "l'élément révisé. Pour l'action remove_element, retourne uniquement le marqueur "
+                "exact NO USEFUL ENRICHMENT afin de supprimer l'élément ciblé; sinon retourne "
+                "un seul bloc TABLE, DIAGRAM ou FIGURE selon le type ciblé, en conservant sa clé "
+                "pour TABLE/DIAGRAM. Respecte strictement "
                 "les handles et règles de validation fournis. Pour une FIGURE, sélectionne "
                 "uniquement un FIGURE_HANDLE accepté du catalogue, avec des evidence handles "
                 "de la même source. Une architecture, chaîne d'exploitation ou chaîne malware, "
@@ -722,7 +765,20 @@ class ProductionEditorialEnrichmentRevisionService:
                 "sans valeur analytique, image d'article adjacent ou figure sans lien direct aux "
                 "preuves. Une URL ou une image ne remplace jamais le handle. La caption doit "
                 "être courte et descriptive; si elle manque, le code préfère la caption source, "
-                "puis un alt exploitable, et refuse de publier sans l'un de ces textes."
+                "puis un alt exploitable, et refuse de publier sans l'un de ces textes. Une table "
+                "ne doit pas republier les IP, domaines, URL, hachés ou e-mails projetés lorsque "
+                "ses autres colonnes sont constantes ou répètent seulement leur type; conserve-la "
+                "si elle relie les IOC à des attributs analytiques utiles et documentés. Un "
+                "diagramme doit clarifier une séquence, un pipeline, une architecture, des "
+                "branches, une convergence, plusieurs relations, un contrôle-flow, une propagation "
+                "ou un mapping complexe. Une branche ou convergence à un seul niveau autour d'un "
+                "seul nœud ne suffit pas si au moins 80% des libellés réutilisent au moins la "
+                "moitié "
+                "de leurs termes de contenu d'une phrase d'ancrage, sans ajouter de chemin multi-"
+                "étapes ou de mapping distinct; omets alors le bloc. "
+                "Aucun nombre minimal de nœuds ne s'applique. Dans GAIN, réponds obligatoirement à "
+                "« Qu'est-ce que le lecteur comprend mieux grâce à cet élément ? » par un gain "
+                "concret; sinon omets le bloc."
             ),
             "action": action.value,
             "instruction": instruction,
