@@ -335,7 +335,9 @@ def _wire_evidence_handles(value: str) -> tuple[str, ...] | None:
     return handles if handles and not residue else None
 
 
-def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
+def parse_synthesis_proposal_wire(
+    raw_text: str, *, require_lead: bool = True
+) -> SynthesisWireParseResult:
     """Parse independent synthesis blocks without relaxing claim validation."""
     if not isinstance(raw_text, str):
         return SynthesisWireParseResult(None, error_code="synthesis_unintelligible_response")
@@ -799,7 +801,7 @@ def parse_synthesis_proposal_wire(raw_text: str) -> SynthesisWireParseResult:
             warnings=tuple(warnings),
             diagnostics=tuple(diagnostics),
         )
-    if not lead:
+    if require_lead and not lead:
         rejected.append(_wire_rejection("LEAD", "synthesis_lead_missing", lines))
         return SynthesisWireParseResult(
             None,
