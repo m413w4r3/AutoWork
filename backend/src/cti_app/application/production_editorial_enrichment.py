@@ -199,7 +199,7 @@ EDITORIAL_ENRICHMENT_EVIDENCE_PACK_POLICY_VERSION = (
     "editorial-enrichment-evidence-pack-v8-relation-support"
 )
 EDITORIAL_ENRICHMENT_VALIDATOR_VERSION = (
-    "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
+    "editorial-enrichment-validator-v19-shared-diagram-attestation"
 )
 EDITORIAL_ENRICHMENT_ANALYTIC_POLICY_VERSION = (
     "editorial-enrichment-analytic-policy-v6-ioc-republication-diagram-value"
@@ -1767,13 +1767,52 @@ def _soft_tokens(value: str) -> frozenset[str]:
     )
 
 
+_DIAGRAM_COVERAGE_TOKEN_EQUIVALENTS = {
+    "conti": "bundl",
+    "defi": "chall",
+    "defis": "chall",
+    "paque": "packa",
+    "piege": "troja",
+    "pieges": "troja",
+}
+_DIAGRAM_GENERIC_FILE_SUFFIXES = frozenset(
+    {"bin", "dat", "dll", "elf", "exe", "js", "json", "py", "so", "sys", "txt", "xml"}
+)
+
+
+def _diagram_coverage_tokens(value: str) -> frozenset[str]:
+    return frozenset(
+        _DIAGRAM_COVERAGE_TOKEN_EQUIVALENTS.get(token, token)
+        for token in _soft_tokens(value)
+        if token not in _DIAGRAM_GENERIC_FILE_SUFFIXES
+    )
+
+
+def _diagram_label_variants(label: str) -> tuple[str, ...]:
+    variants: list[str] = []
+    for part in re.split(r"\s+/\s+", label.strip()):
+        variants.append(part)
+        alias = re.fullmatch(r"(.*?)\s+\(([^()]+)\)", part)
+        if alias is None:
+            continue
+        base_label, alias_label = alias.groups()
+        if base_label.strip():
+            variants.append(base_label.strip())
+        # Short protocol tags such as S3 qualify a service name; they are not
+        # enough on their own to establish the branded endpoint.
+        if len(alias_label.strip()) > 3:
+            variants.append(alias_label.strip())
+    return tuple(dict.fromkeys(variants))
+
+
 def _record_covers(record: Mapping[str, Any], label: str) -> bool:
     """True when most of a label's words (by stem) appear in a record, in any language."""
-    terms = _soft_tokens(label)
-    if not terms:
-        return False
-    present = _soft_tokens(" ".join(_string_values(record)))
-    return len(terms & present) / len(terms) >= _SOFT_COVERAGE_THRESHOLD
+    present = _diagram_coverage_tokens(" ".join(_string_values(record)))
+    for variant in _diagram_label_variants(label):
+        terms = _diagram_coverage_tokens(variant)
+        if terms and len(terms & present) / len(terms) >= _SOFT_COVERAGE_THRESHOLD:
+            return True
+    return False
 
 
 # Fallback only, for records with no translated field to compare their quote against.
@@ -2146,46 +2185,86 @@ def _edge_projection_rejection(
     node_by_id = {item.node_id: item for item in diagram.nodes}
     source_label = node_by_id[edge.source_node_id].label
     target_label = node_by_id[edge.target_node_id].label
-    records_by_handle = {
-        str(item.get("handle")): item
-        for item in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence)
-        if isinstance(item.get("handle"), str)
-    }
+    records_by_handle: dict[str, Mapping[str, Any]] = {}
+    for item in (*evidence_pack.narrative_evidence, *evidence_pack.technical_evidence):
+        handle = item.get("handle")
+        if isinstance(handle, str) and handle in evidence_pack._handle_to_ref:
+            records_by_handle.setdefault(handle, item)
+    reserve_records_by_ref: dict[ExtractionEvidenceRefV1, Mapping[str, Any]] = {}
+    for item in evidence_pack.reserve_evidence:
+        handle = item.get("handle")
+        ref = evidence_pack._reserve_handle_to_ref.get(handle) if isinstance(handle, str) else None
+        if ref is not None:
+            reserve_records_by_ref.setdefault(ref, item)
+    for handle, ref in evidence_pack._handle_to_ref.items():
+        if handle not in records_by_handle and ref in reserve_records_by_ref:
+            records_by_handle[handle] = reserve_records_by_ref[ref]
     edge_records = [
         records_by_handle[handle] for handle in edge.evidence_handles if handle in records_by_handle
     ]
-    # Evidence is quoted in the source language while labels are written in the
-    # publication language, so a lexical match alone rejects translated diagrams. For
-    # such a foreign record an endpoint or relation is also supported when its
-    # node cites a handle the edge cites too: the model attests the grounding explicitly.
+    # Evidence may be quoted in the source language while labels are written in the
+    # publication language. Shared node citations can attest the relation, with each
+    # endpoint separately grounded by that node's evidence handles.
     foreign = {
         handle
         for handle, item in records_by_handle.items()
         if _record_is_foreign_to(item, evidence_pack.publication_language)
     }
-    edge_handles = set(edge.evidence_handles) & foreign
-    source_cited = edge_handles & set(node_by_id[edge.source_node_id].evidence_handles)
-    target_cited = edge_handles & set(node_by_id[edge.target_node_id].evidence_handles)
-    source_supported = bool(source_cited) or any(
-        _record_covers(item, source_label) for item in edge_records
+
+    def node_label_is_supported(node: DiagramNodeProposalV1) -> bool:
+        return any(
+            _record_covers(record, node.label)
+            or _record_is_foreign_to(record, evidence_pack.publication_language)
+            for handle in node.evidence_handles
+            if (record := records_by_handle.get(handle)) is not None
+        )
+
+    source_node = node_by_id[edge.source_node_id]
+    target_node = node_by_id[edge.target_node_id]
+    source_node_supported = node_label_is_supported(source_node)
+    target_node_supported = node_label_is_supported(target_node)
+    known_edge_handles = set(edge.evidence_handles) & records_by_handle.keys()
+    foreign_edge_handles = known_edge_handles & foreign
+    source_cited = foreign_edge_handles & set(source_node.evidence_handles)
+    target_cited = foreign_edge_handles & set(target_node.evidence_handles)
+    # Shared node citations are an explicit relationship attestation even when a
+    # translated record is not classified as foreign. Keep each endpoint tied to
+    # its own cited evidence so a shared handle cannot introduce an absent node.
+    shared_cited = (
+        known_edge_handles & set(source_node.evidence_handles) & set(target_node.evidence_handles)
     )
-    target_supported = bool(target_cited) or any(
-        _record_covers(item, target_label) for item in edge_records
+    shared_citation_supported = (
+        bool(shared_cited) and source_node_supported and target_node_supported
     )
-    shared_cited = source_cited & target_cited
-    same_record_support = bool(shared_cited) or any(
+    source_supported = (
+        bool(source_cited)
+        or shared_citation_supported
+        or any(_record_covers(item, source_label) for item in edge_records)
+    )
+    target_supported = (
+        bool(target_cited)
+        or shared_citation_supported
+        or any(_record_covers(item, target_label) for item in edge_records)
+    )
+    same_record_support = shared_citation_supported or any(
         _record_covers(item, source_label) and _record_covers(item, target_label)
         for item in edge_records
     )
     label = edge.label or ""
     relation_text_support = bool(_soft_tokens(label)) and (
-        bool(shared_cited)
+        shared_citation_supported
         or any(
             _record_covers(item, source_label)
             and _record_covers(item, target_label)
             and _record_covers(item, label)
             for item in edge_records
         )
+    )
+    sequence_text_support = bool(source_cited & target_cited) or any(
+        _record_covers(item, source_label)
+        and _record_covers(item, target_label)
+        and _record_covers(item, label)
+        for item in edge_records
     )
     if not source_supported or not target_supported:
         return "editorial_enrichment_diagram_relation_endpoint_unsupported"
@@ -2195,7 +2274,7 @@ def _edge_projection_rejection(
         if edge.label is None or "comparison" not in _analytic_tokens(edge.label):
             return "editorial_enrichment_comparison_relation_not_labelled"
     if diagram.kind is EnrichmentDiagramKind.INFECTION_CHAIN and (
-        edge.relation_type is not DiagramRelationType.FACTUAL or not relation_text_support
+        edge.relation_type is not DiagramRelationType.FACTUAL or not sequence_text_support
     ):
         return "editorial_enrichment_infection_chain_sequence_not_documented"
     if edge.relation_type is DiagramRelationType.FACTUAL and not same_record_support:

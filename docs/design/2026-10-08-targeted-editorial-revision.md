@@ -233,6 +233,31 @@ inventaire empêchent que des entrées remplacées ou modifiées profitent de
 l'exception. L'exception est limitée au marqueur écrit par le chemin de
 réparation; aucune nouvelle version de politique n'est nécessaire.
 
+## Filtre de relations des diagrammes
+
+Le filtre résout d'abord chaque handle ordinaire `E…` sur son record narratif
+ou technique direct. Si ce record manque, il peut utiliser un record réservé
+`R…` qui partage exactement la même référence canonique. Cette résolution de
+secours ne remplace jamais un record direct par un autre record qui partage sa
+référence; un handle absent du pack reste refusé par le parseur.
+
+Une relation factuelle peut être étayée soit par un record cité qui couvre les
+deux extrémités et son libellé, soit par le même handle connu cité sur la
+relation et sur les deux nœuds. Dans le second cas, les handles propres à
+chaque nœud doivent encore étayer son libellé par correspondance lexicale ou
+par la règle existante des preuves en langue étrangère. Cette attestation
+partagée couvre les différences de libellé et de langue sans autoriser un
+nœud sans preuve. La couverture lexicale accepte les équivalents courants
+`défi/challenge`, `piégé/trojanized` et `paquet/package`, ainsi que les alias
+explicites séparés par `/` ou placés entre parenthèses. Les extensions
+génériques (`.exe`, `.json`, `.js`, etc.) ne suffisent pas seules à établir un
+endpoint. Les relations d'infection gardent leur exigence de séquence
+documentée; les indications de contre-preuve et les relations de projection
+inter-sources restent bloquantes.
+
+Cette règle est versionnée par `editorial-enrichment-v12-shared-diagram-attestation`
+et le validateur `editorial-enrichment-validator-v19-shared-diagram-attestation`.
+
 ## Correctif — validation d'un patch sans chapeau
 
 Un patch ciblé de section ou de paragraphe peut omettre `@@LEAD@@`, puisque le

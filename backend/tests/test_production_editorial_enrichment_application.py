@@ -2077,6 +2077,126 @@ def test_relation_without_endpoint_support_is_rejected_without_dropping_table() 
     }
 
 
+def test_shared_known_handle_attested_on_grounded_nodes_supports_relationship() -> None:
+    snapshot = _snapshot()
+
+    def fact(value: str, category: str) -> ExtractionFactV1:
+        return ExtractionFactV1(
+            category=category,
+            value=value,
+            attack_id=None,
+            context="",
+            evidence_quote=value,
+            evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+            source_document_ids=(_DOCUMENT_ID,),
+        )
+
+    source_value = "API des bots Telegram"
+    target_value = "HEAVYGRAM (RuntimeSSH.exe)"
+    relation_value = "Le préfixe C2 @@ transmet une chaîne à run_command()."
+    extraction = _extraction(
+        facts=(
+            fact(source_value, "infrastructure"),
+            fact(target_value, "malware"),
+            fact(relation_value, "commands"),
+        ),
+        input_hash=snapshot.input_hash,
+    )
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    handles_by_value = {str(item["value"]): str(item["handle"]) for item in pack.narrative_evidence}
+    source_handle = handles_by_value[source_value]
+    target_handle = handles_by_value[target_value]
+    relation_handle = handles_by_value[relation_value]
+    wire = _proposal_to_wire(_proposal(relation_handle))
+    wire = wire.replace("KIND: infection_chain", "KIND: custom", 1)
+    wire = wire.replace(
+        f"LABEL: ExampleRAT\nROLE: unknown\nEVIDENCE: {relation_handle}",
+        f"LABEL: API des bots Telegram\nROLE: unknown\n"
+        f"EVIDENCE: {source_handle}, {relation_handle}",
+        1,
+    )
+    wire = wire.replace(
+        f"LABEL: Execution\nROLE: unknown\nEVIDENCE: {relation_handle}",
+        f"LABEL: HEAVYGRAM (RuntimeSSH.exe)\nROLE: unknown\n"
+        f"EVIDENCE: {target_handle}, {relation_handle}",
+        1,
+    )
+    wire = wire.replace("LABEL: launches", "LABEL: commande C2", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.diagrams) == 1
+    assert result.proposal.diagrams[0].edges[0].evidence_handles == (relation_handle,)
+    assert "editorial_enrichment_diagram_relation_endpoint_unsupported" not in {
+        item.reason_code for item in result.rejections
+    }
+
+
+def test_multilingual_record_covers_diagram_alias_labels() -> None:
+    snapshot = _snapshot()
+    fact = ExtractionFactV1(
+        category="infection_chain",
+        value=(
+            "Le package colorized_terminal est dans une archive trojanisée d'un coding challenge."
+        ),
+        attack_id=None,
+        context="",
+        evidence_quote=(
+            "The attackers bundled the trojanized colorized_terminal package directly "
+            "in the coding challenge archive."
+        ),
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    assert not enrichment_module._record_is_foreign_to(pack.narrative_evidence[0], "fr")
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("LABEL: ExampleRAT", "LABEL: Archives de défis piégés", 1)
+    wire = wire.replace("LABEL: Execution", "LABEL: colorized_terminal / pretty-log", 1)
+    wire = wire.replace("LABEL: launches", "LABEL: contiennent les paquets piégés", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert len(result.proposal.diagrams) == 1
+    assert not any(
+        item.reason_code.startswith("editorial_enrichment_diagram_relation_")
+        for item in result.rejections
+    )
+
+
+def test_file_extension_alone_does_not_ground_diagram_endpoint() -> None:
+    snapshot = _snapshot()
+    fact = ExtractionFactV1(
+        category="commands",
+        value="winappx.exe executes a payload.",
+        attack_id=None,
+        context="",
+        evidence_quote="winappx.exe executes a payload.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(_DOCUMENT_ID,),
+    )
+    extraction = _extraction(facts=(fact,), input_hash=snapshot.input_hash)
+    synthesis = _synthesis(extraction)
+    pack = build_editorial_enrichment_evidence_pack(snapshot, extraction, synthesis)
+    wire = _proposal_to_wire(_proposal("E001"))
+    wire = wire.replace("LABEL: ExampleRAT", "LABEL: RuntimeSSH.exe", 1)
+    wire = wire.replace("LABEL: Execution", "LABEL: winappx.exe", 1)
+    wire = wire.replace("LABEL: launches", "LABEL: executes", 1)
+
+    result = parse_editorial_enrichment_proposal_wire(wire, pack)
+
+    assert result.proposal is not None
+    assert result.proposal.diagrams == ()
+    assert "editorial_enrichment_diagram_relation_endpoint_unsupported" in {
+        item.reason_code for item in result.rejections
+    }
+
+
 def test_factual_relation_needs_both_endpoints_in_the_same_cited_evidence_item() -> None:
     snapshot = _snapshot()
     extraction = _extraction(input_hash=snapshot.input_hash)
@@ -3000,7 +3120,7 @@ def test_validator_version_changes_artifact_identity_without_changing_invocation
     artifact_after = compute_editorial_enrichment_input_hash(**common)
 
     assert EDITORIAL_ENRICHMENT_VALIDATOR_VERSION == (
-        "editorial-enrichment-validator-v18-ioc-republication-diagram-value"
+        "editorial-enrichment-validator-v19-shared-diagram-attestation"
     )
     assert invocation_before == invocation_after
     assert artifact_before != artifact_after
