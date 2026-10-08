@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from cti_app.application.model_gateway import (
@@ -43,7 +45,6 @@ from cti_app.application.production_synthesis import (
     SynthesisEvidencePackV1,
     SynthesisProposalControlError,
     SynthesisProposalV1,
-    _editorial_title_group,
     build_synthesis_evidence_pack,
     build_synthesis_model_request,
     canonical_extraction_hash,
@@ -829,7 +830,7 @@ _GROUNDING_STOP_WORDS = frozenset(
 
 
 def _grounding_token(value: str) -> str:
-    token = value.casefold().replace("\u2019", "'").strip("'-")
+    token = unicodedata.normalize("NFKC", value).casefold().replace("\u2019", "'").strip("'-")
     if token.endswith(("ies", "ied")) and len(token) > 5:
         return f"{token[:-3]}y"
     if token.endswith("ing") and len(token) > 5:
@@ -841,6 +842,160 @@ def _grounding_token(value: str) -> str:
     if token.endswith("s") and len(token) > 4:
         return token[:-1]
     return token
+
+
+def _normalized_editorial_title_text(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _editorial_title_group_aliases(group: str) -> tuple[str, ...]:
+    raw_aliases = group.split("/")
+    aliases = tuple(_normalized_editorial_title_text(alias) for alias in raw_aliases)
+    return aliases if aliases and all(aliases) else ()
+
+
+def _editorial_title_group_is_anchored(group: str, context: Sequence[str]) -> bool:
+    aliases = _editorial_title_group_aliases(group)
+    if not aliases:
+        return False
+
+    normalized_context = _normalized_editorial_title_text(" ".join(context))
+    context_tokens = {
+        _grounding_token(token)
+        for token in re.findall(
+            r"[\w-]+",
+            unicodedata.normalize("NFKC", " ".join(context)),
+            flags=re.UNICODE,
+        )
+    }
+    for alias in aliases:
+        significant_tokens = {
+            _grounding_token(token)
+            for token in re.findall(r"[\w-]+", alias, flags=re.UNICODE)
+            if len(token) >= 4 and _grounding_token(token) not in _GROUNDING_STOP_WORDS
+        }
+        exact_alias_is_anchored = (
+            re.search(
+                rf"(?<![\w-]){re.escape(alias)}(?![\w-])",
+                normalized_context,
+                flags=re.UNICODE,
+            )
+            is not None
+        )
+        if not exact_alias_is_anchored and (
+            not significant_tokens or not significant_tokens.issubset(context_tokens)
+        ):
+            return False
+    return True
+
+
+def _editorial_title_group_from_title(title: str) -> str | None:
+    match = re.match(r"^\[([^\]]+)\] ", title)
+    return match.group(1) if match is not None else None
+
+
+def _publisher_title_aliases(
+    snapshot: ProductionInputSnapshot,
+    extraction: ProductionExtractionV1,
+) -> frozenset[str]:
+    publishers: set[str] = set()
+    for source in snapshot.core_sources:
+        if source.publisher.strip():
+            publishers.update(_editorial_title_group_aliases(source.publisher))
+    publishers.update(
+        _normalized_editorial_title_text(hostname)
+        for source in extraction.sources
+        if (hostname := (urlsplit(source.canonical_url).hostname or "").removeprefix("www."))
+    )
+    return frozenset(publishers)
+
+
+def _group_matches_publisher(group: str, publishers: frozenset[str]) -> bool:
+    return any(alias in publishers for alias in _editorial_title_group_aliases(group))
+
+
+def _has_anchored_actor(
+    *,
+    base_synthesis: ProductionSynthesisV1,
+    extraction: ProductionExtractionV1,
+    snapshot: ProductionInputSnapshot,
+    context: Sequence[str],
+    publishers: frozenset[str],
+) -> bool:
+    actor_candidates = [snapshot.actor_or_campaign]
+    actor_candidates.extend(
+        fact.value
+        for source in extraction.sources
+        for fact in source.facts
+        if fact.category in {"actors", "campaigns"}
+    )
+    actor_candidates.extend(
+        group
+        for group in (
+            _editorial_title_group_from_title(base_synthesis.title),
+            _editorial_title_group_from_title(snapshot.subject_title),
+        )
+        if group is not None
+    )
+    unestablished_labels = {
+        "unknown",
+        "unknown actor",
+        "unattributed",
+        "unattributed actor",
+        "inconnu",
+        "acteur inconnu",
+        "non attribue",
+        "non identifie",
+        "non attribué",
+        "non identifié",
+    }
+    for candidate in actor_candidates:
+        if not candidate.strip():
+            continue
+        aliases = _editorial_title_group_aliases(candidate)
+        actor_aliases = tuple(
+            alias
+            for alias in aliases
+            if alias not in unestablished_labels and alias not in publishers
+        )
+        if any(_editorial_title_group_is_anchored(alias, context) for alias in actor_aliases):
+            return True
+    return False
+
+
+def _editorial_title_context(
+    *,
+    base_synthesis: ProductionSynthesisV1,
+    evidence_pack: SynthesisEvidencePackV1,
+    extraction: ProductionExtractionV1,
+    snapshot: ProductionInputSnapshot,
+) -> tuple[str, ...]:
+    context = [base_synthesis.title, snapshot.subject_title, snapshot.actor_or_campaign]
+    context.extend(paragraph.text for paragraph in base_synthesis.lead)
+    context.extend(
+        paragraph.text for section in base_synthesis.sections for paragraph in section.paragraphs
+    )
+    evidence_records = (
+        *evidence_pack.narrative_evidence,
+        *evidence_pack.technical_evidence,
+        *evidence_pack.reserve_evidence,
+    )
+    omitted_fields = {"handle", "source_label", "source_role", "editorial_role"}
+    context.extend(
+        value
+        for record in evidence_records
+        for key, value in record.items()
+        if key not in omitted_fields and isinstance(value, str)
+    )
+    context.extend(source.publisher for source in snapshot.core_sources if source.publisher.strip())
+    for source in extraction.sources:
+        hostname = (urlsplit(source.canonical_url).hostname or "").removeprefix("www.")
+        if hostname:
+            context.append(hostname)
+        for fact in source.facts:
+            if fact.category in {"actors", "campaigns"}:
+                context.extend((fact.value, fact.context, fact.evidence_quote))
+    return tuple(context)
 
 
 def _assert_claim_handles_and_relations_supported(
@@ -1145,8 +1300,24 @@ def _apply_wire_patch(
         title = _extract_after_text(raw_after, "TITLE")
         if not is_valid_editorial_title(title):
             raise TargetedSynthesisRevisionValidationError("synthesis_title_invalid")
-        expected_group = _editorial_title_group(snapshot, extraction)
-        if not title.startswith(f"[{expected_group}] "):
+        group = _editorial_title_group_from_title(title)
+        assert group is not None
+        title_context = _editorial_title_context(
+            base_synthesis=base_synthesis,
+            evidence_pack=evidence_pack,
+            extraction=extraction,
+            snapshot=snapshot,
+        )
+        publishers = _publisher_title_aliases(snapshot, extraction)
+        if _group_matches_publisher(group, publishers) and _has_anchored_actor(
+            base_synthesis=base_synthesis,
+            extraction=extraction,
+            snapshot=snapshot,
+            context=title_context,
+            publishers=publishers,
+        ):
+            raise TargetedSynthesisRevisionValidationError("synthesis_title_publisher_as_actor")
+        if not _editorial_title_group_is_anchored(group, title_context):
             raise TargetedSynthesisRevisionValidationError("synthesis_title_actor_ungrounded")
     elif operation is TargetedEditorialRevisionOperation.RENAME_SECTION:
         heading = _extract_after_text(raw_after, "HEADING")

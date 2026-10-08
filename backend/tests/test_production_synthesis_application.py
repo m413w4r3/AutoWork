@@ -82,6 +82,7 @@ from cti_app.domain.production import (
     ProductionArtifactStatus,
     ProductionEvidenceBasis,
     ProductionInputSnapshot,
+    ProductionInputSource,
     ProductionRun,
     ProductionStage,
     SynthesisMode,
@@ -4073,6 +4074,227 @@ def _targeted_revision_fixture() -> tuple[
     return world, synthesis, evidence_pack, handle
 
 
+def _apply_targeted_title_revision(
+    world: SimpleNamespace,
+    base: ProductionSynthesisV1,
+    evidence_pack: SynthesisEvidencePackV1,
+    title: str,
+    *,
+    snapshot: ProductionInputSnapshot | None = None,
+) -> tuple[ProductionSynthesisV1, dict[str, Any]]:
+    snapshot = snapshot or world.snapshot
+    if base.production_input_hash != snapshot.input_hash:
+        base = replace(base, production_input_hash=snapshot.input_hash)
+    payload = production_synthesis_to_json(base)
+    target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
+    operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
+    patch = _targeted_wire_patch(
+        payload,
+        target,
+        operation,
+        f"@@TITLE@@\n{title}\n@@END TITLE@@",
+    )
+    revised, revised_payload, _ = synthesis_revision_module._apply_wire_patch(
+        base_synthesis=base,
+        base_payload=payload,
+        target=target,
+        operation=operation,
+        patch=patch,
+        evidence_pack=evidence_pack,
+        extraction=world.extraction,
+        snapshot=snapshot,
+    )
+    return revised, revised_payload
+
+
+def _snapshot_with_anthropic_publisher(
+    snapshot: ProductionInputSnapshot,
+    *,
+    actor_or_campaign: str = "GTG-30004",
+    subject_title: str = "GTG-30004 Automatise le profilage OSINT",
+) -> ProductionInputSnapshot:
+    core_sources = tuple(replace(source, publisher="Anthropic") for source in snapshot.core_sources)
+    if not core_sources:
+        core_sources = (
+            ProductionInputSource(
+                discovery_candidate_id=snapshot.member_candidate_ids[0],
+                source_candidate_id=uuid4(),
+                canonical_url="https://anthropic.com/research/gtg-30004",
+                role=SourceRole.PRIMARY,
+                title="GTG-30004 report",
+                publisher="Anthropic",
+                published_at=None,
+                tlp=snapshot.subject_tlp,
+                sensitivity="public",
+                external_llm_allowed=True,
+            ),
+        )
+    return replace(
+        snapshot,
+        subject_title=subject_title,
+        actor_or_campaign=actor_or_campaign,
+        input_hash="",
+        reuse_basis_hash="",
+        core_sources=core_sources,
+    )
+
+
+def test_targeted_title_revision_accepts_anchored_campaign_with_anthropic_publisher() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    snapshot = _snapshot_with_anthropic_publisher(world.snapshot)
+    source = world.extraction.sources[0]
+    extraction = replace(
+        world.extraction,
+        sources=(
+            replace(
+                source,
+                facts=(
+                    *source.facts,
+                    ExtractionFactV1(
+                        category="tools",
+                        value="NanoDump",
+                        attack_id=None,
+                        context="NanoDump is the documented dump utility.",
+                        evidence_quote="The report documents NanoDump.",
+                        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+                        source_document_ids=(source.source_document_id,),
+                    ),
+                ),
+            ),
+        ),
+    )
+    world = SimpleNamespace(**vars(world))
+    world.extraction = extraction
+    base = replace(
+        base,
+        title="[Anthropic] GTG-30004 Automatise le profilage OSINT",
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=synthesis_module.canonical_extraction_hash(extraction),
+    )
+    title = "[GTG-30004] Automatise le profilage OSINT et obfusque un dérivé de NanoDump"
+
+    revised, revised_payload = _apply_targeted_title_revision(
+        world, base, evidence_pack, title, snapshot=snapshot
+    )
+
+    assert revised.title == title
+    assert revised_payload["title"] == title
+
+
+def test_targeted_title_revision_normalizes_case_nfkc_and_documented_aliases() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    snapshot = _snapshot_with_anthropic_publisher(
+        world.snapshot,
+        actor_or_campaign="GTG-30004 / APT28",
+    )
+    base = replace(base, production_input_hash=snapshot.input_hash)
+    title = "[\uff27\uff34\uff27-30004 / apt28] Updated campaign activity"
+
+    revised, _ = _apply_targeted_title_revision(
+        world, base, evidence_pack, title, snapshot=snapshot
+    )
+
+    assert revised.title == title
+
+
+def test_targeted_title_revision_anchors_names_documented_in_extraction() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    snapshot = replace(
+        world.snapshot,
+        subject_title="Network intrusion activity",
+        actor_or_campaign="",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    source = world.extraction.sources[0]
+    actor_fact = ExtractionFactV1(
+        category="actors",
+        value="GTG-30004",
+        attack_id=None,
+        context="The report identifies GTG-30004 as the campaign.",
+        evidence_quote="GTG-30004 conducted the campaign.",
+        evidence_basis=ProductionEvidenceBasis.SOURCE_VERIFIED,
+        source_document_ids=(source.source_document_id,),
+    )
+    extraction = replace(
+        world.extraction,
+        sources=(replace(source, facts=(*source.facts, actor_fact)),),
+    )
+    actor_world = SimpleNamespace(**vars(world))
+    actor_world.extraction = extraction
+    base = replace(
+        base,
+        production_input_hash=snapshot.input_hash,
+        extraction_hash=synthesis_module.canonical_extraction_hash(extraction),
+    )
+
+    revised, _ = _apply_targeted_title_revision(
+        actor_world,
+        base,
+        evidence_pack,
+        "[GTG-30004] Updated campaign activity",
+        snapshot=snapshot,
+    )
+
+    assert revised.title == "[GTG-30004] Updated campaign activity"
+
+
+def test_targeted_title_revision_rejects_publisher_when_actor_is_anchored() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    snapshot = _snapshot_with_anthropic_publisher(world.snapshot)
+    base = replace(base, production_input_hash=snapshot.input_hash)
+
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError) as error:
+        _apply_targeted_title_revision(
+            world,
+            base,
+            evidence_pack,
+            "[Anthropic] Revised FooRAT activity",
+            snapshot=snapshot,
+        )
+
+    assert error.value.reason_code == "synthesis_title_publisher_as_actor"
+
+
+def test_targeted_title_revision_rejects_unanchored_group() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError) as error:
+        _apply_targeted_title_revision(
+            world, base, evidence_pack, "[InventedCluster] Revised FooRAT activity"
+        )
+
+    assert error.value.reason_code == "synthesis_title_actor_ungrounded"
+
+
+def test_targeted_title_revision_accepts_publisher_fallback_without_actor() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+    snapshot = replace(
+        world.snapshot,
+        subject_title="Network intrusion activity",
+        actor_or_campaign="",
+        input_hash="",
+        reuse_basis_hash="",
+    )
+    publisher = synthesis_module._editorial_title_group(world.snapshot, world.extraction)
+    title = f"[{publisher}] Revised FooRAT activity"
+
+    revised, _ = _apply_targeted_title_revision(
+        world, base, evidence_pack, title, snapshot=snapshot
+    )
+
+    assert revised.title == title
+
+
+def test_targeted_title_revision_rejects_invalid_title() -> None:
+    world, base, evidence_pack, _ = _targeted_revision_fixture()
+
+    with pytest.raises(synthesis_revision_module.TargetedSynthesisRevisionValidationError) as error:
+        _apply_targeted_title_revision(world, base, evidence_pack, "A title without a group")
+
+    assert error.value.reason_code == "synthesis_title_invalid"
+
+
 def test_extraction_hash_recognizes_legacy_payload_without_optional_scope() -> None:
     world = _fresh_setup()
     payload = production_extraction_to_json(world.extraction)
@@ -4442,10 +4664,7 @@ def test_targeted_title_revision_preserves_legacy_sections_byte_for_byte() -> No
     payload = production_synthesis_to_json(base)
     target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
     operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
-    expected_title = (
-        f"[{synthesis_module._editorial_title_group(world.snapshot, world.extraction)}] "
-        "Updated FooRAT activity"
-    )
+    expected_title = f"[{world.snapshot.actor_or_campaign}] Updated FooRAT activity"
     patch = _targeted_wire_patch(
         payload,
         target,
@@ -4804,10 +5023,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
     base_hash = hashlib.sha256(artifact_store.bytes[synthesis_blob]).hexdigest()
     before_hash = synthesis_revision_module._sha256(base.title)
     target_path = "synthesis.title"
-    expected_title = (
-        f"[{synthesis_module._editorial_title_group(world.snapshot, world.extraction)}] "
-        "Updated FooRAT activity"
-    )
+    expected_title = f"[{world.snapshot.actor_or_campaign}] Updated FooRAT activity"
     wire = (
         "@@TARGET@@\n"
         f"{target_path}\n"
@@ -4819,7 +5035,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         "@@AFTER@@\n@@TITLE@@\n"
         f"{expected_title}\n"
         "@@END TITLE@@\n"
-        "@@RATIONALE@@\nThe title retains the evidenced publisher group.\n"
+        "@@RATIONALE@@\nThe title retains the grounded actor group.\n"
         "@@END@@"
     )
     gateway = _RecordingGateway(lambda request: _succeeded(request, None, text=wire))
@@ -4848,7 +5064,7 @@ async def test_synthesis_revision_recovers_existing_model_run_without_resubmissi
         base_canonical_sha256=base_hash,
         target=TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
         operation=TargetedEditorialRevisionOperation.REWRITE_TITLE,
-        instruction="Correct the title to match the publisher group.",
+        instruction="Correct the title to match the grounded actor group.",
         mode=TargetedEditorialRevisionMode.EXISTING_EVIDENCE_ONLY,
         requester="test-analyst",
     )
@@ -5205,13 +5421,13 @@ async def test_targeted_revision_lineage_walks_title_section_attribution_chain()
         for item in evidence_pack.narrative_evidence
         if "Attribution remains uncertain." in json.dumps(item, ensure_ascii=False)
     )
-    editorial_group = synthesis_module._editorial_title_group(world.snapshot, world.extraction)
+    editorial_group = world.snapshot.actor_or_campaign
     steps = (
         (
             TargetedEditorialRevisionOperation.REWRITE_TITLE,
             TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
             f"@@TITLE@@\n[{editorial_group}] Corrected FooRAT activity\n@@END TITLE@@",
-            "Correct the title to match the publisher group.",
+            "Correct the title to match the grounded actor group.",
         ),
         (
             TargetedEditorialRevisionOperation.RENAME_SECTION,
@@ -5483,10 +5699,7 @@ async def test_source_extension_lineage_v1_to_v2_to_v3_keeps_source_provenance()
 
     synthesis_v3 = replace(
         synthesis_v2,
-        title=(
-            f"[{synthesis_module._editorial_title_group(world.snapshot, extraction)}] "
-            "FooRAT and NanoDump reference"
-        ),
+        title=f"[{world.snapshot.actor_or_campaign}] FooRAT and NanoDump reference",
     )
     payload_v3 = production_synthesis_to_json(synthesis_v3)
     artifact_v3_id = uuid4()
@@ -5581,7 +5794,7 @@ def _targeted_operation_case(
         return section_wire(text)
 
     if operation is TargetedEditorialRevisionOperation.REWRITE_TITLE:
-        expected_group = synthesis_module._editorial_title_group(world.snapshot, world.extraction)
+        expected_group = world.snapshot.actor_or_campaign
         return (
             base,
             TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE),
@@ -5837,7 +6050,7 @@ def test_targeted_revision_supports_legacy_sections_without_headings() -> None:
     payload = production_synthesis_to_json(base)
     target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
     operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
-    expected_group = synthesis_module._editorial_title_group(world.snapshot, world.extraction)
+    expected_group = world.snapshot.actor_or_campaign
     patch = _targeted_wire_patch(
         payload,
         target,
@@ -5990,7 +6203,7 @@ async def test_synthesis_revision_rebases_only_enrichments_with_valid_dependenci
     if change == "title":
         operation = TargetedEditorialRevisionOperation.REWRITE_TITLE
         target = TargetedEditorialRevisionTarget(kind=TargetedEditorialRevisionTargetKind.TITLE)
-        expected_group = synthesis_module._editorial_title_group(world.snapshot, world.extraction)
+        expected_group = world.snapshot.actor_or_campaign
         after = f"@@TITLE@@\n[{expected_group}] Updated FooRAT activity\n@@END TITLE@@"
     else:
         operation = TargetedEditorialRevisionOperation.REWRITE_PARAGRAPH
