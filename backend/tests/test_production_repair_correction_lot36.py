@@ -14,7 +14,7 @@ from cti_app.application.production_artifact_store import (
     MAX_ARTIFACT_BYTES,
     ProductionArtifactStore,
 )
-from cti_app.application.production_parsers import TechnicalExtraction
+from cti_app.application.production_parsers import ExtractionItem, TechnicalExtraction
 from cti_app.application.production_repairs import (
     EffectiveExtractionProjector,
     ProductionRepairAdjudicationService,
@@ -22,6 +22,7 @@ from cti_app.application.production_repairs import (
     ProductionRepairIssueDetail,
     ProductionRepairIssueView,
     ProductionRepairValueNotVerifiableError,
+    _item_projection_key,
     classify_repair_impact,
     production_repair_correction_identity,
 )
@@ -34,6 +35,7 @@ from cti_app.domain.production import (
     ProductionRepairIssueKind,
     ProductionRepairVerificationState,
 )
+from cti_app.domain.publication import ArtifactType
 
 EDITION_ID = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
 SUBJECT_ID = UUID("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
@@ -349,6 +351,22 @@ async def test_replacement_verification_reads_archived_source_above_artifact_lim
     )
 
     assert verification.verified is True
+
+
+def test_projection_key_tolerates_a_malformed_literal_in_the_base_extraction() -> None:
+    item = ExtractionItem(
+        local_id="i1",
+        category="indicator",
+        value="127.0.0.1:48739",
+        context="",
+        artifact_type=ArtifactType.IP,
+        attack_id=None,
+        reference_ids=(),
+        source_ids=(),
+        supported=True,
+    )
+
+    assert _item_projection_key(item) == ("ip", "127.0.0.1:48739")
 
 
 def _rule_issue(value: str) -> ProductionRepairIssueView:

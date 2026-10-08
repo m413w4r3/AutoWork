@@ -5623,8 +5623,14 @@ def _item_projection_key(item: ExtractionItem) -> tuple[str, str]:
     if item.artifact_type is None:
         return item.category, item.value.casefold()
     artifact_type = ArtifactType(item.artifact_type)
-    normalized = item.normalized_value or canonical_indicator_key(item.value, artifact_type)
-    return artifact_type.value, normalized
+    if item.normalized_value:
+        return artifact_type.value, item.normalized_value
+    try:
+        return artifact_type.value, canonical_indicator_key(item.value, artifact_type)
+    except ValueError:
+        # A malformed literal already present in the base extraction (for instance an
+        # ``ip:port``) must not block the repair projection: key it by its raw value.
+        return artifact_type.value, item.value.casefold()
 
 
 def _prefer_projection_object[T](
